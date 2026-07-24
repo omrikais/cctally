@@ -7,6 +7,8 @@ import shutil
 import sqlite3
 import sys
 
+import pytest
+
 from conftest import load_script, redirect_paths
 
 
@@ -124,6 +126,24 @@ def test_027_defers_before_dml_when_codex_flock_is_held(tmp_path, monkeypatch):
             raise AssertionError("027 must defer while Codex sync owns the flock")
         assert conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] == 1
     conn.close()
+
+
+def test_027_defers_before_dml_when_global_writer_flock_is_held(
+    tmp_path, monkeypatch
+):
+    db, core = _seed_existing_cache(tmp_path, monkeypatch)
+    lock_path = pathlib.Path(str(core.CACHE_DB_PATH) + ".lock")
+    with open(lock_path, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(db.MigrationGateNotMet, match="writer busy"):
+            db._eagerly_apply_cache_migrations()
+        conn = sqlite3.connect(core.CACHE_DB_PATH)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM codex_session_entries"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
 
 
 def test_027_per_migration_goldens_pin_codex_replay_arm():

@@ -876,6 +876,20 @@ _cmd_config_set = _cctally_config._cmd_config_set
 _cmd_config_unset = _cctally_config._cmd_config_unset
 _get_quota_alerts_config = _cctally_config._get_quota_alerts_config
 
+# Account subcommand + the R8 decoration helpers (#341 Task 3). Eager re-export
+# so the parser's `set_defaults(func=c.cmd_account)` binds and the alerts /
+# --account / doctor / dashboard consumers reach the shared registry helpers
+# through the cctally namespace.
+_cctally_account = _load_sibling("_cctally_account")
+cmd_account = _cctally_account.cmd_account
+load_accounts = _cctally_account.load_accounts
+real_account_count = _cctally_account.real_account_count
+provider_is_decorated = _cctally_account.provider_is_decorated
+account_label = _cctally_account.account_label
+resolve_active_account_keys = _cctally_account.resolve_active_account_keys
+resolve_account_filter = _cctally_account.resolve_account_filter
+account_json_fields = _cctally_account.account_json_fields
+
 
 # `cctally refresh-usage` + the OAuth-usage fetch/render/config surface,
 # the in-process refresh helper consumed by the dashboard `POST /api/sync`
@@ -1015,6 +1029,7 @@ _collect_codex_entries_direct = _cctally_cache._collect_codex_entries_direct
 get_codex_entries = _cctally_cache.get_codex_entries
 _sum_codex_cost_for_range = _cctally_cache._sum_codex_cost_for_range
 get_entries = _cctally_cache.get_entries
+AccountAttributionUnavailable = _cctally_cache.AccountAttributionUnavailable
 open_cache_db = _cctally_cache.open_cache_db
 open_conversations_db = _cctally_cache.open_conversations_db
 sync_claude_conversations = _cctally_cache.sync_claude_conversations
@@ -1772,14 +1787,21 @@ def _sum_cost_for_range(
     project: str | None = None,
     *,
     skip_sync: bool = False,
+    account_key: "str | None" = None,
 ) -> float:
     """Sum USD cost of all Claude Code usage entries in [start, end].
 
     Pass `skip_sync=True` to read only the cache-as-of-now without running
     a JSONL ingest pass (for forecast --no-sync).
+
+    ``account_key`` (#341, P2-CQ2) scopes the sum to one account's stamped
+    entries; ``None`` (default) sums all accounts (merged, byte-identical). Used
+    by the per-account ``sync-week`` cost materialization + per-account budget
+    ladders so a snapshot / budget carries genuinely per-account cost.
     """
     total = 0.0
-    for entry in get_entries(start, end, project=project, skip_sync=skip_sync):
+    for entry in get_entries(start, end, project=project, skip_sync=skip_sync,
+                             account_key=account_key):
         total += _calculate_entry_cost(
             entry.model,
             entry.usage,
@@ -2106,9 +2128,13 @@ def _load_claude_config_for_args(args: argparse.Namespace) -> "dict":
 
 
 def _resolve_primary_model_for_block(
-    conn: sqlite3.Connection, five_hour_window_key: int
+    conn: sqlite3.Connection, five_hour_window_key: int,
+    *, account_key: str = "unattributed",
 ) -> "str | None":
     """Return the highest-cost model active in this 5h block, or ``None``.
+
+    ``account_key`` (#341) scopes the child lookup so a shared physical window
+    reflects THIS account's models.
 
     Reads from ``five_hour_block_models`` (recompute-every-tick rollup-child;
     UNIQUE on ``(five_hour_window_key, model)``). Returns ``None`` when the
@@ -2124,9 +2150,9 @@ def _resolve_primary_model_for_block(
     """
     row = conn.execute(
         "SELECT model FROM five_hour_block_models "
-        "WHERE five_hour_window_key = ? "
+        "WHERE five_hour_window_key = ? AND account_key = ? "
         "ORDER BY cost_usd DESC, model ASC LIMIT 1",
-        (int(five_hour_window_key),),
+        (int(five_hour_window_key), account_key),
     ).fetchone()
     if row is None:
         return None
@@ -2881,6 +2907,13 @@ def _validate_source_args(args) -> None:
         return
     source = getattr(args, "source", "claude")
     speed = getattr(args, "speed", "auto")
+    # #341: `--account` on the source-aware analytics commands scopes the CLAUDE
+    # analytics only (the account dimension is provider-scoped; source `all` has
+    # no account selector, and Codex account filtering lives on `codex quota`).
+    # Reject `--account` with `--source {codex,all}` (spec §3 / handoff item d).
+    if getattr(args, "account", None) is not None and source in {"codex", "all"}:
+        raise ValueError(
+            f"--account is only valid with --source claude (got --source {source})")
     if source == "claude" and speed != "auto":
         raise ValueError("--speed is only valid for Codex or all-source requests")
     if command == "project" and source in {"codex", "all"} and getattr(args, "sort", None) == "used":
@@ -3265,6 +3298,12 @@ def main(argv: list[str] | None = None) -> int:
         # A version-mismatched stats.db with no journal to rebuild from — hard
         # error with guidance (DB journal redesign §7.1). Caught before the
         # generic DatabaseError so it never renders as a raw traceback.
+        eprint(f"cctally: {exc}")
+        return 3
+    except AccountAttributionUnavailable as exc:
+        # #341: a `--account`-scoped entry read hit a query-time cache degrade
+        # (open failure / concurrent ingest) that would drop the account
+        # identity. Fail closed (exit 3) rather than emit a mislabeled render.
         eprint(f"cctally: {exc}")
         return 3
     except sqlite3.DatabaseError as exc:

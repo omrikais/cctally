@@ -920,6 +920,31 @@ def _build_anon_mapping(
     return mapping
 
 
+def anonymize_account_label(
+    label: str, index: int, *, reveal: bool,
+) -> str:
+    """Map an account label to ``Account A/B/C`` unless ``reveal`` (#341 Task 4).
+
+    Account labels are user data (spec §4 Privacy) — a share/export must never
+    leak them, exactly like project names. This is the fail-closed anonymization
+    chokepoint: ``reveal`` is the SAME toggle that governs project reveal
+    (``reveal_projects``), so anon-mode (the default) rewrites the label to a
+    positional ``Account <letter>`` keyed by the account's deterministic registry
+    ``index`` (0→A, 1→B, …); only an explicit reveal shows the real label. Emails
+    never enter a share at all — the ``data.accounts[]`` wire carries no email
+    field — so this covers the only account user-data a share can see.
+    """
+    if reveal:
+        return label
+    if index < 0:
+        index = 0
+    # A..Z then Account-27, Account-28, … (registries never approach 26 real
+    # accounts, but stay total rather than raise).
+    if index < 26:
+        return f"Account {chr(ord('A') + index)}"
+    return f"Account {index + 1}"
+
+
 def _apply_anon_mapping(
     snap: ShareSnapshot, mapping: dict[_ProjectAnonKey, str] | dict[str, str],
 ) -> ShareSnapshot:

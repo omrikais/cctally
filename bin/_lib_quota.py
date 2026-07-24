@@ -11,8 +11,10 @@ import datetime as dt
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Literal
+
+import _lib_accounts
 
 
 FUTURE_CLOCK_SKEW_SECONDS = 300
@@ -52,11 +54,18 @@ class QuotaWindowIdentity:
     logical_limit_key: str
     observed_slot: str
     window_minutes: int
+    # account_key (#341) participates in equality/hashing so never-combine
+    # extends to accounts automatically: two accounts sharing one physical
+    # window key are distinct identities. It defaults to the reserved sentinel so
+    # a single-account / pre-#341 caller building an identity by keyword is
+    # byte-stable. limit_id/limit_name remain compare=False display metadata.
+    account_key: str = _lib_accounts.UNATTRIBUTED
     limit_id: str | None = field(default=None, compare=False)
     limit_name: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
-        for name in ("source", "source_root_key", "logical_limit_key", "observed_slot"):
+        for name in ("source", "source_root_key", "logical_limit_key", "observed_slot",
+                     "account_key"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.window_minutes, int) or isinstance(self.window_minutes, bool):
@@ -194,14 +203,20 @@ class QuotaThresholdDecision:
     threshold: int
 
 
-def identity_sort_key(identity: QuotaWindowIdentity) -> tuple[str, str, str, str, int]:
-    """Return the stable full logical identity ordering used by every selector."""
+def identity_sort_key(identity: QuotaWindowIdentity) -> tuple[str, str, str, str, int, str]:
+    """Return the stable full logical identity ordering used by every selector.
+
+    ``account_key`` (#341) is appended LAST so the existing 5-element ordering is
+    preserved byte-for-byte for a single-account install (the account is constant
+    there) and only ever breaks a genuine cross-account tie deterministically.
+    """
     return (
         identity.source,
         identity.source_root_key,
         identity.logical_limit_key,
         identity.observed_slot,
         identity.window_minutes,
+        identity.account_key,
     )
 
 
@@ -267,6 +282,68 @@ def build_history(observations: Iterable[QuotaObservation]) -> tuple[QuotaHistor
             physical_observations=physical,
             observations=tuple(interpreted),
         ))
+    return tuple(result)
+
+
+def _physical_window_key(observation: QuotaObservation) -> tuple[object, ...]:
+    """The account-INDEPENDENT physical window key used by the continuity fold.
+
+    Two observations share a physical window iff they agree on root, limit key,
+    slot, window minutes, and the exact (canonical UTC) reset boundary — the
+    account is deliberately EXCLUDED so unidentified observations can be adopted
+    by a same-window identified account (spec §2 window-account continuity).
+    """
+    identity = observation.identity
+    return (
+        identity.source,
+        identity.source_root_key,
+        identity.logical_limit_key,
+        identity.observed_slot,
+        identity.window_minutes,
+        observation.resets_at,
+    )
+
+
+def adopt_unidentified_observations(
+    observations: Iterable[QuotaObservation],
+) -> tuple[QuotaObservation, ...]:
+    """Apply the window-account continuity rule (#341 spec §2 rev 4).
+
+    Group observations by their physical window key (account EXCLUDED). Within a
+    group, identified observations (``account_key != unattributed``) are
+    AUTHORITATIVE and NEVER re-assigned — two identified accounts sharing an
+    identical physical window key stay separate windows (never-combine holds
+    unconditionally). Unidentified observations are adopted by the window's
+    account IFF exactly ONE identified account is ever observed for that key;
+    zero or ambiguous (>=2) identified accounts leave them ``unattributed``.
+
+    Pure and order-preserving: identified observations pass through untouched; an
+    adopted unidentified observation is returned with its identity re-stamped to
+    the single identified account. A single-account install (all observations
+    already carry one account, or all are unattributed with no identified peer)
+    is a byte-stable no-op.
+    """
+    values = tuple(observations)
+    identified_by_window: dict[tuple[object, ...], set[str]] = {}
+    for observation in values:
+        account = observation.identity.account_key
+        if account != _lib_accounts.UNATTRIBUTED:
+            identified_by_window.setdefault(
+                _physical_window_key(observation), set()
+            ).add(account)
+    result: list[QuotaObservation] = []
+    for observation in values:
+        if observation.identity.account_key != _lib_accounts.UNATTRIBUTED:
+            result.append(observation)
+            continue
+        accounts = identified_by_window.get(_physical_window_key(observation))
+        if accounts is not None and len(accounts) == 1:
+            adopted = next(iter(accounts))
+            result.append(replace(
+                observation, identity=replace(observation.identity, account_key=adopted),
+            ))
+        else:
+            result.append(observation)
     return tuple(result)
 
 

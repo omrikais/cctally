@@ -303,7 +303,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1000
+    assert core.STATS_INDEX_EPOCH == 1001  # #341 account-dimension bump (was 1000)
     assert core.LEGACY_STATS_HEAD == 13
 
 

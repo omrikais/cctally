@@ -5,6 +5,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.81.0] - 2026-07-24
+
+### Added
+- cctally now tracks usage per account for each provider: if you use more than one Claude or Codex account on this machine, each account's percent, 5-hour, and quota milestones — and their alerts — are recorded and fire independently instead of silently colliding. (#341)
+- New `cctally account list|show|label` subcommand shows every observed account (provider, label, email, plan, first/last seen, and which is currently active) and lets you set a durable friendly label that survives a stats rebuild. (#341)
+- Optional per-account weekly budgets via `config set budget.accounts` (Claude) and `config set budget.codex.accounts` (Codex); a budget targets an immutable account even after you rename its label, and a Codex per-account budget works without a vendor-wide amount. (#341)
+- `cctally doctor` gains an Accounts section reporting whether the active identity is readable, the registry is consistent, and whether usage is landing under the correct account. (#341)
+- New `--account <ref>` filter scopes a command's output to one account (by label, email, or account-key prefix). It works on the Claude usage/analytics commands — `report`, `forecast`, `weekly`, `percent-breakdown`, `five-hour-blocks`, `five-hour-breakdown`, `daily`, `monthly`, `session`, `project`, `diff`, `range-cost`, `cache-report` — and the `codex quota` views; `--json` output gains `accountKey`/`accountLabel` when an account is selected. (#341)
+- The dashboard gains a multi-account view: when a provider has more than one real account, an account chip row appears under the source switcher (keyboard `a` cycles), the "All accounts" view shows a per-account hero card (weekly/5-hour bars, plan, weekly spend, reset countdown), and selecting a chip focuses that account. Single-account dashboards are pixel-identical. (#341)
+
+### Changed
+- Multi-account is byte-stable: if you use a single account per provider (the common case), every report, alert, and status line is unchanged. Account labels and columns appear only once a provider has more than one real account. (#341)
+- Alert notifications gain a `[label]` prefix only when a provider has more than one real account, and `alerts.log` now records the account on every line. (#341)
+- `record-credit` records the credit under the currently active account (and asks you to retry if that identity can't be read mid-write); `sync-week` attributes its cost snapshot to the active account. (#341)
+
+### Fixed
+- Concurrent Claude and Codex hook syncs now serialize every `cache.db` write and WAL checkpoint through one global-first lock order. Forced writer death resumes from truthful per-file cursors, and quota-journal and migration writers use the same discipline, closing the cross-provider write/checkpoint overlap consistent with the recurring page-one corruption. (#344)
+- Corrupt `cache.db` rebuilds now recover without manual file surgery, including
+  corruption discovered after open and repairs interrupted at any phase.
+  Dead, malformed, or PID-reused repair owners self-clear safely, `doctor`
+  reports live versus stale maintenance, and the dashboard distinguishes
+  actionable server cache failures from disconnects and failed manual sync
+  requests. (#344)
+
 ## [1.80.4] - 2026-07-23
 
 ### Fixed

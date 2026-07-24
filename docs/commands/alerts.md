@@ -94,11 +94,14 @@ Exit codes for the CLI form:
   new alert lands; click to dismiss. Distinct visual variant from status
   toasts; colored by the 3-tier severity (see [Severity](#severity)).
 - **`alerts.log` audit line.** One tab-delimited line per dispatch
-  attempt at `~/.local/share/cctally/logs/alerts.log`. The seven columns
+  attempt at `~/.local/share/cctally/logs/alerts.log`. The eight columns
   are: `timestamp`, `axis`, `threshold`, `window_key`, `mode`
   (`real`/`test`), `status` (`queued` / `no_notifier:<reason>` /
-  `spawn_error:…`), and `severity` (`info`/`warn`/`critical`). The
-  severity column is the 7th field.
+  `spawn_error:…`), `severity` (`info`/`warn`/`critical`), and
+  `account_key` (the crossing's account; `*` for vendor-wide rows — #341).
+  The severity column is the 7th field; the account_key column is the 8th.
+  The 8th field is unconditional (the log is runtime state, exempt from the
+  R8 byte-stability contract).
 
 ## Configuring threshold lists
 

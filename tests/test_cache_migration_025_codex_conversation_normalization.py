@@ -75,7 +75,12 @@ _EVENTS = [
 
 def _seed_existing_cache(tmp_path, monkeypatch):
     """A populated post-S1 cache at the 024 head: a stored Codex conversation
-    (events + thread) with NO normalized rows, plus a Claude sentinel."""
+    (events + thread) with NO normalized rows, plus a Claude sentinel.
+
+    Note: there is intentionally no ``session_entries`` row here, so cache
+    migration 029 (Claude account backfill, #341) finds nothing pending and
+    no-ops — the chain reaches head 29 without needing a cutover op (contrast
+    the 024 fixture, which seeds an ``unattributed`` one)."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core as core
@@ -226,7 +231,7 @@ def test_025_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 28
+        assert _version(conn) == 29
     finally:
         conn.close()
 
@@ -253,7 +258,7 @@ def test_025_defers_without_mutation_while_codex_lock_is_held(tmp_path, monkeypa
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 28
+        assert _version(conn) == 29
     finally:
         conn.close()
 
@@ -281,7 +286,7 @@ def test_025_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(tmp
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 28
+        assert _version(conn) == 29
     finally:
         conn.close()
 

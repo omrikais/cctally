@@ -345,3 +345,81 @@ def test_codex_tick_drains_stdin_before_discovering_roots(runtime, monkeypatch):
 
     assert ns["cmd_hook_tick"](_hook_args()) == 0
     assert order == ["stdin", "roots"]
+
+
+# --------------------------------------------------------------------------
+# #341 Task 2 Step 7: throttle marker keys by (source_root_key, account_key).
+# --------------------------------------------------------------------------
+
+import base64  # noqa: E402
+from _lib_codex_hooks import mark_lifecycle_success  # noqa: E402
+import _lib_accounts as _accts  # noqa: E402
+
+
+def _b64(obj) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps(obj).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _codex_auth(account_id: str, email: str) -> str:
+    id_token = (
+        f"{_b64({'alg': 'RS256'})}."
+        f"{_b64({'email': email, 'https://api.openai.com/auth': {'chatgpt_account_id': account_id}})}."
+        "sig"
+    )
+    return json.dumps({"tokens": {"id_token": id_token}})
+
+
+def test_codex_throttle_marker_keys_by_account_switch_bypasses(tmp_path, monkeypatch):
+    """A mid-interval account switch bypasses the prior account's throttle: the
+    marker keys by (source_root_key, account_key), so the new account's marker is
+    absent and the first post-switch tick is due (spec §1)."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    home = tmp_path / "codex-shared"
+    (home / "sessions").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    [root] = codex_hook_roots([home])
+    app_dir = ns["_cctally_core"].APP_DIR
+    now = 1000.0
+
+    # Account A active -> due, marker carries A's key.
+    (home / "auth.json").write_text(_codex_auth("acct-a", "a@x.com"))
+    key_a = _accts.account_key("codex", "acct-a\0a@x.com")
+    locks = acquire_due_lifecycle_locks(app_dir, [root], now=now)
+    assert [lk.root.source_root_key for lk in locks] == [root.source_root_key]
+    assert locks[0].marker_path.name == f"{root.source_root_key}.{key_a}.last-success"
+    mark_lifecycle_success(locks)
+    release_lifecycle_locks(locks)
+
+    # Same account A within the throttle window -> suppressed.
+    assert acquire_due_lifecycle_locks(app_dir, [root], now=now + 1.0) == []
+
+    # Switch to account B within the same window -> NOT throttled (B's marker
+    # is absent), so the first post-switch tick observes the new account.
+    (home / "auth.json").write_text(_codex_auth("acct-b", "b@x.com"))
+    key_b = _accts.account_key("codex", "acct-b\0b@x.com")
+    locks_b = acquire_due_lifecycle_locks(app_dir, [root], now=now + 2.0)
+    try:
+        assert [lk.root.source_root_key for lk in locks_b] == [root.source_root_key]
+        assert locks_b[0].marker_path.name == (
+            f"{root.source_root_key}.{key_b}.last-success")
+    finally:
+        release_lifecycle_locks(locks_b)
+
+
+def test_codex_throttle_marker_unattributed_keeps_legacy_name(tmp_path, monkeypatch):
+    """No auth.json (api-key / no identity) keeps the byte-stable legacy marker
+    name (no account suffix) — single-account / no-auth installs are unchanged."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    home = tmp_path / "codex-noauth"
+    (home / "sessions").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    [root] = codex_hook_roots([home])
+    app_dir = ns["_cctally_core"].APP_DIR
+    locks = acquire_due_lifecycle_locks(app_dir, [root], now=1000.0)
+    try:
+        assert locks[0].marker_path.name == f"{root.source_root_key}.last-success"
+    finally:
+        release_lifecycle_locks(locks)

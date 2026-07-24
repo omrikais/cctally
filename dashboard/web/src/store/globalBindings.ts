@@ -5,8 +5,14 @@ import { openPanelByPosition } from '../lib/openPanelByPosition';
 import { buildShareKeyBinding } from '../share/keyboardShare';
 import { buildBasketKeyBindings } from '../share/keyboardBasket';
 import { BENTO_MEDIA_QUERY } from '../lib/breakpoints';
+import {
+  ALL_ACCOUNTS,
+  nextAccountFocus,
+  resolveAccountFocus,
+  sourceAccounts,
+} from './accountFocus';
 import type { Binding } from './keymap';
-import type { DashboardSelection } from '../types/envelope';
+import type { DashboardSelection, SourceEntry } from '../types/envelope';
 
 // #294 S5 — the `v` cycle order for the global source selector. Dashboard-view
 // scoped; the Conversations `v` (cycle focus mode) is view:'conversations' and
@@ -19,6 +25,24 @@ export function cycleActiveSource(): void {
   const idx = SOURCE_CYCLE.indexOf(cur);
   const next = SOURCE_CYCLE[(idx + 1) % SOURCE_CYCLE.length];
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: next });
+}
+
+// #341 Task 4 — cycle the focused account within the active physical source
+// (All → account₁ → … → accountₙ → All). A no-op when the active source is
+// source `all` or has <=1 real account (undecorated — no chip row to cycle).
+export function cycleActiveAccount(): void {
+  const s = getState();
+  const source = s.activeSource;
+  if (source === 'all') return;
+  const accounts = sourceAccounts(
+    (s.snapshot?.sources?.[source] ?? null) as SourceEntry<unknown> | null,
+  );
+  if (accounts == null) return;
+  const current = resolveAccountFocus(
+    s.snapshot, source, s.accountFocus[source] ?? ALL_ACCOUNTS,
+  );
+  const next = nextAccountFocus(accounts, current);
+  dispatch({ type: 'SET_ACCOUNT_FOCUS', source, account: next });
 }
 
 // True in the desktop bento (>=900px), where per-card collapse is removed (A3).
@@ -91,6 +115,10 @@ export function buildGlobalKeyBindings(): Binding[] {
     // modal/input guard as the other dashboard globals. Dashboard-view default
     // (the Conversations `v` cycles focus mode and is view-scoped).
     { key: 'v', scope: 'global', when: _globalKeyGuard, action: cycleActiveSource },
+    // #341 Task 4 — cycle the focused account within a decorated source (Q6
+    // Option A). Same modal/input guard; `cycleActiveAccount` no-ops on an
+    // undecorated source, so a single-account install's `a` is inert.
+    { key: 'a', scope: 'global', when: _globalKeyGuard, action: cycleActiveAccount },
     { key: 'q', scope: 'global', when: _globalKeyGuard, action: tryQuit },
     { key: 'n', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(1) },
     { key: 'N', scope: 'global', when: _globalKeyGuard, action: () => stepMatch(-1) },

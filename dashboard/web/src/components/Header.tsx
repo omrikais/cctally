@@ -3,6 +3,7 @@ import { BasketChip } from './BasketChip';
 import { DoctorChip } from './DoctorChip';
 import { SyncChip } from './SyncChip';
 import { SourceSwitcher } from './SourceSwitcher';
+import { AccountChipRow } from './AccountChipRow';
 import { SourceStatusChip } from './SourceStatusChip';
 import { UpdateBadge } from './UpdateBadge';
 import { ViewSwitcher } from '../conversations/ViewSwitcher';
@@ -128,6 +129,10 @@ export function Header() {
       {/* #294 S5 — the global Claude / Codex / All source selector. Self-hides
           outside the dashboard workspace. Sits beside the workspace switcher. */}
       <SourceSwitcher />
+      {/* #341 Task 4 — the per-account chip row (Q6 Option A). Self-hides unless
+          the active physical source has >1 real account (byte-stable otherwise);
+          renders under the source switcher. */}
+      <AccountChipRow />
       {/* condensed readout: Task 7 — a mobile-only, dashboard-only condensed
           line, gated on view==='dashboard' && heroScrolled. Provider-native
           under Codex (native quota summary); hidden under All; Claude keeps the

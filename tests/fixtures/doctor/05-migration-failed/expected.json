@@ -209,11 +209,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 28,
+                            "registry_size": 29,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1000,
+                            "epoch": 1001,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -258,7 +258,8 @@
                                     "025_codex_conversation_normalization",
                                     "026_codex_conversation_key_backfill",
                                     "027_codex_fork_preamble_rebuild",
-                                    "028_split_conversation_store"
+                                    "028_split_conversation_store",
+                                    "029_backfill_claude_account"
                                 ],
                                 "skipped": []
                             },
@@ -459,13 +460,17 @@
                             [
                                 "cache.db",
                                 "028_split_conversation_store"
+                            ],
+                            [
+                                "cache.db",
+                                "029_backfill_claude_account"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "40 pending",
+                    "summary": "41 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -689,6 +694,53 @@
             "checks": [
                 {
                     "details": {
+                        "claude_identity_status": "stably_absent"
+                    },
+                    "id": "accounts.identity",
+                    "severity": "ok",
+                    "summary": "no active Claude identity on disk (single-account / api-key mode)",
+                    "title": "Account identity source"
+                },
+                {
+                    "details": {
+                        "by_provider": {},
+                        "missing_provider": 0,
+                        "real_account_count": 0
+                    },
+                    "id": "accounts.registry",
+                    "severity": "ok",
+                    "summary": "no accounts observed yet",
+                    "title": "Account registry"
+                },
+                {
+                    "details": {
+                        "freshest_last_seen_age_s": null
+                    },
+                    "id": "accounts.freshness",
+                    "severity": "ok",
+                    "summary": "no attribution activity recorded",
+                    "title": "Account attribution freshness"
+                },
+                {
+                    "details": {
+                        "claude_identity_status": "stably_absent",
+                        "recent_attributed": 0,
+                        "recent_unattributed": 0
+                    },
+                    "id": "accounts.attribution",
+                    "severity": "ok",
+                    "summary": "usage attribution healthy",
+                    "title": "Account attribution"
+                }
+            ],
+            "id": "accounts",
+            "severity": "ok",
+            "title": "Accounts"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
                         "fallback": [],
                         "unpriced": []
                     },
@@ -777,7 +829,7 @@
     "overall": {
         "counts": {
             "fail": 1,
-            "ok": 36,
+            "ok": 40,
             "warn": 7
         },
         "severity": "fail"

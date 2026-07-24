@@ -788,6 +788,51 @@ def _build_alerts_envelope_array(
     return out[:limit]
 
 
+def _sync_failure_envelope(error: str | None) -> dict | None:
+    """Classify a raw server sync failure into a privacy-safe UI contract."""
+    if not error:
+        return None
+
+    text = error.casefold()
+    if (
+        "stale maintenance marker" in text
+        or "stale repair marker" in text
+        or "recovery could not claim maintenance" in text
+    ):
+        return {
+            "kind": "maintenance_stale",
+            "label": "⚠ cache repair blocked",
+            "detail": "A stale cache repair owner is blocking server sync.",
+            "action": "cctally cache-sync --rebuild",
+        }
+    if "maintenance is in progress" in text:
+        return {
+            "kind": "maintenance_active",
+            "label": "cache repair in progress",
+            "detail": "Another cctally process is repairing the server cache.",
+            "action": None,
+        }
+
+    c = sys.modules["cctally"]
+    if (
+        c._is_sqlite_corruption_error(error)
+        or "cache.db recovery" in text
+        or "cache.db is still open" in text
+    ):
+        return {
+            "kind": "cache_corruption",
+            "label": "⚠ cache recovery needed",
+            "detail": "The server cache database could not be read safely.",
+            "action": "cctally cache-sync --rebuild",
+        }
+    return {
+        "kind": "server_sync",
+        "label": "⚠ server sync error",
+        "detail": "The server could not complete its background sync.",
+        "action": None,
+    }
+
+
 def snapshot_to_envelope(snap: "DataSnapshot", *,
                          now_utc: "dt.datetime",
                          monotonic_now: "float | None" = None,
@@ -1369,6 +1414,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "last_sync_at":    None,
         "sync_age_s":      sync_age_s,
         "last_sync_error": snap.last_sync_error,
+        # Privacy-safe classification for user-facing dashboard copy. Keep the
+        # raw legacy field for API compatibility and diagnostics, but never
+        # place it in visible text/title/aria surfaces.
+        "sync_failure":    _sync_failure_envelope(snap.last_sync_error),
 
         # F1 (server-resolves "local" → IANA): the browser never has to
         # guess. {tz, resolved_tz, offset_label, offset_seconds} computed

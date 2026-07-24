@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Golden-file validation harness for the multi-account CLI surface (#341 Task 3).
+#
+# Covers a >1-real-account world (alice + bob + implicit unattributed) seeded by
+# bin/build-account-fixtures.py: the `account list` table + `--json` envelope,
+# `account show`, the `--account`-scoped `range-cost` render vs. the merged
+# default (R8 decoration present only under --account), plus the ref/exit-code
+# contract (AccountRefError -> 2, --account x --source codex -> 2, --account +
+# unavailable entry cache -> 3). Single-account R8 byte-stability is proven by
+# the sibling per-command harnesses staying green; this harness owns the
+# multi-account renders + the account-subcommand output.
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+HARNESS_BIN="$REPO_ROOT/bin/cctally"
+FIX="$REPO_ROOT/tests/fixtures/account/two-real"
+
+SCRATCH_DIR=$(mktemp -d -t cctally-account-fixtures-XXXXXX)
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+export GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
+
+# shellcheck source=bin/_lib-harness-env.sh
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+# shellcheck source=bin/_lib-golden-diff.sh
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+# shellcheck source=bin/_lib-fixture-cache.sh
+. "$REPO_ROOT/bin/_lib-fixture-cache.sh"
+
+build_fixtures_cached "$REPO_ROOT/bin/build-account-fixtures.py" "$SCRATCH_DIR" || {
+    echo "FAIL: build-account-fixtures.py crashed (exit $?)" >&2
+    exit 1
+}
+
+FAKE_HOME="$SCRATCH_DIR/two-real"
+AS_OF="2026-05-22T18:00:00Z"
+
+pass_count=0
+fail_count=0
+name=""   # consumed by _golden_diff_str's FAIL line
+
+# run_golden <name> <golden_suffix> <cctally args...>
+run_golden () {
+    name="$1"; local suffix="$2"; shift 2
+    local golden="$FIX/golden-$suffix.txt"
+    local actual
+    actual=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+             "$HARNESS_BIN" "$@" 2>&1)
+    if [ "${REGEN:-0}" = "1" ]; then
+        printf '%s\n' "$actual" > "$golden"
+        echo "REGEN $name -> $golden"
+        return 0
+    fi
+    if _golden_diff_str "$name" "$golden" "$actual"; then
+        echo "PASS $name"
+        pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# run_exit <name> <expected_exit> <substr-on-stderr> <cctally args...>
+run_exit () {
+    name="$1"; local want="$2" substr="$3"; shift 3
+    local err rc
+    err=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
+          "$HARNESS_BIN" "$@" 2>&1 >/dev/null)
+    rc=$?
+    if [ "$rc" -ne "$want" ]; then
+        echo "FAIL $name: exit $rc != expected $want"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    if [ -n "$substr" ] && ! printf '%s' "$err" | grep -qF "$substr"; then
+        echo "FAIL $name: stderr missing '$substr' (got: $err)"
+        fail_count=$((fail_count + 1))
+        return 1
+    fi
+    echo "PASS $name (exit $want)"
+    pass_count=$((pass_count + 1))
+}
+
+# ── golden renders ─────────────────────────────────────────────────────────
+run_golden account-list-table   list-table  account list
+run_golden account-list-json    list-json   account list --json
+run_golden account-show-alice   show-alice  account show alice
+run_golden range-cost-merged    rc-merged   range-cost \
+    --start 2026-05-22T00:00:00Z --end 2026-05-23T00:00:00Z --json
+run_golden range-cost-alice     rc-alice    range-cost \
+    --start 2026-05-22T00:00:00Z --end 2026-05-23T00:00:00Z --json --account alice
+run_golden range-cost-unattr    rc-unattr   range-cost \
+    --start 2026-05-22T00:00:00Z --end 2026-05-23T00:00:00Z --json --account unattributed
+
+# ── stats-family --account renders (#341 slice D) ──────────────────────────
+# report joins per-account usage + cost snapshots; alice=40%/$5, bob=15%/$2 —
+# a scoped render differs from the merged latest. Table + JSON.
+run_golden report-alice-table   report-alice-table   report --account alice
+run_golden report-alice-json    report-alice-json    report --account alice --json
+run_golden report-bob-json      report-bob-json      report --account bob --json
+# five-hour-blocks: alice + bob own a block each on ONE physical window, so a
+# scoped render shows only that account's block. Table + JSON.
+run_golden fhb-alice-table      fhb-alice-table      five-hour-blocks --account alice
+run_golden fhb-alice-json       fhb-alice-json       five-hour-blocks --account alice --json
+
+# ── exit-code contract ─────────────────────────────────────────────────────
+run_exit ref-ambiguous-or-unknown 2 "ambiguous or unknown" \
+    range-cost --start 2026-05-22T00:00:00Z --account nobody-here
+run_exit account-show-bad-ref     2 "ambiguous or unknown" account show nobody-here
+run_exit account-x-source-codex   2 "only valid with --source claude" \
+    range-cost --start 2026-05-22T00:00:00Z --source codex --account alice
+
+# needs_cache exit-3: destroy the entry cache (LAST — mutates FAKE_HOME) so the
+# --account read fails closed rather than silently returning unfiltered results.
+rm -rf "$FAKE_HOME/.local/share/cctally/cache.db"
+mkdir -p "$FAKE_HOME/.local/share/cctally/cache.db"
+run_exit account-cache-unavailable 3 "cache required" \
+    range-cost --start 2026-05-22T00:00:00Z --account alice
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

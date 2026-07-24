@@ -572,7 +572,8 @@ class WeeklyView:
 
 
 def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
-                      as_of_utc=None, mode="auto", aggregated_override=None):
+                      as_of_utc=None, mode="auto", aggregated_override=None,
+                      account_key=None):
     """Build a ``WeeklyView`` from subscription-week boundaries
     (spec §5.3).
 
@@ -648,7 +649,8 @@ def build_weekly_view(conn, entries, *, weeks, now_utc, display_tz=None,
             week_start_at=sw.start_ts,
             week_end_at=sw.end_ts,
         )
-        usage_row = get_usage(conn, ref, as_of_utc=as_of_utc)
+        usage_row = get_usage(conn, ref, as_of_utc=as_of_utc,
+                              account_key=account_key)
         used_pct = None
         if usage_row is not None and usage_row["weekly_percent"] is not None:
             used_pct = float(usage_row["weekly_percent"])
@@ -759,7 +761,7 @@ class TrendView:
 
 
 def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
-                     use_weekref_cost_cache=False):
+                     use_weekref_cost_cache=False, account_key=None):
     """Build a ``TrendView`` of the last ``n`` subscription weeks
     (spec §5.4).
 
@@ -799,7 +801,7 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
     get_usage = _cct_core.get_latest_usage_for_week
     c = _cctally()
 
-    week_refs = c.get_recent_weeks(conn, max(1, n))
+    week_refs = c.get_recent_weeks(conn, max(1, n), account_key=account_key)
     if not week_refs:
         return TrendView(
             rows=(), avg_dollars_per_pct=None,
@@ -809,10 +811,13 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
 
     # Determine current_key + current_week_start_at — same pattern as
     # _tui_build_trend / cmd_report's Bug D handling.
+    _acct_pred = "" if account_key is None else " WHERE account_key = ?"
+    _acct_p = () if account_key is None else (account_key,)
     latest_usage = conn.execute(
         "SELECT week_start_date, week_end_date "
-        "FROM weekly_usage_snapshots "
-        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+        "FROM weekly_usage_snapshots" + _acct_pred +
+        " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+        _acct_p,
     ).fetchone()
     current_key = None
     current_week_start_at = None
@@ -858,6 +863,7 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
             as_of_utc=(
                 week_ref.week_end_at if week_ref.key in split_keys else None
             ),
+            account_key=account_key,
         )
         usage_captured_at = usage["captured_at_utc"] if usage else None
         if c._week_ref_has_reset_event(conn, week_ref):
@@ -881,12 +887,12 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
                     week_end_at=parse_iso(week_ref.week_end_at, "week_end_at"),
                     now_utc=now_utc,
                     compute=lambda: c._compute_cost_for_weekref(
-                        week_ref, skip_sync=True
+                        week_ref, skip_sync=True, account_key=account_key
                     ),
                 )
             else:
                 cost_usd = c._compute_cost_for_weekref(
-                    week_ref, skip_sync=skip_sync
+                    week_ref, skip_sync=skip_sync, account_key=account_key
                 )
             cost_captured_at = (
                 usage_captured_at if cost_usd is not None else None
@@ -894,7 +900,8 @@ def build_trend_view(conn, *, now_utc, n=8, display_tz=None, skip_sync=False,
             range_start_iso = week_ref.week_start_at
             range_end_iso = week_ref.week_end_at
         else:
-            cost = c.get_latest_cost_for_week(conn, week_ref)
+            cost = c.get_latest_cost_for_week(
+                conn, week_ref, account_key=account_key)
             cost_usd = float(cost["cost_usd"]) if cost else None
             cost_captured_at = cost["captured_at_utc"] if cost else None
             range_start_iso = (
@@ -1605,6 +1612,7 @@ def build_forecast_view(
     skip_sync: bool = False,
     display_tz=None,
     use_weekref_cost_cache: bool = False,
+    account_key=None,
 ):
     """Build a ``ForecastView`` (issue #57).
 
@@ -1626,6 +1634,7 @@ def build_forecast_view(
     inputs = c._load_forecast_inputs(
         conn, now_utc, skip_sync=skip_sync,
         use_weekref_cost_cache=use_weekref_cost_cache,
+        account_key=account_key,
     )
     if inputs is None:
         return ForecastView(

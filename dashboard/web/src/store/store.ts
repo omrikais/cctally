@@ -48,6 +48,7 @@ import {
   type BasketSlice,
 } from './basketSlice';
 import { loadActiveSource, saveActiveSource } from './sourcePrefs';
+import { seedAccountFocus, saveAccountFocus, resolveAccountFocus, ALL_ACCOUNTS } from './accountFocus';
 import { resolveSourceView } from './sourceView';
 import { deriveVisiblePanelOrder, mapVisibleReorderToFull } from '../lib/visiblePanelOrder';
 import {
@@ -343,6 +344,14 @@ export interface UIState {
   // the already-delivered `sources` bundle: the store NEVER waits for or
   // reconciles this against an envelope (§5.1).
   activeSource: DashboardSelection;
+  // #341 Task 4 — per-source account focus (Q6 Option A). Keyed by physical
+  // source ('claude'/'codex'; 'all' has no selector). The value is an
+  // `accountKey` or the ALL_ACCOUNTS sentinel; seeded from
+  // `cctally:dashboard:account:<source>` and persisted on every real
+  // SET_ACCOUNT_FOCUS. Reconciled against the envelope at read time
+  // (`resolveAccountFocus`) — a vanished account resolves to All without a
+  // store mutation.
+  accountFocus: Record<SourceName, string>;
   // Conversation viewer (spec §4). Top-level view mode + the small
   // cross-cutting reader/search state. Fetched list/reader DATA lives in
   // hook state, not here (mirrors useProjectDetail). None of these persist
@@ -700,6 +709,8 @@ function loadInitial(): UIState {
     snapshot: null,
     // #294 S5 — seed the persisted source selection (invalid/missing → claude).
     activeSource: loadActiveSource(),
+    // #341 Task 4 — seed the per-source account focus (invalid/missing → All).
+    accountFocus: seedAccountFocus(),
     view: 'dashboard',
     selectedConversationId: null,
     selectedConversationRef: null,
@@ -927,6 +938,9 @@ export type Action =
   // it actually changes (identity-gated, like the basket / outline-width
   // persistence); a same-value dispatch is a no-op (no emit, no write).
   | { type: 'SET_ACTIVE_SOURCE'; source: DashboardSelection }
+  // #341 Task 4 — set the focused account for one physical source (Q6 Option A).
+  // Persists to `cctally:dashboard:account:<source>` only on a real change.
+  | { type: 'SET_ACCOUNT_FOCUS'; source: SourceName; account: string }
   // #294 S5 §5.6 — open / close the qualified source-detail modal (Codex/All
   // source rows). The modal fetches `/api/source/<source>/<resource>/<key>`.
   | { type: 'OPEN_SOURCE_DETAIL'; source: SourceName; resource: SourceResource; key: string }
@@ -1181,6 +1195,16 @@ export function dispatch(action: Action): void {
         const next = { ...state, activeSource: action.source };
         state = { ...next, ..._recomputeSearch(next) };
       }
+      break;
+    case 'SET_ACCOUNT_FOCUS':
+      // Per-source account focus. No-op same-value dispatch first (skip the
+      // persist + reassignment), then persist the bare literal and set the slot.
+      if (state.accountFocus[action.source] === action.account) break;
+      saveAccountFocus(action.source, action.account);
+      state = {
+        ...state,
+        accountFocus: { ...state.accountFocus, [action.source]: action.account },
+      };
       break;
     case 'OPEN_SOURCE_DETAIL':
       state = {
@@ -1979,9 +2003,20 @@ export function dispatch(action: Action): void {
       // activeSource at OPEN_SHARE. A later SET_ACTIVE_SOURCE mutates only
       // state.activeSource (not shareModal), so the captured source is frozen
       // for the flow's lifetime — no restamp mid-flow.
+      const capturedSource =
+        action.type === 'OPEN_SHARE'
+          ? (action.source ?? (state.openModal != null ? state.openModalSource : null) ?? state.activeSource)
+          : state.activeSource;
+      // #341 Task 4 — stamp the focused account of the CAPTURED source, resolved
+      // against the current envelope (a vanished/absent account → null = All).
+      // Frozen for the flow's lifetime, exactly like the captured source.
+      const capturedAccount =
+        action.type === 'OPEN_SHARE' && capturedSource !== 'all'
+          ? resolveAccountFocus(state.snapshot, capturedSource, state.accountFocus[capturedSource] ?? ALL_ACCOUNTS)
+          : null;
       const enriched: ShareAction =
         action.type === 'OPEN_SHARE'
-          ? { ...action, source: action.source ?? (state.openModal != null ? state.openModalSource : null) ?? state.activeSource }
+          ? { ...action, source: capturedSource, account: action.account ?? capturedAccount }
           : action;
       const slice = shareReducer(
         { shareModal: state.shareModal, composerModal: state.composerModal },

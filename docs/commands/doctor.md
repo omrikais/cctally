@@ -73,7 +73,14 @@ severity != `OK`.
 
 ### Database
 - `db.stats.file` — WARN when stats.db is absent (fresh install); FAIL when present but cannot open.
-- `db.cache.file` — WARN when cache.db is absent; FAIL when present but cannot open.
+- `db.cache.file` — WARN when cache.db is absent; FAIL when present but cannot
+  open. It also reports a live `cache.db.repairing` owner as "repair in
+  progress" without destructive advice, and a dead/malformed/PID-reused owner
+  as "stale repair owner" with the proven
+  `cctally cache-sync --rebuild` remediation. This marker probe is read-only.
+  Doctor holds the existing cache maintenance lock shared across every raw
+  cache probe; when a repair or pending quarantine exists it skips those
+  SQLite opens, so diagnostics cannot appear beneath the recovery drain check.
 - `db.integrity` — runs `PRAGMA quick_check(1)` on each database. FAIL when **stats.db** (the non-re-derivable DB) reports corruption or cannot be opened for the check; remediation points to `cctally db repair --db stats --yes`, which preserves the corrupt original before a verified atomic replacement. WARN when only **cache.db** is corrupt (re-derivable — `cctally cache-sync --rebuild`). OK when both report `ok`. This check runs **only from the CLI** (`cctally doctor` gathers with a `deep=True` flag); the dashboard health modal, whose gather runs on every rebuild, skips it because `quick_check` on a large cache.db costs seconds — there it shows "not checked (fast gather — run `cctally doctor`)".
 - `db.version_ahead` — classifies each DB's `user_version` versus what this binary expects. **stats.db** follows the EPOCH model (DB journal redesign §7.1): `user_version == STATS_INDEX_EPOCH` (a cut-over install) is HEALTHY, `user_version <= 13` (a pre-cutover legacy install) is HEALTHY (it cuts over on the next open), and `user_version > 13` but `!= epoch` is a §7.1 index **mismatch** → WARN, because it self-heals by journal **rebuild** on the next open (it never bricks, unlike the retired #145 version-ahead FAIL); remediation: `cctally db rebuild --db stats` (NOT the retired `db recover --db stats`). **cache.db** is unchanged (issue #145): a `user_version` past the cache registry head → WARN, auto-heals on the next open (remediation: it heals automatically, or run `cctally db recover --db cache`). OK ("none ahead") otherwise. `doctor` reads the raw `user_version` (no migration dispatcher), so it reports without itself healing or bricking.
 - `db.migrations.applied` — WARN on `skipped` rows; FAIL on `failed` rows.

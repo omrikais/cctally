@@ -29,6 +29,7 @@ from _cctally_source_analytics import (
     load_qualified_codex_entries,
 )
 import _lib_log
+import _lib_accounts
 from _lib_dashboard_sources import (
     CapabilityRecord,
     ProjectionCoherence,
@@ -67,6 +68,47 @@ UTC = dt.timezone.utc
 SOURCE_HISTORY_LIMIT = 250
 DASHBOARD_QUOTA_OBSERVATION_LIMIT = 1000
 DASHBOARD_QUOTA_RECENT_DAYS = 35
+
+
+def accounts_identity_digest(stats_conn: sqlite3.Connection) -> str:
+    """Digest of the account registry + the providers' live active-account state
+    (#341 spec §4 finding 9 — the identity-only invalidation signal).
+
+    Empty when NO account has ever been observed (the ``accounts`` registry is
+    empty): every <=1-account install and every pre-accounts fixture is
+    byte-neutral (the caller never appends an empty digest to a version/idle
+    signature), and no identity-file read happens on the idle path. Once accounts
+    exist it folds together (a) each registry row's ``account_key`` / provider /
+    label / label_source — catching a new account observed or a label edit — and
+    (b) the CURRENTLY-active account keys (``resolve_active_account_keys`` reads
+    ``~/.claude.json`` + each Codex root's ``auth.json``, stable-read + best
+    effort) — catching an in-place account SWITCH with zero new ingested rows.
+    Folded into both the outer dispatch/idle signature and each physical source's
+    ``data_version``, so a switch rebuilds the source state (flipping the
+    ``active`` marker) on the very next tick without any new rows.
+    """
+    try:
+        row = stats_conn.execute("SELECT COUNT(*) FROM accounts").fetchone()
+    except sqlite3.Error:
+        return ""
+    if not row or not row[0]:
+        return ""  # no account ever observed -> byte-stable, no identity I/O
+    parts: list[str] = []
+    try:
+        for r in stats_conn.execute(
+            "SELECT account_key, provider, label, label_source FROM accounts "
+            "ORDER BY provider, account_key"
+        ):
+            parts.append(f"{r[0]}|{r[1]}|{r[2] or ''}|{r[3] or ''}")
+    except sqlite3.Error:
+        pass
+    try:
+        import _cctally_account
+        active = sorted(_cctally_account.resolve_active_account_keys())
+    except Exception:
+        active = []
+    parts.append("active\x1f" + ",".join(active))
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 class CodexCycleUnavailable(RuntimeError):
@@ -128,50 +170,78 @@ def _is_model_scoped_codex_quota(logical_limit_key: object) -> bool:
 def _resolve_codex_weekly_cycle(
     observations: Iterable[object],
     now_utc: dt.datetime,
-) -> CodexCycleBoundary:
-    """Select exactly one active account-level 10,080-minute native cycle."""
-    boundaries: dict[tuple[int, dt.datetime], list[tuple[object, object]]] = {}
-    stale_weekly_evidence = False
+) -> list[CodexCycleBoundary]:
+    """Resolve one active 10,080-minute native cycle PER ACCOUNT (#341 spec §4).
+
+    Returns a list with one :class:`CodexCycleBoundary` per account that has
+    exactly one active weekly boundary — N simultaneously-active account cycles
+    are each valid instead of collapsing to ``CodexCycleUnavailable("conflicting")``.
+    ``conflicting`` now fires only for a genuine conflict WITHIN one account.
+    Raises ``CodexCycleUnavailable`` only when NO account yields a live cycle. A
+    single-account install returns a 1-element list = today's boundary
+    byte-for-byte (the hero path is unchanged, spec R8).
+    """
+    per_account: dict[str, dict[tuple[int, dt.datetime], list[tuple[object, object]]]] = {}
+    accounts_seen: set[str] = set()
+    stale_by_account: dict[str, bool] = {}
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
             continue
         if _is_model_scoped_codex_quota(history.identity.logical_limit_key):
             continue
+        account = history.identity.account_key
+        accounts_seen.add(account)
         baseline = select_baseline(history.observations, now_utc)
         if baseline is None or baseline.resets_at <= now_utc:
             continue
         if quota_freshness(history.physical_observations, now_utc).state != "fresh":
-            stale_weekly_evidence = True
+            stale_by_account[account] = True
             continue
         boundary = (history.identity.window_minutes, baseline.resets_at)
-        boundaries.setdefault(boundary, []).append((history, baseline))
-    if len(boundaries) != 1:
-        if not boundaries:
-            raise CodexCycleUnavailable("stale" if stale_weekly_evidence else "missing")
-        raise CodexCycleUnavailable("conflicting")
-    (window_minutes, resets_at), candidates = next(iter(boundaries.items()))
-    # Preserve the existing hero's max-used-percent choice, then pin every
-    # remaining tie deterministically. The selected full identity—not the
-    # union of sibling roots/slots/limits—owns the hero cycle.
-    history, baseline = max(
-        candidates,
-        key=lambda item: (
-            float(item[1].used_percent),
-            item[1].captured_at.astimezone(UTC),
-            item[0].identity.source_root_key,
-            item[0].identity.logical_limit_key,
-            item[0].identity.observed_slot,
-        ),
-    )
-    selected_identity = history.identity
-    return CodexCycleBoundary(
-        window_minutes=window_minutes,
-        start_at=resets_at - dt.timedelta(minutes=window_minutes),
-        resets_at=resets_at,
-        source_root_keys=(selected_identity.source_root_key,),
-        used_percent=float(baseline.used_percent),
-        quota_identity=selected_identity,
-    )
+        per_account.setdefault(account, {}).setdefault(boundary, []).append((history, baseline))
+    cycles: list[CodexCycleBoundary] = []
+    reasons: list[str] = []
+    for account in sorted(accounts_seen | set(per_account)):
+        boundaries = per_account.get(account, {})
+        if len(boundaries) != 1:
+            # Within one account: 0 boundaries -> stale/missing; >=2 -> conflicting.
+            reasons.append(
+                "conflicting" if boundaries
+                else ("stale" if stale_by_account.get(account) else "missing")
+            )
+            continue
+        (window_minutes, resets_at), candidates = next(iter(boundaries.items()))
+        # Preserve the existing hero's max-used-percent choice, then pin every
+        # remaining tie deterministically. The selected full identity—not the
+        # union of sibling roots/slots/limits—owns the account's hero cycle.
+        history, baseline = max(
+            candidates,
+            key=lambda item: (
+                float(item[1].used_percent),
+                item[1].captured_at.astimezone(UTC),
+                item[0].identity.source_root_key,
+                item[0].identity.logical_limit_key,
+                item[0].identity.observed_slot,
+            ),
+        )
+        selected_identity = history.identity
+        cycles.append(CodexCycleBoundary(
+            window_minutes=window_minutes,
+            start_at=resets_at - dt.timedelta(minutes=window_minutes),
+            resets_at=resets_at,
+            source_root_keys=(selected_identity.source_root_key,),
+            used_percent=float(baseline.used_percent),
+            quota_identity=selected_identity,
+        ))
+    if not cycles:
+        # Aggregate reason: for a single account this is exactly the old reason
+        # (byte-stable); across accounts, conflicting > stale > missing.
+        if "conflicting" in reasons:
+            raise CodexCycleUnavailable("conflicting")
+        if "stale" in reasons:
+            raise CodexCycleUnavailable("stale")
+        raise CodexCycleUnavailable("missing")
+    return cycles
 
 
 def _codex_weekly_periods(
@@ -432,13 +502,27 @@ def _public_copy(value: object) -> object:
     return value
 
 
-def source_detail_lookup(bundle: object, source: str, resource: str, key: str) -> dict[str, object]:
+def source_detail_lookup(
+    bundle: object, source: str, resource: str, key: str,
+    account: "str | None" = None,
+) -> dict[str, object]:
     """Find one provider-owned opaque row without I/O, ingest, or fallback.
 
     The handler has already parsed the fixed route grammar.  This adapter only
     reads the frozen bundle published by the dashboard owner thread, so a
     request cannot accidentally trigger cache sync, rollout parsing, or a
     Claude fallback for a Codex key.
+
+    Server-side account row-ownership (#341 Task 4, spec §4 finding 10).
+    ``account`` is the qualifier the modal captured with ``(source, account)`` at
+    open. When it is provided AND any row matching ``key`` carries an
+    ``account_key`` (the decorated wire shape — two accounts can share one opaque
+    resource key), the server VERIFIES ownership: it returns the row owned by
+    ``account`` and NEVER a different account's row — a key resolving only to
+    another account raises ``SourceResourceNotFound`` rather than leaking it.
+    Account-agnostic rows (no ``account_key``: sessions/projects per Decision R4,
+    or any undecorated source) ignore the qualifier and match by key alone, so
+    the undecorated path stays byte-identical.
     """
     if source not in ("claude", "codex") or resource not in _RESOURCE_ROWS:
         raise SourceCapabilityUnavailable()
@@ -454,10 +538,23 @@ def source_detail_lookup(bundle: object, source: str, resource: str, key: str) -
         rows = data[domain][rows_key]
     except (KeyError, TypeError) as exc:
         raise SourceCapabilityUnavailable() from exc
-    for row in rows:
-        if isinstance(row, Mapping) and row.get("key") == key:
-            return _public_copy(row)  # type: ignore[return-value]
-    raise SourceResourceNotFound()
+    key_matches = [
+        row for row in rows
+        if isinstance(row, Mapping) and row.get("key") == key
+    ]
+    if not key_matches:
+        raise SourceResourceNotFound()
+    if account is not None:
+        # Any key-match that carries an account_key is account-scoped: enforce
+        # ownership so a fetch qualified to account X can never fall through to
+        # account Y's row sharing the same opaque key.
+        scoped = [row for row in key_matches if "account_key" in row]
+        if scoped:
+            owned = [row for row in scoped if row.get("account_key") == account]
+            if not owned:
+                raise SourceResourceNotFound()
+            return _public_copy(owned[0])  # type: ignore[return-value]
+    return _public_copy(key_matches[0])  # type: ignore[return-value]
 
 
 def codex_projection_coherence(
@@ -1200,6 +1297,18 @@ def _quota_read_model(
     history_rows: list[dict[str, object]] = []
     milestone_rows: list[dict[str, object]] = []
     active_rows: list[dict[str, object]] = []
+    # R8 (#341 Task 4): the per-account `account_key` is serialized onto each
+    # history row ONLY when the Codex provider has >1 REAL account, so the idle
+    # clock (`_clock_cycle_validity`) can scope weekly-cycle validity per account
+    # instead of degrading a genuine multi-account state to `conflicting`. A
+    # <=1-real-account install (all fixtures) stays byte-identical (no key added).
+    _codex_decorated = False
+    try:
+        import _cctally_account
+        _codex_decorated = _cctally_account.provider_is_decorated(
+            context.stats_conn, "codex")
+    except Exception:
+        _codex_decorated = False
     for history in histories:
         identity = history.identity
         key_parts = (
@@ -1214,6 +1323,7 @@ def _quota_read_model(
         history_rows.append({
             "key": dashboard_resource_key("quota", "codex", *key_parts),
             "source": "codex",
+            **({"account_key": identity.account_key} if _codex_decorated else {}),
             "label": _native_limit_label(identity.limit_name, identity.window_minutes),
             "observed_slot": identity.observed_slot,
             "window_minutes": identity.window_minutes,
@@ -1395,9 +1505,23 @@ def _clock_cycle_validity(
     histories: Iterable[object],
     now_utc: dt.datetime,
 ) -> tuple[bool, str]:
-    """Re-evaluate frozen weekly evidence without touching cache or rollouts."""
-    boundaries: set[dt.datetime] = set()
-    stale_weekly_evidence = False
+    """Re-evaluate frozen weekly evidence without touching cache or rollouts.
+
+    Per-account (#341 Task 4): boundaries are grouped by the history row's
+    ``account_key`` (serialized only when the Codex provider is DECORATED, i.e.
+    >1 real account — R8). The idle clock mirrors the build-time
+    ``_resolve_codex_weekly_cycle`` resolution: an account yields a live cycle iff
+    it has EXACTLY ONE fresh future boundary, and the hero is valid iff AT LEAST
+    ONE account does (raising the aggregate ``conflicting > stale > missing``
+    reason only when NO account yields one). When ``account_key`` is absent
+    (<=1-real-account install — no decoration) every row falls into one global
+    bucket, so this reduces EXACTLY to the prior single-boundary logic
+    (byte-stable). This removes the documented placeholder degrade where two real
+    accounts with distinct weekly cycles collapsed the whole hero to
+    ``conflicting`` on the idle clock.
+    """
+    per_account: dict[str, set[dt.datetime]] = {}
+    stale_by_account: dict[str, bool] = {}
     for raw_history in histories:
         if not isinstance(raw_history, Mapping):
             continue
@@ -1415,15 +1539,29 @@ def _clock_cycle_validity(
             continue
         if resets_at <= now_utc:
             continue
+        # None account_key (undecorated / <=1 real account) -> one global bucket
+        # == today's behavior. A real key buckets per account.
+        acct = raw_history.get("account_key")
+        bucket = acct if acct is not None else "__all__"
         if raw_history.get("freshness") != "fresh":
-            stale_weekly_evidence = True
+            stale_by_account[bucket] = True
             continue
-        boundaries.add(resets_at)
-    if len(boundaries) == 1:
-        return True, "ok"
-    if not boundaries and stale_weekly_evidence:
+        per_account.setdefault(bucket, set()).add(resets_at)
+    accounts = set(per_account) | set(stale_by_account)
+    reasons: list[str] = []
+    for acct in accounts:
+        boundaries = per_account.get(acct, set())
+        if len(boundaries) == 1:
+            return True, "ok"  # at least one account yields a live cycle
+        reasons.append(
+            "conflicting" if boundaries
+            else ("stale" if stale_by_account.get(acct) else "missing")
+        )
+    if "conflicting" in reasons:
+        return False, "conflicting"
+    if "stale" in reasons:
         return False, "stale"
-    return False, "missing" if not boundaries else "conflicting"
+    return False, "missing"
 
 
 def _refresh_budget_status_clock(
@@ -1953,6 +2091,218 @@ def _build_codex_native_weekly_view(
     )
 
 
+def _codex_account_five_hour_percent(
+    observations: Iterable[object],
+    now_utc: dt.datetime,
+) -> dict[str, float]:
+    """Per-account current five-hour (300-minute) used-percent (#341 Task 4).
+
+    Account key -> the highest active-window used-percent among that account's
+    fresh sibling 300-minute windows. Used to render the per-account hero card's
+    5h bar; account-blind physical breakdown readers are untouched.
+    """
+    result: dict[str, float] = {}
+    for history in build_history(tuple(observations)):
+        if history.identity.window_minutes != 300:
+            continue
+        baseline = select_baseline(history.observations, now_utc)
+        if baseline is None or baseline.resets_at <= now_utc:
+            continue
+        acct = history.identity.account_key
+        pct = float(baseline.used_percent)
+        if acct not in result or pct > result[acct]:
+            result[acct] = pct
+    return result
+
+
+def _codex_accounts_wire(
+    context: DashboardReadContext,
+    *,
+    quota_observations: Iterable[object],
+    cycles: list["CodexCycleBoundary"],
+    accounting_start: dt.datetime,
+    accounting_end: dt.datetime,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Return ``(accounts_wire, hero_cycles_wire)`` for a decorated Codex source.
+
+    Caller must gate on ``provider_is_decorated(stats_conn, "codex")`` — this
+    builds nothing for a <=1-real-account install (the whole surface is absent,
+    so the envelope stays byte-identical, spec R8). Each account carries
+    ``{accountKey, label, plan, active, weeklyPercent, fiveHourPercent, resetsAt,
+    spendUsd, inputTokens, cachedInputTokens, outputTokens,
+    reasoningOutputTokens, totalTokens, unattributed?}``; ``hero_cycles_wire`` is
+    the thin per-account cycle-boundary list the hero renders (``cycles[]``).
+    """
+    import _cctally_account
+    active_keys = _cctally_account.resolve_active_account_keys()
+    five_hour = _codex_account_five_hour_percent(quota_observations, context.now_utc)
+    cycle_by_account: dict[str, "CodexCycleBoundary"] = {}
+    for cyc in cycles:
+        acct = (
+            cyc.quota_identity.account_key if cyc.quota_identity is not None
+            else _lib_accounts.UNATTRIBUTED
+        )
+        cycle_by_account.setdefault(acct, cyc)
+    # Registry accounts (real, deterministically ordered) + the unattributed
+    # sentinel when it has any retained accounting (it renders dimmed, totals
+    # only). Registry rows never include the sentinel.
+    reg = _cctally_account.load_accounts(context.stats_conn, "codex")
+    plan_by_key = {r["account_key"]: r.get("plan_type") for r in reg}
+    ordered_keys = [r["account_key"] for r in reg]
+    # Include unattributed last iff it has cycle/5h/spend evidence.
+    unattributed_rows = load_cached_rooted_codex_accounting_entries(
+        accounting_start, accounting_end, speed=context.speed,
+        cache_conn=context.cache_conn, account_key=_lib_accounts.UNATTRIBUTED,
+    )
+    if (
+        unattributed_rows
+        or _lib_accounts.UNATTRIBUTED in cycle_by_account
+        or _lib_accounts.UNATTRIBUTED in five_hour
+    ):
+        ordered_keys.append(_lib_accounts.UNATTRIBUTED)
+
+    def _totals(rows: tuple[object, ...]) -> dict[str, object]:
+        entries = _codex_entries_from_accounting(rows)
+        cost = build_codex_daily_view(
+            entries, now_utc=context.now_utc, tz_name=context.display_tz_name,
+            speed=context.speed,
+        ).total_cost_usd if entries else 0.0
+        return {
+            "spendUsd": cost,
+            "inputTokens": sum(e.input_tokens for e in entries),
+            "cachedInputTokens": sum(e.cached_input_tokens for e in entries),
+            "outputTokens": sum(e.output_tokens for e in entries),
+            "reasoningOutputTokens": sum(e.reasoning_output_tokens for e in entries),
+            "totalTokens": sum(e.total_tokens for e in entries),
+        }
+
+    accounts_wire: list[dict[str, object]] = []
+    hero_cycles_wire: list[dict[str, object]] = []
+    for key in ordered_keys:
+        cyc = cycle_by_account.get(key)
+        is_unattributed = key == _lib_accounts.UNATTRIBUTED
+        if cyc is not None and not is_unattributed:
+            cycle_end = min(accounting_end, cyc.resets_at)
+            rows = load_cached_rooted_codex_accounting_entries(
+                cyc.start_at, cycle_end, speed=context.speed,
+                cache_conn=context.cache_conn,
+                source_root_keys=cyc.source_root_keys, account_key=key,
+            )
+            totals = _totals(rows)
+        elif is_unattributed:
+            totals = _totals(unattributed_rows)
+        else:
+            # A real account without a live weekly cycle: totals over the
+            # accounting range so the card still shows spend (no bars/reset).
+            rows = load_cached_rooted_codex_accounting_entries(
+                accounting_start, accounting_end, speed=context.speed,
+                cache_conn=context.cache_conn, account_key=key,
+            )
+            totals = _totals(rows)
+        card: dict[str, object] = {
+            "accountKey": key,
+            "label": _cctally_account.account_label(context.stats_conn, key),
+            "plan": plan_by_key.get(key),
+            "active": key in active_keys,
+            "weeklyPercent": (
+                None if is_unattributed or cyc is None else cyc.used_percent
+            ),
+            "fiveHourPercent": (None if is_unattributed else five_hour.get(key)),
+            "resetsAt": (
+                None if is_unattributed or cyc is None
+                else cyc.resets_at.astimezone(UTC).isoformat()
+            ),
+            **totals,
+        }
+        if is_unattributed:
+            card["unattributed"] = True
+        accounts_wire.append(card)
+        if cyc is not None and not is_unattributed:
+            hero_cycles_wire.append({
+                "accountKey": key,
+                "window_minutes": cyc.window_minutes,
+                "start_at": cyc.start_at.astimezone(UTC).isoformat(),
+                "resets_at": cyc.resets_at.astimezone(UTC).isoformat(),
+                "used_percent": cyc.used_percent,
+                "cost_usd": totals["spendUsd"],
+                "total_tokens": totals["totalTokens"],
+            })
+    return accounts_wire, hero_cycles_wire
+
+
+def _claude_accounts_wire(
+    stats_conn: sqlite3.Connection,
+    *,
+    now_utc: dt.datetime,
+) -> list[dict[str, object]]:
+    """Per-account Claude hero cards (#341 Task 4, Ruling C).
+
+    Symmetric with ``_codex_accounts_wire``: the caller gates on
+    ``provider_is_decorated(stats_conn, "claude")`` (>1 REAL account, R8), so a
+    <=1-real-account install builds nothing and its envelope stays byte-identical
+    on BOTH goldens. Each card carries
+    ``{accountKey, label, plan, active, weeklyPercent, fiveHourPercent, resetsAt,
+    spendUsd, unattributed?}`` drawn from the ALREADY-account-scoped stats
+    snapshots (``weekly_usage_snapshots``/``weekly_cost_snapshots`` both hold
+    ``account_key`` — Section 6 scope matrix), taking each account's latest
+    captured row as its current-cycle state. spendUsd is the snapshotted weekly
+    cost (the ``report`` semantics), account-scoped. The unattributed bucket
+    renders last, dimmed/totals-only, iff it has any retained snapshot.
+    """
+    import _cctally_account
+    active_keys = _cctally_account.resolve_active_account_keys()
+    reg = _cctally_account.load_accounts(stats_conn, "claude")
+    plan_by_key = {r["account_key"]: r.get("plan_type") for r in reg}
+    ordered_keys = [r["account_key"] for r in reg]
+
+    def _latest_usage(key: str):
+        return stats_conn.execute(
+            "SELECT weekly_percent, five_hour_percent, week_end_at "
+            "FROM weekly_usage_snapshots WHERE account_key=? "
+            "ORDER BY captured_at_utc DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+
+    def _latest_cost(key: str) -> float:
+        row = stats_conn.execute(
+            "SELECT cost_usd FROM weekly_cost_snapshots WHERE account_key=? "
+            "ORDER BY captured_at_utc DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        return float(row[0]) if row is not None and row[0] is not None else 0.0
+
+    # Include the unattributed bucket last iff it retained any snapshot.
+    unattr_usage = _latest_usage(_lib_accounts.UNATTRIBUTED)
+    unattr_cost = stats_conn.execute(
+        "SELECT 1 FROM weekly_cost_snapshots WHERE account_key=? LIMIT 1",
+        (_lib_accounts.UNATTRIBUTED,),
+    ).fetchone()
+    if unattr_usage is not None or unattr_cost is not None:
+        ordered_keys.append(_lib_accounts.UNATTRIBUTED)
+
+    cards: list[dict[str, object]] = []
+    for key in ordered_keys:
+        is_unattributed = key == _lib_accounts.UNATTRIBUTED
+        usage = _latest_usage(key)
+        weekly_pct = usage[0] if usage is not None else None
+        five_hour_pct = usage[1] if usage is not None else None
+        resets_at = usage[2] if usage is not None else None
+        card: dict[str, object] = {
+            "accountKey": key,
+            "label": _cctally_account.account_label(stats_conn, key),
+            "plan": plan_by_key.get(key),
+            "active": key in active_keys,
+            "weeklyPercent": None if is_unattributed else weekly_pct,
+            "fiveHourPercent": None if is_unattributed else five_hour_pct,
+            "resetsAt": None if is_unattributed else resets_at,
+            "spendUsd": _latest_cost(key),
+        }
+        if is_unattributed:
+            card["unattributed"] = True
+        cards.append(card)
+    return cards
+
+
 def build_codex_source_state(
     context: DashboardReadContext,
     *,
@@ -2037,8 +2387,16 @@ def build_codex_source_state(
         )
     budget_entries = _codex_entries_from_accounting(accounting_entries)
     cycle_reason: str | None = None
+    cycles_all: list[CodexCycleBoundary] = []
     try:
-        cycle = _resolve_codex_weekly_cycle(quota_observations, context.now_utc)
+        # Per-account list (#341 Task 2). ``cycles_all`` drives the per-account
+        # hero cards (Task 4, gated on decoration); ``cycle`` stays the first
+        # account's boundary (sorted by account_key) as the interim single hero —
+        # for a single-account install this IS today's single boundary
+        # (byte-stable), and a multi-account install no longer degrades to
+        # `conflicting`.
+        cycles_all = _resolve_codex_weekly_cycle(quota_observations, context.now_utc)
+        cycle = cycles_all[0] if cycles_all else None
     except CodexCycleUnavailable as exc:
         cycle = None
         cycle_reason = exc.reason
@@ -2176,6 +2534,32 @@ def build_codex_source_state(
             "Codex native reset cycle is unavailable.",
             "hero",
         ))
+    # #341 Task 4: the conditional per-account wire. Built ONLY when the Codex
+    # provider has >1 REAL account (R8) — a <=1-real-account install adds nothing
+    # so its envelope is byte-identical to today. The array ships EVERY account's
+    # projection (client-side chip filter); the hero renders per-account cards.
+    accounts_wire: list[dict[str, object]] = []
+    hero_cycles_wire: list[dict[str, object]] = []
+    try:
+        import _cctally_account
+        _codex_decorated = _cctally_account.provider_is_decorated(
+            context.stats_conn, "codex")
+    except Exception:
+        _codex_decorated = False
+    if _codex_decorated:
+        try:
+            accounts_wire, hero_cycles_wire = _codex_accounts_wire(
+                context,
+                quota_observations=quota_observations,
+                cycles=cycles_all,
+                accounting_start=accounting_start,
+                accounting_end=accounting_end,
+            )
+        except (sqlite3.Error, QualifiedMetadataUnavailable):
+            # A per-account wire failure must never fail the whole source build;
+            # degrade to the byte-stable undecorated shape.
+            accounts_wire = []
+            hero_cycles_wire = []
     return SourceDashboardState(
         source="codex",
         availability=availability,
@@ -2228,7 +2612,9 @@ def build_codex_source_state(
                 "quota": quota["summary"],
                 "budget": configured_budget,
                 "alerts": {"count": len(alerts)},
+                **({"cycles": hero_cycles_wire} if _codex_decorated else {}),
             },
+            **({"accounts": accounts_wire} if _codex_decorated else {}),
             "periods": {
                 "daily": _period_wire(daily),
                 "monthly": _period_wire(monthly),

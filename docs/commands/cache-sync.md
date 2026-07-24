@@ -22,6 +22,10 @@ run. Use `cache-sync` when you want to:
   pricing-dict edits where you want a clean re-derivation (note:
   pricing edits don't actually require a rebuild — cost is computed at
   query time, not stored).
+- Recover a corrupt `cache.db` without moving or unlinking SQLite files by
+  hand. Positively classified corruption is preserved for forensics, the whole
+  main/WAL/SHM family is quarantined after live readers drain, and the requested
+  source scope is re-ingested.
 - Prune cache rows left behind by session directories that were removed from disk (for example a deleted git worktree), without paying for a full rebuild — see `--prune-orphans` below.
 - Limit work to one source (Claude or Codex) when the other half is large.
 
@@ -73,6 +77,26 @@ cctally cache-sync --source claude
   `conversations.db.lock` / `conversations.db.codex.lock` for transcripts.
   Routine auto-syncs that lose the race read the existing store without blocking.
 - `--rebuild` is different: it waits up to 30 seconds for the cache lock, then exits non-zero if it still can't acquire it (for example while a dashboard is actively syncing), instead of silently doing nothing and reporting success. Re-run it once the other process releases the lock. `--prune-orphans` behaves the same way.
+- Corrupt-file recovery is classifier-gated: lock contention, permissions,
+  disk-full errors, and SQL mistakes are never destructive recovery signals.
+  Recovery writes a forensics bundle first, quarantines the complete SQLite
+  family only after the maintenance lock and open-handle drain checks pass,
+  recreates the cache, and retries the requested provider plan once. If
+  corruption occurs in the Codex leg of `--source all`, Claude is re-ingested
+  again on the replacement family; a failed or contended provider walk remains
+  non-zero.
+- `cache.db.repairing` records a repair PID, kernel process-start identity, and
+  unique claim token. A live matching owner blocks new opens. Dead, malformed,
+  or PID-reused ownership is reclaimed under the maintenance lock; platforms
+  that cannot re-read a process-start identity use a bounded 30-minute lease.
+  If a repair is killed at any phase, the next opener or
+  `cache-sync --rebuild` resumes from the surviving corrupt/quarantined/fresh
+  state without manual marker deletion.
+- Whole-family quarantine publishes
+  `cache.db.quarantine-pending.json` before its first rename. The next
+  maintenance-exclusive opener completes the same incident after a killed
+  owner or move failure; it does not create a fresh DB until every snapshotted
+  main/WAL/SHM member is accounted for in quarantine.
 - Both stores are fully re-derivable from JSONL. Prefer
   `cctally cache-sync --rebuild`; never unlink a SQLite main/WAL/SHM family
   while any cctally process may still have it open.

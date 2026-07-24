@@ -174,9 +174,12 @@ def _five_hour_setup(conn, *, journal_id="sa:seed5h", captured="2026-01-04T12:00
 
 def _expected_fhc_key(ns):
     # _AS_OF = 2026-01-04T12:00:05Z; the detector floors it to a 10-min slot.
+    # #341: the fhc harvest natural key (and thus the suppression_map key) now
+    # leads with account_key — detect_reset_and_credit here is called without an
+    # account, so it defaults to the reserved sentinel.
     now_utc = dt.datetime(2026, 1, 4, 12, 0, 5, tzinfo=dt.timezone.utc)
     eff = ns["_floor_to_ten_minutes"](now_utc).isoformat(timespec="seconds")
-    return (_5H_KEY, eff)
+    return ("unattributed", _5H_KEY, eff)
 
 
 def test_detect_5h_suppression_capture(ns):
@@ -211,7 +214,7 @@ def test_detect_5h_suppression_empty_on_replay(ns):
         # Pre-existing event row at the SAME (window_key, effective_iso) but with
         # a DIFFERENT (prior, post) so is_dup=False yet the INSERT OR IGNORE
         # collides on UNIQUE -> rowcount 0 (the crash-replay case).
-        _key, eff = _expected_fhc_key(ns)
+        _acct, _key, eff = _expected_fhc_key(ns)
         conn.execute(
             "INSERT INTO five_hour_reset_events "
             "(detected_at_utc, five_hour_window_key, prior_percent, "
@@ -276,8 +279,10 @@ def test_fire_in_place_credit_wr_suppression_capture(ns):
             observed_pre_credit_pct=60.0, effective_dt=effective_dt,
             as_of=_PAST, commit=False, ctx=ctx,
         )
+        # #341: the wr suppression_map key leads with account_key (defaults to
+        # the reserved sentinel — no account passed).
         assert ctx.suppression_map == {
-            (effective_iso, cur_end_canon): ["sa:seed-wr"]
+            ("unattributed", effective_iso, cur_end_canon): ["sa:seed-wr"]
         }
     finally:
         conn.close()

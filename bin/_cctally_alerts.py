@@ -68,6 +68,7 @@ def _load_lib(name: str):
     return mod
 
 
+_lib_accounts = _load_lib("_lib_accounts")
 _lib_alerts_payload = _load_lib("_lib_alerts_payload")
 _alert_text_weekly = _lib_alerts_payload._alert_text_weekly
 _alert_text_five_hour = _lib_alerts_payload._alert_text_five_hour
@@ -89,8 +90,10 @@ def _build_alert_payload_quota(
     observed_slot: str, window_minutes: int, resets_at_utc: str,
     threshold: int, kind: str, crossed_at_utc: str,
     qualifying_percent: float | None, projected_percent: float | None,
+    account_key: str = _lib_accounts.UNATTRIBUTED,
 ) -> dict:
-    """Build the provider-neutral durable quota alert payload."""
+    """Build the provider-neutral durable quota alert payload. ``account_key``
+    (#341) is the observation's account (per-account family)."""
     context = {
         "source": str(source), "source_root_key": str(source_root_key),
         "logical_limit_key": str(logical_limit_key), "observed_slot": str(observed_slot),
@@ -111,6 +114,7 @@ def _build_alert_payload_quota(
         ),
         "axis": "quota", "threshold": int(threshold), "kind": str(kind),
         "crossed_at": crossed_at_utc, "alerted_at": crossed_at_utc,
+        "account_key": str(account_key),
         **context, "context": context,
     }
 
@@ -156,6 +160,48 @@ def load_config(*args, **kwargs):
 # via call-time module-attribute access (this sibling no longer needs
 # the historical _cctally() accessor).
 from _cctally_core import now_utc_iso
+
+
+# Axis -> the provider whose account registry drives the R8 `[label]` prefix.
+# projected weekly_pct is Claude; its `*`-scoped vendor-budget metrics never take
+# a prefix (account_key stays `*`), so mapping the whole axis to claude is safe.
+_AXIS_VENDOR = {
+    "weekly": "claude", "five_hour": "claude", "budget": "claude",
+    "projected": "claude", "project_budget": "claude",
+    "codex_budget": "codex", "quota": "codex",
+}
+
+
+def _alert_label_prefix(axis: str, account_key: "str | None") -> str:
+    """Return ``"[<label>] "`` for an account-specific crossing when the vendor
+    has >1 real account (R8), else ``""``. Best-effort + never-raise: a missing
+    DB / read error / vendor-wide (`*`) row yields no prefix, so a ≤1-real-account
+    install's alert text stays byte-identical to today.
+
+    Delegates the R8 gate + label precedence to the single-definition helpers
+    ``_cctally_account.real_account_count`` / ``account_label`` (P2-CQ1) so the
+    ">1 real account" trigger and the key->label map have exactly one home; this
+    wrapper only opens the RO connection and stays best-effort/never-raise."""
+    if not account_key or account_key == _lib_accounts.VENDOR_WIDE:
+        return ""
+    vendor = _AXIS_VENDOR.get(axis)
+    if vendor is None:
+        return ""
+    try:
+        import sqlite3 as _sq
+        import _cctally_account
+        db_path = _cctally_core.DB_PATH
+        if not db_path.exists():
+            return ""
+        conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            if _cctally_account.real_account_count(conn, vendor) <= 1:
+                return ""
+            return f"[{_cctally_account.account_label(conn, account_key)}] "
+        finally:
+            conn.close()
+    except Exception:
+        return ""
 
 
 def _alerts_log_path() -> "pathlib.Path":
@@ -240,6 +286,12 @@ def _dispatch_alert_notification(
             f"axis={axis} threshold={payload.get('threshold')}",
         )
 
+    # R8 label prefix (#341): an account-specific crossing gains a `[<label>] `
+    # title prefix ONLY when the vendor has >1 real account. Byte-identical at
+    # <=1 real account (empty prefix). Applied to the notification title only.
+    account_key = payload.get("account_key")
+    title = _alert_label_prefix(axis, account_key) + title
+
     # Severity (3-tier) drives both the notify-send urgency token and the
     # trailing log column. A missing threshold (defensive — shouldn't happen for
     # a real crossing) floors at "info".
@@ -308,9 +360,13 @@ def _dispatch_alert_notification(
             or ctx.get("period_start_at")
             or ""
         )
+        # 8th tab field (#341, spec §6): the account_key the crossing wrote
+        # under (`*` for vendor-wide rows). UNCONDITIONAL — the log is runtime
+        # state, exempt from the R8 byte-stability contract.
+        log_account_key = account_key or _lib_accounts.VENDOR_WIDE
         line = (
             f"{now_utc_iso()}\t{axis}\t{payload.get('threshold')}\t{window_key}"
-            f"\t{mode}\t{status}\t{severity}\n"
+            f"\t{mode}\t{status}\t{severity}\t{log_account_key}\n"
         )
         with open(log_path, "a") as f:
             f.write(line)

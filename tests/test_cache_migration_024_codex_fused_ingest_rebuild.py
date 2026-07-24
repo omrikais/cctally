@@ -48,6 +48,18 @@ def _seed_existing_cache(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core as core
 
+    # #341: seed a resolved (``unattributed``) accounts cutover op so cache
+    # migration 029 (Claude account backfill) resolves as a NO-OP rather than
+    # gate-deferring on the legacy ``session_entries`` sentinel seeded below.
+    # Without the op, 029 raises MigrationGateNotMet (that NULL-account Claude
+    # row is pending), and the dispatcher never advances user_version to head.
+    # An ``unattributed`` op leaves the sentinel row untouched (NULL ==
+    # unattributed) while letting the chain reach head — matching this file's
+    # "reopen drives the chain to head" assertions.
+    sys.modules["_cctally_journal"].append_accounts_cutover_op(
+        "unattributed", at="2026-07-15T00:00:00Z"
+    )
+
     db = _db_module()
     cache_path = core.CACHE_DB_PATH
     conn = sqlite3.connect(cache_path)
@@ -265,8 +277,10 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 28
+        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # seeded unattributed cutover op lets 029 resolve so the chain reaches
+        # head (rather than gate-deferring on the legacy Claude sentinel row).
+        assert _version(conn) == 29
     finally:
         conn.close()
 
@@ -297,8 +311,10 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 28
+        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # seeded unattributed cutover op lets 029 resolve so the chain reaches
+        # head (rather than gate-deferring on the legacy Claude sentinel row).
+        assert _version(conn) == 29
     finally:
         conn.close()
 
@@ -330,8 +346,10 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Fork-preamble accounting rebuild appended migration 027.
-        assert _version(conn) == 28
+        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # seeded unattributed cutover op lets 029 resolve so the chain reaches
+        # head (rather than gate-deferring on the legacy Claude sentinel row).
+        assert _version(conn) == 29
     finally:
         conn.close()
 

@@ -811,6 +811,7 @@ def _bucket_to_json(
     *,
     list_key: str,
     date_key: str,
+    extra: "dict | None" = None,
 ) -> str:
     """Serialize bucket aggregates to JSON matching upstream ccusage's shape.
 
@@ -824,11 +825,15 @@ def _bucket_to_json(
     """
     bucket_list = [_daily_row_dict(d, date_key=date_key) for d in buckets]
     totals = _bucket_totals_dict(buckets)
-    payload = stamp_schema_version({list_key: bucket_list, "totals": totals})
+    body = {list_key: bucket_list, "totals": totals}
+    if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
+        body.update(extra)
+    payload = stamp_schema_version(body)
     return json.dumps(payload, indent=2)
 
 
-def _bucket_by_project_to_json(project_groups, *, date_key: str = "date") -> str:
+def _bucket_by_project_to_json(project_groups, *, date_key: str = "date",
+                               extra: "dict | None" = None) -> str:
     """Serialize ``[(label, [BucketUsage]), ...]`` to ``{projects:{label:[rows]},
     totals}`` (upstream ccusage daily --instances shape). Caller passes the
     disambiguated (unique, non-aliased) label per group; insertion order is
@@ -838,8 +843,10 @@ def _bucket_by_project_to_json(project_groups, *, date_key: str = "date") -> str
     for label, buckets in project_groups:
         projects[label] = [_daily_row_dict(b, date_key=date_key) for b in buckets]
         all_buckets.extend(buckets)
-    payload = stamp_schema_version(
-        {"projects": projects, "totals": _bucket_totals_dict(all_buckets)})
+    body = {"projects": projects, "totals": _bucket_totals_dict(all_buckets)}
+    if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
+        body.update(extra)
+    payload = stamp_schema_version(body)
     return json.dumps(payload, indent=2)
 
 
@@ -847,6 +854,8 @@ def _weekly_to_json(
     buckets: list[BucketUsage],
     weeks: list[SubWeek],
     week_pct_overlay: list[tuple[float | None, float | None]],
+    *,
+    extra: "dict | None" = None,
 ) -> str:
     """Serialize weekly rollup to JSON.
 
@@ -924,6 +933,8 @@ def _weekly_to_json(
             "totalCost": tot_cost,
         },
     }
+    if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
+        payload.update(extra)
     return json.dumps(stamp_schema_version(payload), indent=2)
 
 
@@ -1179,7 +1190,8 @@ def _codex_sessions_to_json(sessions: list[CodexSessionUsage]) -> str:
     return json.dumps(payload, indent=2)
 
 
-def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage]) -> str:
+def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage], *,
+                             extra: "dict | None" = None) -> str:
     """Serialize Claude sessions to JSON (spec A2.8, amended by issue #104).
 
     Per-session: sessionId, projectPath, sourcePaths (list), firstActivity
@@ -1242,6 +1254,8 @@ def _claude_sessions_to_json(sessions: list[ClaudeSessionUsage]) -> str:
             "totalCost": tot_cost,
         },
     }
+    if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
+        payload.update(extra)
     return json.dumps(stamp_schema_version(payload), indent=2)
 
 

@@ -237,19 +237,22 @@ if log_path.exists():
     lines = log_path.read_text().splitlines()
     print(f"log_lines={len(lines)}")
     for i, ln in enumerate(lines):
-        # Tab-delimited: ts, axis, threshold, window_key, mode, status, severity
-        # Print the (axis, threshold, mode, status_kind, severity) tuple so the
-        # bash side can assert without dealing with timestamps. severity is the
-        # Phase B 7th column ('info'|'warn'|'critical'); "" when an older line
-        # predates the column.
+        # Tab-delimited: ts, axis, threshold, window_key, mode, status,
+        # severity, account_key. Print the (axis, threshold, mode, status_kind,
+        # severity, account) tuple so the bash side can assert without dealing
+        # with timestamps. severity is the Phase B 7th column
+        # ('info'|'warn'|'critical'); account_key is the #341 unconditional 8th
+        # column ('*' for vendor-wide rows, 'unattributed' for a single-account
+        # install); "" when an older line predates a column.
         parts = ln.split("\t")
         if len(parts) >= 6:
             axis, thr, mode, status = parts[1], parts[2], parts[4], parts[5]
             severity = parts[6] if len(parts) >= 7 else ""
+            account = parts[7] if len(parts) >= 8 else ""
             status_kind = "queued" if status == "queued" else (
                 "spawn_error" if status.startswith("spawn_error") else "other"
             )
-            print(f"log_{i}={axis}|{thr}|{mode}|{status_kind}|{severity}")
+            print(f"log_{i}={axis}|{thr}|{mode}|{status_kind}|{severity}|{account}")
 else:
     print("log_lines=0")
 PY
@@ -316,6 +319,11 @@ else
     # Phase B: the 7th log column is the crossing's 3-tier severity (90 -> warn).
     assert_contains "enabled-weekly-90: log line carries severity warn" \
         "real|queued|warn" "$(get_state log_0)"
+    # #341: the unconditional 8th column is the crossing's account_key. This
+    # single-account harness install has no ~/.claude.json, so the crossing
+    # writes the reserved 'unattributed' sentinel (and no [label] prefix -> R8).
+    assert_contains "enabled-weekly-90: log line carries account_key unattributed" \
+        "warn|unattributed" "$(get_state log_0)"
 fi
 
 # ─── Scenario 4: enabled-five-hour-95 ────────────────────────────────

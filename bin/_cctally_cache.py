@@ -103,6 +103,7 @@ import fcntl
 import json
 import os
 import pathlib
+import signal
 import sqlite3
 import sys
 import time
@@ -371,6 +372,21 @@ CHECKPOINT_AUTO_BUSY_TIMEOUT_MS = 100
 CHECKPOINT_CMD_BUSY_TIMEOUT_MS = 15000
 
 
+def _cache_storm_test_pause(point: str) -> None:
+    """Private process-control seam for the killed-writer stress harness.
+
+    Production is a zero-cost string comparison. Tests arm one exact point and
+    marker path, then SIGKILL the stopped child from the parent process.
+    """
+    if os.environ.get("CCTALLY_TEST_CACHE_STORM_PAUSE_AT") != point:
+        return
+    marker = os.environ.get("CCTALLY_TEST_CACHE_STORM_MARKER")
+    if not marker:
+        return
+    pathlib.Path(marker).write_text(f"{os.getpid()}\n")
+    os.kill(os.getpid(), signal.SIGSTOP)
+
+
 class CheckpointResult(NamedTuple):
     """Outcome of a single ``PRAGMA wal_checkpoint(TRUNCATE)`` (#297).
 
@@ -430,8 +446,18 @@ def _maybe_truncate_wal(conn, db_path) -> None:
     all ingest work by this point.
     """
     try:
-        if _wal_file_size(db_path) <= CACHE_WAL_CHECKPOINT_TRIGGER_BYTES:
+        trigger = CACHE_WAL_CHECKPOINT_TRIGGER_BYTES
+        test_trigger = os.environ.get("CCTALLY_TEST_CACHE_WAL_TRIGGER_BYTES")
+        if test_trigger is not None:
+            try:
+                trigger = max(0, int(test_trigger))
+            except ValueError:
+                pass
+        if _wal_file_size(db_path) <= trigger:
             return
+        # After this point, resuming the private stopped process necessarily
+        # enters a real TRUNCATE checkpoint rather than a threshold no-op.
+        _cache_storm_test_pause("cache_precheckpoint")
         prior = conn.execute("PRAGMA busy_timeout").fetchone()[0]
         try:
             conn.execute(f"PRAGMA busy_timeout={CHECKPOINT_AUTO_BUSY_TIMEOUT_MS}")
@@ -686,6 +712,101 @@ def _codex_provider_roots() -> list[CodexProviderRoot]:
             source_root_key=source_root_key(str(provider_root)),
         ))
     return roots
+
+
+@dataclass(frozen=True)
+class _CodexRootAccount:
+    """Resolved account for one Codex provider root (spec §1 observe-and-stamp).
+
+    ``status`` ∈ {"identified", "stably_absent", "torn"}; ``account_key`` is the
+    real key ONLY when identified, with ``identity`` carrying the registry
+    enrichment (natural_id/email/plan_type). stably-absent (missing auth.json /
+    api-key mode) stamps NULL (``NULL ≡ unattributed`` on the read path); torn
+    defers the whole root's files this cycle without advancing any cursor.
+    """
+
+    status: str
+    account_key: str | None = None
+    identity: dict | None = None
+
+
+def _read_codex_account_from_auth_bytes(data: bytes) -> "dict | None":
+    """stable-read reader for ``auth.json``: bytes -> identity dict or None.
+
+    Raises :class:`_lib_accounts.TornRead` on unparseable/half-written JSON so
+    the stable-read machinery reports *torn* (defer). Returns None for api-key
+    mode / no ChatGPT identity (-> stably_absent). The id_token lives at
+    ``tokens.id_token`` (official Codex CLI shape); a flat ``id_token`` is
+    tolerated. NO signature verification — we read our own disk state. The dict
+    carries ``{account_key, natural_id, email, plan_type}`` for the registry."""
+    import _lib_accounts
+    try:
+        obj = json.loads(data)
+    except (ValueError, TypeError):
+        raise _lib_accounts.TornRead()
+    if not isinstance(obj, dict):
+        raise _lib_accounts.TornRead()
+    tokens = obj.get("tokens")
+    id_token = tokens.get("id_token") if isinstance(tokens, dict) else obj.get("id_token")
+    payload = _lib_accounts.decode_id_token_payload(id_token)
+    natural = _lib_accounts.codex_natural_id(payload)
+    if natural is None:
+        return None
+    return {
+        "account_key": _lib_accounts.account_key("codex", natural),
+        "natural_id": natural,
+        "email": _lib_accounts.codex_email(payload),
+        "plan_type": _lib_accounts.codex_plan_type(payload),
+    }
+
+
+def _resolve_codex_account_for_root(provider_root: pathlib.Path) -> _CodexRootAccount:
+    """Resolve one provider root's active account via a stable-read of its own
+    ``<provider_root>/auth.json`` (spec §1 — attribution is per-root, so a future
+    per-account-roots layout gets deterministic attribution for free)."""
+    import _lib_accounts
+    path = str(provider_root / "auth.json")
+    result = _lib_accounts.stable_read_identity(
+        path, _read_codex_account_from_auth_bytes)
+    if result.status == "identified":
+        info = result.value
+        return _CodexRootAccount("identified", str(info["account_key"]), info)
+    if result.status == "torn":
+        return _CodexRootAccount("torn", None)
+    return _CodexRootAccount("stably_absent", None)
+
+
+_OBSERVED_CODEX_ACCOUNT_MARKER_PREFIX = "observed-codex-account-"
+
+
+def _maybe_append_codex_account_observe(identity: "dict | None") -> None:
+    """Append an ``account_observe`` op on first sight of a Codex account or an
+    identity change (#341, spec §1) — NOT every sync. Deduped by a per-account
+    marker file in APP_DIR (per-account, since one machine hosts multiple Codex
+    accounts — a scalar marker would flip-flop). Best-effort: a marker/journal
+    hiccup never breaks the ingest."""
+    import _lib_accounts
+    if not identity:
+        return
+    account_key = identity.get("account_key")
+    if not account_key or account_key == _lib_accounts.UNATTRIBUTED:
+        return
+    marker = (_cctally_core.APP_DIR
+              / (_OBSERVED_CODEX_ACCOUNT_MARKER_PREFIX + account_key))
+    if marker.exists():
+        return
+    try:
+        import _cctally_journal as _jr
+        import _lib_journal as _lj
+        at = (_cctally_core._command_as_of()
+              .isoformat(timespec="seconds").replace("+00:00", "Z"))
+        _jr.append_record(_lj.make_account_observe(
+            at=at, account_key=account_key, provider="codex",
+            natural_id=identity.get("natural_id"), email=identity.get("email"),
+            plan_type=identity.get("plan_type"), label_source="auto"))
+        marker.write_text(account_key + "\n")
+    except OSError:
+        pass
 
 
 def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
@@ -1224,15 +1345,21 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
         (source, source_root_key, source_path, line_offset, captured_at_utc,
          observed_slot, logical_limit_key, limit_id, limit_name, window_minutes,
          used_percent, resets_at_utc, plan_type, individual_limit_json,
-         reached_type, observed_model) = row
+         reached_type, observed_model, account_key) = row
         at = captured_at_utc or (
             _cctally_core._command_as_of()
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )
         try:
+            # #341: the obs carries the top-level ``account`` field ONLY for a
+            # real account (invariant: the sentinel/single-account case OMITS the
+            # field entirely, so a no-auth install produces byte-identical
+            # journals). NULL/unattributed re-derives to NULL account_key at the
+            # QUOTA_APPLIER's cache upsert.
             _jr.append_record(_jl.make_obs(
                 at=at, src="codex-quota", provider="codex",
+                account=account_key,
                 payload={
                     "kind": "quota_window_snapshot",
                     "source": source, "source_root_key": source_root_key,
@@ -1272,6 +1399,7 @@ def _write_codex_file_batch(
     thread_rows: list[tuple[Any, ...]],
     active_root_keys: set[str],
     prune_roots: bool = True,
+    account_key: "str | None" = None,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
 
@@ -1299,8 +1427,8 @@ def _write_codex_file_batch(
                (source_path, line_offset, timestamp_utc, session_id, model,
                 input_tokens, cached_input_tokens, output_tokens,
                 reasoning_output_tokens, total_tokens, source_root_key,
-                conversation_key)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                conversation_key, account_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             accounting_rows,
         )
         rows_changed = conn.total_changes - before
@@ -1310,8 +1438,9 @@ def _write_codex_file_batch(
                (source, source_root_key, source_path, line_offset,
                 captured_at_utc, observed_slot, logical_limit_key, limit_id,
                 limit_name, window_minutes, used_percent, resets_at_utc,
-                plan_type, individual_limit_json, reached_type, observed_model)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                plan_type, individual_limit_json, reached_type, observed_model,
+                account_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             quota_rows,
         )
     if thread_rows:
@@ -1340,13 +1469,13 @@ def _write_codex_file_batch(
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
             last_session_id, last_model, last_total_tokens, source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            last_conversation_key, last_turn_id, account_key)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
             last_model, last_total_tokens, discovered.source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id,
+            last_conversation_key, last_turn_id, account_key,
         ),
     )
     if prune_roots:
@@ -1355,6 +1484,7 @@ def _write_codex_file_batch(
     # facts as one physical unit. Keep the version bump in that same commit so
     # a rolled-back batch never appears newer to the dashboard signature.
     _bump_codex_physical_mutation_seq(conn)
+    _cache_storm_test_pause("codex_precommit")
     conn.commit()
     return rows_changed
 
@@ -1442,6 +1572,11 @@ class IngestStats:
     # and are otherwise unaffected.
     files_failed: int = 0
     deferred_reason: "str | None" = None
+    # #341: a torn ``~/.claude.json`` read (mid-rewrite) DEFERS the whole Claude
+    # tail-ingest this sync (identity resolved once per sync); the deferred sync
+    # advances no per-file cursor so the next sync re-reads + re-stamps rather
+    # than guessing an account. Non-zero ⇒ the walk was skipped this cycle.
+    files_deferred_torn: int = 0
     # #279 S2 F1 parse-health counters — passive observers over the new-byte
     # span this sync walked. lines_seen counts non-blank lines (malformed
     # included); assistant_lines_skipped counts assistant-typed lines
@@ -1889,6 +2024,29 @@ def sync_cache(
             if _targeted_has_pending_global_work(conn):
                 stats.deferred_reason = "pending_global_flags"
                 return stats
+
+        # #341 observe-and-stamp (spec §1): resolve the active Claude identity
+        # ONCE per sync from ~/.claude.json (stable-read, mtime-cached). The
+        # active account stamps every newly-ingested session_entries row (and the
+        # session_files last-observed diagnostic). A single global identity file
+        # governs the whole Claude tail, so a TORN read (mid-rewrite) DEFERS the
+        # ENTIRE ingest this cycle — resolved here BEFORE the rebuild wipe / the
+        # file walk so nothing mutates and no per-file cursor advances; the next
+        # sync re-reads the same bytes and re-stamps rather than guessing (never
+        # mis-stamp). identified → the real key; stably-absent (no ~/.claude.json
+        # / api-key mode) → None (stamped NULL == unattributed on the read path,
+        # byte-stable for the no-identity corpus). The Claude account_observe is
+        # journaled by record-usage, not here, so sync_cache owns the cache-row
+        # stamp only — no journal double-stamp.
+        import _lib_accounts
+        _claude_identity = _cctally_core._resolve_active_claude_identity()
+        if _claude_identity.get("status") == "torn":
+            stats.files_deferred_torn += 1
+            stats.deferred_reason = "identity_torn"
+            return stats
+        _account_key = _claude_identity["account_key"]
+        file_account_key = (
+            None if _account_key == _lib_accounts.UNATTRIBUTED else _account_key)
 
         # Walk-complete sentinel gating (cctally-dev#93, D5b/D6b). Capture
         # whether cache 001 was already applied at the moment this sync
@@ -2579,7 +2737,15 @@ def sync_cache(
                     # file's `sync_seq` and mutation_min_ts = its own
                     # timestamp_utc (== the event time on insert).
                     sync_seq = _bump_mutation_seq(conn)
-                    stamped_rows = [r + (sync_seq, r[2]) for r in rows]
+                    # #341: append the active account (resolved once per sync) as
+                    # the trailing column. First-stamp-wins — account_key is
+                    # DELIBERATELY OMITTED from the ON CONFLICT DO UPDATE SET below
+                    # (spec §2 cache.db: a resumed session replaying identical
+                    # bytes under a different account is the SAME message and keeps
+                    # the first observed stamp). ``file_account_key`` is None when
+                    # stably-absent (stamped NULL == unattributed on read).
+                    stamped_rows = [
+                        r + (sync_seq, r[2], file_account_key) for r in rows]
                     before = conn.total_changes
                     # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
                     # wins on conflict; speed-set breaks ties. The partial
@@ -2610,8 +2776,8 @@ def sync_cache(
                             msg_id, req_id, input_tokens, output_tokens,
                             cache_create_tokens, cache_read_tokens,
                             usage_extra_json, speed, cost_usd_raw,
-                            mutation_seq, mutation_min_ts)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            mutation_seq, mutation_min_ts, account_key)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                            ON CONFLICT(msg_id, req_id)
                            WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
                            DO UPDATE SET
@@ -2696,20 +2862,28 @@ def sync_cache(
                 # UPSERT preserves session_id / project_path columns populated
                 # by _ensure_session_files_row at the top of this loop. A plain
                 # INSERT OR REPLACE would wipe them on every changed-file sync.
+                # #341: session_files.account_key is a "last observed" diagnostic
+                # only (spec §2 — entry rows are authoritative for attribution; no
+                # aggregation reads file rows). Stamp the active account resolved
+                # once per sync; None (stably-absent) writes NULL.
                 conn.execute(
                     """INSERT INTO session_files
-                       (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at)
-                       VALUES (?,?,?,?,?)
+                       (path, size_bytes, mtime_ns, last_byte_offset,
+                        last_ingested_at, account_key)
+                       VALUES (?,?,?,?,?,?)
                        ON CONFLICT(path) DO UPDATE SET
                            size_bytes       = excluded.size_bytes,
                            mtime_ns         = excluded.mtime_ns,
                            last_byte_offset = excluded.last_byte_offset,
-                           last_ingested_at = excluded.last_ingested_at""",
+                           last_ingested_at = excluded.last_ingested_at,
+                           account_key      = excluded.account_key""",
                     (
                         path_str, size, mtime_ns, final_offset,
                         dt.datetime.now(dt.timezone.utc).isoformat(),
+                        file_account_key,
                     ),
                 )
+                _cache_storm_test_pause("claude_precommit")
                 conn.commit()
                 stats.files_processed += 1
                 # Browse-rail rollup: record the session_ids this file just
@@ -2721,6 +2895,12 @@ def sync_cache(
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    # Corruption is a database-family failure, not a bad input
+                    # file.  The recovery plan must see it immediately so it can
+                    # close this handle, quarantine once, and restart the full
+                    # requested provider plan on a fresh family.
+                    raise
                 walk_clean = False  # rolled back this file without ingesting (D5a)
                 stats.files_failed += 1
                 continue
@@ -3464,12 +3644,19 @@ def iter_entries(
     range_end: dt.datetime,
     *,
     project: str | None = None,
+    account_key: "str | None" = None,
 ) -> list[UsageEntry]:
     """Return cached UsageEntry rows whose timestamp falls in [range_start,
     range_end]. Optional `project` filters by the project slug (directory
     name under `<claude>/projects/`). Drop-in replacement for the old
     `_discover_session_files` + `_parse_usage_entries` loop; dedup is
     enforced at write time by the UNIQUE(msg_id, req_id) index.
+
+    ``account_key`` (#341, P2-CQ2) scopes the sum to one account's stamped
+    entries. ``None`` (default) reads all accounts (merged, byte-identical to
+    today). The reserved ``unattributed`` sentinel matches BOTH the literal
+    stamp AND a NULL ``account_key`` (read rule: ``NULL ≡ unattributed``), so a
+    single-account / legacy install whose rows are all NULL sums identically.
     """
     start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
@@ -3482,6 +3669,14 @@ def iter_entries(
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
     )
     params: list[Any] = [start_iso, end_iso]
+    if account_key is not None:
+        import _lib_accounts
+        if account_key == _lib_accounts.UNATTRIBUTED:
+            sql += " AND (account_key IS NULL OR account_key = ?)"
+            params.append(_lib_accounts.UNATTRIBUTED)
+        else:
+            sql += " AND account_key = ?"
+            params.append(account_key)
     if project is not None:
         # Escape LIKE wildcards (_ matches any single char, % matches any
         # string). The old glob-based discovery matched project names
@@ -3593,6 +3788,25 @@ def iter_entries_with_id(
     return out
 
 
+class AccountAttributionUnavailable(Exception):
+    """A ``--account``-scoped entry read cannot be satisfied from the account-
+    stamped cache and would otherwise degrade to a direct-JSONL parse (#341,
+    spec §3). The historical JSONL carries NO account identity, so that fallback
+    would silently return unfiltered/merged (or empty) entries mislabeled as the
+    selected account. The CLI maps this to exit 3
+    (``account attribution unavailable (cache required)``) — failing closed
+    rather than emitting an unattributable render. Only raised when the caller
+    passed a real ``account_key`` (merged reads keep the correctness-degrade)."""
+
+
+def _guard_account_attribution(account_key: "str | None", where: str) -> None:
+    """Fail closed (#341) when an ``account_key``-scoped read would fall back to
+    the identity-less direct-JSONL path. No-op for merged (``None``) reads."""
+    if account_key is not None:
+        raise AccountAttributionUnavailable(
+            f"account attribution unavailable (cache required): {where}")
+
+
 def _collect_entries_direct(
     range_start: dt.datetime,
     range_end: dt.datetime,
@@ -3664,6 +3878,7 @@ def get_claude_session_entries(
     *,
     project: str | None = None,
     skip_sync: bool = False,
+    account_key: "str | None" = None,
 ) -> list[_JoinedClaudeEntry]:
     """Fetch in-range Claude entries joined to per-file metadata.
 
@@ -3686,17 +3901,25 @@ def get_claude_session_entries(
     try:
         conn = open_cache_db()
     except (sqlite3.DatabaseError, OSError) as exc:
+        # #341: an account-scoped read can't degrade to the identity-less
+        # direct-JSONL path — fail closed (exit 3) rather than mislabel.
+        _guard_account_attribution(account_key, "cache open failed")
         eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
         return _direct_parse_claude_session_entries(
             range_start, range_end, project=project
         )
 
     if not skip_sync:
-        stats = sync_cache(conn)
+        stats, conn = _run_cache_operation_with_recovery(
+            conn, lambda active_conn: sync_cache(active_conn)
+        )
         if stats.lock_contended:
             # Partial cache window: a concurrent ingest may have committed some
             # files but not others. For correctness, fall back to a direct
             # JSONL parse — same rationale as `get_entries`.
+            # #341: fail closed on an account-scoped read — the direct-JSONL
+            # fallback carries no account identity (exit 3, not a mislabel).
+            _guard_account_attribution(account_key, "concurrent ingest")
             eprint(
                 "[cache] concurrent ingest in progress; "
                 "falling back to direct JSONL parse for correctness"
@@ -3727,6 +3950,17 @@ def get_claude_session_entries(
         )
         sql += r" AND se.source_path LIKE ? ESCAPE '\'"
         params.append(f"%/projects/{escaped}/%")
+    if account_key is not None:
+        # #341 --account scoping (mirrors iter_entries/get_entries). The reserved
+        # ``unattributed`` sentinel matches BOTH the literal stamp AND NULL
+        # (``NULL ≡ unattributed`` on the read path); a real key matches exactly.
+        import _lib_accounts
+        if account_key == _lib_accounts.UNATTRIBUTED:
+            sql += " AND (se.account_key IS NULL OR se.account_key = ?)"
+            params.append(_lib_accounts.UNATTRIBUTED)
+        else:
+            sql += " AND se.account_key = ?"
+            params.append(account_key)
     # Explicit (timestamp_utc, id) tie-break (#275) — the same contract #271 §5
     # pinned on `get_entries` (see the twin ORDER BY above). `id` is the rowid, so
     # against `idx_entries_timestamp` (which stores keys as (timestamp_utc, rowid))
@@ -3935,6 +4169,10 @@ class CodexIngestStats:
     # normalization, DB exception).
     files_failed: int = 0
     deferred_reason: "str | None" = None
+    # #341: files whose root auth.json read was torn (mid-rewrite) this cycle.
+    # Deferred WITHOUT advancing their cursor so the next sync re-reads and
+    # re-stamps rather than guessing an account (spec §1 stable-read protocol).
+    files_deferred_torn: int = 0
 
     @property
     def targeted_clean(self) -> bool:
@@ -3968,9 +4206,10 @@ def sync_codex_cache(
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
-    Acquires an exclusive fcntl.flock on cache.db.codex.lock (separate from
-    the Claude sync lock so the two ingests can run concurrently). On
-    contention returns immediately with lock_contended=True.
+    Acquires the shared cache.db writer flock before the Codex provider flock.
+    The global-first order excludes cross-provider writes and checkpoints while
+    preserving provider-scoped migration/rebuild coordination. On contention
+    returns immediately with lock_contended=True.
 
     When `rebuild=True`, clears the cached rows AFTER acquiring the lock
     so a lost race does not wipe a cache another process is actively
@@ -3990,15 +4229,24 @@ def sync_codex_cache(
     deferred_cert_roots: "set[str] | None" = None
     deferred_cert_sigs: "dict[str, str] | None" = None
     c = _cctally()
-    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    _cctally_core.CACHE_LOCK_CODEX_PATH.touch()
+    from _lib_cache_writer_lock import (
+        acquire_cache_writer_flocks,
+        release_cache_writer_flocks,
+    )
 
-    lock_fh = open(_cctally_core.CACHE_LOCK_CODEX_PATH, "w")
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    held_writer_flocks: list[int] = []
     try:
         with _perf.phase("flock") as _p_flock:
-            _acquired = _acquire_cache_flock(lock_fh, timeout=lock_timeout)
-            _p_flock.set_meta(contended=not _acquired)
-        if not _acquired:
+            acquired = acquire_cache_writer_flocks(
+                _cctally_core.CACHE_LOCK_PATH,
+                _cctally_core.CACHE_LOCK_CODEX_PATH,
+                timeout=lock_timeout,
+            )
+            if acquired is not None:
+                held_writer_flocks = acquired
+            _p_flock.set_meta(contended=acquired is None)
+        if acquired is None:
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
@@ -4161,6 +4409,10 @@ def sync_codex_cache(
                     stats.deferred_reason = "truncation"
                     return stats
 
+        # #341: per-root active-account cache, resolved once per sync (auth.json
+        # is per provider root and rarely changes mid-sync). Keyed by
+        # source_root_key. A torn read defers every file under that root.
+        root_accounts: "dict[str, _CodexRootAccount]" = {}
         # #279 S2 F4: ONE coarse `walk` phase bracketing the per-file loop
         # (count = files_processed, never per-row — §2 rule). Manual CM so
         # the loop stays flat, mirroring sync_cache's walk seam.
@@ -4230,6 +4482,30 @@ def sync_codex_cache(
                     initial_total_tokens = 0
                     prev_total_tokens = None
 
+            # #341: resolve this root's active account (per-root auth.json
+            # stable-read, resolved once per sync). A torn read (auth.json
+            # mid-rewrite) DEFERS the whole file this cycle — skip its new bytes
+            # WITHOUT advancing the cursor, so the next sync re-reads and
+            # re-stamps rather than guessing an account (spec §1 stable-read
+            # protocol). identified -> real key; stably-absent (no auth /
+            # api-key mode) -> None (stamped NULL == unattributed on read).
+            root_account = root_accounts.get(discovered.source_root_key)
+            if root_account is None:
+                root_account = _resolve_codex_account_for_root(
+                    discovered.provider_root)
+                root_accounts[discovered.source_root_key] = root_account
+            if root_account.status == "torn":
+                stats.files_deferred_torn += 1
+                if targeted:
+                    stats.files_failed += 1  # §5.1 deferred → call dirty
+                continue
+            file_account_key = root_account.account_key
+            # First-sight registry observe, journaled DURABLY BEFORE any
+            # account-stamped quota obs / cache row for this account (spec §1:
+            # replay can never see a stamped row whose account was never
+            # observed). Marker-deduped; no-op for the sentinel.
+            _maybe_append_codex_account_observe(root_account.identity)
+
             accounting_rows: list[tuple[Any, ...]] = []
             quota_rows: list[tuple[Any, ...]] = []
             thread_rows: list[tuple[Any, ...]] = []
@@ -4296,6 +4572,7 @@ def sync_codex_cache(
                                 quota.used_percent, quota.resets_at_utc,
                                 quota.plan_type, quota.individual_limit_json,
                                 quota.reached_type, iter_state.model,
+                                file_account_key,  # #341 trailing account_key
                             ))
                         if (thread := emission.thread) is not None and (
                             thread.conversation_key is not None
@@ -4325,6 +4602,7 @@ def sync_codex_cache(
                             entry.total_tokens,
                             discovered.source_root_key,
                             event.conversation_key,
+                            file_account_key,  # #341 trailing account_key
                         ))
                         yielded_count += 1
                     final_offset = fh.tell()
@@ -4430,9 +4708,16 @@ def sync_codex_cache(
                         # §5.1 whole-tree bypass: targeted mode never prunes
                         # codex_source_roots for roots outside its target set.
                         prune_roots=not targeted,
+                        account_key=file_account_key,  # #341 last-observed stamp
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
+                    if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                        # Retrying a corrupt SQLite connection in place cannot
+                        # heal it and hides the signal from the shared recovery
+                        # boundary.  Propagate classified family corruption on
+                        # the first observation.
+                        raise
                     if attempt == 0:
                         # Private test seam: the callback runs after the
                         # failed file transaction has rolled back, and before
@@ -4449,8 +4734,10 @@ def sync_codex_cache(
                 committed = True
                 break
             if not committed:
-                if targeted:
-                    stats.files_failed += 1  # §5.1 DB-exception decline → dirty
+                # Both whole-tree and targeted callers need an honest failed
+                # walk count.  Targeted mode already depended on this signal;
+                # explicit rebuild now uses it to reject partial success too.
+                stats.files_failed += 1
                 continue
 
             # Private test seam (§5.1 post-preflight late-shrink race): fires
@@ -4469,8 +4756,8 @@ def sync_codex_cache(
         _p_walk.set_meta(skipped=stats.files_skipped_unchanged,
                          rows=stats.rows_changed)
         # #279 S2 F1: rolling parse-health record (codex half). Same
-        # anomaly-delta gate as the Claude tail; SQLite serializes the
-        # cache.db write against a concurrent Claude sync.
+        # anomaly-delta gate as the Claude tail; the global writer flock
+        # excludes a concurrent Claude sync.
         _update_parse_health_meta(
             conn, "parse_health_codex",
             lines_seen=stats.lines_seen,
@@ -4480,14 +4767,14 @@ def sync_codex_cache(
             rebuild=rebuild,
         )
         # Codex creates/extends cache.db sidecars independently of Claude's
-        # sync path. Harden them while the Codex flock is still held and after
-        # all Codex writes, before the optional checkpoint can rotate a WAL.
+        # sync path. Harden them while both cache flocks are still held and
+        # after all Codex writes, before the optional checkpoint can rotate a
+        # WAL.
         _harden_cache_sidecars()
-        # #297: forced end-of-sync WAL drain (Codex half). Claude and Codex
-        # ingests use SEPARATE flocks but commit into the SAME cache.db WAL, so
-        # the fail-fast short timeout naturally dedupes concurrent attempts —
-        # whoever wins truncates; the other gets `busy` immediately and moves
-        # on. All Codex ingest work is committed here (no active txn).
+        # #297/#344: forced end-of-sync WAL drain (Codex half). The global
+        # writer flock excludes every Claude write/checkpoint until this
+        # checkpoint finishes. All Codex ingest work is committed here (no
+        # active transaction).
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
         # Projection intentionally runs only after this function releases the
         # Codex cache flock in ``finally`` below.  cache.db and stats.db are not
@@ -4549,11 +4836,7 @@ def sync_codex_cache(
                     else:
                         project_after_unlock = True
     finally:
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_fh.close()
+        release_cache_writer_flocks(held_writer_flocks)
 
     if deferred_cert_roots is not None:
         # F1: the gate's skip-condition must be IDENTICAL to
@@ -4583,8 +4866,16 @@ def iter_codex_entries(
     conn: sqlite3.Connection,
     range_start: dt.datetime,
     range_end: dt.datetime,
+    *,
+    account_key: "str | None" = None,
 ) -> list[CodexEntry]:
-    """Return cached CodexEntry rows with timestamp in [range_start, range_end]."""
+    """Return cached CodexEntry rows with timestamp in [range_start, range_end].
+
+    ``account_key`` (#341 Step 4-eval) scopes the read to one Codex account's
+    stamped entries for the per-account budget ladder; ``None`` (default) reads
+    all accounts (merged / byte-identical). The ``unattributed`` sentinel matches
+    the literal stamp OR a NULL ``account_key`` (read rule ``NULL ≡ unattributed``).
+    """
     start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
     sql = (
@@ -4593,10 +4884,19 @@ def iter_codex_entries(
         "reasoning_output_tokens, total_tokens, source_path "
         "FROM codex_session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ? "
-        "ORDER BY timestamp_utc ASC"
     )
+    params: "list[Any]" = [start_iso, end_iso]
+    if account_key is not None:
+        import _lib_accounts
+        if account_key == _lib_accounts.UNATTRIBUTED:
+            sql += "AND (account_key IS NULL OR account_key = ?) "
+            params.append(_lib_accounts.UNATTRIBUTED)
+        else:
+            sql += "AND account_key = ? "
+            params.append(account_key)
+    sql += "ORDER BY timestamp_utc ASC"
     entries: list[CodexEntry] = []
-    for row in conn.execute(sql, (start_iso, end_iso)):
+    for row in conn.execute(sql, params):
         entries.append(CodexEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),
             session_id=row[1],
@@ -4635,6 +4935,7 @@ def get_codex_entries(
     range_end: dt.datetime,
     *,
     skip_sync: bool = False,
+    account_key: "str | None" = None,
 ) -> list[CodexEntry]:
     """Cache-first Codex entry fetch with transparent fallback.
 
@@ -4650,12 +4951,23 @@ def get_codex_entries(
     try:
         conn = open_cache_db()
     except (sqlite3.DatabaseError, OSError) as exc:
+        # #341 (Task 4, fail-closed symmetry with the Claude siblings): an
+        # account-scoped read can't degrade to the identity-less direct-JSONL
+        # path — fail closed (exit 3) rather than return ALL Codex entries
+        # mislabeled as the selected account. No-op for merged (None) reads.
+        _guard_account_attribution(account_key, "cache open failed")
         eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
         return _collect_codex_entries_direct(range_start, range_end)
     try:
         if skip_sync:
-            return iter_codex_entries(conn, range_start, range_end)
-        stats = sync_codex_cache(conn)
+            return iter_codex_entries(
+                conn, range_start, range_end, account_key=account_key)
+        # #344: route the ingest through the guarded recovery boundary so a
+        # classified corruption closes the handle, quarantines once, and
+        # restarts on a fresh family (reassigning `conn`, closed in finally).
+        stats, conn = _run_cache_operation_with_recovery(
+            conn, lambda active_conn: sync_codex_cache(active_conn)
+        )
         if stats.lock_contended:
             # Sync commits file-by-file, so contention on the ingest lock
             # (e.g. a concurrent --rebuild, or a first-run sync still in
@@ -4665,12 +4977,17 @@ def get_codex_entries(
             # caller's range. Fall back to a direct JSONL parse unconditionally
             # on contention; correctness > speed in the rare-but-real window
             # where cache state does not match disk.
+            # #341 (Task 4): fail closed on an account-scoped read — the
+            # direct-JSONL fallback carries no account identity (exit 3, not a
+            # mislabel). Symmetric with get_entries / get_claude_session_entries.
+            _guard_account_attribution(account_key, "concurrent ingest")
             eprint(
                 "[cache] concurrent codex ingest in progress; "
                 "falling back to direct JSONL parse for correctness"
             )
             return _collect_codex_entries_direct(range_start, range_end)
-        return iter_codex_entries(conn, range_start, range_end)
+        return iter_codex_entries(
+            conn, range_start, range_end, account_key=account_key)
     finally:
         conn.close()
 
@@ -4681,6 +4998,7 @@ def _sum_codex_cost_for_range(
     *,
     speed: str = "auto",
     skip_sync: bool = False,
+    account_key: "str | None" = None,
 ) -> float:
     """Sum USD Codex cost of all `codex_session_entries` in ``[start, end)``.
 
@@ -4715,7 +5033,8 @@ def _sum_codex_cost_for_range(
     c = _cctally()
     eff_speed = c._resolve_codex_speed(speed)
     total = 0.0
-    for entry in c.get_codex_entries(start, end, skip_sync=skip_sync):
+    for entry in c.get_codex_entries(start, end, skip_sync=skip_sync,
+                                     account_key=account_key):
         if entry.timestamp >= end:
             continue
         total += c._calculate_codex_entry_cost(
@@ -4735,6 +5054,7 @@ def get_entries(
     *,
     project: str | None = None,
     skip_sync: bool = False,
+    account_key: "str | None" = None,
 ) -> list[UsageEntry]:
     """Cache-first entry fetch with transparent fallback. Every JSONL-consuming
     command should use this instead of talking to open_cache_db directly.
@@ -4742,29 +5062,56 @@ def get_entries(
     When `skip_sync=True`, bypass the JSONL ingest and serve whatever is
     already cached. The cache-open fallback still fires if the cache DB is
     unusable, but the ingest + lock-contention fallback are both skipped.
+
+    ``account_key`` (#341, P2-CQ2) scopes the cache read to one account's
+    stamped entries (``None`` = merged / byte-identical). Not threaded into the
+    direct-JSONL fallback: historical JSONL lines carry no identity, so an
+    account-scoped read that has to fall back is an unattributable degrade — the
+    ``--account`` CLI surface fails closed (exit 3) before it reaches here.
     """
     try:
         conn = open_cache_db()
     except (sqlite3.DatabaseError, OSError) as exc:
+        # #341: an account-scoped read can't degrade to the identity-less
+        # direct-JSONL path — fail closed (exit 3) rather than mislabel.
+        _guard_account_attribution(account_key, "cache open failed")
         eprint(f"[cache] unavailable ({exc}); falling back to direct JSONL parse")
         return _collect_entries_direct(range_start, range_end, project=project)
-    if not skip_sync:
-        stats = sync_cache(conn)
-        if stats.lock_contended:
-            # Sync commits file-by-file, so contention on the ingest lock
-            # (e.g. a concurrent --rebuild, or a first-run sync still in
-            # flight) can leave the cache PARTIALLY populated — some files
-            # ingested, others pending. An "is the table empty?" guard passes
-            # in that window and we'd silently return results missing the
-            # caller's range. Fall back to a direct JSONL parse unconditionally
-            # on contention; correctness > speed in the rare-but-real window
-            # where cache state does not match disk.
-            eprint(
-                "[cache] concurrent ingest in progress; "
-                "falling back to direct JSONL parse for correctness"
+    # Close the cache connection on every return path (#341 P2-CQ2 hygiene): the
+    # prior code opened it and returned `iter_entries(conn, …)` — a materialized
+    # list — without ever closing, leaking a connection per call (ResourceWarning
+    # at GC). iter_entries fully materializes, so closing after is byte-neutral.
+    # The finally also closes the #344 recovery-replacement `conn` (a classified
+    # corruption reassigns it to a fresh family here); double-close is a no-op.
+    try:
+        if not skip_sync:
+            stats, conn = _run_cache_operation_with_recovery(
+                conn, lambda active_conn: sync_cache(active_conn)
             )
-            return _collect_entries_direct(range_start, range_end, project=project)
-    return iter_entries(conn, range_start, range_end, project=project)
+            if stats.lock_contended:
+                # Sync commits file-by-file, so contention on the ingest lock
+                # (e.g. a concurrent --rebuild, or a first-run sync still in
+                # flight) can leave the cache PARTIALLY populated — some files
+                # ingested, others pending. An "is the table empty?" guard passes
+                # in that window and we'd silently return results missing the
+                # caller's range. Fall back to a direct JSONL parse unconditionally
+                # on contention; correctness > speed in the rare-but-real window
+                # where cache state does not match disk.
+                # #341: fail closed on an account-scoped read — the direct-JSONL
+                # fallback carries no account identity (exit 3, not a mislabel).
+                _guard_account_attribution(account_key, "concurrent ingest")
+                eprint(
+                    "[cache] concurrent ingest in progress; "
+                    "falling back to direct JSONL parse for correctness"
+                )
+                return _collect_entries_direct(range_start, range_end, project=project)
+        return iter_entries(
+            conn, range_start, range_end, project=project, account_key=account_key)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _harden_cache_sidecars() -> None:
@@ -4798,52 +5145,104 @@ def _cache_open_guarded() -> sqlite3.Connection:
     """
     path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
     marker = _cctally_db_sib._repair_marker_path(path)
+    pending = _cctally_db_sib._quarantine_pending_path(path)
     lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = open(lock_path, "a+")
-    conn = None
     try:
-        fcntl.flock(lock_fh, fcntl.LOCK_SH)
-        if marker.exists():
-            raise sqlite3.DatabaseError(
-                f"cache.db maintenance is in progress ({marker})"
-            )
-        conn = _cctally_store.open_index("cache")
-        # Force a real header/schema read. SELECT 1 is constant-folded and can
-        # report success without touching a malformed database file.
-        conn.execute("PRAGMA schema_version").fetchone()
-        # The v1.80.2 production incident left the schema and left edge of
-        # session_entries readable while its interior root page pointed past
-        # EOF on the right. Probe that right-most path explicitly: O(log N), so
-        # every short-lived hook can afford it, unlike PRAGMA quick_check's
-        # whole-database scan.
-        if conn.execute(
-            "SELECT 1 FROM sqlite_schema "
-            "WHERE type='table' AND name='session_entries'"
-        ).fetchone() is not None:
-            conn.execute(
-                "SELECT rowid FROM session_entries "
-                "ORDER BY rowid DESC LIMIT 1"
-            ).fetchone()
-        if marker.exists():
-            conn.close()
+        for _attempt in range(2):
             conn = None
-            raise sqlite3.DatabaseError(
-                f"cache.db maintenance is in progress ({marker})"
-            )
-        return conn
-    except Exception:
-        if conn is not None:
+            fcntl.flock(lock_fh, fcntl.LOCK_SH)
+            if marker.exists() or pending.exists():
+                live, reason = (
+                    _cctally_db_sib._repair_marker_is_live(marker)
+                    if marker.exists()
+                    else (False, "pending quarantine")
+                )
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                if live:
+                    raise sqlite3.DatabaseError(
+                        f"cache.db maintenance is in progress ({reason})"
+                    )
+                # Drop shared before taking exclusive so two stale-marker
+                # reclaimers cannot deadlock while upgrading. Recheck under
+                # exclusive: a live owner may have replaced the stale marker.
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                if marker.exists():
+                    live, reason = _cctally_db_sib._repair_marker_is_live(marker)
+                    if live:
+                        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                        raise sqlite3.DatabaseError(
+                            f"cache.db maintenance is in progress ({reason})"
+                        )
+                if pending.exists():
+                    try:
+                        open_pids = _cctally_db_sib._db_family_open_pids(
+                            path
+                        )
+                        if open_pids is None:
+                            raise OSError(
+                                "could not verify that the database family "
+                                "has no open handles"
+                            )
+                        if open_pids:
+                            raise OSError(
+                                "database family is still open in process(es) "
+                                + ", ".join(
+                                    str(pid) for pid in sorted(open_pids)
+                                )
+                            )
+                        _cctally_db_sib.quarantine_db_family(path, strict=True)
+                    except OSError as exc:
+                        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                        raise sqlite3.DatabaseError(
+                            f"cache.db pending quarantine could not resume: {exc}"
+                        ) from exc
+                removed, reclaim_reason = (
+                    _cctally_db_sib._remove_stale_repair_marker(path)
+                )
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                if not removed:
+                    raise sqlite3.DatabaseError(
+                        f"cache.db maintenance is in progress: {reclaim_reason}"
+                    )
+                continue
             try:
-                conn.close()
+                conn = _cctally_store.open_index("cache")
+                # Force a real header/schema read. SELECT 1 is constant-folded
+                # and can report success without touching a malformed file.
+                conn.execute("PRAGMA schema_version").fetchone()
+                # The v1.80.2 incident left the schema and left edge readable
+                # while the interior root's right-most child pointed past EOF.
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_schema "
+                    "WHERE type='table' AND name='session_entries'"
+                ).fetchone() is not None:
+                    conn.execute(
+                        "SELECT rowid FROM session_entries "
+                        "ORDER BY rowid DESC LIMIT 1"
+                    ).fetchone()
+                if marker.exists():
+                    conn.close()
+                    conn = None
+                    raise sqlite3.DatabaseError(
+                        f"cache.db maintenance is in progress ({marker})"
+                    )
+                return conn
             except Exception:
-                pass
-        raise
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        raise sqlite3.DatabaseError(
+            "cache.db stale maintenance marker could not be reclaimed"
+        )
     finally:
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
-        finally:
-            lock_fh.close()
+        lock_fh.close()
 
 
 def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
@@ -4858,15 +5257,16 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
 
     path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
     try:
-        claimed, reason = _cctally_db_sib._claim_repair_marker(path)
+        claim, reason = _cctally_db_sib._claim_repair_marker(path)
     except OSError as marker_exc:
         raise sqlite3.DatabaseError(
             f"cache.db recovery could not claim maintenance: {marker_exc}"
         ) from exc
-    if not claimed:
+    if claim is None:
         raise sqlite3.DatabaseError(
             f"cache.db maintenance is in progress: {reason}"
         ) from exc
+    _cache_storm_test_pause("cache_repair_claimed")
 
     lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4887,7 +5287,15 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
             ) from exc
 
         _cctally_db_sib.write_corruption_forensics(path, db_label="cache")
-        incident = _cctally_db_sib.quarantine_db_family(path)
+        _cache_storm_test_pause("cache_repair_forensics")
+        try:
+            incident = _cctally_db_sib.quarantine_db_family(path, strict=True)
+        except OSError as quarantine_exc:
+            raise sqlite3.DatabaseError(
+                "cache.db recovery could not complete whole-family quarantine: "
+                f"{quarantine_exc}"
+            ) from exc
+        _cache_storm_test_pause("cache_repair_quarantined")
         eprint(
             f"[cache] corrupt cache DB ({exc}); quarantined its file family "
             f"under {incident} and recreating from source JSONL"
@@ -4898,7 +5306,54 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         finally:
             lock_fh.close()
-        _cctally_db_sib._release_repair_marker(path)
+        _cctally_db_sib._release_repair_marker(path, claim)
+
+
+def _run_cache_operation_with_recovery(
+    conn: sqlite3.Connection,
+    operation: Callable[[sqlite3.Connection], Any],
+) -> "tuple[Any, sqlite3.Connection]":
+    results, replacement = _run_cache_plan_with_recovery(conn, (operation,))
+    return results[0], replacement
+
+
+def _run_cache_plan_with_recovery(
+    conn: sqlite3.Connection,
+    operations: "tuple[Callable[[sqlite3.Connection], Any], ...]",
+) -> "tuple[tuple[Any, ...], sqlite3.Connection]":
+    """Run a provider plan, recovering once and restarting from its first leg.
+
+    The connection that observed corruption is closed before the destructive
+    maintenance handshake. Because cache.db is one shared physical family, a
+    recovery in a later provider leg invalidates every earlier result; the
+    complete requested plan therefore restarts against the replacement family.
+    A second classified failure closes the replacement and propagates without a
+    second quarantine attempt.
+    """
+    if not operations:
+        return (), conn
+    active = conn
+    recovered = False
+    while True:
+        try:
+            results = tuple(operation(active) for operation in operations)
+            return results, active
+        except sqlite3.DatabaseError as exc:
+            if (
+                recovered
+                or not _cctally_db_sib._is_sqlite_corruption_error(exc)
+            ):
+                active.close()
+                raise
+            active.close()
+            if not _recover_corrupt_cache(exc):
+                raise
+            active = open_cache_db()
+            _cache_storm_test_pause("cache_repair_recreated")
+            recovered = True
+        except BaseException:
+            active.close()
+            raise
 
 
 def open_cache_db() -> sqlite3.Connection:
@@ -4919,6 +5374,7 @@ def open_cache_db() -> sqlite3.Connection:
         os.chmod(_cctally_core.APP_DIR, 0o700)
     except OSError as exc:
         eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
+    recovered = False
     try:
         conn = _cache_open_guarded()
     except sqlite3.DatabaseError as exc:
@@ -4927,6 +5383,9 @@ def open_cache_db() -> sqlite3.Connection:
         # One retry only. A second failure surfaces to the existing direct-JSONL
         # fallback instead of looping through destructive recovery.
         conn = _cache_open_guarded()
+        recovered = True
+    if recovered:
+        _cache_storm_test_pause("cache_repair_recreated")
 
     # Best-effort 0600 on cache.db itself (the 0700 dir above backstops the
     # sidecars until the first write hardens them in sync_cache).
@@ -4935,59 +5394,78 @@ def open_cache_db() -> sqlite3.Connection:
     except OSError as exc:
         eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
-    # §6.1 PRAGMA policy (auto_vacuum=INCREMENTAL emitted first — #313 P3
-    # reclaim needs it before the first page; journal_mode=WAL / busy_timeout /
-    # journal_size_limit #297; synchronous=NORMAL #279 S1 F8). Byte-equivalent
-    # to the former inline block, now owned by the shared policy table.
-    _cctally_store.apply_policy(conn, "cache")
-
-    # §6.2 version gate: run the full schema executescript + add_column_if_missing
-    # probes + the codex last_total_tokens ALTER/purge ONLY when the stamped
-    # user_version differs from the registry head. On a steady-state open of an
-    # up-to-date cache.db this whole block is skipped — the open becomes
-    # connect → PRAGMAs → one user_version read → the dispatcher fast-path.
-    if not _cctally_store.schema_current(conn, "cache"):
-        # Apply the shared cache.db schema (cctally-dev#93, D4): Claude tables +
-        # indexes, the session_id / project_path column adds on session_files
-        # (A2 `session` metadata, populated lazily in sync_cache() /
-        # _ensure_session_files_row()), the Codex base tables + indexes, and the
-        # cache_meta sentinel table. This is the single cache.db schema source —
-        # the eager-apply path (_eagerly_apply_cache_migrations) uses the SAME
-        # helper, so the two can no longer drift. The Codex last_total_tokens
-        # ALTER + purge stays below (out of the shared helper — D4/P1#3).
-        _cctally_db_sib._apply_cache_schema(conn)
-
-        # Migration: add last_total_tokens to codex_session_files. When the
-        # column is newly added (i.e. this is the first run after upgrade),
-        # purge the Codex cache so the duplicate-counted rows produced by the
-        # previous iterator are reingested cleanly by sync_codex_cache(). The
-        # cache is fully re-derivable from ~/.codex/sessions/*.jsonl so this is
-        # safe. Under the version gate now (spec §6.2): on an up-to-date DB the
-        # column already exists so add_column_if_missing was a no-op / no purge,
-        # making the gate byte-equivalent.
-        if add_column_if_missing(conn, "codex_session_files", "last_total_tokens", "INTEGER"):
-            conn.execute("DELETE FROM codex_session_entries")
-            conn.execute("DELETE FROM codex_session_files")
-            conn.commit()
-            eprint("[cache] migrated codex cache — re-ingesting")
-
-    # Migration framework dispatcher for cache.db. Runs unconditionally (spec
-    # §6.2: only the schema apply moves under the gate; the dispatcher keeps its
-    # own fast-path that returns early when user_version == registry head). See
-    # the @cache_migration decorator further down in this file.
-    _run_pending_migrations(
-        conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
-        recover_version_ahead=True,
-    )
-    # Migration 028 removes the legacy transcript objects after arming the
-    # independent rebuild. Recreate EMPTY compatibility objects only so older
-    # migration/fixture probes remain valid; live core sync never populates
-    # them. Keeping this conditional avoids a second schema pass on normal
-    # opens while preserving the physical data split.
-    if conn.execute(
+    schema_current = _cctally_store.schema_current(conn, "cache")
+    compatibility_current = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name='conversation_messages'"
-    ).fetchone() is None:
-        _cctally_db_sib._apply_cache_schema(conn)
+    ).fetchone() is not None
+    journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+
+    if schema_current and compatibility_current and journal_mode == "wal":
+        # Steady-state opens stay lock-free and apply connection-local policy
+        # only. Persistent/schema PRAGMAs and every DDL/DML migration path are
+        # reserved for the globally serialized branch below.
+        _cctally_store.apply_connection_policy(conn, "cache")
+        return conn
+
+    from _lib_cache_writer_lock import (
+        acquire_ordered_flocks,
+        release_cache_writer_flocks,
+    )
+
+    held = acquire_ordered_flocks(
+        [
+            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX),
+            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        ],
+        timeout=15.0,
+    )
+    if held is None:
+        conn.close()
+        raise sqlite3.DatabaseError(
+            "cache.db schema/policy update deferred: cache writer is busy"
+        )
+    try:
+        # Another first-open/upgrade process may have completed while this one
+        # waited. Re-read every mutation gate under the global writer flock.
+        schema_current = _cctally_store.schema_current(conn, "cache")
+        compatibility_current = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='conversation_messages'"
+        ).fetchone() is not None
+        journal_mode = str(
+            conn.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+
+        if not schema_current or journal_mode != "wal":
+            _cctally_store.apply_policy(conn, "cache")
+        else:
+            _cctally_store.apply_connection_policy(conn, "cache")
+
+        # §6.2 version gate: schema apply, ALTER/purge, and the complete cache
+        # migration dispatcher all run under maintenance-exclusive → global writer
+        # exclusion. No first-open or upgrade write can overlap provider sync.
+        if not schema_current:
+            _cctally_db_sib._apply_cache_schema(conn)
+            if add_column_if_missing(
+                conn,
+                "codex_session_files",
+                "last_total_tokens",
+                "INTEGER",
+            ):
+                conn.execute("DELETE FROM codex_session_entries")
+                conn.execute("DELETE FROM codex_session_files")
+                conn.commit()
+                eprint("[cache] migrated codex cache — re-ingesting")
+            _cctally_db_sib._run_pending_cache_migrations_under_writer_lock(conn)
+
+        # Migration 028 removes the legacy transcript objects after arming the
+        # independent rebuild. Recreate EMPTY compatibility objects only so
+        # older migration/fixture probes remain valid.
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='conversation_messages'"
+        ).fetchone() is None:
+            _cctally_db_sib._apply_cache_schema(conn)
+    finally:
+        release_cache_writer_flocks(held)
     return conn
 
 
@@ -5892,6 +6370,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "(Codex orphans are pruned automatically during codex sync); "
                 "nothing to do for --source codex."
             )
+            conn.close()
             return 0
         res = _prune_orphaned_cache_entries(
             conn, lock_timeout=_REBUILD_LOCK_TIMEOUT_SECONDS
@@ -5901,6 +6380,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "[cache-sync] prune-orphans skipped: "
                 "another process holds the lock"
             )
+            conn.close()
             return 1
         eprint(
             f"[cache-sync] pruned {res.pruned_files} orphaned file(s), "
@@ -5912,6 +6392,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"(shared session or missing conversation evidence); "
                 f"run `cache-sync --rebuild` to clear them"
             )
+        conn.close()
         return 0
 
     # --prune-conversations: on-demand, UNTHROTTLED transcript retention prune
@@ -5926,6 +6407,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "[cache-sync] transcript retention is disabled "
                 "(conversation.retention_days=0); nothing pruned."
             )
+            conn.close()
             return 0
         conv_conn = open_conversations_db(attach_cache=False)
         try:
@@ -5942,6 +6424,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "[cache-sync] prune-conversations skipped: another process "
                 "holds the maintenance or a provider lock; retry shortly."
             )
+            conn.close()
             return 1
         eprint(
             f"[cache-sync] pruned transcripts older than {retention_days}d: "
@@ -5951,6 +6434,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             f"{result.codex_events} event(s). "
             f"Run `cctally db vacuum --db conversations` to reclaim the freed space."
         )
+        conn.close()
         return 0
 
     # Note: when --rebuild is set we delegate the DELETE to sync_cache /
@@ -5971,16 +6455,58 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     _p_root = _perf.phase("cache-sync")
     _p_root.__enter__()
 
+    plan: list[Callable[[sqlite3.Connection], Any]] = []
+
     if source in ("claude", "all"):
-        with _perf.phase("sync_cache"):
-            stats = sync_cache(
-                conn, progress=_progress_stderr, rebuild=args.rebuild, lock_timeout=lt
-            )
+        def _sync_claude_leg(active_conn: sqlite3.Connection) -> IngestStats:
+            with _perf.phase("sync_cache"):
+                return sync_cache(
+                    active_conn,
+                    progress=_progress_stderr,
+                    rebuild=args.rebuild,
+                    lock_timeout=lt,
+                )
+
+        plan.append(_sync_claude_leg)
+
+    if source in ("codex", "all"):
+        def _sync_codex_leg(
+            active_conn: sqlite3.Connection,
+        ) -> CodexIngestStats:
+            with _perf.phase("sync_codex_cache"):
+                return sync_codex_cache(
+                    active_conn,
+                    progress=_progress_codex_stderr,
+                    rebuild=args.rebuild,
+                    lock_timeout=lt,
+                )
+
+        plan.append(_sync_codex_leg)
+
+    try:
+        plan_results, conn = _run_cache_plan_with_recovery(conn, tuple(plan))
+    except (OSError, sqlite3.DatabaseError) as exc:
+        eprint(f"[cache-sync] failed: {exc}")
+        _p_root.__exit__(type(exc), exc, exc.__traceback__)
+        if _perf.enabled():
+            _perf.flush_stderr(_perf.current_root())
+        return 1
+    result_index = 0
+
+    if source in ("claude", "all"):
+        stats = plan_results[result_index]
+        result_index += 1
         _progress_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
                 "[cache-sync] rebuild skipped (claude): "
                 "another process holds the lock"
+            )
+            contended = True
+        elif stats.files_failed and args.rebuild:
+            eprint(
+                "[cache-sync] rebuild incomplete (claude): "
+                f"{stats.files_failed} file(s) failed"
             )
             contended = True
         elif not stats.lock_contended:
@@ -5994,16 +6520,18 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             )
 
     if source in ("codex", "all"):
-        with _perf.phase("sync_codex_cache"):
-            stats = sync_codex_cache(
-                conn, progress=_progress_codex_stderr, rebuild=args.rebuild,
-                lock_timeout=lt,
-            )
+        stats = plan_results[result_index]
         _progress_codex_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
                 "[cache-sync] rebuild skipped (codex): "
                 "another process holds the lock"
+            )
+            contended = True
+        elif stats.files_failed and args.rebuild:
+            eprint(
+                "[cache-sync] rebuild incomplete (codex): "
+                f"{stats.files_failed} file(s) failed"
             )
             contended = True
         elif not stats.lock_contended:
@@ -6015,6 +6543,8 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.lines_malformed} malformed, "
                 f"{stats.token_events_skipped} drift-skipped"
             )
+
+    conn.close()
 
     # #320: transcript/search ingestion is a second physical database with its
     # own cursors and flocks. Run it only after the core providers have

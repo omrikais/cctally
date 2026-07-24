@@ -24,6 +24,11 @@ export interface ShareModalState {
   // this, so every render/compose/history/preset request this flow issues
   // carries the captured source, not the live selection. Defaults to 'claude'.
   source: DashboardSelection;
+  // #341 Task 4 §4 — the focused account captured under the same OPEN_SHARE, so
+  // the server renders only this account's snapshot regardless of a mid-flow
+  // SET_ACCOUNT_FOCUS. `null` = All accounts (the whole-source snapshot). The
+  // master store stamps it from the resolved focus of the captured source.
+  account: string | null;
   // Element id captured when the share modal opens; <ShareModalRoot>
   // uses it to re-acquire the trigger element for focus restoration on
   // close (a11y: matches the existing panel-modal focus-restore pattern).
@@ -63,6 +68,9 @@ export type ShareAction =
       // when it forwards OPEN_SHARE (the pure action creator omits it). Defaults
       // to 'claude' in the reducer so direct unit dispatches stay valid.
       source?: DashboardSelection;
+      // #341 Task 4 — the focused account (accountKey) captured at OPEN_SHARE;
+      // null (default) = All accounts.
+      account?: string | null;
     }
   | { type: 'CLOSE_SHARE' }
   | { type: 'OPEN_COMPOSER' }
@@ -76,9 +84,10 @@ export function shareReducer(state: ShareSlice, action: ShareAction): ShareSlice
       // would leave the key in the object and break narrowed
       // discriminated-union checks downstream.
       const source: DashboardSelection = action.source ?? 'claude';
+      const account: string | null = action.account ?? null;
       const modal: ShareModalState = action.params !== undefined
-        ? { panel: action.panel, triggerId: action.triggerId, source, params: action.params }
-        : { panel: action.panel, triggerId: action.triggerId, source };
+        ? { panel: action.panel, triggerId: action.triggerId, source, account, params: action.params }
+        : { panel: action.panel, triggerId: action.triggerId, source, account };
       return { ...state, shareModal: modal };
     }
     case 'CLOSE_SHARE':

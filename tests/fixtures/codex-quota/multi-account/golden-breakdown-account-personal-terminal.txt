@@ -1,0 +1,3 @@
+Codex quota breakdown · secondary · 1h · root=root-shared · limit=limit-secondary
+reset 2026-07-15T15:00:00Z · speed standard
+ 41%         0 tokens  $0.000000  Δ$0.000000

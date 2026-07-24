@@ -2726,7 +2726,15 @@ def _setup_install(args: argparse.Namespace) -> int:
             try:
                 cache_conn = c.open_cache_db()
                 try:
-                    stats = c.sync_cache(cache_conn, progress=progress.sync_callback)
+                    cache_mod = c._load_sibling("_cctally_cache")
+                    stats, cache_conn = (
+                        cache_mod._run_cache_operation_with_recovery(
+                            cache_conn,
+                            lambda active_conn: c.sync_cache(
+                                active_conn, progress=progress.sync_callback
+                            ),
+                        )
+                    )
                 finally:
                     try:
                         cache_conn.close()

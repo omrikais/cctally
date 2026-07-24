@@ -91,6 +91,12 @@ class SnapshotSignature(NamedTuple):
     # from the independently-committed quota/budget projection database.
     codex_physical_mutation_seq: int = 0
     codex_stats_digest: str = ""
+    # #341 finding 9: a digest of the account registry + the providers' on-disk
+    # identity-file/active-account state. Empty for every <=1-account install (no
+    # account ever observed), so it is byte-neutral there; otherwise it flips on
+    # an account SWITCH with zero new ingested rows, so the idle short-circuit is
+    # left and the `active` marker rebuilds on the next tick.
+    accounts_digest: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -179,6 +185,7 @@ def compute_signature(
     *,
     generation: int,
     codex_stats_digest: str = "",
+    accounts_digest: str = "",
 ) -> SnapshotSignature:
     """Composite data-version signature across cache.db + stats.db (spec §3).
 
@@ -199,6 +206,7 @@ def compute_signature(
         entry_mutation_seq=_entry_mutation_seq(cache_conn),
         codex_physical_mutation_seq=_codex_physical_mutation_seq(cache_conn),
         codex_stats_digest=str(codex_stats_digest),
+        accounts_digest=str(accounts_digest),
     )
 
 

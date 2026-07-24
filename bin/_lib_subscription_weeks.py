@@ -284,8 +284,17 @@ def _compute_subscription_weeks(
     range_start: dt.datetime,
     range_end: dt.datetime,
     config: "dict | None" = None,
+    *,
+    account_key: "str | None",
 ) -> list[SubWeek]:
     """Generate the ordered list of subscription weeks overlapping [range_start, range_end].
+
+    ``account_key`` (#341, review finding 11): MANDATORY account context — no
+    silent global fallback. A real key scopes the snapshot-derived reset anchors
+    to that account so two accounts with different reset cadences never
+    re-anchor each other's week walk; ``None`` is the explicit "all accounts"
+    (merged) read used by the analytics callers, byte-identical to today on a
+    single-account install.
 
     Prefers snapshot rows (authoritative reset boundaries from actual data)
     and extrapolates by 7-day multiples only for the range tail before the
@@ -309,7 +318,10 @@ def _compute_subscription_weeks(
     dates that miss actual snapshot boundaries for middle weeks. Using
     snapshot rows directly for weeks they cover avoids that drift.
     """
-    # Case A: snapshots exist.
+    # Case A: snapshots exist. Account scoping (#341): a real key filters the
+    # reset anchors to that account; None is the merged (all-accounts) read.
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
     snap_rows = conn.execute(
         "SELECT "
         "    MIN(week_start_at) AS week_start_at, "
@@ -320,8 +332,10 @@ def _compute_subscription_weeks(
         "WHERE week_start_at IS NOT NULL "
         "  AND week_end_at   IS NOT NULL "
         "  AND week_start_date IS NOT NULL "
+        f"  {acct_pred} "
         "GROUP BY week_start_date "
-        "ORDER BY MIN(week_start_at) ASC"
+        "ORDER BY MIN(week_start_at) ASC",
+        acct_params,
     ).fetchall()
 
     weeks: list[SubWeek] = []

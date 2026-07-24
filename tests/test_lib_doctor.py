@@ -68,6 +68,8 @@ def test_doctor_state_has_required_fields():
         # #315: read-only cache.db free-page evidence.
         "cache_db_page_count", "cache_db_freelist_count",
         "conversations_db_page_count", "conversations_db_freelist_count",
+        # #344 Task B: privacy-safe repair-owner classification.
+        "cache_repair_marker",
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
@@ -82,6 +84,9 @@ def test_doctor_state_has_required_fields():
         "journal_malformed_count", "journal_torn_tail_count",
         "journal_cursor_lag_bytes", "journal_hw_segment",
         "journal_cursor_segment", "journal_heal_incidents",
+        # #341 Task 3: multi-account health legs (accounts.identity/registry/
+        # freshness/attribution) all read off this single gathered snapshot.
+        "accounts_state",
     }
     assert fields == expected, fields ^ expected
 
@@ -1279,8 +1284,8 @@ def test_safety_update_available_details_omit_suppressed_when_irrelevant():
 def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
-        "install", "hooks", "auth", "db", "journal", "data", "pricing",
-        "safety", "telemetry",
+        "install", "hooks", "auth", "db", "journal", "data", "accounts",
+        "pricing", "safety", "telemetry",
     }
 
 
@@ -1355,8 +1360,8 @@ def test_serialize_json_top_level_shape():
     assert payload["cctally_version"] == "1.6.3"
     cat_ids = [c["id"] for c in payload["categories"]]
     assert cat_ids == [
-        "install", "hooks", "auth", "db", "journal", "data", "pricing",
-        "safety", "telemetry",
+        "install", "hooks", "auth", "db", "journal", "data", "accounts",
+        "pricing", "safety", "telemetry",
     ]
 
 

@@ -274,12 +274,16 @@ It opens the target via a **raw existing-file-only** connection
 (`sqlite3.connect("file:<path>?mode=rw", uri=True)`, guarded by an
 `exists()` check) — explicitly **not** `open_cache_db()` / `open_db()`,
 which apply schema, run the migration dispatcher, can delete Codex rows,
-and would create a missing DB. It relies on SQLite's own file locking
-plus a 15 s `busy_timeout`; it is **best-effort** — if a reader/writer
-holds the target off past the timeout it reports `busy` rather than
-hanging. There is **no prod guard and no `--yes`** — a checkpoint is safe
-from any instance (a dev checkout drains the dev data dir; the installed
-binary drains prod).
+and would create a missing DB. For `cache.db`, it first takes the same
+shared side of `cache.db.maintenance.lock` and then the same global writer
+flock as Claude/Codex sync, using the 15 s timeout as one bounded lock
+wait. A manual checkpoint therefore cannot start during recovery's
+drain/quarantine handshake or overlap a cache write/end-of-sync
+checkpoint. SQLite's own locking still excludes readers. The command is
+**best-effort** — if either layer stays busy it reports `busy` rather than
+hanging. There is **no prod guard and no
+`--yes`** — a checkpoint is safe from any instance (a dev checkout drains
+the dev data dir; the installed binary drains prod).
 
 | Flag | Description |
 | --- | --- |

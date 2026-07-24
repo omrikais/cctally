@@ -321,12 +321,14 @@ ALLOWED_CONFIG_KEYS = (
     "budget.period",
     "budget.projects",
     "budget.project_alerts_enabled",
+    "budget.accounts",
     "budget.codex",
     "budget.codex.amount_usd",
     "budget.codex.period",
     "budget.codex.alerts_enabled",
     "budget.codex.alert_thresholds",
     "budget.codex.projected_enabled",
+    "budget.codex.accounts",
     "telemetry.enabled",
     "conversation.retention_days",
 )
@@ -422,15 +424,89 @@ def _config_codex_leaf_value(config: dict, key: str) -> object:
             "alerts_enabled": False,
             "alert_thresholds": [90, 100],
             "projected_enabled": False,
+            "accounts": {},
         }
         value = defaults[leaf]
     else:
-        value = block[leaf]
+        # `accounts` is conditionally present in the validated block (#341); an
+        # absent map reads as the empty default rather than KeyError-ing.
+        value = block.get(leaf, {} if leaf == "accounts" else None)
     return list(value) if isinstance(value, list) else value
+
+
+def _resolve_one_account_budget_ref(conn, ref: object, provider: str,
+                                    label: str) -> str:
+    """Resolve one per-account-budget ref to an immutable account_key at WRITE
+    time (#341, spec §6 — a later label rename must never retarget the budget).
+
+    A raw 32-hex account_key is accepted verbatim; a label / email / key prefix
+    is resolved against the accounts registry (``conn`` may be None when the DB
+    does not exist yet — only raw keys are then accepted). The reserved
+    ``unattributed`` / ``*`` buckets are rejected (per-account budgets target
+    real accounts only). An unresolvable non-key ref raises _BudgetConfigError."""
+    import re as _re
+    import _lib_accounts
+    if not isinstance(ref, str) or not ref:
+        raise _BudgetConfigError(f"{label} keys must be non-empty strings")
+    if ref in (_lib_accounts.UNATTRIBUTED, _lib_accounts.VENDOR_WIDE):
+        raise _BudgetConfigError(
+            f"{label} cannot target the reserved {ref!r} bucket "
+            "(per-account budgets target real accounts only)"
+        )
+    if _re.fullmatch(r"[0-9a-f]{32}", ref):
+        return ref  # already an immutable account_key
+    if conn is None:
+        raise _BudgetConfigError(
+            f"{label}: cannot resolve account ref {ref!r} — no accounts observed "
+            "yet; use the 32-hex account key"
+        )
+    try:
+        return _lib_accounts.resolve_account_ref(conn, ref, provider)
+    except _lib_accounts.AccountRefError:
+        raise _BudgetConfigError(
+            f"{label}: unknown or ambiguous account ref {ref!r}"
+        )
+
+
+def _normalize_account_budget_refs(raw_obj: dict, provider: str,
+                                   label: str) -> dict:
+    """Normalize every ref key in a ``{ref: usd}`` account-budget object to its
+    immutable account_key (write-time resolution). Values pass through unchanged
+    (validated numerically by ``_validate_account_budget_map`` under the lock)."""
+    import sqlite3
+    conn = None
+    try:
+        db_path = _cctally_core.DB_PATH
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        out: dict = {}
+        for ref, val in raw_obj.items():
+            key = _resolve_one_account_budget_ref(conn, ref, provider, label)
+            out[key] = val
+        return out
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _parse_account_budget_value(raw_value: str, provider: str,
+                                label: str) -> dict:
+    """Parse a ``config set`` account-budget value: JSON object of ``{ref: usd}``
+    with each ref normalized to its account_key at write time."""
+    try:
+        parsed = json.loads(raw_value)
+    except (json.JSONDecodeError, ValueError):
+        raise _BudgetConfigError(f"{label} must be a JSON object, got {raw_value!r}")
+    if not isinstance(parsed, dict):
+        raise _BudgetConfigError(f"{label} must be a JSON object")
+    return _normalize_account_budget_refs(parsed, provider, label)
 
 
 def _parse_codex_budget_leaf_value(leaf: str, raw_value: str) -> object:
     """Parse exactly the command-line wire format for one Codex leaf."""
+    if leaf == "accounts":
+        return _parse_account_budget_value(
+            raw_value, "codex", "budget.codex.accounts")
     if leaf == "amount_usd":
         try:
             return float(raw_value)
@@ -480,7 +556,9 @@ def _set_codex_budget_leaf(config: dict, key: str, raw_value: str) -> dict:
         raise _BudgetConfigError("budget must be an object")
     existing = (budget or {}).get("codex")
     if existing is None:
-        if leaf != "amount_usd":
+        # `accounts` (#341) is valid without a vendor-wide amount_usd, so it —
+        # like amount_usd — may bootstrap a fresh codex block.
+        if leaf not in ("amount_usd", "accounts"):
             raise _BudgetConfigError(
                 "budget.codex.amount_usd must be configured before setting "
                 f"budget.codex.{leaf}"
@@ -930,6 +1008,7 @@ def _config_known_value(config: dict, key: str) -> "object":
         "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.accounts",
         "budget.codex",
     ):
         inner = key.split(".", 1)[1]
@@ -963,7 +1042,7 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     def _coerce(k: str, v: "object") -> "object":
         if k in (
             "alerts.command_template", "alerts.quota", "budget.projects",
-            "budget.codex",
+            "budget.accounts", "budget.codex",
         ) or k.startswith(_CODEX_BUDGET_LEAF_PREFIX):
             return v
         return v if v is not None else ""
@@ -1007,13 +1086,17 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
             # round-trips via `config set alerts.enabled <plain-text>` work.
             if k in (
                 "alerts.command_template", "alerts.quota", "budget.projects",
-                "budget.codex",
+                "budget.accounts", "budget.codex",
             ):
                 # JSON-encoded so `config get` output round-trips through the
                 # matching `config set` branch (both JSON-parse their value).
                 # `alerts.command_template` is a list-of-strings|null;
-                # `budget.projects` is an object {git-root: usd};
+                # `budget.projects` / `budget.accounts` are objects;
                 # `budget.codex` is an object|null (the no-budget sentinel).
+                rendered = json.dumps(v)
+            elif k.startswith(_CODEX_BUDGET_LEAF_PREFIX) and isinstance(v, dict):
+                # `budget.codex.accounts` (#341) is a JSON object; round-trips
+                # through the codex-leaf setter's JSON parse.
                 rendered = json.dumps(v)
             elif k.startswith(_CODEX_BUDGET_LEAF_PREFIX) and v is None:
                 rendered = "null"
@@ -1611,6 +1694,7 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.accounts",
         "budget.codex",
     ):
         inner_key = key.split(".", 1)[1]
@@ -1675,6 +1759,18 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                     )
                     return 2
                 new_val = parsed_codex
+        elif inner_key == "accounts":
+            # `budget.accounts` is a dict {account_key: usd} (#341). Accepts refs
+            # (label/email/prefix) but normalizes to immutable account keys HERE,
+            # at write time, so a later `account label` rename never retargets the
+            # budget (spec §6). The per-value numeric rule is enforced by
+            # _get_budget_config under the lock below.
+            try:
+                new_val = _parse_account_budget_value(
+                    raw, "claude", "budget.accounts")
+            except _BudgetConfigError as exc:
+                eprint(f"cctally config: {exc}")
+                return 2
         elif inner_key == "projects":
             # `budget.projects` is a dict {git-root: usd}, which the plain
             # number/bool/list leaves can't round-trip — JSON-parse it (mirrors
@@ -1800,9 +1896,9 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             if isinstance(out_val, bool):
                 rendered = "true" if out_val else "false"
-            elif inner_key in ("projects", "codex"):
-                # JSON so `config get budget.{projects,codex}` round-trips back
-                # through this branch (str(dict)/None is not valid JSON; the
+            elif inner_key in ("projects", "codex", "accounts"):
+                # JSON so `config get budget.{projects,codex,accounts}` round-trips
+                # back through this branch (str(dict)/None is not valid JSON; the
                 # codex no-budget sentinel renders as `null`).
                 rendered = json.dumps(out_val)
             else:
@@ -1847,6 +1943,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                     return 0
                 prospective = dict(validated_existing)
                 prospective.pop(leaf, None)
+                # A per-account-only Codex block (#341) whose accounts (or a
+                # bare block whose amount) are now gone has nothing left to
+                # anchor -> drop the whole codex block rather than re-raise the
+                # "amount_usd required" validation.
+                if prospective.get("amount_usd") is None and not (
+                    prospective.get("accounts") or {}
+                ):
+                    block.pop("codex", None)
+                    if block:
+                        config["budget"] = block
+                    else:
+                        config.pop("budget", None)
+                    save_config(config)
+                    return 0
                 configured = _validate_codex_budget_block(prospective)
                 assert configured is not None
                 block["codex"] = configured
@@ -2065,6 +2175,7 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
         "budget.period",
         "budget.projects",
         "budget.project_alerts_enabled",
+        "budget.accounts",
         "budget.codex",
     ):
         # Drop only the named leaf; preserve sibling budget.* keys (e.g.

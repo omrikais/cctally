@@ -86,6 +86,7 @@ def _common_setup_preamble() -> str:
         : "${HARNESS_FAKE_HOME:?HARNESS_FAKE_HOME must be set}"
         : "${REPO_ROOT:?REPO_ROOT must be set}"
         mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally"
+        touch "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db.maintenance.lock"
         mkdir -p "$HARNESS_FAKE_HOME/.claude"
         mkdir -p "$HARNESS_FAKE_HOME/.local/bin"
         # The harness sets CCTALLY_AS_OF before invoking doctor, so all

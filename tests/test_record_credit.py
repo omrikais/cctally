@@ -75,7 +75,7 @@ def test_weekly_credit_floors_table_created_no_migration(ns):
 def test_reset_aware_floor_empty_is_none(ns):
     conn = ns["open_db"]()
     try:
-        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT) is None
+        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT, account_key=None) is None
     finally:
         conn.close()
 
@@ -89,7 +89,7 @@ def test_reset_aware_floor_credit_floor_only(ns):
             ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
              "2026-06-19T14:37:00Z"))
         conn.commit()
-        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT)
+        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT, account_key=None)
         assert got == "2026-06-19T14:00:00+00:00"
     finally:
         conn.close()
@@ -115,7 +115,7 @@ def test_reset_aware_floor_latest_wins_mixed_offsets(ns):
             ("2026-06-13", "2026-06-19T14:00:00+00:00", 46.0,
              "2026-06-19T14:37:00Z"))
         conn.commit()
-        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT)
+        got = ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT, account_key=None)
         assert got == "2026-06-19T14:00:00+00:00"   # the later credit floor
     finally:
         conn.close()
@@ -133,7 +133,7 @@ def test_reset_aware_floor_reset_event_out_of_window_ignored(ns):
             ("2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z",
              "2026-06-06T05:00:00+00:00", "2026-06-01T00:00:00Z", 50.0))
         conn.commit()
-        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT) is None
+        assert ns["_reset_aware_floor"](conn, "2026-06-13", WS_AT, WE_AT, account_key=None) is None
     finally:
         conn.close()
 
@@ -245,7 +245,7 @@ def _weekly_reads(ns):
     conn = ns["open_db"]()
     try:
         return ns["_resolve_reset_aware_hwm"](
-            conn, "2026-06-13", WS_AT, WE_AT)
+            conn, "2026-06-13", WS_AT, WE_AT, account_key=None)
     finally:
         conn.close()
 
@@ -448,7 +448,8 @@ def test_s13_write_clamp_stores_post_credit_tick(ns, monkeypatch):
         if owned:
             conn = ns["open_db"]()
         try:
-            return ns["_resolve_reset_aware_hwm"](conn, wsd, ws_at, we_at)
+            return ns["_resolve_reset_aware_hwm"](conn, wsd, ws_at, we_at,
+                                                  account_key=None)
         finally:
             if owned:
                 conn.close()

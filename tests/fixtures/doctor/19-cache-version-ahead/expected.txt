@@ -20,12 +20,12 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 99 / 28 known
+  ✓ cache.db                 version 99 / 29 known
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            cache.db ahead (v99 > known v28) — auto-heals
+  ⚠ Version ahead            cache.db ahead (v99 > known v29) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
-  ✓ Migrations               0/41 applied
-  ⚠ Pending migrations       41 pending
+  ✓ Migrations               0/42 applied
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -47,6 +47,11 @@ Data
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
   ✓ Conversation rollup      no data
+Accounts
+  ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Account registry         no accounts observed yet
+  ✓ Account attribution freshness no attribution activity recorded
+  ✓ Account attribution      usage attribution healthy
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -59,4 +64,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 39 OK · 5 WARN · 0 FAIL
+Summary: 43 OK · 5 WARN · 0 FAIL

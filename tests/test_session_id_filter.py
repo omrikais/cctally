@@ -100,8 +100,9 @@ def patched_session(cctally_mod, monkeypatch):
     aggregated = [sess_b, sess_a]
 
     # Replace `get_claude_session_entries` (DB read) → empty entries list.
+    # cmd_session now passes account_key= (#341), so absorb it via **kwargs.
     monkeypatch.setattr(mod, "get_claude_session_entries",
-                        lambda start, end: [])
+                        lambda start, end, **kwargs: [])
     # Replace `build_sessions_view` with a stub returning our mock data.
     fake_view = SimpleNamespace(aggregated=tuple(aggregated), rows=())
     monkeypatch.setattr(
@@ -233,7 +234,7 @@ def test_filter_applies_to_share_export(cctally_mod, monkeypatch):
         total_cost_usd=3.0,
     )
     monkeypatch.setattr(mod, "get_claude_session_entries",
-                        lambda start, end: [])
+                        lambda start, end, **kwargs: [])
     monkeypatch.setattr(mod, "build_sessions_view",
                         lambda *a, **kw: real_view)
     monkeypatch.setattr(mod, "_share_validate_args", lambda args: None)

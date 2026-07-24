@@ -361,6 +361,10 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "JOURNAL_DIR": share / "journal",
         "JOURNAL_LOCK_PATH": share / "journal.lock",
         "JOURNAL_INGEST_LOCK_PATH": share / "journal.ingest.lock",
+        # Claude identity file (#341). Pinned so account-attribution reads (the
+        # epoch-transition coordinator, record-usage/statusline stamping) hit the
+        # per-test fake HOME, never the developer's real ~/.claude.json.
+        "CLAUDE_JSON_PATH": tmp_path / ".claude.json",
         "CONFIG_LOCK_PATH": share / "config.json.lock",
         "CONFIG_PATH": share / "config.json",
         "MIGRATION_ERROR_LOG_PATH": share / "logs" / "migration-errors.log",

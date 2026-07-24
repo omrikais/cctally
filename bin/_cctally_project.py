@@ -423,6 +423,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         # fallback for non-Monday-reset accounts).
         current_weeks = c._compute_subscription_weeks(
             conn, now, now + dt.timedelta(microseconds=1), config=config,
+            account_key=None,  # #341: merged (all-accounts) analytics read
         )
         if current_weeks:
             cw_start = parse_iso_datetime(
@@ -444,6 +445,7 @@ def cmd_project(args: argparse.Namespace) -> int:
     # `_aggregate_weekly`'s bisect pattern (first-match-wins on overlap).
     subweeks = c._compute_subscription_weeks(
         conn, since_dt, until_dt, config=config,
+        account_key=None,  # #341: merged (all-accounts) analytics read
     )
     parsed_bounds: list[tuple[dt.datetime, dt.datetime]] = []
     for sw in subweeks:
@@ -489,6 +491,13 @@ def cmd_project(args: argparse.Namespace) -> int:
     else:
         scan_start, scan_end = since_dt, until_dt
 
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable). None = merged.
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
     resolver_cache: dict[str, ProjectKey] = {}
     buckets: dict[tuple[ProjectKey, dt.datetime], dict] = {}
     total_cost_by_week: dict[dt.datetime, float] = {}
@@ -502,7 +511,8 @@ def cmd_project(args: argparse.Namespace) -> int:
     # aggregation semantics (denominator widened to ALL entries; visible
     # rows only the post-filter subset). The list is small enough to
     # hold (entries already in memory via the cache row factory).
-    joined_entries_all = list(c.get_claude_session_entries(scan_start, scan_end))
+    joined_entries_all = list(c.get_claude_session_entries(
+        scan_start, scan_end, account_key=acct_key))
 
     # Build the --debug report dataset: skip synthetic + out-of-window
     # entries, then apply --model and --project filters (mirroring the
@@ -788,6 +798,7 @@ def cmd_project(args: argparse.Namespace) -> int:
             include_breakdown=args.breakdown,
             week_snapshots=week_snapshots,
         )
+        payload.update(c.account_json_fields(acct_key))  # #341 R8 decoration
         sink = getattr(args, "_source_result_sink", None)
         if sink is not None:
             sink(payload)

@@ -301,12 +301,43 @@ def codex_hook_roots(paths: list[pathlib.Path]) -> list[CodexHookRoot]:
     return [roots[key] for key in sorted(roots)]
 
 
+def _resolve_codex_hook_account(root: CodexHookRoot) -> str:
+    """Resolve one hook root's active account_key from ``<home>/auth.json`` via
+    the stable-read protocol (#341, spec §1). identified -> the real key;
+    stably-absent (no auth / api-key mode) OR torn -> the ``unattributed``
+    sentinel (so the throttle marker keeps its byte-stable name). Read-only."""
+    import _lib_accounts
+
+    def _reader(data: bytes):
+        try:
+            obj = json.loads(data)
+        except (ValueError, TypeError):
+            raise _lib_accounts.TornRead()
+        if not isinstance(obj, dict):
+            raise _lib_accounts.TornRead()
+        tokens = obj.get("tokens")
+        id_token = (tokens.get("id_token") if isinstance(tokens, dict)
+                    else obj.get("id_token"))
+        payload = _lib_accounts.decode_id_token_payload(id_token)
+        nat = _lib_accounts.codex_natural_id(payload)
+        if nat is None:
+            return None
+        return _lib_accounts.account_key("codex", nat)
+
+    result = _lib_accounts.stable_read_identity(
+        str(root.codex_home / "auth.json"), _reader)
+    if result.status == "identified":
+        return str(result.value)
+    return _lib_accounts.UNATTRIBUTED
+
+
 def acquire_due_lifecycle_locks(
     app_dir: pathlib.Path,
     roots: list[CodexHookRoot],
     *,
     now: float,
     throttle_seconds: float = CODEX_HOOK_THROTTLE_SECONDS,
+    account_resolver: "Callable[[CodexHookRoot], str] | None" = None,
 ) -> list[CodexLifecycleLock]:
     base = app_dir / "codex-hook-tick"
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -314,10 +345,18 @@ def acquire_due_lifecycle_locks(
         os.chmod(base, 0o700)
     except OSError:
         pass
+    resolve_account = account_resolver or _resolve_codex_hook_account
     held: list[CodexLifecycleLock] = []
     for root in sorted(roots, key=lambda item: item.source_root_key):
         lock_path = base / f"{root.source_root_key}.lock"
-        marker_path = base / f"{root.source_root_key}.last-success"
+        # Throttle marker keys by (source_root_key, account_key) so a mid-interval
+        # account switch bypasses the PRIOR account's throttle (spec §1). The
+        # ``unattributed`` sentinel keeps the byte-stable legacy marker name (no
+        # account suffix) — single-account / no-auth installs are unchanged.
+        import _lib_accounts
+        account = resolve_account(root)
+        suffix = "" if account == _lib_accounts.UNATTRIBUTED else f".{account}"
+        marker_path = base / f"{root.source_root_key}{suffix}.last-success"
         fd = -1
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)

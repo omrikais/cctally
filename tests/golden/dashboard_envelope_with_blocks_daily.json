@@ -205,6 +205,7 @@
     }
   },
   "sync_age_s": null,
+  "sync_failure": null,
   "trend": null,
   "update": {
     "state": null,

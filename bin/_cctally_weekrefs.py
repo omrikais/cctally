@@ -72,24 +72,34 @@ def _get_canonical_boundary_for_date(
     return None, None
 
 
-def get_recent_weeks(conn: sqlite3.Connection, limit: "int | None") -> list[WeekRef]:
+def get_recent_weeks(
+    conn: sqlite3.Connection, limit: "int | None", *,
+    account_key: "str | None" = None,
+) -> list[WeekRef]:
     # ``limit=None`` → SQL ``LIMIT -1`` (unbounded): the milestone-history
     # index (#hero-milestone-history) enumerates EVERY navigable week with no
     # depth cap. Existing callers pass a concrete int and are unaffected.
+    #
+    # ``account_key`` (#341, spec §3): ``None`` = the account-blind merged read
+    # (today's byte-identical behavior); a real key / ``unattributed`` scopes both
+    # snapshot legs to that account's weeks (the ``--account`` render consumers —
+    # ``report`` — pass it explicitly).
     limit_sql = -1 if limit is None else int(limit)
+    acct_pred = "" if account_key is None else " WHERE account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
     rows = conn.execute(
-        """
+        f"""
         SELECT week_start_date, MAX(week_end_date) AS week_end_date
         FROM (
-          SELECT week_start_date, week_end_date FROM weekly_usage_snapshots
+          SELECT week_start_date, week_end_date FROM weekly_usage_snapshots{acct_pred}
           UNION ALL
-          SELECT week_start_date, week_end_date FROM weekly_cost_snapshots
+          SELECT week_start_date, week_end_date FROM weekly_cost_snapshots{acct_pred}
         )
         GROUP BY week_start_date
         ORDER BY week_start_date DESC
         LIMIT ?
         """,
-        (limit_sql,),
+        acct_p + acct_p + (limit_sql,),
     ).fetchall()
 
     refs: list[WeekRef] = []
@@ -333,21 +343,31 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 return
     try:
         rows = conn.execute(
-            "SELECT captured_at_utc, week_end_at, weekly_percent "
+            "SELECT captured_at_utc, week_end_at, weekly_percent, account_key "
             "FROM weekly_usage_snapshots "
             "WHERE week_end_at IS NOT NULL "
-            "ORDER BY captured_at_utc ASC, id ASC"
+            "ORDER BY account_key ASC, captured_at_utc ASC, id ASC"
         ).fetchall()
     except sqlite3.DatabaseError:
         return
     # Canonicalized (hour-rounded) previous end; stored canonical form is
     # what WeekRef.week_end_at carries after make_week_ref, so maps in
     # _apply_reset_events_to_weekrefs stay joinable without extra parsing.
+    # #341: the scan is PARTITIONED by account_key (ORDER BY account_key first)
+    # so one account's boundary shift never derives a phantom reset off another
+    # account's consecutive snapshot; prior state resets at each account boundary.
     prior_end = None
     prior_pct: float | None = None
+    prior_account = None
     for row in rows:
         cur_end_raw = row["week_end_at"]
         cur_pct = row["weekly_percent"]
+        cur_account = row["account_key"]
+        if cur_account != prior_account:
+            # New account partition — do not compare across the boundary.
+            prior_end = None
+            prior_pct = None
+            prior_account = cur_account
         if not cur_end_raw:
             continue
         try:
@@ -385,8 +405,9 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "INSERT OR IGNORE INTO week_reset_events "
                     "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                    " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-                    (row["captured_at_utc"], prior_end, cur_end, effective_iso),
+                    " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+                    (row["captured_at_utc"], prior_end, cur_end, effective_iso,
+                     cur_account),
                 )
         elif prior_end and cur_end == prior_end:
             # In-place credit branch (v1.7.2). Mirrors the live detection
@@ -418,8 +439,8 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 # upgrade. (See round-2 review Bug 1.)
                 already = conn.execute(
                     "SELECT 1 FROM week_reset_events "
-                    "WHERE new_week_end_at = ? LIMIT 1",
-                    (cur_end,),
+                    "WHERE new_week_end_at = ? AND account_key = ? LIMIT 1",
+                    (cur_end, cur_account),
                 ).fetchone()
                 if already is not None:
                     prior_end = cur_end
@@ -450,8 +471,9 @@ def _backfill_week_reset_events(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "INSERT OR IGNORE INTO week_reset_events "
                     "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                    " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
-                    (row["captured_at_utc"], effective_iso, cur_end, effective_iso),
+                    " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+                    (row["captured_at_utc"], effective_iso, cur_end, effective_iso,
+                     cur_account),
                 )
         prior_end = cur_end
         prior_pct = cur_pct
@@ -553,7 +575,7 @@ def _week_ref_has_reset_event(
 
 
 def _compute_cost_for_weekref(
-    ref: WeekRef, *, skip_sync: bool = False
+    ref: WeekRef, *, skip_sync: bool = False, account_key: "str | None" = None,
 ) -> float | None:
     """Live-compute USD cost over `ref`'s (possibly reset-adjusted) range
     straight from session_entries. Mirrors what cmd_sync_week writes into
@@ -577,7 +599,8 @@ def _compute_cost_for_weekref(
         return None
     if end <= start:
         return 0.0
-    return c._sum_cost_for_range(start, end, mode="auto", skip_sync=skip_sync)
+    return c._sum_cost_for_range(
+        start, end, mode="auto", skip_sync=skip_sync, account_key=account_key)
 
 
 def _apply_overlap_clamp_to_weekrefs(refs: list[WeekRef]) -> list[WeekRef]:

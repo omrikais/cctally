@@ -34,6 +34,7 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
         now_arg = "None"
     else:
         now_arg = f"dt.datetime.fromisoformat({now_iso!r})"
+    pre_call_stmt = f"exec({pre_call!r})" if pre_call else ""
     driver = textwrap.dedent(f"""
         import sys, json, datetime as dt
         sys.path.insert(0, {str(REPO / 'bin')!r})
@@ -45,7 +46,7 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
         # sys.modules[cls.__module__].__dict__, which would NPE otherwise.
         sys.modules["cctally"] = mod
         loader.exec_module(mod)
-        {pre_call}
+        {pre_call_stmt}
         st = mod.doctor_gather_state(
             now_utc={now_arg},
             runtime_bind={runtime_bind!r},
@@ -73,8 +74,14 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
     env.pop("CODEX_HOME", None)
     if env_extra:
         env.update(env_extra)
-    res = subprocess.run([sys.executable, "-c", driver],
-                         env=env, capture_output=True, text=True, check=True)
+    res = subprocess.run(
+        [sys.executable, "-c", driver],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)
 
 
@@ -119,6 +126,37 @@ def test_gather_install_is_brew_true_when_keg(tmp_path):
     assert st["install_is_brew"] is True
 
 
+def test_gather_skips_every_cache_probe_while_repair_owner_is_live(tmp_path):
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    pre_call = textwrap.dedent("""
+        import os, sqlite3, time
+        cache = mod.open_cache_db()
+        cache.close()
+        db_mod = mod._load_sibling("_cctally_db")
+        marker = db_mod._repair_marker_path(mod._cctally_core.CACHE_DB_PATH)
+        marker.write_text(db_mod._encode_repair_owner(
+            pid=os.getpid(),
+            process_start=db_mod._process_start_identity(os.getpid()),
+            claim_id="doctor-live-owner",
+            created_ns=time.time_ns(),
+        ))
+        real_connect = sqlite3.connect
+        def guarded_connect(target, *args, **kwargs):
+            if str(target).split("?", 1)[0].endswith("cache.db"):
+                raise AssertionError("doctor opened cache.db during live repair")
+            return real_connect(target, *args, **kwargs)
+        sqlite3.connect = guarded_connect
+    """)
+
+    st = _run_gather(tmp_path, pre_call=pre_call)
+
+    assert st["cache_repair_marker"]["exists"] is True
+    assert st["cache_repair_marker"]["live"] is True
+    assert st["cache_entries_count"] is None
+    assert st["codex_entries_count"] is None
+    assert st["parse_health_claude"] is None
+
+
 # --- U9: conversation_sessions rollup gather (#217 S1) ----------------------
 
 def _seed_rollup_cache(home: pathlib.Path, *, rollup_rows: int,
@@ -161,6 +199,7 @@ def _seed_codex_project_metadata_cache(home: pathlib.Path):
     import _cctally_db as db  # noqa: PLC0415
     cdir = home / ".local" / "share" / "cctally"
     cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / "cache.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(cdir / "cache.db"))
     try:
         db._apply_cache_schema(conn)
@@ -201,6 +240,7 @@ def test_gather_codex_project_metadata_query_failure_is_explicit(tmp_path):
 
     cache_dir = tmp_path / ".local" / "share" / "cctally"
     cache_dir.mkdir(parents=True)
+    (cache_dir / "cache.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(cache_dir / "cache.db"))
     try:
         conn.execute("CREATE TABLE codex_session_entries (timestamp_utc TEXT NOT NULL)")

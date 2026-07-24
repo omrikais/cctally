@@ -288,7 +288,8 @@ def _legacy_fixture_dependencies(module, command: str, *, populated: bool):
             "2026-06-29T00:00:00Z", "2026-07-06T00:00:00Z",
         ))
         replace(module, "_apply_reset_events_to_weekrefs", lambda _conn, refs: refs)
-        replace(module, "get_recent_weeks", lambda *_args: [week_ref] if populated else [])
+        replace(module, "get_recent_weeks",
+                lambda *_args, **_kw: [week_ref] if populated else [])  # **_kw: #341 account_key=
         replace(module, "build_trend_view", lambda *_args, **_kwargs: module.TrendView(rows=trend_rows))
         replace(module._cctally_forecast, "open_db", _fixture_db)
     try:

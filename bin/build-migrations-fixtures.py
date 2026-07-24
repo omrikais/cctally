@@ -4589,6 +4589,178 @@ def build_per_migration_001_five_hour_block_models_backfill_v1(
     _build_post(pre, post)
 
 
+# Fixed cutover Claude account_key baked into the 029 golden (deterministic;
+# NOT derived from any machine state so the #197 byte-idempotency guard holds).
+_CACHE_029_CUTOVER_ACCOUNT = "cafef00dcafef00dcafef00dcafef00d"
+
+
+def build_per_migration_029_backfill_claude_account(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``029_backfill_claude_account``
+    (#341, spec §2 cache.db Claude backfill).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``,
+        so the ``account_key`` columns already exist on session_entries /
+        session_files / codex_session_entries — they are added by
+        ``_apply_cache_schema``, NOT this migration), a ``schema_migrations``
+        table carrying cache 001-028 (an existing install at the 028 head), two
+        Claude ``session_entries`` + one ``session_files`` + one
+        ``codex_session_entries`` row, all with NULL ``account_key``.
+      * ``post.sqlite`` — after running the production 029 handler against a
+        temp journal carrying a cutover op that records a fixed real Claude
+        account: the Claude rows attribute to that account, the Codex row stays
+        NULL (Q2). The dispatcher central-stamps the 029 marker (#140).
+
+    The handler reads ONLY the journal cutover op (never auth); the builder pins
+    both the journal op's account and the row set so a regen is byte-idempotent.
+    Loaded by ``tests/test_cache_migration_029_per_migration_goldens.py`` (which
+    reproduces the same fixed journal op).
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    _PRIOR_CHAIN = tuple(
+        f"{n:03d}_{s}" for n, s in [
+            (1, "dedup_highest_wins"),
+            (2, "conversation_messages_backfill"),
+            (3, "conversation_reingest_tool_ids"),
+            (4, "conversation_reingest_subagent_kind"),
+            (5, "conversation_reingest_meta"),
+            (6, "conversation_reingest_source_tool_use_id"),
+            (7, "conversation_reingest_enrichment"),
+            (8, "session_entries_speed_backfill"),
+            (9, "conversation_media_reingest"),
+            (10, "conversation_search_split"),
+            (11, "conversation_promote_command_args"),
+            (12, "create_conversation_ai_titles"),
+            (13, "create_conversation_sessions"),
+            (14, "conversation_queued_prompt_reingest"),
+            (15, "conversation_sessions_filter_columns"),
+            (16, "drop_search_aux"),
+            (17, "arm_nested_agent_reingest"),
+            (18, "create_conversation_title_fts"),
+            (19, "create_conversation_file_touches"),
+            (20, "session_entries_physical_unique"),
+            (21, "index_conversation_messages_cwd"),
+            (22, "index_conversation_messages_model"),
+            (23, "conversation_sessions_enrichment_columns"),
+            (24, "codex_fused_ingest_rebuild"),
+            (25, "codex_conversation_normalization"),
+            (26, "codex_conversation_key_backfill"),
+            (27, "codex_fork_preamble_rebuild"),
+            (28, "split_conversation_store"),
+        ]
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-15T12:00:00Z"),
+                )
+            # Legacy (pre-#341) rows: NULL account_key on every family.
+            conn.executemany(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model) "
+                "VALUES (?,?,?,?)",
+                [("/p/a.jsonl", 0, "2026-07-01T10:00:00Z", "claude-sonnet-4"),
+                 ("/p/a.jsonl", 120, "2026-07-01T10:05:00Z", "claude-sonnet-4")],
+            )
+            conn.execute(
+                "INSERT INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+                "VALUES (?,?,?,?,?)",
+                ("/p/a.jsonl", 240, 0, 240, "2026-07-01T10:05:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model) "
+                "VALUES (?,?,?,?,?)",
+                ("/c/x.jsonl", 0, "2026-07-01T10:00:00Z", "sess", "gpt-5"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        core = sys.modules["_cctally_core"]
+        journal = sys.modules["_cctally_journal"]
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "029_backfill_claude_account":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("029_backfill_claude_account not registered")
+        # Isolated temp journal with a cutover op recording the fixed account.
+        jdir = scenario_dir / "_journal-tmp"
+        if jdir.exists():
+            import shutil as _sh
+            _sh.rmtree(jdir)
+        jdir.mkdir(parents=True)
+        orig_journal_dir = core.JOURNAL_DIR
+        orig_lock = core.JOURNAL_LOCK_PATH
+        core.JOURNAL_DIR = jdir
+        core.JOURNAL_LOCK_PATH = jdir / "journal.lock"
+        try:
+            journal.append_accounts_cutover_op(
+                _CACHE_029_CUTOVER_ACCOUNT, at="2026-07-15T12:00:00Z")
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                handler(conn)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    ("029_backfill_claude_account", "2026-07-15T12:00:00Z"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        finally:
+            core.JOURNAL_DIR = orig_journal_dir
+            core.JOURNAL_LOCK_PATH = orig_lock
+            import shutil as _sh
+            _sh.rmtree(jdir, ignore_errors=True)
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -5200,6 +5372,9 @@ def main() -> int:
     )
     build_per_migration_028_split_conversation_store(
         FIXTURES_ROOT / "per-migration" / "028_split_conversation_store"
+    )
+    build_per_migration_029_backfill_claude_account(
+        FIXTURES_ROOT / "per-migration" / "029_backfill_claude_account"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

@@ -272,6 +272,20 @@ class DoctorState:
     journal_hw_segment: Optional[str] = None
     journal_cursor_segment: Optional[str] = None
     journal_heal_incidents: Optional[list] = None
+    # Multi-account attribution (#341). A dict (None when unavailable) with:
+    #   * claude_identity_status — "identified" | "stably_absent" | "torn"
+    #   * claude_email — the active Claude email (or None)
+    #   * real_account_count — # real accounts across providers (excludes the
+    #     unattributed sentinel); by_provider — {provider: count}
+    #   * missing_provider — # registry rows lacking a provider (corrupt)
+    #   * freshest_last_seen_age_s — age of the newest last_seen_utc (or None)
+    #   * recent_attributed / recent_unattributed — last-7-day Claude usage
+    #     snapshot counts stamped to a real account vs the sentinel.
+    accounts_state: Optional[dict] = None
+    # Issue #344 Task B: read-only repair-owner classification for
+    # cache.db.repairing. {exists, live, reason}; None only when gather itself
+    # could not inspect the marker. Doctor never reclaims or deletes it.
+    cache_repair_marker: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -692,6 +706,25 @@ def _check_db_stats_file(s: DoctorState) -> CheckResult:
 
 
 def _check_db_cache_file(s: DoctorState) -> CheckResult:
+    marker = s.cache_repair_marker
+    if marker and marker.get("exists"):
+        if marker.get("live") is True:
+            return CheckResult(
+                id="db.cache.file",
+                title="cache.db",
+                severity="warn",
+                summary="repair in progress",
+                remediation="Wait for the active cache repair to finish.",
+                details={"repair_marker": marker},
+            )
+        return CheckResult(
+            id="db.cache.file",
+            title="cache.db",
+            severity="warn",
+            summary="stale repair owner",
+            remediation="Run `cctally cache-sync --rebuild`",
+            details={"repair_marker": marker},
+        )
     return _db_file_check("db.cache.file", "cache.db", s.cache_db_status,
                           "Run `cctally cache-sync --rebuild`")
 
@@ -2055,6 +2088,127 @@ def _check_journal_auto_heal(s: DoctorState) -> CheckResult:
 # `_evaluate_one` uses this id — not the function name — so the synthesized
 # FAIL CheckResult retains the contract id and fingerprint stays stable across
 # success-vs-raise transitions.
+def _check_accounts_identity(s: DoctorState) -> CheckResult:
+    """Is the active-account identity source (`~/.claude.json`) readable? A torn
+    mid-write read WARNs (transient); identified / stably-absent are OK (a legacy
+    / non-Claude-Code install has no file — that is a resolved state, not a
+    fault)."""
+    st = s.accounts_state or {}
+    status = st.get("claude_identity_status")
+    if status == "torn":
+        return CheckResult(
+            id="accounts.identity", title="Account identity source",
+            severity="warn",
+            summary="~/.claude.json is being rewritten (torn read); attribution deferred",
+            remediation="Transient — re-run once Claude Code finishes writing",
+            details={"claude_identity_status": status},
+        )
+    if status == "identified":
+        summary = f"active Claude account readable ({st.get('claude_email') or 'no email'})"
+    else:
+        summary = "no active Claude identity on disk (single-account / api-key mode)"
+    return CheckResult(
+        id="accounts.identity", title="Account identity source",
+        severity="ok", summary=summary, remediation=None,
+        details={"claude_identity_status": status},
+    )
+
+
+def _check_accounts_registry(s: DoctorState) -> CheckResult:
+    """Is the accounts registry consistent? A row lacking a provider is corrupt
+    (WARN → rebuild)."""
+    st = s.accounts_state
+    if st is None:
+        return CheckResult(
+            id="accounts.registry", title="Account registry",
+            severity="ok", summary="no registry (fresh install)",
+            remediation=None, details={},
+        )
+    missing = int(st.get("missing_provider") or 0)
+    count = int(st.get("real_account_count") or 0)
+    by_provider = st.get("by_provider") or {}
+    details = {"real_account_count": count, "by_provider": by_provider,
+               "missing_provider": missing}
+    if missing:
+        return CheckResult(
+            id="accounts.registry", title="Account registry",
+            severity="warn",
+            summary=f"{missing} account row(s) missing a provider",
+            remediation="Run `cctally db rebuild --db stats` to re-derive the registry",
+            details=details,
+        )
+    return CheckResult(
+        id="accounts.registry", title="Account registry",
+        severity="ok",
+        summary=(f"{count} account(s) known" if count
+                 else "no accounts observed yet"),
+        remediation=None, details=details,
+    )
+
+
+def _check_accounts_freshness(s: DoctorState) -> CheckResult:
+    """Attribution freshness — how recently any account was last seen. Purely
+    informational (always OK); a stale value just reports the age."""
+    st = s.accounts_state or {}
+    age = st.get("freshest_last_seen_age_s")
+    if age is None:
+        summary = "no attribution activity recorded"
+    else:
+        a = int(age)
+        if a >= 86400:
+            human = f"{a // 86400}d"
+        elif a >= 3600:
+            human = f"{a // 3600}h"
+        elif a >= 60:
+            human = f"{a // 60}m"
+        else:
+            human = f"{a}s"
+        summary = f"most recent account activity {human} ago"
+    return CheckResult(
+        id="accounts.freshness", title="Account attribution freshness",
+        severity="ok", summary=summary, remediation=None,
+        details={"freshest_last_seen_age_s": age},
+    )
+
+
+def _check_accounts_attribution(s: DoctorState) -> CheckResult:
+    """WARN when Claude usage is flowing but landing in `unattributed` despite a
+    resolved active account (the stamping pipeline is broken), or while the
+    identity is torn. This is the runtime complement to the structural
+    writer-audit backstop for the account_key DEFAULT."""
+    st = s.accounts_state or {}
+    recent_unattr = int(st.get("recent_unattributed") or 0)
+    recent_attr = int(st.get("recent_attributed") or 0)
+    status = st.get("claude_identity_status")
+    details = {"recent_attributed": recent_attr,
+               "recent_unattributed": recent_unattr,
+               "claude_identity_status": status}
+    # A real active account, recent usage, yet all of it unattributed -> the
+    # write-path stamp is not landing.
+    if status == "identified" and recent_unattr > 0 and recent_attr == 0:
+        return CheckResult(
+            id="accounts.attribution", title="Account attribution",
+            severity="warn",
+            summary="recent Claude usage is landing in 'unattributed' despite an active account",
+            remediation="Run `cctally db rebuild --db stats`; if it persists, file an issue",
+            details=details,
+        )
+    if status == "torn" and recent_unattr > 0:
+        return CheckResult(
+            id="accounts.attribution", title="Account attribution",
+            severity="warn",
+            summary="recent usage attributed to 'unattributed' while identity is torn",
+            remediation="Transient — the next clean read re-attributes new usage",
+            details=details,
+        )
+    return CheckResult(
+        id="accounts.attribution", title="Account attribution",
+        severity="ok",
+        summary="usage attribution healthy",
+        remediation=None, details=details,
+    )
+
+
 _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("install", "Install", (
         ("install.mode", "_check_install_dev_mode"),
@@ -2105,6 +2259,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),
         ("data.conversation_sessions_rollup",
          "_check_data_conversation_sessions_rollup"),
+    )),
+    ("accounts", "Accounts", (
+        ("accounts.identity", "_check_accounts_identity"),
+        ("accounts.registry", "_check_accounts_registry"),
+        ("accounts.freshness", "_check_accounts_freshness"),
+        ("accounts.attribution", "_check_accounts_attribution"),
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),

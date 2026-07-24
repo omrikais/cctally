@@ -10,6 +10,9 @@ All persistent state lives under `~/.local/share/cctally/` (a dev checkout uses 
 | `stats.db-wal`, `stats.db-shm`, `cache.db-wal`, `cache.db-shm`, `conversations.db-wal`, `conversations.db-shm` | Yes — SQLite auto-manages them | Nothing once the owning DB is closed cleanly (they checkpoint back into the parent `.db`). Deleting them under a live writer can drop the most recent uncheckpointed writes. |
 | `cache.db` | Yes — `cache-sync --rebuild`, or it rebuilds on the next read | Compact accounting, quota observations, source cursors, and Codex thread identity. Re-derived from your `~/.claude` / `~/.codex` JSONL. |
 | `conversations.db` | Yes — `cache-sync --rebuild` or the dashboard conversation worker | Transcript prose/events, browse rollups, and full-text indexes. Independently re-derived from the same JSONL without blocking core accounting refresh. |
+| `cache.db.repairing` | Yes — normally removed when recovery finishes; a stale owner is reclaimed by the next cache open/rebuild | No user data. It is an atomic repair-owner record (PID + process-start identity + claim token), not a lock file to delete by hand. |
+| `cache.db.quarantine-pending.json` | Yes — removed only after every snapshotted family member reaches one completed quarantine incident | No user data. Durable interruption state for a partially moved cache main/WAL/SHM family; leave it for the next opener/rebuild to resume. |
+| `quarantine/cache.db-*`, `logs/cache-corruption-forensics-*` | No — retained incident evidence | The damaged SQLite family and its diagnostic metadata. Safe recovery creates these before rebuilding; preserve them when investigating recurring corruption. |
 | `cache.db.lock`, `cache.db.codex.lock`, `conversations.db.lock`, `conversations.db.codex.lock`, `conversations.db.maintenance.lock`, `config.json.lock` | Yes — `fcntl.flock` files, re-created on demand | Nothing — they carry no data. |
 | `config.json` | Yes, **but only to defaults** | Your saved settings (`display.tz`, the `dashboard.*` keys, `telemetry.enabled`, week-start, budget, alert config, …). It comes back empty/default — your preferences are not recovered. See [configuration.md](configuration.md). |
 | `install_id` | Yes, **but as a new identity** | Your anonymous telemetry identity rotates — a fresh random id mints on the next beat, so the install count may count you once more. Equivalent to `cctally telemetry reset`. Never leaves your machine. |
@@ -63,7 +66,17 @@ One row per `sync-week` invocation. Stores the computed USD cost for a week wind
 
 ## `cache.db` schema
 
-Fully re-derivable from JSONL through `cache-sync --rebuild`. It carries the compact Claude and Codex accounting/quota estates. Transcript/search state lives separately in `conversations.db`; do not unlink either SQLite family beneath a live process.
+Fully re-derivable from JSONL through `cache-sync --rebuild`. It carries the
+compact Claude and Codex accounting/quota estates. Transcript/search state lives
+separately in `conversations.db`; do not unlink either SQLite family beneath a
+live process. Classified corruption is preserved in forensics/quarantine only
+after the maintenance handshake proves the main/WAL/SHM family has no live
+handles. The failed open or ingest is retried once against the recreated cache;
+`--source claude|codex|all` still controls which provider rows are re-derived,
+and `all` restarts both provider legs if either leg triggers family replacement.
+An atomic pending-quarantine record makes the three family renames resumable;
+recreation waits until the complete snapshotted family is present in one
+incident directory.
 
 ### Claude side
 

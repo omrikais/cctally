@@ -20,6 +20,7 @@ from _cctally_core import (
     parse_iso_datetime,
 )
 from _cctally_cache import _codex_provider_roots
+import _lib_accounts
 from _lib_quota import build_blocks
 from _lib_pricing import _calculate_codex_entry_cost
 from _cctally_quota import load_codex_quota_observations
@@ -81,6 +82,10 @@ class RootedCodexAccountingEntry:
     reasoning_output_tokens: int
     total_tokens: int
     cost_usd: float
+    # #341 Task 4: the ingest-stamped account (NULL in cache.db reads as the
+    # reserved ``unattributed`` sentinel). Carried so the per-account hero cards
+    # can scope spend without a second query shape.
+    account_key: str = _lib_accounts.UNATTRIBUTED
 
 
 _OPAQUE_PROJECT_KEY_RE = re.compile(r"^project:[0-9a-f]{24}$")
@@ -131,14 +136,23 @@ _CODEX_ACCOUNTING_ENTRIES_SQL = """
 """
 
 
+# P3-4 (#341 Task 4 review): the `account_key` column is selected unguarded — it
+# is NOT behind a `has_columns(...)` check like some other account-aware reads.
+# This is safe by construction: `add_column_if_missing(conn, "codex_session_entries",
+# "account_key", ...)` runs on every cache.db open (the pure column-addition
+# schema-evolution path, spec §2), so the column is guaranteed present before any
+# reader can reach this SQL. Defense-in-depth note only; do NOT add a runtime
+# guard here (it would mask a genuinely broken/un-migrated cache instead of failing
+# loudly, and every production reader opens the cache through that migration path).
 _ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL = """
     SELECT timestamp_utc, session_id, source_path, source_root_key, model,
            input_tokens, cached_input_tokens, output_tokens,
-           reasoning_output_tokens, total_tokens
+           reasoning_output_tokens, total_tokens, account_key
       FROM codex_session_entries INDEXED BY idx_codex_entries_ts_root_conversation
      WHERE timestamp_utc >= ?
        AND timestamp_utc < ?
      {root_predicate}
+     {account_predicate}
      ORDER BY timestamp_utc ASC, source_root_key ASC, conversation_key ASC, id ASC
 """
 
@@ -274,6 +288,7 @@ def load_cached_rooted_codex_accounting_entries(
     speed: str,
     cache_conn: sqlite3.Connection,
     source_root_keys: Iterable[str] | None = None,
+    account_key: str | None = None,
 ) -> tuple[RootedCodexAccountingEntry, ...]:
     """Read bounded accounting from one caller-owned cache snapshot only.
 
@@ -282,6 +297,11 @@ def load_cached_rooted_codex_accounting_entries(
     cached root key plus source path are the dashboard's file identity.  A
     caller can additionally constrain the read to roots that established one
     native cycle; root identities remain internal to this adapter.
+
+    ``account_key`` (#341 Task 4) optionally scopes the read to one account; the
+    reserved ``unattributed`` sentinel matches rows whose ``account_key`` is NULL
+    (``NULL ≡ unattributed`` — the cache-read rule). ``None`` reads every account
+    (byte-stable — the default merged read).
     """
     if start.tzinfo is None or start.utcoffset() is None:
         raise ValueError("start must be timezone-aware")
@@ -299,11 +319,22 @@ def load_cached_rooted_codex_accounting_entries(
         "AND source_root_key IN (" + ", ".join("?" for _ in root_keys) + ")"
         if source_root_keys is not None else ""
     )
+    account_params: tuple = ()
+    if account_key is None:
+        account_predicate = ""
+    elif account_key == _lib_accounts.UNATTRIBUTED:
+        account_predicate = "AND (account_key IS NULL OR account_key = ?)"
+        account_params = (_lib_accounts.UNATTRIBUTED,)
+    else:
+        account_predicate = "AND account_key = ?"
+        account_params = (account_key,)
     try:
         rows = tuple(cache_conn.execute(
-            _ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL.format(root_predicate=root_predicate),
+            _ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL.format(
+                root_predicate=root_predicate, account_predicate=account_predicate),
             (
-                start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(), *root_keys,
+                start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(),
+                *root_keys, *account_params,
             ),
         ))
     except sqlite3.Error as exc:
@@ -315,12 +346,16 @@ def load_cached_rooted_codex_accounting_entries(
             (
                 timestamp_raw, session_id_raw, source_path_raw, source_root_key_raw,
                 model_raw, input_raw, cached_input_raw, output_raw, reasoning_raw,
-                total_raw,
+                total_raw, account_key_raw,
             ) = row
             source_path = source_path_raw if isinstance(source_path_raw, str) else ""
             source_root_key = source_root_key_raw if isinstance(source_root_key_raw, str) else ""
             if not source_path or not source_root_key:
                 raise ValueError("rooted accounting identity is absent")
+            entry_account_key = (
+                account_key_raw if isinstance(account_key_raw, str) and account_key_raw
+                else _lib_accounts.UNATTRIBUTED
+            )
             model = str(model_raw)
             input_tokens = int(input_raw)
             cached_input_tokens = int(cached_input_raw)
@@ -349,6 +384,7 @@ def load_cached_rooted_codex_accounting_entries(
             reasoning_output_tokens=reasoning_output_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
+            account_key=entry_account_key,
         ))
     return tuple(result)
 
@@ -451,7 +487,10 @@ def load_qualified_codex_entries(
     previous_row_factory = conn.row_factory
     try:
         if sync:
-            stats = c.sync_codex_cache(conn)
+            cache_mod = c._load_sibling("_cctally_cache")
+            stats, conn = cache_mod._run_cache_operation_with_recovery(
+                conn, lambda active_conn: c.sync_codex_cache(active_conn)
+            )
             if stats.lock_contended:
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
         conn.row_factory = sqlite3.Row
@@ -624,11 +663,15 @@ def load_codex_accounting_entries(
     return tuple(result)
 
 
-def _identity_sort_key(identity: object) -> tuple[str, str, str, str, int]:
+def _identity_sort_key(identity: object) -> tuple[str, str, str, str, int, str]:
+    # account_key (#341) is appended LAST so single-account ordering is
+    # byte-identical (the tiebreak is constant) while a multi-account install
+    # gets a deterministic tiebreak between two accounts' windows.
     return (
         str(identity.source), str(identity.source_root_key),
         str(identity.logical_limit_key), str(identity.observed_slot),
         int(identity.window_minutes),
+        str(getattr(identity, "account_key", "unattributed")),
     )
 
 
@@ -2286,7 +2329,13 @@ def cmd_source_report(args: object) -> int:
         try:
             cache = c.open_cache_db()
             try:
-                sync_stats = c.sync_codex_cache(cache)
+                cache_mod = c._load_sibling("_cctally_cache")
+                sync_stats, cache = (
+                    cache_mod._run_cache_operation_with_recovery(
+                        cache,
+                        lambda active_conn: c.sync_codex_cache(active_conn),
+                    )
+                )
             finally:
                 cache.close()
             c.reconcile_codex_quota_projection(now=as_of)

@@ -679,6 +679,7 @@ def _aggregate_cache_by_day(
     project: str | None = None,
     *,
     display_tz: "ZoneInfo | None" = None,
+    account_key: "str | None" = None,
 ) -> list["crk.CacheRow"]:
     """CLI adapter: pulls entries from ``get_entries`` and delegates to the
     pure-fn kernel ``_lib_cache_report._aggregate_cache_by_day``.
@@ -695,7 +696,8 @@ def _aggregate_cache_by_day(
     the I/O query here; the kernel itself trusts the caller's pre-filter.
     """
     c = _cctally()
-    entries = list(c.get_entries(since, until, project=project))
+    entries = list(c.get_entries(since, until, project=project,
+                                 account_key=account_key))
     return crk._aggregate_cache_by_day(
         entries,
         display_tz=display_tz,
@@ -708,6 +710,8 @@ def _aggregate_cache_by_session(
     since: dt.datetime,
     until: dt.datetime,
     project: str | None = None,
+    *,
+    account_key: "str | None" = None,
 ) -> list["crk.CacheRow"]:
     """CLI adapter: pulls Claude session entries from
     ``get_claude_session_entries`` and delegates to the pure-fn kernel
@@ -723,7 +727,8 @@ def _aggregate_cache_by_session(
     itself trusts the caller's pre-filter.
     """
     c = _cctally()
-    entries = c.get_claude_session_entries(since, until, project=project)
+    entries = c.get_claude_session_entries(since, until, project=project,
+                                           account_key=account_key)
     if not entries:
         return []
 
@@ -1140,6 +1145,14 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
             eprint(f"Error: {msg}")
         return 1
 
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable). None = merged.
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+    _acct_fields = c.account_json_fields(acct_key)  # #341 R8 (empty unless --account)
+
     # Issue #89 Pattern C: deferred loader scoped to the rendered window
     # (project filter mirrors what the cache-aggregator uses).
     c._emit_debug_samples_if_set(
@@ -1157,6 +1170,7 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
                 {top_key: [], "totals": None,
                  "generatedAt": now_utc_iso(now_utc=now_utc)}
             )
+            payload.update(_acct_fields)  # #341 R8 decoration
             sink = getattr(args, "_source_result_sink", None)
             if sink is not None:
                 sink(payload)
@@ -1167,7 +1181,8 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
         return 0
 
     if mode == "session":
-        rows = _aggregate_cache_by_session(since, until, project=args.project)
+        rows = _aggregate_cache_by_session(
+            since, until, project=args.project, account_key=acct_key)
     else:
         # Task A3: pass the resolved display_tz so day buckets match the
         # ``--tz`` flag (closes the pre-existing minor bug where the
@@ -1175,6 +1190,7 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
         # spec §1.6 / plan A3).
         rows = _aggregate_cache_by_day(
             since, until, project=args.project, display_tz=tz,
+            account_key=acct_key,
         )
 
     if not rows:
@@ -1183,6 +1199,7 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
                 {top_key: [], "totals": None,
                  "generatedAt": now_utc_iso(now_utc=now_utc)}
             )
+            payload.update(_acct_fields)  # #341 R8 decoration
             sink = getattr(args, "_source_result_sink", None)
             if sink is not None:
                 sink(payload)
@@ -1206,6 +1223,7 @@ def cmd_cache_report(args: argparse.Namespace) -> int:
 
     if args.json:
         payload = _cache_report_json_payload(rows, mode, now_utc=now_utc)
+        payload.update(_acct_fields)  # #341 R8 decoration
         sink = getattr(args, "_source_result_sink", None)
         if sink is not None:
             sink(payload)

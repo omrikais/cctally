@@ -36,6 +36,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import pathlib
+import re
 import sqlite3
 import sys
 from collections.abc import Mapping
@@ -1266,6 +1267,60 @@ def _share_source_selection(req: dict) -> tuple[str, bool]:
     return source, explicit
 
 
+_ACCOUNT_KEY_RE = re.compile(r"[0-9a-f]{32}|unattributed|\*")
+
+
+def _share_account_selection(req: dict) -> "str | None":
+    """Resolve the optional captured account qualifier (#341 Task 4, spec §4).
+
+    The composer captures ``(source, account)`` at OPEN_SHARE (client
+    ``shareModal.account``) and posts the resolved account_key. A legacy request
+    (no ``account`` field, or an explicit null) stays account-agnostic — today's
+    byte-identical behavior. A malformed value is rejected so a bad qualifier
+    can never reach the reader. The account carries into the data_digest (a focus
+    change busts the composer drift check) and the response/history metadata.
+    """
+    if "account" not in req:
+        return None
+    account = req.get("account")
+    if account is None:
+        return None
+    if not isinstance(account, str) or not _ACCOUNT_KEY_RE.fullmatch(account):
+        raise ValueError("source capability unavailable")
+    return account
+
+
+def _share_account_display_label(source: str, account: "str | None",
+                                 *, reveal: bool) -> "str | None":
+    """The reveal-aware account label to stamp on a share artifact (#341 Task 4).
+
+    Resolves the account's registry label + deterministic index for its provider
+    (``all`` has no account selector) and routes both through the fail-closed
+    kernel chokepoint ``anonymize_account_label`` — so anon-mode (the default)
+    emits ``Account A/B/C`` and only an explicit reveal shows the real label.
+    Returns ``None`` when no account is captured or it cannot be resolved (never
+    guesses; never leaks). Emails are never consulted — only the label.
+    """
+    if account is None or source not in ("claude", "codex"):
+        return None
+    ls = _share_load_lib()
+    c = sys.modules["cctally"]
+    try:
+        import _cctally_account
+        conn = c._load_sibling("_cctally_core").open_db()
+        try:
+            reg = _cctally_account.load_accounts(conn, source)
+            label = _cctally_account.account_label(conn, account)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    index = next(
+        (i for i, r in enumerate(reg) if r["account_key"] == account), -1,
+    )
+    return ls.anonymize_account_label(label, index, reveal=reveal)
+
+
 def _source_state_for_share(data_snap, source: str):
     try:
         bundle = data_snap.source_bundle
@@ -1583,12 +1638,17 @@ def _share_state_domain(state, panel: str):
 
 def _share_digest_input(*, panel: str, template_id: str, source: str,
                         source_explicit: bool, states, snapshots,
-                        panel_data):
+                        panel_data, account: "str | None" = None):
+    # #341 Task 4: the captured account participates in the digest so switching
+    # the focused account registers as data drift in the composer (spec §4).
+    # Absent (legacy / account-agnostic) → omitted, so the digest is byte-stable.
+    account_key = {"account": account} if account is not None else {}
     if not source_explicit:
         return {
             "panel": panel,
             "template_id": template_id,
             "panel_data": panel_data,
+            **account_key,
         }
     providers = []
     for state, snapshot in zip(states, snapshots):
@@ -1612,6 +1672,7 @@ def _share_digest_input(*, panel: str, template_id: str, source: str,
             {"claude_panel_data": panel_data}
             if source in ("claude", "all") else {}
         ),
+        **account_key,
     }
 
 
@@ -1763,6 +1824,7 @@ def _handle_share_render_post_impl(handler) -> None:
         return
     try:
         source, source_explicit = _share_source_selection(req)
+        account = _share_account_selection(req)
     except ValueError:
         handler._respond_json(400, {
             "code": "source_capability_unavailable",
@@ -1924,6 +1986,7 @@ def _handle_share_render_post_impl(handler) -> None:
         states=source_states,
         snapshots=source_snaps,
         panel_data=panel_data,
+        account=account,
     )
     try:
         data_digest = ls._data_digest(digest_input)
@@ -1932,6 +1995,16 @@ def _handle_share_render_post_impl(handler) -> None:
         # back to an empty string and let the composer treat it as
         # "always drifted" rather than failing the whole render.
         data_digest = ""
+
+    # #341 Task 4: the captured account + its reveal-aware anonymized label
+    # (fail-closed via the kernel chokepoint). Present only when an account was
+    # captured, so a legacy/account-agnostic share's response is byte-stable.
+    account_label = _share_account_display_label(source, account, reveal=reveal)
+    account_meta = {}
+    if account is not None:
+        account_meta["account"] = account
+        if account_label is not None:
+            account_meta["account_label"] = account_label
 
     handler._respond_json(200, {
         "body": body,
@@ -1944,6 +2017,7 @@ def _handle_share_render_post_impl(handler) -> None:
             "generated_at": _share_now_utc_iso(),
             "data_digest": data_digest,
             **({"source": source} if source_explicit else {}),
+            **account_meta,
         },
     })
 
@@ -2132,6 +2206,9 @@ def _handle_share_compose_post_impl(handler) -> None:
                 states=source_states,
                 snapshots=source_snaps,
                 panel_data=panel_data,
+                # #341 Task 4: carry the section's captured account so a
+                # focus-changed section re-digests as drift (matching render).
+                account=_share_account_selection(snap_recipe),
             ))
         except Exception:
             digest_now = ""

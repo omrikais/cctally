@@ -25,7 +25,8 @@ import { collectSourceSessionRows, type SessionDisplayRow } from '../lib/sourceR
 import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { SourceChip, DegradedChip } from './sourcePanel';
-import type { DashboardSelection } from '../types/envelope';
+import type { DashboardSelection, SourceName } from '../types/envelope';
+import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import { openShareModal } from '../store/shareSlice';
 import { legacyClaudeConversationRef } from '../types/conversation';
 
@@ -60,6 +61,18 @@ export function SourceSessionsGrid() {
   const searchIndex = useSyncExternalStore(subscribeStore, () => getState().searchIndex);
   const searchText = useSyncExternalStore(subscribeStore, () => getState().searchText);
   const collapsed = useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsCollapsed);
+
+  // #341 Task 4 (Decision R4) — sessions are OUT of the account dimension this
+  // epic: they are labeled unfiltered when an account focus is active, never
+  // filtered. Compute whether the active source has a focus so the label shows.
+  const accountFocusSlot = useSyncExternalStore(
+    subscribeStore,
+    () => (activeSource === 'all'
+      ? ALL_ACCOUNTS
+      : getState().accountFocus[activeSource as SourceName]),
+  );
+  const accountFocused = activeSource !== 'all'
+    && resolveAccountFocus(env, activeSource, accountFocusSlot ?? ALL_ACCOUNTS) != null;
 
   const isMobile = useIsMobile();
   const isAll = activeSource === 'all';
@@ -187,6 +200,15 @@ export function SourceSessionsGrid() {
             </span>
           )}
           {gate.mode === 'degraded' && <DegradedChip gate={gate} />}
+          {accountFocused && (
+            <span
+              className="sessions-unfiltered-note"
+              data-testid="sessions-unfiltered-note"
+              title="Sessions are not filtered by account this release (conversations are account-agnostic)."
+            >
+              all accounts (unfiltered)
+            </span>
+          )}
         </div>
         <div className="panel-header-actions">
           {!isMobile && <SessionsControls />}

@@ -7,8 +7,9 @@ import {
   alertDisplay,
   selectSourceAlertRows,
 } from '../lib/alertIdentity';
-import type { SourceAlertRow } from '../types/envelope';
+import type { SourceAlertRow, SourceName } from '../types/envelope';
 import { resolveSourceView } from '../store/sourceView';
+import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
@@ -36,6 +37,21 @@ export function RecentAlertsPanel(): JSX.Element {
   );
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
+
+  // #341 Task 4 (Decision R4) — the alerts panel currently shows ALL accounts'
+  // rows (per-account alert-wire decoration is a filed follow-up, not this
+  // slice). So when a source is decorated AND an account focus is active, we
+  // LABEL the panel "all accounts (unfiltered)" — the same honesty affordance
+  // the Sessions grid got — rather than silently showing every account's alerts
+  // next to a focused radiogroup. Absent with no focus, on All, and undecorated.
+  const accountFocusSlot = useSyncExternalStore(
+    subscribeStore,
+    () => (activeSource === 'all'
+      ? ALL_ACCOUNTS
+      : getState().accountFocus[activeSource as SourceName]),
+  );
+  const accountFocused = activeSource !== 'all'
+    && resolveAccountFocus(env ?? null, activeSource, accountFocusSlot ?? ALL_ACCOUNTS) != null;
   const claudeLegacyRows: SourceAlertRow[] = legacyAlerts.map((a) => ({
     ...a,
     source: 'claude' as const,
@@ -112,6 +128,15 @@ export function RecentAlertsPanel(): JSX.Element {
           <h2>
             Recent alerts <span className="sub">(last 10)</span>
           </h2>
+          {accountFocused && (
+            <span
+              className="alerts-unfiltered-note"
+              data-testid="alerts-unfiltered-note"
+              title="Alerts are not filtered by account this release (showing all accounts)."
+            >
+              all accounts (unfiltered)
+            </span>
+          )}
         </div>
         <div className="panel-header-actions">
           <ExpandButton label="Recent alerts" onOpen={openModal} />

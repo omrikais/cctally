@@ -33,11 +33,11 @@ once ``user_version == registry head``. Add the column via a registered
 migration (which bumps the head and re-triggers the apply) instead.
 
 **Lock-order law** (spec §5.2 / §6.4; asserted here as documentation, exercised
-by the storm test): maintenance flocks → ``journal.ingest.lock`` → provider
-flocks (cache Claude → cache Codex → conversations Claude → conversations
-Codex) → SQLite transactions → ``journal.lock`` (leaf). Never acquire the
-ingest lock while holding a provider flock; no SQLite write transaction ever
-spans a flock acquisition.
+by the storm test): maintenance flocks → ``journal.ingest.lock`` → the global
+``cache.db.lock`` writer flock → the cache Codex provider flock → conversation
+provider flocks (Claude → Codex) → SQLite transactions → ``journal.lock``
+(leaf). Never acquire the ingest lock while holding a cache writer/provider
+flock; no SQLite write transaction ever spans a flock acquisition.
 
 **Raw-connect escape hatches stay OUT of this module by design** (spec §6.1):
 ``db checkpoint``'s ``mode=rw`` connect, ``db vacuum``'s exclusive connect, and
@@ -158,6 +158,12 @@ def apply_policy(conn: sqlite3.Connection, store: str) -> None:
     if policy.auto_vacuum is not None:
         conn.execute(f"PRAGMA auto_vacuum={policy.auto_vacuum}")
     conn.execute(f"PRAGMA journal_mode={policy.journal_mode}")
+    apply_connection_policy(conn, store)
+
+
+def apply_connection_policy(conn: sqlite3.Connection, store: str) -> None:
+    """Apply non-schema connection settings without changing journal mode."""
+    policy = STORE_POLICY[store]
     conn.execute(f"PRAGMA synchronous={policy.synchronous}")
     conn.execute(f"PRAGMA busy_timeout={policy.busy_timeout}")
     conn.execute(f"PRAGMA journal_size_limit={policy.journal_size_limit}")
@@ -497,10 +503,16 @@ def resolve_stats_epoch_mismatch():
                         "present to rebuild from. The journal/ directory is the "
                         "durable source — restore it from backup, then run "
                         "`cctally db rebuild --db stats`.")
-                # Preserve the version-ahead DB (nothing deleted), then rebuild a
-                # fresh epoch index into the now-absent destination.
+                # Preserve the version-ahead DB (nothing deleted), then run the
+                # #341 account epoch-transition coordinator into the now-absent
+                # destination: resolve the cutover identity (no stats.db open),
+                # append the canonical cutover op, then rebuild account-scoped
+                # (spec §2 — op strictly before the rebuild HW). A same-epoch or
+                # legacy DB never reaches here; a fresh cutover install stamps the
+                # epoch directly (run_cutover), so this path is the 1000->1001
+                # upgrade of an already-journaled install.
                 _cctally_db.quarantine_db_family(path)
-                _cctally_journal.rebuild_stats_index()
+                _cctally_journal.run_epoch_transition()
         finally:
             _heal_release_flock(maint_fd)
         return _cctally_core.open_db()

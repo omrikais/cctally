@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
 
 import _cctally_core
+import _lib_accounts
 from _cctally_core import _command_as_of, eprint
 from _lib_quota import (
     QuotaBlock,
@@ -28,6 +29,7 @@ from _lib_quota import (
     QuotaPercentMilestone,
     QuotaRule,
     QuotaWindowIdentity,
+    adopt_unidentified_observations,
     build_blocks,
     build_history,
     forecast_quota,
@@ -285,6 +287,12 @@ def load_codex_quota_observations(
         has_observed_model = has_columns(
             "quota_window_snapshots", {"observed_model"},
         )
+        # account_key (#341 Task 2): NULL ≡ unattributed on the read path; a
+        # pre-Task-2 cache lacking the column reads every window as unattributed.
+        has_account = has_columns("quota_window_snapshots", {"account_key"})
+        account_expr = (
+            "account_key" if has_account else "NULL AS account_key"
+        )
         entry_lookup = (
             "(SELECT entries.model FROM codex_session_entries AS entries "
             "WHERE entries.source_path=quota_window_snapshots.source_path "
@@ -310,10 +318,10 @@ def load_codex_quota_observations(
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,
                    limit_name, window_minutes, used_percent, resets_at_utc,
                    plan_type, individual_limit_json, reached_type,
-                   {model_expr}
+                   {model_expr}, {account_expr}
               FROM quota_window_snapshots
              WHERE source='codex' AND source_root_key IS NOT NULL
-        """.format(model_expr=model_expr)
+        """.format(model_expr=model_expr, account_expr=account_expr)
         params: list[object] = []
         if requested is not None:
             if not requested:
@@ -368,9 +376,15 @@ def load_codex_quota_observations(
                         str(row["observed_slot"]), int(row["window_minutes"]),
                         str(row["observed_model"]),
                     )
+                raw_account = row["account_key"]
+                account_key = (
+                    str(raw_account) if raw_account not in (None, "")
+                    else _lib_accounts.UNATTRIBUTED
+                )
                 identity = QuotaWindowIdentity(
                     source=str(row["source"]),
                     source_root_key=str(row["source_root_key"]),
+                    account_key=account_key,
                     logical_limit_key=logical_limit_key,
                     observed_slot=str(row["observed_slot"]),
                     window_minutes=int(row["window_minutes"]),
@@ -410,6 +424,13 @@ def load_codex_quota_observations(
             ):
                 continue
             result.append(observation)
+        # Window-account continuity fold (#341 spec §2): adopt unidentified
+        # observations into a same-physical-window identified account (exactly
+        # one). Physical signatures above are account-independent (computed from
+        # the physical tuple), so folding after them is order-invariant; the
+        # recursion path below re-fetches + re-folds. Idempotent for an
+        # already-identified set — a single-account cache is a no-op.
+        result = list(adopt_unidentified_observations(result))
         if physical_signatures is not None:
             physical_signatures.clear()
             roots = requested if requested is not None else set(signature_tuples)
@@ -499,19 +520,22 @@ def _block_params(block: QuotaBlock, generation: str) -> tuple[object, ...]:
         identity.limit_name, _utc_iso(block.resets_at), _utc_iso(block.nominal_start_at),
         _utc_iso(block.first_observed_at), _utc_iso(block.last_observed_at),
         block.first_percent, block.current_percent, latest.source_path,
-        latest.line_offset, generation,
+        latest.line_offset, generation, identity.account_key,
     )
 
 
+# account_key (#341): part of the block/milestone identity — the ON CONFLICT
+# target includes it so two accounts sharing one physical window are DISTINCT
+# rows (never-combine), and each account's row upserts independently.
 _BLOCK_UPSERT = """
     INSERT INTO quota_window_blocks
        (source, source_root_key, logical_limit_key, observed_slot,
         window_minutes, limit_id, limit_name, resets_at_utc, nominal_start_at_utc,
         first_observed_at_utc, last_observed_at_utc, first_percent, current_percent,
-        last_source_path, last_line_offset, generation, orphaned_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-    ON CONFLICT(source, source_root_key, logical_limit_key, observed_slot,
-                window_minutes, resets_at_utc) DO UPDATE SET
+        last_source_path, last_line_offset, generation, orphaned_at, account_key)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+    ON CONFLICT(source, source_root_key, account_key, logical_limit_key,
+                observed_slot, window_minutes, resets_at_utc) DO UPDATE SET
       limit_id=excluded.limit_id, limit_name=excluded.limit_name,
       nominal_start_at_utc=excluded.nominal_start_at_utc,
       first_observed_at_utc=excluded.first_observed_at_utc,
@@ -526,10 +550,11 @@ _MILESTONE_UPSERT = """
     INSERT INTO quota_percent_milestones
        (source, source_root_key, logical_limit_key, observed_slot, window_minutes,
         resets_at_utc, percent_threshold, captured_at_utc, source_path,
-        line_offset, high_water_percent, generation, orphaned_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-    ON CONFLICT(source, source_root_key, logical_limit_key, observed_slot,
-                window_minutes, resets_at_utc, percent_threshold) DO UPDATE SET
+        line_offset, high_water_percent, generation, orphaned_at, account_key)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+    ON CONFLICT(source, source_root_key, account_key, logical_limit_key,
+                observed_slot, window_minutes, resets_at_utc, percent_threshold)
+    DO UPDATE SET
       captured_at_utc=excluded.captured_at_utc, source_path=excluded.source_path,
       line_offset=excluded.line_offset, high_water_percent=excluded.high_water_percent,
       generation=excluded.generation, orphaned_at=NULL
@@ -545,6 +570,7 @@ def _milestone_params(
         identity.observed_slot, identity.window_minutes, _utc_iso(block.resets_at),
         milestone.percent, _utc_iso(milestone.captured_at), milestone.observation.source_path,
         milestone.observation.line_offset, milestone.percent, generation,
+        identity.account_key,
     )
 
 
@@ -568,11 +594,14 @@ def _orphan_unseen(conn: sqlite3.Connection, roots: set[str], generation: str, n
     # this completed generation, so a cache rebuild that restores the exact
     # block clears a transient prune marker without creating a new terminal
     # claim.
+    # account_key (#341): join on the account too so account A's terminal event
+    # is never un-orphaned by account B's block sharing the physical window.
     event_sql = f"""UPDATE quota_threshold_events AS events
               SET orphaned_at=CASE WHEN EXISTS (
                   SELECT 1 FROM quota_window_blocks AS blocks
                    WHERE blocks.source=events.source
                      AND blocks.source_root_key=events.source_root_key
+                     AND blocks.account_key=events.account_key
                      AND blocks.logical_limit_key=events.logical_limit_key
                      AND blocks.observed_slot=events.observed_slot
                      AND blocks.window_minutes=events.window_minutes
@@ -611,11 +640,11 @@ def _quota_alert_config() -> tuple[bool, bool, tuple[QuotaRule, ...], dict]:
 def _arming_row(conn: sqlite3.Connection, identity: QuotaWindowIdentity) -> sqlite3.Row | None:
     return conn.execute(
         """SELECT rule_fingerprint, activated_at_utc FROM quota_alert_arming
-             WHERE source=? AND source_root_key=? AND logical_limit_key=?
-               AND observed_slot=? AND window_minutes=?""",
+             WHERE source=? AND source_root_key=? AND account_key=?
+               AND logical_limit_key=? AND observed_slot=? AND window_minutes=?""",
         (
-            identity.source, identity.source_root_key, identity.logical_limit_key,
-            identity.observed_slot, identity.window_minutes,
+            identity.source, identity.source_root_key, identity.account_key,
+            identity.logical_limit_key, identity.observed_slot, identity.window_minutes,
         ),
     ).fetchone()
 
@@ -640,15 +669,16 @@ def _activate_quota_rule(
     conn.execute(
         """INSERT INTO quota_alert_arming
                (source, source_root_key, logical_limit_key, observed_slot,
-                window_minutes, rule_fingerprint, activated_at_utc)
-               VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(source, source_root_key, logical_limit_key,
+                window_minutes, rule_fingerprint, activated_at_utc, account_key)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(source, source_root_key, account_key, logical_limit_key,
                            observed_slot, window_minutes) DO UPDATE SET
                  rule_fingerprint=excluded.rule_fingerprint,
                  activated_at_utc=excluded.activated_at_utc""",
         (
             identity.source, identity.source_root_key, identity.logical_limit_key,
             identity.observed_slot, identity.window_minutes, fingerprint, now_iso,
+            identity.account_key,
         ),
     )
     if journal_emit is not None:
@@ -670,14 +700,14 @@ def _insert_quota_terminal_event(
                (source, source_root_key, logical_limit_key, observed_slot,
                 window_minutes, resets_at_utc, threshold, qualifying_kind,
                 qualifying_percent, projected_percent, severity, created_at_utc,
-                disposition, alerted_at, suppressed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                disposition, alerted_at, suppressed_at, account_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             identity.source, identity.source_root_key, identity.logical_limit_key,
             identity.observed_slot, identity.window_minutes, _utc_iso(resets_at),
             threshold, kind, qualifying_percent, projected_percent,
             _cctally().severity_for(threshold), now_iso, disposition,
-            alerted_at, suppressed_at,
+            alerted_at, suppressed_at, identity.account_key,
         ),
     )
     return cur.rowcount == 1
@@ -711,6 +741,7 @@ def _quota_alert_payload(
         resets_at_utc=_utc_iso(resets_at), threshold=threshold, kind=kind,
         crossed_at_utc=now_iso, qualifying_percent=qualifying_percent,
         projected_percent=projected_percent,
+        account_key=identity.account_key,
     )
 
 
@@ -864,17 +895,35 @@ def _apply_quota_projection_rows(
     # The completion stamp is intentionally the final DML in the stats
     # transaction.  A pre-commit failure rolls all projection updates back;
     # a retry sees the prior complete generation or rederives it.
+    #
+    # projection_state is (source_root_key, account_key)-keyed (#341 spec §2). The
+    # active account identities are derived from the FOLDED observations (so an
+    # adopted-unidentified window contributes its adopting account, not the raw
+    # `unattributed` stamp); a root with no observations still stamps one
+    # `unattributed` row so its coherence signature is present (byte-stable with
+    # the prior per-root behavior for a single-account install). The
+    # physical_signature stays PER-ROOT (account-independent) — it certifies the
+    # root's physical cache evidence and matches the per-root cache certificate.
+    accounts_by_root: dict[str, set[str]] = {root: set() for root in active_roots}
+    for observation in observations:
+        root = observation.identity.source_root_key
+        if root in accounts_by_root:
+            accounts_by_root[root].add(observation.identity.account_key)
     for root_key in sorted(active_roots):
-        conn.execute(
-            """INSERT INTO quota_projection_state
-               (source_root_key, generation, physical_signature, completed_at_utc)
-               VALUES (?,?,?,?)
-               ON CONFLICT(source_root_key) DO UPDATE SET
-                 generation=excluded.generation,
-                 physical_signature=excluded.physical_signature,
-                 completed_at_utc=excluded.completed_at_utc""",
-            (root_key, generation, _signature(observations, root_key), now_iso),
-        )
+        accounts = accounts_by_root[root_key] or {_lib_accounts.UNATTRIBUTED}
+        root_signature = _signature(observations, root_key)
+        for account_key in sorted(accounts):
+            conn.execute(
+                """INSERT INTO quota_projection_state
+                   (source_root_key, account_key, generation, physical_signature,
+                    completed_at_utc)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(source_root_key, account_key) DO UPDATE SET
+                     generation=excluded.generation,
+                     physical_signature=excluded.physical_signature,
+                     completed_at_utc=excluded.completed_at_utc""",
+                (root_key, account_key, generation, root_signature, now_iso),
+            )
     if sink is not None:
         # Set-then-dispatch: all claims committed with the cycle before the
         # cycle's post-commit ALERT_DISPATCHER fires them (spec §5.2 step 6).
@@ -1027,16 +1076,22 @@ def reconcile_codex_quota_projection(
     def _codex_leg(ctx):
         def _emit_arming(identity, fingerprint, activated_at):
             # Item 5: journal the arming state change (`quota_alert_arming` evt).
+            # account_key (#341) is part of the qaa natural key (after the root):
+            # two accounts arming the same physical window produce DISTINCT evt
+            # ids + rows. This id MUST match the cutover export's natural_key_id
+            # ordering in _cctally_journal._CUTOVER_SPECS so a live re-emission and
+            # a cutover-exported arming for one identity converge as ONE record.
             eid = _jl.evt_id(
                 "qaa", identity.source, identity.source_root_key,
-                identity.logical_limit_key, identity.observed_slot,
-                identity.window_minutes,
+                identity.account_key, identity.logical_limit_key,
+                identity.observed_slot, identity.window_minutes,
             )
             _jr.append_record(_jl.make_evt(
                 kind="quota_alert_arming", id=eid, at=activated_at,
                 payload={
                     "source": identity.source,
                     "source_root_key": identity.source_root_key,
+                    "account_key": identity.account_key,
                     "logical_limit_key": identity.logical_limit_key,
                     "observed_slot": identity.observed_slot,
                     "window_minutes": identity.window_minutes,
@@ -1081,13 +1136,14 @@ def _load_active_milestones(
         return list(stats.execute(
             """SELECT percent_threshold, captured_at_utc, source_path, line_offset
                  FROM quota_percent_milestones
-                WHERE source=? AND source_root_key=? AND logical_limit_key=?
-                  AND observed_slot=? AND window_minutes=? AND resets_at_utc=?
-                  AND orphaned_at IS NULL
+                WHERE source=? AND source_root_key=? AND account_key=?
+                  AND logical_limit_key=? AND observed_slot=? AND window_minutes=?
+                  AND resets_at_utc=? AND orphaned_at IS NULL
                 ORDER BY percent_threshold""",
             (
-                identity.source, identity.source_root_key, identity.logical_limit_key,
-                identity.observed_slot, identity.window_minutes, _utc_iso(resets_at),
+                identity.source, identity.source_root_key, identity.account_key,
+                identity.logical_limit_key, identity.observed_slot,
+                identity.window_minutes, _utc_iso(resets_at),
             ),
         ))
     finally:
@@ -1486,7 +1542,10 @@ def _sync_and_load(
     if should_sync:
         cache = c.open_cache_db()
         try:
-            c.sync_codex_cache(cache)
+            cache_mod = c._load_sibling("_cctally_cache")
+            _, cache = cache_mod._run_cache_operation_with_recovery(
+                cache, lambda active_conn: c.sync_codex_cache(active_conn)
+            )
         finally:
             cache.close()
     # The nested quota leaves heal the durable projection on every read.  The
@@ -1528,6 +1587,38 @@ def _command_context(
     return as_of, since, until, selected
 
 
+def _resolve_account_and_scope(args, histories):
+    """(#341, spec §3) Resolve ``--account`` (provider=codex) and scope histories.
+
+    Returns ``(account_key | None, exit_code | None, filtered_histories)``:
+    ``None`` key = the merged view (byte-identical to today, R8); a resolved ref
+    filters to that account's quota identities; a bad ref yields exit 2 (the
+    ``account: …`` diagnostic is printed by ``resolve_account_filter``).
+    The native quota views read the projection, not the entry cache, so
+    ``needs_cache=False``.
+    """
+    c = _cctally()
+    account_key, acct_exit = c.resolve_account_filter(
+        args, "codex", needs_cache=False)
+    if acct_exit is not None:
+        return None, acct_exit, histories
+    if account_key is not None:
+        histories = type(histories)(
+            h for h in histories
+            if getattr(h.identity, "account_key", _lib_accounts.UNATTRIBUTED)
+            == account_key
+        )
+    return account_key, None, histories
+
+
+def _decorate_account(payload: dict[str, object], account_key: "str | None") -> dict:
+    """(#341 R8) Add ``accountKey``/``accountLabel`` to a quota payload under an
+    explicit ``--account`` invocation; a no-flag render stays byte-identical."""
+    if account_key is not None:
+        payload.update(_cctally().account_json_fields(account_key))
+    return payload
+
+
 def _emit(args, payload: dict[str, object], text: str) -> int:
     if getattr(args, "json", False):
         print(json.dumps(stamp_schema_version(payload), ensure_ascii=False))
@@ -1547,6 +1638,9 @@ def cmd_codex_quota_history(args) -> int:
         as_of, since, until, histories = _command_context(args, range_args=True)
     except QuotaCLIError as exc:
         return _command_error(exc)
+    acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
+    if acct_exit is not None:
+        return acct_exit
     windows = []
     text_rows = ["Codex quota history · local-rollout"]
     for history in histories:
@@ -1572,6 +1666,7 @@ def cmd_codex_quota_history(args) -> int:
         "source": "codex", "generatedAt": _iso_z(as_of),
         "freshnessSource": "local-rollout", "windows": windows,
     }
+    _decorate_account(payload, acct_key)  # #341 R8
     if len(text_rows) == 1:
         text_rows.append("No Codex quota history.")
     return _emit(args, payload, "\n".join(text_rows))
@@ -1595,6 +1690,9 @@ def cmd_codex_quota_statusline(args) -> int:
         as_of, _since, _until, histories = _command_context(args)
     except QuotaCLIError as exc:
         return _command_error(exc)
+    acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
+    if acct_exit is not None:
+        return acct_exit
     windows = []
     text_rows = []
     for history in histories:
@@ -1622,6 +1720,7 @@ def cmd_codex_quota_statusline(args) -> int:
         "source": "codex", "generatedAt": _iso_z(as_of),
         "freshnessSource": "local-rollout", "windows": windows,
     }
+    _decorate_account(payload, acct_key)  # #341 R8
     return _emit(args, payload, "\n".join(text_rows) if text_rows else "Codex quota unavailable.")
 
 
@@ -1648,6 +1747,9 @@ def cmd_codex_quota_forecast(args) -> int:
         as_of, _since, _until, histories = _command_context(args)
     except QuotaCLIError as exc:
         return _command_error(exc)
+    acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
+    if acct_exit is not None:
+        return acct_exit
     forecasts = [_forecast_wire(history, as_of) for history in histories]
     text_rows = ["Codex quota forecast · local-rollout"]
     for history, forecast in zip(histories, forecasts):
@@ -1664,6 +1766,7 @@ def cmd_codex_quota_forecast(args) -> int:
         "source": "codex", "generatedAt": _iso_z(as_of),
         "freshnessSource": "local-rollout", "forecasts": forecasts,
     }
+    _decorate_account(payload, acct_key)  # #341 R8
     return _emit(args, payload, "\n".join(text_rows))
 
 
@@ -1673,6 +1776,9 @@ def cmd_codex_quota_blocks(args) -> int:
         as_of, since, until, histories = _command_context(args, range_args=True)
     except QuotaCLIError as exc:
         return _command_error(exc)
+    acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
+    if acct_exit is not None:
+        return acct_exit
     blocks = []
     text_rows = ["Codex quota blocks · local-rollout"]
     for block in build_blocks(
@@ -1698,6 +1804,7 @@ def cmd_codex_quota_blocks(args) -> int:
         "source": "codex", "generatedAt": _iso_z(as_of),
         "freshnessSource": "local-rollout", "blocks": blocks,
     }
+    _decorate_account(payload, acct_key)  # #341 R8
     if len(text_rows) == 1:
         text_rows.append("No Codex quota blocks.")
     return _emit(args, payload, "\n".join(text_rows))
@@ -1707,6 +1814,9 @@ def cmd_codex_quota_breakdown(args) -> int:
     """Render root-qualified, live-priced milestone deltas for one block."""
     try:
         as_of, _since, _until, histories = _command_context(args)
+        acct_key, acct_exit, histories = _resolve_account_and_scope(args, histories)
+        if acct_exit is not None:
+            return acct_exit
         if len(histories) != 1:
             raise QuotaCLIError(
                 "breakdown requires selectors resolving to exactly one quota identity; candidates:\n"
@@ -1745,6 +1855,7 @@ def cmd_codex_quota_breakdown(args) -> int:
         "block": {"resetAt": _iso_z(block.resets_at), "nominalStartAt": _iso_z(block.nominal_start_at)},
         "speed": speed, "milestones": milestones,
     }
+    _decorate_account(payload, acct_key)  # #341 R8
     text_rows = [
         f"Codex quota breakdown · {_identity_label(identity)}",
         f"reset {_iso_z(block.resets_at)} · speed {speed}",

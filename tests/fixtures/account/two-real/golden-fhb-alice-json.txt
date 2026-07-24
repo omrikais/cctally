@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "window": {
+    "since": null,
+    "until": null,
+    "limit": 50,
+    "order": "desc",
+    "count": 1,
+    "truncated": false
+  },
+  "blocks": [
+    {
+      "blockStartAt": "2026-05-22T10:00:00Z",
+      "fiveHourWindowKey": 340000,
+      "fiveHourResetsAt": "2026-05-22T15:00:00Z",
+      "lastObservedAtUtc": "2026-05-22T14:30:00Z",
+      "status": "closed",
+      "finalFiveHourPercent": 30.0,
+      "totalCost": 1.0,
+      "dollarsPerPercent": 0.033333333,
+      "inputTokens": 100,
+      "outputTokens": 200,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "sevenDayPctAtBlockStart": null,
+      "sevenDayPctAtBlockEnd": null,
+      "sevenDayPctDeltaPp": null,
+      "crossedSevenDayReset": false,
+      "credits": []
+    }
+  ],
+  "accountKey": "24e1c7396048eb38fdfe7643d88ce6e5",
+  "accountLabel": "alice"
+}

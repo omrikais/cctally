@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 14 / 14 known
   ✓ 013_codex_quota_projection_state               applied <REDACTED>
   ✓ 014_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 29 / 29 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 30 / 30 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -44,7 +44,8 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 29 / 29 known
   ✓ 026_codex_conversation_key_backfill            applied <REDACTED>
   ✓ 027_codex_fork_preamble_rebuild                applied <REDACTED>
   ✓ 028_split_conversation_store                   applied <REDACTED>
-  ✓ 029_test_cache_migration                       applied <REDACTED>
+  ✓ 029_backfill_claude_account                    applied <REDACTED>
+  ✓ 030_test_cache_migration                       applied <REDACTED>
 
 conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 1 / 1 known
   ✓ 001_adopt_schema_version_marker                applied <REDACTED>
@@ -72,7 +73,7 @@ stats.db:
     014_test_failure_injection
   schema_migrations_skipped:
 cache.db:
-  user_version: 29
+  user_version: 30
   schema_migrations:
     001_dedup_highest_wins
     002_conversation_messages_backfill
@@ -102,7 +103,8 @@ cache.db:
     026_codex_conversation_key_backfill
     027_codex_fork_preamble_rebuild
     028_split_conversation_store
-    029_test_cache_migration
+    029_backfill_claude_account
+    030_test_cache_migration
   schema_migrations_skipped:
 ## log
 <no migration-errors.log>

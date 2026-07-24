@@ -205,8 +205,9 @@ def test_glue_linux_builds_notify_send(tmp_path, monkeypatch):
     assert sink and sink[0][0] == "notify-send"
     assert "-u" in sink[0] and "critical" in sink[0]   # threshold 100 -> critical
     log = (tmp_path / "alerts.log").read_text().strip().split("\t")
-    assert log[-1] == "critical"                        # appended severity column
-    assert log[-2] == "queued"                          # status column unchanged
+    assert log[-1] == "*"                               # 8th account_key column (#341)
+    assert log[-2] == "critical"                        # severity column
+    assert log[-3] == "queued"                          # status column unchanged
 
 
 def test_glue_quota_axis_uses_provider_neutral_text(tmp_path, monkeypatch):
@@ -236,7 +237,8 @@ def test_glue_linux_no_notify_send_is_no_notifier(tmp_path, monkeypatch):
     )
     assert status == "no_notifier:none"
     assert sink == []                                   # nothing spawned
-    assert (tmp_path / "alerts.log").read_text().strip().endswith("\twarn")
+    # severity now trails into the 8th account_key column (#341); `*` here.
+    assert (tmp_path / "alerts.log").read_text().strip().endswith("\twarn\t*")
 
 
 def test_glue_explicit_unavailable_is_no_notifier_unavailable(tmp_path, monkeypatch):
@@ -310,7 +312,8 @@ def test_glue_malformed_config_does_not_raise(tmp_path, monkeypatch):
     # Fallback default is auto -> notify-send (available on this injected host).
     assert status == "queued"
     log = (tmp_path / "alerts.log").read_text().strip().split("\t")
-    assert log[-1] == "warn"        # threshold 95 -> warn, line still written
+    assert log[-1] == "*"           # 8th account_key column (#341)
+    assert log[-2] == "warn"        # threshold 95 -> warn, line still written
 
 
 def test_glue_load_config_raising_does_not_raise(tmp_path, monkeypatch):
@@ -329,7 +332,9 @@ def test_glue_load_config_raising_does_not_raise(tmp_path, monkeypatch):
         mode="real", platform="linux", which_on_path=lambda n: n == "notify-send",
     )
     assert status == "queued"       # fell back to auto, still dispatched
-    assert (tmp_path / "alerts.log").read_text().strip().endswith("\twarn")
+    # 8th account_key column now trails severity (#341); `*` for a payload
+    # without an account stamp.
+    assert (tmp_path / "alerts.log").read_text().strip().endswith("\twarn\t*")
 
 
 def test_glue_non_int_threshold_does_not_raise(tmp_path, monkeypatch):
@@ -357,5 +362,6 @@ def test_glue_non_int_threshold_does_not_raise(tmp_path, monkeypatch):
     assert sink and sink[0][0] == "notify-send"
     assert "-u" in sink[0] and "low" in sink[0]         # info severity -> "low" urgency
     log = (tmp_path / "alerts.log").read_text().strip().split("\t")
-    assert log[-1] == "info"                            # fallback severity column
-    assert log[-2] == "queued"                          # status column unchanged
+    assert log[-1] == "*"                               # 8th account_key column (#341)
+    assert log[-2] == "info"                            # fallback severity column
+    assert log[-3] == "queued"                          # status column unchanged

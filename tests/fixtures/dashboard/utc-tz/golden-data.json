@@ -666,6 +666,7 @@
     }
   },
   "sync_age_s": null,
+  "sync_failure": null,
   "transcriptsEnabled": true,
   "trend": null,
   "update": "__UPDATE_BLOCK__",

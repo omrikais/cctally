@@ -3,6 +3,13 @@
 
 export type Verdict = 'ok' | 'cap' | 'capped';
 
+export interface SyncFailure {
+  kind: 'cache_corruption' | 'maintenance_active' | 'maintenance_stale' | 'server_sync';
+  label: string;
+  detail: string;
+  action: string | null;
+}
+
 export interface Envelope {
   envelope_version: number;
   generated_at: string | null;
@@ -23,6 +30,9 @@ export interface Envelope {
   last_sync_at: string | null;
   sync_age_s: number | null;
   last_sync_error: string | null;
+  // Privacy-safe server classification. Older Python servers omit it; the
+  // client then retains the generic legacy server-error label.
+  sync_failure?: SyncFailure | null;
   header: HeaderEnvelope;
   current_week: CurrentWeekEnvelope | null;
   forecast: ForecastEnvelope | null;
@@ -1019,6 +1029,39 @@ export interface CodexCycle {
   resets_at: string;
 }
 
+// #341 Task 4 — one per-account hero card. Emitted (conditional, R8) only when
+// the provider has >1 REAL account, so a <=1-real-account install never sees it.
+export interface AccountCard {
+  accountKey: string;
+  label: string;
+  plan: string | null;
+  active: boolean;
+  weeklyPercent: number | null;
+  fiveHourPercent: number | null;
+  resetsAt: string | null;
+  spendUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  // Present + true only for the reserved unattributed bucket (renders dimmed,
+  // totals only, no live bars).
+  unattributed?: boolean;
+}
+
+// #341 Task 4 — the per-account hero cycle boundary (one per account with a
+// live weekly cycle). Conditional on decoration, like `AccountCard`.
+export interface AccountHeroCycle {
+  accountKey: string;
+  window_minutes: number;
+  start_at: string;
+  resets_at: string;
+  used_percent: number | null;
+  cost_usd: number;
+  total_tokens: number;
+}
+
 export interface CodexHero {
   // These accounting values are null only when Codex has visible accounting
   // but no coherent active 10,080-minute native reset boundary. Consumers must
@@ -1033,6 +1076,8 @@ export interface CodexHero {
   quota: CodexQuotaSummary;
   budget: CodexBudgetStatus | null;
   alerts: { count: number };
+  // #341 Task 4 — conditional (R8): one cycle per account when decorated.
+  cycles?: AccountHeroCycle[];
 }
 
 export interface CodexPeriodBucket {
@@ -1157,6 +1202,9 @@ export interface CodexSourceData {
     projected_thresholds?: number[];
   };
   cache_report?: CacheReportEnvelope | null;
+  // #341 Task 4 — conditional (R8): one card per account (real + the
+  // unattributed bucket when non-empty). Absent for a <=1-real-account source.
+  accounts?: AccountCard[];
 }
 
 // ---- Claude provider projection (_tui_project_claude_source_data) -----
@@ -1265,6 +1313,11 @@ export interface ClaudeSourceData {
   quota: ClaudeQuotaDomain;
   budget: { forecast: ForecastEnvelope | null; settings: Record<string, unknown> | null };
   alerts: { rows: Array<Record<string, unknown>> };
+  // #341 Task 4 (Ruling C): the conditional per-account cards, emitted only when
+  // the Claude provider has >1 real account (R8). Absent (undecorated) → the
+  // chip row / hero cards self-hide, byte-identical to today. Symmetric with
+  // `CodexSourceData.accounts`.
+  accounts?: AccountCard[];
 }
 
 // ---- The `all` composition (compose_all_state) ------------------------

@@ -78,7 +78,7 @@ def _init_paths_from_env() -> None:
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
     global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
-    global CLAUDE_PROJECTS_DIR
+    global CLAUDE_PROJECTS_DIR, CLAUDE_JSON_PATH
     global TELEMETRY_INSTALL_ID_PATH, TELEMETRY_LAST_BEAT_PATH
     global TELEMETRY_NOTICE_SHOWN_PATH, TELEMETRY_FIRST_SEEN_PATH
 
@@ -195,6 +195,14 @@ def _init_paths_from_env() -> None:
     TELEMETRY_FIRST_SEEN_PATH = APP_DIR / "telemetry.first-seen"
 
     CLAUDE_SETTINGS_PATH = home / ".claude" / "settings.json"
+
+    # Claude's own identity file (#341): `~/.claude.json` carries the
+    # `oauthAccount` block (accountUuid / emailAddress / plan) maintained by
+    # Claude Code. cctally reads it READ-ONLY for account attribution; never
+    # written. Module constant so tests can `monkeypatch.setattr(_cctally_core,
+    # "CLAUDE_JSON_PATH", ...)`. Rewritten in place by Claude Code, so every read
+    # goes through the stat-read-stat stable-read protocol.
+    CLAUDE_JSON_PATH = home / ".claude.json"
 
     # Claude session JSONL root. Production path is `~/.claude/projects`;
     # exposed as a module-level constant so cross-DB migrations (e.g.
@@ -323,7 +331,14 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # that ``open_db`` cuts over to the epoch on first open (spec §8). Schema change
 # = bump ``STATS_INDEX_EPOCH`` (never a new stats migration — the registry is
 # frozen).
-STATS_INDEX_EPOCH = 1000
+#
+# 1000 -> 1001 (#341, multi-account): the stats index gains the account
+# dimension (account_key on every derived table + the accounts registry). An
+# existing epoch-1000 index resolves the mismatch through the account
+# epoch-transition coordinator (``_cctally_journal.run_epoch_transition``):
+# resolve the cutover identity, append the canonical cutover op, then rebuild
+# account-scoped. See docs/superpowers/specs/2026-07-23-multi-account-design.md §2.
+STATS_INDEX_EPOCH = 1001
 LEGACY_STATS_HEAD = 13
 
 
@@ -817,7 +832,7 @@ BUDGET_PERIODS = ("subscription-week", "calendar-week", "calendar-month")
 CODEX_BUDGET_PERIODS = ("calendar-week", "calendar-month")
 CODEX_BUDGET_LEAVES = (
     "amount_usd", "period", "alerts_enabled", "alert_thresholds",
-    "projected_enabled",
+    "projected_enabled", "accounts",
 )
 _BUDGET_DEFAULTS = {
     "weekly_usd": None,            # None = no budget (default)
@@ -827,6 +842,7 @@ _BUDGET_DEFAULTS = {
     "period": "subscription-week",  # Claude period; default = existing behavior
     "projects": {},               # per-project weekly $ budgets, keyed by git-root
     "project_alerts_enabled": False,  # per-project alerts opt-in (#19/#121); default OFF
+    "accounts": {},               # per-account weekly $ budgets, keyed by account_key (#341)
     "codex": None,                # None = no Codex budget (nested block when set)
 }
 _BUDGET_CONFIG_VALID_KEYS = {
@@ -837,8 +853,39 @@ _BUDGET_CONFIG_VALID_KEYS = {
     "period",
     "projects",
     "project_alerts_enabled",
+    "accounts",
     "codex",
 }
+
+
+def _validate_account_budget_map(v: object, label: str) -> "dict[str, float]":
+    """Validate a per-account ``{account_key: usd}`` budget map (#341, spec §6).
+
+    Mirrors the ``budget.projects`` value rule: keys are strings (immutable
+    account keys — refs are normalized to keys at ``config set`` write time),
+    each value a non-bool finite number > 0. Returns a cleaned copy."""
+    if not isinstance(v, dict):
+        raise _BudgetConfigError(
+            f"{label} must be an object, got {type(v).__name__}"
+        )
+    cleaned: "dict[str, float]" = {}
+    for acc_key, acc_val in v.items():
+        if not isinstance(acc_key, str) or not acc_key:
+            raise _BudgetConfigError(
+                f"{label} keys must be non-empty strings (account keys)"
+            )
+        if isinstance(acc_val, bool) or not isinstance(acc_val, (int, float)):
+            raise _BudgetConfigError(
+                f"{label} values must be numbers, "
+                f"got {type(acc_val).__name__} for key {acc_key!r}"
+            )
+        if not math.isfinite(float(acc_val)) or float(acc_val) <= 0:
+            raise _BudgetConfigError(
+                f"{label} values must be finite numbers > 0, "
+                f"got {acc_val!r} for key {acc_key!r}"
+            )
+        cleaned[acc_key] = float(acc_val)
+    return cleaned
 
 
 def _get_budget_config(cfg: dict) -> dict:
@@ -938,6 +985,11 @@ def _get_budget_config(cfg: dict) -> dict:
             )
         out["project_alerts_enabled"] = v
 
+    if "accounts" in block:
+        out["accounts"] = _validate_account_budget_map(
+            block["accounts"], "budget.accounts"
+        )
+
     if "codex" in block:
         out["codex"] = _validate_codex_budget_block(block["codex"])
 
@@ -994,15 +1046,23 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
         "alert_thresholds": [90, 100],
         "projected_enabled": False,
     }
-    # amount_usd — required (a Codex block must define a budget) finite > 0.
-    # Shares the positive-amount rule with weekly_usd / projects via the helper;
-    # the message form ("must be a number" / "must be a finite number > 0") is
-    # byte-identical to the prior inline checks (code-review #5).
-    if "amount_usd" not in v:
-        raise _BudgetConfigError("budget.codex.amount_usd is required")
-    out["amount_usd"] = _validate_positive_budget_amount(
-        v["amount_usd"], "budget.codex.amount_usd"
+    # amount_usd — the vendor-wide Codex budget, finite > 0. Required UNLESS a
+    # non-empty per-account map (`accounts`, #341) is present: a Codex block may
+    # be per-account-only (no vendor-wide amount), in which case amount_usd stays
+    # None. Shares the positive-amount rule with weekly_usd / projects.
+    _codex_accounts_raw = v.get("accounts")
+    _has_codex_accounts = (
+        isinstance(_codex_accounts_raw, dict) and len(_codex_accounts_raw) > 0
     )
+    if "amount_usd" in v and v["amount_usd"] is not None:
+        out["amount_usd"] = _validate_positive_budget_amount(
+            v["amount_usd"], "budget.codex.amount_usd"
+        )
+    elif not _has_codex_accounts:
+        raise _BudgetConfigError(
+            "budget.codex.amount_usd is required (or set a per-account "
+            "budget.codex.accounts map)"
+        )
 
     if "period" in v:
         p = v["period"]
@@ -1035,6 +1095,13 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
             )
         out["projected_enabled"] = pe
 
+    # Per-account Codex budgets (#341, spec §6). Conditionally present so an
+    # existing codex block (no accounts) validates byte-identically.
+    if "accounts" in v:
+        out["accounts"] = _validate_account_budget_map(
+            v["accounts"], "budget.codex.accounts"
+        )
+
     return out
 
 
@@ -1056,6 +1123,11 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
     013 calls this same helper for old databases while ``open_db`` calls it for
     fresh installs before the migration dispatcher stamps the migration.
     """
+    # account_key (#341 Task 2): every quota identity is (source_root_key,
+    # account_key)-qualified — the UNIQUEs/PK are extended so two accounts on one
+    # physical window never merge, and each carries `DEFAULT 'unattributed'` so a
+    # NULL/single-account cache renders byte-identically (spec §2). No new epoch
+    # bump: this rides Task 1's STATS_INDEX_EPOCH 1000->1001 rebuild.
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS quota_window_blocks (
@@ -1077,11 +1149,12 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             last_line_offset      INTEGER NOT NULL,
             generation            TEXT    NOT NULL,
             orphaned_at           TEXT,
-            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
-                   window_minutes, resets_at_utc)
+            account_key           TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(source, source_root_key, account_key, logical_limit_key,
+                   observed_slot, window_minutes, resets_at_utc)
         );
         CREATE INDEX IF NOT EXISTS idx_quota_blocks_active
-            ON quota_window_blocks(source, source_root_key, orphaned_at,
+            ON quota_window_blocks(source, source_root_key, account_key, orphaned_at,
                                    logical_limit_key, observed_slot,
                                    window_minutes, resets_at_utc);
 
@@ -1100,11 +1173,12 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             high_water_percent    INTEGER NOT NULL CHECK(high_water_percent BETWEEN 1 AND 100),
             generation            TEXT    NOT NULL,
             orphaned_at           TEXT,
-            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
-                   window_minutes, resets_at_utc, percent_threshold)
+            account_key           TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(source, source_root_key, account_key, logical_limit_key,
+                   observed_slot, window_minutes, resets_at_utc, percent_threshold)
         );
         CREATE INDEX IF NOT EXISTS idx_quota_milestones_active
-            ON quota_percent_milestones(source, source_root_key, orphaned_at,
+            ON quota_percent_milestones(source, source_root_key, account_key, orphaned_at,
                                         logical_limit_key, observed_slot,
                                         window_minutes, resets_at_utc,
                                         percent_threshold);
@@ -1127,21 +1201,24 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             alerted_at             TEXT,
             suppressed_at          TEXT,
             orphaned_at            TEXT,
+            account_key           TEXT    NOT NULL DEFAULT 'unattributed',
             CHECK((disposition = 'alerted' AND alerted_at IS NOT NULL AND suppressed_at IS NULL)
                OR (disposition = 'suppressed_backfill' AND suppressed_at IS NOT NULL AND alerted_at IS NULL)),
-            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
-                   window_minutes, resets_at_utc, threshold)
+            UNIQUE(source, source_root_key, account_key, logical_limit_key,
+                   observed_slot, window_minutes, resets_at_utc, threshold)
         );
         CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_active
-            ON quota_threshold_events(source, source_root_key, orphaned_at,
+            ON quota_threshold_events(source, source_root_key, account_key, orphaned_at,
                                       logical_limit_key, observed_slot,
                                       window_minutes, resets_at_utc, threshold);
 
         CREATE TABLE IF NOT EXISTS quota_projection_state (
-            source_root_key    TEXT PRIMARY KEY,
+            source_root_key    TEXT NOT NULL,
+            account_key        TEXT NOT NULL DEFAULT 'unattributed',
             generation         TEXT NOT NULL,
             physical_signature TEXT NOT NULL,
-            completed_at_utc   TEXT NOT NULL
+            completed_at_utc   TEXT NOT NULL,
+            PRIMARY KEY(source_root_key, account_key)
         );
 
         CREATE TABLE IF NOT EXISTS quota_alert_arming (
@@ -1153,11 +1230,39 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             window_minutes    INTEGER NOT NULL CHECK(window_minutes > 0),
             rule_fingerprint  TEXT NOT NULL,
             activated_at_utc  TEXT NOT NULL,
-            UNIQUE(source, source_root_key, logical_limit_key, observed_slot,
-                   window_minutes)
+            account_key       TEXT NOT NULL DEFAULT 'unattributed',
+            UNIQUE(source, source_root_key, account_key, logical_limit_key,
+                   observed_slot, window_minutes)
         );
         """
     )
+    # account_key backstops (#341): idempotent no-ops on the fresh CREATEs above
+    # (which already carry the column), but they keep an already-1001 stats.db
+    # that predates the column consistent. quota_projection_state widened its
+    # PRIMARY KEY to (source_root_key, account_key) — a PK cannot be added by
+    # ALTER, so a pre-#341-quota shape (disposable, re-derivable coherence index)
+    # is DROP+recreated rather than back-filled.
+    _c = sys.modules.get("cctally")
+    add_column_if_missing = _c.add_column_if_missing if _c is not None else None
+    _proj_cols = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(quota_projection_state)")
+    }
+    if "account_key" not in _proj_cols:
+        conn.execute("DROP TABLE quota_projection_state")
+        conn.execute(
+            "CREATE TABLE quota_projection_state ("
+            " source_root_key TEXT NOT NULL,"
+            " account_key TEXT NOT NULL DEFAULT 'unattributed',"
+            " generation TEXT NOT NULL,"
+            " physical_signature TEXT NOT NULL,"
+            " completed_at_utc TEXT NOT NULL,"
+            " PRIMARY KEY(source_root_key, account_key))"
+        )
+    if add_column_if_missing is not None:
+        for _tbl in ("quota_window_blocks", "quota_percent_milestones",
+                     "quota_threshold_events", "quota_alert_arming"):
+            add_column_if_missing(
+                conn, _tbl, "account_key", "TEXT NOT NULL DEFAULT 'unattributed'")
 
 
 def open_db(*, _target_path=None) -> sqlite3.Connection:
@@ -1329,7 +1434,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             weekly_percent REAL NOT NULL,
             page_url TEXT,
             source TEXT NOT NULL DEFAULT 'userscript',
-            payload_json TEXT NOT NULL
+            payload_json TEXT NOT NULL,
+            account_key TEXT NOT NULL DEFAULT 'unattributed'
         )
         """
     )
@@ -1353,7 +1459,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             cost_usd REAL NOT NULL,
             source TEXT NOT NULL DEFAULT 'cctally-range-cost',
             mode TEXT NOT NULL DEFAULT 'auto',
-            project TEXT
+            project TEXT,
+            account_key TEXT NOT NULL DEFAULT 'unattributed'
         )
         """
     )
@@ -1366,6 +1473,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
 
     add_column_if_missing(conn, "weekly_usage_snapshots", "week_start_at", "TEXT")
     add_column_if_missing(conn, "weekly_usage_snapshots", "week_end_at", "TEXT")
+    # account_key (#341): the account dimension rides the STATS_INDEX_EPOCH bump
+    # (a fresh rebuild carries it via the CREATE TABLE above); this backstop keeps
+    # an already-1001 DB that predates the column consistent. DEFAULT
+    # 'unattributed' — every production writer passes the key explicitly (rev 4.1
+    # defensive-backstop rule), enforced by the structural writer-audit test.
+    add_column_if_missing(
+        conn, "weekly_usage_snapshots", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_percent", "REAL")
     add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_resets_at", "TEXT")
     # five_hour_window_key — canonical (10-min-floored epoch) key for
@@ -1425,6 +1540,9 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     add_column_if_missing(conn, "weekly_cost_snapshots", "week_end_at", "TEXT")
     add_column_if_missing(conn, "weekly_cost_snapshots", "range_start_iso", "TEXT")
     add_column_if_missing(conn, "weekly_cost_snapshots", "range_end_iso", "TEXT")
+    add_column_if_missing(
+        conn, "weekly_cost_snapshots", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
 
     conn.execute(
         """
@@ -1454,12 +1572,16 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             usage_snapshot_id INTEGER NOT NULL,
             cost_snapshot_id INTEGER NOT NULL,
             reset_event_id INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(week_start_date, percent_threshold, reset_event_id)
+            account_key TEXT NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, week_start_date, percent_threshold, reset_event_id)
         )
         """
     )
 
     add_column_if_missing(conn, "percent_milestones", "five_hour_percent_at_crossing", "REAL")
+    add_column_if_missing(
+        conn, "percent_milestones", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     # reset_event_id: segment column added by migration 005. Fresh-install
     # DBs get it via the live CREATE TABLE above + the dispatcher
     # fast-stamps the migration. Existing pre-005 DBs trip the migration's
@@ -1495,10 +1617,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             new_week_end_at        TEXT NOT NULL,
             effective_reset_at_utc TEXT NOT NULL,
             observed_pre_credit_pct REAL,
-            UNIQUE(old_week_end_at, new_week_end_at)
+            account_key TEXT NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, old_week_end_at, new_week_end_at)
         )
         """
     )
+    add_column_if_missing(
+        conn, "week_reset_events", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     _backfill_week_reset_events(conn)
 
     # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
@@ -1533,17 +1659,21 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             prior_percent          REAL NOT NULL,
             post_percent           REAL NOT NULL,
             effective_reset_at_utc TEXT NOT NULL,
-            UNIQUE(five_hour_window_key, effective_reset_at_utc)
+            account_key            TEXT NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
         )
         """
     )
+    add_column_if_missing(
+        conn, "five_hour_reset_events", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
 
     # ── five_hour_blocks (rollup, one row per API-anchored 5h block) ──
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS five_hour_blocks (
             id                            INTEGER PRIMARY KEY AUTOINCREMENT,
-            five_hour_window_key          INTEGER NOT NULL UNIQUE,
+            five_hour_window_key          INTEGER NOT NULL,
             five_hour_resets_at           TEXT    NOT NULL,
             block_start_at                TEXT    NOT NULL,
             first_observed_at_utc         TEXT    NOT NULL,
@@ -1559,10 +1689,15 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             total_cost_usd                REAL    NOT NULL DEFAULT 0,
             is_closed                     INTEGER NOT NULL DEFAULT 0,
             created_at_utc                TEXT    NOT NULL,
-            last_updated_at_utc           TEXT    NOT NULL
+            last_updated_at_utc           TEXT    NOT NULL,
+            account_key                   TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, five_hour_window_key)
         )
         """
     )
+    add_column_if_missing(
+        conn, "five_hour_blocks", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_five_hour_blocks_block_start
@@ -1588,7 +1723,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             marginal_cost_usd           REAL,
             seven_day_pct_at_crossing   REAL,
             reset_event_id              INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(five_hour_window_key, percent_threshold, reset_event_id),
+            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, five_hour_window_key, percent_threshold, reset_event_id),
             FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
         )
         """
@@ -1607,6 +1743,9 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # "alerts disabled at moment of crossing OR threshold not configured"
     # — never "delivery failed".
     add_column_if_missing(conn, "five_hour_milestones", "alerted_at", "TEXT")
+    add_column_if_missing(
+        conn, "five_hour_milestones", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
 
     # reset_event_id: segment column added by migration 006. Fresh-install
     # DBs get it via the live CREATE TABLE above + the dispatcher fast-stamps
@@ -1636,11 +1775,15 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
             cost_usd                    REAL    NOT NULL DEFAULT 0,
             entry_count                 INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(five_hour_window_key, model),
+            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, five_hour_window_key, model),
             FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
         )
         """
     )
+    add_column_if_missing(
+        conn, "five_hour_block_models", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_five_hour_block_models_block
@@ -1670,11 +1813,15 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
             cost_usd                    REAL    NOT NULL DEFAULT 0,
             entry_count                 INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(five_hour_window_key, project_path),
+            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, five_hour_window_key, project_path),
             FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
         )
         """
     )
+    add_column_if_missing(
+        conn, "five_hour_block_projects", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_five_hour_block_projects_block
@@ -1726,10 +1873,13 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             consumption_pct REAL    NOT NULL,
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(vendor, period_start_at, period, threshold)
+            account_key     TEXT    NOT NULL DEFAULT '*',
+            UNIQUE(vendor, account_key, period_start_at, period, threshold)
         )
         """
     )
+    add_column_if_missing(
+        conn, "budget_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
 
     # ── projected_milestones (week-average-pace projection crossings — #121) ──
     # Write-once, forward-only — same posture as `budget_milestones` (no
@@ -1758,10 +1908,13 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             denominator     REAL    NOT NULL,   -- target_usd (budget / codex_budget) | 100.0 (weekly)
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(week_start_at, period, metric, threshold)
+            account_key     TEXT    NOT NULL DEFAULT '*',  -- '*' for vendor-budget metrics; real account for weekly_pct (Task 3)
+            UNIQUE(account_key, week_start_at, period, metric, threshold)
         )
         """
     )
+    add_column_if_missing(
+        conn, "projected_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
 
     # ── project_budget_milestones (per-project equiv-$ budget crossings) ──────
     # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
@@ -1794,10 +1947,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             consumption_pct REAL    NOT NULL,
             crossed_at_utc  TEXT    NOT NULL,
             alerted_at      TEXT,
-            UNIQUE(week_start_at, project_key, threshold)
+            account_key     TEXT    NOT NULL DEFAULT '*',  -- account-blind this epic (spec §6): always '*'
+            UNIQUE(account_key, week_start_at, project_key, threshold)
         )
         """
     )
+    add_column_if_missing(
+        conn, "project_budget_milestones", "account_key",
+        "TEXT NOT NULL DEFAULT '*'")
 
     # In-place weekly partial-credit floor (issue #209, record-credit M2).
     # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / NO user_version
@@ -1822,7 +1979,39 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             effective_at_utc        TEXT    NOT NULL,
             observed_pre_credit_pct REAL    NOT NULL,
             applied_at_utc          TEXT    NOT NULL,
-            UNIQUE(week_start_date, effective_at_utc)
+            account_key             TEXT    NOT NULL DEFAULT 'unattributed',
+            UNIQUE(account_key, week_start_date, effective_at_utc)
+        )
+        """
+    )
+    add_column_if_missing(
+        conn, "weekly_credit_floors", "account_key",
+        "TEXT NOT NULL DEFAULT 'unattributed'")
+
+    # ── accounts registry (multi-account epic #341, spec §1/§2) ───────────────
+    # Derived from the journal like all stats.db state: `account_observe` op
+    # lines fold into rows here (via _apply_op_account_observe), `account_label`
+    # ops set the user label. Framework-untracked (plain CREATE TABLE IF NOT
+    # EXISTS, no migration / no user_version bump — same posture as
+    # weekly_credit_floors above), so it never touches `schema_migrations` and
+    # the stats-schema change rides the STATS_INDEX_EPOCH bump + rebuild, not a
+    # new stats migration (the frozen-registry rule). `last_seen_utc` is derived
+    # at fold time from the max `at` of any account-stamped line, NOT carried by
+    # the observe record. `label_source` records provenance for the
+    # user > switcher > auto precedence rule. A new empty table is byte-invisible
+    # to every existing render, preserving the R8 byte-stability contract.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_key    TEXT PRIMARY KEY,
+            provider       TEXT NOT NULL,
+            natural_id     TEXT,
+            email          TEXT,
+            label          TEXT,
+            plan_type      TEXT,
+            label_source   TEXT NOT NULL DEFAULT 'auto',
+            first_seen_utc TEXT,
+            last_seen_utc  TEXT
         )
         """
     )
@@ -2056,28 +2245,38 @@ def _get_latest_row_for_week(
     table_name: str,
     week_ref: WeekRef,
     as_of_utc: str | None = None,
+    *,
+    account_key: str | None = None,
 ) -> sqlite3.Row | None:
+    """Latest week row from a weekly snapshot table.
+
+    ``account_key`` (#341): ``None`` = the account-blind merged read (today's
+    behavior, byte-stable); a real key scopes to that account's rows — the
+    ``--account`` render consumers and the write-path milestone-cost read (P2-1)
+    pass it explicitly."""
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_params: tuple = () if account_key is None else (account_key,)
     if as_of_utc is None:
         return conn.execute(
             f"""
             SELECT *
             FROM {table_name}
-            WHERE week_start_date = ?
+            WHERE week_start_date = ?{acct_pred}
             ORDER BY captured_at_utc DESC, id DESC
             LIMIT 1
             """,
-            (week_ref.week_start.isoformat(),),
+            (week_ref.week_start.isoformat(),) + acct_params,
         ).fetchone()
     return conn.execute(
         f"""
         SELECT *
         FROM {table_name}
         WHERE week_start_date = ?
-          AND captured_at_utc <= ?
+          AND captured_at_utc <= ?{acct_pred}
         ORDER BY captured_at_utc DESC, id DESC
         LIMIT 1
         """,
-        (week_ref.week_start.isoformat(), as_of_utc),
+        (week_ref.week_start.isoformat(), as_of_utc) + acct_params,
     ).fetchone()
 
 
@@ -2086,10 +2285,18 @@ def _reset_aware_floor(
     week_start_date: str,
     week_start_at: str,
     week_end_at: str,
+    *,
+    account_key: str | None,
 ) -> str | None:
     """Return the latest in-week clamp floor (an ISO timestamp) across BOTH
     `week_reset_events` and `weekly_credit_floors`, or None when neither has a
     row for this week.
+
+    ``account_key`` (#341, review finding 11): MANDATORY account context — no
+    silent global fallback. A real key scopes both legs to that account's
+    reset/credit rows (so one account's mid-week credit never clamps another's
+    week); ``None`` is the explicit "all accounts" (merged) read used by the
+    analytics floor path, byte-identical to today on a single-account install.
 
     This is the single chokepoint the four MAX-clamp sites consult to floor the
     current 7d % to the most-recent in-place credit / reset effective moment
@@ -2109,27 +2316,32 @@ def _reset_aware_floor(
     spellings (`Z` / `+00:00`), and a lexical MAX would silently mis-order them
     on a non-UTC host (the same gotcha as the statusline clamp / 5h-block
     cross-reset flag; see the comment at bin/_cctally_statusline.py)."""
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    reset_params: tuple = (week_start_at, week_end_at) + (
+        () if account_key is None else (account_key,))
+    floor_params: tuple = (week_start_date,) + (
+        () if account_key is None else (account_key,))
     row = conn.execute(
-        """
+        f"""
         SELECT floor_at FROM (
             SELECT effective_reset_at_utc AS floor_at
               FROM week_reset_events
              WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
-               AND unixepoch(effective_reset_at_utc) <  unixepoch(?)
+               AND unixepoch(effective_reset_at_utc) <  unixepoch(?){acct_pred}
             UNION ALL
             SELECT effective_at_utc AS floor_at
               FROM weekly_credit_floors
-             WHERE week_start_date = ?
+             WHERE week_start_date = ?{acct_pred}
         )
         ORDER BY unixepoch(floor_at) DESC
         LIMIT 1
         """,
-        (week_start_at, week_end_at, week_start_date),
+        reset_params + floor_params,
     ).fetchone()
     return row[0] if row and row[0] else None
 
 
-def _floored_week_max(conn, rows):
+def _floored_week_max(conn, rows, *, account_key=None):
     """Return {week_key -> per-week reset-aware-floored maximum weekly_percent}.
 
     ``rows`` is an iterable of
@@ -2174,7 +2386,11 @@ def _floored_week_max(conn, rows):
     # Pass 2: resolve floor once per week, drop pre-floor captures, take max.
     result: dict = {}
     for wk, b in buckets.items():
-        floor_iso = _reset_aware_floor(conn, b["wsd"], b["ws_at"], b["we_at"])
+        # Analytics floor path: ``account_key=None`` merges across accounts —
+        # byte-identical to today on a single-account install (#341); a real key
+        # scopes the floor to that account (the ``forecast --account`` dpp read).
+        floor_iso = _reset_aware_floor(
+            conn, b["wsd"], b["ws_at"], b["we_at"], account_key=account_key)
         floor_epoch = None
         if floor_iso:
             try:
@@ -2205,11 +2421,90 @@ def _floored_week_max(conn, rows):
     return result
 
 
+# --------------------------------------------------------------------------
+# Active Claude account resolution (#341, spec §1 observe-and-stamp) — the
+# identity source for record-usage / statusline / hook-tick obs stamping. A
+# stat-read-stat over ``~/.claude.json`` (rewritten in place by Claude Code),
+# mtime-cached so a hot status-line loop reads it at most once per file change.
+# --------------------------------------------------------------------------
+
+_ACTIVE_CLAUDE_ACCOUNT_CACHE: dict = {"sig": None, "identity": None}
+
+
+def _resolve_active_claude_identity() -> dict:
+    """Resolve the active Claude identity from ``~/.claude.json`` via the
+    stable-read protocol, mtime-cached. Returns a dict
+    ``{account_key, natural_id, email, plan_type}`` — ``account_key`` is the
+    reserved ``unattributed`` sentinel and the rest ``None`` when stably-absent /
+    api-key mode / torn mid-write. Never raises; never invents a guess."""
+    import json as _json
+    import _lib_accounts
+
+    path = str(CLAUDE_JSON_PATH)
+    try:
+        st = os.stat(path)
+        sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        sig = None
+    cache = _ACTIVE_CLAUDE_ACCOUNT_CACHE
+    if sig is not None and cache.get("sig") == sig:
+        return cache["identity"]
+
+    def _reader(data: bytes):
+        try:
+            obj = _json.loads(data)
+        except (ValueError, TypeError):
+            raise _lib_accounts.TornRead()
+        if not isinstance(obj, dict):
+            raise _lib_accounts.TornRead()
+        oauth = obj.get("oauthAccount")
+        nat = _lib_accounts.claude_natural_id(oauth)
+        if nat is None:
+            return None
+        return {
+            "natural_id": nat,
+            "email": _lib_accounts.claude_email(oauth),
+            "plan_type": (oauth.get("plan") if isinstance(oauth, dict) else None),
+        }
+
+    result = _lib_accounts.stable_read_identity(path, _reader)
+    if result.status == "identified":
+        info = result.value
+        identity = {
+            "account_key": _lib_accounts.account_key("claude", info["natural_id"]),
+            "natural_id": info["natural_id"],
+            "email": info.get("email"),
+            "plan_type": info.get("plan_type"),
+            # The three-valued read status (spec §1). ``account_key`` collapses
+            # torn+stably_absent to the sentinel; consumers that must tell a
+            # RESOLVED absence (single-account / api-key -> unattributed) from a
+            # TRANSIENT torn read (defer / exit 2 for record-credit) read this.
+            "status": "identified",
+        }
+    else:
+        identity = {"account_key": _lib_accounts.UNATTRIBUTED,
+                    "natural_id": None, "email": None, "plan_type": None,
+                    "status": result.status}
+    if sig is not None:
+        cache["sig"] = sig
+        cache["identity"] = identity
+    return identity
+
+
+def _resolve_active_claude_account() -> str:
+    """The active Claude ``account_key`` (or ``unattributed``). Thin key-only
+    accessor over :func:`_resolve_active_claude_identity` (mtime-cached)."""
+    return _resolve_active_claude_identity()["account_key"]
+
+
 def get_latest_usage_for_week(
     conn: sqlite3.Connection,
     week_ref: WeekRef,
     as_of_utc: str | None = None,
+    *,
+    account_key: str | None = None,
 ) -> sqlite3.Row | None:
     return _get_latest_row_for_week(
         conn, "weekly_usage_snapshots", week_ref, as_of_utc=as_of_utc,
+        account_key=account_key,
     )

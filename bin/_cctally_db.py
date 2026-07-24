@@ -60,6 +60,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import contextvars
 import datetime as dt
 import enum
 import fcntl
@@ -98,6 +99,18 @@ from _cctally_core import (
 # the migration gate-defer diagnostic routes through _lib_log so
 # CCTALLY_DEBUG verbosity is decided in one place.
 import _lib_log
+
+
+# Production cache dispatchers hold maintenance-exclusive + the global cache
+# writer flock across schema apply, every migration handler, and ledger/version
+# stamps.  Older destructive handlers still acquire the global flock when
+# invoked directly by their unit/golden tests; this context flag prevents those
+# handlers from trying to re-lock the same flock through a second descriptor
+# during a production dispatcher walk.
+_CACHE_DISPATCH_WRITER_LOCK_HELD = contextvars.ContextVar(
+    "_CACHE_DISPATCH_WRITER_LOCK_HELD",
+    default=False,
+)
 
 # Stats migration 008 needs the same per-entry cost computation used by
 # the live cost-report path. Direct import keeps the kernel single-sourced
@@ -732,13 +745,172 @@ def write_corruption_forensics(
     return out
 
 
-def quarantine_db_family(db_path, *, ts: "str | None" = None) -> pathlib.Path:
+def _quarantine_pending_path(db_path: pathlib.Path) -> pathlib.Path:
+    return db_path.with_name(f"{db_path.name}.quarantine-pending.json")
+
+
+def _atomic_write_private_json(path: pathlib.Path, payload: dict) -> None:
+    """Durably replace one private JSON control record."""
+    token = f"{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}"
+    temp = path.with_name(f".{path.name}.{token}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        encoded = (
+            json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while publishing control record")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temp, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_pending_quarantine(db_path: pathlib.Path) -> "dict[str, Any] | None":
+    pending = _quarantine_pending_path(db_path)
+    if not pending.exists():
+        return None
+    try:
+        state = json.loads(pending.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OSError(f"invalid pending quarantine record {pending}: {exc}") from exc
+    if (
+        not isinstance(state, dict)
+        or state.get("schemaVersion") != 1
+        or state.get("originalPath") != str(db_path)
+        or not isinstance(state.get("incidentPath"), str)
+        or not isinstance(state.get("members"), list)
+        or not all(
+            isinstance(name, str)
+            and name in {
+                db_path.name,
+                f"{db_path.name}-wal",
+                f"{db_path.name}-shm",
+            }
+            for name in state["members"]
+        )
+    ):
+        raise OSError(f"invalid pending quarantine record {pending}")
+    incident = pathlib.Path(state["incidentPath"])
+    expected_root = _cctally_core.APP_DIR / "quarantine"
+    try:
+        if incident.parent.resolve() != expected_root.resolve():
+            raise OSError(
+                f"pending quarantine incident is outside {expected_root}: {incident}"
+            )
+    except OSError as exc:
+        raise OSError(f"invalid pending quarantine incident {incident}: {exc}") from exc
+    return state
+
+
+def _quarantine_db_family_strict(
+    db_path: pathlib.Path, *, ts: "str | None" = None,
+) -> pathlib.Path:
+    """Resumably move every snapshotted family member or fail closed.
+
+    The durable pending record is published before the first rename.  A killed
+    owner or individual rename failure therefore leaves enough information for
+    the next maintenance-exclusive opener to complete the exact same incident;
+    recreation is forbidden until every member is present at its destination.
+    """
+    db_path = pathlib.Path(db_path)
+    pending = _quarantine_pending_path(db_path)
+    state = _load_pending_quarantine(db_path)
+    if state is None:
+        ts = ts or _db_backup_timestamp()
+        root = _cctally_core.APP_DIR / "quarantine"
+        incident = root / f"{db_path.name}-{ts}"
+        incident.mkdir(parents=True, exist_ok=True)
+        for directory in (root, incident):
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+        # Move sidecars first and the main file last.  The pending record blocks
+        # every opener throughout, but retaining the main file longest also
+        # leaves the most useful evidence in place after an abrupt first move.
+        members = [
+            candidate.name
+            for candidate in (
+                pathlib.Path(f"{db_path}-wal"),
+                pathlib.Path(f"{db_path}-shm"),
+                db_path,
+            )
+            if candidate.exists()
+        ]
+        if not members:
+            raise OSError(f"no database family exists to quarantine at {db_path}")
+        state = {
+            "schemaVersion": 1,
+            "originalPath": str(db_path),
+            "incidentPath": str(incident),
+            "members": members,
+            "createdAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+        }
+        _atomic_write_private_json(pending, state)
+    else:
+        incident = pathlib.Path(state["incidentPath"])
+        incident.mkdir(parents=True, exist_ok=True)
+
+    moved: list[str] = []
+    for name in state["members"]:
+        src = db_path.parent / name
+        dst = incident / name
+        src_exists = src.exists()
+        dst_exists = dst.exists()
+        if src_exists and dst_exists:
+            raise OSError(
+                f"ambiguous quarantine member exists at source and destination: {name}"
+            )
+        if src_exists:
+            os.replace(src, dst)
+            _fsync_directory(src.parent)
+            _fsync_directory(dst.parent)
+        elif not dst_exists:
+            raise OSError(
+                f"pending quarantine member is missing at source and destination: {name}"
+            )
+        try:
+            os.chmod(dst, 0o600)
+        except OSError:
+            pass
+        moved.append(name)
+
+    manifest = {
+        "schemaVersion": 1,
+        "quarantinedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+        "originalPath": str(db_path),
+        "movedFiles": moved,
+        "complete": True,
+    }
+    _atomic_write_private_json(incident / "manifest.json", manifest)
+    pending.unlink()
+    _fsync_directory(pending.parent)
+    return incident
+
+
+def quarantine_db_family(
+    db_path, *, ts: "str | None" = None, strict: bool = False,
+) -> pathlib.Path:
     """Move a damaged DB + its ``-wal``/``-shm`` sidecars into a single
     timestamped incident directory under ``quarantine/`` with a manifest (spec
     §6.3). NEVER deletes evidence — three renames under the caller's exclusion
     locks, not pretending to be one atomic op. ``0o700`` dir / ``0o600`` files.
     Returns the incident directory (which may be empty if nothing was present)."""
     db_path = pathlib.Path(db_path)
+    if strict:
+        return _quarantine_db_family_strict(db_path, ts=ts)
     ts = ts or _db_backup_timestamp()
     root = _cctally_core.APP_DIR / "quarantine"
     incident = root / f"{db_path.name}-{ts}"
@@ -2674,8 +2846,9 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     ``add_column_if_missing``). Does NOT run the dispatcher and does NOT include
     the Codex ``last_total_tokens`` ALTER, which carries a one-time purge
     side-effect that stays in ``open_cache_db``. The eager dispatcher can run
-    024, but that handler acquires its own Codex flock and only deletes
-    Codex-derived rows; it neither reads nor requires ``last_total_tokens``.
+    024 under the dispatcher's global writer flock, after which that handler
+    acquires its Codex flock and only deletes Codex-derived rows; it neither
+    reads nor requires ``last_total_tokens``.
     Normal ``open_cache_db`` remains responsible for the ALTER and its historic
     purge, so leaving it outside this shared schema is safe.
     """
@@ -3084,6 +3257,20 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # existing last_model/thread facts. A batch that ends after a turn_context
     # and resumes with a response_item stamps the correct effective turn.
     add_column_if_missing(conn, "codex_session_files", "last_turn_id", "TEXT")
+    # account_key (#341, spec §2 cache.db): observe-and-stamp attribution rides a
+    # NULLABLE column on every stamped-entry family — the read-side rule is
+    # ``NULL ≡ unattributed`` (no NOT NULL, no default), so an unstamped legacy
+    # row and a stably-unattributed ingest render identically. The Claude
+    # families (session_entries/session_files) are backfilled from the cutover op
+    # by cache migration 029; Codex families are stamped forward at ingest time
+    # (per-root auth.json) and pre-feature Codex rows stay NULL per Q2. These
+    # column-adds ride the migration-bumped head like every other cache column
+    # addition (schema apply is version-gated, migrations-gotchas.md).
+    add_column_if_missing(conn, "session_entries", "account_key", "TEXT")
+    add_column_if_missing(conn, "session_files", "account_key", "TEXT")
+    add_column_if_missing(conn, "codex_session_entries", "account_key", "TEXT")
+    add_column_if_missing(conn, "codex_session_files", "account_key", "TEXT")
+    add_column_if_missing(conn, "quota_window_snapshots", "account_key", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_codex_files_source_root "
         "ON codex_session_files(source_root_key)"
@@ -3846,7 +4033,47 @@ def _codex_conversation_fts_full_clear(conn: sqlite3.Connection) -> None:
             pass  # table not yet created (pre-schema conn); nothing to clear
 
 
+def _run_pending_cache_migrations_under_writer_lock(
+    conn: sqlite3.Connection,
+) -> None:
+    """Run the cache dispatcher while marking its global flock as owned."""
+    token = _CACHE_DISPATCH_WRITER_LOCK_HELD.set(True)
+    try:
+        _run_pending_migrations(
+            conn,
+            registry=_CACHE_MIGRATIONS,
+            db_label="cache.db",
+            recover_version_ahead=True,
+        )
+    finally:
+        _CACHE_DISPATCH_WRITER_LOCK_HELD.reset(token)
+
+
 def _eagerly_apply_cache_migrations() -> None:
+    """Serialize the eager cache schema/migration path against all writers."""
+    from _lib_cache_writer_lock import (
+        acquire_ordered_flocks,
+        release_cache_writer_flocks,
+    )
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    held = acquire_ordered_flocks(
+        [
+            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX),
+            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        ]
+    )
+    if held is None:
+        raise MigrationGateNotMet(
+            "cache.db writer busy; deferring eager cache migrations"
+        )
+    try:
+        _eagerly_apply_cache_migrations_under_writer_lock()
+    finally:
+        release_cache_writer_flocks(held)
+
+
+def _eagerly_apply_cache_migrations_under_writer_lock() -> None:
     """Open cache.db so its pending migrations (notably
     ``001_dedup_highest_wins``) apply BEFORE stats migration 008's gate
     check.
@@ -3953,10 +4180,7 @@ def _eagerly_apply_cache_migrations() -> None:
         # Dispatcher (cache.db side). Runs every pending cache
         # migration, including ``001_dedup_highest_wins``. Idempotent —
         # if 001 has already applied, this is a fast-path return.
-        _run_pending_migrations(
-            conn, registry=_CACHE_MIGRATIONS, db_label="cache.db",
-            recover_version_ahead=True,
-        )
+        _run_pending_cache_migrations_under_writer_lock(conn)
     finally:
         # Close immediately so the WAL writer lock (if any) is
         # released before the stats 008 body opens its read-only
@@ -4103,6 +4327,43 @@ def _cache_db_codex_lock_path_for_conn(
     return None
 
 
+def _acquire_cache_db_codex_provider_flock(
+    conn: sqlite3.Connection,
+    *,
+    migration: str,
+) -> list[int]:
+    """Take the Codex provider flock inside the dispatcher's global flock.
+
+    Production dispatchers already hold the global cache writer flock. The
+    provider-local lock remains inside handlers 024–027 so direct migration
+    tests and provider-scoped coordination retain their fail-closed behavior.
+    """
+    provider_path = _cache_db_codex_lock_path_for_conn(conn)
+    if provider_path is None:
+        return []
+
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    try:
+        held = acquire_ordered_flocks([(provider_path, fcntl.LOCK_EX)])
+    except OSError as exc:
+        raise MigrationGateNotMet(
+            f"cache.db Codex lock unavailable; deferring cache {migration}"
+        ) from exc
+    if held is None:
+        raise MigrationGateNotMet(
+            f"cache.db Codex lock held by a concurrent Codex sync; "
+            f"deferring cache {migration}"
+        )
+    return held
+
+
+def _release_cache_db_writer_flocks(held: list[int]) -> None:
+    from _lib_cache_writer_lock import release_cache_writer_flocks
+
+    release_cache_writer_flocks(held)
+
+
 @cache_migration("001_dedup_highest_wins")
 def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     """One-time re-ingest of session_entries with corrected msg_id+req_id dedup.
@@ -4151,9 +4412,10 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
           handler time anyway. Interactive surfaces (``report``,
           ``weekly``, ``percent-breakdown``, etc.) still see it once.
     """
-    # #105 — mutual exclusion with ``sync_cache``. Acquire the SAME
-    # ``cache.db.lock`` fcntl flock ``sync_cache`` holds for its entire
-    # walk, BEFORE the ``BEGIN IMMEDIATE`` below. Both paths therefore
+    # #105 — mutual exclusion with ``sync_cache``. Production dispatchers
+    # already hold the SAME ``cache.db.lock`` fcntl flock ``sync_cache`` holds
+    # for its entire walk. Direct handler calls (unit/golden tests) acquire it
+    # here before the ``BEGIN IMMEDIATE`` below. Both paths therefore
     # acquire fcntl -> SQLite write lock in ONE consistent order, so there
     # is no opposite-order deadlock (the hazard that deferred this fix:
     # SQLite-then-fcntl in 001 vs fcntl-then-SQLite in sync_cache). With
@@ -4172,7 +4434,11 @@ def _001_dedup_highest_wins(conn: sqlite3.Connection) -> None:
     # non-blocking LOCK_NB-and-bail and the framework's "defer is the safe
     # side" contract. 008/009/010 already defer while 001 is pending, so the
     # system stays safe until a non-contended instant applies it.
-    lock_path = _cache_db_lock_path_for_conn(conn)
+    lock_path = (
+        None
+        if _CACHE_DISPATCH_WRITER_LOCK_HELD.get()
+        else _cache_db_lock_path_for_conn(conn)
+    )
     lock_fh = None
     if lock_path is not None:
         lock_fh = open(lock_path, "w")
@@ -4786,8 +5052,10 @@ def _020_session_entries_physical_unique(conn: sqlite3.Connection) -> None:
     offset bookkeeping cannot produce them) with no principled winner; MIN(id)
     keeps the first-ingested row, matching the pre-bug state. cache.db is
     re-derivable — `cache-sync --rebuild` remains the escape hatch. Mirrors
-    cache 001's flock-then-BEGIN-IMMEDIATE pattern (#105): mutual exclusion with
-    a mid-walk sync_cache, deferring via MigrationGateNotMet on contention.
+    cache 001's global-flock-then-BEGIN-IMMEDIATE pattern (#105): mutual
+    exclusion with a mid-walk sync_cache. Production dispatchers already hold
+    that flock; direct handler calls acquire it here and defer via
+    MigrationGateNotMet on contention.
 
     Fresh installs never run this handler: the dispatcher stamps it WITHOUT
     running (the fresh-install branch), and `_apply_cache_schema` already created
@@ -4796,7 +5064,11 @@ def _020_session_entries_physical_unique(conn: sqlite3.Connection) -> None:
     on a second run) and the index create is `IF NOT EXISTS`; safe on an empty
     table.
     """
-    lock_path = _cache_db_lock_path_for_conn(conn)
+    lock_path = (
+        None
+        if _CACHE_DISPATCH_WRITER_LOCK_HELD.get()
+        else _cache_db_lock_path_for_conn(conn)
+    )
     lock_fh = None
     if lock_path is not None:
         lock_fh = open(lock_path, "w")
@@ -4906,27 +5178,18 @@ def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
     sync rederives them from rollout source. Claude tables and Claude quota
     snapshots remain untouched.
 
-    The handler takes ``cache.db.codex.lock`` before ``BEGIN IMMEDIATE`` — the
-    same fcntl-then-SQLite order as ``sync_codex_cache``. Contention raises
+    The cache dispatcher holds maintenance + global writer exclusion; this
+    handler then takes ``cache.db.codex.lock`` before ``BEGIN IMMEDIATE`` — the same
+    fcntl-then-SQLite order as ``sync_codex_cache``. Contention raises
     ``MigrationGateNotMet`` before any DML, so both ordinary and eager cache
     dispatch defer without a partial clear. The DELETE-only transition is safe
     to retry after a crash between this commit and the dispatcher's separate
-    marker stamp: rerunning against its own empty Codex state is a no-op.
-    Never self-stamp; the dispatcher owns ``schema_migrations`` and
-    ``user_version``.
+    marker stamp: rerunning against its own empty Codex state is a no-op. Never
+    self-stamp; the dispatcher owns ``schema_migrations`` and ``user_version``.
     """
-    lock_path = _cache_db_codex_lock_path_for_conn(conn)
-    lock_fh = None
-    if lock_path is not None:
-        lock_fh = open(lock_path, "w")
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_fh.close()
-            raise MigrationGateNotMet(
-                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
-                "deferring cache 024 fused-ingest rebuild (#294 S1)"
-            )
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="024 fused-ingest rebuild (#294 S1)"
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -4948,12 +5211,7 @@ def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
     finally:
-        if lock_fh is not None:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+        _release_cache_db_writer_flocks(held)
 
 
 @cache_migration("025_codex_conversation_normalization")
@@ -4969,27 +5227,19 @@ def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
     turn_context sticky state as it goes. The physical event log and Codex
     accounting/thread/quota rows are the replay SOURCE and are never touched.
 
-    Takes ``cache.db.codex.lock`` with the same fcntl-then-``BEGIN IMMEDIATE``
-    order as ``sync_codex_cache``, raising ``MigrationGateNotMet`` on contention
-    (defer, never partially normalize) from both the ordinary and eager cache
-    dispatch paths. Deterministic replay order + the non-AUTOINCREMENT ``id``
-    rowid alias + the storm-free full-clear make a re-run (handler success, crash
-    before the central stamp) byte-idempotent INCLUDING the FTS shadow tables.
-    Never self-stamps; the dispatcher owns ``schema_migrations`` and
-    ``user_version``.
+    The cache dispatcher holds maintenance + global writer exclusion; this
+    handler then takes ``cache.db.codex.lock`` with the same
+    fcntl-then-``BEGIN IMMEDIATE`` order as ``sync_codex_cache``, raising
+    ``MigrationGateNotMet`` on contention (defer, never partially normalize)
+    from both the ordinary and eager cache dispatch paths. Deterministic replay
+    order + the non-AUTOINCREMENT ``id`` rowid alias + the storm-free full-clear
+    make a re-run (handler success, crash before the central stamp)
+    byte-idempotent INCLUDING the FTS shadow tables. Never self-stamps; the
+    dispatcher owns ``schema_migrations`` and ``user_version``.
     """
-    lock_path = _cache_db_codex_lock_path_for_conn(conn)
-    lock_fh = None
-    if lock_path is not None:
-        lock_fh = open(lock_path, "w")
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_fh.close()
-            raise MigrationGateNotMet(
-                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
-                "deferring cache 025 conversation normalization (#294 S6)"
-            )
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="025 conversation normalization (#294 S6)"
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -5003,12 +5253,7 @@ def _025_codex_conversation_normalization(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
     finally:
-        if lock_fh is not None:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+        _release_cache_db_writer_flocks(held)
 
 
 @cache_migration("026_codex_conversation_key_backfill")
@@ -5022,25 +5267,17 @@ def _026_codex_conversation_key_backfill(conn: sqlite3.Connection) -> None:
     clear helper with ``sync_codex_cache(rebuild=True)`` so new or future Codex
     families cannot drift from the migration's destructive scope.
 
-    The Codex flock is acquired before ``BEGIN IMMEDIATE``.  Contention defers
-    through ``MigrationGateNotMet`` before any DML; after a handler/data commit
-    but before the dispatcher's central stamp, a rerun against the empty state
-    is a byte-idempotent no-op.  The physical mutation sequence advances only
-    when the shared clear actually changed persisted Codex state.  The handler
-    never self-stamps.
+    The cache dispatcher holds maintenance + global writer exclusion; this
+    handler then takes the Codex flock before ``BEGIN IMMEDIATE``. Contention
+    defers through ``MigrationGateNotMet``
+    before any DML; after a handler/data commit but before the dispatcher's
+    central stamp, a rerun against the empty state is a byte-idempotent no-op.
+    The physical mutation sequence advances only when the shared clear actually
+    changed persisted Codex state. The handler never self-stamps.
     """
-    lock_path = _cache_db_codex_lock_path_for_conn(conn)
-    lock_fh = None
-    if lock_path is not None:
-        lock_fh = open(lock_path, "w")
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_fh.close()
-            raise MigrationGateNotMet(
-                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
-                "deferring cache 026 conversation-key backfill (#312)"
-            )
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="026 conversation-key backfill (#312)"
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -5053,12 +5290,7 @@ def _026_codex_conversation_key_backfill(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
     finally:
-        if lock_fh is not None:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+        _release_cache_db_writer_flocks(held)
 
 
 @cache_migration("027_codex_fork_preamble_rebuild")
@@ -5072,24 +5304,17 @@ def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
     remain authoritative, so clear all re-derivable Codex families and let the
     corrected fused parser replay them from byte zero.
 
-    The Codex flock precedes ``BEGIN IMMEDIATE``.  Contention defers before DML;
-    a markerless retry against already-cleared state is a no-op.  The shared
-    clear helper keeps this migration aligned with runtime rebuild scope and
-    advances the physical mutation sequence only when state actually changed.
-    The dispatcher owns the migration marker.
+    The cache dispatcher holds maintenance + global writer exclusion; this
+    handler then takes the Codex flock before ``BEGIN IMMEDIATE``. Contention
+    defers before DML; a markerless retry
+    against already-cleared state is a no-op. The shared clear helper keeps this
+    migration aligned with runtime rebuild scope and advances the physical
+    mutation sequence only when state actually changed. The dispatcher owns the
+    migration marker.
     """
-    lock_path = _cache_db_codex_lock_path_for_conn(conn)
-    lock_fh = None
-    if lock_path is not None:
-        lock_fh = open(lock_path, "w")
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_fh.close()
-            raise MigrationGateNotMet(
-                "cache.db.codex.lock held by a concurrent sync_codex_cache; "
-                "deferring cache 027 fork-preamble rebuild"
-            )
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="027 fork-preamble rebuild"
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -5102,12 +5327,7 @@ def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
     finally:
-        if lock_fh is not None:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+        _release_cache_db_writer_flocks(held)
 
 
 @cache_migration("028_split_conversation_store")
@@ -5118,14 +5338,14 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
     the independent current-schema store, arms provider-local byte-zero replay,
     then drops the legacy transcript tables from the hot cache. Compact Codex
     thread metadata stays in cache.db because accounting/project attribution
-    joins it directly.
+    joins it directly. The dispatcher already holds cache maintenance exclusive
+    + the global writer flock; this handler takes the remaining conversation
+    maintenance and provider flocks in total lock order.
     """
     core = _cctally_core
     lock_paths = (
-        core.CACHE_LOCK_MAINTENANCE_PATH,
-        core.CACHE_LOCK_PATH,
-        core.CACHE_LOCK_CODEX_PATH,
         core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
+        core.CACHE_LOCK_CODEX_PATH,
         core.CONVERSATIONS_LOCK_PATH,
         core.CONVERSATIONS_LOCK_CODEX_PATH,
     )
@@ -5220,6 +5440,62 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
             except OSError:
                 pass
             fh.close()
+
+
+@cache_migration("029_backfill_claude_account")
+def _029_backfill_claude_account(conn: sqlite3.Connection) -> None:
+    """Backfill Claude ``session_entries`` / ``session_files`` ``account_key``
+    from the cutover op's recorded account (#341, spec §2 cache.db).
+
+    The ``account_key`` columns themselves are added by ``_apply_cache_schema``
+    (CREATE-time + ``add_column_if_missing`` — the repo's column-addition rule),
+    so they are present in BOTH pre and post; this migration bumps the cache head
+    so an existing install re-runs that schema apply AND performs the one-time
+    Claude row backfill. It reads ONLY the journal cutover op (``never re-reads
+    auth`` — spec §2 epoch transition): Claude legacy rows attribute to the op's
+    recorded account; Codex rows stay NULL (Q2). ``NULL ≡ unattributed`` on the
+    read path, so a single-account / no-identity install is byte-stable.
+
+    Ordering: the cutover op is appended by the stats epoch transition, which may
+    run AFTER this cache open. So when the op is ABSENT but legacy Claude rows
+    exist, DEFER (``MigrationGateNotMet``) — the op appears on a later open and
+    this backfill runs then. An op recording the ``unattributed`` sentinel is a
+    resolved (not pending) outcome → no-op (leave NULL). Idempotent: only touches
+    ``account_key IS NULL`` rows. Central stamp via the dispatcher (#140); the
+    handler does NOT self-stamp.
+    """
+    import _cctally_journal as _jr
+    import _lib_accounts as _acc
+
+    op_value = _jr.find_accounts_cutover_op()
+    if op_value is None:
+        # Cutover hasn't appended its op yet. Defer only if there is legacy Claude
+        # history to attribute; a fresh install (no such rows) proceeds as a no-op.
+        pending = conn.execute(
+            "SELECT 1 FROM session_entries WHERE account_key IS NULL LIMIT 1"
+        ).fetchone()
+        if pending is not None:
+            raise MigrationGateNotMet(
+                "accounts cutover op not yet appended; deferring Claude account "
+                "backfill until the epoch transition records it"
+            )
+        return
+    if op_value == _acc.UNATTRIBUTED:
+        return  # resolved unattributed — leave NULL (== unattributed)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE session_entries SET account_key=? WHERE account_key IS NULL",
+            (op_value,),
+        )
+        conn.execute(
+            "UPDATE session_files SET account_key=? WHERE account_key IS NULL",
+            (op_value,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
@@ -6499,6 +6775,33 @@ def _db_path_for_label(db_label: str) -> pathlib.Path:
     raise ValueError(f"unknown db_label: {db_label}")
 
 
+def _acquire_cache_admin_writer_flocks(
+    db_label: str,
+    *,
+    timeout: float = 15.0,
+) -> "list[int] | None":
+    """Serialize raw cache admin mutations without affecting other stores."""
+    if db_label != "cache.db":
+        return []
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    return acquire_ordered_flocks(
+        [
+            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        ],
+        timeout=timeout,
+    )
+
+
+def _release_cache_admin_writer_flocks(held: list[int]) -> None:
+    if not held:
+        return
+    from _lib_cache_writer_lock import release_cache_writer_flocks
+
+    release_cache_writer_flocks(held)
+
+
 def cmd_db_skip(args: argparse.Namespace) -> int:
     """Mark a migration as skipped.
 
@@ -6524,7 +6827,15 @@ def cmd_db_skip(args: argparse.Namespace) -> int:
     # ~/.local/share/cctally/ yet, and sqlite3.connect() does NOT
     # create parent directories (only the DB file itself).
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    held = _acquire_cache_admin_writer_flocks(db_label)
+    if held is None:
+        eprint("cctally: cache.db writer busy; could not record migration skip.")
+        return 3
+    try:
+        conn = sqlite3.connect(path)
+    except BaseException:
+        _release_cache_admin_writer_flocks(held)
+        raise
     try:
         conn.execute(
             """
@@ -6571,6 +6882,7 @@ def cmd_db_skip(args: argparse.Namespace) -> int:
         conn.commit()
     finally:
         conn.close()
+        _release_cache_admin_writer_flocks(held)
     print(f"Skipped: {name}")
     return 0
 
@@ -6609,7 +6921,15 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"cctally: {name} is not skipped; nothing to do.")
         return 0
-    conn = sqlite3.connect(path)
+    held = _acquire_cache_admin_writer_flocks(db_label)
+    if held is None:
+        eprint("cctally: cache.db writer busy; could not remove migration skip.")
+        return 3
+    try:
+        conn = sqlite3.connect(path)
+    except BaseException:
+        _release_cache_admin_writer_flocks(held)
+        raise
     try:
         try:
             cur = conn.execute(
@@ -6627,6 +6947,7 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
         conn.commit()
     finally:
         conn.close()
+        _release_cache_admin_writer_flocks(held)
     print(f"Unskipped: {name} (will run on next open).")
     return 0
 
@@ -6665,7 +6986,15 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         print(f"cctally: {label} not present; nothing to recover.")
         return 0
 
-    conn = sqlite3.connect(path)
+    held = _acquire_cache_admin_writer_flocks(label)
+    if held is None:
+        eprint("cctally: cache.db writer busy; could not recover schema state.")
+        return 3
+    try:
+        conn = sqlite3.connect(path)
+    except BaseException:
+        _release_cache_admin_writer_flocks(held)
+        raise
     try:
         cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
         head = len(registry)
@@ -6688,6 +7017,7 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         return 0
     finally:
         conn.close()
+        _release_cache_admin_writer_flocks(held)
 
 
 def _db_backup_timestamp() -> str:
@@ -6696,6 +7026,16 @@ def _db_backup_timestamp() -> str:
 
 def _repair_marker_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(f"{path.name}.repairing")
+
+
+_REPAIR_OWNER_VERSION = 1
+_REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class RepairMarkerClaim:
+    marker: pathlib.Path
+    claim_id: str
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -6710,40 +7050,177 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _claim_repair_marker(path: pathlib.Path) -> "tuple[bool, str]":
-    """Atomically block new cctally stats opens; reclaim dead-owner markers."""
+def _process_start_identity(pid: int) -> "str | None":
+    """Return a kernel-derived process-start identity for PID-reuse defense."""
+    if pid <= 0:
+        return None
+    proc_stat = pathlib.Path(f"/proc/{pid}/stat")
+    try:
+        raw = proc_stat.read_text()
+        # Field 2 is parenthesized and may contain spaces. Fields after the
+        # final ')' begin at field 3; process starttime is field 22.
+        tail = raw.rsplit(")", 1)[1].strip().split()
+        if len(tail) >= 20:
+            return f"proc:{tail[19]}"
+    except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except OSError:
+        return None
+    started = " ".join(result.stdout.split())
+    return f"ps:{started}" if result.returncode == 0 and started else None
+
+
+def _encode_repair_owner(
+    *,
+    pid: int,
+    process_start: str,
+    claim_id: str,
+    created_ns: "int | None" = None,
+) -> str:
+    return json.dumps(
+        {
+            "version": _REPAIR_OWNER_VERSION,
+            "pid": pid,
+            "process_start": process_start,
+            "claim_id": claim_id,
+            "created_ns": time.time_ns() if created_ns is None else created_ns,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _read_repair_owner(marker: pathlib.Path) -> "dict[str, Any] | None":
+    try:
+        raw = marker.read_text().strip()
+    except OSError:
+        return None
+    def legacy_owner() -> "dict[str, Any] | None":
+        # Legacy markers contained only a PID. They remain live for a bounded
+        # lease when that PID exists, preventing a reused PID from wedging the
+        # database forever.
+        try:
+            return {
+                "version": 0,
+                "pid": int(raw),
+                "process_start": None,
+                "claim_id": None,
+            }
+        except ValueError:
+            return None
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return legacy_owner()
+    if not isinstance(decoded, dict):
+        return legacy_owner()
+    if (
+        decoded.get("version") != _REPAIR_OWNER_VERSION
+        or not isinstance(decoded.get("pid"), int)
+        or not isinstance(decoded.get("process_start"), str)
+        or not decoded["process_start"]
+        or not isinstance(decoded.get("claim_id"), str)
+        or not decoded["claim_id"]
+    ):
+        return None
+    return decoded
+
+
+def _repair_marker_is_live(marker: pathlib.Path) -> "tuple[bool, str]":
+    owner = _read_repair_owner(marker)
+    if owner is None:
+        return False, "malformed owner record"
+    pid = int(owner["pid"])
+    if not _pid_is_alive(pid):
+        return False, f"owner pid {pid} is not running"
+    expected_start = owner.get("process_start")
+    if expected_start:
+        actual_start = _process_start_identity(pid)
+        if actual_start is not None:
+            if actual_start == expected_start:
+                return True, f"pid {pid}"
+            return False, f"pid {pid} was reused"
+    try:
+        age_seconds = max(0.0, time.time() - marker.stat().st_mtime)
+    except OSError:
+        return False, "owner record disappeared"
+    if age_seconds <= _REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS:
+        return True, f"pid {pid} (identity unavailable; bounded lease)"
+    return False, f"pid {pid} owner identity lease expired"
+
+
+def _remove_stale_repair_marker(path: pathlib.Path) -> "tuple[bool, str]":
+    """Remove a provably stale marker; the caller owns maintenance-exclusive."""
     marker = _repair_marker_path(path)
-    for _attempt in range(2):
+    if not marker.exists():
+        return True, ""
+    live, reason = _repair_marker_is_live(marker)
+    if live:
+        return False, f"another {path.name} repair owns {marker} ({reason})"
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return True, ""
+    except OSError as exc:
+        return False, f"could not remove stale repair marker {marker}: {exc}"
+    _fsync_directory(marker.parent)
+    return True, reason
+
+
+def _claim_repair_marker(
+    path: pathlib.Path,
+) -> "tuple[RepairMarkerClaim | None, str]":
+    """Atomically publish a complete owner record; reclaim stale ownership."""
+    marker = _repair_marker_path(path)
+    process_start = _process_start_identity(os.getpid())
+    if process_start is None:
+        raise OSError("could not establish repair-owner process identity")
+    for _attempt in range(3):
+        claim_id = f"{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}"
+        temp = marker.with_name(f".{marker.name}.{claim_id}.tmp")
+        payload = _encode_repair_owner(
+            pid=os.getpid(),
+            process_start=process_start,
+            claim_id=claim_id,
+        )
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            try:
-                owner = int(marker.read_text().strip())
-            except (OSError, ValueError):
-                owner = -1
-            if _pid_is_alive(owner):
-                return False, (
-                    f"another {path.name} repair owns {marker} (pid {owner})"
-                )
-            try:
-                marker.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                return False, f"could not remove stale repair marker {marker}: {exc}"
-            continue
-        try:
-            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+            os.write(fd, payload.encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
-        _fsync_directory(marker.parent)
-        return True, ""
-    return False, f"could not claim repair marker {marker}"
+        try:
+            try:
+                os.link(temp, marker)
+            except FileExistsError:
+                removed, reason = _remove_stale_repair_marker(path)
+                if not removed:
+                    return None, reason
+                continue
+            _fsync_directory(marker.parent)
+            return RepairMarkerClaim(marker=marker, claim_id=claim_id), ""
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+    return None, f"could not claim repair marker {marker}"
 
 
-def _release_repair_marker(path: pathlib.Path) -> None:
+def _release_repair_marker(path: pathlib.Path, claim: RepairMarkerClaim) -> None:
     marker = _repair_marker_path(path)
+    owner = _read_repair_owner(marker)
+    if owner is not None and owner.get("claim_id") != claim.claim_id:
+        raise OSError(f"repair marker ownership changed before cleanup: {marker}")
     try:
         marker.unlink()
     except FileNotFoundError:
@@ -7031,11 +7508,11 @@ def cmd_db_repair(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        claimed, reason = _claim_repair_marker(path)
+        claim, reason = _claim_repair_marker(path)
     except OSError as exc:
         eprint(f"cctally: could not create stats.db repair marker: {exc}")
         return 3
-    if not claimed:
+    if claim is None:
         eprint(f"cctally: {reason}")
         return 3
     try:
@@ -7047,7 +7524,7 @@ def cmd_db_repair(args: argparse.Namespace) -> int:
         eprint(f"cctally: unexpected stats.db repair failure: {exc}")
         rc = 3
     try:
-        _release_repair_marker(path)
+        _release_repair_marker(path, claim)
     except OSError as exc:
         eprint(
             f"cctally: stats.db repair marker cleanup failed ({exc}); "
@@ -7381,9 +7858,12 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
     the main DB and truncates the -wal file — it changes no data, no schema, no
     user_version — so there is no prod guard and no --yes.
 
-    Exit 0 when drained / already-small / the DB is absent; 3 (staged) if the
-    target stayed busy or was not fully truncated through the timeout — an
-    actionable "something is still holding it" signal.
+    A cache checkpoint takes the same global writer flock as both provider
+    syncs, using the command's timeout as one bounded wait, so it cannot overlap
+    a cache write or another cache checkpoint. Exit 0 when drained /
+    already-small / the DB is absent; 3 (staged) if the target stayed busy or
+    was not fully truncated through the timeout — an actionable "something is
+    still holding it" signal.
     """
     import _cctally_cache
     from _lib_json_envelope import stamp_schema_version
@@ -7410,12 +7890,39 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
             print(f"cctally: no {label} database file present; nothing to drain.")
         return 0
 
-    conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
+    held: list[int] = []
     try:
-        conn.execute(f"PRAGMA busy_timeout={timeout}")
-        result = _cctally_cache._run_wal_truncate(conn, path, db_label=label)
+        if which == "cache":
+            from _lib_cache_writer_lock import acquire_ordered_flocks
+
+            acquired = acquire_ordered_flocks(
+                [
+                    (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+                    (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+                ],
+                timeout=max(timeout, 0) / 1000,
+            )
+            if acquired is None:
+                wal_bytes = _cctally_cache._wal_file_size(path)
+                result = _cctally_cache.CheckpointResult(
+                    label, wal_bytes, wal_bytes, 0, True, False
+                )
+            else:
+                held = acquired
+        if which != "cache" or held:
+            conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
+            try:
+                conn.execute(f"PRAGMA busy_timeout={timeout}")
+                result = _cctally_cache._run_wal_truncate(
+                    conn, path, db_label=label
+                )
+            finally:
+                conn.close()
     finally:
-        conn.close()
+        if held:
+            from _lib_cache_writer_lock import release_cache_writer_flocks
+
+            release_cache_writer_flocks(held)
 
     if as_json:
         payload = {"db": result.db, "walBytesBefore": result.wal_bytes_before,

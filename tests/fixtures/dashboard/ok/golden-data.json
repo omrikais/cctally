@@ -9583,6 +9583,7 @@
     }
   },
   "sync_age_s": null,
+  "sync_failure": null,
   "transcriptsEnabled": true,
   "trend": {
     "avg_dollars_per_pct": 0.4178466954125681,

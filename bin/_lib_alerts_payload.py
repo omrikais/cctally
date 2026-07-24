@@ -54,6 +54,15 @@ def _load_lib(name: str):
 _lib_display_tz = _load_lib("_lib_display_tz")
 format_display_dt = _lib_display_tz.format_display_dt
 
+# Account dimension (#341): every alert payload carries the account_key it wrote
+# under as a TOP-LEVEL field (never in `context`, to avoid touching any
+# context-serialized golden). Real-account families default to the sentinel;
+# vendor-wide families default to `*`. `_dispatch_alert_notification` reads it for
+# the unconditional 8th `alerts.log` field + the R8 `[label]` title prefix.
+_lib_accounts = _load_lib("_lib_accounts")
+_UNATTRIBUTED = _lib_accounts.UNATTRIBUTED
+_VENDOR_WIDE = _lib_accounts.VENDOR_WIDE
+
 
 def _alert_text_weekly(payload: dict, tz: "ZoneInfo | None") -> tuple[str, str, str]:
     """Build (title, subtitle, body) for a weekly threshold alert.
@@ -137,6 +146,7 @@ def _build_alert_payload_weekly(
     week_start_date: str,
     cumulative_cost_usd: float,
     dollars_per_percent: "float | None",
+    account_key: str = _UNATTRIBUTED,
 ) -> dict:
     """Build the alert payload for a weekly threshold crossing.
 
@@ -144,14 +154,15 @@ def _build_alert_payload_weekly(
     sets the DB ``alerted_at`` BEFORE invoking ``_dispatch_alert_notification``
     (set-then-dispatch invariant, spec §3.2). Consumers (envelope builders,
     test inspectors) read the ``alerted_at`` field as the authoritative
-    "alert was attempted" timestamp.
-    """
+    "alert was attempted" timestamp. ``account_key`` (#341) is the real account
+    the crossing wrote under (per-account family)."""
     return {
         "id": f"weekly:{week_start_date}:{threshold}",
         "axis": "weekly",
         "threshold": int(threshold),
         "crossed_at": crossed_at_utc,
         "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "account_key": str(account_key),
         "context": {
             "week_start_date": week_start_date,
             "cumulative_cost_usd": float(cumulative_cost_usd),
@@ -170,6 +181,7 @@ def _build_alert_payload_five_hour(
     block_start_at: str,
     block_cost_usd: float,
     primary_model: "str | None",
+    account_key: str = _UNATTRIBUTED,
 ) -> dict:
     """Build the alert payload for a 5h-block threshold crossing.
 
@@ -177,14 +189,15 @@ def _build_alert_payload_five_hour(
     rationale. ``primary_model`` is the highest-cost model active in the
     block (resolved via ``_resolve_primary_model_for_block``); ``None`` when
     the rollup-children child table is empty (e.g., direct-JSONL-fallback
-    path before lazy backfill).
-    """
+    path before lazy backfill). ``account_key`` (#341) is the block's account
+    (per-account family)."""
     return {
         "id": f"five_hour:{five_hour_window_key}:{threshold}",
         "axis": "five_hour",
         "threshold": int(threshold),
         "crossed_at": crossed_at_utc,
         "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "account_key": str(account_key),
         "context": {
             "five_hour_window_key": int(five_hour_window_key),
             "block_start_at": block_start_at,
@@ -223,6 +236,7 @@ def _build_alert_payload_budget(
     spent_usd: float,
     consumption_pct: float,
     period: str = "subscription-week",
+    account_key: str = _VENDOR_WIDE,
 ) -> dict:
     """Build the alert payload for an equiv-$ budget threshold crossing.
 
@@ -245,6 +259,7 @@ def _build_alert_payload_budget(
         "threshold": int(threshold),
         "crossed_at": crossed_at_utc,
         "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "account_key": str(account_key),
         "context": {
             "week_start_at": week_start_at,
             "period": str(period),
@@ -296,6 +311,7 @@ def _build_alert_payload_project_budget(
     budget_usd: float,
     spent_usd: float,
     consumption_pct: float,
+    account_key: str = _VENDOR_WIDE,
 ) -> dict:
     """Build the alert payload for a PER-PROJECT equiv-$ budget threshold
     crossing (axis ``project_budget``, the fifth alert axis; spec §5.3).
@@ -315,6 +331,7 @@ def _build_alert_payload_project_budget(
         "threshold": int(threshold),
         "crossed_at": crossed_at_utc,
         "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "account_key": str(account_key),
         "context": {
             "week_start_at": week_start_at,
             "project": project,
@@ -369,6 +386,7 @@ def _build_alert_payload_codex_budget(
     budget_usd: float,
     spent_usd: float,
     consumption_pct: float,
+    account_key: str = _VENDOR_WIDE,
 ) -> dict:
     """Build the alert payload for a Codex budget threshold crossing (axis
     ``codex_budget``, the sixth alert axis; spec §6).
@@ -388,6 +406,7 @@ def _build_alert_payload_codex_budget(
         "threshold": int(threshold),
         "crossed_at": crossed_at_utc,
         "alerted_at": crossed_at_utc,  # set-then-dispatch
+        "account_key": str(account_key),
         "context": {
             "period": str(period),
             "period_start_at": period_start_at,
@@ -442,6 +461,7 @@ def _build_alert_payload_projected(
     projected_value: float,
     denominator: float,
     week_start_at: str,
+    account_key: str = _VENDOR_WIDE,
 ) -> dict:
     """Build the alert payload for a projected-pace threshold crossing (#121).
 
@@ -464,6 +484,7 @@ def _build_alert_payload_projected(
         "threshold": int(threshold),
         "projected_value": float(projected_value),
         "denominator": float(denominator),
+        "account_key": str(account_key),
         "context": {
             "week_start_at": week_start_at,
             "metric": str(metric),

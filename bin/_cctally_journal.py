@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime as dt
 import fcntl
+import json
 import os
 import pathlib
 import sqlite3
@@ -35,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 
 import _cctally_core
+import _lib_accounts
 import _lib_journal
 import _lib_record
 
@@ -408,8 +410,9 @@ def journal_high_water() -> tuple[str, int] | None:
 #   QUOTA_APPLIER    the Codex quota cache leg (Task 7; wired to `_quota_applier`
 #                    below). Contract: (decoded) -> stop_index | None. `decoded`
 #                    is the ordered list of (record, segment, offset); a non-None
-#                    int is a prefix-stop boundary (busy `cache.db.codex.lock` at
-#                    a quota line): the cycle processes decoded[:stop] and
+#                    int is a prefix-stop boundary (busy global or Codex cache
+#                    writer flock at a quota line): the cycle processes
+#                    decoded[:stop] and
 #                    advances the cursor to decoded[stop]'s offset (spec §5.2
 #                    step 3). Always-on: a Claude-only batch scans + returns None.
 #   codex_apply      per-cycle `(ctx) -> None` closure (Task 7, a `run_stats_
@@ -690,10 +693,11 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
 # --------------------------------------------------------------------------
 # cache leg — Codex quota obs -> cache.db quota_window_snapshots (spec §5.2
 # step 3, Task 7 Item 2). Runs BEFORE the stats BEGIN IMMEDIATE, under the
-# `cache.db.codex.lock` provider flock (lock-order law: provider flocks precede
-# SQLite write transactions). The journal Codex quota obs are the DURABLE truth
-# (§1 latent data-loss hole — the source rollout JSONL evaporates); this leg
-# re-materializes the disposable cache.db index from them, idempotently
+# global cache writer flock followed by `cache.db.codex.lock` (lock-order law:
+# flocks precede SQLite write transactions). The journal Codex quota obs are the
+# DURABLE truth (§1 latent data-loss hole — the source rollout JSONL
+# evaporates); this leg re-materializes the disposable cache.db index from them,
+# idempotently
 # (INSERT OR IGNORE on the natural key). Distinct from the direct cache write in
 # `sync_codex_cache._write_codex_file_batch` (kept byte-identical, Item 1) — the
 # two converge on the same rows.
@@ -706,8 +710,8 @@ _QUOTA_SNAPSHOT_INSERT = (
     "(source, source_root_key, source_path, line_offset, captured_at_utc, "
     " observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
     " used_percent, resets_at_utc, plan_type, individual_limit_json, "
-    " reached_type, observed_model) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    " reached_type, observed_model, account_key) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 _QUOTA_SNAPSHOT_COLS = (
@@ -716,6 +720,17 @@ _QUOTA_SNAPSHOT_COLS = (
     "window_minutes", "used_percent", "resets_at_utc", "plan_type",
     "individual_limit_json", "reached_type", "observed_model",
 )
+
+
+def _quota_snapshot_values(rec: dict) -> tuple:
+    """Build the INSERT values tuple for one Codex quota obs. account_key (#341)
+    rides the obs TOP-LEVEL ``account`` field (obs stamp shape), not the payload,
+    so an unstamped/sentinel obs re-materializes cache.db with NULL account_key
+    (``NULL ≡ unattributed`` on the read path). first-stamp-wins via the
+    ``INSERT OR IGNORE`` natural key — account_key is a stamped attribute, never
+    part of the identity."""
+    p = rec.get("payload") or {}
+    return tuple(p.get(col) for col in _QUOTA_SNAPSHOT_COLS) + (rec.get("account"),)
 
 
 def _is_codex_quota_obs(rec: dict) -> bool:
@@ -728,12 +743,13 @@ def _is_codex_quota_obs(rec: dict) -> bool:
 
 def _quota_applier(decoded) -> int | None:
     """Cache leg (spec §5.2 step 3): materialize this batch's Codex quota obs
-    into cache.db `quota_window_snapshots`, under a NON-BLOCKING
-    `cache.db.codex.lock`. Contract (journal seam): `(decoded) -> stop | None`,
-    `decoded = [(record, segment, offset), ...]` in canonical order.
+    into cache.db `quota_window_snapshots`, under the NON-BLOCKING global cache
+    writer lock followed by `cache.db.codex.lock`. Contract (journal seam):
+    `(decoded) -> stop | None`, `decoded = [(record, segment, offset), ...]` in
+    canonical order.
 
     - No Codex quota obs in the batch → return None (no flock taken).
-    - Busy codex flock, OR a cache write it cannot complete → PREFIX-STOP:
+    - Busy global/provider flock, OR a cache write it cannot complete → PREFIX-STOP:
       return the index of the FIRST codex quota obs, so the cycle processes only
       `decoded[:stop]` and advances the cursor to `decoded[stop]`'s offset,
       retrying the remainder next cycle (the scalar cursor never advances past an
@@ -744,14 +760,22 @@ def _quota_applier(decoded) -> int | None:
                  if _is_codex_quota_obs(rec)]
     if not quota_idx:
         return None
+    from _lib_cache_writer_lock import (
+        acquire_cache_writer_flocks,
+        release_cache_writer_flocks,
+    )
+
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(_cctally_core.CACHE_LOCK_CODEX_PATH),
-                 os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError):
-            return quota_idx[0]  # busy codex flock -> prefix-stop
+        held = acquire_cache_writer_flocks(
+            _cctally_core.CACHE_LOCK_PATH,
+            _cctally_core.CACHE_LOCK_CODEX_PATH,
+        )
+    except OSError:
+        return quota_idx[0]
+    if held is None:
+        return quota_idx[0]
+    try:
         try:
             cache = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH), timeout=15.0)
         except sqlite3.Error as exc:  # pragma: no cover — cache.db unopenable
@@ -761,9 +785,8 @@ def _quota_applier(decoded) -> int | None:
             cache.execute("PRAGMA busy_timeout=15000")
             cache.execute("BEGIN IMMEDIATE")
             for i in quota_idx:
-                p = decoded[i][0]["payload"]
                 cache.execute(_QUOTA_SNAPSHOT_INSERT,
-                              tuple(p.get(col) for col in _QUOTA_SNAPSHOT_COLS))
+                              _quota_snapshot_values(decoded[i][0]))
             cache.commit()
         except sqlite3.Error as exc:
             try:
@@ -778,10 +801,7 @@ def _quota_applier(decoded) -> int | None:
             cache.close()
         return None
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        release_cache_writer_flocks(held)
 
 
 # Wire the seam (declared None near the top as the contract stub). Always-on:
@@ -869,14 +889,22 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
     weekly_percent = float(payload["weekly_percent"])
     five_hour_percent = payload.get("five_hour_percent")
     five_hour_window_key = payload.get("five_hour_window_key")
+    # Account dimension (#341, review finding 11): every clamp/dedup query below
+    # is scoped to the account being processed so two accounts writing into the
+    # same week / same physical 5h window never clamp or dedup against each other.
+    # Defaults to the reserved sentinel when the caller omits it (byte-stable on a
+    # single-account install where every row shares one key).
+    account_key = payload.get("account_key") or _lib_accounts.UNATTRIBUTED
 
     clamp_floor_iso = _cctally_core._reset_aware_floor(
-        conn, week_start_date, week_start_at, week_end_at
+        conn, week_start_date, week_start_at, week_end_at,
+        account_key=account_key,
     ) or "1970-01-01T00:00:00Z"
     max_row = conn.execute(
         "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
-        "WHERE week_start_date = ? AND unixepoch(captured_at_utc) >= unixepoch(?)",
-        (week_start_date, clamp_floor_iso),
+        "WHERE week_start_date = ? AND account_key = ? "
+        "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
+        (week_start_date, account_key, clamp_floor_iso),
     ).fetchone()
     max_v = max_row[0] if max_row else None
     if _lib_record.hwm_clamp_applies(weekly_percent, max_v):
@@ -886,12 +914,14 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
     if five_hour_percent is not None and five_hour_window_key is not None:
         max_5h_row = conn.execute(
             "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots "
-            "WHERE five_hour_window_key = ? "
+            "WHERE five_hour_window_key = ? AND account_key = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(COALESCE("
             "        (SELECT effective_reset_at_utc FROM five_hour_reset_events "
-            "          WHERE five_hour_window_key = ? ORDER BY id DESC LIMIT 1),"
+            "          WHERE five_hour_window_key = ? AND account_key = ? "
+            "          ORDER BY id DESC LIMIT 1),"
             "        '1970-01-01T00:00:00Z'))",
-            (int(five_hour_window_key), int(five_hour_window_key)),
+            (int(five_hour_window_key), account_key,
+             int(five_hour_window_key), account_key),
         ).fetchone()
         max_5h = max_5h_row[0] if max_5h_row else None
         if _lib_record.hwm_clamp_applies(float(five_hour_percent), max_5h):
@@ -899,8 +929,9 @@ def _usage_snapshot_fold_decision(conn, payload) -> tuple[bool, object]:
 
     last = conn.execute(
         "SELECT weekly_percent, five_hour_percent FROM weekly_usage_snapshots "
-        "WHERE week_start_date = ? ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-        (week_start_date,),
+        "WHERE week_start_date = ? AND account_key = ? "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+        (week_start_date, account_key),
     ).fetchone()
     if last is not None and float(last[0]) == weekly_percent:
         last_5h = last[1]
@@ -929,13 +960,286 @@ def _apply_op_weekly_credit_floor(conn, record) -> None:
         "effective_at_utc": payload["effective_at_utc"],
         "observed_pre_credit_pct": float(payload["observed_pre_credit_pct"]),
         "applied_at_utc": payload.get("applied_at_utc", record["at"]),
+        # Two-shaped stamp (#341 rev 4.1): evt/op carry account_key in the
+        # payload. Default to the sentinel for legacy ops written pre-#341.
+        "account_key": payload.get("account_key") or _lib_accounts.UNATTRIBUTED,
     })
+
+
+# --------------------------------------------------------------------------
+# accounts registry fold (#341, spec §1/§2). `account_observe` / `account_label`
+# op lines fold into the `accounts` registry. Registered here so BOTH the live
+# ingest (`_pipeline_op_fold`) AND `rebuild_stats_index` (its op-fold stream)
+# derive the registry deterministically. `last_seen_utc` is NOT set here — it
+# derives from the max `at` of any account-stamped line via
+# `_derive_account_last_seen`, run after the fold in both paths.
+# --------------------------------------------------------------------------
+
+_LABEL_RANK = {"auto": 0, "switcher": 1, "user": 2}
+
+
+def _label_rank(source: str | None) -> int:
+    return _LABEL_RANK.get(source or "auto", 0)
+
+
+def _apply_op_account_observe(conn, record) -> None:
+    """Fold an `account_observe` op into the `accounts` registry. Idempotent:
+    INSERT OR IGNORE creates the row on first sight, then the identity fields
+    (provider/natural_id/email/plan_type) take the latest chronological value
+    (canonical fold order = chronological), `first_seen_utc` keeps the MIN `at`,
+    and an optional label is applied only when its provenance rank is >= the
+    stored one (user > switcher > auto — never override a user label)."""
+    p = record.get("payload") or {}
+    key = p.get("account_key")
+    at = record.get("at")
+    if not key:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts "
+        "(account_key, provider, label_source, first_seen_utc, last_seen_utc) "
+        "VALUES (?, ?, 'auto', ?, ?)",
+        (key, p.get("provider"), at, at),
+    )
+    conn.execute(
+        "UPDATE accounts SET provider = COALESCE(?, provider), "
+        "  natural_id = COALESCE(?, natural_id), email = COALESCE(?, email), "
+        "  plan_type = COALESCE(?, plan_type) WHERE account_key = ?",
+        (p.get("provider"), p.get("natural_id"), p.get("email"),
+         p.get("plan_type"), key),
+    )
+    if at is not None:
+        conn.execute(
+            "UPDATE accounts SET first_seen_utc = ? WHERE account_key = ? "
+            "AND (first_seen_utc IS NULL OR ? < first_seen_utc)",
+            (at, key, at),
+        )
+        conn.execute(
+            "UPDATE accounts SET last_seen_utc = ? WHERE account_key = ? "
+            "AND (last_seen_utc IS NULL OR ? > last_seen_utc)",
+            (at, key, at),
+        )
+    inc_label = p.get("label")
+    if inc_label is not None:
+        inc_src = p.get("label_source") or "auto"
+        row = conn.execute(
+            "SELECT label_source FROM accounts WHERE account_key = ?", (key,)
+        ).fetchone()
+        cur_src = row[0] if row is not None else "auto"
+        if _label_rank(inc_src) >= _label_rank(cur_src):
+            conn.execute(
+                "UPDATE accounts SET label = ?, label_source = ? "
+                "WHERE account_key = ?",
+                (inc_label, inc_src, key),
+            )
+
+
+def _apply_op_account_label(conn, record) -> None:
+    """Fold an `account_label` op (a user rename) — always authoritative
+    (label_source='user', the top of the precedence order)."""
+    p = record.get("payload") or {}
+    key = p.get("account_key")
+    if not key:
+        return
+    at = record.get("at")
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts "
+        "(account_key, provider, label_source, first_seen_utc, last_seen_utc) "
+        "VALUES (?, ?, 'auto', ?, ?)",
+        (key, p.get("provider"), at, at),
+    )
+    conn.execute(
+        "UPDATE accounts SET label = ?, label_source = 'user' "
+        "WHERE account_key = ?",
+        (p.get("label"), key),
+    )
+
+
+def _account_of(record) -> str | None:
+    """The account_key a record contributes to `last_seen_utc`: the top-level
+    `account` stamp on a data-bearing line, or an `account_observe`'s own key."""
+    acct = record.get("account")
+    if isinstance(acct, str) and acct:
+        return acct
+    if record.get("t") == "op":
+        p = record.get("payload") or {}
+        if p.get("kind") == "account_observe":
+            k = p.get("account_key")
+            if isinstance(k, str) and k:
+                return k
+    return None
+
+
+def _derive_account_last_seen(conn, records) -> None:
+    """Fold-time `last_seen_utc` derivation (spec §1): the MAX `at` of any
+    account-stamped line advances an account's last-seen, so a stable account's
+    last-seen keeps moving without extra observe records. Idempotent MAX update;
+    runs after the fold in both the live cycle and rebuild. Only touches rows a
+    prior observe already created (never invents an account row)."""
+    latest: dict = {}
+    for rec in records:
+        key = _account_of(rec)
+        at = rec.get("at")
+        if not key or not at:
+            continue
+        prev = latest.get(key)
+        if prev is None or at > prev:
+            latest[key] = at
+    for key, at in latest.items():
+        conn.execute(
+            "UPDATE accounts SET last_seen_utc = ? WHERE account_key = ? "
+            "AND (last_seen_utc IS NULL OR ? > last_seen_utc)",
+            (at, key, at),
+        )
+
+
+# --------------------------------------------------------------------------
+# legacy classifier (#341, spec §2). A DATA-BEARING journal line that lacks an
+# `account` field is "legacy" (pre-cutover). Accounts-machinery records
+# (account_observe / account_label ops, the cutover op) are recognised by their
+# registered kinds and are NEITHER legacy NOR account-stamped data. This pure
+# classifier maps a legacy line to its provider, then `legacy_account_key` maps
+# that provider to the cutover mapping (Claude legacy -> the op's value; Codex
+# legacy -> unattributed). Used at rebuild + by the cache backfill migration to
+# normalise the missing account_key BEFORE insertion.
+# --------------------------------------------------------------------------
+
+# Old evt lines carry no top-level provider, so evt kind -> provider is a fixed
+# table. `budget` is vendor-dependent (its payload `vendor` names the provider).
+_EVT_KIND_PROVIDER = {
+    "snapshot_accept": "claude",
+    "weekly_cost_snapshot": "claude",
+    "week_reset": "claude",
+    "five_hour_credit": "claude",
+    "five_hour_block_close": "claude",
+    "percent_milestone": "claude",
+    "five_hour_milestone": "claude",
+    "projected": "claude",
+    "project_budget": "claude",
+    "quota_alert_arming": "codex",
+}
+
+# Op kinds that are accounts-machinery (recognised, never classified as legacy).
+_ACCOUNTS_MACHINERY_KINDS = frozenset(
+    ("account_observe", "account_label", "accounts_cutover"))
+
+# Legacy-classifier exhaustiveness guard (#341, review finding P2-1). EVERY evt
+# kind in `_EVT_SPECS` and every harvest kind in `_HARVEST_SPECS` must carry a
+# classifier disposition: a provider verdict (a data-bearing real-account or
+# `*`-family kind, via `_EVT_KIND_PROVIDER`), the vendor-tagged special case
+# (`budget`, provider read from the payload `vendor`), or an explicit EXEMPTION.
+# `weekly_credit_effects` is exempt because it is effects-only
+# (`_EvtSpec.table is None`): it inserts NO target row, so nothing carries
+# `account_key` to normalise — it only deletes stale-replica snapshots by their
+# globally-unique `journal_id` (an account-agnostic key) and force-writes the
+# account-agnostic hwm-7d statusline file. The exhaustiveness is asserted
+# STRUCTURALLY by tests/test_accounts_journal.py (iterating both spec registries),
+# so a future data-bearing kind cannot silently escape classification.
+_CLASSIFIER_VENDOR_TAGGED_KINDS = frozenset(("budget",))
+_CLASSIFIER_EXEMPT_KINDS = frozenset(("weekly_credit_effects",))
+
+
+def classify_legacy_provider(record) -> str | None:
+    """Return the provider ('claude'|'codex') of a DATA-BEARING legacy record
+    (obs/op/evt lacking an account stamp), or None when the record is not
+    legacy data — an already-account-stamped line, an accounts-machinery record,
+    an effects-only exempt kind, or an unknown kind (additive-evolution
+    tolerance).
+
+    Two-shaped already-stamped guard (#341 rev 4.1): obs carry the account on the
+    top-level ``account`` field; evt/op carry it inside ``payload.account_key``.
+    EITHER shape means the line is already account-stamped and is NOT legacy — a
+    single-shape check would mis-classify a freshly account-stamped evt as legacy
+    and re-normalise it."""
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload") or {}
+    kind = payload.get("kind")
+    # A line already carrying an account stamp (either shape) is not legacy.
+    if isinstance(record.get("account"), str) and record.get("account"):
+        return None
+    if isinstance(payload.get("account_key"), str) and payload.get("account_key"):
+        return None
+    # Accounts-machinery records + effects-only exempt kinds carry no target row
+    # to stamp — recognised by registration, never legacy data (review P3-D).
+    if kind in _ACCOUNTS_MACHINERY_KINDS or kind in _CLASSIFIER_EXEMPT_KINDS:
+        return None
+    t = record.get("t")
+    if t == "obs":
+        prov = record.get("provider")
+        return prov if prov in ("claude", "codex") else None
+    if t == "op":
+        # weekly_credit_floor is the only legacy op family; it is Claude.
+        return "claude" if kind == "weekly_credit_floor" else None
+    if t == "evt":
+        if kind in _CLASSIFIER_VENDOR_TAGGED_KINDS:
+            vendor = payload.get("vendor")
+            return vendor if vendor in ("claude", "codex") else None
+        return _EVT_KIND_PROVIDER.get(kind)
+    return None
+
+
+def legacy_account_key(record, claude_legacy_account: str) -> str | None:
+    """Map a legacy record to the account_key to stamp: the cutover op's
+    recorded Claude account for a Claude legacy line, `unattributed` for a Codex
+    legacy line. Returns None when the record is not legacy data (caller leaves
+    it untouched)."""
+    prov = classify_legacy_provider(record)
+    if prov is None:
+        return None
+    if prov == "claude":
+        return claude_legacy_account
+    return _lib_accounts.UNATTRIBUTED
+
+
+# The REAL-account evt/op kinds whose missing account_key is normalised to the
+# cutover mapping at rebuild (#341, handoff item 2). The `*`-families (`budget`,
+# `projected`, `project_budget`) are DELIBERATELY excluded — they take the
+# schema DEFAULT `'*'`, never the cutover account (spec §2 / scope matrix).
+_REAL_ACCOUNT_EVT_OP_KINDS = frozenset((
+    "snapshot_accept", "weekly_cost_snapshot", "week_reset", "five_hour_credit",
+    "five_hour_block_close", "percent_milestone", "five_hour_milestone",
+    "weekly_credit_floor",
+))
+
+
+def _normalize_legacy_account_stamp(record, claude_legacy_account: str) -> None:
+    """In-place two-shaped account normalisation for a legacy (pre-#341) record
+    at rebuild (spec §2, handoff item 2). obs get a top-level ``account``; a
+    REAL-account evt/op gets ``payload.account_key``. Already-stamped records,
+    ``*``-families, and unknown/machinery kinds are left untouched — so a rebuild
+    over a cutover-op'd journal reproduces pre-feature Claude data under the op's
+    account and pre-feature Codex data under ``unattributed`` (acceptance 4)."""
+    if not isinstance(record, dict):
+        return
+    t = record.get("t")
+    if t == "obs":
+        if isinstance(record.get("account"), str) and record.get("account"):
+            return
+        key = legacy_account_key(record, claude_legacy_account)
+        if key is not None:
+            record["account"] = key
+        return
+    if t in ("evt", "op"):
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if payload.get("kind") not in _REAL_ACCOUNT_EVT_OP_KINDS:
+            return
+        if isinstance(payload.get("account_key"), str) and payload.get("account_key"):
+            return
+        key = legacy_account_key(record, claude_legacy_account)
+        if key is not None:
+            payload["account_key"] = key
 
 
 # Obs/op fold registry (spec §5.3 "fold op"). Keyed by `payload.kind`; the
 # built-in `_pipeline_op_fold` pipeline hook dispatches through it. 6b may
 # register more op folds; obs no longer fold directly (see the NOTE above).
-FOLD_APPLIERS = {"weekly_credit_floor": _apply_op_weekly_credit_floor}
+FOLD_APPLIERS = {
+    "weekly_credit_floor": _apply_op_weekly_credit_floor,
+    "account_observe": _apply_op_account_observe,
+    "account_label": _apply_op_account_label,
+}
 
 
 # --------------------------------------------------------------------------
@@ -974,12 +1278,23 @@ def _apply_generic_evt(conn, evt):
             cols[key] = value
     # Re-derive any projection-FK columns from a journaled natural-key column
     # (spec §5.3 — e.g. five_hour_milestones.block_id from five_hour_window_key,
-    # since the open block is a projection with no logical id). 0 when absent.
+    # since the open block is a projection with no logical id). Composite
+    # (account_key, <lookup_col>) when the row carries an account (#341, review
+    # finding 3): a shared physical 5h window resolves THIS account's block, so a
+    # milestone child never attaches to another account's block. 0 when absent.
+    acct = cols.get("account_key")
     for column, (ref_table, lookup_col) in spec.derived_fk.items():
-        row = conn.execute(
-            f"SELECT id FROM {ref_table} WHERE {lookup_col} = ?",
-            (cols.get(lookup_col),),
-        ).fetchone()
+        if acct is not None:
+            row = conn.execute(
+                f"SELECT id FROM {ref_table} "
+                f"WHERE {lookup_col} = ? AND account_key = ?",
+                (cols.get(lookup_col), acct),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT id FROM {ref_table} WHERE {lookup_col} = ?",
+                (cols.get(lookup_col),),
+            ).fetchone()
         cols[column] = int(row[0]) if row is not None else 0
     return _insert_or_ignore(conn, spec.table, cols)
 
@@ -1031,18 +1346,23 @@ def _apply_quota_alert_arming(conn, evt):
     no `journal_id` column (it is not in the Task-4 additive list); idempotence
     is the natural-key upsert, not a journal_id INSERT OR IGNORE."""
     p = evt.get("payload") or {}
+    # account_key (#341) is part of the arming identity/UNIQUE. A live-emitted evt
+    # carries payload.account_key; a legacy (pre-#341) cutover-exported arming has
+    # none -> normalise to the sentinel (Codex legacy -> unattributed) so the
+    # NOT NULL column always receives a value.
+    account_key = p.get("account_key") or _lib_accounts.UNATTRIBUTED
     conn.execute(
         "INSERT INTO quota_alert_arming "
         "(source, source_root_key, logical_limit_key, observed_slot, "
-        " window_minutes, rule_fingerprint, activated_at_utc) "
-        "VALUES (?,?,?,?,?,?,?) "
-        "ON CONFLICT(source, source_root_key, logical_limit_key, observed_slot, "
-        "            window_minutes) DO UPDATE SET "
+        " window_minutes, rule_fingerprint, activated_at_utc, account_key) "
+        "VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(source, source_root_key, account_key, logical_limit_key, "
+        "            observed_slot, window_minutes) DO UPDATE SET "
         "  rule_fingerprint=excluded.rule_fingerprint, "
         "  activated_at_utc=excluded.activated_at_utc",
         (p.get("source"), p.get("source_root_key"), p.get("logical_limit_key"),
          p.get("observed_slot"), p.get("window_minutes"),
-         p.get("rule_fingerprint"), p.get("activated_at_utc")),
+         p.get("rule_fingerprint"), p.get("activated_at_utc"), account_key),
     )
     return None
 
@@ -1065,10 +1385,21 @@ def _apply_block_close(conn, evt):
             continue
         parent[key] = value
     _insert_or_ignore(conn, "five_hour_blocks", parent)
-    prow = conn.execute(
-        "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
-        (parent.get("five_hour_window_key"),),
-    ).fetchone()
+    # Composite (account_key, five_hour_window_key) parent resolution (#341,
+    # review finding 3): a shared physical window resolves THIS account's block
+    # so its rollup children attach to the right parent.
+    p_acct = parent.get("account_key")
+    if p_acct is not None:
+        prow = conn.execute(
+            "SELECT id FROM five_hour_blocks "
+            "WHERE five_hour_window_key = ? AND account_key = ?",
+            (parent.get("five_hour_window_key"), p_acct),
+        ).fetchone()
+    else:
+        prow = conn.execute(
+            "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
+            (parent.get("five_hour_window_key"),),
+        ).fetchone()
     if prow is None:
         return None
     block_id = int(prow[0])
@@ -1076,6 +1407,17 @@ def _apply_block_close(conn, evt):
         for child in children.get(payload_key, []):
             cols = dict(child)
             cols["block_id"] = block_id
+            # Force each child under the PARENT's account (#341 P2-2, 8a review):
+            # a no-op on the live/already-stamped path (children already agree),
+            # but on the legacy rebuild path _normalize_legacy_account_stamp
+            # re-derives ONLY the parent's payload.account_key — the embedded
+            # _models/_projects children stay unstamped and would otherwise take
+            # the schema DEFAULT 'unattributed', mismatching their parent and
+            # splitting the composite (account_key, window, model/project) UNIQUE
+            # partition. Guarded on p_acct so a truly account-less rebuild (no
+            # cutover mapping) leaves the DEFAULT untouched.
+            if p_acct is not None:
+                cols["account_key"] = p_acct
             _insert_or_ignore(conn, child_table, cols)
     return None
 
@@ -1126,26 +1468,32 @@ def _apply_evt(conn, evt):
 # harvest registry (natural-keyed families, spec §5.3)
 # --------------------------------------------------------------------------
 
+# Every harvest family's natural key now leads with `account_key` (#341): the
+# account is part of each table's extended UNIQUE, so the opaque evt id must
+# include it to stay a bijection with the row (two accounts sharing a physical
+# window / week / threshold produce DISTINCT evt ids). account_key is also a
+# plain payload column, so the generic fold round-trips it back onto the row.
 _HARVEST_SPECS = [
     _HarvestSpec(
         "week_reset_events", "week_reset", "wr",
-        id_parts=("old_week_end_at", "new_week_end_at"),
+        id_parts=("account_key", "old_week_end_at", "new_week_end_at"),
         at_column="detected_at_utc", order=30, suppression=True,
     ),
     _HarvestSpec(
         "five_hour_reset_events", "five_hour_credit", "fhc",
-        id_parts=("five_hour_window_key", "effective_reset_at_utc"),
+        id_parts=("account_key", "five_hour_window_key", "effective_reset_at_utc"),
         at_column="detected_at_utc", order=30, suppression=True,
     ),
     _HarvestSpec(
         "five_hour_blocks", "five_hour_block_close", "fhbc",
-        id_parts=("five_hour_window_key",),
+        id_parts=("account_key", "five_hour_window_key"),
         at_column="last_updated_at_utc", order=40, closed_only=True,
         children=_BLOCK_CHILDREN,
     ),
     _HarvestSpec(
         "percent_milestones", "percent_milestone", "pm",
-        id_parts=("week_start_date", "reset_event_id", "percent_threshold"),
+        id_parts=("account_key", "week_start_date", "reset_event_id",
+                  "percent_threshold"),
         fk_refs={
             "usage_snapshot_id": ("weekly_usage_snapshots", "usage_snapshot_ref"),
             "cost_snapshot_id": ("weekly_cost_snapshots", "cost_snapshot_ref"),
@@ -1155,30 +1503,33 @@ _HARVEST_SPECS = [
     ),
     _HarvestSpec(
         "five_hour_milestones", "five_hour_milestone", "fhm",
-        id_parts=("five_hour_window_key", "reset_event_id", "percent_threshold"),
+        id_parts=("account_key", "five_hour_window_key", "reset_event_id",
+                  "percent_threshold"),
         fk_refs={
             "usage_snapshot_id": ("weekly_usage_snapshots", "usage_snapshot_ref"),
             "reset_event_id": ("five_hour_reset_events", "reset_event_ref"),
         },
         # block_id points at the OPEN five_hour_blocks row (a projection with no
-        # journal_id) — re-derive it at fold from the journaled window key
-        # instead of a broken logical FK (harvest-order violation otherwise).
+        # journal_id) — re-derive it at fold from the journaled (account_key,
+        # window key) composite (#341) instead of a broken logical FK.
         derived_fk={"block_id": ("five_hour_blocks", "five_hour_window_key")},
         at_column="captured_at_utc", order=60,
     ),
     _HarvestSpec(
         "budget_milestones", "budget", "bm",
-        id_parts=("vendor", "period_start_at", "period", "threshold"),
+        id_parts=("account_key", "vendor", "period_start_at", "period",
+                  "threshold"),
         at_column="crossed_at_utc", order=60,
     ),
     _HarvestSpec(
         "projected_milestones", "projected", "pjm",
-        id_parts=("week_start_at", "period", "metric", "threshold"),
+        id_parts=("account_key", "week_start_at", "period", "metric",
+                  "threshold"),
         at_column="crossed_at_utc", order=60,
     ),
     _HarvestSpec(
         "project_budget_milestones", "project_budget", "pbm",
-        id_parts=("week_start_at", "project_key", "threshold"),
+        id_parts=("account_key", "week_start_at", "project_key", "threshold"),
         at_column="crossed_at_utc", order=60,
     ),
 ]
@@ -1543,8 +1894,8 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
             decoded.append((rec, seg, off))
 
         # Step 3: cache leg (Codex quota) BEFORE the stats txn (lock-order law).
-        # QUOTA_APPLIER attempts the cache.db.codex.lock NB upsert; on a busy
-        # flock it returns a prefix-stop index — the cycle processes
+        # QUOTA_APPLIER attempts the global-then-Codex cache flock NB upsert; on
+        # a busy flock it returns a prefix-stop index — the cycle processes
         # decoded[:stop], sets the cursor to decoded[stop]'s offset, and retries
         # the remainder next cycle (§5.2 step 3; prefix consumption keeps the
         # scalar cursor sound).
@@ -1613,6 +1964,11 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # O(this-cycle inserts) even on the accept-only common tick).
         if conn.total_changes != pipeline_changes_before:
             _harvest(ctx)
+        # 4c'. Fold-time `last_seen_utc` derivation (#341): advance each account's
+        # last-seen from the max `at` of any account-stamped line this cycle. A
+        # no-op when the batch carries no account stamps (byte-stable on a
+        # pre-multi-account single-account install).
+        _derive_account_last_seen(conn, records)
         # 4d. Advance the cursor (to HW, or to the cache-leg prefix boundary).
         # `cursor_target is None` ONLY on a reconcile-only cycle over a still-
         # empty journal (§5.2 above): there are no consumed lines to advance
@@ -1764,7 +2120,7 @@ _REBUILD_COUNT_TABLES = (
     "five_hour_block_projects", "weekly_credit_floors", "percent_milestones",
     "five_hour_milestones", "budget_milestones", "projected_milestones",
     "project_budget_milestones", "quota_alert_arming", "quota_window_blocks",
-    "quota_percent_milestones", "quota_threshold_events",
+    "quota_percent_milestones", "quota_threshold_events", "accounts",
 )
 
 
@@ -1800,20 +2156,35 @@ def _rebuild_quota_cache_leg(records) -> None:
     quota obs (spec §5.4). The journal obs are the DURABLE source (§1 latent
     data-loss hole — the rollout JSONL evaporates); this INSERT OR IGNOREs them
     on the natural key, mirroring `_quota_applier`. Runs BEFORE any stats
-    transaction, under the `cache.db.codex.lock` provider flock (lock-order law).
-    Best-effort: a missing/busy cache.db is a clean skip (the obs stay durable in
-    the journal; the stats quota projection pass then degrades cleanly)."""
+    transaction, under the global cache writer lock followed by the
+    `cache.db.codex.lock` provider flock (lock-order law). Best-effort: a
+    missing/busy cache.db is a clean skip (the obs stay durable in the journal;
+    the stats quota projection pass then degrades cleanly)."""
     quota_obs = [r for r in records if _is_codex_quota_obs(r)]
     if not quota_obs:
         return
     cache_path = _cctally_core.CACHE_DB_PATH
     if not cache_path.exists():
         return
+    from _lib_cache_writer_lock import (
+        acquire_cache_writer_flocks,
+        release_cache_writer_flocks,
+    )
+
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(_cctally_core.CACHE_LOCK_CODEX_PATH),
-                 os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        held = acquire_cache_writer_flocks(
+            _cctally_core.CACHE_LOCK_PATH,
+            _cctally_core.CACHE_LOCK_CODEX_PATH,
+            timeout=15.0,
+        )
+    except OSError as exc:
+        print(f"[rebuild] quota cache leg lock failed: {exc}", file=sys.stderr)
+        return
+    if held is None:
+        print("[rebuild] quota cache leg locks busy; skipping", file=sys.stderr)
+        return
+    try:
         try:
             cache = sqlite3.connect(str(cache_path), timeout=15.0)
         except sqlite3.Error as exc:  # pragma: no cover — cache.db unopenable
@@ -1823,9 +2194,8 @@ def _rebuild_quota_cache_leg(records) -> None:
             cache.execute("PRAGMA busy_timeout=15000")
             cache.execute("BEGIN IMMEDIATE")
             for r in quota_obs:
-                p = r["payload"]
                 cache.execute(_QUOTA_SNAPSHOT_INSERT,
-                              tuple(p.get(col) for col in _QUOTA_SNAPSHOT_COLS))
+                              _quota_snapshot_values(r))
             cache.commit()
         except sqlite3.Error as exc:
             try:
@@ -1836,10 +2206,7 @@ def _rebuild_quota_cache_leg(records) -> None:
         finally:
             cache.close()
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        release_cache_writer_flocks(held)
 
 
 def rebuild_stats_index(*, target_path=None) -> RebuildResult:
@@ -1886,6 +2253,17 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
                     malformed += 1
                     continue
                 decoded.append(rec)
+
+        # Legacy account normalisation (#341, spec §2 / handoff item 2): a
+        # pre-#341 real-account line lacks an account stamp — inject the cutover
+        # mapping BEFORE the fold (Claude legacy -> the cutover op's account;
+        # Codex legacy -> unattributed). `*`-families + already-stamped lines are
+        # untouched. Resolved once from the journal's own cutover op (falls back
+        # to `unattributed` when none is present), so a fresh single-account
+        # rebuild is byte-neutral (everything is already `unattributed`).
+        cutover_claude = resolve_cutover_claude_account()
+        for rec in decoded:
+            _normalize_legacy_account_stamp(rec, cutover_claude)
 
         # Cache leg BEFORE any stats txn (provider-flock lock-order): journal
         # Codex quota obs -> cache.db quota_window_snapshots.
@@ -1950,6 +2328,10 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
             for _order, _seq, _kind, rec in tail:
                 _apply_evt(conn, rec)
                 lines_folded += 1
+            # Fold-time `last_seen_utc` derivation (#341): re-derive each
+            # account's last-seen from the whole journal (the observe ops folded
+            # in the structural phase already created the rows).
+            _derive_account_last_seen(conn, decoded)
             if hw is not None:
                 _write_cursor(conn, hw[0], hw[1])
             conn.commit()
@@ -2103,8 +2485,9 @@ _CUTOVER_SPECS = (
     # record and a later live re-emission for the same identity are ONE record.
     _CutoverSpec("quota_alert_arming", "quota_alert_arming", "evt",
                  "activated_at_utc", stamp=False, natural_key_prefix="qaa",
-                 natural_key_id=("source", "source_root_key", "logical_limit_key",
-                                 "observed_slot", "window_minutes")),
+                 natural_key_id=("source", "source_root_key", "account_key",
+                                 "logical_limit_key", "observed_slot",
+                                 "window_minutes")),
 )
 
 # Journal-covered stats tables whose rows get a `journal_id` stamp at cutover.
@@ -2126,8 +2509,14 @@ def _export_stats_table(conn, spec) -> list:
         rowid = row["id"]
         payload = {}
         for key in row.keys():
-            if key in ("id", "journal_id") or key in spec.fk_refs \
-                    or key in spec.exclude:
+            # account_key (#341) is NEVER exported — a legacy stats.db row carries
+            # only the schema DEFAULT ('unattributed'/'*'), so exporting it would
+            # make the bootstrap evt look already-stamped and defeat the rebuild's
+            # legacy normalisation. Dropping it lets the fold re-derive the right
+            # account (Claude legacy -> cutover op's account; Codex legacy ->
+            # unattributed; `*`-families -> schema DEFAULT '*').
+            if key in ("id", "journal_id", "account_key") \
+                    or key in spec.fk_refs or key in spec.exclude:
                 continue
             payload[key] = row[key]
         for col, (ref_table, ref_key) in spec.fk_refs.items():
@@ -2141,9 +2530,16 @@ def _export_stats_table(conn, spec) -> list:
                 for cr in child_rows]
         if spec.natural_key_id:
             # §5.3 "state" family: the evt id is the natural-key form (matching
-            # the live emission), NOT the b:<table>:<rowid> bootstrap id.
+            # the live emission), NOT the b:<table>:<rowid> bootstrap id. A legacy
+            # (pre-#341) stats.db has no `account_key` column, so a natural-key
+            # component absent from the row is the sentinel (#341): the exported
+            # qaa id becomes `qaa:...:unattributed:...`, matching what a live
+            # re-emission for the unattributed identity would build.
+            row_cols = set(row.keys())
             bid = _lib_journal.evt_id(
-                spec.natural_key_prefix, *(row[c] for c in spec.natural_key_id))
+                spec.natural_key_prefix,
+                *(row[c] if c in row_cols else _lib_accounts.UNATTRIBUTED
+                  for c in spec.natural_key_id))
         else:
             bid = _lib_journal.bootstrap_id(spec.table, rowid)
         at = row[spec.at_col]
@@ -2172,9 +2568,20 @@ def _export_quota_obs() -> list:
     except sqlite3.Error:
         return []
     try:
+        # account_key (#341) rides the obs top-level ``account`` field, NOT the
+        # payload — so a NULL/unattributed cache row exports an obs that OMITS the
+        # field (byte-stable, invariant #1). Selected after the payload cols when
+        # present; a pre-#341 cache lacking the column exports NULL (never loses
+        # the durable quota obs).
+        has_account = any(
+            str(r[1]) == "account_key"
+            for r in cache.execute("PRAGMA table_info(quota_window_snapshots)")
+        )
+        acct_sel = ", account_key" if has_account else ", NULL AS account_key"
         cols = ", ".join(_QUOTA_SNAPSHOT_COLS)
         rows = cache.execute(
-            f"SELECT id, {cols} FROM quota_window_snapshots").fetchall()
+            f"SELECT id, {cols}{acct_sel} FROM quota_window_snapshots"
+        ).fetchall()
     except sqlite3.Error:
         return []
     finally:
@@ -2185,9 +2592,10 @@ def _export_quota_obs() -> list:
         payload = {"kind": _QUOTA_OBS_KIND}
         for i, col in enumerate(_QUOTA_SNAPSHOT_COLS):
             payload[col] = row[1 + i]
+        account = row[1 + len(_QUOTA_SNAPSHOT_COLS)]
         at = payload.get("captured_at_utc") or _now_iso()
         rec = _lib_journal.make_obs(at=at, src="bootstrap", provider="codex",
-                                    payload=payload)
+                                    account=account, payload=payload)
         rec["id"] = _lib_journal.bootstrap_id("quota_window_snapshots", rowid)
         out.append(rec)
     return out
@@ -2290,3 +2698,106 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
         except Exception:
             pass
         raise
+
+
+# ==========================================================================
+# Account epoch-transition coordinator (#341, spec §2)
+# ==========================================================================
+#
+# Epoch 1000 -> 1001 adds the account dimension. An existing epoch-1000 stats.db
+# reaches `resolve_stats_epoch_mismatch`, which runs this coordinator BEFORE the
+# rebuild, in exact order (spec §2, review finding 1):
+#   (1) resolve the cutover identity WITHOUT opening stats.db — a stable-read of
+#       ~/.claude.json; stably-absent / torn -> `unattributed` (never a guess);
+#   (2) atomically check/append the canonical cutover op (stable semantic id
+#       `accounts-cutover-v1`, timestamp-independent, so a retry cannot duplicate
+#       it and replay is deterministic forever);
+#   (3) only THEN capture the journal HW and rebuild — so the op is always inside
+#       the rebuild's input and the legacy classifier can consume its recorded
+#       Claude account.
+# The cache backfill migration (Task 2) consumes the SAME op value; it never
+# re-reads auth. The coordinator opens no stats.db until the rebuild's own
+# scratch, so no ordering circularity exists.
+
+CUTOVER_OP_ID = "accounts-cutover-v1"      # stable semantic id (timestamp-free)
+_CUTOVER_OP_KIND = "accounts_cutover"
+_CUTOVER_OP_SRC = "accounts-cutover"
+
+
+def _resolve_claude_cutover_identity(claude_json_path=None) -> str:
+    """Resolve the single legacy Claude account_key from ~/.claude.json without
+    opening stats.db (spec §2 step 1). Identified -> account_key; stably-absent
+    (missing file / no oauthAccount) or torn (unparseable mid-write) ->
+    ``unattributed`` (the op is always appended with whatever was resolvable, so
+    replay is deterministic forever after)."""
+    path = str(claude_json_path) if claude_json_path is not None \
+        else str(_cctally_core.CLAUDE_JSON_PATH)
+
+    def _reader(data: bytes):
+        try:
+            obj = json.loads(data)
+        except (ValueError, TypeError):
+            raise _lib_accounts.TornRead()
+        if not isinstance(obj, dict):
+            raise _lib_accounts.TornRead()
+        return _lib_accounts.claude_natural_id(obj.get("oauthAccount"))
+
+    result = _lib_accounts.stable_read_identity(path, _reader)
+    if result.status == "identified":
+        return _lib_accounts.account_key("claude", result.value)
+    return _lib_accounts.UNATTRIBUTED
+
+
+def find_accounts_cutover_op():
+    """Scan the journal for the canonical cutover op; return its recorded
+    ``claude_legacy_account`` (spec §2 payload), or None when it has not been
+    appended yet. Cheap enough for the one-time transition + the retry check."""
+    for seg in list_segments():
+        seg_path = _cctally_core.JOURNAL_DIR / seg
+        try:
+            size = os.path.getsize(seg_path)
+        except OSError:
+            continue
+        for _name, _off, raw in _read_segment_lines(seg_path, 0, size):
+            rec = _lib_journal.decode_line(raw)
+            if rec is not None and rec.get("id") == CUTOVER_OP_ID:
+                return (rec.get("payload") or {}).get("claude_legacy_account")
+    return None
+
+
+def append_accounts_cutover_op(claude_legacy_account: str, *, at=None) -> str:
+    """Check-and-append the canonical cutover op (spec §2 step 2). Idempotent on
+    the stable semantic id: if the op is already present, return its recorded
+    value unchanged (a retry appends nothing). The real transition holds the
+    maintenance lock, which serialises concurrent transitions; the stable id +
+    identical payload make any residual race converge."""
+    existing = find_accounts_cutover_op()
+    if existing is not None:
+        return existing
+    rec = _lib_journal.make_op(
+        at=(at or _now_iso()), src=_CUTOVER_OP_SRC,
+        payload={"kind": _CUTOVER_OP_KIND,
+                 "claude_legacy_account": claude_legacy_account})
+    rec["id"] = CUTOVER_OP_ID   # override the content id with the stable token
+    append_record(rec)
+    return claude_legacy_account
+
+
+def resolve_cutover_claude_account() -> str:
+    """The single legacy Claude account the cutover op recorded, for the legacy
+    classifier + cache backfill. Falls back to ``unattributed`` when no op is
+    present (a fresh install with no legacy Claude history)."""
+    value = find_accounts_cutover_op()
+    return value if value is not None else _lib_accounts.UNATTRIBUTED
+
+
+def run_epoch_transition(*, claude_json_path=None) -> str:
+    """The account epoch-transition coordinator (spec §2). Resolve the cutover
+    identity, check/append the canonical cutover op, THEN rebuild — in that exact
+    order, so the op is inside the rebuild's input. Returns the resolved
+    ``claude_legacy_account``. Exposed for tests; the epoch-mismatch path calls
+    it (under the maintenance + ingest locks) after quarantining the old index."""
+    claude_key = _resolve_claude_cutover_identity(claude_json_path)
+    recorded = append_accounts_cutover_op(claude_key)
+    rebuild_stats_index()
+    return recorded

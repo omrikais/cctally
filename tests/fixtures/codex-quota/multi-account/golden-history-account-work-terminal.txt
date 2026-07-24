@@ -1,0 +1,5 @@
+Codex quota history · local-rollout
+primary · 5h 30m · root=root-shared · limit=limit-primary
+  2026-07-15T09:00:00Z  10.0%  reset 2026-07-15T15:00:00Z  path 8cf890c00db00607c9d1357dbbe47aea
+  2026-07-15T10:00:00Z  12.4%  reset 2026-07-15T15:00:00Z  path 8cf890c00db00607c9d1357dbbe47aea
+  2026-07-15T11:00:00Z  16.1%  reset 2026-07-15T15:00:00Z  path 8cf890c00db00607c9d1357dbbe47aea

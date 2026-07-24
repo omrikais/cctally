@@ -175,7 +175,9 @@ _DISCRIMINATING_COST_BY_DATE = {
 }
 
 
-def _discriminating_cost_fn(ws, we, mode="auto", skip_sync=False):
+def _discriminating_cost_fn(ws, we, mode="auto", skip_sync=False, **kwargs):
+    # **kwargs absorbs the #341 account_key= that _select_dollars_per_percent
+    # now threads into _sum_cost_for_range (None on the merged forecast path).
     return _DISCRIMINATING_COST_BY_DATE[ws.date()]
 
 

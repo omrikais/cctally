@@ -38,8 +38,11 @@ Every JSONL-reading command goes through a delta cache:
 4. Queries (`iter_entries()`) then run against `session_entries` instead of
    re-parsing JSONL.
 
-**Concurrency:** `fcntl.flock` on `cache.db.lock` (Claude) and
-`cache.db.codex.lock` (Codex) serializes compact accounting writers. Transcript
+**Concurrency:** `cache.db.lock` is the global compact-cache writer/checkpoint
+flock. Claude takes it directly; Codex takes it before its provider-specific
+`cache.db.codex.lock`. Schema and recovery work first takes the maintenance
+flock, preserving the total order
+`maintenance → global cache → Codex provider → SQLite transaction`. Transcript
 writers use the independent `conversations.db.lock`,
 `conversations.db.codex.lock`, and maintenance lock, so a large reingest never
 extends the core sync critical section.
@@ -49,9 +52,16 @@ at query time from `CLAUDE_MODEL_PRICING` / `CODEX_MODEL_PRICING`. Update
 the dict, and the next read sees the new prices — no invalidation.
 
 **Resilience:** both derived stores are fully re-derivable; use
-`cache-sync --rebuild` rather than unlinking a live SQLite family. If
-`cache.db` can't be opened (e.g.
-read-only fs), `get_entries()` falls back to direct JSONL parse.
+`cache-sync --rebuild` rather than unlinking a live SQLite family. Classified
+cache corruption converges through a single forensics-first, whole-family
+quarantine contract at open time or during ingest, then retries once. An
+`all`-provider recovery restarts the complete Claude→Codex plan because both
+providers share the replaced physical family. A durable pending-quarantine
+record makes individual main/WAL/SHM renames resumable and forbids recreation
+after a partial move. Repair ownership uses PID plus process-start identity so
+a dead owner or reused PID cannot permanently wedge readers. Non-corruption
+failures never quarantine. If `cache.db` can't be opened (e.g. read-only fs),
+`get_entries()` falls back to direct JSONL parse.
 
 ## The transcript/search store (`conversations.db`)
 

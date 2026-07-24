@@ -93,13 +93,34 @@ def test_core_accessor_use_is_bounded():
 
 
 def test_core_imports_no_siblings():
-    """Core is leaf — no imports from any _cctally_* or _lib_* sibling."""
+    """Core carries NO import cycle risk. It must not import any ``_cctally_*``
+    sibling (any of which can import core back). It may import a ``_lib_*``
+    sibling ONLY if that sibling is itself a PROVEN LEAF — it imports no sibling
+    of its own, so it cannot close a cycle through core.
+
+    The #341 account dimension gave core an account-identity resolver
+    (``_resolve_active_claude_identity``) that depends on ``_lib_accounts`` — a
+    stdlib-only kernel importing no sibling. Rather than hard-coding an allowlist
+    that could rot, the check VERIFIES the leaf property structurally: the
+    imported ``_lib_`` module must have no sibling import of its own.
+    """
+    sibling_import = re.compile(
+        r'^\s*(?:from|import)\s+(_cctally_\w+|_lib_\w+)', re.MULTILINE)
     core = (BIN / "_cctally_core.py").read_text()
-    bad = re.findall(
+    imported = re.findall(
         r'^\s*(?:from|import)\s+(_cctally_(?!core\b)\w+|_lib_\w+)',
         core, re.MULTILINE,
     )
-    assert not bad, f"Core imports siblings (cycle risk): {bad}"
+    bad = []
+    for name in imported:
+        if name.startswith("_cctally_"):
+            bad.append(name)  # a _cctally_* sibling can import core back (cycle)
+            continue
+        lib_path = BIN / f"{name}.py"
+        # Allowed only if the imported _lib_ kernel is itself a proven leaf.
+        if not lib_path.exists() or sibling_import.search(lib_path.read_text()):
+            bad.append(name)
+    assert not bad, f"Core imports non-leaf siblings (cycle risk): {bad}"
 
 
 def test_moved_symbols_not_defined_in_cctally():

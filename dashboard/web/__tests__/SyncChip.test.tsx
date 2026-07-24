@@ -13,7 +13,7 @@ import type { Envelope } from '../src/types/envelope';
 // and added `.sync-error` directly; the chip's next tick re-rendered
 // "synced Xs ago" within 1 s, wiping the failure message. Now the floor
 // lives in store state (syncErrorFloorUntil), so the chip force-renders
-// "⚠ sync failed" + `.sync-error` for the full 3 seconds.
+// "⚠ sync request failed" + `.sync-error` for the full 3 seconds.
 
 function mkEnvelopeWithSyncAge(ageS: number): Envelope {
   return {
@@ -57,7 +57,7 @@ afterEach(() => {
 });
 
 describe('<SyncChip /> error floor', () => {
-  it('renders ⚠ sync failed + .sync-error for the full floor duration', () => {
+  it('renders ⚠ sync request failed + .sync-error for the full floor duration', () => {
     // Seed a happy-path envelope so the chip would otherwise read
     // "synced Xs ago" and clobber the error message on the next tick.
     updateSnapshot(mkEnvelopeWithSyncAge(5));
@@ -74,26 +74,26 @@ describe('<SyncChip /> error floor', () => {
     });
 
     // Immediate: floor text + class.
-    expect(screen.getByText('⚠ sync failed')).toBeInTheDocument();
-    expect(screen.getByText('⚠ sync failed').classList.contains('sync-error')).toBe(true);
+    expect(screen.getByText('⚠ sync request failed')).toBeInTheDocument();
+    expect(screen.getByText('⚠ sync request failed').classList.contains('sync-error')).toBe(true);
 
     // Advance ~100 ms (less than the chip's 1-second tick) and verify
     // the error text is still there — the key bug the fix closed.
     act(() => { vi.advanceTimersByTime(100); });
-    expect(screen.getByText('⚠ sync failed')).toBeInTheDocument();
-    expect(screen.getByText('⚠ sync failed').classList.contains('sync-error')).toBe(true);
+    expect(screen.getByText('⚠ sync request failed')).toBeInTheDocument();
+    expect(screen.getByText('⚠ sync request failed').classList.contains('sync-error')).toBe(true);
 
     // Advance past 1 s (the chip's tick interval). Without the store-
     // mediated floor, this is where the legacy bug restored "synced Xs
     // ago"; assert the floor still holds.
     act(() => { vi.advanceTimersByTime(1500); });
-    expect(screen.getByText('⚠ sync failed')).toBeInTheDocument();
-    expect(screen.getByText('⚠ sync failed').classList.contains('sync-error')).toBe(true);
+    expect(screen.getByText('⚠ sync request failed')).toBeInTheDocument();
+    expect(screen.getByText('⚠ sync request failed').classList.contains('sync-error')).toBe(true);
 
     // Advance past the floor expiry (total elapsed > 3 s); the chip
     // should resume env-driven rendering and the class must go away.
     act(() => { vi.advanceTimersByTime(2000); });
-    expect(screen.queryByText('⚠ sync failed')).not.toBeInTheDocument();
+    expect(screen.queryByText('⚠ sync request failed')).not.toBeInTheDocument();
     const revertedEl = screen.getByText(/synced \d+s ago/);
     expect(revertedEl.classList.contains('sync-error')).toBe(false);
   });
@@ -106,7 +106,7 @@ describe('<SyncChip /> error floor', () => {
       dispatch({ type: 'SET_SYNC_ERROR_FLOOR', untilMs: Date.now() - 10 });
     });
     render(<SyncChip />);
-    expect(screen.queryByText('⚠ sync failed')).not.toBeInTheDocument();
+    expect(screen.queryByText('⚠ sync request failed')).not.toBeInTheDocument();
     expect(screen.getByText(/synced \d+s ago/)).toBeInTheDocument();
   });
 });
@@ -161,7 +161,7 @@ describe('<SyncChip /> render priority', () => {
     });
     render(<SyncChip />);
     expect(screen.getByText('syncing…')).toBeInTheDocument();
-    expect(screen.queryByText('⚠ sync failed')).not.toBeInTheDocument();
+    expect(screen.queryByText('⚠ sync request failed')).not.toBeInTheDocument();
     expect(screen.queryByText('✓ updated')).not.toBeInTheDocument();
   });
 
@@ -173,7 +173,7 @@ describe('<SyncChip /> render priority', () => {
       dispatch({ type: 'SET_SYNC_SUCCESS_FLASH', untilMs: t + 1200 });
     });
     render(<SyncChip />);
-    expect(screen.getByText('⚠ sync failed')).toBeInTheDocument();
+    expect(screen.getByText('⚠ sync request failed')).toBeInTheDocument();
     expect(screen.queryByText('✓ updated')).not.toBeInTheDocument();
   });
 

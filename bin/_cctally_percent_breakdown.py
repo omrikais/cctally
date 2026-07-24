@@ -80,6 +80,14 @@ def _render_percent_breakdown_terminal(
 
 def cmd_percent_breakdown(args: argparse.Namespace) -> int:
     c = _cctally()
+    # #341 --account: resolve the render filter (provider=claude). This command
+    # reads only stats tables (percent_milestones / weekly_usage_snapshots), not
+    # the entry cache, so needs_cache=False. None = merged / byte-stable.
+    acct_key, acct_exit = c.resolve_account_filter(args, "claude", needs_cache=False)
+    if acct_exit is not None:
+        return acct_exit
+    _acct_pred = "" if acct_key is None else " AND account_key = ?"
+    _acct_p = () if acct_key is None else (acct_key,)
     config = c.load_config()
     tz = c.resolve_display_tz(args, config)
     args._resolved_tz = tz
@@ -91,12 +99,10 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
             week_start = parse_date_str(args.week_start, "--week-start")
         else:
             latest_usage = conn.execute(
-                """
-                SELECT week_start_date
-                FROM weekly_usage_snapshots
-                ORDER BY captured_at_utc DESC, id DESC
-                LIMIT 1
-                """
+                "SELECT week_start_date FROM weekly_usage_snapshots"
+                + (" WHERE 1=1" + _acct_pred if acct_key is not None else "")
+                + " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+                _acct_p,
             ).fetchone()
             if latest_usage is not None:
                 week_start = dt.date.fromisoformat(latest_usage["week_start_date"])
@@ -109,17 +115,18 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
 
         # Get week_end from any snapshot for this week
         end_row = conn.execute(
-            """
+            f"""
             SELECT MAX(week_end_date) AS week_end_date
             FROM (
-              SELECT week_end_date FROM weekly_usage_snapshots WHERE week_start_date = ?
+              SELECT week_end_date FROM weekly_usage_snapshots WHERE week_start_date = ?{_acct_pred}
               UNION ALL
-              SELECT week_end_date FROM weekly_cost_snapshots WHERE week_start_date = ?
+              SELECT week_end_date FROM weekly_cost_snapshots WHERE week_start_date = ?{_acct_pred}
               UNION ALL
-              SELECT week_end_date FROM percent_milestones WHERE week_start_date = ?
+              SELECT week_end_date FROM percent_milestones WHERE week_start_date = ?{_acct_pred}
             )
             """,
-            (week_start_date, week_start_date, week_start_date),
+            (week_start_date,) + _acct_p + (week_start_date,) + _acct_p
+            + (week_start_date,) + _acct_p,
         ).fetchone()
         week_end_date = end_row["week_end_date"] if end_row and end_row["week_end_date"] else (
             (week_start + dt.timedelta(days=6)).isoformat()
@@ -158,9 +165,9 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
         canon_end_for_lookup = None
         latest_end_row = conn.execute(
             "SELECT week_end_at FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? AND week_end_at IS NOT NULL "
-            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            (week_start_date,),
+            "WHERE week_start_date = ? AND week_end_at IS NOT NULL" + _acct_pred +
+            " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (week_start_date,) + _acct_p,
         ).fetchone()
         if latest_end_row is not None:
             canon_end_for_lookup = _canonicalize_optional_iso(
@@ -177,7 +184,8 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
                 active_segment = int(seg_row["id"])
 
         milestones = [
-            m for m in c.get_milestones_for_week(conn, week_start_date)
+            m for m in c.get_milestones_for_week(
+                conn, week_start_date, account_key=acct_key)
             if int(m["reset_event_id"] or 0) == active_segment
         ]
 
@@ -201,6 +209,7 @@ def cmd_percent_breakdown(args: argparse.Namespace) -> int:
         }
 
         if args.json:
+            output.update(c.account_json_fields(acct_key))  # #341 R8 decoration
             print(json.dumps(c.stamp_schema_version(output), indent=2))
             return 0
 

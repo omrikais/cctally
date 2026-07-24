@@ -32,6 +32,7 @@ def _seed_quota_cache(home: pathlib.Path, *, stale_root_key: str,
                       fresh_root_key: str) -> None:
     db_path = home / ".local" / "share" / "cctally" / "cache.db"
     db_path.parent.mkdir(parents=True)
+    db_path.with_name("cache.db.maintenance.lock").touch()
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("""

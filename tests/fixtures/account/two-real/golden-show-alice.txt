@@ -1,0 +1,10 @@
+Account:    alice
+Key:        24e1c7396048eb38fdfe7643d88ce6e5
+Provider:   claude
+Email:      alice@example.com
+Plan:       max
+Label from: auto
+First seen: 2026-05-01T00:00:00Z
+Last seen:  2026-05-20T00:00:00Z
+Active:     no
+Attribution: 2 usage snapshot(s), 0 percent milestone(s)

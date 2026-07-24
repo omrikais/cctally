@@ -33,13 +33,14 @@ describe('<HelpOverlay />', () => {
     expect(card).not.toBeNull();
     // h2 "Keybindings"
     expect(card?.querySelector('h2')?.textContent).toBe('Keybindings');
-    // 26 table rows: 10 panel keys (1-9,0 — #264 S2 split the History card back
-    // into Daily/Weekly/Monthly, so the grid order is 10 long) + 13 data-driven
-    // HELP_ROWS single-key rows (#207 D1: r, v, s, d, S, B, f, /, c, n/N, q, ?,
-    // Esc — #294 S5 added `v` for the source cycle) + 3 combo/gesture rows
-    // (Hold+drag, Shift+arrows, ↑/↓ select period).
+    // 27 table rows: 10 panel keys (1-9,0 — #264 S2 split the History card back
+    // into Daily/Weekly/Monthly, so the grid order is 10 long) + 14 data-driven
+    // HELP_ROWS single-key rows (#207 D1: r, v, a, s, d, S, B, f, /, c, n/N, q, ?,
+    // Esc — #294 S5 added `v` for the source cycle, #341 Task 4 added `a` for the
+    // account cycle) + 3 combo/gesture rows (Hold+drag, Shift+arrows, ↑/↓ select
+    // period).
     const rows = card?.querySelectorAll('table tr');
-    expect(rows?.length).toBe(26);
+    expect(rows?.length).toBe(27);
     // Meta line with server URL
     const meta = card?.querySelector('p.meta');
     expect(meta?.textContent).toMatch(/cctally/);

@@ -107,10 +107,19 @@ def evt_id(kind: str, *parts: object) -> str:
 # fully-formed line records
 # --------------------------------------------------------------------------
 
-def make_obs(at: str, src: str, provider: str, payload: dict) -> dict:
+def make_obs(at: str, src: str, provider: str, payload: dict,
+             account: str | None = None) -> dict:
     """Build a complete ``obs`` line record (raw capture; canonicalization is
-    derivation-time, never baked into the stored line — spec §4.2)."""
+    derivation-time, never baked into the stored line — spec §4.2).
+
+    ``account`` (#341) is the account_key stamp, a top-level sibling of
+    ``provider``. It is emitted ONLY when supplied, so a pre-epic / single-account
+    writer that passes nothing produces a byte-identical line (and a byte-stable
+    content id). When supplied it participates in the content id, so two obs that
+    differ only by account are distinct records."""
     core = {"t": "obs", "at": at, "src": src, "provider": provider, "payload": payload}
+    if account is not None:
+        core["account"] = account
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
@@ -131,6 +140,60 @@ def make_evt(kind: str, id: str, at: str, payload: dict, rev: int = 0) -> dict:
     body["kind"] = kind
     return {"v": LINE_VERSION, "t": "evt", "id": id, "rev": rev,
             "at": at, "src": "ingest", "payload": body}
+
+
+# --------------------------------------------------------------------------
+# accounts-machinery records (#341): registered op kinds folded into the
+# `accounts` registry. These are NOT data-bearing account-stamped lines and are
+# NOT legacy — the classifier recognises them by their registered `kind`.
+# --------------------------------------------------------------------------
+
+def make_account_observe(
+    at: str,
+    account_key: str,
+    provider: str,
+    *,
+    natural_id: str | None = None,
+    email: str | None = None,
+    plan_type: str | None = None,
+    label: str | None = None,
+    label_source: str | None = None,
+) -> dict:
+    """Build an ``account_observe`` op line — appended on first sight of an
+    account or an identity change (NOT every tick). Folded into the ``accounts``
+    registry by ``_apply_op_account_observe`` (rebuild applier). ``last_seen_utc``
+    is NOT carried here — it derives at fold time from the max ``at`` of any
+    account-stamped line (spec §1)."""
+    payload = {"kind": "account_observe", "account_key": account_key,
+               "provider": provider}
+    if natural_id is not None:
+        payload["natural_id"] = natural_id
+    if email is not None:
+        payload["email"] = email
+    if plan_type is not None:
+        payload["plan_type"] = plan_type
+    if label is not None:
+        payload["label"] = label
+    if label_source is not None:
+        payload["label_source"] = label_source
+    return make_op(at=at, src="account-observe", payload=payload)
+
+
+def make_account_label(
+    at: str,
+    account_key: str,
+    label: str,
+    *,
+    provider: str | None = None,
+) -> dict:
+    """Build an ``account_label`` op line (a user rename). Folded by
+    ``_apply_op_account_label`` with ``label_source='user'`` — the top of the
+    label-precedence order (user > switcher > auto), so a later switcher/auto
+    enrichment never overrides it (spec §1)."""
+    payload = {"kind": "account_label", "account_key": account_key, "label": label}
+    if provider is not None:
+        payload["provider"] = provider
+    return make_op(at=at, src="account-label", payload=payload)
 
 
 # --------------------------------------------------------------------------

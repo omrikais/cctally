@@ -56,11 +56,17 @@ def _resolve_block_selector(
     *,
     block_start: str | None,
     ago: int | None,
+    account_key: "str | None" = None,
 ) -> dict | None:
     """Resolve a five-hour-breakdown selector to one ``five_hour_blocks`` row.
 
     Returns a dict-mapped ``sqlite3.Row`` (or ``None`` if no block matches).
     Raises ``ValueError`` on conflicting / malformed input.
+
+    ``account_key`` (#341, spec §3): ``None`` = merged / byte-stable; a real key /
+    ``unattributed`` scopes selection to that account's blocks — required because
+    ``five_hour_window_key`` is shared across accounts (one physical window can
+    own one block per account).
 
     Selector rules (spec §3.1):
       * Both ``None`` -> most-recent block (highest ``block_start_at``).
@@ -74,6 +80,8 @@ def _resolve_block_selector(
         (cannot derive a unique canonical 5h key from a date alone).
     """
     _c = _cctally()
+    _acct_pred = "" if account_key is None else " AND account_key = ?"
+    _acct_p: tuple = () if account_key is None else (account_key,)
     if block_start is not None and ago is not None:
         raise ValueError(
             "--block-start and --ago are mutually exclusive"
@@ -95,8 +103,9 @@ def _resolve_block_selector(
         resets_epoch = int(parsed.timestamp()) + 5 * 3600
         key = _c._canonical_5h_window_key(resets_epoch)
         row = conn.execute(
-            "SELECT * FROM five_hour_blocks WHERE five_hour_window_key = ?",
-            (key,),
+            "SELECT * FROM five_hour_blocks WHERE five_hour_window_key = ?"
+            + _acct_pred,
+            (key,) + _acct_p,
         ).fetchone()
         return dict(row) if row else None
 
@@ -105,12 +114,10 @@ def _resolve_block_selector(
     if offset < 0:
         raise ValueError(f"--ago must be non-negative (got {ago})")
     row = conn.execute(
-        """
-        SELECT * FROM five_hour_blocks
-         ORDER BY block_start_at DESC, id DESC
-         LIMIT 1 OFFSET ?
-        """,
-        (offset,),
+        "SELECT * FROM five_hour_blocks"
+        + (" WHERE account_key = ?" if account_key is not None else "")
+        + " ORDER BY block_start_at DESC, id DESC LIMIT 1 OFFSET ?",
+        _acct_p + (offset,),
     ).fetchone()
     return dict(row) if row else None
 
@@ -913,7 +920,7 @@ def _block_is_active(
 
 
 def _latest_seven_day_and_window(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection, *, account_key: "str | None" = None,
 ) -> tuple[float | None, int | None]:
     """Return ``(latest_7d_percent, latest_5h_window_key)`` from
     ``weekly_usage_snapshots``.
@@ -923,15 +930,18 @@ def _latest_seven_day_and_window(
     Either or both elements may be ``None``. Used by
     ``cmd_five_hour_breakdown`` to override
     ``seven_day_pct_at_block_end`` on the active row.
+
+    ``account_key`` (#341, spec §3): ``None`` = merged / byte-stable; a real key /
+    ``unattributed`` scopes the latest-snapshot pick to that account.
     """
+    acct_pred = "" if account_key is None else " WHERE account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
     try:
         row = conn.execute(
-            """
-            SELECT weekly_percent, five_hour_window_key
-              FROM weekly_usage_snapshots
-             ORDER BY captured_at_utc DESC, id DESC
-             LIMIT 1
-            """
+            "SELECT weekly_percent, five_hour_window_key "
+            "FROM weekly_usage_snapshots" + acct_pred +
+            " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            acct_p,
         ).fetchone()
     except sqlite3.DatabaseError:
         return None, None
@@ -998,6 +1008,12 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     # cmd_five_hour_breakdown). Used by the active-predicate to gate
     # natural expiration so an idle-past-reset block doesn't render ACTIVE.
     now_utc = _command_as_of()
+    # #341 --account: resolve the render filter (provider=claude). This command
+    # renders from the five_hour_blocks stats table (not the entry cache), so
+    # needs_cache=False. None = merged / byte-stable.
+    acct_key, acct_exit = _c.resolve_account_filter(args, "claude", needs_cache=False)
+    if acct_exit is not None:
+        return acct_exit
     conn = open_db()
     try:
         # Date filter parsing — same convention as cmd_blocks.
@@ -1026,6 +1042,9 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
             until_dt = dt.date.fromisoformat(until_iso) + dt.timedelta(days=1)
             where.append("block_start_at < ?")
             params.append(until_dt.isoformat())
+        if acct_key is not None:  # #341: scope blocks to the selected account
+            where.append("account_key = ?")
+            params.append(acct_key)
         clause = ("WHERE " + " AND ".join(where)) if where else ""
 
         # No filter → cap at 50; with filter → unbounded.
@@ -1071,19 +1090,21 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
         # SAME filter set (none here, but kept symmetric for clarity).
         truncated = False
         if cap is not None and len(rows) == cap:
+            # #341: the cap path implies no date filter, but an --account filter
+            # can still apply — probe over the SAME account scope.
+            _probe_pred = "" if acct_key is None else " WHERE account_key = ?"
+            _probe_p: tuple = () if acct_key is None else (acct_key,)
             extra = conn.execute(
-                """
-                SELECT 1 FROM five_hour_blocks
-                 ORDER BY block_start_at DESC, id DESC
-                 LIMIT 1 OFFSET ?
-                """,
-                (cap,),
+                "SELECT 1 FROM five_hour_blocks" + _probe_pred +
+                " ORDER BY block_start_at DESC, id DESC LIMIT 1 OFFSET ?",
+                _probe_p + (cap,),
             ).fetchone()
             truncated = extra is not None
 
         # Latest live 7d% from the latest weekly_usage_snapshots row, used
         # to fill seven_day_pct_at_block_end on the active row.
-        latest_7d, latest_window_key = _latest_seven_day_and_window(conn)
+        latest_7d, latest_window_key = _latest_seven_day_and_window(
+            conn, account_key=acct_key)
 
         # Pre-load credit events for every window_key the rows query
         # returned. Single index-scan over `five_hour_reset_events`;
@@ -1091,11 +1112,14 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
         # JOIN against each block dict. Used by both the text/JSON
         # render path AND the share-output snapshot wiring (spec §5.1.1).
         # Loaded in a single pass — no per-block SELECT.
+        _credit_pred = "" if acct_key is None else " WHERE account_key = ?"
+        _credit_p: tuple = () if acct_key is None else (acct_key,)
         credit_rows = conn.execute(
             "SELECT five_hour_window_key, prior_percent, post_percent, "
             "       effective_reset_at_utc "
-            "  FROM five_hour_reset_events "
-            " ORDER BY five_hour_window_key, effective_reset_at_utc"
+            "  FROM five_hour_reset_events" + _credit_pred +
+            " ORDER BY five_hour_window_key, effective_reset_at_utc",
+            _credit_p,
         ).fetchall()
         credits_by_window: dict[int, list[dict]] = {}
         for cr in credit_rows:
@@ -1199,13 +1223,12 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 )
 
         if args.json:
-            print(json.dumps(
-                _c._five_hour_blocks_to_json(
-                    block_dicts, since_iso, until_iso,
-                    cap, truncated, args.breakdown,
-                ),
-                indent=2,
-            ))
+            _fhb_payload = _c._five_hour_blocks_to_json(
+                block_dicts, since_iso, until_iso,
+                cap, truncated, args.breakdown,
+            )
+            _fhb_payload.update(_c.account_json_fields(acct_key))  # #341 R8
+            print(json.dumps(_fhb_payload, indent=2))
             return 0
 
         _c._render_five_hour_blocks_table(block_dicts, args)
@@ -1224,6 +1247,11 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
     # other testing-hook-only commands). Used for the active-block elapsed
     # display below so fixture-pinned harnesses get deterministic output.
     now_utc = _command_as_of()
+    # #341 --account: resolve the render filter (provider=claude). Reads only the
+    # five_hour_* stats tables (not the entry cache), so needs_cache=False.
+    acct_key, acct_exit = _c.resolve_account_filter(args, "claude", needs_cache=False)
+    if acct_exit is not None:
+        return acct_exit
     conn = open_db()
     try:
         try:
@@ -1231,6 +1259,7 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
                 conn,
                 block_start=args.block_start,
                 ago=args.ago,
+                account_key=acct_key,
             )
         except ValueError as e:
             print(f"five-hour-breakdown: {e}", file=sys.stderr)
@@ -1271,14 +1300,14 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         # renderer can interleave a ``⚡ CREDIT  -Xpp @ HH:MM`` divider
         # row between pre- and post-credit milestone segments and JSON
         # consumers see the parallel ``credits[]`` array (Section 5.2).
+        _bd_credit_pred = "" if acct_key is None else " AND account_key = ?"
+        _bd_credit_p: tuple = () if acct_key is None else (acct_key,)
         credit_rows = conn.execute(
-            """
-            SELECT effective_reset_at_utc, prior_percent, post_percent
-              FROM five_hour_reset_events
-             WHERE five_hour_window_key = ?
-             ORDER BY effective_reset_at_utc ASC
-            """,
-            (block["five_hour_window_key"],),
+            "SELECT effective_reset_at_utc, prior_percent, post_percent "
+            "FROM five_hour_reset_events "
+            "WHERE five_hour_window_key = ?" + _bd_credit_pred +
+            " ORDER BY effective_reset_at_utc ASC",
+            (block["five_hour_window_key"],) + _bd_credit_p,
         ).fetchall()
         credits_list: list[dict] = [
             {
@@ -1297,7 +1326,8 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         p_end = block.get("seven_day_pct_at_block_end")
 
         # Live 7d_end on active row.
-        latest_7d, latest_window_key = _latest_seven_day_and_window(conn)
+        latest_7d, latest_window_key = _latest_seven_day_and_window(
+            conn, account_key=acct_key)
         is_active = _block_is_active(block, latest_window_key, now_utc)
         if is_active and latest_7d is not None:
             p_end = latest_7d
@@ -1352,15 +1382,14 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
             # ``milestones`` — same shape as the ``credits`` field on
             # ``five-hour-blocks --json`` (§5.1). Stacked credits across
             # distinct 10-min slots produce multiple entries.
-            print(json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "block": block_out,
-                    "milestones": ms_out,
-                    "credits": credits_list,
-                },
-                indent=2,
-            ))
+            _bd_payload = {
+                "schemaVersion": 1,
+                "block": block_out,
+                "milestones": ms_out,
+                "credits": credits_list,
+            }
+            _bd_payload.update(_c.account_json_fields(acct_key))  # #341 R8
+            print(json.dumps(_bd_payload, indent=2))
             return 0
 
         # Human-readable header line.
@@ -1493,18 +1522,21 @@ def _backfill_five_hour_blocks(
         # 5h percent. The percent guard is critical: MAX(five_hour_percent)
         # over a NULL-only window is NULL, which would trip the
         # final_five_hour_percent NOT NULL constraint at insert time.
+        # #341: re-materialize one open block per (account_key, window_key). A
+        # shared physical 5h window observed by two accounts yields two distinct
+        # open blocks so rebuild reproduces per-account ownership.
         keys_sql = """
-                SELECT DISTINCT five_hour_window_key
+                SELECT DISTINCT five_hour_window_key, account_key
                   FROM weekly_usage_snapshots
                  WHERE five_hour_window_key IS NOT NULL
                    AND five_hour_percent     IS NOT NULL
         """
         if only_missing:
             keys_sql += (
-                "   AND five_hour_window_key NOT IN "
-                "(SELECT five_hour_window_key FROM five_hour_blocks)"
+                "   AND (five_hour_window_key, account_key) NOT IN "
+                "(SELECT five_hour_window_key, account_key FROM five_hour_blocks)"
             )
-        keys = [int(r[0]) for r in conn.execute(keys_sql).fetchall()]
+        keys = [(int(r[0]), r[1]) for r in conn.execute(keys_sql).fetchall()]
 
         now_iso = now_utc_iso()
         now_dt = parse_iso_datetime(now_iso, "now")
@@ -1520,30 +1552,32 @@ def _backfill_five_hour_blocks(
         # See cctally-dev#87.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for key in keys:
+            for key, acct in keys:
                 # MIN-captured row defines the immutable block boundary
                 # values (deterministic — picking "any in-window row"
                 # would be nondeterministic under seconds-level Anthropic
-                # ISO jitter that the canonical key collapses).
+                # ISO jitter that the canonical key collapses). Scoped to
+                # (window_key, account_key) so a shared window's per-account
+                # blocks each read their own account's boundary rows (#341).
                 min_row = conn.execute(
                     """
                     SELECT five_hour_resets_at, captured_at_utc, weekly_percent
                       FROM weekly_usage_snapshots
-                     WHERE five_hour_window_key = ?
+                     WHERE five_hour_window_key = ? AND account_key = ?
                        AND five_hour_percent IS NOT NULL
                      ORDER BY captured_at_utc ASC, id ASC LIMIT 1
                     """,
-                    (key,),
+                    (key, acct),
                 ).fetchone()
                 max_row = conn.execute(
                     """
                     SELECT captured_at_utc, weekly_percent, five_hour_percent
                       FROM weekly_usage_snapshots
-                     WHERE five_hour_window_key = ?
+                     WHERE five_hour_window_key = ? AND account_key = ?
                        AND five_hour_percent IS NOT NULL
                      ORDER BY captured_at_utc DESC, id DESC LIMIT 1
                     """,
-                    (key,),
+                    (key, acct),
                 ).fetchone()
                 if min_row is None or max_row is None:
                     continue   # defensive — should be unreachable per the keys query
@@ -1574,22 +1608,24 @@ def _backfill_five_hour_blocks(
                 cross_row = conn.execute(
                     """
                     SELECT 1 FROM week_reset_events
-                     WHERE unixepoch(effective_reset_at_utc) >= unixepoch(?)
+                     WHERE account_key = ?
+                       AND unixepoch(effective_reset_at_utc) >= unixepoch(?)
                        AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
                      LIMIT 1
                     """,
-                    (block_start_at, last_obs),
+                    (acct, block_start_at, last_obs),
                 ).fetchone()
                 if cross_row is None:
                     cross_row = conn.execute(
                         """
                         SELECT 1 FROM weekly_usage_snapshots
                          WHERE week_start_at IS NOT NULL
+                           AND account_key = ?
                            AND unixepoch(week_start_at) >  unixepoch(?)
                            AND unixepoch(week_start_at) <= unixepoch(?)
                          LIMIT 1
                         """,
-                        (block_start_at, last_obs),
+                        (acct, block_start_at, last_obs),
                     ).fetchone()
                 crossed = 1 if cross_row is not None else 0
 
@@ -1624,9 +1660,10 @@ def _backfill_five_hour_blocks(
                       total_cost_usd,
                       is_closed,
                       created_at_utc,
-                      last_updated_at_utc
+                      last_updated_at_utc,
+                      account_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -1646,6 +1683,7 @@ def _backfill_five_hour_blocks(
                         is_closed,
                         now_iso,
                         now_iso,
+                        acct,
                     ),
                 )
                 inserted += cur.rowcount or 0
@@ -1655,8 +1693,9 @@ def _backfill_five_hour_blocks(
                 # re-runs (UNIQUE(five_hour_window_key, model|project_path)).
                 # Same transaction as the parent INSERT.
                 parent_id_row = conn.execute(
-                    "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
-                    (key,),
+                    "SELECT id FROM five_hour_blocks "
+                    "WHERE five_hour_window_key = ? AND account_key = ?",
+                    (key, acct),
                 ).fetchone()
                 if parent_id_row is not None:
                     parent_id = int(parent_id_row["id"])
@@ -1667,9 +1706,9 @@ def _backfill_five_hour_blocks(
                               block_id, five_hour_window_key, model,
                               input_tokens, output_tokens,
                               cache_create_tokens, cache_read_tokens,
-                              cost_usd, entry_count
+                              cost_usd, entry_count, account_key
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             [
                                 (
@@ -1682,6 +1721,7 @@ def _backfill_five_hour_blocks(
                                     b["cache_read_tokens"],
                                     b["cost_usd"],
                                     b["entry_count"],
+                                    acct,
                                 )
                                 for model, b in totals["by_model"].items()
                             ],
@@ -1693,9 +1733,9 @@ def _backfill_five_hour_blocks(
                               block_id, five_hour_window_key, project_path,
                               input_tokens, output_tokens,
                               cache_create_tokens, cache_read_tokens,
-                              cost_usd, entry_count
+                              cost_usd, entry_count, account_key
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             [
                                 (
@@ -1708,6 +1748,7 @@ def _backfill_five_hour_blocks(
                                     b["cache_read_tokens"],
                                     b["cost_usd"],
                                     b["entry_count"],
+                                    acct,
                                 )
                                 for project_path, b in totals["by_project"].items()
                             ],

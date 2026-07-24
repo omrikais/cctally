@@ -226,7 +226,8 @@ def create_stats_db(path: Path) -> None:
                 payload_json TEXT NOT NULL,
                 five_hour_percent REAL,
                 five_hour_resets_at TEXT,
-                five_hour_window_key INTEGER
+                five_hour_window_key INTEGER,
+                account_key TEXT NOT NULL DEFAULT 'unattributed'
             );
             CREATE INDEX idx_usage_week_time
                 ON weekly_usage_snapshots(week_start_date, captured_at_utc DESC, id DESC);
@@ -247,7 +248,8 @@ def create_stats_db(path: Path) -> None:
                 cost_usd REAL NOT NULL,
                 source TEXT NOT NULL DEFAULT 'cctally-range-cost',
                 mode TEXT NOT NULL DEFAULT 'auto',
-                project TEXT
+                project TEXT,
+                account_key TEXT NOT NULL DEFAULT 'unattributed'
             );
             CREATE INDEX idx_cost_week_time
                 ON weekly_cost_snapshots(week_start_date, captured_at_utc DESC, id DESC);
@@ -269,7 +271,8 @@ def create_stats_db(path: Path) -> None:
                 five_hour_percent_at_crossing REAL,
                 alerted_at TEXT,
                 reset_event_id INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(week_start_date, percent_threshold, reset_event_id)
+                account_key TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, week_start_date, percent_threshold, reset_event_id)
             );
 
             CREATE TABLE week_reset_events (
@@ -279,12 +282,13 @@ def create_stats_db(path: Path) -> None:
                 new_week_end_at        TEXT NOT NULL,
                 effective_reset_at_utc TEXT NOT NULL,
                 observed_pre_credit_pct REAL,
-                UNIQUE(old_week_end_at, new_week_end_at)
+                account_key            TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, old_week_end_at, new_week_end_at)
             );
 
             CREATE TABLE five_hour_blocks (
                 id                            INTEGER PRIMARY KEY AUTOINCREMENT,
-                five_hour_window_key          INTEGER NOT NULL UNIQUE,
+                five_hour_window_key          INTEGER NOT NULL,
                 five_hour_resets_at           TEXT    NOT NULL,
                 block_start_at                TEXT    NOT NULL,
                 first_observed_at_utc         TEXT    NOT NULL,
@@ -300,7 +304,9 @@ def create_stats_db(path: Path) -> None:
                 total_cost_usd                REAL    NOT NULL DEFAULT 0,
                 is_closed                     INTEGER NOT NULL DEFAULT 0,
                 created_at_utc                TEXT    NOT NULL,
-                last_updated_at_utc           TEXT    NOT NULL
+                last_updated_at_utc           TEXT    NOT NULL,
+                account_key                   TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key)
             );
             CREATE INDEX idx_five_hour_blocks_block_start
                 ON five_hour_blocks(block_start_at DESC);
@@ -321,7 +327,8 @@ def create_stats_db(path: Path) -> None:
                 seven_day_pct_at_crossing   REAL,
                 alerted_at                  TEXT,
                 reset_event_id              INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(five_hour_window_key, percent_threshold, reset_event_id),
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, percent_threshold, reset_event_id),
                 FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
             );
             CREATE INDEX idx_five_hour_milestones_block
@@ -350,7 +357,8 @@ def create_stats_db(path: Path) -> None:
                 consumption_pct REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(vendor, period_start_at, period, threshold)
+                account_key     TEXT    NOT NULL DEFAULT '*',
+                UNIQUE(vendor, account_key, period_start_at, period, threshold)
             );
 
             -- projected_milestones: projected-pace threshold crossings (issue
@@ -371,7 +379,8 @@ def create_stats_db(path: Path) -> None:
                 denominator     REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(week_start_at, period, metric, threshold)
+                account_key     TEXT    NOT NULL DEFAULT '*',
+                UNIQUE(account_key, week_start_at, period, metric, threshold)
             );
 
             -- five_hour_reset_events: parallel to week_reset_events for the
@@ -385,7 +394,8 @@ def create_stats_db(path: Path) -> None:
                 prior_percent          REAL NOT NULL,
                 post_percent           REAL NOT NULL,
                 effective_reset_at_utc TEXT NOT NULL,
-                UNIQUE(five_hour_window_key, effective_reset_at_utc)
+                account_key            TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
             );
 
             CREATE TABLE schema_migrations (
@@ -416,7 +426,8 @@ def create_stats_db(path: Path) -> None:
                 cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
                 cost_usd                    REAL    NOT NULL DEFAULT 0,
                 entry_count                 INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(five_hour_window_key, model),
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, model),
                 FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
             );
             CREATE INDEX idx_five_hour_block_models_block
@@ -435,7 +446,8 @@ def create_stats_db(path: Path) -> None:
                 cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
                 cost_usd                    REAL    NOT NULL DEFAULT 0,
                 entry_count                 INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(five_hour_window_key, project_path),
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, project_path),
                 FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
             );
             CREATE INDEX idx_five_hour_block_projects_block
@@ -459,7 +471,8 @@ def create_stats_db(path: Path) -> None:
                 consumption_pct REAL    NOT NULL,
                 crossed_at_utc  TEXT    NOT NULL,
                 alerted_at      TEXT,
-                UNIQUE(week_start_at, project_key, threshold)
+                account_key     TEXT    NOT NULL DEFAULT '*',
+                UNIQUE(account_key, week_start_at, project_key, threshold)
             );
 
             -- weekly_credit_floors: in-place weekly partial-credit floor
@@ -475,7 +488,22 @@ def create_stats_db(path: Path) -> None:
                 effective_at_utc        TEXT    NOT NULL,
                 observed_pre_credit_pct REAL    NOT NULL,
                 applied_at_utc          TEXT    NOT NULL,
-                UNIQUE(week_start_date, effective_at_utc)
+                account_key             TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, week_start_date, effective_at_utc)
+            );
+            -- Account registry (#341). Single source of DDL: byte-matches the
+            -- production `CREATE TABLE IF NOT EXISTS accounts` in
+            -- `_cctally_core.py` (invariant #5: builder schema == production).
+            CREATE TABLE accounts (
+                account_key    TEXT PRIMARY KEY,
+                provider       TEXT NOT NULL,
+                natural_id     TEXT,
+                email          TEXT,
+                label          TEXT,
+                plan_type      TEXT,
+                label_source   TEXT NOT NULL DEFAULT 'auto',
+                first_seen_utc TEXT,
+                last_seen_utc  TEXT
             );
         """)
         # Keep fixture fresh-schema parity with open_db() and migration 013.
@@ -513,6 +541,7 @@ def _self_test_create_stats_db() -> None:
             "quota_window_blocks", "quota_percent_milestones",
             "quota_threshold_events", "quota_projection_state",
             "quota_alert_arming",
+            "accounts",
             "schema_migrations", "schema_migrations_skipped",
         }
         missing = expected - tables
@@ -718,6 +747,34 @@ def seed_session_file(
     )
 
 
+def seed_account(
+    conn: sqlite3.Connection,
+    *,
+    account_key: str,
+    provider: str,
+    natural_id: Optional[str] = None,
+    email: Optional[str] = None,
+    label: Optional[str] = None,
+    plan_type: Optional[str] = None,
+    label_source: str = "auto",
+    first_seen_utc: Optional[str] = None,
+    last_seen_utc: Optional[str] = None,
+) -> None:
+    """Insert an ``accounts`` registry row (#341). Direct-seed for render
+    fixtures — the journal-derivation path (rebuild_stats_index folding
+    ``account_observe`` ops) is covered by pytest ``test_account_cli.py``; this
+    matches the established render-fixture convention (every ``build-*-fixtures``
+    direct-seeds its stats.db tables). Column list == production DDL."""
+    conn.execute(
+        """INSERT INTO accounts
+           (account_key, provider, natural_id, email, label, plan_type,
+            label_source, first_seen_utc, last_seen_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (account_key, provider, natural_id, email, label, plan_type,
+         label_source, first_seen_utc, last_seen_utc),
+    )
+
+
 def seed_session_entry(
     conn: sqlite3.Connection,
     *,
@@ -734,22 +791,24 @@ def seed_session_entry(
     usage_extra_json: Optional[str] = None,
     speed: Optional[str] = None,
     cost_usd_raw: Optional[float] = None,
+    account_key: Optional[str] = None,
 ) -> None:
     """Insert a session_entries row. Matches production column list;
     cost_usd_raw left NULL by default since costs are recomputed at query
     time from CLAUDE_MODEL_PRICING. `speed` materializes the fast-tier flag
-    (#181); leave None for normal-tier rows."""
+    (#181); leave None for normal-tier rows. ``account_key`` (#341) stamps the
+    row's account (NULL == unattributed on the read path)."""
     conn.execute(
         """INSERT INTO session_entries
            (source_path, line_offset, timestamp_utc, model,
             msg_id, req_id,
             input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
-            usage_extra_json, speed, cost_usd_raw)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            usage_extra_json, speed, cost_usd_raw, account_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (source_path, line_offset, timestamp_utc, model,
          msg_id, req_id,
          input_tokens, output_tokens, cache_create, cache_read,
-         usage_extra_json, speed, cost_usd_raw),
+         usage_extra_json, speed, cost_usd_raw, account_key),
     )
 
 
@@ -768,6 +827,7 @@ def seed_weekly_usage_snapshot(
     page_url: Optional[str] = None,
     source: str = "userscript",
     payload_json: str = "{}",
+    account_key: Optional[str] = None,
 ) -> None:
     """Insert a weekly_usage_snapshots row.
 
@@ -783,21 +843,41 @@ def seed_weekly_usage_snapshot(
     same shape as `_canonical_5h_window_key`) to exercise the dashboard's
     `_select_current_block_for_envelope` path that joins
     `weekly_usage_snapshots.five_hour_window_key` against
-    `five_hour_blocks.five_hour_window_key`."""
-    conn.execute(
-        """INSERT INTO weekly_usage_snapshots
-           (captured_at_utc, week_start_date, week_end_date,
-            week_start_at, week_end_at, weekly_percent,
-            page_url, source, payload_json,
-            five_hour_percent, five_hour_resets_at,
-            five_hour_window_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (captured_at_utc, week_start_date, week_end_date,
-         week_start_at, week_end_at, weekly_percent,
-         page_url, source, payload_json,
-         five_hour_percent, five_hour_resets_at,
-         five_hour_window_key),
-    )
+    `five_hour_blocks.five_hour_window_key`.
+
+    `account_key` (#341) stamps the row's account; None keeps the schema
+    default (`unattributed`), byte-identical for existing single-account
+    fixtures."""
+    if account_key is None:
+        conn.execute(
+            """INSERT INTO weekly_usage_snapshots
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, weekly_percent,
+                page_url, source, payload_json,
+                five_hour_percent, five_hour_resets_at,
+                five_hour_window_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (captured_at_utc, week_start_date, week_end_date,
+             week_start_at, week_end_at, weekly_percent,
+             page_url, source, payload_json,
+             five_hour_percent, five_hour_resets_at,
+             five_hour_window_key),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO weekly_usage_snapshots
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, weekly_percent,
+                page_url, source, payload_json,
+                five_hour_percent, five_hour_resets_at,
+                five_hour_window_key, account_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (captured_at_utc, week_start_date, week_end_date,
+             week_start_at, week_end_at, weekly_percent,
+             page_url, source, payload_json,
+             five_hour_percent, five_hour_resets_at,
+             five_hour_window_key, account_key),
+        )
 
 
 def seed_weekly_cost_snapshot(
@@ -814,6 +894,7 @@ def seed_weekly_cost_snapshot(
     source: str = "cctally-range-cost",
     mode: str = "auto",
     project: Optional[str] = None,
+    account_key: Optional[str] = None,
 ) -> None:
     """Insert a weekly_cost_snapshots row (sibling of
     seed_weekly_usage_snapshot).
@@ -824,17 +905,33 @@ def seed_weekly_cost_snapshot(
     default None) to exercise the ISO-match vs date-only-fallback join paths —
     same posture as the usage seeder. `cost_usd` is the snapshotted cost (report
     reads the snapshot value, unlike `weekly`, which recomputes from
-    session_entries)."""
-    conn.execute(
-        """INSERT INTO weekly_cost_snapshots
-           (captured_at_utc, week_start_date, week_end_date,
-            week_start_at, week_end_at, range_start_iso, range_end_iso,
-            cost_usd, source, mode, project)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (captured_at_utc, week_start_date, week_end_date,
-         week_start_at, week_end_at, range_start_iso, range_end_iso,
-         cost_usd, source, mode, project),
-    )
+    session_entries).
+
+    `account_key` (#341): the account dimension of the snapshot. `None` lets the
+    schema DEFAULT ('unattributed') apply (byte-stable for legacy fixtures); a
+    real key seeds the per-account `report --account` render (#341 slice D)."""
+    if account_key is None:
+        conn.execute(
+            """INSERT INTO weekly_cost_snapshots
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, range_start_iso, range_end_iso,
+                cost_usd, source, mode, project)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (captured_at_utc, week_start_date, week_end_date,
+             week_start_at, week_end_at, range_start_iso, range_end_iso,
+             cost_usd, source, mode, project),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO weekly_cost_snapshots
+               (captured_at_utc, week_start_date, week_end_date,
+                week_start_at, week_end_at, range_start_iso, range_end_iso,
+                cost_usd, source, mode, project, account_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (captured_at_utc, week_start_date, week_end_date,
+             week_start_at, week_end_at, range_start_iso, range_end_iso,
+             cost_usd, source, mode, project, account_key),
+        )
 
 
 def seed_week_reset_event(

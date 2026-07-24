@@ -187,13 +187,15 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     # Both tables must exist with the expected column counts.
     blocks_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_blocks');")
     milestones_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_milestones');")
-    # 19 = 18 legacy columns + `journal_id TEXT` (DB journal redesign Task 4 —
-    # the nullable replay-identity column added to every journal-covered table).
-    assert_eq "$blocks_cols"     "19" "five_hour_blocks column count"
-    # 16 = 13 base columns + `alerted_at TEXT` (threshold-actions T1 migration)
+    # 20 = 18 legacy columns + `journal_id TEXT` (DB journal redesign Task 4 —
+    # the nullable replay-identity column added to every journal-covered table)
+    # + `account_key TEXT NOT NULL DEFAULT 'unattributed'` (#341 multi-account).
+    assert_eq "$blocks_cols"     "20" "five_hour_blocks column count"
+    # 17 = 13 base columns + `alerted_at TEXT` (threshold-actions T1 migration)
     # + `reset_event_id` (migration 006 — 5h in-place credit segment column)
-    # + `journal_id TEXT` (DB journal redesign Task 4 replay-identity column).
-    assert_eq "$milestones_cols" "16" "five_hour_milestones column count"
+    # + `journal_id TEXT` (DB journal redesign Task 4 replay-identity column)
+    # + `account_key TEXT NOT NULL DEFAULT 'unattributed'` (#341 multi-account).
+    assert_eq "$milestones_cols" "17" "five_hour_milestones column count"
 
     # Spot-check a few critical columns by name.
     has_window_key=$(sql "$home" "SELECT name FROM pragma_table_info('five_hour_blocks') WHERE name='five_hour_window_key';")
@@ -630,8 +632,10 @@ RESETS_7D=1746118800  # 2025-05-01T17:00:00Z (+1d+5h of default AS_OF=2025-04-30
     models_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_block_models');")
     projects_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('five_hour_block_projects');")
     migrations_cols=$(sql "$home" "SELECT COUNT(*) FROM pragma_table_info('schema_migrations');")
-    assert_eq "$models_cols"     "10" "five_hour_block_models column count"
-    assert_eq "$projects_cols"   "10" "five_hour_block_projects column count"
+    # 11 = 10 base columns + `account_key TEXT NOT NULL DEFAULT 'unattributed'`
+    # (#341 multi-account rollup-child scoping).
+    assert_eq "$models_cols"     "11" "five_hour_block_models column count"
+    assert_eq "$projects_cols"   "11" "five_hour_block_projects column count"
     assert_eq "$migrations_cols" "2"  "schema_migrations column count"
 
     # Spot-check a few critical columns.

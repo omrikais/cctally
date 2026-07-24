@@ -29,7 +29,7 @@ Database
   ✓ Version ahead            none ahead
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       40 pending
+  ⚠ Pending migrations       41 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -52,6 +52,11 @@ Data
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
   ✓ Conversation rollup      no data
+Accounts
+  ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Account registry         no accounts observed yet
+  ✓ Account attribution freshness no attribution activity recorded
+  ✓ Account attribution      usage attribution healthy
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -64,4 +69,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 33 OK · 8 WARN · 3 FAIL
+Summary: 37 OK · 8 WARN · 3 FAIL

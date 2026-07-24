@@ -201,6 +201,7 @@ from _cctally_core import (
     _command_as_of,
     _as_of_or_command,
 )
+import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel default (#341)
 from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
 from _lib_pricing import _calculate_entry_cost
 from _lib_codex_hooks import (
@@ -446,6 +447,26 @@ def _warn_budget_bad_config_once(*args, **kwargs):
     return sys.modules["cctally"]._warn_budget_bad_config_once(*args, **kwargs)
 
 
+_BUDGET_ANCHOR_WARNED = False
+
+
+def _warn_budget_active_anchor_unavailable_once():
+    """One-shot stderr WARN (#341 Step 4-eval, spec §6 `*`-anchor): the Claude
+    vendor-wide subscription-week budget ladder was SKIPPED this tick because the
+    active-account anchor is genuinely unavailable (a torn `~/.claude.json`
+    read). Throttled to once per process so a persistent torn read never spams
+    the hot path; the persistent health signal is the doctor `accounts.identity`
+    WARN leg."""
+    global _BUDGET_ANCHOR_WARNED
+    if _BUDGET_ANCHOR_WARNED:
+        return
+    _BUDGET_ANCHOR_WARNED = True
+    eprint(
+        "warning: skipping vendor-wide Claude budget alert — the active account "
+        "anchor is unavailable (torn ~/.claude.json read); see `cctally doctor`"
+    )
+
+
 def _hook_tick_oauth_refresh(*args, **kwargs):
     """Shim for ``_hook_tick_oauth_refresh``.
 
@@ -538,9 +559,13 @@ _logged_window_key_coerce_failure = False
 def _resolve_active_five_hour_reset_event_id(
     conn: "sqlite3.Connection",
     five_hour_window_key: int,
+    *,
+    account_key: str = _lib_accounts.UNATTRIBUTED,
 ) -> int:
     """Return ``id`` of the most-recent ``five_hour_reset_events`` row for
-    ``five_hour_window_key``, else 0 (pre-credit / no-event sentinel).
+    ``(account_key, five_hour_window_key)``, else 0 (pre-credit / no-event
+    sentinel). ``account_key`` (#341) scopes the active-segment resolution to
+    the account so a shared physical window keeps per-account segments.
 
     Mirrors the weekly active-segment resolution pattern used by
     ``maybe_record_milestone`` for ``percent_milestones.reset_event_id``.
@@ -565,9 +590,9 @@ def _resolve_active_five_hour_reset_event_id(
     try:
         row = conn.execute(
             "SELECT id FROM five_hour_reset_events "
-            "WHERE five_hour_window_key = ? "
+            "WHERE five_hour_window_key = ? AND account_key = ? "
             "ORDER BY id DESC LIMIT 1",
-            (int(five_hour_window_key),),
+            (int(five_hour_window_key), account_key),
         ).fetchone()
     except sqlite3.DatabaseError:
         return 0
@@ -583,9 +608,16 @@ def maybe_record_milestone(
     as_of: "str | None" = None,
     alert_sink: "list | None" = None,
     journal: "tuple | None" = None,
+    account_key: str = _lib_accounts.UNATTRIBUTED,
 ) -> None:
     """Check if a new integer percent threshold was crossed, and if so,
     fetch cost and record the milestone. Errors are logged, not raised.
+
+    ``account_key`` (#341): the account the crossing belongs to. Scopes the
+    per-account milestone ledger (max/marginal reads, INSERT, alerted_at
+    UPDATE) so two accounts crossing the SAME threshold in the SAME week each
+    record independently. Default ``"unattributed"`` is the rev-4.1 defensive
+    backstop; the ingest pipeline hook passes the resolved account explicitly.
 
     Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
     when ``conn`` is passed the crossing folds into the caller's transaction —
@@ -646,16 +678,18 @@ def maybe_record_milestone(
                 """
                 SELECT id FROM week_reset_events
                  WHERE new_week_end_at = ?
+                   AND account_key = ?
                    AND unixepoch(effective_reset_at_utc) <= unixepoch(?)
                  ORDER BY id DESC LIMIT 1
                 """,
-                (week_end_at, captured_at_iso),
+                (week_end_at, account_key, captured_at_iso),
             ).fetchone()
             if seg_row is not None:
                 reset_event_id = int(seg_row["id"])
 
         max_existing = get_max_milestone_for_week(
             conn, week_start_date, reset_event_id=reset_event_id,
+            account_key=account_key,
         )
         if max_existing is not None and current_floor <= max_existing:
             return
@@ -684,6 +718,9 @@ def maybe_record_milestone(
                 conn=(None if own_conn else conn),
                 as_of=as_of,
                 journal=(None if own_conn else journal),
+                # Materialize the cost snapshot under the crossing's account
+                # (#341 P2-1) so the account-scoped read below finds it.
+                account_key=account_key,
             )
         except Exception as exc:
             eprint(f"[milestone] cost sync failed, using latest available: {exc}")
@@ -715,7 +752,13 @@ def maybe_record_milestone(
             cumulative_cost = live_cost
             cost_snapshot_id = 0  # no snapshot row to anchor against
         else:
-            latest_cost = get_latest_cost_for_week(conn, week_ref)
+            # Account-scoped read (#341 P2-1): the cost snapshot was just
+            # materialized under `account_key`, so scope the read to it — the
+            # merged (account-blind) read would return another account's row on
+            # a multi-account install. Byte-stable at single-account (the sole
+            # row is the crossing account's).
+            latest_cost = get_latest_cost_for_week(
+                conn, week_ref, account_key=account_key)
             if latest_cost is None:
                 eprint("[milestone] no cost snapshot yet for this week, skipping")
                 return
@@ -754,6 +797,7 @@ def maybe_record_milestone(
                 prev_cost = get_milestone_cost_for_week(
                     conn, week_start_date, max_existing,
                     reset_event_id=reset_event_id,
+                    account_key=account_key,
                 )
                 marginal = (cumulative_cost - prev_cost) if prev_cost is not None else None
             else:
@@ -773,6 +817,7 @@ def maybe_record_milestone(
                 commit=False,
                 reset_event_id=reset_event_id,
                 as_of=as_of,
+                account_key=account_key,
             )
             # ── Threshold-actions dispatch (set-then-dispatch, spec §3.2) ──
             # Only the genuine-new-crossing winner (rowcount==1) reaches this
@@ -797,9 +842,10 @@ def maybe_record_milestone(
                     conn.execute(
                         "UPDATE percent_milestones SET alerted_at = ? "
                         "WHERE week_start_date = ? AND percent_threshold = ? "
-                        "  AND reset_event_id = ? "
+                        "  AND reset_event_id = ? AND account_key = ? "
                         "  AND alerted_at IS NULL",
-                        (crossed_at, week_start_date, pct, reset_event_id),
+                        (crossed_at, week_start_date, pct, reset_event_id,
+                         account_key),
                     )
                     # Cheap re-read for payload context (cumulative_cost_usd
                     # reflects the value persisted on insert, immune to any
@@ -811,8 +857,8 @@ def maybe_record_milestone(
                     row = conn.execute(
                         "SELECT cumulative_cost_usd FROM percent_milestones "
                         "WHERE week_start_date = ? AND percent_threshold = ? "
-                        "  AND reset_event_id = ?",
-                        (week_start_date, pct, reset_event_id),
+                        "  AND reset_event_id = ? AND account_key = ?",
+                        (week_start_date, pct, reset_event_id, account_key),
                     ).fetchone()
                     if row is not None:
                         cum = float(row["cumulative_cost_usd"])
@@ -824,6 +870,7 @@ def maybe_record_milestone(
                             week_start_date=week_start_date,
                             cumulative_cost_usd=cum,
                             dollars_per_percent=dpp,
+                            account_key=account_key,
                         )
                         pending_alerts.append(payload)
         # Single commit after the loop durably writes every milestone row
@@ -864,6 +911,7 @@ def maybe_record_milestone(
 def _record_budget_milestone_for_vendor(
     *, vendor, target, thresholds, period, config, tz, build_payload,
     raise_errors: bool = False, conn=None, as_of=None, alert_sink=None,
+    account_key: str = "*", window_account_key=None,
 ) -> int:
     """Shared budget-milestone firing core for both vendors (#143).
 
@@ -894,6 +942,7 @@ def _record_budget_milestone_for_vendor(
     ``threshold`` / ``crossed_at_utc`` / ``period_key`` / ``period`` /
     ``budget_usd`` / ``spent_usd`` / ``consumption_pct`` keyword args.
     """
+    import _cctally_cache  # for the fail-closed AccountAttributionUnavailable skip (#341)
     now_utc = _as_of_or_command(as_of)
     pending_alerts: list[dict[str, Any]] = []
     own_conn = conn is None
@@ -902,7 +951,7 @@ def _record_budget_milestone_for_vendor(
     try:
         start_at = _resolve_budget_window(
             conn, vendor=vendor, now_utc=now_utc, period=period,
-            config=config, tz=tz,
+            config=config, tz=tz, window_account_key=window_account_key,
         )
         if start_at is None:
             return 0  # no resolvable window yet (claude subscription-week pre-snapshot)
@@ -911,9 +960,9 @@ def _record_budget_milestone_for_vendor(
         present = {
             int(r[0]) for r in conn.execute(
                 "SELECT threshold FROM budget_milestones "
-                "WHERE vendor = ? AND period_start_at = ? "
+                "WHERE vendor = ? AND account_key = ? AND period_start_at = ? "
                 "  AND (period = ? OR period IS NULL)",
-                (vendor, period_key, period),
+                (vendor, account_key, period_key, period),
             )
         }
         pending = [t for t in sorted(thresholds) if t not in present]
@@ -921,7 +970,8 @@ def _record_budget_milestone_for_vendor(
             return 0  # nothing left this window → skip the cost SUM
 
         spent = _budget_spend_for_vendor(
-            conn, vendor=vendor, start_at=start_at, now_utc=now_utc
+            conn, vendor=vendor, start_at=start_at, now_utc=now_utc,
+            account_key=account_key,
         )
         # Shared INSERT-and-arm core (set-then-dispatch, fire-once via rowcount);
         # commit=False inside, so this conn owns the single durable commit below.
@@ -935,6 +985,7 @@ def _record_budget_milestone_for_vendor(
             spent=spent,
             now_utc=now_utc,
             as_of=as_of,
+            account_key=account_key,
         ):
             pending_alerts.append(build_payload(
                 threshold=t,
@@ -944,12 +995,26 @@ def _record_budget_milestone_for_vendor(
                 budget_usd=tg,
                 spent_usd=sp,
                 consumption_pct=pct,
+                account_key=account_key,
             ))
         # Single commit: every INSERT + its alerted_at marker durable together.
         # On the passed-conn (ingest) path the caller owns the commit + the
         # post-commit dispatch (the ingester's ALERT_DISPATCHER).
         if own_conn:
             conn.commit()
+    except _cctally_cache.AccountAttributionUnavailable as exc:
+        # #341 (Task 4): a per-account ladder whose account-scoped spend read
+        # hit the fail-closed cache guard is SKIPPED this tick — never fired on
+        # wrong/merged data (the mislabel the guard prevents) and, unlike a
+        # generic failure, NEVER re-raised (a transient attribution gap must not
+        # abort the whole ingest cycle). Fires next healthy tick. spec §6
+        # "unresolvable keys ... skipped ... never a crash". `pending_alerts`
+        # is empty at this point (the spend leg precedes any crossing), so no
+        # partial arm leaks. Vendor-wide (`*`) reads pass `account_key=None`
+        # downstream and never trip the guard, so this only guards real ladders.
+        eprint(f"[budget-milestone:{vendor}] account attribution unavailable; "
+               f"skipping the {account_key} ladder this tick ({exc})")
+        return 0
     except Exception as exc:
         # Exception discipline (6c-gate P1): passed-conn (ingest) path re-raises
         # so a failure ABORTS the cycle (invariant ii); this covers both budget
@@ -1010,31 +1075,32 @@ def maybe_record_budget_milestone(
     except _BudgetConfigError as exc:
         _warn_budget_bad_config_once(exc)
         return
-    if not _budget_alerts_active(budget_cfg):
+    thresholds = budget_cfg.get("alert_thresholds")
+    if not thresholds or not budget_cfg.get("alerts_enabled"):
         return
-    thresholds = budget_cfg["alert_thresholds"]
-    if not thresholds:
-        return
+    weekly_usd = budget_cfg.get("weekly_usd")
+    # Per-account budget ladders (#341 Step 4-eval, spec §6): `budget.accounts` is
+    # a {account_key: usd} map (refs normalised to immutable keys at write time).
+    # Each real account fires its OWN ladder over its OWN stamped spend. A Claude
+    # budget can be per-account-ONLY (no vendor-wide `weekly_usd`), so the gate
+    # below no longer requires `weekly_usd`.
+    accounts = budget_cfg.get("accounts") or {}
+    if weekly_usd is None and not accounts:
+        return  # neither a vendor-wide nor a per-account budget → nothing to do
     # Period generalization (spec §6): subscription-week resolves the snapshot-
     # anchored window; a calendar period (calendar-week / calendar-month)
     # resolves the window purely from `now` + the period. config/tz are
     # resolved once for the calendar branch.
     period = budget_cfg.get("period", "subscription-week")
     tz = resolve_display_tz(argparse.Namespace(tz=None), config)
-    _record_budget_milestone_for_vendor(
-        vendor="claude",
-        target=budget_cfg["weekly_usd"],
-        thresholds=thresholds,
-        period=period,
-        config=config,
-        tz=tz,
-        conn=conn,
-        as_of=as_of,
-        alert_sink=alert_sink,
+
+    def _claude_budget_payload(**kw):
         # The Claude payload builder takes the legacy `week_start_at=` kwarg
         # (its value is the resolved period-start instant, == period_key), so
         # the at-fire dispatch id stays byte-stable `budget:<period_start_at>:<t>`.
-        build_payload=lambda **kw: _build_alert_payload_budget(
+        # `account_key` (#341) rides through to the alert's [label] prefix + the
+        # `alerts.log` 8th field; `*` for the vendor-wide ladder.
+        return _build_alert_payload_budget(
             threshold=kw["threshold"],
             crossed_at_utc=kw["crossed_at_utc"],
             week_start_at=kw["period_key"],
@@ -1042,8 +1108,50 @@ def maybe_record_budget_milestone(
             spent_usd=kw["spent_usd"],
             consumption_pct=kw["consumption_pct"],
             period=kw["period"],
-        ),
-    )
+            account_key=kw["account_key"],
+        )
+
+    # Vendor-wide (`*`) ladder — today's semantics (sum across ALL accounts incl.
+    # unattributed, the guaranteed-complete vendor total). Rev-3 `*`-anchor: a
+    # subscription-week vendor budget anchors on the ACTIVE account's week; when
+    # the active identity is genuinely UNAVAILABLE (a TORN `~/.claude.json` read —
+    # NOT a resolved `unattributed` absence) we skip the eval + WARN rather than
+    # guess a wrong anchor (the doctor `accounts.identity` leg surfaces the torn
+    # read persistently). A <=1-real-account install resolves `unattributed`
+    # (stably-absent) and behaves exactly as today (byte-stable).
+    if weekly_usd is not None:
+        skip_vendor_wide = False
+        vendor_window_key = None
+        if period == "subscription-week":
+            ident = _cctally_core._resolve_active_claude_identity()
+            if ident.get("status") == "torn":
+                _warn_budget_active_anchor_unavailable_once()
+                skip_vendor_wide = True
+            else:
+                # #341 (spec §6 rev-4): the vendor-wide (`*`) subscription-week
+                # ladder anchors its PERIOD on the ACTIVE account's week (its
+                # SPEND still sums every account). A <=1-real-account install
+                # resolves `unattributed` → the same window as today (byte-stable).
+                vendor_window_key = ident.get("account_key")
+        if not skip_vendor_wide:
+            _record_budget_milestone_for_vendor(
+                vendor="claude", target=weekly_usd, thresholds=thresholds,
+                period=period, config=config, tz=tz, conn=conn, as_of=as_of,
+                alert_sink=alert_sink, account_key="*",
+                window_account_key=vendor_window_key,
+                build_payload=_claude_budget_payload,
+            )
+
+    # Per-account ladders — one per real account in `budget.accounts`. Each
+    # anchors its period on its OWN account's subscription week (spec §6).
+    for acct_key, acct_usd in accounts.items():
+        _record_budget_milestone_for_vendor(
+            vendor="claude", target=acct_usd, thresholds=thresholds,
+            period=period, config=config, tz=tz, conn=conn, as_of=as_of,
+            alert_sink=alert_sink, account_key=acct_key,
+            window_account_key=acct_key,
+            build_payload=_claude_budget_payload,
+        )
 
 
 def maybe_record_project_budget_milestone(
@@ -1093,7 +1201,20 @@ def maybe_record_project_budget_milestone(
     if own_conn:
         conn = open_db()
     try:
-        window = _resolve_current_budget_window(conn, now_utc)
+        # #341 (spec §6 rev-4): project_budget_milestones is a `*`-scoped
+        # subscription-week writer, so it anchors "the current week" on the
+        # ACTIVE account's week under the same skip+WARN rule as the vendor
+        # budget ladder. TORN identity → skip + one-shot WARN (never guess an
+        # anchor); identified/stably-absent → scope the window to that account
+        # (<=1-real-account resolves `unattributed` = byte-stable).
+        pb_window_key = None
+        ident = _cctally_core._resolve_active_claude_identity()
+        if ident.get("status") == "torn":
+            _warn_budget_active_anchor_unavailable_once()
+            return
+        pb_window_key = ident.get("account_key")
+        window = _resolve_current_budget_window(
+            conn, now_utc, account_key=pb_window_key)
         if window is None:
             return  # no resolvable week window yet
         week_start_at, _week_end_at = window
@@ -1272,20 +1393,22 @@ def maybe_record_codex_budget_milestone(
         return 0
     target = codex_cfg.get("amount_usd")
     thresholds = codex_cfg.get("alert_thresholds") or []
-    if target is None or not thresholds:
+    # Per-account Codex ladders (#341 Step 4-eval, spec §6): `budget.codex.accounts`
+    # is a {account_key: usd} map. A Codex budget can be per-account-ONLY (no
+    # vendor-wide `amount_usd`), so the gate accepts either a vendor-wide amount OR
+    # a non-empty per-account map. Codex is calendar-anchored (no subscription
+    # week -> no `*`-anchor rule).
+    accounts = codex_cfg.get("accounts") or {}
+    if not thresholds or (target is None and not accounts):
         return 0
     tz = resolve_display_tz(argparse.Namespace(tz=None), config)
-    return _record_budget_milestone_for_vendor(
-        vendor="codex",
-        target=target,
-        thresholds=thresholds,
-        period=codex_cfg["period"],
-        config=config,
-        tz=tz,
+
+    def _codex_budget_payload(**kw):
         # The Codex payload builder takes `period_start_at=` directly (== the
         # resolved period-start instant, == period_key), so the at-fire dispatch
         # id stays byte-stable `codex_budget:<period_start_at>:<threshold>`.
-        build_payload=lambda **kw: _build_alert_payload_codex_budget(
+        # `account_key` (#341) rides through to the [label] prefix + log field.
+        return _build_alert_payload_codex_budget(
             threshold=kw["threshold"],
             crossed_at_utc=kw["crossed_at_utc"],
             period_start_at=kw["period_key"],
@@ -1293,12 +1416,27 @@ def maybe_record_codex_budget_milestone(
             budget_usd=kw["budget_usd"],
             spent_usd=kw["spent_usd"],
             consumption_pct=kw["consumption_pct"],
-        ),
-        raise_errors=raise_errors,
-        conn=conn,
-        as_of=as_of,
-        alert_sink=alert_sink,
-    )
+            account_key=kw["account_key"],
+        )
+
+    fired = 0
+    if target is not None:
+        fired += _record_budget_milestone_for_vendor(
+            vendor="codex", target=target, thresholds=thresholds,
+            period=codex_cfg["period"], config=config, tz=tz,
+            build_payload=_codex_budget_payload, account_key="*",
+            raise_errors=raise_errors, conn=conn, as_of=as_of,
+            alert_sink=alert_sink,
+        ) or 0
+    for acct_key, acct_usd in accounts.items():
+        fired += _record_budget_milestone_for_vendor(
+            vendor="codex", target=acct_usd, thresholds=thresholds,
+            period=codex_cfg["period"], config=config, tz=tz,
+            build_payload=_codex_budget_payload, account_key=acct_key,
+            raise_errors=raise_errors, conn=conn, as_of=as_of,
+            alert_sink=alert_sink,
+        ) or 0
+    return fired
 
 
 def _weekly_pct_week_avg_projection(conn, now_utc):
@@ -1510,13 +1648,29 @@ def maybe_record_projected_alert(
                 sorted(set(int(t) for t in budget_cfg["alert_thresholds"]))
             )
             claude_period = budget_cfg.get("period", "subscription-week")
+            # #341 (spec §6 rev-4): the vendor-budget projected metric is a
+            # `*`-scoped subscription-week writer, so it anchors on the ACTIVE
+            # account's week under the same skip+WARN rule. TORN identity → skip
+            # ONLY this leg (the weekly_pct + codex legs still run); identified /
+            # stably-absent → scope the window (byte-stable at <=1 real account).
+            # Calendar periods ignore the key (pure calendar).
+            bu_window_key = None
+            bu_leg_ok = True
+            if claude_period == "subscription-week":
+                _bu_ident = _cctally_core._resolve_active_claude_identity()
+                if _bu_ident.get("status") == "torn":
+                    _warn_budget_active_anchor_unavailable_once()
+                    bu_leg_ok = False
+                else:
+                    bu_window_key = _bu_ident.get("account_key")
             # Resolve the window key CHEAPLY first (SUM-free, same resolver the
             # actual-budget axis uses) so the pre-probe can short-circuit BEFORE
             # _build_vendor_budget_inputs runs any cost SUM / cache sync — the
             # pre-probe-runs-first contract (spec §3.4; mirrors the actual axis).
             window = _resolve_claude_budget_window(
-                conn, now_utc, period=claude_period, config=cfg, tz=config_tz
-            )
+                conn, now_utc, period=claude_period, config=cfg, tz=config_tz,
+                window_account_key=bu_window_key,
+            ) if bu_leg_ok else None
             if window is not None and thresholds:
                 b_ws_at, _b_we_at = window
                 b_week_key = b_ws_at.isoformat(timespec="seconds")
@@ -1530,6 +1684,7 @@ def maybe_record_projected_alert(
                         vendor="claude", period=claude_period, target_usd=target,
                         alert_thresholds=thresholds, now_utc=now_utc, config=cfg,
                         tz=config_tz, skip_sync=True,
+                        window_account_key=bu_window_key,
                     )
                     if inputs is not None:
                         status = compute_budget_status(inputs)
@@ -1758,11 +1913,18 @@ def _compute_block_totals(
 
 def maybe_update_five_hour_block(
     saved: dict[str, Any], *, conn=None, as_of: "str | None" = None,
-    alert_sink: "list | None" = None,
+    alert_sink: "list | None" = None, account_key: str = _lib_accounts.UNATTRIBUTED,
 ) -> None:
     """Upsert the current 5h block in five_hour_blocks; close strictly
     older open blocks; sweep naturally-expired blocks; flag blocks
     spanning a recorded mid-week 7d-reset.
+
+    ``account_key`` (#341): the account the 5h block belongs to. Every
+    block/child/milestone query below is scoped to it (composite
+    ``(account_key, five_hour_window_key)`` identity — spec review finding 3) so
+    two accounts observing the SAME physical 5h window each own their own block
+    and children. Default ``"unattributed"`` is the rev-4.1 defensive backstop;
+    the ingest pipeline hook passes the resolved account explicitly.
 
     Errors are logged and swallowed — record-usage must not regress
     because of this helper, same posture as maybe_record_milestone.
@@ -1810,8 +1972,9 @@ def maybe_update_five_hour_block(
                    block_start_at  AS block_start_at
               FROM five_hour_blocks
              WHERE five_hour_window_key = ?
+               AND account_key = ?
             """,
-            (int(five_hour_window_key),),
+            (int(five_hour_window_key), account_key),
         ).fetchone()
 
         # Whole-table emptiness BEFORE this tick's upsert — the exact trigger of
@@ -1822,7 +1985,8 @@ def maybe_update_five_hour_block(
         # block. Gating on this (not just `resets < now`) keeps a strictly-newer
         # historical block open — the backfill never touched a non-first insert.
         blocks_were_empty = conn.execute(
-            "SELECT COUNT(*) FROM five_hour_blocks"
+            "SELECT COUNT(*) FROM five_hour_blocks WHERE account_key = ?",
+            (account_key,),
         ).fetchone()[0] == 0
 
         if prior is None:
@@ -1903,9 +2067,10 @@ def maybe_update_five_hour_block(
                 UPDATE five_hour_blocks
                    SET is_closed = 1, last_updated_at_utc = ?
                  WHERE is_closed = 0
+                   AND account_key = ?
                    AND five_hour_window_key < ?
                 """,
-                (now_iso, int(five_hour_window_key)),
+                (now_iso, account_key, int(five_hour_window_key)),
             )
 
             # Step 5b: natural-expiration sweep. The close-older predicate
@@ -1920,9 +2085,10 @@ def maybe_update_five_hour_block(
                 UPDATE five_hour_blocks
                    SET is_closed = 1, last_updated_at_utc = ?
                  WHERE is_closed = 0
+                   AND account_key = ?
                    AND five_hour_resets_at < ?
                 """,
-                (now_iso, now_iso),
+                (now_iso, account_key, now_iso),
             )
 
             # Step 7: atomic upsert. Single statement collapses the
@@ -1956,10 +2122,11 @@ def maybe_update_five_hour_block(
                   total_cost_usd,
                   is_closed,
                   created_at_utc,
-                  last_updated_at_utc
+                  last_updated_at_utc,
+                  account_key
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(five_hour_window_key) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                ON CONFLICT(account_key, five_hour_window_key) DO UPDATE SET
                   last_observed_at_utc       = excluded.last_observed_at_utc,
                   final_five_hour_percent    = excluded.final_five_hour_percent,
                   seven_day_pct_at_block_end = excluded.seven_day_pct_at_block_end,
@@ -1986,16 +2153,19 @@ def maybe_update_five_hour_block(
                     totals["cost_usd"],
                     now_iso,
                     now_iso,
+                    account_key,
                 ),
             )
 
             # ── Resolve current block_id once for reuse by the per-(block, model)
             # / per-(block, project) child writes below AND the existing milestone
             # detection (which previously did its own SELECT — drop that SELECT in
-            # favor of this variable).
+            # favor of this variable). Composite (account_key, five_hour_window_key)
+            # so a shared physical window resolves THIS account's block (#341).
             block_id_row = conn.execute(
-                "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
-                (int(five_hour_window_key),),
+                "SELECT id FROM five_hour_blocks "
+                "WHERE five_hour_window_key = ? AND account_key = ?",
+                (int(five_hour_window_key), account_key),
             ).fetchone()
             block_id = int(block_id_row["id"])
 
@@ -2010,9 +2180,9 @@ def maybe_update_five_hour_block(
             if blocks_were_empty:
                 conn.execute(
                     "UPDATE five_hour_blocks SET is_closed = 1, last_updated_at_utc = ? "
-                    "WHERE five_hour_window_key = ? AND is_closed = 0 "
-                    "  AND five_hour_resets_at < ?",
-                    (now_iso, int(five_hour_window_key), now_iso),
+                    "WHERE five_hour_window_key = ? AND account_key = ? "
+                    "  AND is_closed = 0 AND five_hour_resets_at < ?",
+                    (now_iso, int(five_hour_window_key), account_key, now_iso),
                 )
 
             # ── Replace-all per-tick: per-(block, model) and per-(block, project_path)
@@ -2021,8 +2191,9 @@ def maybe_update_five_hour_block(
             # Same transaction as the parent upsert; if these raise, the whole tick
             # rolls back and the next tick recomputes from scratch.
             conn.execute(
-                "DELETE FROM five_hour_block_models WHERE five_hour_window_key = ?",
-                (int(five_hour_window_key),),
+                "DELETE FROM five_hour_block_models "
+                "WHERE five_hour_window_key = ? AND account_key = ?",
+                (int(five_hour_window_key), account_key),
             )
             if totals.get("by_model"):
                 conn.executemany(
@@ -2031,9 +2202,9 @@ def maybe_update_five_hour_block(
                       block_id, five_hour_window_key, model,
                       input_tokens, output_tokens,
                       cache_create_tokens, cache_read_tokens,
-                      cost_usd, entry_count
+                      cost_usd, entry_count, account_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -2046,14 +2217,16 @@ def maybe_update_five_hour_block(
                             b["cache_read_tokens"],
                             b["cost_usd"],
                             b["entry_count"],
+                            account_key,
                         )
                         for model, b in totals["by_model"].items()
                     ],
                 )
 
             conn.execute(
-                "DELETE FROM five_hour_block_projects WHERE five_hour_window_key = ?",
-                (int(five_hour_window_key),),
+                "DELETE FROM five_hour_block_projects "
+                "WHERE five_hour_window_key = ? AND account_key = ?",
+                (int(five_hour_window_key), account_key),
             )
             if totals.get("by_project"):
                 conn.executemany(
@@ -2062,9 +2235,9 @@ def maybe_update_five_hour_block(
                       block_id, five_hour_window_key, project_path,
                       input_tokens, output_tokens,
                       cache_create_tokens, cache_read_tokens,
-                      cost_usd, entry_count
+                      cost_usd, entry_count, account_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -2077,6 +2250,7 @@ def maybe_update_five_hour_block(
                             b["cache_read_tokens"],
                             b["cost_usd"],
                             b["entry_count"],
+                            account_key,
                         )
                         for project_path, b in totals["by_project"].items()
                     ],
@@ -2094,7 +2268,7 @@ def maybe_update_five_hour_block(
             # the active segment is the latest five_hour_reset_events row
             # for this window_key, else sentinel 0 (pre-credit).
             active_reset_event_id = _resolve_active_five_hour_reset_event_id(
-                conn, int(five_hour_window_key)
+                conn, int(five_hour_window_key), account_key=account_key
             )
 
             if current_floor >= 1:
@@ -2110,8 +2284,9 @@ def maybe_update_five_hour_block(
                 # maybe_record_milestone's max_existing path.
                 row = conn.execute(
                     "SELECT MAX(percent_threshold) AS m FROM five_hour_milestones "
-                    "WHERE five_hour_window_key = ? AND reset_event_id = ?",
-                    (int(five_hour_window_key), active_reset_event_id),
+                    "WHERE five_hour_window_key = ? AND reset_event_id = ? "
+                    "  AND account_key = ?",
+                    (int(five_hour_window_key), active_reset_event_id, account_key),
                 ).fetchone()
                 max_existing = row["m"] if row and row["m"] is not None else None
 
@@ -2141,9 +2316,10 @@ def maybe_update_five_hour_block(
                             "SELECT block_cost_usd FROM five_hour_milestones "
                             "WHERE five_hour_window_key = ? "
                             "  AND percent_threshold = ? "
-                            "  AND reset_event_id = ?",
+                            "  AND reset_event_id = ? "
+                            "  AND account_key = ?",
                             (int(five_hour_window_key), int(max_existing),
-                             active_reset_event_id),
+                             active_reset_event_id, account_key),
                         ).fetchone()
                         if prev_row is not None:
                             prior_cost = float(prev_row["block_cost_usd"])
@@ -2174,9 +2350,10 @@ def maybe_update_five_hour_block(
                               block_cost_usd,
                               marginal_cost_usd,
                               seven_day_pct_at_crossing,
-                              reset_event_id
+                              reset_event_id,
+                              account_key
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 block_id,
@@ -2192,6 +2369,7 @@ def maybe_update_five_hour_block(
                                 marginal,
                                 weekly_percent,
                                 active_reset_event_id,
+                                account_key,
                             ),
                         )
                         # ── Threshold-actions dispatch (set-then-dispatch, spec §3.2) ──
@@ -2230,9 +2408,10 @@ def maybe_update_five_hour_block(
                                 "WHERE five_hour_window_key = ? "
                                 "  AND percent_threshold = ? "
                                 "  AND reset_event_id = ? "
+                                "  AND account_key = ? "
                                 "  AND alerted_at IS NULL",
                                 (crossed_at, int(five_hour_window_key),
-                                 int(pct), active_reset_event_id),
+                                 int(pct), active_reset_event_id, account_key),
                             )
                             # Cheap re-reads inside BEGIN are SELECT-only and
                             # safe; values reflect post-INSERT state. We
@@ -2248,17 +2427,19 @@ def maybe_update_five_hour_block(
                                 "SELECT block_cost_usd FROM five_hour_milestones "
                                 "WHERE five_hour_window_key = ? "
                                 "  AND percent_threshold = ? "
-                                "  AND reset_event_id = ?",
+                                "  AND reset_event_id = ? "
+                                "  AND account_key = ?",
                                 (int(five_hour_window_key), int(pct),
-                                 active_reset_event_id),
+                                 active_reset_event_id, account_key),
                             ).fetchone()
                             block_row = conn.execute(
                                 "SELECT block_start_at FROM five_hour_blocks "
-                                "WHERE five_hour_window_key = ?",
-                                (int(five_hour_window_key),),
+                                "WHERE five_hour_window_key = ? AND account_key = ?",
+                                (int(five_hour_window_key), account_key),
                             ).fetchone()
                             primary_model = _resolve_primary_model_for_block(
-                                conn, int(five_hour_window_key)
+                                conn, int(five_hour_window_key),
+                                account_key=account_key,
                             )
                             payload = _build_alert_payload_five_hour(
                                 threshold=int(pct),
@@ -2273,6 +2454,7 @@ def maybe_update_five_hour_block(
                                     else 0.0
                                 ),
                                 primary_model=primary_model,
+                                account_key=account_key,
                             )
                             pending_alerts.append(payload)
 
@@ -2320,16 +2502,19 @@ def maybe_update_five_hour_block(
                 UPDATE five_hour_blocks
                    SET crossed_seven_day_reset = 1
                  WHERE crossed_seven_day_reset = 0
+                   AND account_key = ?
                    AND (
                      EXISTS (
                        SELECT 1 FROM week_reset_events e
-                        WHERE unixepoch(e.effective_reset_at_utc)
+                        WHERE e.account_key = five_hour_blocks.account_key
+                          AND unixepoch(e.effective_reset_at_utc)
                               BETWEEN unixepoch(five_hour_blocks.block_start_at)
                                   AND unixepoch(five_hour_blocks.last_observed_at_utc)
                      )
                      OR EXISTS (
                        SELECT 1 FROM weekly_usage_snapshots ws
                         WHERE ws.week_start_at IS NOT NULL
+                          AND ws.account_key = five_hour_blocks.account_key
                           AND unixepoch(ws.week_start_at)
                               >  unixepoch(five_hour_blocks.block_start_at)
                           AND unixepoch(ws.week_start_at)
@@ -2337,6 +2522,7 @@ def maybe_update_five_hour_block(
                      )
                    )
                 """,
+                (account_key,),
             )
 
             if own_conn:
@@ -2458,10 +2644,14 @@ def _read_reset_zero_marker():
 
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
                           *, observed_pre_credit_pct, effective_dt,
-                          as_of=None, commit=True, ctx=None):
+                          as_of=None, commit=True, ctx=None,
+                          account_key=_lib_accounts.UNATTRIBUTED):
     """Emit/refresh the in-place weekly-credit artifacts (issue #19 + #128).
     Shared by the immediate >=25pp path and the debounced reset-to-zero
     confirmation path.
+
+    ``account_key`` (#341): stamps the ``week_reset_events`` row and scopes the
+    stale-replica capture/DELETE to the account.
 
     Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
     ``commit=False`` folds the event-row INSERT + stale-replica DELETE into the
@@ -2494,8 +2684,9 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
     # ticks. UNIQUE(old, new) also dedups, but the pre-check avoids a useless
     # write attempt and keeps logs clean.
     already = conn.execute(
-        "SELECT 1 FROM week_reset_events WHERE new_week_end_at = ? LIMIT 1",
-        (cur_end_canon,),
+        "SELECT 1 FROM week_reset_events "
+        "WHERE new_week_end_at = ? AND account_key = ? LIMIT 1",
+        (cur_end_canon, account_key),
     ).fetchone()
     if already is None:
         # Row shape: old=effective_iso, new=cur_end_canon (DISTINCT) so only
@@ -2505,10 +2696,10 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         ins_wr = conn.execute(
             "INSERT OR IGNORE INTO week_reset_events "
             "(detected_at_utc, old_week_end_at, new_week_end_at, "
-            " effective_reset_at_utc, observed_pre_credit_pct) "
-            "VALUES (?, ?, ?, ?, ?)",
+            " effective_reset_at_utc, observed_pre_credit_pct, account_key) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (as_of or now_utc_iso(), effective_iso, cur_end_canon,
-             effective_iso, float(observed_pre_credit_pct)),
+             effective_iso, float(observed_pre_credit_pct), account_key),
         )
         # Design B (§5.3 event+effects): on the ingest path, capture the doomed
         # stale-replica snapshots' journal_ids BEFORE the pivot-2 DELETE (SAME
@@ -2519,12 +2710,16 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
         if ctx is not None and ins_wr.rowcount == 1:
             doomed = conn.execute(
                 "SELECT journal_id FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? "
+                "WHERE week_start_date = ? AND account_key = ? "
                 "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
                 "  AND ABS(weekly_percent - ?) < 1.0",
-                (week_start_date, effective_iso, float(observed_pre_credit_pct)),
+                (week_start_date, account_key, effective_iso,
+                 float(observed_pre_credit_pct)),
             ).fetchall()
-            ctx.suppression_map[(effective_iso, cur_end_canon)] = [
+            # #341: the wr harvest id_parts now lead with account_key, so the
+            # suppression_map key (which _build_harvest_evt derives from id_parts)
+            # must match: (account_key, old_week_end_at, new_week_end_at).
+            ctx.suppression_map[(account_key, effective_iso, cur_end_canon)] = [
                 r[0] for r in doomed
             ]
         if commit:
@@ -2546,10 +2741,11 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
     try:
         conn.execute(
             "DELETE FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? "
+            "WHERE week_start_date = ? AND account_key = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "  AND ABS(weekly_percent - ?) < 1.0",
-            (week_start_date, effective_iso, float(observed_pre_credit_pct)),
+            (week_start_date, account_key, effective_iso,
+             float(observed_pre_credit_pct)),
         )
         if commit:
             conn.commit()
@@ -2560,10 +2756,16 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
 def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             weekly_percent, five_hour_window_key,
                             five_hour_percent, as_of=None, commit=True,
-                            ctx=None):
+                            ctx=None, account_key=_lib_accounts.UNATTRIBUTED):
     """Detect + record weekly and 5h reset/credit artifacts for one usage
     observation (extracted from ``cmd_record_usage``; DB journal redesign
     §5.2.3).
+
+    ``account_key`` (#341): the account the observation belongs to. Every
+    reset/credit row written here (``week_reset_events``,
+    ``five_hour_reset_events``, ``weekly_credit_floors``, synthetic snapshots)
+    is stamped with it so the reset-aware clamp legs stay account-scoped.
+    Default ``"unattributed"`` is the rev-4.1 defensive backstop.
 
     Runs the mid-week ``week_reset_events`` detection, the reset-to-zero
     debounce + >=25pp in-place-credit fire, and the parallel 5h in-place-
@@ -2644,9 +2846,10 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     conn.execute(
                         "INSERT OR IGNORE INTO week_reset_events "
                         "(detected_at_utc, old_week_end_at, new_week_end_at, "
-                        " effective_reset_at_utc) VALUES (?, ?, ?, ?)",
+                        " effective_reset_at_utc, account_key) "
+                        "VALUES (?, ?, ?, ?, ?)",
                         ((as_of or now_utc_iso()), prior_end_canon, cur_end_canon,
-                         effective_iso),
+                         effective_iso, account_key),
                     )
                     # (inline commit removed — the function commits once at the
                     # end on the legacy path; the ingest cycle owns the commit.)
@@ -2692,6 +2895,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             observed_pre_credit_pct=float(prior_pct),
                             effective_dt=_floor_to_hour(now_utc),
                             as_of=as_of, commit=commit, ctx=ctx,
+                            account_key=account_key,
                         )
                     elif decision == CONFIRM_RESET:
                         # Second reading stayed low → confirm. Anchor the
@@ -2706,6 +2910,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             observed_pre_credit_pct=marker[2],
                             effective_dt=_floor_to_hour(first_zero_dt),
                             as_of=as_of, commit=commit, ctx=ctx,
+                            account_key=account_key,
                         )
                         # Clear ONLY after the fire completes (P2a): a
                         # mid-fire crash leaves the marker armed so the next
@@ -2811,8 +3016,9 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             "SELECT prior_percent, post_percent "
                             "  FROM five_hour_reset_events "
                             " WHERE five_hour_window_key = ? "
+                            "   AND account_key = ? "
                             " ORDER BY id DESC LIMIT 1",
-                            (int(five_hour_window_key),),
+                            (int(five_hour_window_key), account_key),
                         ).fetchone()
                         is_dup = (
                             most_recent is not None
@@ -2846,14 +3052,15 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                                 "INSERT OR IGNORE INTO five_hour_reset_events "
                                 "(detected_at_utc, five_hour_window_key, "
                                 " prior_percent, post_percent, "
-                                " effective_reset_at_utc) "
-                                "VALUES (?, ?, ?, ?, ?)",
+                                " effective_reset_at_utc, account_key) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
                                 (
                                     (as_of or now_utc_iso()),
                                     int(five_hour_window_key),
                                     prior_5h_pct,
                                     float(five_hour_percent),
                                     effective_iso,
+                                    account_key,
                                 ),
                             )
                             # Design B (§5.3 event+effects): on the ingest path,
@@ -2873,18 +3080,23 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                                     "SELECT journal_id "
                                     "FROM weekly_usage_snapshots "
                                     " WHERE five_hour_window_key = ? "
+                                    "   AND account_key = ? "
                                     "   AND unixepoch(captured_at_utc) "
                                     "       >= unixepoch(?) "
                                     "   AND ABS(five_hour_percent - ?) "
                                     "       < 1.0",
                                     (
                                         int(five_hour_window_key),
+                                        account_key,
                                         effective_iso,
                                         prior_5h_pct,
                                     ),
                                 ).fetchall()
+                                # #341: fhc harvest id_parts lead with
+                                # account_key -> match the suppression_map key.
                                 ctx.suppression_map[
-                                    (int(five_hour_window_key), effective_iso)
+                                    (account_key, int(five_hour_window_key),
+                                     effective_iso)
                                 ] = [r[0] for r in doomed]
                             # (inline commit removed — one end-of-function commit
                             # on legacy; the ingest cycle owns the commit.)
@@ -2960,12 +3172,14 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             conn.execute(
                                 "DELETE FROM weekly_usage_snapshots "
                                 " WHERE five_hour_window_key = ? "
+                                "   AND account_key = ? "
                                 "   AND unixepoch(captured_at_utc) "
                                 "       >= unixepoch(?) "
                                 "   AND ABS(five_hour_percent - ?) "
                                 "       < 1.0",
                                 (
                                     int(five_hour_window_key),
+                                    account_key,
                                     effective_iso,
                                     prior_5h_pct,
                                 ),
@@ -2999,35 +3213,48 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
         conn.commit()
 
 
-def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at):
+def _resolve_reset_aware_hwm(conn, week_start_date, week_start_at, week_end_at,
+                             *, account_key):
     """The floored MAX(weekly_percent) the statusline _hwm_clamp computes:
     MAX over snapshots captured at/after the latest in-week clamp floor. The
     floor is the latest effective across BOTH `week_reset_events` and
     `weekly_credit_floors` (`_reset_aware_floor`) so a manual partial credit
     (record-credit M2, #209) lowers the resolved HWM without re-anchoring the
     week — used both as the `--from` default and as the assertion source of
-    truth in the record-credit tests."""
-    floor_iso = _reset_aware_floor(conn, week_start_date, week_start_at, week_end_at)
+    truth in the record-credit tests.
+
+    ``account_key`` (#341): MANDATORY account context (no silent global
+    fallback). A real key scopes the HWM to one account; ``None`` is the
+    explicit merged read (byte-identical to today on a single-account install)."""
+    floor_iso = _reset_aware_floor(conn, week_start_date, week_start_at,
+                                   week_end_at, account_key=account_key)
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_param: tuple = () if account_key is None else (account_key,)
     if floor_iso is not None:
         row = conn.execute(
             "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
-            " WHERE week_start_date = ? AND unixepoch(captured_at_utc) >= unixepoch(?)",
-            (week_start_date, floor_iso),
+            f" WHERE week_start_date = ?{acct_pred} "
+            "   AND unixepoch(captured_at_utc) >= unixepoch(?)",
+            (week_start_date, *acct_param, floor_iso),
         ).fetchone()
     else:
         row = conn.execute(
             "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots "
-            " WHERE week_start_date = ?",
-            (week_start_date,),
+            f" WHERE week_start_date = ?{acct_pred}",
+            (week_start_date, *acct_param),
         ).fetchone()
     return None if not row or row[0] is None else float(row[0])
 
 
 def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None),
-                            commit=True, journal=None):
+                            commit=True, journal=None,
+                            account_key=_lib_accounts.UNATTRIBUTED):
     """Insert the post-credit synthetic snapshot at plan.to_pct, tagged
     source='record-credit'. The SOLE synthetic-snapshot writer on BOTH paths
     (legacy inline + ingest), so the non-vacuity stub stays load-bearing.
+
+    ``account_key`` (#341) stamps the synthetic row so it joins the same
+    account's clamp/HWM ledger.
 
     ``commit=False`` (DB journal redesign §5.2.3) folds the synthetic-snapshot
     INSERT into the caller's transaction instead of committing inline; the
@@ -3065,6 +3292,7 @@ def _insert_credit_snapshot(conn, plan, *, five_hour=(None, None, None),
         "five_hour_percent": fhp,
         "five_hour_resets_at": fhr,
         "five_hour_window_key": fhk,
+        "account_key": account_key,
     }
     if journal is not None:
         ctx, evt_id = journal
@@ -3105,11 +3333,15 @@ def _resolve_prior_5h(conn, at_dt):
 
 
 def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
-                  commit=True, ctx=None, id_base=None, forced=False):
+                  commit=True, ctx=None, id_base=None, forced=False,
+                  account_key=_lib_accounts.UNATTRIBUTED):
     """Apply the M2 same-window partial-credit artifacts (record-credit, #209,
     spec §4). Unlike the >=25pp auto-credit path (`_fire_in_place_credit`), this
     writes NO `week_reset_events` row — the window-resolution code never sees a
     credit, so the week is NOT re-anchored. It only lowers the clamp floor.
+
+    ``account_key`` (#341): stamps the ``weekly_credit_floors`` row + the
+    synthetic snapshot and scopes the stale-replay DELETE to the account.
 
     Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
     ``commit=False`` folds the floor INSERT + stale-replay DELETE + synthetic
@@ -3175,9 +3407,11 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
     if ctx is None:
         conn.execute(
             "INSERT OR IGNORE INTO weekly_credit_floors "
-            "(week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc) "
-            "VALUES (?, ?, ?, ?)",
-            (plan.week_start_date, effective_iso, pre_credit, as_of or now_utc_iso()),
+            "(week_start_date, effective_at_utc, observed_pre_credit_pct, "
+            " applied_at_utc, account_key) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (plan.week_start_date, effective_iso, pre_credit,
+             as_of or now_utc_iso(), account_key),
         )
         if commit:
             conn.commit()
@@ -3201,10 +3435,10 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
         try:
             conn.execute(
                 "DELETE FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? "
+                "WHERE week_start_date = ? AND account_key = ? "
                 "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
                 "  AND ABS(weekly_percent - ?) < 1.0",
-                (plan.week_start_date, effective_iso, pre_credit),
+                (plan.week_start_date, account_key, effective_iso, pre_credit),
             )
             if commit:
                 conn.commit()
@@ -3212,7 +3446,8 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             eprint(f"[record-credit] post-credit cleanup failed: {exc}")
 
         # 4d. INSERT the synthetic post-credit snapshot at plan.to_pct.
-        c._insert_credit_snapshot(conn, plan, five_hour=five_hour, commit=commit)
+        c._insert_credit_snapshot(conn, plan, five_hour=five_hour, commit=commit,
+                                  account_key=account_key)
     else:
         # ── Ingest path (Design B, §5.3 event+effects) ─────────────────────
         # Journal the destructive effects + synthetic instead of running them
@@ -3235,12 +3470,13 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
         # (`id_base` is a content digest `o:<hex>`, no LIKE metacharacters.)
         doomed = conn.execute(
             "SELECT journal_id FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? "
+            "WHERE week_start_date = ? AND account_key = ? "
             "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
             "  AND ABS(weekly_percent - ?) < 1.0 "
             "  AND journal_id IS NOT NULL "
             "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
-            (plan.week_start_date, effective_iso, pre_credit, id_base),
+            (plan.week_start_date, account_key, effective_iso, pre_credit,
+             id_base),
         ).fetchall()
         supp = [r[0] for r in doomed]
         floor_supp: list = []
@@ -3267,17 +3503,18 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
             # content digest `o:<hex>`, no LIKE metacharacters.)
             old_syn = conn.execute(
                 "SELECT journal_id FROM weekly_usage_snapshots "
-                "WHERE week_start_date = ? AND source = 'record-credit' "
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND source = 'record-credit' "
                 "  AND journal_id IS NOT NULL "
                 "  AND journal_id NOT LIKE 'sa:' || ? || ':syn:%'",
-                (plan.week_start_date, id_base),
+                (plan.week_start_date, account_key, id_base),
             ).fetchall()
             supp.extend(r[0] for r in old_syn if r[0] not in supp)
             old_floors = conn.execute(
                 "SELECT journal_id FROM weekly_credit_floors "
-                "WHERE week_start_date = ? AND journal_id IS NOT NULL "
-                "  AND journal_id != ?",
-                (plan.week_start_date, id_base),
+                "WHERE week_start_date = ? AND account_key = ? "
+                "  AND journal_id IS NOT NULL AND journal_id != ?",
+                (plan.week_start_date, account_key, id_base),
             ).fetchall()
             floor_supp = [r[0] for r in old_floors]
         # wce evt (effects-only, table=None): snapshot suppression list + floor
@@ -3307,7 +3544,7 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
         # load-bearing (stubbing it disables the synthetic on the ingest path too).
         c._insert_credit_snapshot(
             conn, plan, five_hour=five_hour, commit=False,
-            journal=(ctx, f"sa:{id_base}:syn:0"))
+            journal=(ctx, f"sa:{id_base}:syn:0"), account_key=account_key)
 
     # 4e. Clear a stale same-week reset-zero marker so the next record-usage
     # tick can't confirm a phantom reset-to-zero off it.
@@ -3426,7 +3663,7 @@ def _revalidate_credit_plan(conn, args, *, now, at_dt, expected_plan):
         elif existing is not None and existing[2] is not None:
             from_pct, from_source = float(existing[2]), "prior_credit"
         else:
-            from_pct = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+            from_pct = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at, account_key=None)
             if from_pct is None:
                 return None
             from_source = "hwm"
@@ -3514,7 +3751,7 @@ def cmd_record_credit(args) -> int:
             # is 'prior_credit' (spec §5).
             from_pct, from_source = float(existing[2]), "prior_credit"
         else:
-            hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+            hwm = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at, account_key=None)
             if hwm is None:
                 eprint("record-credit: no usage history for the week; pass --from")
                 return 2
@@ -3562,7 +3799,7 @@ def cmd_record_credit(args) -> int:
         is_dry = getattr(args, "dry_run", False)
         is_yes = getattr(args, "yes", False)
         stale_replays = _count_stale_replays(conn, plan)
-        hwm_before = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at)
+        hwm_before = _resolve_reset_aware_hwm(conn, week_start_date, ws_at, we_at, account_key=None)
         if hwm_before is None:
             hwm_before = plan.from_pct
 
@@ -3638,7 +3875,8 @@ def cmd_record_credit(args) -> int:
             plan, existing, is_completion = revalidated
             stale_replays = _count_stale_replays(conn, plan)
             hwm_before = _resolve_reset_aware_hwm(
-                conn, plan.week_start_date, plan.week_start_at, plan.week_end_at
+                conn, plan.week_start_date, plan.week_start_at, plan.week_end_at,
+                account_key=None
             )
             if hwm_before is None:
                 hwm_before = plan.from_pct
@@ -3670,6 +3908,22 @@ def cmd_record_credit(args) -> int:
             effective_utc = parse_iso_datetime(
                 plan.effective_iso, "op.effective"
             ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+            # Active-account gate (#341 P2-1, spec §3): record-credit is
+            # active-account-only. Resolve the active Claude account and stamp
+            # the credit op so the floor lands under the SAME account post-Step-9
+            # usage carries — else the account-scoped `_reset_aware_floor` clamp
+            # would never see a real credit floor. A TORN read (transient
+            # mid-write ~/.claude.json) means the active identity is genuinely
+            # unavailable -> exit 2 (retry). A stably-absent read (no
+            # ~/.claude.json / api-key mode) is a RESOLVED `unattributed` outcome
+            # (single-account / legacy install), NOT unavailable -> proceed
+            # byte-identically to pre-#341.
+            identity = _cctally_core._resolve_active_claude_identity()
+            if identity.get("status") == "torn":
+                eprint("record-credit: active Claude account is unavailable "
+                       "(torn read of ~/.claude.json); retry once it settles")
+                return 2
+            credit_account_key = identity["account_key"]
             import _cctally_journal as _jr
             import _lib_journal as _lj
             op = _lj.make_op(
@@ -3684,6 +3938,9 @@ def cmd_record_credit(args) -> int:
                     "plan": dict(vars(plan)),
                     "five_hour": list(five_hour),
                     "forced": forced,
+                    # Two-shaped stamp (#341): evt/op carry account_key in the
+                    # payload; the op fold + `_apply_credit` both read it.
+                    "account_key": credit_account_key,
                 },
             )
             # Close the command's read connection BEFORE the ingester (the sole
@@ -3857,12 +4114,61 @@ def cmd_record_usage(
 
     import _cctally_journal as _jr
     import _lib_journal as _lj
+    import _lib_accounts
+    # Observe-and-stamp (#341, spec §1): resolve the active Claude account from
+    # ~/.claude.json (stable-read, mtime-cached) and stamp the usage obs with it.
+    # Byte-safe: a real account is stamped explicitly; the reserved sentinel
+    # (no ~/.claude.json / api-key / torn) OMITS the field, so a single-account /
+    # legacy install's journal obs stays byte-identical to today (the pipeline's
+    # `rec.get("account") or UNATTRIBUTED` fallback treats both the same).
+    obs_at = now_utc_iso(now_dt)
+    identity = _cctally_core._resolve_active_claude_identity()
+    account_key = identity["account_key"]
+    obs_account = None if account_key == _lib_accounts.UNATTRIBUTED else account_key
+    if obs_account is not None:
+        # Journal the account_observe DURABLY BEFORE the account-stamped usage obs
+        # (spec §1: replay can never see a stamped row whose account was never
+        # observed). First-sight/identity-change only — marker-deduped so it is
+        # not appended every tick.
+        _maybe_append_account_observe(identity, at=obs_at)
     _jr.append_record(_lj.make_obs(
-        at=now_utc_iso(now_dt), src=writer, provider="claude", payload=raw))
+        at=obs_at, src=writer, provider="claude", payload=raw,
+        account=obs_account))
     # authoritative observes its own write synchronously; opportunistic skips a
     # busy ingest lock and lets the current holder consume the appended line.
     _jr.run_stats_ingest(mode=ingest_mode)
     return 0
+
+
+_OBSERVED_ACCOUNT_MARKER = "observed-claude-account"
+
+
+def _maybe_append_account_observe(identity: dict, *, at: str) -> None:
+    """Append an ``account_observe`` op on first sight of a Claude account or an
+    identity change (#341, spec §1) — NOT every tick. Deduped by a marker file in
+    APP_DIR so a hot status-line loop journals at most one observe per account.
+    Best-effort: a marker/journal hiccup never breaks record-usage."""
+    import _lib_accounts
+    account_key = identity.get("account_key")
+    if not account_key or account_key == _lib_accounts.UNATTRIBUTED:
+        return
+    marker = _cctally_core.APP_DIR / _OBSERVED_ACCOUNT_MARKER
+    try:
+        last = marker.read_text().strip()
+    except OSError:
+        last = None
+    if last == account_key:
+        return
+    try:
+        import _cctally_journal as _jr
+        import _lib_journal as _lj
+        _jr.append_record(_lj.make_account_observe(
+            at=at, account_key=account_key, provider="claude",
+            natural_id=identity.get("natural_id"), email=identity.get("email"),
+            plan_type=identity.get("plan_type"), label_source="auto"))
+        marker.write_text(account_key + "\n")
+    except OSError:
+        pass
 
 
 def _hook_tick_log_line(line: str) -> None:
@@ -4227,7 +4533,13 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
                 contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
             cache = c.open_cache_db()
             try:
-                stats = c.sync_codex_cache(cache, lock_timeout=0)
+                cache_mod = c._load_sibling("_cctally_cache")
+                stats, cache = cache_mod._run_cache_operation_with_recovery(
+                    cache,
+                    lambda active_conn: c.sync_codex_cache(
+                        active_conn, lock_timeout=0
+                    ),
+                )
             finally:
                 cache.close()
             if stats.lock_contended:
@@ -4400,7 +4712,13 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         try:
             cache_conn = open_cache_db()
             try:
-                stats = sync_cache(cache_conn)
+                cache_mod = _cctally()._load_sibling("_cctally_cache")
+                stats, cache_conn = (
+                    cache_mod._run_cache_operation_with_recovery(
+                        cache_conn,
+                        lambda active_conn: sync_cache(active_conn),
+                    )
+                )
                 ingested = int(stats.rows_changed)
                 parse_malformed = int(stats.lines_malformed)
                 parse_skipped = int(stats.assistant_lines_skipped)
@@ -4610,6 +4928,7 @@ _USAGE_SNAPSHOT_COLUMNS = (
     "captured_at_utc", "week_start_date", "week_end_date", "week_start_at",
     "week_end_at", "weekly_percent", "page_url", "source", "payload_json",
     "five_hour_percent", "five_hour_resets_at", "five_hour_window_key",
+    "account_key",
 )
 
 
@@ -4685,6 +5004,10 @@ def _usage_snapshot_columns(conn, payload, week_start_name):
         "five_hour_percent": five_hour_percent,
         "five_hour_resets_at": five_hour_resets_at,
         "five_hour_window_key": five_hour_window_key,
+        # Account dimension (#341): carried from the payload when present (the
+        # snapshot_accept emit path threads the resolved account through here);
+        # defaults to the reserved sentinel for the bare test-only insert path.
+        "account_key": payload.get("account_key") or "unattributed",
     }
 
     saved = {
@@ -4727,9 +5050,10 @@ def insert_usage_snapshot(payload: dict[str, Any], week_start_name: str) -> dict
               payload_json,
               five_hour_percent,
               five_hour_resets_at,
-              five_hour_window_key
+              five_hour_window_key,
+              account_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             tuple(cols[k] for k in _USAGE_SNAPSHOT_COLUMNS),
         )
@@ -4970,6 +5294,12 @@ def _pipeline_claude_usage(ctx, rec):
     weekly_percent = float(payload["weekly_percent"])
     resets_at = int(payload["resets_at"])
     source = payload.get("source", "statusline")
+    # Account dimension (#341): the obs carries the account stamp (record-usage /
+    # statusline resolve it once per read, Step 9). Absent (pre-multi-account /
+    # legacy obs) -> the reserved sentinel, which keeps every scoped query
+    # byte-identical on a single-account install.
+    import _lib_accounts
+    account_key = rec.get("account") or _lib_accounts.UNATTRIBUTED
 
     # Week boundaries from resets_at (cmd_record_usage canonicalization).
     week_end_at_dt = dt.datetime.fromtimestamp(resets_at, tz=dt.timezone.utc)
@@ -5004,6 +5334,7 @@ def _pipeline_claude_usage(ctx, rec):
         as_of=as_of,
         commit=False,
         ctx=ctx,
+        account_key=account_key,
     )
 
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the
@@ -5016,6 +5347,7 @@ def _pipeline_claude_usage(ctx, rec):
         "weekly_percent": weekly_percent,
         "five_hour_percent": five_hour_percent,
         "five_hour_window_key": five_hour_window_key,
+        "account_key": account_key,
     })
     five_hour_percent = adjusted_5h
 
@@ -5046,6 +5378,9 @@ def _pipeline_claude_usage(ctx, rec):
 
         week_start_name = get_week_start_name(ctx.config or {}, None)
         cols, saved = _usage_snapshot_columns(conn, out_payload, week_start_name)
+        # Stamp the account onto the snapshot_accept evt columns so the journaled
+        # row (and every replay/rebuild fold of it) carries the account (#341).
+        cols["account_key"] = account_key
         rowid = jr.emit_model_a(
             ctx,
             kind="snapshot_accept",
@@ -5058,8 +5393,9 @@ def _pipeline_claude_usage(ctx, rec):
     else:
         latest = conn.execute(
             "SELECT * FROM weekly_usage_snapshots WHERE week_start_date = ? "
+            "  AND account_key = ? "
             "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            (week_start_date,),
+            (week_start_date, account_key),
         ).fetchone()
         if latest is None:
             return  # nothing recorded yet -> nothing to derive against
@@ -5073,9 +5409,10 @@ def _pipeline_claude_usage(ctx, rec):
     #    crosses a $ threshold still derives it.
     c.maybe_record_milestone(
         saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
-        journal=(ctx, rec["id"]))
+        journal=(ctx, rec["id"]), account_key=account_key)
     c.maybe_update_five_hour_block(
-        saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts)
+        saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
+        account_key=account_key)
     # The dollar-decoupled axes resolve a CURRENT budget/period WINDOW from
     # "now" and must see the record's DETECTION clock (`as_of` = rec["at"] =
     # `_command_as_of()`), NOT the wall-clock capture stamp: legacy
@@ -5107,7 +5444,8 @@ def _pipeline_claude_usage(ctx, rec):
         if latest_wk is None or int(latest_wk) != int(five_hour_window_key):
             if conn.execute(
                 "SELECT 1 FROM five_hour_blocks WHERE five_hour_window_key = ? "
-                "LIMIT 1", (int(five_hour_window_key),),
+                "  AND account_key = ? LIMIT 1",
+                (int(five_hour_window_key), account_key),
             ).fetchone() is None:
                 c.maybe_update_five_hour_block(
                     {
@@ -5118,7 +5456,8 @@ def _pipeline_claude_usage(ctx, rec):
                         "fiveHourResetsAt": five_hour_resets_at_str,
                         "fiveHourWindowKey": int(five_hour_window_key),
                     },
-                    conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts)
+                    conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
+                    account_key=account_key)
 
     # 5. hwm-7d / hwm-5h projection files — ACCEPT path only (the monotonic
     #    writer; a dedup tick's percent is already <= the stored HWM). In-place
@@ -5156,10 +5495,15 @@ def _pipeline_record_credit(ctx, rec):
     c = _cctally()
     plan = argparse.Namespace(**plan_data)
     five_hour = tuple(payload.get("five_hour") or (None, None, None))
+    # Two-shaped stamp (#341): the record-credit op carries account_key in its
+    # payload (Step 9 / Task 3 resolves the active account before appending it);
+    # default to the sentinel for a legacy op written pre-#341.
+    import _lib_accounts
     c._apply_credit(
         ctx.conn, plan, five_hour=five_hour, as_of=rec["at"],
         commit=False, ctx=ctx, id_base=rec["id"],
-        forced=bool(payload.get("forced")))
+        forced=bool(payload.get("forced")),
+        account_key=(payload.get("account_key") or _lib_accounts.UNATTRIBUTED))
 
 
 def _pipeline_sync_week(ctx, rec):
@@ -5184,8 +5528,14 @@ def _pipeline_sync_week(ctx, rec):
         json=False,
         quiet=True,
     )
+    # Two-shaped stamp (#341 P2-1): the sync_week op carries the active account
+    # in its payload; the fold stamps the cost snapshot under it (rebuild-
+    # deterministic). Absent -> the sentinel (single-account / legacy op).
+    import _lib_accounts
     c.cmd_sync_week(args, conn=ctx.conn, as_of=rec["at"],
-                    journal=(ctx, rec["id"]))
+                    journal=(ctx, rec["id"]),
+                    account_key=(payload.get("account_key")
+                                 or _lib_accounts.UNATTRIBUTED))
 
 
 def _register_ingest_pipeline_hooks():

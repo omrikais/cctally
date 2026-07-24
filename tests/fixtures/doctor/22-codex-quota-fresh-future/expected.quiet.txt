@@ -8,16 +8,17 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       41 pending
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data
   ⚠ Codex quota              2 window(s); future
       → Run `cctally cache-sync --source codex` after Codex activity.
+Accounts
 Pricing
 Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 39 OK · 5 WARN · 0 FAIL
+Summary: 43 OK · 5 WARN · 0 FAIL

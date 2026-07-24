@@ -97,6 +97,7 @@ def test_http_budget_valid_round_trip(monkeypatch, tmp_path):
             "period": "subscription-week",
             "projects": {},
             "project_alerts_enabled": False,
+            "accounts": {},
             "codex": None,
         }
         cfg = json.loads(ns["CONFIG_PATH"].read_text())

@@ -116,10 +116,20 @@ def _resolve_forecast_now(as_of: str | None) -> dt.datetime:
     return _command_as_of()
 
 
-def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime):
+def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime,
+                                  *, account_key: "str | None" = None):
     """Return (week_start_at, week_end_at, list[(captured_at, percent, five_hr)])
     for the subscription week containing `now_utc`, or None if no snapshot
     exists for the current week.
+
+    ``account_key`` (#341, spec §6 rev-4 `*`-anchor): scopes the snapshot window
+    to ONE account's `weekly_usage_snapshots` rows so a `*`-scoped
+    subscription-week writer (vendor budget ladder / vendor-budget projected
+    metric / project_budget) resolves "the current week" as the ACTIVE account's
+    week rather than an account-blind latest. ``None`` (every non-account caller —
+    forecast / weekly / TUI / the budget display) is the merged read, byte-
+    identical to today; a <=1-real-account install's rows all default to
+    `unattributed`, so scoping to `unattributed` returns the same window.
 
     Selection: the snapshot whose [week_start_at, week_end_at) contains
     now_utc; ties (none expected) broken by max(captured_at_utc).
@@ -137,11 +147,17 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     is deterministic (no leak of future snapshots into samples[-1] / p_now /
     snapshot_count / latest_snapshot_at).
     """
+    # #341: optional account scoping — same predicate on every leg so the whole
+    # window resolution stays consistent (a real key or the `unattributed`
+    # sentinel both match `account_key = ?`; `None` omits the predicate = merged).
+    _acct_pred = "" if account_key is None else " AND account_key = ?"
+    _acct_p: tuple = () if account_key is None else (account_key,)
     candidates = conn.execute(
         "SELECT week_start_at, week_end_at, week_start_date, MAX(captured_at_utc) AS latest_cap "
         "FROM weekly_usage_snapshots "
-        "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
-        "GROUP BY week_start_at, week_end_at, week_start_date"
+        "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL" + _acct_pred +
+        " GROUP BY week_start_at, week_end_at, week_start_date",
+        _acct_p,
     ).fetchall()
     chosen = None
     chosen_cap = None
@@ -165,10 +181,10 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         drow = conn.execute(
             "SELECT week_start_date, week_end_date "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_date <= ? AND week_end_date >= ? "
-            "GROUP BY week_start_date, week_end_date "
+            "WHERE week_start_date <= ? AND week_end_date >= ?" + _acct_pred +
+            " GROUP BY week_start_date, week_end_date "
             "ORDER BY MAX(captured_at_utc) DESC LIMIT 1",
-            (today_local_str, today_local_str),
+            (today_local_str, today_local_str) + _acct_p,
         ).fetchone()
         if drow is None:
             return None
@@ -181,9 +197,9 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         rows = conn.execute(
             "SELECT captured_at_utc, weekly_percent, five_hour_percent "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? "
-            "ORDER BY captured_at_utc ASC",
-            (drow[0],),
+            "WHERE week_start_date = ?" + _acct_pred +
+            " ORDER BY captured_at_utc ASC",
+            (drow[0],) + _acct_p,
         ).fetchall()
         samples = [
             (parse_iso_datetime(r[0], "captured_at_utc"), float(r[1]),
@@ -212,10 +228,10 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     rows = conn.execute(
         f"SELECT captured_at_utc, weekly_percent, five_hour_percent "
         f"FROM weekly_usage_snapshots "
-        f"WHERE week_start_at IN ({placeholders}) "
-        f"   OR (week_start_at IS NULL AND week_start_date = ?) "
+        f"WHERE (week_start_at IN ({placeholders}) "
+        f"       OR (week_start_at IS NULL AND week_start_date = ?)){_acct_pred} "
         f"ORDER BY captured_at_utc ASC",
-        tuple(matching_texts) + (chosen_date,),
+        tuple(matching_texts) + (chosen_date,) + _acct_p,
     ).fetchall()
     samples = [
         (parse_iso_datetime(r[0], "captured_at_utc"), float(r[1]),
@@ -264,10 +280,14 @@ def _apply_midweek_reset_override(
     return week_start_at, samples
 
 
-def _resolve_current_budget_window(conn, now_utc):
+def _resolve_current_budget_window(conn, now_utc, *, account_key=None):
     """Return ``(effective_week_start_dt, week_end_dt)`` for the subscription
     week containing ``now_utc``, honoring a mid-week reset re-anchor; or
     ``None`` if no snapshot exists yet.
+
+    ``account_key`` (#341, spec §6 `*`-anchor): scopes the window to one
+    account's snapshots (passed through to ``_fetch_current_week_snapshots``).
+    ``None`` = merged / byte-identical.
 
     Reuses the SAME reset-aware resolution forecast/weekly use
     (``_fetch_current_week_snapshots`` + ``_apply_midweek_reset_override``)
@@ -278,7 +298,7 @@ def _resolve_current_budget_window(conn, now_utc):
     the window, so the worst case is ``spent_usd = 0`` (spec §6), not a
     no-window outcome.
     """
-    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    fetched = _fetch_current_week_snapshots(conn, now_utc, account_key=account_key)
     if fetched is None:
         return None
     week_start_at, week_end_at, samples = fetched
@@ -347,12 +367,18 @@ def _select_dollars_per_percent(
     *,
     skip_sync: bool = False,
     use_weekref_cost_cache: bool = False,
+    account_key: "str | None" = None,
 ) -> tuple[float, str]:
     """Return (dollars_per_percent, source_label). See spec §1 selection rule.
 
     Eligible prior week: week_end_at < now_utc AND final_weekly_percent >= 1.
     Uses the existing `_sum_cost_for_range` helper (which opens the cache DB
     via `get_entries`); `conn` is only used for snapshot queries.
+
+    ``account_key`` (#341, spec §3): ``None`` = the account-blind merged read
+    (byte-identical to today); a real key / ``unattributed`` scopes both the
+    current-week ``spent_usd``/``p_now`` inputs (already scoped by the caller) and
+    the trailing-4wk-median prior-week snapshot + cost reads to that account.
     """
     c = _cctally()
     # Path 1: current week, stable sample.
@@ -365,13 +391,15 @@ def _select_dollars_per_percent(
     # needs 4 eligible; 12 leaves margin so flooring a credited week below 1%
     # can't starve it, while keeping this hot path (live forecast view +
     # dashboard refresh) from materializing all history.
+    _acct_pred = "" if account_key is None else " AND account_key = ?"
+    _acct_p: tuple = () if account_key is None else (account_key,)
     cand = conn.execute(
         "SELECT DISTINCT week_start_at, week_end_at, week_start_date "
         "FROM weekly_usage_snapshots "
         "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
-        "  AND datetime(week_start_at) < datetime(?) "
-        "ORDER BY datetime(week_start_at) DESC LIMIT 12",
-        (current_week_start.isoformat(),),
+        "  AND datetime(week_start_at) < datetime(?)" + _acct_pred +
+        " ORDER BY datetime(week_start_at) DESC LIMIT 12",
+        (current_week_start.isoformat(),) + _acct_p,
     ).fetchall()
     we_by_ws: dict[dt.datetime, dt.datetime] = {}
     rows_in: list = []
@@ -382,8 +410,8 @@ def _select_dollars_per_percent(
             "SELECT week_start_date, week_start_at, week_end_at, "
             "       captured_at_utc, weekly_percent "
             "FROM weekly_usage_snapshots "
-            "WHERE week_start_at IN (" + placeholders + ")",
-            ws_iso_list,
+            "WHERE week_start_at IN (" + placeholders + ")" + _acct_pred,
+            ws_iso_list + list(_acct_p),
         ).fetchall()
         for wsd, ws_iso, we_iso, cap_iso, pct in snap:
             if pct is None:
@@ -395,7 +423,8 @@ def _select_dollars_per_percent(
                 continue
             we_by_ws.setdefault(ws, we)  # first-wins; all rows share one instant
             rows_in.append((ws, wsd, ws_iso, we_iso, cap_iso, pct))
-    floored = c._floored_week_max(conn, rows_in)  # {ws_instant -> floored max}
+    floored = c._floored_week_max(
+        conn, rows_in, account_key=account_key)  # {ws_instant -> floored max}
     eligible: list[tuple[dt.datetime, dt.datetime, float]] = [
         (ws, we_by_ws[ws], floored[ws])
         for ws in floored
@@ -422,12 +451,14 @@ def _select_dollars_per_percent(
                 week_cost = _sc.cached_weekref_cost(
                     week_start_at=ws, week_end_at=we, now_utc=now_utc,
                     compute=lambda ws=ws, we=we: c._sum_cost_for_range(
-                        ws, we, mode="auto", skip_sync=True
+                        ws, we, mode="auto", skip_sync=True,
+                        account_key=account_key,
                     ),
                 )
             else:
                 week_cost = c._sum_cost_for_range(
-                    ws, we, mode="auto", skip_sync=skip_sync
+                    ws, we, mode="auto", skip_sync=skip_sync,
+                    account_key=account_key,
                 )
             values.append(week_cost / final_pct)
         return statistics.median(values), "trailing_4wk_median"
@@ -476,14 +507,20 @@ def _load_forecast_inputs(
     *,
     skip_sync: bool = False,
     use_weekref_cost_cache: bool = False,
+    account_key: "str | None" = None,
 ) -> ForecastInputs | None:
     """Gather everything from the DB. Returns None if no current-week snapshot.
 
     When `skip_sync=True`, all JSONL-backed cost lookups skip the ingest pass
     and serve whatever is already in the cache (honors `forecast --no-sync`).
+
+    ``account_key`` (#341, spec §3): ``None`` = the account-blind merged read
+    (today's byte-identical behavior); a real key / ``unattributed`` scopes the
+    current-week snapshot window, the live spend, and the $/1% derivation to that
+    account (``forecast --account``).
     """
     c = _cctally()
-    fetched = _fetch_current_week_snapshots(conn, now_utc)
+    fetched = _fetch_current_week_snapshots(conn, now_utc, account_key=account_key)
     if fetched is None:
         return None
     week_start_at, week_end_at, samples = fetched
@@ -512,7 +549,8 @@ def _load_forecast_inputs(
     # Live compute current-week spend via the existing helper (opens cache.db
     # internally); mirrors `weekly`'s pattern of not trusting weekly_cost_snapshots.
     spent_usd = c._sum_cost_for_range(
-        week_start_at, now_utc, mode="auto", skip_sync=skip_sync
+        week_start_at, now_utc, mode="auto", skip_sync=skip_sync,
+        account_key=account_key,
     )
     p_24h_ago, t_24h = _pick_p_24h_ago(samples, now_utc)
 
@@ -522,6 +560,7 @@ def _load_forecast_inputs(
     dpp, dpp_source = _select_dollars_per_percent(
         conn, now_utc, week_start_at, p_now, spent_usd, skip_sync=True,
         use_weekref_cost_cache=use_weekref_cost_cache,
+        account_key=account_key,
     )
     confidence, reasons = _assess_forecast_confidence(elapsed_hours, p_now, len(samples))
     target_24h = now_utc - dt.timedelta(hours=24)
@@ -637,11 +676,14 @@ def _build_forecast_json_payload(out: ForecastOutput) -> dict:
     return payload
 
 
-def _emit_forecast_json(out: ForecastOutput) -> str:
+def _emit_forecast_json(out: ForecastOutput, *, extra: "dict | None" = None) -> str:
     # Stamp at the CLI boundary ONLY — never in _build_forecast_json_payload,
     # which also feeds the dashboard `explain` subtree (spec gate F3).
+    payload = _build_forecast_json_payload(out)
+    if extra:  # #341 R8 decoration (accountKey/accountLabel; empty unless --account)
+        payload.update(extra)
     return json.dumps(
-        _cctally().stamp_schema_version(_build_forecast_json_payload(out)),
+        _cctally().stamp_schema_version(payload),
         indent=2)
 
 
@@ -911,6 +953,13 @@ def _render_forecast_terminal(out: "ForecastOutput", args, color: bool) -> str:
 def cmd_report(args: argparse.Namespace) -> int:
     c = _cctally()
     c._share_validate_args(args)
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable, since reset-affected
+    # weeks live-compute cost from session_entries). None = merged / byte-stable.
+    acct_key, acct_exit = c.resolve_account_filter(args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+    _acct_fields = c.account_json_fields(acct_key)  # #341 R8 (empty unless --account)
     if args.sync_current:
         sync_ns = argparse.Namespace(
             week_start=None,
@@ -931,13 +980,12 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     conn = open_db()
     try:
+        _rep_acct_pred = "" if acct_key is None else " WHERE account_key = ?"
+        _rep_acct_p = () if acct_key is None else (acct_key,)
         latest_usage = conn.execute(
-            """
-            SELECT *
-            FROM weekly_usage_snapshots
-            ORDER BY captured_at_utc DESC, id DESC
-            LIMIT 1
-            """
+            "SELECT * FROM weekly_usage_snapshots" + _rep_acct_pred +
+            " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            _rep_acct_p,
         ).fetchone()
         if latest_usage is not None:
             date_str = latest_usage["week_start_date"]
@@ -974,7 +1022,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         if _adjusted_current:
             current_ref = _adjusted_current[0]
 
-        weeks = c.get_recent_weeks(conn, max(1, args.weeks))
+        weeks = c.get_recent_weeks(conn, max(1, args.weeks), account_key=acct_key)
         if not weeks:
             # Format-aware empty path mirrors cmd_forecast:18578-18629 — a
             # fresh install requesting `report --format html` should emit a
@@ -1011,7 +1059,9 @@ def cmd_report(args: argparse.Namespace) -> int:
                 c._share_render_and_emit(snap, args)
                 return 0
             if args.json:
-                payload = c.stamp_schema_version({"current": None, "trend": []})
+                _empty = {"current": None, "trend": []}
+                _empty.update(_acct_fields)  # #341 R8 decoration
+                payload = c.stamp_schema_version(_empty)
                 sink = getattr(args, "_source_result_sink", None)
                 if sink is not None:
                     sink(payload)
@@ -1033,7 +1083,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         # cmd_report's JSON contract is newest-first to mirror
         # get_recent_weeks's order — we reverse below.
         view = c.build_trend_view(conn, now_utc=_command_as_of(), n=args.weeks,
-                                 display_tz=tz)
+                                 display_tz=tz, account_key=acct_key)
         # Serialize TuiTrendRow → today's camelCase keys. Order:
         # newest-first (matches the prior cmd_report behavior).
         # Map week_start_date → original WeekRef ISO strings so the
@@ -1153,7 +1203,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         }
 
         if args.detail:
-            milestone_rows = c.get_milestones_for_week(conn, current_ref.week_start.isoformat())
+            milestone_rows = c.get_milestones_for_week(
+                conn, current_ref.week_start.isoformat(), account_key=acct_key)
             output["milestones"] = [
                 {
                     "percentThreshold": int(m["percent_threshold"]),
@@ -1209,6 +1260,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             return 0
 
         if args.json:
+            output.update(_acct_fields)  # #341 R8 decoration
             payload = c.stamp_schema_version(output)
             sink = getattr(args, "_source_result_sink", None)
             if sink is not None:
@@ -1302,7 +1354,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         )
 
         if args.detail:
-            milestone_rows = c.get_milestones_for_week(conn, current_ref.week_start.isoformat())
+            milestone_rows = c.get_milestones_for_week(
+                conn, current_ref.week_start.isoformat(), account_key=acct_key)
             if milestone_rows:
                 print()
                 print("Percent breakdown (current week):\n")
@@ -1344,6 +1397,14 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         # cctally-native usage error → exit 2 (docs/cli-contract.md; #279 S6 W2).
         return 2
 
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable, since current-week spend
+    # comes from session_entries). None = merged / byte-stable.
+    acct_key, acct_exit = c.resolve_account_filter(args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+    _acct_fields = c.account_json_fields(acct_key)  # #341 R8 (empty unless --account)
+
     now_utc = _resolve_forecast_now(args.as_of)
     conn = open_db()
     # Cache sync is gated inside get_entries(..., skip_sync=args.no_sync); no
@@ -1358,6 +1419,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     view = c.build_forecast_view(
         conn, now_utc=now_utc, targets=tuple(targets),
         skip_sync=args.no_sync, display_tz=args._resolved_tz,
+        account_key=acct_key,
     )
     inputs = view.output.inputs if view.output is not None else None
     if inputs is None:
@@ -1415,10 +1477,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             c._share_render_and_emit(snap, args)
             return 0
         if args.json:
-            print(json.dumps(c.stamp_schema_version({
+            _nodata = {
                 "error": "no_current_week_data",
                 "meta": {"generated_at": _iso_z(now_utc), "tool_version": TOOL_VERSION},
-            }), indent=2))
+            }
+            _nodata.update(_acct_fields)  # #341 R8 decoration
+            print(json.dumps(c.stamp_schema_version(_nodata), indent=2))
         elif args.status_line:
             pass  # silent segment
         else:
@@ -1442,7 +1506,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         # fires when `--format` is requested, so the cost is bounded.
         # `_apply_midweek_reset_override` is replayed so the chart axis
         # matches the (possibly-shifted) week_start_at carried by `inputs`.
-        fetched = _fetch_current_week_snapshots(conn, now_utc)
+        fetched = _fetch_current_week_snapshots(conn, now_utc, account_key=acct_key)
         actual_series: list[tuple[str, float, float]] = []
         if fetched is not None:
             _ws_at, _we_at, raw_samples = fetched
@@ -1516,7 +1580,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         return 0
 
     if args.json:
-        print(_emit_forecast_json(output))
+        print(_emit_forecast_json(output, extra=_acct_fields))
         return 0
     if args.status_line:
         # --status-line is invoked via $(cmd 2>/dev/null) by design — stdout is
@@ -1700,7 +1764,7 @@ def _civil_period_label(period, start_utc, end_utc, tz):
 
 def _build_vendor_budget_inputs(
     *, vendor, period, target_usd, alert_thresholds, now_utc, config, tz,
-    skip_sync=False,
+    skip_sync=False, window_account_key=None,
 ):
     """Resolve the window + live spend for one (vendor, period) budget and
     return a :class:`BudgetInputs` (or ``None`` only for the Claude /
@@ -1730,7 +1794,12 @@ def _build_vendor_budget_inputs(
     if vendor == "claude" and period == "subscription-week":
         conn = open_db()
         try:
-            window = _resolve_current_budget_window(conn, now_utc)
+            # #341 `*`-anchor: the projected vendor-budget metric passes the
+            # active account so its window matches the actual-budget ladder;
+            # `None` (the budget DISPLAY + every other caller) = merged /
+            # byte-identical.
+            window = _resolve_current_budget_window(
+                conn, now_utc, account_key=window_account_key)
         finally:
             conn.close()
         if window is None:

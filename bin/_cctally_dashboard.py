@@ -1090,16 +1090,23 @@ def _build_claude_source_detail(
 
 
 def build_source_detail(*, snapshot, source: str, resource: str,
-                        key: str, window_weeks: int = 4) -> dict[str, Any]:
+                        key: str, window_weeks: int = 4,
+                        account: "str | None" = None) -> dict[str, Any]:
     """Resolve one qualified opaque key to a provider-native read-only detail.
 
     The frozen published bundle is the first bounded key index.  Claude then
     invokes the existing detail builders with cache-only reads; Codex returns
     the native S1-S3 adapter detail without a Claude fallback or a rollout
     parse.  Every branch preserves the generic handler errors above it.
+
+    ``account`` (#341 Task 4): the modal-captured account qualifier. When set,
+    ``source_detail_lookup`` verifies row ownership before returning, so an
+    account-focused modal can never surface another account's row.
     """
     try:
-        row = source_detail_lookup(snapshot.source_bundle, source, resource, key)
+        row = source_detail_lookup(
+            snapshot.source_bundle, source, resource, key, account=account,
+        )
     except SourceResourceNotFound:
         # A Claude project drill can expose a recent session outside the
         # dashboard panel's bounded published slice.  The provider adapter
@@ -2131,7 +2138,8 @@ def _dashboard_build_weekly_periods(conn: "sqlite3.Connection",
     """
     range_end = now_utc
     range_start = now_utc - dt.timedelta(days=7 * (n + 1))
-    weeks = _compute_subscription_weeks(conn, range_start, range_end)
+    weeks = _compute_subscription_weeks(conn, range_start, range_end,
+                                        account_key=None)  # #341: merged read
     if not weeks:
         return []
     fetch_start = min(
@@ -6062,11 +6070,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             "resource": resource,
             "key": key,
         }
+        query = _urlparse.parse_qs(
+            _urlparse.urlsplit(self.path).query,
+            keep_blank_values=True,
+        )
+        # #341 Task 4 (spec §4 finding 10): the account qualifier the modal
+        # captured at open. When present, the detail lookup verifies row
+        # ownership so an account-focused modal never surfaces another account's
+        # row. Absent = today's account-agnostic behavior. Validate the shape (a
+        # 32-hex account_key or a reserved sentinel) before it reaches the reader.
+        raw_account = query.get("account")
+        if raw_account is not None:
+            if (
+                len(raw_account) != 1
+                or not re.fullmatch(r"[0-9a-f]{32}|unattributed|\*", raw_account[0])
+            ):
+                self._respond_json(400, {
+                    "code": "source_capability_unavailable",
+                    "error": "source capability unavailable",
+                })
+                return
+            detail_kwargs["account"] = raw_account[0]
         if resource == "project":
-            query = _urlparse.parse_qs(
-                _urlparse.urlsplit(self.path).query,
-                keep_blank_values=True,
-            )
             raw_weeks = query.get("weeks")
             if raw_weeks is not None:
                 if len(raw_weeks) != 1 or raw_weeks[0] not in {"1", "4", "8", "12"}:

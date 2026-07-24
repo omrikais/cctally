@@ -30,6 +30,8 @@ export const HELP_ROWS: ReadonlyArray<{ keys: string[]; desc: string }> = [
   { keys: ['r'], desc: 'force refresh' },
   // #294 S5 — the global source selector cycle.
   { keys: ['v'], desc: 'cycle source (Claude / Codex / All)' },
+  // #341 Task 4 — cycle the focused account (only on a multi-account source).
+  { keys: ['a'], desc: 'cycle account (multi-account sources)' },
   { keys: ['s'], desc: 'open Settings' },
   { keys: ['d'], desc: 'open Doctor' },
   { keys: ['S'], desc: 'share the focused panel (focus a panel first)' },

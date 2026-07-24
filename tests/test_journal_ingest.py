@@ -336,10 +336,13 @@ def test_harvest_crash_convergence_percent_milestone(tmp_path, monkeypatch):
         ).fetchone()
     finally:
         conn.close()
-    assert wr["journal_id"] == "wr:%s:%s" % (_OLD_END, _NEW_END)
+    # #341: harvest evt ids now lead with account_key (the unstamped obs defaults
+    # to the reserved sentinel) — the id stays a bijection with the extended
+    # UNIQUE key.
+    assert wr["journal_id"] == "wr:unattributed:%s:%s" % (_OLD_END, _NEW_END)
     # pm's reset FK resolves to the wr rowid; its id embeds the wr LOGICAL id.
     assert pm["reset_event_id"] == wr["id"]
-    assert pm["journal_id"] == "pm:2026-07-19:%s:57" % wr["journal_id"]
+    assert pm["journal_id"] == "pm:unattributed:2026-07-19:%s:57" % wr["journal_id"]
 
 
 # --------------------------------------------------------------------------
@@ -630,7 +633,7 @@ def test_block_close_harvest_fold_roundtrip(tmp_path, monkeypatch):
         evt = jr._build_harvest_evt(
             jr.IngestContext(conn=conn, batch=[]), spec, row
         )
-        assert evt["id"] == "fhbc:%s" % WK
+        assert evt["id"] == "fhbc:unattributed:%s" % WK
         assert len(evt["payload"]["_models"]) == 1
         assert len(evt["payload"]["_projects"]) == 1
 
@@ -649,7 +652,7 @@ def test_block_close_harvest_fold_roundtrip(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM five_hour_block_projects").fetchone()[0] == 1
         assert conn.execute(
             "SELECT journal_id FROM five_hour_blocks"
-        ).fetchone()[0] == "fhbc:%s" % WK
+        ).fetchone()[0] == "fhbc:unattributed:%s" % WK
     finally:
         conn.close()
 

@@ -6,9 +6,9 @@ Covers the Codex-side reroute onto the 6a ingest machinery:
     observation (the durable truth for the evaporating rollout JSONL), keeping
     the direct cache.db write byte-identical.
   * Item 2 — the ``QUOTA_APPLIER`` cache leg materializes those obs into cache.db
-    ``quota_window_snapshots`` under a NON-BLOCKING ``cache.db.codex.lock``, and
-    PREFIX-STOPS on a busy flock so the scalar cursor never advances past an
-    unmaterialized obs.
+    ``quota_window_snapshots`` under the NON-BLOCKING global cache writer lock
+    followed by ``cache.db.codex.lock``, and PREFIX-STOPS on either busy flock
+    so the scalar cursor never advances past an unmaterialized obs.
   * Item 3 — ``reconcile_codex_quota_projection`` runs its stats writes through
     the single-flight ingest cycle (covered end-to-end by the existing
     ``test_codex_quota_projection`` suite; this file adds the journaling seam).
@@ -204,6 +204,35 @@ def test_quota_applier_prefix_stops_on_busy_codex_flock(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_quota_applier_prefix_stops_on_busy_global_writer_flock(
+    tmp_path, monkeypatch
+):
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    core = importlib.import_module("_cctally_core")
+
+    quota_obs = _codex_quota_obs(
+        jl, source_root_key="root-a", source_path="/codex/root-a/r.jsonl",
+        line_offset=10, captured_at_utc=_iso(10))
+    decoded = [(quota_obs, "seg", 100)]
+
+    held = os.open(str(core.CACHE_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        assert jr._quota_applier(decoded) == 0
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots "
+            "WHERE source='codex'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 # ==========================================================================
 # Item 1 — sync_codex_cache appends a Codex quota obs per observation
 # ==========================================================================
@@ -256,6 +285,7 @@ def test_quota_obs_replay_has_stable_identity(tmp_path, monkeypatch):
         "codex", "root-a", "/codex/root-a/r.jsonl", 10, _iso(10),
         "primary", "limit-primary", "native-primary", "Primary", 300,
         42.0, RESET, "pro", None, None, "gpt-5.3-codex",
+        None,  # #341 trailing account_key (unattributed -> obs omits `account`)
     )
 
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T12:00:00Z")
@@ -292,6 +322,7 @@ def test_quota_obs_upgrade_dedupes_legacy_command_time_identity(
         "codex", "root-a", "/codex/root-a/r.jsonl", 10, _iso(10),
         "primary", "limit-primary", "native-primary", "Primary", 300,
         42.0, RESET, "pro", None, None, "gpt-5.3-codex",
+        None,  # #341 trailing account_key (unattributed -> obs omits `account`)
     )
 
     # v1.80.1 used the later sync command clock as `at`, so the same retained

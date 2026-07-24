@@ -75,6 +75,17 @@ def _pin_paths(core, tmp_path, monkeypatch, cache_path):
     (projects / "session1.jsonl").write_text("{}\n")
     monkeypatch.setattr(core, "APP_DIR", tmp_path)
     monkeypatch.setattr(core, "CACHE_DB_PATH", cache_path)
+    monkeypatch.setattr(core, "CACHE_LOCK_PATH", pathlib.Path(f"{cache_path}.lock"))
+    monkeypatch.setattr(
+        core,
+        "CACHE_LOCK_CODEX_PATH",
+        pathlib.Path(f"{cache_path}.codex.lock"),
+    )
+    monkeypatch.setattr(
+        core,
+        "CACHE_LOCK_MAINTENANCE_PATH",
+        pathlib.Path(f"{cache_path}.maintenance.lock"),
+    )
     monkeypatch.setattr(core, "CLAUDE_PROJECTS_DIR", projects)
 
 

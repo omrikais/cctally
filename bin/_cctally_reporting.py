@@ -45,19 +45,23 @@ def _cctally():
 # === moved verbatim from bin/cctally (Regions R1–R2) ===
 
 
-def _emit_daily_view_table_or_json(view, args):
+def _emit_daily_view_table_or_json(view, args, *, extra=None):
     """Order + emit a DailyView as the flat daily table or {daily} JSON.
 
     Shared by cmd_daily's default path and its -p-only (filter, no grouping)
     path so the two cannot drift. Body is exactly the default path's order +
     emit tail; callers keep their own --format share gate upstream of this.
+
+    ``extra`` (#341 R8): JSON decoration merged into the emitted payload under an
+    explicit ``--account`` invocation; ``None``/empty keeps the render byte-stable.
     """
     c = _cctally()
     days = list(reversed(view.aggregated))
     if args.order == "desc":
         days = list(reversed(days))
     if args.json:
-        print(c._bucket_to_json(days, list_key="daily", date_key="date"))
+        print(c._bucket_to_json(days, list_key="daily", date_key="date",
+                                extra=extra))
         return
     print(c._render_bucket_table(
         days,
@@ -91,6 +95,15 @@ def cmd_daily(args: argparse.Namespace) -> int:
         return range
     range_start, range_end = range
 
+    # #341 --account: resolve the render filter (provider=claude; the stamped-
+    # entry family fails closed with exit 3 when the entry cache is unavailable,
+    # since the direct-JSONL fallback carries no identity). None = merged
+    # (byte-identical). Threaded into every entry read below.
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
     # ── Project-axis path (issue #86 Session E / T1.11) ────────────────────
     # Gated by -i/--instances or -p/--project; the default path below is
     # untouched/byte-stable. Mirrors cmd_project's I/O-layer git-root
@@ -99,7 +112,8 @@ def cmd_daily(args: argparse.Namespace) -> int:
     project_patterns = [p.lower() for p in (getattr(args, "project", None) or [])]
 
     if getattr(args, "instances", False) or project_patterns:
-        joined = list(c.get_claude_session_entries(range_start, range_end))
+        joined = list(c.get_claude_session_entries(
+            range_start, range_end, account_key=acct_key))
         resolver_cache: dict = {}
         keyed: list = []              # [(ProjectKey, UsageEntry)] — for -i grouping
         filtered_uentries: list = []  # UsageEntry — for -p-only / --format / debug
@@ -176,7 +190,9 @@ def cmd_daily(args: argparse.Namespace) -> int:
                 json_groups.append((json_label, ordered))
                 table_groups.append((table_label, ordered))
             if args.json:
-                print(c._bucket_by_project_to_json(json_groups, date_key="date"))
+                print(c._bucket_by_project_to_json(
+                    json_groups, date_key="date",
+                    extra=c.account_json_fields(acct_key)))  # #341 R8
                 return 0
             print(c._render_bucket_table(
                 [], first_col_name="Date", title_suffix="Daily",
@@ -190,12 +206,13 @@ def cmd_daily(args: argparse.Namespace) -> int:
         # -p only (no -i): filter-only → normal date-aggregated daily output.
         view = c.build_daily_view(filtered_uentries, now_utc=_command_as_of(),
                                 display_tz=tz, mode=args.mode)
-        _emit_daily_view_table_or_json(view, args)
+        _emit_daily_view_table_or_json(
+            view, args, extra=c.account_json_fields(acct_key))  # #341 R8
         return 0
 
     # ── Default path (UNCHANGED) ───────────────────────────────────────────
     # Collect entries.
-    all_entries = c.get_entries(range_start, range_end)
+    all_entries = c.get_entries(range_start, range_end, account_key=acct_key)
 
     c._emit_debug_samples_if_set(
         args, all_entries, command_label="daily",
@@ -243,7 +260,8 @@ def cmd_daily(args: argparse.Namespace) -> int:
     # Order + emit the flat daily table / {daily} JSON. Extracted into
     # `_emit_daily_view_table_or_json` so this default path and the
     # -p-only (filter, no grouping) path above stay byte-identical.
-    _emit_daily_view_table_or_json(view, args)
+    _emit_daily_view_table_or_json(
+        view, args, extra=c.account_json_fields(acct_key))  # #341 R8
     return 0
 
 
@@ -265,7 +283,12 @@ def cmd_monthly(args: argparse.Namespace) -> int:
         return range
     range_start, range_end = range
 
-    all_entries = c.get_entries(range_start, range_end)
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)  # #341 --account (see cmd_daily)
+    if acct_exit is not None:
+        return acct_exit
+
+    all_entries = c.get_entries(range_start, range_end, account_key=acct_key)
 
     c._emit_debug_samples_if_set(
         args, all_entries, command_label="monthly",
@@ -314,7 +337,9 @@ def cmd_monthly(args: argparse.Namespace) -> int:
         months = list(reversed(months))
 
     if args.json:
-        print(c._bucket_to_json(months, list_key="monthly", date_key="month"))
+        print(c._bucket_to_json(
+            months, list_key="monthly", date_key="month",
+            extra=c.account_json_fields(acct_key)))  # #341 R8
         return 0
 
     print(c._render_bucket_table(
@@ -336,6 +361,13 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     c._bridge_z_into_tz(args, config)
     args._resolved_tz = c.resolve_display_tz(args, config)
 
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable, since weekly cost is
+    # recomputed from session_entries). None = merged / byte-stable.
+    acct_key, acct_exit = c.resolve_account_filter(args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
     now_utc = _command_as_of()
     range = c._parse_cli_date_range(args, now_utc=now_utc)
     if isinstance(range, int):
@@ -351,6 +383,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     # calendar-week fallback uses the explicit override's `week_start`.
     weeks = c._compute_subscription_weeks(
         conn, range_start, range_end, config=config,
+        account_key=acct_key,  # #341: None = merged (all-accounts) read
     )
 
     # Fetch entries and aggregate.
@@ -368,7 +401,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         )
     else:
         fetch_start = range_start
-    all_entries = c.get_entries(fetch_start, range_end)
+    all_entries = c.get_entries(fetch_start, range_end, account_key=acct_key)
 
     c._emit_debug_samples_if_set(
         args, all_entries, command_label="weekly",
@@ -399,6 +432,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
     view = c.build_weekly_view(
         conn, all_entries, weeks=weeks, now_utc=now_utc,
         display_tz=args._resolved_tz, as_of_utc=as_of_utc, mode=args.mode,
+        account_key=acct_key,
     )
     buckets = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
@@ -438,7 +472,10 @@ def cmd_weekly(args: argparse.Namespace) -> int:
         overlay = list(reversed(overlay))
 
     if args.json:
-        print(c._weekly_to_json(buckets, weeks, overlay))
+        print(c._weekly_to_json(
+            buckets, weeks, overlay,
+            extra=c.account_json_fields(acct_key),  # #341 R8 decoration
+        ))
         return 0
 
     if not buckets:
@@ -474,7 +511,13 @@ def cmd_session(args: argparse.Namespace) -> int:
         return range
     range_start, range_end = range
 
-    entries = c.get_claude_session_entries(range_start, range_end)
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)  # #341 --account (see cmd_daily)
+    if acct_exit is not None:
+        return acct_exit
+
+    entries = c.get_claude_session_entries(
+        range_start, range_end, account_key=acct_key)
 
     # Issue #89: --debug report describes the joined-entry list filtered
     # by --id (post-fallback session_id resolution) when set, matching
@@ -581,7 +624,8 @@ def cmd_session(args: argparse.Namespace) -> int:
         sessions = list(reversed(sessions))
 
     if args.json:
-        print(c._claude_sessions_to_json(sessions))
+        print(c._claude_sessions_to_json(
+            sessions, extra=c.account_json_fields(acct_key)))  # #341 R8
         return 0
 
     if not sessions:
@@ -622,6 +666,11 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
         eprint("Error: --end must be after --start")
         return 1
 
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)  # #341 --account (see cmd_daily)
+    if acct_exit is not None:
+        return acct_exit
+
     total_cost = 0.0
     matched_entries = 0
     first_match: dt.datetime | None = None
@@ -633,7 +682,8 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
     # applied at the loader (SELECT-time), so the scope is the same.
     # P2.2 (issue #89 review-loop): get_entries already returns
     # list[UsageEntry] per bin/_cctally_cache.py:1224 — no list() wrap.
-    entries_list = c.get_entries(start_dt, end_dt, project=args.project)
+    entries_list = c.get_entries(start_dt, end_dt, project=args.project,
+                                 account_key=acct_key)
     c._emit_debug_samples_if_set(
         args, entries_list, command_label="range-cost",
     )
@@ -702,6 +752,8 @@ def cmd_range_cost(args: argparse.Namespace) -> int:
             ),
             "modelBreakdowns": breakdowns,
         }
+        # #341 R8: conditional account decoration under an explicit --account.
+        output.update(c.account_json_fields(acct_key))
         payload = c.stamp_schema_version(output)
         sink = getattr(args, "_source_result_sink", None)
         if sink is not None:

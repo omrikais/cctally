@@ -425,8 +425,11 @@ def test_harvest_attaches_suppression_list_to_reset_evt(ns):
              "2026-01-08T00:00:00+00:00", "2026-01-04T09:00:00+00:00"),
         )
         ctx = jr.IngestContext(conn=conn, batch=[])
+        # #341: the wr harvest id_parts (and thus the suppression_map key) now
+        # lead with account_key — the seeded row defaults to the sentinel.
         ctx.suppression_map[
-            ("2026-01-04T09:00:00+00:00", "2026-01-08T00:00:00+00:00")
+            ("unattributed", "2026-01-04T09:00:00+00:00",
+             "2026-01-08T00:00:00+00:00")
         ] = ["b:weekly_usage_snapshots:5", "b:weekly_usage_snapshots:6"]
         jr._harvest(ctx)
         conn.commit()
@@ -437,8 +440,10 @@ def test_harvest_attaches_suppression_list_to_reset_evt(ns):
     assert evt["payload"]["suppression"] == [
         "b:weekly_usage_snapshots:5", "b:weekly_usage_snapshots:6"
     ]
-    # id stays the pure natural key — suppression is NOT an id component.
-    assert evt["id"] == "wr:2026-01-04T09:00:00+00:00:2026-01-08T00:00:00+00:00"
+    # id stays the pure natural key — suppression is NOT an id component. #341:
+    # the natural key now leads with account_key (unstamped row -> sentinel).
+    assert evt["id"] == (
+        "wr:unattributed:2026-01-04T09:00:00+00:00:2026-01-08T00:00:00+00:00")
 
 
 def test_reset_fold_applier_inserts_row_and_replays_suppression(ns):

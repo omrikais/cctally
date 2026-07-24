@@ -263,6 +263,8 @@ _ensure_sibling_loaded("_lib_dashboard_sources")
 _ensure_sibling_loaded("_cctally_dashboard_sources")
 from _cctally_dashboard_sources import (
     DashboardReadContext,
+    _claude_accounts_wire,
+    accounts_identity_digest,
     build_codex_source_state,
     refresh_codex_source_clock,
     resolve_dashboard_source_semantics,
@@ -2145,7 +2147,12 @@ def _snapshot_data_version(sig) -> str:
         getattr(sig, "codex_physical_mutation_seq", 0),
     ))
     digest = getattr(sig, "codex_stats_digest", "")
-    return numeric_legs if not digest else f"{numeric_legs}.{digest}"
+    out = numeric_legs if not digest else f"{numeric_legs}.{digest}"
+    # #341 finding 9: fold the account registry/active-identity digest so an
+    # account switch with zero new rows still flips the SSE change-signal. Empty
+    # for every <=1-account install (byte-neutral — never appended).
+    acct = getattr(sig, "accounts_digest", "")
+    return out if not acct else f"{out}.a{acct}"
 
 
 def _tui_source_copy(value: object) -> object:
@@ -2394,22 +2401,32 @@ def _tui_build_source_bundle(
             display_tz_name=display_tz_name,
         )
         stats_digest = codex_stats_digest(stats_conn)
+        # #341 finding 9: the account registry/active-identity digest. Empty for
+        # every <=1-account install (byte-neutral — appended only when non-empty),
+        # so single-account source versions stay byte-identical to today; a
+        # multi-account switch flips it -> the source rebuilds (re-resolving the
+        # `active` marker). Folded into BOTH providers' versions: a switch is a
+        # rare event and a rebuild is safe, so per-provider narrowing is not worth
+        # the split.
+        accounts_digest = accounts_identity_digest(stats_conn)
         signature = c.compute_signature(
             cache_conn,
             stats_conn,
             generation=c.current_generation(),
             codex_stats_digest=stats_digest,
+            accounts_digest=accounts_digest,
         )
+        _acct_suffix = f":a{accounts_digest}" if accounts_digest else ""
         codex_version = (
             f"codex:{signature.max_codex_id}:"
             f"{signature.codex_physical_mutation_seq}:{stats_digest}:"
-            f"{semantics.codex_identity}"
+            f"{semantics.codex_identity}{_acct_suffix}"
         )
         claude_version = (
             f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"
             f"{signature.max_wus_id}:{signature.max_wcs_id}:"
             f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
-            f"{signature.generation}:{semantics.claude_identity}"
+            f"{signature.generation}:{semantics.claude_identity}{_acct_suffix}"
         )
         prior_claude = (
             prior_bundle.sources.get("claude")
@@ -2443,6 +2460,26 @@ def _tui_build_source_bundle(
             )
         if claude is None:
             claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
+            # #341 Task 4 (Ruling C): the conditional per-account Claude wire,
+            # symmetric with Codex. Built ONLY when the Claude provider has >1
+            # REAL account (R8) — a <=1-real-account install (every envelope
+            # golden) adds nothing, so its wire is byte-identical. The generic
+            # chip row / hero cards light up automatically for a decorated Claude
+            # source. A read failure degrades to the byte-stable undecorated shape.
+            claude_accounts: list[dict[str, object]] = []
+            try:
+                import _cctally_account
+                if _cctally_account.provider_is_decorated(stats_conn, "claude"):
+                    claude_accounts = _claude_accounts_wire(stats_conn, now_utc=now_utc)
+            except Exception:
+                # #341 Task 4 P3 — degrade to no-accounts-wire on ANY read
+                # failure, symmetric with the Codex path. Beyond sqlite, the wire
+                # reaches the identity read (file I/O on ~/.claude.json via
+                # resolve_active_account_keys) and the account registry/label
+                # lookups; a transient failure in this best-effort DECORATIVE
+                # wire must never fail the whole dashboard tick — it just falls
+                # back to the byte-stable undecorated shape.
+                claude_accounts = []
             claude = SourceDashboardState(
                 source="claude",
                 availability=claude_available,
@@ -2478,6 +2515,7 @@ def _tui_build_source_bundle(
                             "alerts": {"rows": ()},
                         }
                     ),
+                    **({"accounts": claude_accounts} if claude_accounts else {}),
                 },
             )
         if codex_ingest_failed:
@@ -2566,6 +2604,7 @@ def _tui_build_source_bundle(
             stats_conn,
             generation=c.current_generation(),
             codex_stats_digest=post_stats_digest,
+            accounts_digest=accounts_identity_digest(stats_conn),
         )
         if post_signature != signature:
             if prior_bundle is not None:
@@ -2749,24 +2788,58 @@ def _tui_build_snapshot(
             if do_ingest:
                 try:
                     cache_conn = _cctally().open_cache_db()
+                    cache_mod = _cctally()._load_sibling("_cctally_cache")
                     try:
-                        try:
-                            claude_ingest = sync_cache(cache_conn)
+                        def _claude_leg(active_conn):
+                            try:
+                                return sync_cache(active_conn), None
+                            except sqlite3.DatabaseError as exc:
+                                if cache_mod._cctally_db_sib._is_sqlite_corruption_error(
+                                    exc
+                                ):
+                                    raise
+                                return None, exc
+                            except Exception as exc:
+                                return None, exc
+
+                        operations = [_claude_leg]
+                        if precompute_envelope:
+                            def _codex_leg(active_conn):
+                                try:
+                                    return sync_codex_cache(active_conn), None
+                                except sqlite3.DatabaseError as exc:
+                                    if cache_mod._cctally_db_sib._is_sqlite_corruption_error(
+                                        exc
+                                    ):
+                                        raise
+                                    return None, exc
+                                except Exception as exc:
+                                    return None, exc
+
+                            operations.append(_codex_leg)
+
+                        results, cache_conn = (
+                            cache_mod._run_cache_plan_with_recovery(
+                                cache_conn, tuple(operations)
+                            )
+                        )
+                        claude_ingest, claude_error = results[0]
+                        if claude_error is None:
                             claude_ingest_contended = bool(
                                 getattr(claude_ingest, "lock_contended", False)
                             )
-                        except Exception as exc:
+                        else:
                             claude_ingest_failed = True
-                            errors.append(f"sync-cache: {exc}")
+                            errors.append(f"sync-cache: {claude_error}")
                         if precompute_envelope:
-                            try:
-                                codex_ingest = sync_codex_cache(cache_conn)
+                            codex_ingest, codex_error = results[1]
+                            if codex_error is None:
                                 codex_ingest_contended = bool(
                                     getattr(codex_ingest, "lock_contended", False)
                                 )
-                            except Exception as exc:
+                            else:
                                 codex_ingest_failed = True
-                                errors.append(f"sync-codex-cache: {exc}")
+                                errors.append(f"sync-codex-cache: {codex_error}")
                     finally:
                         cache_conn.close()
                 except Exception as exc:
@@ -3589,6 +3662,7 @@ def _tui_compute_dispatch_signature(stats_conn):
             stats_conn,
             generation=sc.current_generation(),
             codex_stats_digest=codex_stats_digest(stats_conn),
+            accounts_digest=accounts_identity_digest(stats_conn),
         )
     finally:
         cache_conn.close()
@@ -6092,6 +6166,7 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     throttle=throttle, monotonic=_time.monotonic,
                 )
                 cache_conn = _cctally().open_cache_db()
+                cache_mod = _cctally()._load_sibling("_cctally_cache")
                 try:
                     # Under CCTALLY_PERF_TRACE the phase tree this standalone
                     # sync_cache builds is intentionally NOT surfaced in the live
@@ -6100,13 +6175,19 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     # these phases never reach an emitter. §0's trace-attribution
                     # target is `cctally-bench --trace`, which builds directly
                     # (no decoupled standalone ingest) and keeps its phase tree.
-                    sync_cache(cache_conn, progress=cb)
-                    # Dashboard S4's physical identity includes Codex.  Keep
-                    # the decoupled path's ingest set identical to the direct
-                    # dashboard snapshot path before its final pure read, or
-                    # it can publish a legacy data version from a different
-                    # provider generation.
-                    sync_codex_cache(cache_conn)
+                    # Dashboard S4's physical identity includes both providers.
+                    # They are one recovery plan because quarantine replaces
+                    # the shared physical family: corruption in the second leg
+                    # must restart the first leg too.
+                    _, cache_conn = cache_mod._run_cache_plan_with_recovery(
+                        cache_conn,
+                        (
+                            lambda active_conn: sync_cache(
+                                active_conn, progress=cb
+                            ),
+                            lambda active_conn: sync_codex_cache(active_conn),
+                        ),
+                    )
                 except Exception as exc:  # noqa: BLE001 — surfaced on the snap
                     sync_error = f"sync-cache: {exc}"
                 finally:

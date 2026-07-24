@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "current": {
+    "weekStartDate": "2026-05-18",
+    "weekEndDate": "2026-05-25",
+    "weekStartAt": "2026-05-18T00:00:00+00:00",
+    "weekEndAt": "2026-05-25T00:00:00+00:00",
+    "weeklyPercent": 15.0,
+    "weeklyCostUSD": 2.0,
+    "dollarsPerPercent": 0.133333333,
+    "usageCapturedAt": "2026-05-18T13:00:00Z",
+    "costCapturedAt": "2026-05-18T13:00:00Z",
+    "asOf": "2026-05-18T13:00:00+00:00",
+    "rangeStartIso": null,
+    "rangeEndIso": null
+  },
+  "trend": [
+    {
+      "weekStartDate": "2026-05-18",
+      "weekEndDate": "2026-05-25",
+      "weekStartAt": "2026-05-18T00:00:00+00:00",
+      "weekEndAt": "2026-05-25T00:00:00+00:00",
+      "weeklyPercent": 15.0,
+      "weeklyCostUSD": 2.0,
+      "dollarsPerPercent": 0.133333333,
+      "usageCapturedAt": "2026-05-18T13:00:00Z",
+      "costCapturedAt": "2026-05-18T13:00:00Z",
+      "asOf": "2026-05-18T13:00:00+00:00",
+      "rangeStartIso": null,
+      "rangeEndIso": null
+    }
+  ],
+  "weekStartRule": "monday",
+  "generatedAt": "2026-05-22T18:00:00Z",
+  "currentWeek": {
+    "weekStartDate": "2026-05-18",
+    "weekEndDate": "2026-05-25",
+    "weekStartAt": "2026-05-18T00:00:00+00:00",
+    "weekEndAt": "2026-05-25T00:00:00+00:00"
+  },
+  "accountKey": "a8749ae58c90247c62903f4b191a9ff9",
+  "accountLabel": "bob"
+}

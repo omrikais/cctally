@@ -189,7 +189,7 @@ def test_codex_cycle_selects_the_active_seven_day_boundary_over_five_hour_limit(
     cycle = source_module._resolve_codex_weekly_cycle((
         _quota_observation(root="root", window_minutes=300, resets_at=NOW + dt.timedelta(hours=4)),
         _quota_observation(root="root", window_minutes=10_080, resets_at=reset),
-    ), NOW)
+    ), NOW)[0]  # #341: per-account list — single-account scenario -> 1 element
 
     assert cycle.window_minutes == 10_080
     assert cycle.start_at == reset - dt.timedelta(days=7)
@@ -202,7 +202,7 @@ def test_codex_cycle_allows_a_fresh_weekly_boundary_without_a_five_hour_window()
 
     cycle = source_module._resolve_codex_weekly_cycle((
         _quota_observation(root="root", window_minutes=10_080, resets_at=reset),
-    ), NOW)
+    ), NOW)[0]  # #341: per-account list — single-account scenario -> 1 element
 
     assert cycle.resets_at == reset
 
@@ -222,7 +222,7 @@ def test_codex_cycle_ignores_a_concurrent_model_scoped_spark_week():
             root="root", window_minutes=10_080, resets_at=spark_reset,
             logical_limit_key=spark_key,
         ),
-    ), NOW)
+    ), NOW)[0]  # #341: per-account list — single-account scenario -> 1 element
 
     assert cycle.resets_at == standard_reset
 
@@ -361,7 +361,7 @@ def test_codex_cycle_selects_one_full_identity_for_one_boundary():
             logical_limit_key="limit-b", observed_slot="secondary",
             used_percent=61.0,
         ),
-    ), NOW)
+    ), NOW)[0]  # #341: per-account list — single-account scenario -> 1 element
 
     assert cycle.resets_at == reset
     assert cycle.source_root_keys == ("root-b",)
@@ -2169,7 +2169,8 @@ def test_dashboard_current_cycle_uses_complete_durable_quota_breakdown():
             source TEXT, source_root_key TEXT, logical_limit_key TEXT,
             observed_slot TEXT, window_minutes INTEGER, resets_at_utc TEXT,
             percent_threshold INTEGER, captured_at_utc TEXT,
-            source_path TEXT, line_offset INTEGER, orphaned_at TEXT
+            source_path TEXT, line_offset INTEGER, orphaned_at TEXT,
+            account_key TEXT
         );
     """)
     path = "/private/a.jsonl"
@@ -2193,7 +2194,8 @@ def test_dashboard_current_cycle_uses_complete_durable_quota_breakdown():
         if percent:
             stats.execute(
                 "INSERT INTO quota_percent_milestones VALUES "
-                "('codex', 'root-a', 'weekly', 'primary', 10080, ?, ?, ?, ?, ?, NULL)",
+                "('codex', 'root-a', 'weekly', 'primary', 10080, ?, ?, ?, ?, ?, NULL, "
+                "'unattributed')",
                 (reset.isoformat(), percent, captured.isoformat(), path, percent),
             )
             cache.execute(
@@ -2469,3 +2471,100 @@ def test_codex_projection_incoherence_is_scoped_to_the_current_hero_generation(
     finally:
         cache.close()
         stats.close()
+
+
+# ==========================================================================
+# #341 Task 4 — _clock_cycle_validity per-account grouping. When history rows
+# carry `account_key` (serialized only for a DECORATED >1-real-account Codex
+# provider, R8), the idle clock scopes weekly-cycle validity PER ACCOUNT instead
+# of degrading a genuine multi-account state to `conflicting`. Without
+# `account_key` (<=1 real account) it reduces EXACTLY to the prior single-
+# boundary logic (byte-stable).
+# ==========================================================================
+
+from _cctally_dashboard_sources import _clock_cycle_validity  # noqa: E402
+
+_CLOCK_NOW = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
+
+
+def _weekly_history(*, resets_at, freshness="fresh", account_key=None,
+                    current_percent=25.0):
+    row = {
+        "window_minutes": 10_080,
+        "current_percent": current_percent,
+        "freshness": freshness,
+        "forecast": {"resets_at": resets_at.astimezone(UTC).isoformat()},
+    }
+    if account_key is not None:
+        row["account_key"] = account_key
+    return row
+
+
+def test_clock_validity_two_accounts_distinct_cycles_stay_valid():
+    """The fix: two real accounts each with ONE distinct fresh future boundary
+    are each valid -> the hero stays `ok` instead of degrading to `conflicting`."""
+    a_reset = _CLOCK_NOW + dt.timedelta(days=1)
+    b_reset = _CLOCK_NOW + dt.timedelta(days=3)
+    histories = [
+        _weekly_history(resets_at=a_reset, account_key="acct-a"),
+        _weekly_history(resets_at=b_reset, account_key="acct-b"),
+    ]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+
+
+def test_clock_validity_no_account_key_two_boundaries_is_conflicting():
+    """Non-vacuity + byte-stability: WITHOUT `account_key` (a <=1-real-account
+    install) two distinct fresh boundaries fall into one global bucket and stay
+    `conflicting`, exactly like today. This is the SAME input shape as the fix
+    test minus the keys — so it proves `account_key` is the genuine discriminator."""
+    a_reset = _CLOCK_NOW + dt.timedelta(days=1)
+    b_reset = _CLOCK_NOW + dt.timedelta(days=3)
+    histories = [
+        _weekly_history(resets_at=a_reset),
+        _weekly_history(resets_at=b_reset),
+    ]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "conflicting")
+
+
+def test_clock_validity_single_boundary_ok_byte_stable():
+    histories = [_weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1))]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+
+
+def test_clock_validity_one_account_fresh_other_stale_stays_valid():
+    """At least one account yields a live cycle -> hero valid (mirrors the
+    build-time `_resolve_codex_weekly_cycle` 'raise only when NO account yields
+    a cycle')."""
+    histories = [
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
+                        account_key="acct-a"),
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=2),
+                        freshness="stale", account_key="acct-b"),
+    ]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (True, "ok")
+
+
+def test_clock_validity_all_accounts_stale_is_stale():
+    histories = [
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
+                        freshness="stale", account_key="acct-a"),
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=2),
+                        freshness="stale", account_key="acct-b"),
+    ]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "stale")
+
+
+def test_clock_validity_no_weekly_histories_is_missing():
+    assert _clock_cycle_validity((), _CLOCK_NOW) == (False, "missing")
+
+
+def test_clock_validity_one_account_two_boundaries_conflicting():
+    """A single account with two distinct fresh boundaries is itself
+    `conflicting` (per-account never-combine)."""
+    histories = [
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=1),
+                        account_key="acct-a"),
+        _weekly_history(resets_at=_CLOCK_NOW + dt.timedelta(days=3),
+                        account_key="acct-a"),
+    ]
+    assert _clock_cycle_validity(histories, _CLOCK_NOW) == (False, "conflicting")

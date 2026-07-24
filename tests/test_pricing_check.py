@@ -266,6 +266,7 @@ def _seed_cache_with_models(home, claude_models=(), codex_models=(), age_days=1)
     import sqlite3
     cache_path = home / ".local" / "share" / "cctally" / "cache.db"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.with_name("cache.db.maintenance.lock").touch()
     ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=age_days))
     ts_iso = ts.isoformat().replace("+00:00", "Z")
     conn = sqlite3.connect(str(cache_path))

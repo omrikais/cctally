@@ -10,6 +10,7 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
 import { warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
+import { AccountHeroCards } from './AccountHeroCards';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import type { AllSourceData, CodexSourceData, Envelope, FreshnessEnvelope } from '../types/envelope';
 
@@ -76,6 +77,9 @@ export function HeroStrip() {
       }}
     >
       {body}
+      {/* #341 Task 4 — per-account hero cards (Q6 Option A). Self-hides unless
+          the active physical source is decorated (>1 real account). */}
+      <AccountHeroCards />
     </section>
   );
 }

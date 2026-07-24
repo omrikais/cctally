@@ -54,7 +54,7 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
     if (disconnected) { setText('disconnected'); setColor('var(--accent-red)'); setBucket(''); return; }
     if (!env) return;
     if (env.last_sync_error) {
-      setText('⚠ sync error');
+      setText(env.sync_failure?.label ?? '⚠ server sync error');
       setColor('var(--accent-red)');
       setBucket('');
       return;
@@ -89,7 +89,7 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
   }, [env, disconnected]);
 
   // Schedule a single re-render at the exact moment the floor expires,
-  // so the chip stops showing "⚠ sync failed" without waiting up to 1 s
+  // so the chip stops showing "⚠ sync request failed" without waiting up to 1 s
   // for the tick. Guards against negative delay if the floor was set in
   // the past (useEffect cleanup covers unmount / floor change).
   useEffect(() => {
@@ -154,7 +154,7 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
         aria-live="polite"
         style={{ color: 'var(--accent-red)' }}
       >
-        ⚠ sync failed
+        ⚠ sync request failed
       </span>
     );
   }
@@ -169,11 +169,23 @@ export function SyncChip({ id = 'sync-chip' }: { id?: string } = {}) {
       </span>
     );
   }
+  const serverFailure = (
+    !disconnected && env?.last_sync_error ? env.sync_failure : null
+  );
+  const serverFailureTitle = serverFailure
+    ? [serverFailure.detail, serverFailure.action].filter(Boolean).join(' ')
+    : undefined;
   return (
     <span
-      className={'sync-chip mute' + (bucket ? ` sync-chip--${bucket}` : '')}
+      className={
+        'sync-chip mute'
+        + (bucket ? ` sync-chip--${bucket}` : '')
+        + (serverFailure || disconnected ? ' sync-error' : '')
+      }
       id={id}
       aria-live="polite"
+      aria-label={serverFailureTitle}
+      title={serverFailureTitle}
       style={{ color }}
     >
       {text}

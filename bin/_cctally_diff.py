@@ -220,6 +220,13 @@ def cmd_diff(args: argparse.Namespace) -> int:
     if args.min_delta_pct is not None:
         threshold = dataclasses.replace(threshold, min_delta_pct=args.min_delta_pct)
 
+    # #341 --account: resolve the render filter (provider=claude; fail closed
+    # with exit 3 when the entry cache is unavailable). None = merged.
+    acct_key, acct_exit = c.resolve_account_filter(
+        args, "claude", needs_cache=True)
+    if acct_exit is not None:
+        return acct_exit
+
     try:
         result = dk._build_diff_result(
             window_a, window_b,
@@ -229,6 +236,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
             allow_mismatch=bool(args.allow_mismatch),
             skip_sync=not bool(args.sync),
             top=args.top,
+            account_key=acct_key,
         )
     except dk.WindowMismatchError as exc:
         print(f"diff: {exc}", file=sys.stderr)
@@ -250,6 +258,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
     if args.emit_json:
         payload = dk._diff_to_json_payload(result, options=options)
+        payload.update(c.account_json_fields(acct_key))  # #341 R8 decoration
         sink = getattr(args, "_source_result_sink", None)
         if sink is not None:
             sink(payload)

@@ -97,7 +97,7 @@ def _install_spies(cctally, monkeypatch):
     real_box = cctally._boxed_table
     real_ts = cctally._format_ts_compact
 
-    def spy_milestones(conn, week_start_date):
+    def spy_milestones(conn, week_start_date, **kwargs):  # **kwargs: #341 account_key=
         calls["get_milestones_for_week"] += 1
         return [_fake_milestone_row()]
 

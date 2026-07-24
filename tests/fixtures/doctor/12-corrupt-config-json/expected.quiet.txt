@@ -13,10 +13,11 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       41 pending
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data
+Accounts
 Pricing
 Safety
   ✗ config.json              unreadable: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
@@ -25,4 +26,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 36 OK · 7 WARN · 1 FAIL
+Summary: 40 OK · 7 WARN · 1 FAIL

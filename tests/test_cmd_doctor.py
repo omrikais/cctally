@@ -42,8 +42,8 @@ def test_doctor_json_mode_valid_schema(tmp_path):
     payload = json.loads(r.stdout, parse_constant=reject_nonfinite)
     assert payload["schema_version"] == 1
     assert {c["id"] for c in payload["categories"]} == {
-        "install", "hooks", "auth", "db", "journal", "data", "pricing",
-        "safety", "telemetry",
+        "install", "hooks", "auth", "db", "journal", "data", "accounts",
+        "pricing", "safety", "telemetry",
     }
     data = next(
         category for category in payload["categories"]
@@ -234,6 +234,11 @@ def _valid_sqlite(path):
     conn.close()
 
 
+def _valid_cache_sqlite(path):
+    path.with_name("cache.db.maintenance.lock").touch()
+    _valid_sqlite(path)
+
+
 def _gather(ns, monkeypatch, tmp_path, **kw):
     redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_core
@@ -247,7 +252,7 @@ def test_gather_deep_false_skips_quick_check(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _valid_sqlite(_cctally_core.DB_PATH)
-    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     state = ns["doctor_gather_state"](deep=False)
     assert state.stats_db_quick_check is None
     assert state.cache_db_quick_check is None
@@ -259,7 +264,7 @@ def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _valid_sqlite(_cctally_core.DB_PATH)
-    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     state = ns["doctor_gather_state"](deep=True)
     assert state.stats_db_quick_check == "ok"
     assert state.cache_db_quick_check == "ok"
@@ -272,6 +277,7 @@ def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _valid_sqlite(_cctally_core.DB_PATH)
 
+    _cctally_core.CACHE_DB_PATH.with_name("cache.db.maintenance.lock").touch()
     conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
     conn.execute("CREATE TABLE reclaimable_payload (payload BLOB)")
     conn.executemany(
@@ -329,7 +335,7 @@ def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.DB_PATH.write_bytes(b"this is not a sqlite database at all")
-    _valid_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
     state = ns["doctor_gather_state"](deep=True)
     assert state.stats_db_quick_check is not None
     assert state.stats_db_quick_check != "ok"

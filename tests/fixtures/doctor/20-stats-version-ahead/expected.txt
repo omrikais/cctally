@@ -22,10 +22,10 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1000) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1001) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
-  ✓ Migrations               0/41 applied
-  ⚠ Pending migrations       41 pending
+  ✓ Migrations               0/42 applied
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -47,6 +47,11 @@ Data
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
   ✓ Conversation rollup      no data
+Accounts
+  ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Account registry         no accounts observed yet
+  ✓ Account attribution freshness no attribution activity recorded
+  ✓ Account attribution      usage attribution healthy
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -59,4 +64,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 38 OK · 6 WARN · 0 FAIL
+Summary: 42 OK · 6 WARN · 0 FAIL

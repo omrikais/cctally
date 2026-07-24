@@ -62,7 +62,7 @@ def test_cmd_project_resolves_share_and_cache_through_namespace(cctally_mod, mon
     mod = cctally_mod
     calls = {"entries": 0, "snapshot": 0, "emit": 0}
 
-    def fake_entries(start, end):
+    def fake_entries(start, end, **kwargs):  # **kwargs absorbs #341 account_key
         calls["entries"] += 1
         return []
 

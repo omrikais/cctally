@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "start": "2026-05-22T00:00:00Z",
+  "end": "2026-05-23T00:00:00Z",
+  "mode": "auto",
+  "project": null,
+  "matchedEntries": 0,
+  "totalCostUSD": 0.0,
+  "firstMatchedEntry": null,
+  "lastMatchedEntry": null,
+  "modelBreakdowns": [],
+  "accountKey": "unattributed",
+  "accountLabel": "Unattributed"
+}

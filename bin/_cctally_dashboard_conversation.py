@@ -853,8 +853,12 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
             # the transcript cursor. Neither lock is held across the other.
             core = open_cache_db()
             try:
-                core_stats = sync_codex_cache(
-                    core, only_paths=set(to_ingest)
+                cache_mod = sys.modules["cctally"]._load_sibling("_cctally_cache")
+                core_stats, core = cache_mod._run_cache_operation_with_recovery(
+                    core,
+                    lambda active_conn: sync_codex_cache(
+                        active_conn, only_paths=set(to_ingest)
+                    ),
                 )
             finally:
                 core.close()

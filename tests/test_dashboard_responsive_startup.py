@@ -16,6 +16,7 @@ import datetime as dt
 import pathlib
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -471,3 +472,40 @@ def test_a2_decouple_threads_sync_cache_error(monkeypatch, tmp_path):
     # The final build still completed and cleared the hydration latch — the sync
     # error is threaded through, not fatal.
     assert published.hydrating is False
+
+
+def test_a2_decouple_recovers_classified_cache_corruption_once(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = ns["_cctally_cache"]
+    ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
+    hub = _CapturingHub()
+    real_sync = ns["sync_cache"]
+    attempts = 0
+
+    def corrupt_once(conn, *, progress=None, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real_sync(conn, progress=progress, **kwargs)
+
+    monkeypatch.setitem(ns, "sync_cache", corrupt_once)
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref, hub=hub, pinned_now=EMPTY_NOW,
+        display_tz_pref_override=None,
+    )
+    locked(skip_sync=False)
+
+    assert attempts == 2
+    assert len(hub.published) == 1
+    assert hub.published[-1].last_sync_error is None
+    assert hub.published[-1].hydrating is False
+    incidents = list(
+        (pathlib.Path(ns["_cctally_core"].APP_DIR) / "quarantine").glob(
+            "cache.db-*"
+        )
+    )
+    assert len(incidents) == 1

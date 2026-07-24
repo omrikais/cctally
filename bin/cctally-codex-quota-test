@@ -92,6 +92,30 @@ run_one full breakdown date-only-reset \
     "--root-key root-a --limit-key limit-primary --reset-at 2026-07-15" \
     "golden-breakdown-date-only-reset.txt"
 
+# #341 Task 4 (Ruling B): `--account <ref>` render variants for all five views
+# on the two-real-account scenario. Deterministic (AS_OF pinned; the resolve/
+# decorate/scope path is pure), so these are safe byte-goldens. `work` and
+# `personal` each scope to their own window — proving the filter is non-vacuous.
+account_cases=(
+    "history|work|--since 2026-07-15 --until 2026-07-16"
+    "statusline|work|--as-of 2026-07-15T12:00:00Z"
+    "forecast|work|--as-of 2026-07-15T12:00:00Z"
+    "blocks|work|--since 2026-07-15 --until 2026-07-16"
+    "breakdown|work|--root-key root-shared --limit-key limit-primary --reset-at 2026-07-15T15:00:00Z"
+    "history|personal|--since 2026-07-15 --until 2026-07-16"
+    "statusline|personal|--as-of 2026-07-15T12:00:00Z"
+    "forecast|personal|--as-of 2026-07-15T12:00:00Z"
+    "blocks|personal|--since 2026-07-15 --until 2026-07-16"
+    "breakdown|personal|--root-key root-shared --limit-key limit-secondary --reset-at 2026-07-15T15:00:00Z"
+)
+for entry in "${account_cases[@]}"; do
+    IFS='|' read -r ac_leaf ac_ref ac_flags <<< "$entry"
+    run_one multi-account "$ac_leaf" "account-$ac_ref-terminal" \
+        "$ac_flags --account $ac_ref" "golden-$ac_leaf-account-$ac_ref-terminal.txt"
+    run_one multi-account "$ac_leaf" "account-$ac_ref-json" \
+        "$ac_flags --account $ac_ref --json" "golden-$ac_leaf-account-$ac_ref-json.txt"
+done
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

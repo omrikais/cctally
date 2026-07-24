@@ -73,6 +73,25 @@ describe('useSourceDetail (§5.6)', () => {
     );
   });
 
+  it('#341 Task 4 — an account-scoped block fetch carries the ?account= qualifier', async () => {
+    const fetchFn = stubFetch(() =>
+      jsonResponse(200, { source: 'codex', resource: 'block', data: { detail_kind: 'codex_block', key: 'block:x' } }),
+    );
+    const acct = 'a'.repeat(32);
+    renderHook(() => useSourceDetail('codex', 'block', 'block:x', { account: acct }));
+    await waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    expect(fetchFn).toHaveBeenCalledWith(`/api/source/codex/block/block%3Ax?account=${acct}`);
+  });
+
+  it('#341 Task 4 — no account option keeps the account-agnostic route (byte-stable)', async () => {
+    const fetchFn = stubFetch(() =>
+      jsonResponse(200, { source: 'codex', resource: 'block', data: { detail_kind: 'codex_block', key: 'block:y' } }),
+    );
+    renderHook(() => useSourceDetail('codex', 'block', 'block:y'));
+    await waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    expect(fetchFn).toHaveBeenCalledWith('/api/source/codex/block/block%3Ay');
+  });
+
   it('a 400 capability error surfaces as the friendly capability variant', async () => {
     stubFetch(() => jsonResponse(400, { code: 'source_capability_unavailable', error: 'x' }));
     const { result } = renderHook(() => useSourceDetail('codex', 'block', 'block:x'));

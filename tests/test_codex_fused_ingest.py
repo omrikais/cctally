@@ -167,6 +167,8 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("individual_limit_json", "TEXT", 0),
             ("reached_type", "TEXT", 0),
             ("observed_model", "TEXT", 0),
+            # account_key (#341): observe-and-stamp attribution, NULL ≡ unattributed.
+            ("account_key", "TEXT", 0),
         ]
         assert _columns(conn, "codex_conversation_events") == [
             ("id", "INTEGER", 0),
@@ -184,11 +186,13 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("call_id", "TEXT", 0),
             ("payload_json", "TEXT", 1),
         ]
-        assert _columns(conn, "codex_session_entries")[-2:] == [
+        assert _columns(conn, "codex_session_entries")[-3:] == [
             ("source_root_key", "TEXT", 0),
             ("conversation_key", "TEXT", 0),
+            # account_key (#341): trailing observe-and-stamp column.
+            ("account_key", "TEXT", 0),
         ]
-        assert _columns(conn, "codex_session_files")[-6:] == [
+        assert _columns(conn, "codex_session_files")[-7:] == [
             ("source_root_key", "TEXT", 0),
             ("last_native_thread_id", "TEXT", 0),
             ("last_root_thread_id", "TEXT", 0),
@@ -196,6 +200,8 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("last_conversation_key", "TEXT", 0),
             # #294 S6: terminal sticky-turn seed for delta resumes.
             ("last_turn_id", "TEXT", 0),
+            # account_key (#341): last-observed stamp (diagnostic; NULL ≡ unattributed).
+            ("account_key", "TEXT", 0),
         ]
 
         quota_sql = _schema_sql(conn, "quota_window_snapshots")

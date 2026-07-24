@@ -678,14 +678,19 @@ def test_real_s1_rebuild_recovery_preserves_generation_and_terminal_claims(
 
 
 def _seed_projection_state(ns, rows: list[tuple[str, str]]):
-    """Seed quota_projection_state (source_root_key, physical_signature)."""
+    """Seed quota_projection_state (source_root_key, physical_signature).
+
+    account_key (#341) is part of the PK; these root-level fixtures land under the
+    schema-default ``unattributed`` identity (one account per root), which the
+    per-root ``_stats_projection_signatures_match`` collapses back to ``{root: sig}``.
+    """
     conn = ns["open_db"]()
     try:
         conn.executemany(
             """INSERT INTO quota_projection_state
                (source_root_key, generation, physical_signature, completed_at_utc)
                VALUES (?, 'gen-x', ?, ?)
-               ON CONFLICT(source_root_key) DO UPDATE SET
+               ON CONFLICT(source_root_key, account_key) DO UPDATE SET
                  physical_signature=excluded.physical_signature""",
             [(root, sig, _iso(12)) for root, sig in rows],
         )

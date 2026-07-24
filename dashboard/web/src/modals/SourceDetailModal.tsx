@@ -1,6 +1,8 @@
 import { useCallback, useState, useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useSourceDetail } from '../hooks/useSourceDetail';
+import { useSnapshot } from '../hooks/useSnapshot';
+import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { modelChipClass } from '../lib/model';
@@ -39,11 +41,27 @@ export function SourceDetailModal() {
     subscribeStore,
     () => getState().prefs.projectsWindowWeeks,
   );
+  // #341 Task 4 — the account qualifier for an account-scoped detail. `block`
+  // (quota) is the account-scoped detail resource; sessions/projects stay
+  // account-agnostic (Decision R4), so they never send the qualifier. The
+  // server verifies row ownership when it is present (spec §4 finding 10).
+  const env = useSnapshot();
+  const detailSource = open?.source ?? 'codex';
+  const focusSlot = useSyncExternalStore(
+    subscribeStore,
+    () => getState().accountFocus[detailSource] ?? ALL_ACCOUNTS,
+  );
+  const detailAccount = open?.resource === 'block'
+    ? resolveAccountFocus(env, detailSource, focusSlot)
+    : null;
   const detail = useSourceDetail<SourceDetailBody>(
     open?.source ?? 'codex',
     open?.resource ?? 'session',
     open?.key ?? null,
-    { windowWeeks: open?.resource === 'project' ? projectWindowWeeks : undefined },
+    {
+      windowWeeks: open?.resource === 'project' ? projectWindowWeeks : undefined,
+      account: detailAccount,
+    },
   );
   const close = useCallback(() => dispatch({ type: 'CLOSE_SOURCE_DETAIL' }), []);
   if (open == null) return null;

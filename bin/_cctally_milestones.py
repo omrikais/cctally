@@ -57,6 +57,8 @@ def compute_week_cost(
     project: str | None,
     start_iso_override: str | None = None,
     end_iso_override: str | None = None,
+    *,
+    account_key: "str | None" = None,
 ) -> WeekCostResult:
     # internal fallback: host-local intentional
     now_local = dt.datetime.now().astimezone()
@@ -101,7 +103,11 @@ def compute_week_cost(
     end_dt = parse_iso_datetime(end_iso, "end")
 
     c = _cctally()
-    cost = c._sum_cost_for_range(start_dt, end_dt, mode=mode, project=project)
+    # #341 P2-CQ2: scope the cost sum to the account the snapshot is stamped for
+    # (None = merged / byte-identical) so per-account weekly_cost_snapshots + the
+    # milestone $/1% cumulative cost carry genuinely per-account cost.
+    cost = c._sum_cost_for_range(
+        start_dt, end_dt, mode=mode, project=project, account_key=account_key)
 
     return WeekCostResult(
         week_start=week_start,
@@ -112,8 +118,12 @@ def compute_week_cost(
     )
 
 
-def get_latest_cost_for_week(conn: sqlite3.Connection, week_ref: WeekRef) -> sqlite3.Row | None:
-    return _get_latest_row_for_week(conn, "weekly_cost_snapshots", week_ref)
+def get_latest_cost_for_week(
+    conn: sqlite3.Connection, week_ref: WeekRef, *,
+    account_key: "str | None" = None,
+) -> sqlite3.Row | None:
+    return _get_latest_row_for_week(
+        conn, "weekly_cost_snapshots", week_ref, account_key=account_key)
 
 
 def insert_cost_snapshot(
@@ -131,8 +141,14 @@ def insert_cost_snapshot(
     commit: bool = True,
     as_of: "str | None" = None,
     journal: "tuple | None" = None,
+    account_key: str = "unattributed",
 ) -> int:
     """Insert a ``weekly_cost_snapshots`` row and return its rowid.
+
+    ``account_key`` (#341): the account dimension of the write. Default
+    ``"unattributed"`` mirrors the schema DEFAULT (rev 4.1 defensive backstop);
+    per-account ``sync-week`` materialization (Step 9 / Task 3) passes the
+    resolved account explicitly.
 
     Transaction-neutral / capture-time-pure seam (DB journal redesign §5.2.3):
     ``commit=False`` skips the inner ``conn.commit()`` so the ingester can bundle
@@ -174,6 +190,7 @@ def insert_cost_snapshot(
                 "cost_usd": cost_usd,
                 "mode": mode,
                 "project": project,
+                "account_key": account_key,
             },
             at=captured,
         )
@@ -190,9 +207,10 @@ def insert_cost_snapshot(
           range_end_iso,
           cost_usd,
           mode,
-          project
+          project,
+          account_key
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             captured,
@@ -205,6 +223,7 @@ def insert_cost_snapshot(
             cost_usd,
             mode,
             project,
+            account_key,
         ),
     )
     if commit:
@@ -217,6 +236,7 @@ def get_max_milestone_for_week(
     week_start_date: str,
     *,
     reset_event_id: int = 0,
+    account_key: str,
 ) -> int | None:
     """Return the highest percent_threshold recorded for a week's segment,
     or None.
@@ -227,6 +247,11 @@ def get_max_milestone_for_week(
     segment id so the segment's threshold ledger is independent of the
     pre-credit one — the post-credit 1% / 2% / 3% milestones fire even
     if the pre-credit segment already crossed those thresholds.
+
+    ``account_key`` (#341, review finding 11): MANDATORY — the max is scoped
+    to one account's ledger so a second account crossing the SAME threshold in
+    the SAME week is not silently deduped against the first. No silent global
+    fallback: the caller resolves the account being processed.
     """
     row = conn.execute(
         """
@@ -234,8 +259,9 @@ def get_max_milestone_for_week(
         FROM percent_milestones
         WHERE week_start_date = ?
           AND reset_event_id = ?
+          AND account_key = ?
         """,
-        (week_start_date, reset_event_id),
+        (week_start_date, reset_event_id, account_key),
     ).fetchone()
     if row and row["max_pct"] is not None:
         return int(row["max_pct"])
@@ -248,6 +274,7 @@ def get_milestone_cost_for_week(
     percent_threshold: int,
     *,
     reset_event_id: int = 0,
+    account_key: str,
 ) -> float | None:
     """Return the cumulative_cost_usd for a specific (week, threshold,
     segment), or None.
@@ -257,6 +284,9 @@ def get_milestone_cost_for_week(
     marginal cost between consecutive thresholds inside the SAME segment
     — without the filter, the post-credit threshold-3 row would compute
     its marginal against the pre-credit threshold-2 cost (wrong segment).
+
+    ``account_key`` (#341): MANDATORY — scoped to one account's ledger (a
+    marginal must be computed against the SAME account's prior threshold row).
     """
     row = conn.execute(
         """
@@ -265,8 +295,9 @@ def get_milestone_cost_for_week(
         WHERE week_start_date = ?
           AND percent_threshold = ?
           AND reset_event_id = ?
+          AND account_key = ?
         """,
-        (week_start_date, percent_threshold, reset_event_id),
+        (week_start_date, percent_threshold, reset_event_id, account_key),
     ).fetchone()
     if row:
         return float(row["cumulative_cost_usd"])
@@ -276,16 +307,25 @@ def get_milestone_cost_for_week(
 def get_milestones_for_week(
     conn: sqlite3.Connection,
     week_start_date: str,
+    *,
+    account_key: "str | None" = None,
 ) -> list[sqlite3.Row]:
-    """Return all milestones for a week, ordered by threshold ascending."""
+    """Return all milestones for a week, ordered by threshold ascending.
+
+    ``account_key`` (#341, spec §3): ``None`` = the account-blind merged read
+    (today's byte-identical behavior); a real key / ``unattributed`` scopes the
+    ``percent_milestones`` read to that account (``percent-breakdown --account``).
+    """
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
     return conn.execute(
-        """
+        f"""
         SELECT *
         FROM percent_milestones
-        WHERE week_start_date = ?
+        WHERE week_start_date = ?{acct_pred}
         ORDER BY percent_threshold ASC
         """,
-        (week_start_date,),
+        (week_start_date,) + acct_p,
     ).fetchall()
 
 
@@ -305,8 +345,17 @@ def insert_percent_milestone(
     commit: bool = True,
     reset_event_id: int = 0,
     as_of: "str | None" = None,
+    account_key: str = "unattributed",
 ) -> int:
     """Insert a percent_milestones row idempotently.
+
+    ``account_key`` (#341): the account dimension of the write. Default
+    ``"unattributed"`` mirrors the schema DEFAULT as a defensive backstop
+    (rev 4.1); the production writer (``maybe_record_milestone``) passes the
+    resolved account explicitly, enforced by the structural writer-audit test.
+    Participates in the ``UNIQUE(account_key, week_start_date, percent_threshold,
+    reset_event_id)`` dedup key so two accounts crossing the same threshold in
+    the same week each get their own row.
 
     ``as_of`` (DB journal redesign §5.2.3): overrides the ``captured_at_utc``
     wall-clock stamp with the record's capture time when the ingester drives
@@ -356,9 +405,10 @@ def insert_percent_milestone(
           usage_snapshot_id,
           cost_snapshot_id,
           five_hour_percent_at_crossing,
-          reset_event_id
+          reset_event_id,
+          account_key
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             as_of or now_utc_iso(),
@@ -373,6 +423,7 @@ def insert_percent_milestone(
             cost_snapshot_id,
             five_hour_percent_at_crossing,
             reset_event_id,
+            account_key,
         ),
     )
     if commit:
@@ -392,6 +443,7 @@ def insert_budget_milestone(
     consumption_pct: float,
     commit: bool = True,
     as_of: "str | None" = None,
+    account_key: str = "*",
 ) -> int:
     """INSERT OR IGNORE a budget threshold crossing into the unified vendor-tagged
     table (#143). Returns ``cur.rowcount`` (1 = genuinely new crossing, 0 =
@@ -407,7 +459,11 @@ def insert_budget_milestone(
     ``period`` (#137) is the configured period noun at crossing
     ('calendar-week'|'calendar-month'|'subscription-week'); it discriminates the
     UNIQUE key so calendar-week and calendar-month windows that share a start
-    instant don't collide. A NULL ``period`` is the pre-011 "unknown" sentinel
+    instant don't collide. ``account_key`` (#341 Step 4-eval) discriminates the
+    per-account ladder from the vendor-wide ladder: ``"*"`` (the schema DEFAULT +
+    this arg's default) is the vendor-wide row; a real account key is that
+    account's own ladder — ``UNIQUE(vendor, account_key, period_start_at, period,
+    threshold)``. A NULL ``period`` is the pre-011 "unknown" sentinel
     (only seeded migration rows carry it). ``alerted_at`` is left NULL — the
     caller stamps it in the SAME transaction BEFORE dispatching (set-then-dispatch
     invariant, CLAUDE.md Alerts gotcha). ``commit=False`` lets the caller bundle
@@ -416,11 +472,12 @@ def insert_budget_milestone(
     """
     cur = conn.execute(
         "INSERT OR IGNORE INTO budget_milestones "
-        "(vendor, period_start_at, period, threshold, budget_usd, spent_usd, "
-        " consumption_pct, crossed_at_utc) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(vendor, account_key, period_start_at, period, threshold, budget_usd, "
+        " spent_usd, consumption_pct, crossed_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(vendor),
+            str(account_key),
             period_start_at,
             period,
             int(threshold),
@@ -562,7 +619,8 @@ def _projected_levels_already_latched(
     return all(int(level) in have for level in levels)
 
 
-def _resolve_claude_budget_window(conn, now_utc, *, period, config, tz):
+def _resolve_claude_budget_window(conn, now_utc, *, period, config, tz,
+                                  window_account_key=None):
     """Resolve the Claude budget's ``(start_utc, end_utc)`` window for the
     configured ``period`` (calendar-period-codex-budgets generalization, spec
     §6). Subscription-week → the existing ``_resolve_current_budget_window``
@@ -570,14 +628,21 @@ def _resolve_claude_budget_window(conn, now_utc, *, period, config, tz):
     yet). Calendar period → the pure ``_resolve_calendar_window`` (derived purely
     from ``now`` + the period; NEVER ``None``). The dedup key column is now
     ``period_start_at`` (#143) — it carries the resolved PERIOD-start instant
-    (subscription-week OR calendar period-start)."""
+    (subscription-week OR calendar period-start).
+
+    ``window_account_key`` (#341, spec §6 `*`-anchor): scopes the
+    subscription-week snapshot window to one account (the active account for a
+    `*` ladder, the ladder's own account for a per-account ladder). ``None`` =
+    merged (byte-identical); calendar periods ignore it (pure calendar)."""
     c = _cctally()
     if period == "subscription-week":
-        return c._resolve_current_budget_window(conn, now_utc)
+        return c._resolve_current_budget_window(
+            conn, now_utc, account_key=window_account_key)
     return c._resolve_calendar_window(period, now_utc, config, tz)
 
 
-def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz):
+def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz,
+                           window_account_key=None):
     """Resolve the budget period-start instant for ``vendor`` (#143). CHEAP — does
     NO cost SUM, preserving the pre-probe-before-spend hot path (spec §4.2): the
     firing paths resolve this cheap window, pre-probe which thresholds are already
@@ -594,7 +659,8 @@ def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz):
     pre-snapshot)."""
     if vendor == "claude":
         window = _resolve_claude_budget_window(
-            conn, now_utc, period=period, config=config, tz=tz
+            conn, now_utc, period=period, config=config, tz=tz,
+            window_account_key=window_account_key,
         )
     else:
         window = _resolve_codex_budget_period_window(period, now_utc, config, tz)
@@ -604,20 +670,34 @@ def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz):
     return start_at
 
 
-def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc) -> float:
+def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc,
+                             account_key: str = "*") -> float:
     """Spend over ``[start_at, now]`` for ``vendor`` (#143) — the COSTLY leg,
     called only after the pre-probe finds pending thresholds (spec §4.2). claude
     routes through the Claude cost SUM (``mode="auto"``); codex through the Codex
-    cost SUM."""
+    cost SUM.
+
+    ``account_key`` (#341 Step 4-eval, spec §6): the vendor-wide sentinel ``"*"``
+    sums EVERY account's spend (including ``unattributed`` — the guaranteed-
+    complete vendor total), so it reads unscoped (``account_key=None`` on the
+    cost SUM). A REAL account scopes the sum to that account's stamped entries so
+    a per-account ladder counts only its own spend (unattributed spend can never
+    trip a per-account alert)."""
     c = _cctally()
+    scope = None if account_key == "*" else account_key
+    # Byte-stability: the vendor-wide (`*`) path calls with the EXACT legacy
+    # signature (no `account_key` kwarg), so existing cost-sum test doubles +
+    # every non-account install are untouched. Only a per-account ladder passes
+    # the kwarg (its doubles accept it).
+    extra = {} if scope is None else {"account_key": scope}
     if vendor == "claude":
-        return c._sum_cost_for_range(start_at, now_utc, mode="auto")
-    return c._sum_codex_cost_for_range(start_at, now_utc)
+        return c._sum_cost_for_range(start_at, now_utc, mode="auto", **extra)
+    return c._sum_codex_cost_for_range(start_at, now_utc, **extra)
 
 
 def _reconcile_budget_milestones_on_set(
     conn, *, vendor, target, thresholds, now_utc, period, config=None, tz=None,
-    as_of=None, commit=True,
+    as_of=None, commit=True, account_key: str = "*",
 ):
     """Forward-only-from-set reconcile for the budget axis (both vendors, #143):
     on `budget set`, every threshold ALREADY crossed for the current
@@ -644,7 +724,8 @@ def _reconcile_budget_milestones_on_set(
         return
     period_key = start_at.isoformat(timespec="seconds")
     spent = _budget_spend_for_vendor(
-        conn, vendor=vendor, start_at=start_at, now_utc=now_utc
+        conn, vendor=vendor, start_at=start_at, now_utc=now_utc,
+        account_key=account_key,
     )
     # target > 0 guaranteed by the caller (validated weekly_usd / amount_usd);
     # the else is belt-and-suspenders.
@@ -662,15 +743,17 @@ def _reconcile_budget_milestones_on_set(
                 consumption_pct=consumption_pct,
                 commit=False,
                 as_of=as_of,
+                account_key=account_key,
             )
-            # alerted_at UPDATE keys on the CONCRETE (vendor, period) (not the
-            # wildcard): only the row we just inserted is stamped, never a
-            # pre-011 NULL-period sibling (#137) or another vendor's row (#143).
+            # alerted_at UPDATE keys on the CONCRETE (vendor, account_key, period)
+            # (not the wildcard): only the row we just inserted is stamped, never
+            # a pre-011 NULL-period sibling (#137), another vendor's row (#143),
+            # or a different account's ladder (#341).
             conn.execute(
                 "UPDATE budget_milestones SET alerted_at = ? "
-                "WHERE vendor = ? AND period_start_at = ? AND period = ? "
-                "  AND threshold = ? AND alerted_at IS NULL",
-                (as_of or now_utc_iso(), vendor, period_key, period, t),
+                "WHERE vendor = ? AND account_key = ? AND period_start_at = ? "
+                "  AND period = ? AND threshold = ? AND alerted_at IS NULL",
+                (as_of or now_utc_iso(), vendor, account_key, period_key, period, t),
             )
     if commit:
         conn.commit()
@@ -690,7 +773,7 @@ def _resolve_codex_budget_period_window(period, now_utc, config, tz):
 
 def _budget_crossings(
     conn, *, vendor, period_key, period=None, thresholds, target, spent, now_utc,
-    as_of=None,
+    as_of=None, account_key: str = "*",
 ):
     """Shared INSERT-and-arm core for the budget axis (both vendors, #143): for
     every STILL-pending threshold that's been crossed at ``spent``, ``INSERT OR
@@ -727,17 +810,19 @@ def _budget_crossings(
                 consumption_pct=consumption_pct,
                 commit=False,
                 as_of=as_of,
+                account_key=account_key,
             )
             if inserted == 1:
                 crossed_at = as_of or now_utc_iso()
-                # alerted_at UPDATE keys on the CONCRETE (vendor, period) (#137 /
-                # #143): only the row just inserted is stamped, never a pre-011
-                # NULL-period sibling or another vendor's row.
+                # alerted_at UPDATE keys on the CONCRETE (vendor, account_key,
+                # period) (#137 / #143 / #341): only the row just inserted is
+                # stamped, never a pre-011 NULL-period sibling, another vendor's
+                # row, or a different account's ladder.
                 conn.execute(
                     "UPDATE budget_milestones SET alerted_at = ? "
-                    "WHERE vendor = ? AND period_start_at = ? AND period = ? "
-                    "  AND threshold = ? AND alerted_at IS NULL",
-                    (crossed_at, vendor, period_key, period, t),
+                    "WHERE vendor = ? AND account_key = ? AND period_start_at = ? "
+                    "  AND period = ? AND threshold = ? AND alerted_at IS NULL",
+                    (crossed_at, vendor, account_key, period_key, period, t),
                 )
                 fired.append((t, crossed_at, spent, target, consumption_pct))
     return fired
@@ -759,7 +844,11 @@ def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_o
     if not codex:
         return
     thresholds = codex.get("alert_thresholds") or []
-    if not (codex.get("alerts_enabled") and codex.get("amount_usd") and thresholds):
+    amount_usd = codex.get("amount_usd")
+    # Per-account Codex ladders (#341 Step 4-eval): reconcile each account too.
+    accounts = codex.get("accounts") or {}
+    if not (codex.get("alerts_enabled") and thresholds
+            and (amount_usd is not None or accounts)):
         return
     c = _cctally()
     own_conn = conn is None
@@ -767,21 +856,30 @@ def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_o
         import argparse
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
+        now_utc = _as_of_or_command(as_of)
         if own_conn:
             conn = open_db()
         try:
-            _reconcile_budget_milestones_on_set(
-                conn,
-                vendor="codex",
-                target=codex["amount_usd"],
-                thresholds=thresholds,
-                now_utc=_as_of_or_command(as_of),
-                period=codex["period"],
-                config=config,
-                tz=tz,
-                as_of=as_of,
-                commit=own_conn,
-            )
+            ladders = []
+            if amount_usd is not None:
+                ladders.append(("*", amount_usd))
+            ladders.extend((k, v) for k, v in accounts.items())
+            for acct_key, acct_usd in ladders:
+                _reconcile_budget_milestones_on_set(
+                    conn,
+                    vendor="codex",
+                    target=acct_usd,
+                    thresholds=thresholds,
+                    now_utc=now_utc,
+                    period=codex["period"],
+                    config=config,
+                    tz=tz,
+                    as_of=as_of,
+                    commit=False,
+                    account_key=acct_key,
+                )
+            if own_conn:
+                conn.commit()
         finally:
             if own_conn:
                 conn.close()
@@ -801,7 +899,13 @@ def _reconcile_budget_on_config_write(validated_budget, *, conn=None, as_of=None
     open/commit/close); ``as_of`` (ISO-Z) injects the capture time. Both
     defaults keep the legacy own-connection, wall-clock behavior."""
     thresholds = validated_budget.get("alert_thresholds") or []
-    if not (_budget_alerts_active(validated_budget) and thresholds):
+    alerts_enabled = bool(validated_budget.get("alerts_enabled"))
+    weekly_usd = validated_budget.get("weekly_usd")
+    # Per-account ladders (#341 Step 4-eval): reconcile each real account in
+    # `budget.accounts` too, so setting a per-account budget mid-week (already
+    # over) records the crossed thresholds as already-alerted WITHOUT dispatch.
+    accounts = validated_budget.get("accounts") or {}
+    if not thresholds or not alerts_enabled or (weekly_usd is None and not accounts):
         return
     c = _cctally()
     period = validated_budget.get("period", "subscription-week")
@@ -810,21 +914,30 @@ def _reconcile_budget_on_config_write(validated_budget, *, conn=None, as_of=None
         import argparse
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
+        now_utc = _as_of_or_command(as_of)
         if own_conn:
             conn = open_db()
         try:
-            _reconcile_budget_milestones_on_set(
-                conn,
-                vendor="claude",
-                target=validated_budget["weekly_usd"],
-                thresholds=thresholds,
-                now_utc=_as_of_or_command(as_of),
-                period=period,
-                config=config,
-                tz=tz,
-                as_of=as_of,
-                commit=own_conn,
-            )
+            ladders = []
+            if weekly_usd is not None:
+                ladders.append(("*", weekly_usd))
+            ladders.extend((k, v) for k, v in accounts.items())
+            for acct_key, acct_usd in ladders:
+                _reconcile_budget_milestones_on_set(
+                    conn,
+                    vendor="claude",
+                    target=acct_usd,
+                    thresholds=thresholds,
+                    now_utc=now_utc,
+                    period=period,
+                    config=config,
+                    tz=tz,
+                    as_of=as_of,
+                    commit=False,
+                    account_key=acct_key,
+                )
+            if own_conn:
+                conn.commit()
         finally:
             if own_conn:
                 conn.close()

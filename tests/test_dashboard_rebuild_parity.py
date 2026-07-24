@@ -1094,7 +1094,8 @@ def test_weekly_share_override_does_not_pollute_sync_cache(monkeypatch, tmp_path
         conn = ns["open_db"]()
         try:
             weeks = ns["_compute_subscription_weeks"](
-                conn, NOW_UTC - dt.timedelta(days=7 * 13), NOW_UTC
+                conn, NOW_UTC - dt.timedelta(days=7 * 13), NOW_UTC,
+                account_key=None,  # #341: explicit merged (all-accounts) read
             )
         finally:
             conn.close()

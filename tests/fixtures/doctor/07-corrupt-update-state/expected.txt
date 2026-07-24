@@ -25,8 +25,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/41 applied
-  ⚠ Pending migrations       41 pending
+  ✓ Migrations               0/42 applied
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -48,6 +48,11 @@ Data
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
   ✓ Conversation rollup      no data
+Accounts
+  ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Account registry         no accounts observed yet
+  ✓ Account attribution freshness no attribution activity recorded
+  ✓ Account attribution      usage attribution healthy
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -60,4 +65,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 37 OK · 6 WARN · 1 FAIL
+Summary: 41 OK · 6 WARN · 1 FAIL

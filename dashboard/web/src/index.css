@@ -1378,6 +1378,18 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-size: var(--fs-body); color: var(--text-dim); white-space: nowrap;
 }
 
+/* #341 Task 4 (Decision R4) — sessions + recent-alerts are labeled unfiltered
+   (never filtered) when an account focus is active, since conversations are out
+   of the account dimension this release and per-account alert-wire decoration is
+   a follow-up. A muted, non-interactive caption chip. */
+.sessions-unfiltered-note,
+.alerts-unfiltered-note {
+  display: inline-flex; align-items: center;
+  font-size: var(--fs-caption, var(--fs-body)); color: var(--text-dim);
+  white-space: nowrap; padding: 1px 8px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+}
+
 /* S3 (#264) — Session (title) + Cache columns. The Session cell is ALWAYS
    present; a gated-off / missing title renders a muted em-dash
    (.sess-title-empty). Content-sized-columns posture: size to content, but
@@ -6771,6 +6783,133 @@ mark.current {
   outline: none;
   box-shadow: var(--focus-ring);
 }
+
+/* #341 Task 4 — the per-account chip row (Q6 Option A). Reuses the source-seg
+   radiogroup vocabulary; wraps on narrow viewports (the sticky-topbar
+   nowrap-overflow gotcha applies — this row must flex-wrap, never nowrap). */
+.account-chip-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--panel-bg-2);
+}
+.account-chip {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: var(--space-1) var(--space-2);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.account-chip:hover { color: var(--text); }
+.account-chip.is-active {
+  background: var(--panel-bg);
+  color: var(--accent-blue);
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
+.account-chip.is-dimmed { opacity: 0.6; }
+.account-chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.account-chip-hint {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.account-chip.is-active .account-chip-hint { color: var(--accent-blue); }
+
+/* #341 Task 4 — the unified per-account hero cards. A wrapping row of compact
+   cards under the hero; each card's accent is the deterministic account color
+   (--account-color). The unattributed card renders dimmed with totals only. */
+.account-hero-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+.account-hero-card {
+  flex: 1 1 220px;
+  min-width: 200px;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--account-color, var(--accent-blue));
+  border-radius: 8px;
+  padding: var(--space-3);
+  background: var(--panel-bg-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.account-hero-card.is-dimmed { opacity: 0.62; }
+.account-hero-card.is-focused { box-shadow: inset 0 0 0 1px var(--account-color, var(--accent-blue)); }
+.account-hero-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.account-hero-card-label {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
+}
+.account-hero-card-plan {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.account-hero-card-active { color: var(--account-color, var(--accent-blue)); font-size: 9px; }
+.account-hero-card-bars { display: flex; flex-direction: column; gap: 4px; }
+.account-hero-bar {
+  display: grid;
+  grid-template-columns: 32px 1fr 40px;
+  align-items: center;
+  gap: var(--space-2);
+}
+.account-hero-bar-label { font-size: 10.5px; color: var(--text-dim); font-family: var(--font-mono); }
+.account-hero-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-bg);
+  overflow: hidden;
+}
+.account-hero-bar-fill {
+  height: 100%;
+  background: var(--account-color, var(--accent-blue));
+  border-radius: 3px;
+}
+.account-hero-bar-value {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  text-align: right;
+}
+.account-hero-card-foot {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.account-hero-card-spend { font-family: var(--font-mono); font-weight: 700; color: var(--text); }
+.account-hero-card-reset,
+.account-hero-card-note { font-size: 11px; color: var(--text-dim); }
 
 /* Active-source status chip (§6.8) — distinct from the global SyncChip. Reuses
    the existing chip severity vocabulary rather than inventing new primitives. */

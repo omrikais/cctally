@@ -302,6 +302,20 @@ def _add_source_args(
         )
 
 
+def _add_account_arg(parser: argparse.ArgumentParser) -> None:
+    """Attach the ``--account <ref>`` render filter (#341, spec §3).
+
+    Default ``None`` -> the merged view, byte-identical to today (R8). The ref is
+    resolved at command time via ``_cctally_account.resolve_account_filter``
+    (case-insensitive label -> email -> unique key-prefix; ``unattributed``
+    accepted literally; ambiguous/unknown -> exit 2). Idempotent per parser."""
+    parser.add_argument(
+        "--account", metavar="REF", default=None,
+        help="Scope output to one account (label / email / account-key prefix / "
+             "'unattributed'). Ambiguous or unknown ref exits 2.",
+    )
+
+
 def _add_share_args(
     parser, *, has_status_line: bool = False, json_dest: str = "json",
 ) -> None:
@@ -509,6 +523,7 @@ def _build_daily_parser(subparsers, name, *, help_text, xref):
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)
     _add_share_args(p)
+    _add_account_arg(p)
     p.set_defaults(func=c.cmd_daily)
     return p
 
@@ -561,6 +576,7 @@ def _build_monthly_parser(subparsers, name, *, help_text, xref):
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)
     _add_share_args(p)
+    _add_account_arg(p)
     p.set_defaults(func=c.cmd_monthly)
     return p
 
@@ -603,6 +619,7 @@ def _build_weekly_parser(subparsers, name, *, help_text, xref):
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)
     _add_share_args(p)
+    _add_account_arg(p)
     p.set_defaults(func=c.cmd_weekly)
     return p
 
@@ -656,6 +673,7 @@ def _build_session_parser(subparsers, name, *, help_text, xref):
     _add_ccusage_alias_args(p, ansi_emit=False)
     _add_mode_arg(p)
     _add_share_args(p)
+    _add_account_arg(p)
     p.set_defaults(func=c.cmd_session)
     return p
 
@@ -1083,6 +1101,9 @@ def _add_codex_quota_common_args(parser, *, sync_by_default: bool = True) -> Non
         "--json", action="store_true",
         help="Emit stamped schemaVersion:1 JSON.",
     )
+    # #341 --account: scope the native quota views to one Codex account
+    # (provider="codex"). Shared by all 5 quota leaves via this chokepoint.
+    _add_account_arg(parser)
 
 
 def _build_codex_quota_parser(subparsers, name, *, help_text, xref=None):
@@ -1374,6 +1395,7 @@ def _build_report_parser(subparsers, name, *, help_text, xref=None, fixed_source
     )
     _add_source_args(pr, fixed_source=fixed_source, speed=True)
     _add_share_args(pr)
+    _add_account_arg(pr)
     pr.set_defaults(func=c.cmd_report)
 
 def _build_forecast_parser(subparsers, name, *, help_text, xref=None):
@@ -1424,6 +1446,7 @@ def _build_forecast_parser(subparsers, name, *, help_text, xref=None):
                     help="Color output control (also honors NO_COLOR).")
     fc.add_argument("--as-of", dest="as_of", default=None, help=argparse.SUPPRESS)
     _add_share_args(fc, has_status_line=True)
+    _add_account_arg(fc)
     fc.set_defaults(func=c.cmd_forecast)
 
 def _build_budget_parser(subparsers, name, *, help_text, xref=None):
@@ -1545,6 +1568,7 @@ def _build_percent_breakdown_parser(subparsers, name, *, help_text, xref=None):
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_account_arg(pb)
     pb.set_defaults(func=c.cmd_percent_breakdown)
 
 def _build_five_hour_breakdown_parser(subparsers, name, *, help_text, xref=None):
@@ -1606,6 +1630,7 @@ def _build_five_hour_breakdown_parser(subparsers, name, *, help_text, xref=None)
         help="Display timezone: local, utc, or IANA name. "
              "Overrides config display.tz for this call.",
     )
+    _add_account_arg(fhbd)
     fhbd.set_defaults(func=c.cmd_five_hour_breakdown)
 
 def _build_tui_parser(subparsers, name, *, help_text, xref=None):
@@ -2026,6 +2051,7 @@ def _build_cache_report_parser(subparsers, name, *, help_text, xref=None, fixed_
     _add_ccusage_alias_args(pc, ansi_emit=False)
     _add_source_args(pc, fixed_source=fixed_source, speed=True)
     _add_share_args(pc)
+    _add_account_arg(pc)
     pc.set_defaults(func=c.cmd_cache_report)
 
 def _build_range_cost_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
@@ -2093,6 +2119,7 @@ def _build_range_cost_parser(subparsers, name, *, help_text, xref=None, fixed_so
     _add_ccusage_alias_args(rc, ansi_emit=False)
     _add_source_args(rc, fixed_source=fixed_source, speed=True)
     _add_share_args(rc)
+    _add_account_arg(rc)
     rc.set_defaults(func=c.cmd_range_cost)
 
 def _build_five_hour_blocks_parser(subparsers, name, *, help_text, xref=None):
@@ -2150,6 +2177,7 @@ def _build_five_hour_blocks_parser(subparsers, name, *, help_text, xref=None):
     _add_ccusage_alias_args(fhb, ansi_emit=False)
     _add_mode_arg(fhb, noop=True)
     _add_share_args(fhb)
+    _add_account_arg(fhb)
     fhb.set_defaults(func=c.cmd_five_hour_blocks)
 
 def _build_cache_sync_parser(subparsers, name, *, help_text, xref=None):
@@ -2266,6 +2294,7 @@ def _build_project_parser(subparsers, name, *, help_text, xref=None, fixed_sourc
     _add_ccusage_alias_args(p_project, ansi_emit=True)
     _add_source_args(p_project, fixed_source=fixed_source, speed=True)
     _add_share_args(p_project)
+    _add_account_arg(p_project)
     p_project.set_defaults(func=c.cmd_project)
 
 def _build_diff_parser(subparsers, name, *, help_text, xref=None, fixed_source=None):
@@ -2316,6 +2345,7 @@ def _build_diff_parser(subparsers, name, *, help_text, xref=None, fixed_source=N
     _add_ccusage_alias_args(diff_p, ansi_emit=True)
     _add_source_args(diff_p, fixed_source=fixed_source, speed=True)
     _add_share_args(diff_p, json_dest="emit_json")
+    _add_account_arg(diff_p)
     diff_p.set_defaults(func=c.cmd_diff)
 
 def _build_claude_parser(subparsers, name, *, help_text, xref=None):
@@ -2518,6 +2548,62 @@ def _build_telemetry_parser(subparsers, name, *, help_text, xref=None):
         help="Emit the status as JSON (status output only).",
     )
     tele_p.set_defaults(func=c.cmd_telemetry)
+
+def _build_account_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `account` parser (registered via _REGISTRATION; #341 Task 3).
+
+    ``list`` / ``show <ref>`` / ``label <ref> <name>`` over the accounts
+    registry. Call-time ``c = _cctally()`` binding, mirroring the config/db
+    nested-subcommand shape.
+    """
+    c = _cctally()
+    acct_p = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent("""\
+                    Inspect the per-provider account registry (multi-account, #341).
+
+                    cctally observes which Claude/Codex account each usage sample was
+                    written under (from the provider's own on-disk credential state)
+                    and records milestones/quota/alerts per account. This subcommand
+                    lists the observed accounts, shows one account's identity +
+                    attribution summary, and sets a durable friendly label.
+
+                    A <ref> is resolved case-insensitively by label, then email, then
+                    a unique account-key prefix; the literal 'unattributed' is accepted
+                    for the pre-feature / unresolved bucket. An ambiguous or unknown ref
+                    exits 2 with the candidate keys on stderr.
+
+                    Actions:
+                      list            List every observed account (add --json for the
+                                      stamped-first camelCase envelope).
+                      show <ref>      Show one account's identity + attribution summary.
+                      label <ref> <name>
+                                      Set a durable user label (survives db rebuild).
+
+                    Examples:
+                      cctally account list
+                      cctally account list --json
+                      cctally account show work@example.com
+                      cctally account label 3f2a1b work
+                """),
+    )
+    acct_sub = acct_p.add_subparsers(dest="account_action", required=True)
+    acct_list = acct_sub.add_parser("list", help="List observed accounts")
+    acct_list.add_argument("--json", dest="emit_json", action="store_true",
+                           help="Emit the stamped-first camelCase JSON envelope.")
+    acct_list.set_defaults(func=c.cmd_account)
+    acct_show = acct_sub.add_parser("show", help="Show one account's detail")
+    acct_show.add_argument("ref", help="Account ref (label / email / key prefix)")
+    acct_show.add_argument("--json", dest="emit_json", action="store_true",
+                           help="Emit the stamped-first camelCase JSON envelope.")
+    acct_show.set_defaults(func=c.cmd_account)
+    acct_label = acct_sub.add_parser("label", help="Set a durable account label")
+    acct_label.add_argument("ref", help="Account ref (label / email / key prefix)")
+    acct_label.add_argument("label", help="New label")
+    acct_label.set_defaults(func=c.cmd_account)
+
 
 def _build_alerts_parser(subparsers, name, *, help_text, xref=None):
     """Build the `alerts` parser (registered via _REGISTRATION; #279 S6 W3).
@@ -3277,6 +3363,7 @@ _REGISTRATION = (
     _Reg('claude', _build_claude_parser, "Claude-source reports (drop-in for `ccusage claude …`)", None, None),
     _Reg('codex', _build_codex_parser, "Codex-source reports (drop-in for `ccusage codex …`)", None, None),
     _Reg('config', _build_config_parser, "Get / set / unset persisted user preferences", None, None),
+    _Reg('account', _build_account_parser, "Inspect per-provider account registry (list / show / label)", None, None),
     _Reg('telemetry', _build_telemetry_parser, "Show or change anonymous install-count telemetry", None, None),
     _Reg('alerts', _build_alerts_parser, "Manage threshold alerts", None, None),
     _Reg('setup', _build_setup_parser, "Install cctally into Claude Code (hooks + symlinks)", None, None),

@@ -44,12 +44,13 @@ from _cctally_core import (
     make_week_ref,
     get_latest_usage_for_week,
     now_utc_iso,
+    _resolve_active_claude_account,
 )
 
 
 def cmd_sync_week(
     args: argparse.Namespace, *, conn=None, as_of: "str | None" = None,
-    journal: "tuple | None" = None,
+    journal: "tuple | None" = None, account_key: str = "unattributed",
 ) -> int:
     """Compute + persist the week's cost snapshot.
 
@@ -103,6 +104,11 @@ def cmd_sync_week(
             project=args.project,
             start_iso_override=selection.start_iso_override,
             end_iso_override=selection.end_iso_override,
+            # #341 P2-CQ2: the cost VALUE is scoped to the same account the
+            # snapshot is stamped for (below), so a per-account snapshot no longer
+            # carries the merged cost of every account sharing the week. Default
+            # `unattributed` matches all-NULL legacy rows -> byte-stable.
+            account_key=account_key,
         )
         week_start_at = selection.start_iso_override or format_local_iso(week_start, end_of_day=False)
         week_end_at = selection.end_iso_override or format_local_iso(week_end, end_of_day=True)
@@ -120,6 +126,11 @@ def cmd_sync_week(
             commit=own_conn,
             as_of=as_of,
             journal=journal,
+            # Per-account cost materialization (#341 P2-1, spec §3): the snapshot
+            # lands under the active/crossing Claude account so the account-scoped
+            # milestone cost read + `_reset_aware_floor` see it. Default
+            # `unattributed` keeps single-account / legacy installs byte-stable.
+            account_key=account_key,
         )
 
         week_ref = make_week_ref(
@@ -178,19 +189,28 @@ def _cmd_sync_week_via_ingest(c, args: argparse.Namespace) -> int:
     dispatch maps it to the same exit code."""
     import _cctally_journal as _jr
     import _lib_journal as _lj
+    import _lib_accounts
 
+    # Per-account materialization (#341 P2-1, spec §3): resolve the active Claude
+    # account and carry it in the op payload so the fold stamps the cost snapshot
+    # under it (rebuild-deterministic). Byte-safe: the reserved sentinel OMITS
+    # the field, keeping a single-account / no-`~/.claude.json` op line identical.
+    _sync_account = _resolve_active_claude_account()
+    _sync_payload = {
+        "kind": "sync_week",
+        "week_start": args.week_start,
+        "week_end": args.week_end,
+        "week_start_name": args.week_start_name,
+        "mode": args.mode,
+        "offline": args.offline,
+        "project": args.project,
+    }
+    if _sync_account != _lib_accounts.UNATTRIBUTED:
+        _sync_payload["account_key"] = _sync_account
     op = _lj.make_op(
         at=now_utc_iso(),
         src="sync-week",
-        payload={
-            "kind": "sync_week",
-            "week_start": args.week_start,
-            "week_end": args.week_end,
-            "week_start_name": args.week_start_name,
-            "mode": args.mode,
-            "offline": args.offline,
-            "project": args.project,
-        },
+        payload=_sync_payload,
     )
     _jr.append_record(op)
     res = _jr.run_stats_ingest(mode="authoritative")

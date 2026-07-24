@@ -613,22 +613,59 @@ def _epoch_from_iso(value: object) -> int:
     return int(_cctally_core.parse_iso_datetime(str(value), "statusline projection").timestamp())
 
 
+def _statusline_active_account() -> "str | None":
+    """The active Claude ``account_key`` to scope the statusline projection to
+    (#341, spec §3 write-path semantics — statusline resolves the active account
+    once per read and scopes its reset-aware clamps to it).
+
+    Torn-handling (reviewer-specified): a TORN ``~/.claude.json`` read keeps the
+    merged (``None``) behavior — never mis-stamp against a half-written file;
+    *identified* returns the real key; *stably-absent* / api-key returns the
+    ``unattributed`` sentinel. For a <=1-real-account install every stats row
+    defaults to ``unattributed``, so the scoped clamp matches all of them and
+    the rendered output stays byte-frozen (R8). Best-effort / never-raise: any
+    failure falls back to the merged read."""
+    try:
+        ident = _cctally_core._resolve_active_claude_identity()
+        return None if ident.get("status") == "torn" else ident.get("account_key")
+    except Exception:
+        return None
+
+
 def _read_db_projection_once() -> "_candidates.DbProjection":
     conn = open_db()
+    _sl_account = _statusline_active_account()
+    # #341 (spec §3 write-path): the statusline resolves the active account once
+    # per read and scopes its ENTIRE projection to it — candidate selection AND
+    # grouping, not only the reset-aware clamps. Scoping the two candidate
+    # SELECTs here means one account's interleaved snapshots can never become
+    # another account's projection candidate. Same three-valued semantics as
+    # `_reset_aware_floor`: a real key / the `unattributed` sentinel scopes to
+    # `account_key = ?`; `None` (TORN read) keeps the merged/last-known set —
+    # never mis-scope against a half-written identity file. For a <=1-real-account
+    # install every stats row defaults to `unattributed` and the active read
+    # resolves to `unattributed`, so the predicate matches all rows and the
+    # rendered output stays byte-frozen (R8).
+    _acct_pred = "" if _sl_account is None else " AND account_key = ?"
+    _acct_params: tuple = () if _sl_account is None else (_sl_account,)
     try:
         weekly_rows = conn.execute(
             "SELECT id, weekly_percent, week_start_date, week_start_at, week_end_at, "
             "       captured_at_utc, source "
             "FROM weekly_usage_snapshots "
-            "WHERE weekly_percent IS NOT NULL AND week_end_at IS NOT NULL "
-            "ORDER BY unixepoch(captured_at_utc) DESC, id DESC"
+            "WHERE weekly_percent IS NOT NULL AND week_end_at IS NOT NULL"
+            + _acct_pred +
+            " ORDER BY unixepoch(captured_at_utc) DESC, id DESC",
+            _acct_params,
         ).fetchall()
         five_rows = conn.execute(
             "SELECT id, five_hour_percent, five_hour_resets_at, five_hour_window_key, "
             "       captured_at_utc, source "
             "FROM weekly_usage_snapshots "
-            "WHERE five_hour_percent IS NOT NULL AND five_hour_resets_at IS NOT NULL "
-            "ORDER BY unixepoch(captured_at_utc) DESC, id DESC"
+            "WHERE five_hour_percent IS NOT NULL AND five_hour_resets_at IS NOT NULL"
+            + _acct_pred +
+            " ORDER BY unixepoch(captured_at_utc) DESC, id DESC",
+            _acct_params,
         ).fetchall()
 
         weekly_groups: dict[int, list] = {}
@@ -660,6 +697,7 @@ def _read_db_projection_once() -> "_candidates.DbProjection":
                 str(reference["week_start_date"]),
                 str(week_start_at),
                 str(week_end_at),
+                account_key=_sl_account,
             )
             floor_epoch = _epoch_from_iso(floor) if floor else 0
             eligible = [
@@ -1573,6 +1611,14 @@ def _build_statusline_injections(warn_once):
         c = _cctally()
         five_hwm = None
         seven_hwm = None
+        # #341 (spec §3): scope the 7d reset-aware clamp to the active Claude
+        # account (torn -> merged None; identified -> real key; absent ->
+        # `unattributed`). Byte-frozen for <=1 real account (all rows default
+        # `unattributed`). `_resolve_active_claude_identity` is mtime-cached, so
+        # resolving here (as well as in `_read_db_projection_once`) is a cache hit.
+        _sl_account = _statusline_active_account()
+        _acct_pred = "" if _sl_account is None else " AND account_key = ?"
+        _acct_params = () if _sl_account is None else (_sl_account,)
         try:
             conn = open_db()
         except Exception:
@@ -1629,21 +1675,22 @@ def _build_statusline_injections(warn_once):
                     floor_iso = c._reset_aware_floor(
                         conn, week_start_date,
                         week_start_dt.isoformat(), week_end_dt.isoformat(),
+                        account_key=_sl_account,
                     )
                     if floor_iso is not None:
                         row = conn.execute(
                             "SELECT MAX(weekly_percent) "
                             "FROM weekly_usage_snapshots "
-                            "WHERE week_start_date = ? "
+                            "WHERE week_start_date = ?" + _acct_pred + " "
                             "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
-                            (week_start_date, floor_iso),
+                            (week_start_date, *_acct_params, floor_iso),
                         ).fetchone()
                     else:
                         row = conn.execute(
                             "SELECT MAX(weekly_percent) "
                             "FROM weekly_usage_snapshots "
-                            "WHERE week_start_date = ?",
-                            (week_start_date,),
+                            "WHERE week_start_date = ?" + _acct_pred,
+                            (week_start_date, *_acct_params),
                         ).fetchone()
                     if row and row[0] is not None:
                         seven_hwm = float(row[0])

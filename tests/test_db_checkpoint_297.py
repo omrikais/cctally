@@ -15,6 +15,7 @@ An idle (committed, no txn) connection pins no read snapshot, so the handler's
 separate raw connection can still TRUNCATE the WAL.
 """
 import argparse
+import fcntl
 import importlib
 import json
 import os
@@ -86,6 +87,51 @@ def test_checkpoint_busy_exit3(tmp_path, monkeypatch):
         assert os.path.getsize(str(db) + "-wal") > 0
     finally:
         pin.close()
+        writer.close()
+
+
+def test_cache_checkpoint_defers_while_global_writer_flock_is_held(
+    tmp_path, monkeypatch
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    db = tmp_path / "cache.db"
+    writer = _grow(db)
+    lock_path = tmp_path / "cache.db.lock"
+    monkeypatch.setattr(core, "CACHE_DB_PATH", db)
+    monkeypatch.setattr(core, "CACHE_LOCK_PATH", lock_path)
+    held = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        rc = dbmod.cmd_db_checkpoint(_args(busy_timeout_ms=100))
+        assert rc == 3
+        assert os.path.getsize(str(db) + "-wal") > 0
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        writer.close()
+
+
+def test_cache_checkpoint_defers_during_exclusive_maintenance(
+    tmp_path, monkeypatch
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    db = tmp_path / "cache.db"
+    writer = _grow(db)
+    maintenance_path = tmp_path / "cache.db.maintenance.lock"
+    monkeypatch.setattr(core, "CACHE_DB_PATH", db)
+    monkeypatch.setattr(core, "CACHE_LOCK_MAINTENANCE_PATH", maintenance_path)
+    monkeypatch.setattr(core, "CACHE_LOCK_PATH", tmp_path / "cache.db.lock")
+    held = os.open(str(maintenance_path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        rc = dbmod.cmd_db_checkpoint(_args(busy_timeout_ms=100))
+        assert rc == 3
+        assert os.path.getsize(str(db) + "-wal") > 0
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
         writer.close()
 
 

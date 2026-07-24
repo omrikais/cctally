@@ -183,11 +183,159 @@ def _codex_lifecycle_activity_24h(
     return records
 
 
+def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
+    """Best-effort account-attribution state for the doctor `accounts.*` legs
+    (#341). Never raises: identity + registry reads are read-only and each guard
+    swallows OperationalError so a legacy / pre-account stats.db degrades to the
+    empty (all-OK) shape."""
+    state: dict = {
+        "claude_identity_status": None, "claude_email": None,
+        "real_account_count": 0, "by_provider": {}, "missing_provider": 0,
+        "freshest_last_seen_age_s": None,
+        "recent_attributed": 0, "recent_unattributed": 0,
+    }
+    try:
+        ident = _cctally_core._resolve_active_claude_identity()
+        state["claude_identity_status"] = ident.get("status")
+        state["claude_email"] = ident.get("email")
+    except Exception:
+        pass
+    if not _cctally_core.DB_PATH.exists():
+        return state
+    try:
+        conn = sqlite3.connect(f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return state
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT provider, account_key, last_seen_utc FROM accounts"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            # OperationalError (table missing) OR a corrupt / non-DB file
+            # ("file is not a database") -> degrade to the empty (all-OK) shape.
+            rows = []
+        by_provider: dict = {}
+        missing = 0
+        freshest = None
+        for provider, account_key, last_seen in rows:
+            if not provider:
+                missing += 1
+            if account_key and account_key != "unattributed":
+                p = provider or "?"
+                by_provider[p] = by_provider.get(p, 0) + 1
+            if last_seen:
+                try:
+                    ls = parse_iso_datetime(
+                        last_seen, "accounts.last_seen_utc"
+                    ).astimezone(dt.timezone.utc)
+                    if freshest is None or ls > freshest:
+                        freshest = ls
+                except Exception:
+                    pass
+        state["by_provider"] = by_provider
+        state["real_account_count"] = sum(by_provider.values())
+        state["missing_provider"] = missing
+        if freshest is not None:
+            state["freshest_last_seen_age_s"] = max(
+                0, int((now_utc - freshest).total_seconds()))
+        cutoff = (now_utc - dt.timedelta(days=7)).astimezone(
+            dt.timezone.utc).isoformat()
+        try:
+            for account_key, cnt in conn.execute(
+                "SELECT account_key, COUNT(*) FROM weekly_usage_snapshots "
+                "WHERE captured_at_utc >= ? GROUP BY account_key", (cutoff,)
+            ).fetchall():
+                if account_key and account_key != "unattributed":
+                    state["recent_attributed"] += int(cnt)
+                else:
+                    state["recent_unattributed"] += int(cnt)
+        except sqlite3.DatabaseError:
+            pass
+    finally:
+        conn.close()
+    return state
+
+
 def doctor_gather_state(
     *,
     now_utc: "dt.datetime | None" = None,
     runtime_bind: "str | None" = None,
     deep: bool = False,
+):
+    """Gather doctor state while excluding cache-family replacement.
+
+    Doctor is read-only, so it never creates the maintenance lock.  When the
+    lock already exists it holds maintenance-shared from the marker check
+    through every cache probe.  A live/stale marker or a pending quarantine
+    suppresses all raw SQLite cache opens; when a cache exists but its lock is
+    absent, probes also degrade rather than racing a newly starting repair.
+    """
+    cache_lock = None
+    cache_probe_allowed = not _cctally_core.CACHE_DB_PATH.exists()
+    cache_repair_marker = {
+        "exists": False,
+        "live": None,
+        "reason": None,
+    }
+    try:
+        lock_path = _cctally_core.CACHE_LOCK_MAINTENANCE_PATH
+        if lock_path.exists():
+            cache_lock = open(lock_path, "r")
+            fcntl.flock(cache_lock, fcntl.LOCK_SH)
+            cache_probe_allowed = True
+
+        c = _cctally()
+        db_mod = c._load_sibling("_cctally_db")
+        repair_marker = db_mod._repair_marker_path(
+            _cctally_core.CACHE_DB_PATH
+        )
+        pending = db_mod._quarantine_pending_path(
+            _cctally_core.CACHE_DB_PATH
+        )
+        if repair_marker.exists():
+            live, reason = db_mod._repair_marker_is_live(repair_marker)
+            cache_repair_marker = {
+                "exists": True,
+                "live": live,
+                "reason": reason,
+            }
+            cache_probe_allowed = False
+        elif pending.exists():
+            cache_repair_marker = {
+                "exists": True,
+                "live": False,
+                "reason": "interrupted quarantine is pending",
+            }
+            cache_probe_allowed = False
+
+        if not cache_probe_allowed and cache_lock is not None:
+            fcntl.flock(cache_lock, fcntl.LOCK_UN)
+            cache_lock.close()
+            cache_lock = None
+
+        return _doctor_gather_state_impl(
+            now_utc=now_utc,
+            runtime_bind=runtime_bind,
+            deep=deep,
+            _cache_probe_allowed=cache_probe_allowed,
+            _cache_repair_marker=cache_repair_marker,
+        )
+    finally:
+        if cache_lock is not None:
+            try:
+                fcntl.flock(cache_lock, fcntl.LOCK_UN)
+            finally:
+                cache_lock.close()
+
+
+def _doctor_gather_state_impl(
+    *,
+    now_utc: "dt.datetime | None" = None,
+    runtime_bind: "str | None" = None,
+    deep: bool = False,
+    _cache_probe_allowed: bool,
+    _cache_repair_marker: dict,
 ):
     """I/O chokepoint for `cctally doctor` (spec §7.2).
 
@@ -313,14 +461,32 @@ def doctor_gather_state(
     # uv==1000 as HEALTHY (not a #145 version-ahead FAIL). registry_size stays the
     # frozen legacy head (13) and serves as the legacy-range boundary.
     stats_db_status["epoch"] = _cctally_core.STATS_INDEX_EPOCH
-    try:
-        cache_db_status = c._db_status_for(_cctally_core.CACHE_DB_PATH, c._CACHE_MIGRATIONS, "cache.db")
-        if not _cctally_core.CACHE_DB_PATH.exists():
-            cache_db_status["_file_exists"] = False
-    except sqlite3.Error as exc:
-        cache_db_status = {"path": str(_cctally_core.CACHE_DB_PATH), "user_version": 0,
-                           "registry_size": len(c._CACHE_MIGRATIONS),
-                           "migrations": [], "_open_error": str(exc)}
+    if _cache_probe_allowed:
+        try:
+            cache_db_status = c._db_status_for(
+                _cctally_core.CACHE_DB_PATH,
+                c._CACHE_MIGRATIONS,
+                "cache.db",
+            )
+            if not _cctally_core.CACHE_DB_PATH.exists():
+                cache_db_status["_file_exists"] = False
+        except sqlite3.Error as exc:
+            cache_db_status = {
+                "path": str(_cctally_core.CACHE_DB_PATH),
+                "user_version": 0,
+                "registry_size": len(c._CACHE_MIGRATIONS),
+                "migrations": [],
+                "_open_error": str(exc),
+            }
+    else:
+        cache_db_status = {
+            "path": str(_cctally_core.CACHE_DB_PATH),
+            "user_version": 0,
+            "registry_size": len(c._CACHE_MIGRATIONS),
+            "migrations": [],
+            "_open_error": "cache maintenance excludes read probes",
+        }
+    cache_repair_marker = _cache_repair_marker
 
     # ── Data freshness ───────────────────────────────────────────────
     latest_snapshot_at = None
@@ -427,7 +593,7 @@ def doctor_gather_state(
     cache_db_page_count = None
     cache_db_freelist_count = None
     try:
-        if _cctally_core.CACHE_DB_PATH.exists():
+        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 try:
@@ -562,7 +728,7 @@ def doctor_gather_state(
     codex_project_metadata_health = None
     codex_project_metadata_error = None
     try:
-        if _cctally_core.CACHE_DB_PATH.exists():
+        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 row = conn.execute(
@@ -619,7 +785,11 @@ def doctor_gather_state(
     # inspector supplies the exact owned-hook state without exposing paths.
     codex_quota_windows: list[dict] = []
     try:
-        observations = c._cctally_quota.load_codex_quota_observations()
+        observations = (
+            c._cctally_quota.load_codex_quota_observations()
+            if _cache_probe_allowed
+            else ()
+        )
         by_identity: dict[object, list] = {}
         for observation in observations:
             by_identity.setdefault(observation.identity, []).append(observation)
@@ -672,7 +842,7 @@ def doctor_gather_state(
     # ── Parse health (#279 S2 F5a) ───────────────────────────────────
     parse_health_claude = parse_health_codex = None
     try:
-        if _cctally_core.CACHE_DB_PATH.exists():
+        if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 for _key in ("parse_health_claude", "parse_health_codex"):
@@ -702,7 +872,10 @@ def doctor_gather_state(
                               ("cache", _cctally_core.CACHE_DB_PATH)):
             _result = None
             try:
-                if _path.exists():
+                if (
+                    _path.exists()
+                    and (_label != "cache" or _cache_probe_allowed)
+                ):
                     _conn = sqlite3.connect(str(_path))
                     try:
                         _row = _conn.execute(
@@ -871,19 +1044,18 @@ def doctor_gather_state(
     # the rest of the report is unaffected — same posture as the cache reads
     # above. `_pricing_observed_models` honors the no-mutation contract.
     pricing_coverage = None
-    try:
-        observed = c._pricing_observed_models(now_utc)
-        # Detection-only: pass warn=False so finding an unpriced model here does
-        # NOT fire the cost-engine's `[cost] unknown model` stderr warning (this
-        # is a read-only diagnostic, and the warning would also poison the
-        # dedup set, suppressing a later genuine cost-path warning).
-        pricing_coverage = c.classify_coverage(
-            observed,
-            lambda m: c._resolve_model_pricing(m, warn=False),
-            c._is_codex_fallback,
-        )
-    except Exception:
-        pricing_coverage = None
+    if _cache_probe_allowed:
+        try:
+            observed = c._pricing_observed_models(now_utc)
+            # Detection-only: pass warn=False so finding an unpriced model here
+            # does NOT fire the cost-engine's unknown-model warning.
+            pricing_coverage = c.classify_coverage(
+                observed,
+                lambda m: c._resolve_model_pricing(m, warn=False),
+                c._is_codex_fallback,
+            )
+        except Exception:
+            pricing_coverage = None
 
     # ── Meta ─────────────────────────────────────────────────────────
     # ── Journal (DB journal redesign §9) ─────────────────────────────
@@ -1100,6 +1272,9 @@ def doctor_gather_state(
         journal_hw_segment=journal_hw_segment,
         journal_cursor_segment=journal_cursor_segment,
         journal_heal_incidents=journal_heal_incidents,
+        # Multi-account attribution legs (#341).
+        accounts_state=_gather_accounts_state(now_utc),
+        cache_repair_marker=cache_repair_marker,
     )
 
 

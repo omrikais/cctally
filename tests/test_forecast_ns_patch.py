@@ -100,7 +100,7 @@ def test_cmd_report_resolves_view_and_share_through_namespace(cctally_mod, monke
     # ns → namespace-patchable (accessor-routed). Return a minimal non-empty list
     # of the real WeekRef so the `if not weeks:` guard is passed and the path
     # reaches build_trend_view.
-    def spy_weeks(conn, limit):
+    def spy_weeks(conn, limit, **kwargs):  # **kwargs absorbs #341 account_key=
         calls["weeks"] += 1
         return [mod.make_week_ref(
             week_start_date="2026-01-05", week_end_date="2026-01-11",

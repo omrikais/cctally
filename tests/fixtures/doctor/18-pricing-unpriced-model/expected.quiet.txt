@@ -8,12 +8,13 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       41 pending
+  ⚠ Pending migrations       42 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data
   ⚠ Claude cache             1 entries; last sync 172800s ago (>24h)
       → Run `cctally cache-sync --rebuild`
+Accounts
 Pricing
   ⚠ Coverage                 1 unpriced (Claude $0)
       → Run `cctally pricing-check`, then update CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING in bin/_lib_pricing.py
@@ -22,4 +23,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 38 OK · 6 WARN · 0 FAIL
+Summary: 42 OK · 6 WARN · 0 FAIL

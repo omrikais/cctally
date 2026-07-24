@@ -1777,3 +1777,122 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
     finally:
         cache.close()
         stats.close()
+
+
+# ==========================================================================
+# #341 finding 9 — account registry / active-identity digest invalidation.
+# An account SWITCH with zero new ingested rows must still surface: the digest
+# folds into each source's data_version + the dispatch/idle signature so the
+# next tick rebuilds the source state (flipping the `active` marker).
+# ==========================================================================
+
+def _seed_accounts(stats, rows):
+    for r in rows:
+        stats.execute(
+            "INSERT INTO accounts (account_key, provider, natural_id, email, "
+            "label, plan_type, label_source, first_seen_utc, last_seen_utc) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (r["account_key"], r["provider"], r.get("natural_id"), r.get("email"),
+             r.get("label"), r.get("plan_type"), r.get("label_source", "auto"),
+             r.get("first_seen_utc", "2026-07-01T00:00:00Z"),
+             r.get("last_seen_utc", "2026-07-01T00:00:00Z")),
+        )
+    stats.commit()
+
+
+_ACCT_A = "a" * 32
+_ACCT_B = "b" * 32
+
+
+def _seed_two_claude_accounts(stats):
+    _seed_accounts(stats, [
+        dict(account_key=_ACCT_A, provider="claude", email="a@x.com", label="alice"),
+        dict(account_key=_ACCT_B, provider="claude", email="b@x.com", label="bob"),
+    ])
+
+
+def test_accounts_identity_digest_empty_when_no_accounts(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    from _cctally_dashboard_sources import accounts_identity_digest
+    stats = ns["open_db"]()
+    try:
+        # No account ever observed -> byte-neutral empty digest (R8: never folded).
+        assert accounts_identity_digest(stats) == ""
+    finally:
+        stats.close()
+
+
+def test_accounts_identity_digest_flips_on_switch_and_label(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_account
+    from _cctally_dashboard_sources import accounts_identity_digest
+    stats = ns["open_db"]()
+    try:
+        _seed_two_claude_accounts(stats)
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_A})
+        before = accounts_identity_digest(stats)
+        assert before != ""  # registry present -> non-empty
+        # Switch active alice -> bob with ZERO new rows: digest must change.
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_B})
+        after_switch = accounts_identity_digest(stats)
+        assert after_switch != before
+        # A label edit also changes it (new-account / label leg).
+        stats.execute("UPDATE accounts SET label='robert' WHERE account_key=?",
+                      (_ACCT_B,))
+        stats.commit()
+        assert accounts_identity_digest(stats) != after_switch
+    finally:
+        stats.close()
+
+
+def test_dispatch_signature_and_data_version_flip_on_account_switch(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_account
+    stats = ns["open_db"]()
+    try:
+        _seed_two_claude_accounts(stats)
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_A})
+        sig_a = ns["_cctally_tui"]._tui_compute_dispatch_signature(stats)
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_B})
+        sig_b = ns["_cctally_tui"]._tui_compute_dispatch_signature(stats)
+        assert sig_a.accounts_digest != ""
+        assert sig_a != sig_b
+        assert ns["_snapshot_data_version"](sig_a) != ns["_snapshot_data_version"](sig_b)
+    finally:
+        stats.close()
+
+
+def test_source_bundle_rebuilds_on_account_switch(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_account
+    stats = ns["open_db"]()
+    now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
+    try:
+        _seed_two_claude_accounts(stats)
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_A})
+        first = ns["_cctally_tui"]._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now, display_tz_name="UTC",
+            codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
+        )
+        monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
+                            lambda: {_ACCT_B})
+        second = ns["_cctally_tui"]._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now, display_tz_name="UTC",
+            codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
+            prior_bundle=first,
+        )
+        # Switch rebuilt the claude source (new object + new data_version).
+        assert second.sources["claude"] is not first.sources["claude"]
+        assert (second.sources["claude"].data_version
+                != first.sources["claude"].data_version)
+    finally:
+        stats.close()

@@ -31,6 +31,11 @@ export interface SourceDetailState<T> {
 
 export interface SourceDetailOptions {
   windowWeeks?: 1 | 4 | 8 | 12;
+  // #341 Task 4 — the modal-captured account qualifier. When set, the server
+  // verifies row ownership so an account-focused modal can never surface another
+  // account's row (spec §4 finding 10). Undefined = today's account-agnostic
+  // fetch (the server ignores the qualifier for rows without an account_key).
+  account?: string | null;
 }
 
 export function useSourceDetail<T extends { detail_kind: string }>(
@@ -62,7 +67,8 @@ export function useSourceDetail<T extends { detail_kind: string }>(
       return;
     }
     const windowWeeks = resource === 'project' ? options.windowWeeks : undefined;
-    const identity = `${source}/${resource}/${key}/${windowWeeks ?? ''}`;
+    const account = options.account ?? undefined;
+    const identity = `${source}/${resource}/${key}/${windowWeeks ?? ''}/${account ?? ''}`;
     const keyChanged = lastKeyRef.current !== identity;
     const isInitial = keyChanged || data == null;
     // Let an in-flight initial fetch for the same identity resolve; don't
@@ -76,7 +82,10 @@ export function useSourceDetail<T extends { detail_kind: string }>(
     lastKeyRef.current = identity;
     inFlightRef.current = true;
     const myReqId = ++reqIdRef.current;
-    const query = windowWeeks == null ? '' : `?weeks=${windowWeeks}`;
+    const params = new URLSearchParams();
+    if (windowWeeks != null) params.set('weeks', String(windowWeeks));
+    if (account != null && account !== '') params.set('account', account);
+    const query = params.toString() ? `?${params.toString()}` : '';
     const url = `/api/source/${source}/${resource}/${encodeURIComponent(key)}${query}`;
     fetch(url)
       .then(async (r) => {
@@ -125,7 +134,7 @@ export function useSourceDetail<T extends { detail_kind: string }>(
         if (reqIdRef.current === myReqId) inFlightRef.current = false;
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source, resource, key, options.windowWeeks, token]);
+  }, [source, resource, key, options.windowWeeks, options.account, token]);
 
   return { data, error, loading };
 }

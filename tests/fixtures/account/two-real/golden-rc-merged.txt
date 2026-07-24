@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "start": "2026-05-22T00:00:00Z",
+  "end": "2026-05-23T00:00:00Z",
+  "mode": "auto",
+  "project": null,
+  "matchedEntries": 2,
+  "totalCostUSD": 3.0,
+  "firstMatchedEntry": "2026-05-22T12:00:00Z",
+  "lastMatchedEntry": "2026-05-22T12:00:00Z",
+  "modelBreakdowns": [
+    {
+      "model": "claude-opus-4-7",
+      "entries": 2,
+      "inputTokens": 20,
+      "outputTokens": 40,
+      "cacheCreationTokens": 0,
+      "cacheReadTokens": 0,
+      "totalTokens": 60,
+      "costUSD": 3.0
+    }
+  ]
+}

@@ -470,7 +470,8 @@ def _humanize_tokens(n: "int | None") -> str:
     return f"{sign}{a / 1_000_000_000:.1f}B"
 
 
-def _diff_iter_claude_entries(window: ParsedWindow, *, skip_sync: bool):
+def _diff_iter_claude_entries(window: ParsedWindow, *, skip_sync: bool,
+                             account_key=None):
     """Honor ParsedWindow's half-open semantics by trimming end_utc by 1 µs
     before passing into the inclusive-end shared cache helper.
 
@@ -479,10 +480,14 @@ def _diff_iter_claude_entries(window: ParsedWindow, *, skip_sync: bool):
     end-of-day semantics for date-only inputs — so we cannot tighten the
     helper's SQL. `ParsedWindow.end_utc` is documented exclusive, so trim
     by one microsecond locally to bridge the convention gap.
+
+    ``account_key`` (#341 --account) scopes the read to one account's stamped
+    entries; ``None`` = merged (byte-identical).
     """
     end_exclusive = window.end_utc - dt.timedelta(microseconds=1)
     return get_claude_session_entries(
-        window.start_utc, end_exclusive, skip_sync=skip_sync
+        window.start_utc, end_exclusive, skip_sync=skip_sync,
+        account_key=account_key,
     )
 
 
@@ -490,6 +495,7 @@ def _diff_aggregate_overall(
     window: ParsedWindow,
     *,
     skip_sync: bool = False,
+    account_key=None,
 ) -> MetricBundle:
     """Sum cost, tokens, and cache stats across all entries in `window`.
 
@@ -500,7 +506,8 @@ def _diff_aggregate_overall(
     """
     cost = 0.0
     ti = to = tcr = tcw = 0
-    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync):
+    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync,
+                                       account_key=account_key):
         if e.model == "<synthetic>":
             continue
         cost += _calculate_entry_cost(
@@ -532,10 +539,12 @@ def _diff_aggregate_models(
     window: ParsedWindow,
     *,
     skip_sync: bool = False,
+    account_key=None,
 ) -> dict:
     """Group entries by model id, aggregate to per-model MetricBundle."""
     buckets: dict = {}
-    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync):
+    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync,
+                                       account_key=account_key):
         if e.model == "<synthetic>":
             continue
         b = buckets.setdefault(e.model, {
@@ -568,12 +577,14 @@ def _diff_aggregate_projects(
     window: ParsedWindow,
     *,
     skip_sync: bool = False,
+    account_key=None,
     group_mode: str = "git-root",
 ) -> dict:
     """Group entries by ProjectKey.display_key (git-root resolved)."""
     resolver_cache: dict = {}
     buckets: dict = {}
-    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync):
+    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync,
+                                       account_key=account_key):
         if e.model == "<synthetic>":
             continue
         key = _resolve_project_key(e.project_path, group_mode, resolver_cache)
@@ -607,6 +618,7 @@ def _diff_aggregate_cache(
     window: ParsedWindow,
     *,
     skip_sync: bool = False,
+    account_key=None,
 ) -> dict:
     """Cache-active-entries scope: only entries that touched the cache.
 
@@ -619,7 +631,8 @@ def _diff_aggregate_cache(
     """
     cost = 0.0
     tcr = tcw = ti = 0
-    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync):
+    for e in _diff_iter_claude_entries(window, skip_sync=skip_sync,
+                                       account_key=account_key):
         if e.model == "<synthetic>":
             continue
         if e.cache_creation_tokens == 0 and e.cache_read_tokens == 0:
@@ -891,6 +904,7 @@ def _build_diff_result(
     sort: str,
     allow_mismatch: bool = False,
     skip_sync: bool = False,
+    account_key=None,
     top: "int | None" = None,
 ) -> DiffResult:
     """Top-level diff builder: wire window_a vs window_b through every
@@ -936,8 +950,8 @@ def _build_diff_result(
     raw_totals: "dict[str, tuple[MetricBundle | None, MetricBundle | None]]" = {}
 
     if "overall" in sections_requested:
-        a_overall_raw = _norm_a(_diff_aggregate_overall(window_a, skip_sync=skip_sync))
-        b_overall_raw = _norm_b(_diff_aggregate_overall(window_b, skip_sync=skip_sync))
+        a_overall_raw = _norm_a(_diff_aggregate_overall(window_a, skip_sync=skip_sync, account_key=account_key))
+        b_overall_raw = _norm_b(_diff_aggregate_overall(window_b, skip_sync=skip_sync, account_key=account_key))
         # Splice in the resolved Used% AFTER normalization — Used % is
         # never per-day-normalized (it's a weekly ceiling ratio).
         a_overall = dataclasses.replace(a_overall_raw, used_pct=used_a)
@@ -954,9 +968,9 @@ def _build_diff_result(
 
     if "models" in sections_requested:
         a_map = {k: _norm_a(v) for k, v in
-                 _diff_aggregate_models(window_a, skip_sync=skip_sync).items()}
+                 _diff_aggregate_models(window_a, skip_sync=skip_sync, account_key=account_key).items()}
         b_map = {k: _norm_b(v) for k, v in
-                 _diff_aggregate_models(window_b, skip_sync=skip_sync).items()}
+                 _diff_aggregate_models(window_b, skip_sync=skip_sync, account_key=account_key).items()}
         sections.append(_diff_build_section(
             "models", "all", a_map, b_map,
             _DIFF_DEFAULT_COLUMNS_MODELS, threshold, sort,
@@ -969,9 +983,9 @@ def _build_diff_result(
 
     if "projects" in sections_requested:
         a_map = {k: _norm_a(v) for k, v in
-                 _diff_aggregate_projects(window_a, skip_sync=skip_sync).items()}
+                 _diff_aggregate_projects(window_a, skip_sync=skip_sync, account_key=account_key).items()}
         b_map = {k: _norm_b(v) for k, v in
-                 _diff_aggregate_projects(window_b, skip_sync=skip_sync).items()}
+                 _diff_aggregate_projects(window_b, skip_sync=skip_sync, account_key=account_key).items()}
         sections.append(_diff_build_section(
             "projects", "all", a_map, b_map,
             _DIFF_DEFAULT_COLUMNS_PROJECTS, threshold, sort,
@@ -984,9 +998,9 @@ def _build_diff_result(
 
     if "cache" in sections_requested:
         a_map = {k: _norm_a(v) for k, v in
-                 _diff_aggregate_cache(window_a, skip_sync=skip_sync).items()}
+                 _diff_aggregate_cache(window_a, skip_sync=skip_sync, account_key=account_key).items()}
         b_map = {k: _norm_b(v) for k, v in
-                 _diff_aggregate_cache(window_b, skip_sync=skip_sync).items()}
+                 _diff_aggregate_cache(window_b, skip_sync=skip_sync, account_key=account_key).items()}
         sections.append(_diff_build_section(
             "cache", "cache-active-entries", a_map, b_map,
             _DIFF_DEFAULT_COLUMNS_CACHE,
