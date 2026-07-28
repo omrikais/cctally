@@ -130,7 +130,11 @@ def _gather_backup_sync_state(
     run=subprocess.run,
 ) -> dict:
     """Classify known macOS file-level backup/sync coverage without mutation."""
-    platform_name = platform_name or sys.platform
+    platform_name = (
+        platform_name
+        or os.environ.get("CCTALLY_DOCTOR_FIXTURE_PLATFORM")
+        or sys.platform
+    )
     if platform_name != "darwin":
         return {"status": "unsupported", "provider": None}
 

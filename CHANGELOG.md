@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.83.1] - 2026-07-28
+
+### Fixed
+- Doctor golden fixtures now pin the macOS backup/sync classifier as well as the `tmutil` response, keeping the public Linux CI matrix byte-stable across platforms.
+
 ## [1.83.0] - 2026-07-28
 
 ### Added

@@ -120,6 +120,19 @@ def test_backup_sync_gather_is_fail_soft_for_missing_tool_and_non_macos():
     assert empty_output == {"status": "unavailable", "provider": "Time Machine"}
 
 
+def test_backup_sync_gather_honors_fixture_platform_override(monkeypatch):
+    monkeypatch.setenv("CCTALLY_DOCTOR_FIXTURE_PLATFORM", "linux")
+
+    state = gather._gather_backup_sync_state(
+        pathlib.Path("/custom/cctally"),
+        home_dir=pathlib.Path("/Users/example"),
+        which=lambda _name: (_ for _ in ()).throw(AssertionError()),
+        run=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError()),
+    )
+
+    assert state == {"status": "unsupported", "provider": None}
+
+
 def test_backup_sync_gather_skips_time_machine_tool_for_shallow_gather():
     state = gather._gather_backup_sync_state(
         pathlib.Path("/custom/cctally"),

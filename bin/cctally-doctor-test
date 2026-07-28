@@ -61,7 +61,8 @@ PY_CLEAN_BIN="$SCRATCH_ROOT/.py-clean-bin"
 mkdir -p "$PY_CLEAN_BIN"
 ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
 # Pin the read-only Time Machine probe so Doctor goldens do not inherit the
-# runner's backup configuration. Individual included-root scenarios use a
+# runner's platform or backup configuration. The command invocations below
+# also force the Darwin classifier; individual included-root scenarios use a
 # resolved cloud-root path and therefore short-circuit before this stub.
 cat > "$PY_CLEAN_BIN/tmutil" <<'SH'
 #!/bin/sh
@@ -178,6 +179,7 @@ run_mode () {
     raw=$(HOME="$scratch" TZ=Etc/UTC \
           PATH="$fake_path" \
           CODEX_HOME="$fake_codex_home" \
+          CCTALLY_DOCTOR_FIXTURE_PLATFORM=darwin \
           CCTALLY_AS_OF="$AS_OF" \
           NO_COLOR=1 \
           "$CCTALLY" doctor $flags 2>/dev/null) || true
@@ -239,6 +241,7 @@ run_exit_code () {
     local actual_exit
 
     HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" CODEX_HOME="$fake_codex_home" \
+        CCTALLY_DOCTOR_FIXTURE_PLATFORM=darwin \
         CCTALLY_AS_OF="$AS_OF" NO_COLOR=1 \
         "$CCTALLY" doctor --json >/dev/null 2>&1
     actual_exit=$?
