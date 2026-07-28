@@ -30,11 +30,9 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.82.1** (2026-07-24)
+**Latest stable: v1.83.1** (2026-07-28)
 
-- The public README is a fresh, shorter screenshot-led tour, and it now refreshes itself on every stable release: promoting a release regenerates the screenshots against that exact version and updates a "Latest stable" highlights block on the GitHub page automatically.
-- The dashboard's Recent Sessions card shows session names again. Splitting transcript storage into its own database dropped the name lookup, so every row in the Session column had rendered a dash since then. Names come back from the stored conversation index, and a transcript store that is missing, locked, or rebuilding simply leaves the dash in place instead of holding up the rest of the dashboard.
-- The All tab's Recent Sessions rows now show Claude session names too, matching the Codex rows beside them; previously only Codex rows were named there. Names still appear only for a local viewer, exactly as on the Claude tab.
+- Doctor golden fixtures now pin the macOS backup/sync classifier as well as the `tmutil` response, keeping the public Linux CI matrix byte-stable across platforms.
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
