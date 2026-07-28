@@ -125,10 +125,9 @@ def build_multi_project(out_dir: Path) -> None:
         # The materialized `speed` column (#181) must survive the joined-entry
         # path (`get_claude_session_entries` → `_usage_entry_from_joined`) so the
         # project-axis renderer labels this `claude-haiku-4-5-fast`, matching the
-        # normal `daily` path. Claude cost is speed-independent (only Codex
-        # pricing multiplies on fast), so this changes the LABEL only — token
-        # sums + cost + every reconcile invariant stay byte-stable. Regression
-        # guard for the dropped-`usage.speed` bug under `daily -i`/`-p`.
+        # normal `daily` path. Haiku has no supported Claude fast multiplier, so
+        # this fixture remains label-only and its existing cost stays byte-stable.
+        # Supported Opus fast rows are covered by the #413 acceptance fixture.
         src = "/fake/jsonl/repos-lib-0.jsonl"
         seed_session_file(conn, path=src, session_id="lib-s1",
                           project_path=repos_lib)

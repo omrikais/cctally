@@ -320,6 +320,184 @@ def test_dispatcher_fresh_install_stamps_only(cctally_module):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
+def test_dispatcher_fresh_install_clears_only_durably_stamped_error_entries(
+    cctally_module, tmp_path, monkeypatch
+):
+    """Stamp-only application reconciles its stale qualified sentinel block.
+
+    Regression for #398: a rebuilt/fresh cache database stamps migration
+    markers without invoking handlers.  That terminal success must clear only
+    the matching stale failure block after the marker commit, while preserving
+    a different unresolved migration's forensic evidence.
+    """
+    import _cctally_core
+
+    log_path = tmp_path / "migration-errors.log"
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
+    log_path.write_text(
+        "[2026-07-24T10:00:00Z] cache.db:001_applied\n"
+        "  RuntimeError: stale cache failure\n"
+        "  Traceback: stale cache traceback\n\n"
+        "[2026-07-24T10:01:00Z] stats.db:999_unresolved\n"
+        "  RuntimeError: live stats failure\n"
+        "  Traceback: live stats traceback\n\n"
+    )
+
+    conn = _fresh_conn_cache()
+    registry = [
+        cctally_module.Migration(
+            seq=1, name="001_applied", handler=lambda c: pytest.fail(
+                "fresh-install dispatcher must stamp without invoking handlers"
+            )
+        ),
+    ]
+
+    cctally_module._run_pending_migrations(
+        conn, registry=registry, db_label="cache.db",
+    )
+
+    marker = conn.execute(
+        "SELECT applied_at_utc FROM schema_migrations WHERE name = ?",
+        ("001_applied",),
+    ).fetchone()
+    assert marker is not None
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    remaining = log_path.read_text()
+    assert "cache.db:001_applied" not in remaining
+    assert remaining == (
+        "[2026-07-24T10:01:00Z] stats.db:999_unresolved\n"
+        "  RuntimeError: live stats failure\n"
+        "  Traceback: live stats traceback\n\n"
+    )
+    assert "stats.db:999_unresolved" in (
+        cctally_module._render_migration_error_banner() or ""
+    )
+    conn.close()
+
+
+def test_dispatcher_fresh_install_commit_failure_preserves_error_entry(
+    cctally_module, tmp_path, monkeypatch
+):
+    """A failed stamp commit must not erase the unresolved failure evidence."""
+    import _cctally_core
+
+    log_path = tmp_path / "migration-errors.log"
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
+    qualified_name = "cache.db:001_not_durable"
+    log_path.write_text(
+        f"[2026-07-24T10:00:00Z] {qualified_name}\n"
+        "  RuntimeError: prior failure\n"
+        "  Traceback: prior traceback\n\n"
+    )
+
+    real_conn = _fresh_conn_cache()
+
+    class FailSecondCommit:
+        """Delegate SQLite operations but fail the stamp transaction commit."""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self._commit_count = 0
+
+        def execute(self, *args, **kwargs):
+            return self._conn.execute(*args, **kwargs)
+
+        def commit(self):
+            self._commit_count += 1
+            if self._commit_count == 2:
+                raise RuntimeError("planned stamp commit failure")
+            return self._conn.commit()
+
+        def rollback(self):
+            return self._conn.rollback()
+
+    conn = FailSecondCommit(real_conn)
+    registry = [
+        cctally_module.Migration(
+            seq=1, name="001_not_durable", handler=lambda c: None,
+        ),
+    ]
+
+    with pytest.raises(RuntimeError, match="planned stamp commit failure"):
+        cctally_module._run_pending_migrations(
+            conn, registry=registry, db_label="cache.db",
+        )
+
+    assert qualified_name in log_path.read_text()
+    real_conn.rollback()
+    assert real_conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        ("001_not_durable",),
+    ).fetchone() is None
+    real_conn.close()
+
+
+@pytest.mark.parametrize("cleanup_disruption", ["process_exit", "swallowed_io"])
+def test_dispatcher_restart_reconciles_durably_applied_stamp_only_entry(
+    cctally_module, tmp_path, monkeypatch, cleanup_disruption
+):
+    """Restart converges after cleanup is interrupted post-marker commit."""
+    import _cctally_core
+
+    log_path = tmp_path / "migration-errors.log"
+    monkeypatch.setattr(_cctally_core, "MIGRATION_ERROR_LOG_PATH", log_path)
+    qualified_name = "cache.db:001_durable"
+    log_path.write_text(
+        f"[2026-07-24T10:00:00Z] {qualified_name}\n"
+        "  RuntimeError: stale failure\n"
+        "  Traceback: stale traceback\n\n"
+    )
+
+    db_path = tmp_path / "cache.db"
+    registry = [
+        cctally_module.Migration(
+            seq=1, name="001_durable", handler=lambda c: None,
+        ),
+    ]
+    dispatcher_globals = cctally_module._run_pending_migrations.__globals__
+    original_clear = dispatcher_globals["_clear_migration_error_log_entries"]
+
+    def disrupt_matching_cleanup(name):
+        if name == qualified_name:
+            if cleanup_disruption == "process_exit":
+                raise SystemExit("planned exit after durable marker")
+            return  # models the helper swallowing a transient filesystem error
+        return original_clear(name)
+
+    monkeypatch.setitem(
+        dispatcher_globals, "_clear_migration_error_log_entries",
+        disrupt_matching_cleanup,
+    )
+    first_conn = sqlite3.connect(db_path)
+    if cleanup_disruption == "process_exit":
+        with pytest.raises(SystemExit, match="planned exit after durable marker"):
+            cctally_module._run_pending_migrations(
+                first_conn, registry=registry, db_label="cache.db",
+            )
+    else:
+        cctally_module._run_pending_migrations(
+            first_conn, registry=registry, db_label="cache.db",
+        )
+    assert first_conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        ("001_durable",),
+    ).fetchone() is not None
+    assert log_path.exists()
+    first_conn.close()
+
+    monkeypatch.setitem(
+        dispatcher_globals, "_clear_migration_error_log_entries", original_clear,
+    )
+    reopened = sqlite3.connect(db_path)
+    cctally_module._run_pending_migrations(
+        reopened, registry=registry, db_label="cache.db",
+    )
+
+    assert reopened.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert not log_path.exists()
+    reopened.close()
+
+
 def test_cache_db_with_codex_events_is_not_fresh_install(cctally_module):
     """A Codex-bearing cache (S1 fused ingest wrote codex_conversation_events)
     that is missing schema_migrations must NOT be classified fresh (#294 S6).

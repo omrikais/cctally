@@ -26,6 +26,7 @@ JOURNAL_DIR / data dir and ``sys.modules["cctally"]``.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import fcntl
 import importlib
@@ -33,6 +34,8 @@ import json
 import os
 import shutil
 from pathlib import Path
+
+import pytest
 
 from conftest import load_script, redirect_paths
 
@@ -118,12 +121,14 @@ def _seed_quota(ns, *, root, observations, limit="limit-primary"):
         conn.close()
 
 
-def _write_quota_config(ns, *, actual=(90,)):
+def _write_quota_config(
+    ns, *, actual=(90,), global_enabled=True, quota_enabled=True,
+):
     core = importlib.import_module("_cctally_core")
     core.CONFIG_PATH.write_text(json.dumps({"alerts": {
-        "enabled": True,
+        "enabled": global_enabled,
         "quota": {
-            "enabled": True,
+            "enabled": quota_enabled,
             "actual_thresholds": list(actual),
             "projected_thresholds": [],
             "rules": [],
@@ -417,6 +422,179 @@ def test_arming_journaled_and_replay_honored(tmp_path, monkeypatch):
     ]
     assert len(arming_evts2) == 1, "replayed boundary honored -> no re-arm evt"
     assert result.alerts_dispatched == 0, "no historical re-fire"
+
+
+@pytest.mark.parametrize("disabled_gate", ("global", "quota"))
+def test_disabled_arming_tombstone_survives_rebuild_without_historical_fire(
+    tmp_path, monkeypatch, disabled_gate,
+):
+    """A rebuild must not resurrect the boundary deleted while alerts were off."""
+    ns, quota, jr, jl = _load(tmp_path, monkeypatch)
+    _seed_quota(ns, root="root-a", observations=[(_iso(10), 10, 80.0)])
+    _seed_quota(ns, root="root-b", observations=[(_iso(10), 10, 80.0)])
+    _write_quota_config(ns, actual=(90,))
+    dispatched = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+
+    quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a", "root-b"},
+        alert_eligible_root_keys={"root-a", "root-b"},
+        now=dt.datetime(2026, 7, 15, 11, tzinfo=UTC),
+    )
+    cache = ns["open_cache_db"]()
+    try:
+        certificate = quota.load_codex_quota_projection_certificate(cache)
+        physical_sequence = quota.codex_physical_mutation_seq(cache)
+    finally:
+        cache.close()
+    assert certificate is not None
+    assert certificate[0] == physical_sequence
+
+    if disabled_gate == "global":
+        disable_args = argparse.Namespace(
+            action="set", key="alerts.enabled", value="false", emit_json=False,
+        )
+    else:
+        disable_args = argparse.Namespace(
+            action="set",
+            key="alerts.quota",
+            value=json.dumps({
+                "enabled": False,
+                "actual_thresholds": [90],
+                "projected_thresholds": [],
+                "rules": [],
+            }),
+            emit_json=False,
+        )
+    assert ns["cmd_config"](disable_args) == 0
+    quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a", "root-b"},
+        # Read-only report paths deliberately carry no lifecycle eligibility.
+        # No cache data changed after the certificate assertion above, so this
+        # also proves the valid-certificate fast path cannot bypass disarming.
+        alert_eligible_root_keys=set(),
+        now=dt.datetime(2026, 7, 15, 11, 20, tzinfo=UTC),
+    )
+
+    disarms = [
+        line for line in _journal_lines(jr, jl)
+        if line.get("t") == "evt"
+        and (line.get("payload") or {}).get("kind") == "quota_alert_arming"
+        and (line.get("payload") or {}).get("state") == "disarmed"
+    ]
+    assert len(disarms) == 2, "every disabled delete must be retained in the journal"
+    for disarm in disarms:
+        payload = disarm["payload"]
+        assert set(payload) == {
+            "kind", "source", "source_root_key", "account_key",
+            "logical_limit_key", "observed_slot", "window_minutes", "state",
+            "disarmed_at_utc", "journal_identity_version",
+        }
+        assert disarm["id"] == jl.evt_id(
+            "qaa", payload["source"], payload["source_root_key"],
+            payload["account_key"], payload["logical_limit_key"],
+            payload["observed_slot"], payload["window_minutes"],
+            payload["state"], payload["disarmed_at_utc"],
+        )
+        assert disarm["at"] == payload["disarmed_at_utc"]
+
+    _seed_quota(ns, root="root-a", observations=[(_iso(11, 10), 20, 95.0)])
+    _seed_quota(ns, root="root-b", observations=[(_iso(11, 10), 20, 95.0)])
+    jr.rebuild_stats_index()
+    conn = ns["open_db"]()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM quota_alert_arming"
+        ).fetchone()[0] == 0, "replay must leave the identity disarmed"
+    finally:
+        conn.close()
+
+    assert ns["cmd_config"](argparse.Namespace(
+        action="set", key="alerts.enabled", value="true", emit_json=False,
+    )) == 0
+    assert ns["cmd_config"](argparse.Namespace(
+        action="set",
+        key="alerts.quota",
+        value=json.dumps({
+            "enabled": True,
+            "actual_thresholds": [90],
+            "projected_thresholds": [],
+            "rules": [],
+        }),
+        emit_json=False,
+    )) == 0
+    result = quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a", "root-b"},
+        alert_eligible_root_keys={"root-a", "root-b"},
+        now=dt.datetime(2026, 7, 15, 11, 30, tzinfo=UTC),
+    )
+    conn = ns["open_db"]()
+    try:
+        terminal = [
+            tuple(row) for row in conn.execute(
+                "SELECT threshold, disposition FROM quota_threshold_events "
+                "ORDER BY threshold"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert terminal == [
+        (90, "suppressed_backfill"),
+        (90, "suppressed_backfill"),
+    ]
+    assert result.alerts_dispatched == 0
+    assert dispatched == []
+
+
+#: Every `qaa` payload field that is ALSO an id component, in the exact order
+#: `_cctally_quota._emit_arming` passes them to `evt_id`. `kind` and
+#: `journal_identity_version` are family constants, not identity.
+_QAA_ID_COMPONENT_KEYS = (
+    "source", "source_root_key", "account_key", "logical_limit_key",
+    "observed_slot", "window_minutes", "rule_fingerprint", "activated_at_utc",
+)
+_QAA_CONSTANT_KEYS = frozenset({"kind", "journal_identity_version"})
+
+
+def test_arming_payload_carries_no_field_outside_its_id(tmp_path, monkeypatch):
+    """#374 acceptance 10: the direct quota-arming writer
+    (`_cctally_quota.py` `_emit_arming`) appends straight to the journal,
+    bypassing BOTH emit paths — so nothing classifies it and nothing can
+    quarantine a same-revision divergence it produces. That is only safe while
+    divergence is structurally impossible, i.e. while every payload field except
+    the family constants is also an id component (and `at` is one of them). This
+    test pins that: adding a tenth payload field without extending `evt_id`
+    fails HERE rather than silently reopening the #374 defect on a family the
+    write boundary deliberately exempts."""
+    ns, quota, jr, jl = _load(tmp_path, monkeypatch)
+    _seed_quota(ns, root="root-a", observations=[(_iso(10), 10, 95.0)])
+    _write_quota_config(ns, actual=(90,))
+    now = dt.datetime(2026, 7, 15, 12, tzinfo=UTC)
+
+    quota.reconcile_codex_quota_projection(
+        source_root_keys={"root-a"}, alert_eligible_root_keys={"root-a"}, now=now)
+
+    evts = [
+        line for line in _journal_lines(jr, jl)
+        if line.get("t") == "evt"
+        and (line.get("payload") or {}).get("kind") == "quota_alert_arming"
+    ]
+    assert len(evts) == 1
+    evt = evts[0]
+    payload = evt["payload"]
+
+    assert set(payload) - _QAA_CONSTANT_KEYS == set(_QAA_ID_COMPONENT_KEYS), (
+        "every qaa payload field must be an id component or a family constant — "
+        "a field outside the id lets two divergent payloads share one id, which "
+        "this writer has no classifier to catch"
+    )
+    assert payload["journal_identity_version"] == 2
+    assert evt["id"] == jl.evt_id(
+        "qaa", *(payload[key] for key in _QAA_ID_COMPONENT_KEYS)
+    ), "the id must be exactly those fields, in that order"
+    assert evt["at"] == payload["activated_at_utc"], (
+        "the record's `at` is an id component too, so it cannot drift either")
+    assert evt["rev"] == 0
 
 
 # ==========================================================================

@@ -1,7 +1,7 @@
 """cmd_cache_sync: --rebuild aggregates a non-zero exit on lock contention
 (was silently exit 0); --prune-orphans runs the helper and reports."""
 from __future__ import annotations
-import argparse, fcntl, json, os, pathlib, shutil, sqlite3
+import argparse, fcntl, json, multiprocessing, os, pathlib, shutil, sqlite3, time
 import pytest
 from conftest import load_script, redirect_paths
 
@@ -12,6 +12,30 @@ def env(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
     return ns, tmp_path, monkeypatch
+
+
+def _force_confirmed_forensics(ns, monkeypatch):
+    """Keep orchestration tests explicit: their synthetic trigger is confirmed."""
+    db_mod = ns["_cctally_db"]
+    real_write = db_mod.write_corruption_forensics
+
+    def confirmed(*args, **kwargs):
+        assert kwargs.get("return_result") is True
+        result = real_write(*args, **kwargs)
+        assert isinstance(result, db_mod.CorruptionForensicsResult)
+        assert result.path is not None
+        payload = json.loads(result.path.read_text())
+        payload["probeDisposition"] = "confirmed"
+        payload["probeReason"] = "test_confirmed"
+        result.path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        return db_mod.CorruptionForensicsResult(
+            path=result.path,
+            disposition=db_mod.CorruptionProbeDisposition.CONFIRMED,
+            reason="test_confirmed",
+            integrity_check=result.integrity_check,
+        )
+
+    monkeypatch.setattr(db_mod, "write_corruption_forensics", confirmed)
 
 
 def test_rebuild_contended_returns_nonzero(env, capsys):
@@ -84,7 +108,223 @@ def test_transcript_open_failure_makes_explicit_rebuild_nonzero(env, capsys):
         prune_conversations=False,
     )
     assert ns["cmd_cache_sync"](args) == 1
-    assert "core accounting/quota sync is complete" in capsys.readouterr().err
+    stderr = capsys.readouterr().err
+    assert "provider=claude store=conversations.db phase=open" in stderr
+    assert "core accounting/quota sync is complete" in stderr
+    assert (
+        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
+    )
+
+
+def test_transcript_lock_contention_names_phase_and_retry(env, monkeypatch, capsys):
+    ns, _tmp_path, _fixture_monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    monkeypatch.setattr(
+        cache_mod, "_REBUILD_LOCK_TIMEOUT_SECONDS", 0.1
+    )
+    bootstrap = ns["open_conversations_db"](attach_cache=False)
+    bootstrap.close()
+    lock_path = ns["_cctally_core"].CONVERSATIONS_LOCK_PATH
+    holder = open(lock_path, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        args = argparse.Namespace(
+            source="claude",
+            rebuild=True,
+            prune_orphans=False,
+            prune_conversations=False,
+        )
+        assert ns["cmd_cache_sync"](args) == 1
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+    stderr = capsys.readouterr().err
+    assert "provider=claude store=conversations.db phase=lock" in stderr
+    assert (
+        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
+    )
+
+
+def test_transcript_file_failure_names_phase_and_retry(
+    env, monkeypatch, capsys,
+):
+    ns, tmp_path, _fixture_monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    _write_claude_entry(tmp_path)
+
+    def fail_touches(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cache_mod, "_fill_file_touches", fail_touches)
+    args = argparse.Namespace(
+        source="claude",
+        rebuild=True,
+        prune_orphans=False,
+        prune_conversations=False,
+    )
+    assert ns["cmd_cache_sync"](args) == 1
+    stderr = capsys.readouterr().err
+    assert "provider=claude store=conversations.db phase=ingest" in stderr
+    assert "1 file(s) failed" in stderr
+    assert (
+        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
+    )
+
+
+def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
+    """#395 RED: the real cmd orchestration must outlive a wedged transcript leg.
+
+    The outer process is the test's fail-loud hard ceiling. Before the fix,
+    cmd_cache_sync calls the patched leg in-process and this child survives the
+    two-second join; the test kills it and fails instead of hanging pytest.
+    """
+    ns, tmp_path, monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    _write_claude_entry(tmp_path)
+    monkeypatch.setattr(
+        cache_mod,
+        "_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS",
+        0.2,
+        raising=False,
+    )
+    real_fill_file_touches = cache_mod._fill_file_touches
+
+    def stuck(*_args, **_kwargs):
+        while True:
+            time.sleep(0.01)
+
+    # This seam is transcript-only and occurs after the durable pending marker
+    # but before the file cursor/message transaction commits.
+    monkeypatch.setattr(cache_mod, "_fill_file_touches", stuck)
+    args = argparse.Namespace(
+        source="claude",
+        rebuild=True,
+        prune_orphans=False,
+        prune_conversations=False,
+    )
+    ctx = multiprocessing.get_context("fork")
+    results = ctx.SimpleQueue()
+
+    def invoke() -> None:
+        results.put(ns["cmd_cache_sync"](args))
+
+    proc = ctx.Process(target=invoke)
+    started = time.monotonic()
+    proc.start()
+    proc.join(timeout=2.0)
+    elapsed = time.monotonic() - started
+    finished = not proc.is_alive()
+    if not finished:
+        proc.kill()
+        proc.join(timeout=1.0)
+
+    assert finished, (
+        "cmd_cache_sync did not contain the stuck Claude transcript phase "
+        f"within the test ceiling ({elapsed:.3f}s)"
+    )
+    assert proc.exitcode == 0
+    assert results.get() == 1
+    assert elapsed < 2.0
+    stderr = capfd.readouterr().err
+    assert "provider=claude store=conversations.db phase=ingest" in stderr
+    assert "core accounting/quota sync is complete" in stderr
+    assert "partial transcript state remains retry-safe and incomplete" in stderr
+
+    core = ns["open_cache_db"]()
+    try:
+        assert core.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        core_count = core.execute(
+            "SELECT COUNT(*) FROM session_entries"
+        ).fetchone()[0]
+        assert core_count == 1
+    finally:
+        core.close()
+    conversations = ns["open_conversations_db"](attach_cache=False)
+    try:
+        assert conversations.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()[0] == "ok"
+        assert conversations.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='conversation_rebuild_claude_pending'"
+        ).fetchone()[0] == 1
+    finally:
+        conversations.close()
+
+    # Retry with the injected stall removed. It must clear the retry marker and
+    # converge without changing the already-committed core accounting count.
+    monkeypatch.setattr(cache_mod, "_fill_file_touches", real_fill_file_touches)
+    monkeypatch.setattr(
+        cache_mod, "_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS", 5.0
+    )
+    assert ns["cmd_cache_sync"](args) == 0
+    retry_stderr = capfd.readouterr().err
+    assert "claude transcripts phase=prepare" in retry_stderr
+    assert "claude transcripts: 1/1 files" in retry_stderr
+    assert "claude transcripts done: 1 processed" in retry_stderr
+    core = ns["open_cache_db"]()
+    try:
+        assert core.execute(
+            "SELECT COUNT(*) FROM session_entries"
+        ).fetchone()[0] == core_count
+    finally:
+        core.close()
+    conversations = ns["open_conversations_db"](attach_cache=False)
+    try:
+        assert conversations.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()[0] == "ok"
+        assert conversations.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='conversation_rebuild_claude_pending'"
+        ).fetchone()[0] == 0
+        assert conversations.execute(
+            "SELECT COUNT(*) FROM conversation_messages"
+        ).fetchone()[0] >= 1
+    finally:
+        conversations.close()
+
+
+def test_transcript_timeout_tracks_no_progress_not_total_wall_time(
+    env, monkeypatch,
+):
+    """A healthy large phase may outlive the bound while still advancing."""
+    ns, _tmp_path, _fixture_monkeypatch = env
+    cache_mod = ns["_cctally_cache"]
+    monkeypatch.setattr(
+        cache_mod,
+        "_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS",
+        0.12,
+    )
+
+    class FakeConnection:
+        def close(self) -> None:
+            pass
+
+    def advancing(_conn, *, progress, **_kwargs):
+        stats = cache_mod.IngestStats(files_total=3)
+        for completed in range(1, 4):
+            time.sleep(0.08)
+            stats.files_processed = completed
+            progress("ingest", stats)
+        return stats
+
+    monkeypatch.setattr(
+        cache_mod, "open_conversations_db", lambda: FakeConnection()
+    )
+    monkeypatch.setattr(cache_mod, "sync_claude_conversations", advancing)
+
+    started = time.monotonic()
+    outcome = cache_mod._run_transcript_rebuild_worker(
+        "claude", lock_timeout=0.1
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed > 0.12
+    assert outcome.timed_out is False
+    assert outcome.error is None
+    assert outcome.stats is not None
+    assert outcome.stats.files_processed == 3
 
 
 def test_rebuild_recovers_post_open_corruption_and_retries_once(
@@ -92,6 +332,7 @@ def test_rebuild_recovers_post_open_corruption_and_retries_once(
 ):
     ns, _tmp_path, monkeypatch = env
     cache_mod = ns["_cctally_cache"]
+    _force_confirmed_forensics(ns, monkeypatch)
     real_sync = cache_mod.sync_cache
     attempts = 0
     first_conn = None
@@ -186,6 +427,7 @@ def test_real_claude_file_loop_reraises_classified_corruption_for_recovery(
 ):
     ns, tmp_path, _fixture_monkeypatch = env
     cache_mod = ns["_cctally_cache"]
+    _force_confirmed_forensics(ns, monkeypatch)
     _write_claude_entry(tmp_path)
     real_ensure = cache_mod._ensure_session_files_row
     attempts = 0
@@ -241,6 +483,7 @@ def test_rebuild_file_failure_is_not_reported_as_success(env, monkeypatch):
 def test_all_plan_restarts_claude_after_codex_leg_recovers(env, monkeypatch):
     ns, tmp_path, _fixture_monkeypatch = env
     cache_mod = ns["_cctally_cache"]
+    _force_confirmed_forensics(ns, monkeypatch)
     _write_claude_entry(tmp_path)
     real_claude = cache_mod.sync_cache
     real_codex = cache_mod.sync_codex_cache

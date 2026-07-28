@@ -1497,7 +1497,7 @@ def _build_statusline_injections(warn_once):
                 "SELECT se.timestamp_utc, se.model, "
                 "  se.input_tokens, se.output_tokens, "
                 "  se.cache_create_tokens, se.cache_read_tokens, "
-                "  se.cost_usd_raw "
+                "  se.cost_usd_raw, se.cache_create_1h_tokens, se.speed "
                 "FROM session_entries se "
                 "LEFT JOIN session_files sf ON sf.path = se.source_path "
                 "WHERE sf.session_id = ?"
@@ -1514,16 +1514,16 @@ def _build_statusline_injections(warn_once):
             return None
         total = 0.0
         for r in rows:
-            usage = {
-                "input_tokens":                r[2] or 0,
-                "output_tokens":               r[3] or 0,
-                "cache_creation_input_tokens": r[4] or 0,
-                "cache_read_input_tokens":     r[5] or 0,
-            }
-            # #181: cost is token-only (_calculate_entry_cost ignores `speed`),
-            # so the statusline cost path no longer selects or json.loads the
-            # usage_extra_json blob — output is byte-identical. r[6] is still
-            # cost_usd_raw (the dropped column was the trailing slot).
+            usage = c.claude_usage_dict(   # #195 chokepoint
+                input_tokens=r[2],
+                output_tokens=r[3],
+                cache_creation_tokens=r[4],
+                cache_read_tokens=r[5],
+                cache_1h_tokens=r[7],
+                speed=r[8],
+            )
+            # #413: speed is materialized, so the hot statusline path keeps the
+            # effective tier without parsing the legacy usage_extra_json blob.
             try:
                 total += c._calculate_entry_cost(
                     r[1], usage, mode="auto", cost_usd=r[6],

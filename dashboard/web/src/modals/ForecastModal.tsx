@@ -462,9 +462,14 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
   const env = useSnapshot();
   const isClaude = source === 'claude';
   const presented = presentationForecast(env, source);
-  const nativeHistory = env?.sources?.codex?.data?.quota.histories.find(
+  // #373: a separate model pool is listed but is not account-level standard
+  // quota. The fallback needs the same exclusion as the primary `find`, or a
+  // foreign pool becomes the account's forecast whenever no weekly row exists.
+  const accountHistories = (env?.sources?.codex?.data?.quota.histories ?? [])
+    .filter((row) => !row.model_scoped);
+  const nativeHistory = accountHistories.find(
     (row) => row.window_minutes === 10_080,
-  ) ?? env?.sources?.codex?.data?.quota.histories[0];
+  ) ?? accountHistories[0];
   const nativeForecast = nativeHistory?.forecast;
   const nativeRemainingHours = nativeForecast?.remaining_seconds == null
     ? null

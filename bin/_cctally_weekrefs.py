@@ -576,6 +576,7 @@ def _week_ref_has_reset_event(
 
 def _compute_cost_for_weekref(
     ref: WeekRef, *, skip_sync: bool = False, account_key: "str | None" = None,
+    as_of: "str | None" = None,
 ) -> float | None:
     """Live-compute USD cost over `ref`'s (possibly reset-adjusted) range
     straight from session_entries. Mirrors what cmd_sync_week writes into
@@ -588,6 +589,11 @@ def _compute_cost_for_weekref(
     once at the top of the rebuild); ``build_trend_view`` calls this once per
     reset-event week, so without the flag each reset week re-globbed the whole
     ``~/.claude/projects`` tree — the CPU peg the sync-once refactor removes.
+
+    ``as_of`` (#410 Task A) is the retained triggering observation clock. The
+    reset-adjusted range end is clamped to it before the cache query so this
+    alternate milestone-cost path has the same replay boundary as
+    ``compute_week_cost(as_of=...)``.
     """
     c = _cctally()
     if not ref.week_start_at or not ref.week_end_at:
@@ -599,6 +605,14 @@ def _compute_cost_for_weekref(
         return None
     if end <= start:
         return 0.0
+    if as_of is not None:
+        try:
+            retained_end = parse_iso_datetime(as_of, "asOf")
+        except ValueError:
+            return None
+        end = min(end, retained_end)
+        if end <= start:
+            return 0.0
     return c._sum_cost_for_range(
         start, end, mode="auto", skip_sync=skip_sync, account_key=account_key)
 

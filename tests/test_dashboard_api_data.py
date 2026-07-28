@@ -105,6 +105,67 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
     json.dumps(envelope)
 
 
+def test_codex_labels_are_injected_per_request_into_direct_and_all_rows():
+    """One frozen source bundle serves clients with different transcript gates.
+
+    Codex labels are transcript-derived content: they stay in a server-private
+    key map and are injected into fresh request-local wire rows only when the
+    same gate that controls ``transcriptsEnabled`` is open.
+    """
+    ns = load_script()
+    now = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    key = "session:codex-private"
+    label = "Private first prompt"
+    claude = SourceDashboardState(
+        source="claude", availability="empty", freshness="fresh",
+        warnings=(), data_version="claude-v1", last_success_at=now,
+        capabilities={}, data={"sessions": {"rows": ()}},
+    )
+    codex = SourceDashboardState(
+        source="codex", availability="ok", freshness="fresh",
+        warnings=(), data_version="codex-v1", last_success_at=now,
+        capabilities={},
+        data={"sessions": {"rows": ({"key": key, "source": "codex"},)}},
+    )
+    # RED seam: the production dataclass does not expose this server-private
+    # field yet, but a dynamic attribute lets the test exercise the desired
+    # request-local overlay without publishing the label in ``data``.
+    object.__setattr__(codex, "private_session_labels", {key: label})
+    snap = ns["_empty_dashboard_snapshot"]()
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=1, default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={
+            "claude": claude,
+            "codex": codex,
+            "all": compose_all_state(claude, codex),
+        },
+    )
+
+    open_first = ns["snapshot_to_envelope"](
+        snap, now_utc=now, transcripts_visible=True,
+    )
+    closed = ns["snapshot_to_envelope"](
+        snap, now_utc=now, transcripts_visible=False,
+    )
+    open_again = ns["snapshot_to_envelope"](
+        snap, now_utc=now, transcripts_visible=True,
+    )
+
+    def codex_rows(env):
+        sources = env["sources"]
+        return (
+            sources["codex"]["data"]["sessions"]["rows"],
+            sources["all"]["data"]["providers"]["codex"]["sessions"]["rows"],
+        )
+
+    for env in (open_first, open_again):
+        assert all(rows[0]["label"] == label for rows in codex_rows(env))
+    assert all("label" not in rows[0] for rows in codex_rows(closed))
+    # The shared frozen publication remains content-free after open requests.
+    assert "label" not in codex.data["sessions"]["rows"][0]
+
+
 def test_envelope_without_source_bundle_fails_closed_with_unavailable_sources():
     ns = load_script()
     snap = ns["_empty_dashboard_snapshot"]()

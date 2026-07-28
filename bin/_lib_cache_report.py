@@ -56,6 +56,52 @@ def _import_stable_sum():
 stable_sum = _import_stable_sum()
 
 
+def _import_pricing_kernel():
+    """Resolve the ``_lib_pricing`` symbols this kernel needs (#195/#413):
+    ``CACHE_WRITE_1H_MULTIPLIER`` (the derived 1-hour cache-write rate) and
+    ``claude_usage_dict`` (the single cost-feeding usage-dict constructor).
+
+    Same shape and same justification as ``_import_stable_sum`` above:
+    ``_lib_pricing`` is a PURE stdlib leaf with no sibling imports, so binding
+    it here is acyclic and leaves this kernel's purity contract (no I/O, no
+    logging, no environment reads, no SQLite) intact. In practice both loaders
+    of this file have already imported ``_lib_pricing``, so the ``sys.modules``
+    fast path is what runs; the path-load fallback exists for a bare
+    file-path load.
+    """
+    import sys
+    if "_lib_pricing" in sys.modules:
+        m = sys.modules["_lib_pricing"]
+        return (
+            m.CACHE_WRITE_1H_MULTIPLIER,
+            m._claude_fast_multiplier,
+            m.claude_usage_dict,
+        )
+    from pathlib import Path
+    import importlib.util
+    bin_dir = Path(__file__).resolve().parent
+    if str(bin_dir) not in sys.path:
+        sys.path.insert(0, str(bin_dir))
+    spec = importlib.util.spec_from_file_location(
+        "_lib_pricing", bin_dir / "_lib_pricing.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["_lib_pricing"] = m
+    try:
+        spec.loader.exec_module(m)
+    except Exception:
+        sys.modules.pop("_lib_pricing", None)
+        raise
+    return (
+        m.CACHE_WRITE_1H_MULTIPLIER,
+        m._claude_fast_multiplier,
+        m.claude_usage_dict,
+    )
+
+
+(CACHE_WRITE_1H_MULTIPLIER, _claude_fast_multiplier,
+ claude_usage_dict) = _import_pricing_kernel()
+
+
 # Anthropic's per-call >200K-tokens tier — kept in sync with bin/_lib_pricing.
 # Callers may override via the ``tiered_threshold`` kwarg.
 DEFAULT_TIERED_THRESHOLD = 200_000
@@ -232,13 +278,18 @@ def _compute_entry_cache_dollars(
     *,
     pricing: dict,
     tiered_threshold: int = DEFAULT_TIERED_THRESHOLD,
+    cache_1h_tokens: int | None = None,
+    speed=None,
 ) -> tuple[float, float, float]:
     """Return ``(saved_usd, wasted_usd, net_usd)`` for a single entry.
 
     ``saved_usd``  = ``cache_read_tokens × (base_rate − read_rate)``
         — what you'd have paid without caching.
-    ``wasted_usd`` = ``cache_creation_tokens × (create_rate − base_rate)``
-        — premium paid to write cache.
+    ``wasted_usd`` = the cache-WRITE premium over base input, priced by TTL
+        (#195): the 1-hour portion against ``2 ×`` base input, the REMAINDER
+        against today's create rate. ``cache_1h_tokens is None`` (split
+        unknown) and ``== 0`` (all-5m) both take the verbatim pre-#195
+        expression, so this stays byte-identical for every pre-split row.
     ``net_usd``    = ``saved_usd − wasted_usd``. Positive = caching helped.
 
     Applies Anthropic's per-call >200K-tokens tier (mirrors the
@@ -289,8 +340,29 @@ def _compute_entry_cache_dollars(
         "cache_creation_input_token_cost_above_200k_tokens",
     )
 
+    multiplier = (
+        _claude_fast_multiplier(model) if speed == "fast" else 1.0
+    )
+    if multiplier != 1.0:
+        base_for_read *= multiplier
+        read_rate *= multiplier
+        base_for_create *= multiplier
+        create_rate *= multiplier
+
     saved = cache_read_tokens * max(0.0, base_for_read - read_rate)
-    wasted = cache_creation_tokens * max(0.0, create_rate - base_for_create)
+    # #195: the write premium is TTL-dependent. Split the creation tokens the
+    # same way _cache_create_cost does — 1h portion against the 2x rate, the
+    # REMAINDER against today's create_rate — so Wasted $/Net $ cannot disagree
+    # with the total cost the pricing kernel reports. Cache reads remain 0.1x
+    # of the effective base rate, so fast mode scales their absolute savings.
+    h = 0 if cache_1h_tokens is None else max(
+        0, min(int(cache_1h_tokens), cache_creation_tokens))
+    if h == 0:
+        wasted = cache_creation_tokens * max(0.0, create_rate - base_for_create)
+    else:
+        rate_1h = base_for_create * CACHE_WRITE_1H_MULTIPLIER
+        wasted = (h * max(0.0, rate_1h - base_for_create)
+                  + (cache_creation_tokens - h) * max(0.0, create_rate - base_for_create))
     net = saved - wasted
     return (saved, wasted, net)
 
@@ -369,6 +441,10 @@ def _aggregate_cache_by_day(
         else:
             saved, wasted, net = _compute_entry_cache_dollars(
                 entry.model, create_tok, read_tok, pricing=pricing,
+                # #195: the normalized flat key the ingest chokepoint writes;
+                # absent on a pre-split row -> None -> unchanged pricing.
+                cache_1h_tokens=entry.usage.get("cache_creation_1h_input_tokens"),
+                speed=entry.usage.get("speed"),
             )
         models = day_model_buckets.setdefault(day_key, {})
         b = models.setdefault(entry.model, _Bucket())
@@ -522,12 +598,15 @@ def _aggregate_cache_by_session(
             mb_raw.cache_read_tokens += entry.cache_read_tokens
             mb_raw.cost += cost_calculator(
                 entry.model,
-                {
-                    "input_tokens": entry.input_tokens,
-                    "output_tokens": entry.output_tokens,
-                    "cache_creation_input_tokens": entry.cache_creation_tokens,
-                    "cache_read_input_tokens": entry.cache_read_tokens,
-                },
+                claude_usage_dict(   # #195 chokepoint
+                    input_tokens=entry.input_tokens,
+                    output_tokens=entry.output_tokens,
+                    cache_creation_tokens=entry.cache_creation_tokens,
+                    cache_read_tokens=entry.cache_read_tokens,
+                    # getattr: duck-typed entry contract (see below).
+                    cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                    speed=getattr(entry, "speed", None),
+                ),
                 "auto",
                 entry.cost_usd,
             )
@@ -536,6 +615,13 @@ def _aggregate_cache_by_session(
                 entry.cache_creation_tokens,
                 entry.cache_read_tokens,
                 pricing=pricing,
+                # #195: getattr, not attribute access. This is a PURE kernel with
+                # a duck-typed entry contract — callers pass `_JoinedClaudeEntry`
+                # in production and lightweight stand-ins in tests, so a hard
+                # `.cache_1h_tokens` would break every stand-in. Default None ==
+                # split unknown, which prices exactly as before.
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
             )
             mb_raw.saved_usd += saved
             mb_raw.wasted_usd += wasted
@@ -813,6 +899,10 @@ def _aggregate_cache_breakdown(
                 getattr(e, "cache_creation_tokens", 0),
                 getattr(e, "cache_read_tokens", 0),
                 pricing=pricing,
+                # #195: getattr default None == split unknown, so an entry type
+                # that does not carry the split prices exactly as before.
+                cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                speed=getattr(e, "speed", None),
             )
         b.saved_usd += saved
         b.wasted_usd += wasted
@@ -921,6 +1011,8 @@ def aggregate_by_day_project(
         read_tok = getattr(e, "cache_read_tokens", 0)
         _s, _w, net = _compute_entry_cache_dollars(
             model, create_tok, read_tok, pricing=pricing,
+            cache_1h_tokens=getattr(e, "cache_1h_tokens", None),   # #195
+            speed=getattr(e, "speed", None),
         )
         nets.setdefault(k, []).append(net)
         t = toks.setdefault(k, [0, 0, 0])

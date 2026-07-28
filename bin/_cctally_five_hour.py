@@ -1629,8 +1629,16 @@ def _backfill_five_hour_blocks(
                     ).fetchone()
                 crossed = 1 if cross_row is not None else 0
 
-                # is_closed: 1 if the canonical reset moment is already past.
-                is_closed = 1 if resets_dt < now_dt else 0
+                # A rebuild's only-missing row is the trailing unjournaled
+                # projection, never a close decision. Wall time may be past its
+                # reset, but only a later retained observation may close and
+                # clock it (#399). The ordinary legacy backfill keeps its
+                # historical wall-time classification.
+                is_closed = (
+                    0 if only_missing else (1 if resets_dt < now_dt else 0)
+                )
+                projection_created_at = first_obs if only_missing else now_iso
+                projection_updated_at = last_obs if only_missing else now_iso
 
                 # Token + cost totals — recomputed via the shared helper,
                 # which routes through get_entries() and falls back to
@@ -1681,8 +1689,8 @@ def _backfill_five_hour_blocks(
                         totals["cache_read_tokens"],
                         totals["cost_usd"],
                         is_closed,
-                        now_iso,
-                        now_iso,
+                        projection_created_at,
+                        projection_updated_at,
                         acct,
                     ),
                 )
@@ -1776,5 +1784,4 @@ def _backfill_five_hour_blocks(
         eprint(f"[5h-block backfill] failed: {exc}")
         return 0
     return inserted
-
 

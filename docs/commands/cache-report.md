@@ -4,6 +4,10 @@ Claude cache diagnostics or Codex cached-input/token-reuse analytics across
 days or sessions. Provider sections stay separate because their token and cache
 semantics differ.
 
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Synopsis
 
 ```
@@ -31,6 +35,14 @@ without relabeling it as Claude cache behavior.
 - **$ Wasted** — cache-write premium that did not yield enough reads
 - **Net $** — `Saved – Wasted`; negative means caching is costing you
 - **Anomaly glyph (⚠)** — `Net $ < 0` or Cache % drops ≥15pp vs. the trailing median
+
+Claude financial fields use each retained response's effective
+`message.usage.speed`. Current Opus 5/4.8 fast rows use the 2x fast rate;
+historical retained Opus 4.6/4.7 fast rows use 6x. Cache reads and both
+cache-write TTLs stack on that effective base rate, so Total, Saved, Wasted,
+and Net remain internally consistent. Standard, missing, malformed, unsupported,
+and recorded-cost rows keep their existing behavior; Claude has no inferred or
+user-selected speed flag.
 
 **Codex token reuse** shows inclusive input, cached input, non-cached input,
 cached-input percent, output, reasoning output, and source-native cost. It has

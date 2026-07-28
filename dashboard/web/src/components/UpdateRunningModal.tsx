@@ -86,9 +86,11 @@ export function UpdateRunningModal() {
       dispatch({
         type: 'APPEND_UPDATE_STREAM',
         event: {
-          type: type as 'stdout' | 'stderr' | 'step' | 'exit' | 'execvp' | 'error_event' | 'done' | 'heartbeat',
+          type: type as 'stdout' | 'stderr' | 'target' | 'step' | 'exit' | 'execvp' | 'error_event' | 'done' | 'heartbeat',
           data: typeof payload.data === 'string' ? payload.data : undefined,
           name: typeof payload.name === 'string' ? payload.name : undefined,
+          version: typeof payload.version === 'string' ? payload.version : undefined,
+          command: typeof payload.command === 'string' ? payload.command : undefined,
           rc: typeof payload.rc === 'number' ? payload.rc : undefined,
           step: typeof payload.step === 'string' ? payload.step : undefined,
           message: typeof payload.message === 'string' ? payload.message : undefined,
@@ -104,7 +106,12 @@ export function UpdateRunningModal() {
       // zero exit — masking failures from `brew upgrade cctally`. The
       // canonical success transition is `execvp` (handled below); only
       // a non-zero exit short-circuits to `failed`.
-      if (type === 'exit') {
+      if (type === 'target') {
+        // Install-time beta resolution has updated update-state.json. Refresh
+        // the modal before showing/running the exact target selected by the
+        // worker rather than retaining the stale pre-click cached version.
+        void refreshUpdateState();
+      } else if (type === 'exit') {
         const rc = typeof payload.rc === 'number' ? payload.rc : -1;
         if (rc !== 0) {
           dispatch({
@@ -213,7 +220,7 @@ export function UpdateRunningModal() {
       // Generic message-without-event-name (defensive — server always
       // names events but a proxy strip would otherwise lose them).
       es.addEventListener('message', (ev) => pushEvent(ev, 'stdout'));
-      ['stdout', 'stderr', 'step', 'exit', 'execvp', 'error_event', 'done', 'heartbeat'].forEach(
+      ['stdout', 'stderr', 'target', 'step', 'exit', 'execvp', 'error_event', 'done', 'heartbeat'].forEach(
         (name) => {
           es!.addEventListener(name, (ev) => pushEvent(ev as MessageEvent, name));
         },

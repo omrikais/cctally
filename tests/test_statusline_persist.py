@@ -646,6 +646,49 @@ def test_persist_writes_snapshot_and_milestone(app):
     assert n >= 1
 
 
+def test_persist_milestone_uses_canonical_week_date_across_midnight(app):
+    """A 23:45 UTC reset rounds into the next date for every derived row."""
+    reset_dt = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)
+    ).replace(hour=23, minute=45, second=0, microsecond=0)
+    raw_week_start = reset_dt - dt.timedelta(days=7)
+    canonical_week_start = (
+        raw_week_start + dt.timedelta(hours=1)
+    ).replace(minute=0)
+    assert raw_week_start.date() != canonical_week_start.date()
+
+    parsed = _status_input(
+        app,
+        seven_pct=42.0,
+        seven_resets_epoch=int(reset_dt.timestamp()),
+    )
+    app._statusline_persist(parsed, sync_for_test=True)
+
+    conn = app.open_db()
+    try:
+        usage_dates = {
+            row[0] for row in conn.execute(
+                "SELECT week_start_date FROM weekly_usage_snapshots"
+            )
+        }
+        cost_dates = {
+            row[0] for row in conn.execute(
+                "SELECT week_start_date FROM weekly_cost_snapshots"
+            )
+        }
+        milestone_count = conn.execute(
+            "SELECT COUNT(*) FROM percent_milestones "
+            "WHERE percent_threshold = 42"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    expected_date = canonical_week_start.date().isoformat()
+    assert usage_dates == {expected_date}
+    assert cost_dates == {expected_date}
+    assert milestone_count == 1
+
+
 def test_same_value_render_does_not_touch_selected_marker_on_dedup(app):
     """Unchanged stdin stays transport-lively but does not claim selection."""
     import _cctally_core

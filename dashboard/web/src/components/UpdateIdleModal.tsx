@@ -27,11 +27,10 @@ export function UpdateIdleModal() {
   const methodLabel = METHOD_LABEL[method] ?? method;
   const cmd = state.update_command ?? '';
   const isManual = method === 'unknown' || !cmd;
-  // Beta-channel (spec 2026-07-21 §3): a `(beta)` marker next to Latest, and
-  // the "Update now" button installs the EXACT resolved version on beta (the
-  // update_command already shows `cctally@X.Y.Z`); stable stays `@latest`.
+  // Beta-channel: a `(beta)` marker next to Latest. `update_command` shows the
+  // cached exact target, while clicking Update asks the server to resolve the
+  // selected channel again before it starts the subprocess.
   const isBeta = state.configured_channel === 'beta';
-  const startVersion = isBeta ? state.latest_version : undefined;
   return (
     <div className="update-modal-body">
       <div className="update-kv">
@@ -90,7 +89,7 @@ export function UpdateIdleModal() {
           type="button"
           className="update-btn update-btn-primary"
           disabled={isManual}
-          onClick={() => updateActions.start(startVersion)}
+          onClick={() => updateActions.start()}
         >
           Update now
         </button>

@@ -17,6 +17,7 @@ def _reset_logger():
     root = logging.getLogger("cctally")
     for h in list(root.handlers):
         root.removeHandler(h)
+    root.propagate = True
 
 
 def _serve(ns, host="127.0.0.1", port=0):

@@ -4,6 +4,10 @@
 
 For the **command-line** share surface (`--format` on reporting subcommands), see [`share.md`](share.md). The two share paths use the same underlying render kernel (`bin/_lib_share.py`), so output is byte-stable across them.
 
+> **Claude cost coverage:** Dashboard share artifacts inherit the
+> [transcript-derived lower-bound contract](../claude-cost-coverage.md) for
+> Claude dollar and token totals. Codex accounting is unaffected.
+
 ## Overview
 
 Each share-capable dashboard panel (and its detail modal) renders a header **share icon** (`↗`) next to the existing controls. Click it (or press `S` while the panel is focused) to open the **share modal**, which lets you choose a template, tune knobs, preview the result live, and export.

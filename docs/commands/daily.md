@@ -3,6 +3,10 @@
 Claude usage grouped by date. Drop-in replacement for `ccusage daily`,
 offline.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Canonical form: [`cctally claude daily`](claude.md) (this flat form remains as an alias).
 
 ## Synopsis

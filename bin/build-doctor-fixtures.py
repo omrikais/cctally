@@ -43,10 +43,9 @@ SCENARIOS = {
     # Pricing-freshness check (spec 2026-05-29): an in-window unpriced
     # Claude model seeds the cache so `pricing.coverage` WARNs.
     "18-pricing-unpriced-model": "pricing_unpriced_model",
-    # Version-ahead check (issue #145): a DB whose user_version exceeds the
-    # running binary's registry head. cache.db ahead auto-heals → WARN (exit
-    # 0); stats.db ahead bricks → FAIL (exit 2). doctor reads raw
-    # user_version (no dispatcher), so it reports without healing/bricking.
+    # Version-ahead check: cache.db ahead auto-heals. A stats epoch mismatch
+    # rebuilds only when journal bytes exist; the no-journal case reports the
+    # restoration requirement instead of promising an impossible auto-heal.
     "19-cache-version-ahead":    "cache_version_ahead",
     "20-stats-version-ahead":    "stats_version_ahead",
     "21-codex-quota-fresh-stale": "codex_quota_fresh_stale",
@@ -62,6 +61,10 @@ SCENARIOS = {
     # #315: cache.db with a deliberately high free-page ratio. The doctor
     # check must WARN and point at the guarded explicit vacuum command.
     "27-cache-reclaimable":          "cache_reclaimable",
+    # #411: paired real-output fixtures for a rebuildable stats mismatch and
+    # a data dir resolved inside an unexcluded file-level sync root.
+    "28-stats-mismatch-with-journal": "stats_mismatch_with_journal",
+    "29-backup-sync-included":        "backup_sync_included",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -506,10 +509,8 @@ def _scenario_body(slug: str) -> str:
             """)
         return _scenario_body("all_ok") + statusline
     if slug == "stats_version_ahead":
-        # Issue #145: reuse the all_ok baseline, then push stats.db's
-        # user_version past the stats registry head. doctor's raw status read
-        # sees stats.db ahead → FAIL row + overall exit 2 (bricks commands;
-        # not re-derivable). cache.db absent → not ahead.
+        # Reuse the all_ok baseline, then create an epoch mismatch without any
+        # journal bytes. Doctor must not promise that a rebuild can self-heal.
         bump = textwrap.dedent(f"""\
             python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db" <<'PY'
             import sqlite3, sys
@@ -520,6 +521,40 @@ def _scenario_body(slug: str) -> str:
             PY
             """)
         return _scenario_body("all_ok") + bump
+    if slug == "stats_mismatch_with_journal":
+        journal = textwrap.dedent(f"""\
+            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/journal"
+            python3 - "$REPO_ROOT/bin" \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/journal/observations-2026-05.jsonl" <<'PY'
+            import pathlib, sys
+            sys.path.insert(0, sys.argv[1])
+            import _lib_journal as journal
+            record = journal.make_obs(
+                at="2026-05-13T14:00:00Z",
+                src="doctor-fixture",
+                provider="claude",
+                payload={{"weekly_percent": 1.0}},
+            )
+            pathlib.Path(sys.argv[2]).write_bytes(journal.encode_line(record))
+            PY
+            : > "$HARNESS_FAKE_HOME/.local/share/cctally/journal/observations-2026-06.jsonl"
+            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db" <<'PY'
+            import sqlite3, sys
+            conn = sqlite3.connect(sys.argv[1])
+            conn.execute("PRAGMA user_version = 99")
+            conn.commit()
+            conn.close()
+            PY
+            """)
+        return _scenario_body("all_ok") + journal
+    if slug == "backup_sync_included":
+        relocate = textwrap.dedent("""\
+            SYNC_ROOT="$HARNESS_FAKE_HOME/Library/Mobile Documents/com~apple~CloudDocs"
+            mkdir -p "$SYNC_ROOT"
+            mv "$HARNESS_FAKE_HOME/.local/share/cctally" "$SYNC_ROOT/cctally"
+            ln -s "$SYNC_ROOT/cctally" "$HARNESS_FAKE_HOME/.local/share/cctally"
+            """)
+        return _scenario_body("all_ok") + relocate
     raise SystemExit(f"unknown scenario slug: {slug}")
 
 

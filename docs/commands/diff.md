@@ -4,6 +4,10 @@ Compare Claude usage between two windows in a single bordered-table
 render. Answers *"what changed between this week and last week — and
 which models, projects, and cache patterns drove the change?"*
 
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Quick examples
 
     # This subscription week vs last

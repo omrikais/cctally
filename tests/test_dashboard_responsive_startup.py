@@ -13,6 +13,7 @@ skips where that fixture is absent (fresh CI), and is proven non-vacuous
 manually by stashing the cheap-seed impl → RED against the pre-change full-seed.
 """
 import datetime as dt
+import json
 import pathlib
 import shutil
 import socket
@@ -40,8 +41,7 @@ def _dash_mod():
 
 def _seed_data_dir_from_fixture(tmp_path, scenario):
     """Copy a dashboard fixture's SQLite tree into a fresh tmp data dir and
-    return ``(data_dir, claude_dir)`` for CCTALLY_DATA_DIR / CLAUDE_CONFIG_DIR
-    (both pinned — see gotcha_isolate_from_real_claude_data_needs_both_env_vars)."""
+    return ``(data_dir, claude_dir)`` for the fixture loader."""
     src = (REPO / "tests" / "fixtures" / "dashboard" / scenario
            / ".local" / "share" / "cctally")
     data = tmp_path / "data"
@@ -56,12 +56,171 @@ def _seed_data_dir_from_fixture(tmp_path, scenario):
 
 def _load_with_fixture(monkeypatch, tmp_path, scenario):
     data, claude = _seed_data_dir_from_fixture(tmp_path, scenario)
-    # Pin BOTH env vars BEFORE load_script so _init_paths_from_env re-points
-    # cache.db/stats.db at the copy and sync never touches the real data dir.
+    home = tmp_path / "home"
+    codex = tmp_path / "codex"
+    home.mkdir(parents=True, exist_ok=True)
+    (codex / "sessions").mkdir(parents=True, exist_ok=True)
+    # Pin every provider/home root BEFORE load_script so path initialization
+    # and either ingest walker can only see state owned by this fixture.
     monkeypatch.setenv("CCTALLY_DATA_DIR", str(data))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    monkeypatch.setenv("HOME", str(home))
     ns = load_script()
     return ns
+
+
+def _load_with_empty_roots(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    codex = tmp_path / "codex"
+    home.mkdir(parents=True, exist_ok=True)
+    (codex / "sessions").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex))
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    return ns
+
+
+def _write_minimal_codex_rollout(codex_home, *, session_id):
+    rollout = (
+        codex_home / "sessions" / "2026" / "07" / "27"
+        / f"rollout-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "timestamp": "2026-07-27T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": "/fixture/codex-project"},
+        },
+        {
+            "timestamp": "2026-07-27T00:00:01Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5"},
+        },
+        {
+            "timestamp": "2026-07-27T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 20,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 130,
+                    },
+                    "total_token_usage": {"total_tokens": 130},
+                },
+            },
+        },
+    ]
+    rollout.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    return rollout
+
+
+def _codex_schema_state(cache_path):
+    conn = sqlite3.connect(cache_path)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        objects = tuple(
+            conn.execute(
+                """
+                SELECT type, name, tbl_name, COALESCE(sql, '')
+                  FROM sqlite_schema
+                 WHERE type IN ('table', 'index')
+                   AND (name LIKE 'codex_%' OR tbl_name LIKE 'codex_%')
+                 ORDER BY type, name
+                """
+            )
+        )
+        return version, objects
+    finally:
+        conn.close()
+
+
+def test_fixture_loader_replaces_inherited_codex_and_home_roots(
+    monkeypatch, tmp_path,
+):
+    """The copied dashboard fixture owns every provider/home fallback.
+
+    A caller-populated Codex root must not become input merely because the
+    fixture loader inherited its process environment.
+    """
+    inherited_home = tmp_path / "inherited-home"
+    inherited_codex = tmp_path / "inherited-codex"
+    (inherited_codex / "sessions").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(inherited_home))
+    monkeypatch.setenv("CODEX_HOME", str(inherited_codex))
+
+    ns = _load_with_fixture(monkeypatch, tmp_path / "fixture", "ok")
+
+    owned_home = tmp_path / "fixture" / "home"
+    owned_codex = tmp_path / "fixture" / "codex"
+    assert pathlib.Path.home() == owned_home
+    assert ns["_codex_home_roots"]() == [owned_codex]
+    assert all(
+        root.is_relative_to(owned_codex)
+        for root in ns["_codex_session_roots"]()
+    )
+
+
+def test_populated_fixture_cache_codex_first_and_repeat_touch_are_clean(
+    monkeypatch, tmp_path,
+):
+    """A real Codex file is clean on both touches of a copied cache fixture."""
+    owned_codex = tmp_path / "codex"
+    rollout = _write_minimal_codex_rollout(
+        owned_codex, session_id="fixture-first-touch",
+    )
+    ns = _load_with_fixture(monkeypatch, tmp_path, "ok")
+    cache_path = ns["_cctally_core"].CACHE_DB_PATH
+    before = _codex_schema_state(cache_path)
+
+    assert ns["_discover_session_files"](dt.datetime.min.replace(
+        tzinfo=dt.timezone.utc
+    )) == []
+    discovered = ns["_cctally_cache"]._discover_codex_files_with_roots()
+    assert [item.source_path for item in discovered] == [rollout]
+    assert all(
+        item.source_path.is_relative_to(owned_codex)
+        for item in discovered
+    )
+
+    first = ns["_tui_build_snapshot"](
+        now_utc=OK_AS_OF,
+        skip_sync=False,
+        precompute_envelope=True,
+        runtime_bind="127.0.0.1",
+    )
+    after_first = _codex_schema_state(cache_path)
+    second = ns["_tui_build_snapshot"](
+        now_utc=OK_AS_OF,
+        skip_sync=False,
+        precompute_envelope=True,
+        runtime_bind="127.0.0.1",
+    )
+    after_second = _codex_schema_state(cache_path)
+
+    assert first.last_sync_error is None
+    assert second.last_sync_error is None
+    assert after_first == after_second
+    assert after_first[0] >= before[0]
+    conn = sqlite3.connect(cache_path)
+    try:
+        assert conn.execute(
+            "SELECT path FROM codex_session_files"
+        ).fetchall() == [(str(rollout),)]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_session_entries"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
 
 
 def test_cheap_seed_normal_launch_shape(monkeypatch, tmp_path):
@@ -95,8 +254,7 @@ def test_cheap_seed_normal_launch_shape(monkeypatch, tmp_path):
 
 
 def test_cheap_seed_empty_data(monkeypatch, tmp_path):
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     args = types.SimpleNamespace(no_sync=False, host="127.0.0.1")
     seed = _dash_mod()._dashboard_initial_snapshot(
         args, pinned_now=None, display_tz_pref_override=None,
@@ -185,9 +343,15 @@ def test_bind_before_build_timing(tmp_path):
             pass
     claude = tmp_path / "claude" / "projects"
     claude.mkdir(parents=True, exist_ok=True)
+    home = tmp_path / "home"
+    codex = tmp_path / "codex"
+    home.mkdir(parents=True, exist_ok=True)
+    (codex / "sessions").mkdir(parents=True, exist_ok=True)
     env = dict(__import__("os").environ)
     env["CCTALLY_DATA_DIR"] = str(data)
     env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
+    env["CODEX_HOME"] = str(codex)
+    env["HOME"] = str(home)
     t0 = time.monotonic()
     proc = subprocess.Popen(
         [sys.executable, str(BIN), "dashboard", "--port", "0",
@@ -286,8 +450,7 @@ def test_a2_throttle_clock_is_completion_measured(monkeypatch, tmp_path):
 
 
 def test_a2_progress_cb_fires_throttled_and_publishes_hydrating(monkeypatch, tmp_path):
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
@@ -315,8 +478,7 @@ def test_a2_progress_cb_fires_throttled_and_publishes_hydrating(monkeypatch, tmp
 
 
 def test_a2_progress_cb_suppressed_under_perf_tracing(monkeypatch, tmp_path):
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
@@ -335,8 +497,7 @@ def test_a2_progress_cb_suppressed_under_perf_tracing(monkeypatch, tmp_path):
 def test_a2_warm_sync_yields_single_publish(monkeypatch, tmp_path):
     # Empty CLAUDE dir → the real sync_cache finishes far under T → the throttle
     # never fires → exactly one publish (the final, hydrating=False).
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
     locked = ns["_make_run_sync_now_locked"](
@@ -351,8 +512,7 @@ def test_a2_progressive_multi_frame(monkeypatch, tmp_path):
     # A slow first-run sync (faked: progress fires twice) crossing T (patched to
     # 0) yields MULTIPLE hydrating=true partial frames, ending in a
     # hydrating=false complete frame. Non-vacuous vs the pre-change single frame.
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
     monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
@@ -375,8 +535,7 @@ def test_a2_progressive_multi_frame(monkeypatch, tmp_path):
 
 
 def test_a2_perf_trace_suppresses_partials_integration(monkeypatch, tmp_path):
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     import _cctally_tui as tui
     import _lib_perf as perf
     monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
@@ -409,10 +568,19 @@ def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
     # The decoupled path's final published snapshot is byte-identical to today's
     # _tui_build_snapshot(skip_sync=False) over the same cache — proving the
     # decoupling (and any intermediate partials) don't change the final result.
+    inherited_codex = tmp_path / "inherited-codex"
+    _write_minimal_codex_rollout(
+        inherited_codex, session_id="must-not-be-discovered",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(inherited_codex))
     ns = _load_with_fixture(monkeypatch, tmp_path, "ok")
     import _lib_snapshot_cache as sc
-    import json
     BIND = "127.0.0.1"
+
+    assert ns["_cctally_cache"]._discover_codex_files_with_roots() == []
+    assert ns["_discover_session_files"](
+        dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    ) == []
 
     sc.reset_dispatch_state()
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
@@ -440,6 +608,8 @@ def test_a2_decouple_parity_byte_identical(monkeypatch, tmp_path):
     assert json.dumps(env_decoupled, sort_keys=True) == json.dumps(
         env_direct, sort_keys=True
     )
+    assert decoupled.last_sync_error is None
+    assert direct.last_sync_error is None
     assert decoupled.hydrating is False
 
 
@@ -450,8 +620,7 @@ def test_a2_decouple_threads_sync_cache_error(monkeypatch, tmp_path):
     # (its `sync` phase records errors[0] = f"sync-cache: {exc}"). This locks the
     # sync-error-threading parity: decoupling the ingest must not change the
     # error wording the UI sees.
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
 
@@ -474,11 +643,12 @@ def test_a2_decouple_threads_sync_cache_error(monkeypatch, tmp_path):
     assert published.hydrating is False
 
 
-def test_a2_decouple_recovers_classified_cache_corruption_once(
+def test_a2_decouple_declines_unconfirmed_cache_corruption(
     monkeypatch, tmp_path,
 ):
-    ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    import _cctally_tui as tui
+    monkeypatch.setattr(tui, "_A2_PARTIAL_THROTTLE_S", 0.0)
     cache_mod = ns["_cctally_cache"]
     ref = ns["_SnapshotRef"](ns["_empty_dashboard_snapshot"]())
     hub = _CapturingHub()
@@ -499,13 +669,20 @@ def test_a2_decouple_recovers_classified_cache_corruption_once(
     )
     locked(skip_sync=False)
 
-    assert attempts == 2
+    # A classified exception is only a trigger for the locked forensics probe.
+    # This fixture's cache is healthy, so recovery must fail closed: preserve
+    # the original exception path and never retry or quarantine the cache.
+    assert attempts == 1
     assert len(hub.published) == 1
-    assert hub.published[-1].last_sync_error is None
+    assert hub.published[-1].last_sync_error is not None
+    assert hub.published[-1].last_sync_error.startswith("sync-cache: ")
+    assert "database disk image is malformed" in (
+        hub.published[-1].last_sync_error
+    )
     assert hub.published[-1].hydrating is False
     incidents = list(
         (pathlib.Path(ns["_cctally_core"].APP_DIR) / "quarantine").glob(
             "cache.db-*"
         )
     )
-    assert len(incidents) == 1
+    assert incidents == []

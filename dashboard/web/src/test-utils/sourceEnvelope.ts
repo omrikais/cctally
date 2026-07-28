@@ -323,6 +323,11 @@ export function makeCodexSourceEntry(
   return {
     availability: 'ok',
     freshness: 'fresh',
+    domain_freshness: {
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    },
     warnings: [],
     data_version: 'codex:v1',
     last_success_at: '2026-04-24T13:07:00Z',
@@ -419,6 +424,11 @@ export function makeClaudeSourceEntry(
   return {
     availability: 'ok',
     freshness: 'fresh',
+    domain_freshness: {
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    },
     warnings: [],
     data_version: 'claude:v1',
     last_success_at: '2026-04-24T13:07:00Z',
@@ -477,6 +487,11 @@ export function makeAllSourceEntry(
   return {
     availability: 'ok',
     freshness: 'fresh',
+    domain_freshness: {
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    },
     warnings: [],
     data_version: 'all:v1',
     last_success_at: '2026-04-24T13:07:00Z',
@@ -504,6 +519,11 @@ export function makeHydratingEntry(): SourceEntry<never> {
   return {
     availability: 'partial',
     freshness: 'stale',
+    domain_freshness: {
+      hero: 'stale',
+      quota: 'stale',
+      sessions: 'stale',
+    },
     warnings: [],
     data_version: 'hydrating',
     last_success_at: null,

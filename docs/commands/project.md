@@ -5,6 +5,10 @@ against a subscription-week ceiling; Codex has calendar-week cost and token
 rollups without a fabricated `Used %`. In `--source all`, provider sections
 stay separate and `--weeks` resolves one absolute calendar range.
 
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Quick examples
 
     # Current Claude subscription week, sorted by cost desc

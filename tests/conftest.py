@@ -115,6 +115,51 @@ def _guard_real_prod_migration_log(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stats_write_sanction(request):
+    """#386: a pytest process is itself a sanctioned stats.db writer.
+
+    `_cctally_store.arm_stats_authorizer` installs a SQLite authorizer on every
+    stats connection the store hands out; outside a sanctioned write scope it
+    returns `SQLITE_DENY`, and on a dev checkout (which every test run is) a
+    denial RAISES. Spec section 3.1's regimes exist to serialize writers ACROSS
+    PROCESSES under the multi-agent hook storm. An in-process pytest test has no
+    storm and no second writer: it holds the DB alone, and its `open_db()`
+    fixtures deliberately hand-construct states — pre-cutover legacy installs,
+    orphaned milestones, conflicting journals — that no sanctioned path can
+    produce. The fixture IS the serialized writer, so declaring it one is the
+    truthful statement, not an exemption.
+
+    **This does not disarm the guard.** The enforcement that matters runs in
+    REAL CLI processes, which this fixture never touches:
+
+      - every pytest test that spawns `bin/cctally` as a child. The child is a
+        fresh process and inherits `PYTEST_CURRENT_TEST`, so
+        `_guard_should_raise()` is True there — including all 24 real-subprocess
+        cases in `tests/test_stats_writer_storm_386.py`;
+      - `bin/cctally-*-test` shell harnesses that do NOT set
+        `CCTALLY_DISABLE_DEV_AUTODETECT`, where `_is_dev_checkout()` is True;
+      - a developer invoking `cctally` from the checkout.
+
+    Measured, not assumed: `_is_dev_checkout()` returns False whenever
+    `CCTALLY_DISABLE_DEV_AUTODETECT` is set (`bin/_cctally_core.py`), which
+    several harness scenarios do — those run the guard in LOG-ONLY mode, and a
+    green harness there is NOT evidence that a path is sanctioned. The
+    subprocess-from-pytest surface above is the one that actually enforces.
+
+    A module opts out by setting `CCTALLY_STATS_GUARD_LIVE = True` at module
+    scope; `tests/test_stats_writer_guard_386.py` does, because its whole
+    subject is what happens with no scope held.
+    """
+    if getattr(request.module, "CCTALLY_STATS_GUARD_LIVE", False):
+        yield
+        return
+    import _cctally_store
+
+    with _cctally_store.stats_write_scope("pytest-in-process"):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_process_timezone():
     """Immunize the whole suite against cross-test timezone leaks.
 

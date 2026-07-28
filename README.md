@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <strong>See what Claude Code and Codex actually cost you: a local dashboard, conversation viewer, and CLI reports for your subscription quota.</strong>
+  <strong>Understand Claude Code and Codex spend: a local dashboard, conversation viewer, and CLI reports for your subscription quota.</strong>
 </p>
 
 <p align="center">
@@ -17,6 +17,13 @@
 </p>
 
 Your Claude Code plan meters you with a percentage that creeps up all week. cctally reads your local session logs and turns that percentage into dollars: what each percent of quota costs you, whether you are on track to cap before the reset, and where the spend is going. It does the same for OpenAI's Codex CLI. Everything runs on your own machine, against your own data. No account, no API key, and nothing is uploaded.
+
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](docs/claude-cost-coverage.md), not exact
+> `/usage` billing totals. Claude Code can bill title-generation and
+> prompt-suggestion/side-query requests without retaining usable model/token
+> fields. cctally does not guess the missing amount. Codex accounting uses a
+> different retained source and is unaffected.
 
 <p align="center">
   <img src="docs/img/dashboard-desktop.png" alt="cctally dashboard, desktop view" width="900">

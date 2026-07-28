@@ -203,7 +203,7 @@ from _cctally_core import (
 )
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel default (#341)
 from _lib_five_hour import _canonical_5h_window_key, five_hour_milestone_range
-from _lib_pricing import _calculate_entry_cost
+from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 from _lib_codex_hooks import (
     CODEX_HOOK_THROTTLE_SECONDS,
     acquire_due_lifecycle_locks,
@@ -609,6 +609,7 @@ def maybe_record_milestone(
     alert_sink: "list | None" = None,
     journal: "tuple | None" = None,
     account_key: str = _lib_accounts.UNATTRIBUTED,
+    retained_selection=None,
 ) -> None:
     """Check if a new integer percent threshold was crossed, and if so,
     fetch cost and record the milestone. Errors are logged, not raised.
@@ -633,6 +634,11 @@ def maybe_record_milestone(
     ``alerted_at`` stamp already lands in-txn (before harvest), so it survives a
     rebuild. ``None`` keeps today's compute-and-drop behavior on the passed-conn
     path.
+
+    ``retained_selection`` (#410 Task A) carries the triggering raw
+    observation's canonical subscription window. It is deliberately separate
+    from ``saved``: a dedup/self-heal fold may reuse a later physical usage row,
+    but that must never retarget the triggering observation's ``wcs:`` event.
 
     ``journal`` (DB journal redesign Task 6, Design A): the ``(ctx, id_base)``
     tuple threaded into the milestone's pre-record cost sync so the
@@ -697,6 +703,13 @@ def maybe_record_milestone(
         # Threshold crossed — sync cost before recording so the milestone
         # captures up-to-date cumulative cost, not a stale snapshot.
         try:
+            if retained_selection is None:
+                retained_selection = _cctally().WeekSelection(
+                    week_start=dt.date.fromisoformat(week_start_date),
+                    week_end=dt.date.fromisoformat(week_end_date),
+                    start_iso_override=week_start_at,
+                    end_iso_override=week_end_at,
+                )
             sync_ns = argparse.Namespace(
                 week_start=None,
                 week_end=None,
@@ -721,6 +734,10 @@ def maybe_record_milestone(
                 # Materialize the cost snapshot under the crossing's account
                 # (#341 P2-1) so the account-scoped read below finds it.
                 account_key=account_key,
+                # #410 Task A: the implicit milestone sync is a derivation of
+                # THIS retained observation. Never ask `pick_week_selection`
+                # for the latest stats row, which may carry a later anchor.
+                retained_selection=retained_selection,
             )
         except Exception as exc:
             eprint(f"[milestone] cost sync failed, using latest available: {exc}")
@@ -745,7 +762,11 @@ def maybe_record_milestone(
             effective_ref = adjusted[0]
 
         if _week_ref_has_reset_event(conn, effective_ref):
-            live_cost = _compute_cost_for_weekref(effective_ref)
+            live_cost = _compute_cost_for_weekref(
+                effective_ref,
+                account_key=account_key,
+                as_of=as_of,
+            )
             if live_cost is None:
                 eprint("[milestone] could not compute effective-range cost, skipping")
                 return
@@ -1865,12 +1886,14 @@ def _compute_block_totals(
     for entry in get_claude_session_entries(
         block_start_at, range_end, skip_sync=skip_sync,
     ):
-        usage = {
-            "input_tokens":                entry.input_tokens,
-            "output_tokens":               entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens":     entry.cache_read_tokens,
-        }
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        )
         cost = _calculate_entry_cost(
             entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
         )
@@ -1914,6 +1937,7 @@ def _compute_block_totals(
 def maybe_update_five_hour_block(
     saved: dict[str, Any], *, conn=None, as_of: "str | None" = None,
     alert_sink: "list | None" = None, account_key: str = _lib_accounts.UNATTRIBUTED,
+    journal_ctx=None,
 ) -> None:
     """Upsert the current 5h block in five_hour_blocks; close strictly
     older open blocks; sweep naturally-expired blocks; flag blocks
@@ -1935,7 +1959,12 @@ def maybe_update_five_hour_block(
     ``BEGIN IMMEDIATE``/``commit()``/``close()``, and alert dispatch is left to
     the caller (the ingester's ALERT_DISPATCHER). ``as_of`` (ISO-Z) is stamped
     as ``last_updated_at_utc`` / ``alerted_at`` in place of wall clock. Both
-    defaults keep the legacy own-connection, own-transaction behavior."""
+    defaults keep the legacy own-connection, own-transaction behavior.
+
+    ``journal_ctx`` makes a close durable at the transition itself. The complete
+    parent + model/project child sets are frozen before the transaction can
+    commit; an already-stamped closed block is immutable to later observations
+    and mutable cache growth."""
     five_hour_percent = saved.get("fiveHourPercent")
     five_hour_resets_at = saved.get("fiveHourResetsAt")
     five_hour_window_key = saved.get("fiveHourWindowKey")
@@ -1969,7 +1998,10 @@ def maybe_update_five_hour_block(
         prior = conn.execute(
             """
             SELECT id              AS prior_block_id,
-                   block_start_at  AS block_start_at
+                   block_start_at  AS block_start_at,
+                   is_closed       AS is_closed,
+                   journal_id      AS journal_id,
+                   last_updated_at_utc AS last_updated_at_utc
               FROM five_hour_blocks
              WHERE five_hour_window_key = ?
                AND account_key = ?
@@ -2006,6 +2038,11 @@ def maybe_update_five_hour_block(
             block_start_dt = parse_iso_datetime(
                 block_start_at, "five_hour_blocks.block_start_at",
             )
+        current_is_frozen = (
+            prior is not None
+            and int(prior["is_closed"]) == 1
+            and prior["journal_id"] is not None
+        )
 
         # Step 6 (totals) — done outside the transaction so the
         # cache.db read doesn't hold the stats.db write lock open.
@@ -2056,6 +2093,44 @@ def maybe_update_five_hour_block(
         if own_conn:
             conn.execute("BEGIN IMMEDIATE")
         try:
+            # Capture the exact transition set before mutating it. A close is
+            # triggered either by a retained successor-window observation or
+            # by the first retained observation captured after natural expiry.
+            # Both rules use ``now_iso`` (the observation's capture clock),
+            # never ingest/retry wall time.
+            closing_ids = {
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM five_hour_blocks "
+                    "WHERE is_closed = 0 AND account_key = ? "
+                    "AND (five_hour_window_key < ? "
+                    "     OR unixepoch(five_hour_resets_at) < unixepoch(?)) "
+                    "ORDER BY id",
+                    (account_key, int(five_hour_window_key), now_iso),
+                ).fetchall()
+            }
+            # A lost-commit retry replays the frozen event before reprocessing
+            # its trigger observation. Re-emit that exact duplicate only when
+            # this retained trigger clock matches the frozen closure clock;
+            # later ordinary observations do not churn duplicate lines.
+            retry_close_ids = {
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM five_hour_blocks "
+                    "WHERE is_closed = 1 AND journal_id IS NOT NULL "
+                    "AND account_key = ? AND last_updated_at_utc = ? "
+                    "AND (five_hour_window_key < ? "
+                    "     OR unixepoch(five_hour_resets_at) < unixepoch(?)) "
+                    "ORDER BY id",
+                    (
+                        account_key,
+                        now_iso,
+                        int(five_hour_window_key),
+                        now_iso,
+                    ),
+                ).fetchall()
+            }
+
             # Step 5: close any STRICTLY OLDER open block. `<` not `!=`
             # — record-usage runs in parallel via background hook-tick &
             # detach + status-line ticks; an older invocation completing
@@ -2078,15 +2153,15 @@ def maybe_update_five_hour_block(
             # who lets a block expire without a successor (idle / shut down
             # past the 5h reset) would otherwise leave the row at
             # is_closed = 0 forever. Idempotent (only flips 0 → 1); safe to
-            # re-run every tick. ISO-string compare is monotonic so it
-            # works directly on five_hour_resets_at.
+            # re-run every tick. Normalize through unixepoch() because retained
+            # reset/capture stamps may use different equivalent UTC suffixes.
             conn.execute(
                 """
                 UPDATE five_hour_blocks
                    SET is_closed = 1, last_updated_at_utc = ?
                  WHERE is_closed = 0
                    AND account_key = ?
-                   AND five_hour_resets_at < ?
+                   AND unixepoch(five_hour_resets_at) < unixepoch(?)
                 """,
                 (now_iso, account_key, now_iso),
             )
@@ -2136,6 +2211,8 @@ def maybe_update_five_hour_block(
                   total_cache_read_tokens    = excluded.total_cache_read_tokens,
                   total_cost_usd             = excluded.total_cost_usd,
                   last_updated_at_utc        = excluded.last_updated_at_utc
+                WHERE five_hour_blocks.is_closed = 0
+                   OR five_hour_blocks.journal_id IS NULL
                 """,
                 (
                     int(five_hour_window_key),
@@ -2176,12 +2253,13 @@ def maybe_update_five_hour_block(
             # a strictly-newer historical block stays open (scenario D), and on
             # `is_closed = 0` so it is idempotent + a no-op for a legacy own-conn
             # caller whose backfill already closed the historical block. `<`
-            # ISO-string-compares resets_at against now_iso, same as the sweep.
+            # instant-compares resets_at against now_iso, same as the sweep.
             if blocks_were_empty:
                 conn.execute(
                     "UPDATE five_hour_blocks SET is_closed = 1, last_updated_at_utc = ? "
                     "WHERE five_hour_window_key = ? AND account_key = ? "
-                    "  AND is_closed = 0 AND five_hour_resets_at < ?",
+                    "  AND is_closed = 0 "
+                    "  AND unixepoch(five_hour_resets_at) < unixepoch(?)",
                     (now_iso, int(five_hour_window_key), account_key, now_iso),
                 )
 
@@ -2190,71 +2268,83 @@ def maybe_update_five_hour_block(
             # orphan child rows from a prior parent rebuild are cleaned up automatically.
             # Same transaction as the parent upsert; if these raise, the whole tick
             # rolls back and the next tick recomputes from scratch.
-            conn.execute(
-                "DELETE FROM five_hour_block_models "
-                "WHERE five_hour_window_key = ? AND account_key = ?",
-                (int(five_hour_window_key), account_key),
-            )
-            if totals.get("by_model"):
-                conn.executemany(
-                    """
-                    INSERT INTO five_hour_block_models (
-                      block_id, five_hour_window_key, model,
-                      input_tokens, output_tokens,
-                      cache_create_tokens, cache_read_tokens,
-                      cost_usd, entry_count, account_key
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            block_id,
-                            int(five_hour_window_key),
-                            model,
-                            b["input_tokens"],
-                            b["output_tokens"],
-                            b["cache_create_tokens"],
-                            b["cache_read_tokens"],
-                            b["cost_usd"],
-                            b["entry_count"],
-                            account_key,
-                        )
-                        for model, b in totals["by_model"].items()
-                    ],
+            if not current_is_frozen:
+                conn.execute(
+                    "DELETE FROM five_hour_block_models "
+                    "WHERE five_hour_window_key = ? AND account_key = ?",
+                    (int(five_hour_window_key), account_key),
                 )
+                if totals.get("by_model"):
+                    conn.executemany(
+                        """
+                        INSERT INTO five_hour_block_models (
+                          block_id, five_hour_window_key, model,
+                          input_tokens, output_tokens,
+                          cache_create_tokens, cache_read_tokens,
+                          cost_usd, entry_count, account_key
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                block_id,
+                                int(five_hour_window_key),
+                                model,
+                                b["input_tokens"],
+                                b["output_tokens"],
+                                b["cache_create_tokens"],
+                                b["cache_read_tokens"],
+                                b["cost_usd"],
+                                b["entry_count"],
+                                account_key,
+                            )
+                            for model, b in totals["by_model"].items()
+                        ],
+                    )
 
-            conn.execute(
-                "DELETE FROM five_hour_block_projects "
-                "WHERE five_hour_window_key = ? AND account_key = ?",
-                (int(five_hour_window_key), account_key),
-            )
-            if totals.get("by_project"):
-                conn.executemany(
-                    """
-                    INSERT INTO five_hour_block_projects (
-                      block_id, five_hour_window_key, project_path,
-                      input_tokens, output_tokens,
-                      cache_create_tokens, cache_read_tokens,
-                      cost_usd, entry_count, account_key
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            block_id,
-                            int(five_hour_window_key),
-                            project_path,
-                            b["input_tokens"],
-                            b["output_tokens"],
-                            b["cache_create_tokens"],
-                            b["cache_read_tokens"],
-                            b["cost_usd"],
-                            b["entry_count"],
-                            account_key,
-                        )
-                        for project_path, b in totals["by_project"].items()
-                    ],
+                conn.execute(
+                    "DELETE FROM five_hour_block_projects "
+                    "WHERE five_hour_window_key = ? AND account_key = ?",
+                    (int(five_hour_window_key), account_key),
                 )
+                if totals.get("by_project"):
+                    conn.executemany(
+                        """
+                        INSERT INTO five_hour_block_projects (
+                          block_id, five_hour_window_key, project_path,
+                          input_tokens, output_tokens,
+                          cache_create_tokens, cache_read_tokens,
+                          cost_usd, entry_count, account_key
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                block_id,
+                                int(five_hour_window_key),
+                                project_path,
+                                b["input_tokens"],
+                                b["output_tokens"],
+                                b["cache_create_tokens"],
+                                b["cache_read_tokens"],
+                                b["cost_usd"],
+                                b["entry_count"],
+                                account_key,
+                            )
+                            for project_path, b in totals["by_project"].items()
+                        ],
+                    )
+
+            # The first historical block is inserted after the sweep above, so
+            # include it explicitly when this observation closes it.
+            if blocks_were_empty:
+                closed_now = conn.execute(
+                    "SELECT id FROM five_hour_blocks "
+                    "WHERE id = ? AND is_closed = 1 AND journal_id IS NULL",
+                    (block_id,),
+                ).fetchone()
+                if closed_now is not None:
+                    closing_ids.add(int(closed_now["id"]))
 
             # ── 5h-% milestone detection (mirrors maybe_record_milestone) ──
             # Snap-up-by-1e-9 per the gotcha: 0.50 * 100 == 49.99...9 in
@@ -2503,6 +2593,7 @@ def maybe_update_five_hour_block(
                    SET crossed_seven_day_reset = 1
                  WHERE crossed_seven_day_reset = 0
                    AND account_key = ?
+                   AND (is_closed = 0 OR journal_id IS NULL)
                    AND (
                      EXISTS (
                        SELECT 1 FROM week_reset_events e
@@ -2524,6 +2615,19 @@ def maybe_update_five_hour_block(
                 """,
                 (account_key,),
             )
+
+            # Freeze only after every parent field and both rollup child sets
+            # have reached their final close-state values for this observation.
+            # The cross-reset sweep above is part of the parent fact, so moving
+            # this earlier would journal ``crossed_seven_day_reset = 0`` and
+            # then mutate the live closed row to 1.
+            if journal_ctx is not None:
+                import _cctally_journal as _jr
+
+                for closing_id in sorted(closing_ids):
+                    _jr.freeze_five_hour_block_close(journal_ctx, closing_id)
+                for retry_id in sorted(retry_close_ids - closing_ids):
+                    _jr.freeze_five_hour_block_close(journal_ctx, retry_id)
 
             if own_conn:
                 conn.commit()
@@ -2636,6 +2740,38 @@ def _read_reset_zero_marker():
     return (week_start_date, cur_end_canon, baseline_pct, first_zero_iso)
 
 
+def _projection_read_reset_zero_marker(ctx):
+    if ctx is not None and not ctx.projection_writes:
+        return ctx.projection_state.get("reset_zero_marker")
+    return _read_reset_zero_marker()
+
+
+def _projection_clear_reset_zero_marker(ctx):
+    if ctx is not None and not ctx.projection_writes:
+        ctx.projection_state.pop("reset_zero_marker", None)
+        return
+    _clear_reset_zero_marker()
+
+
+def _projection_arm_reset_zero_marker(
+    ctx, week_start_date, cur_end_canon, *, baseline_pct, first_zero_iso,
+):
+    if ctx is not None and not ctx.projection_writes:
+        ctx.projection_state["reset_zero_marker"] = (
+            week_start_date,
+            cur_end_canon,
+            float(baseline_pct),
+            first_zero_iso,
+        )
+        return
+    _arm_reset_zero_marker(
+        week_start_date,
+        cur_end_canon,
+        baseline_pct=baseline_pct,
+        first_zero_iso=first_zero_iso,
+    )
+
+
 # ``CreditPlan`` / ``_parse_credit_at`` / ``_build_credit_plan`` now live in
 # ``bin/_lib_credit.py`` (#279 S4 F1); re-imported at module top so the
 # ``bin/cctally`` re-exports and this module's own callers
@@ -2727,12 +2863,13 @@ def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
     # Unconditional pivot 1: force-write hwm-7d so the next status-line render
     # reflects the post-credit value (the monotonic guard at the normal write
     # site would refuse to decrease the file).
-    try:
-        (_cctally_core.APP_DIR / "hwm-7d").write_text(
-            f"{week_start_date} {weekly_percent}\n"
-        )
-    except OSError:
-        pass
+    if ctx is None or ctx.projection_writes:
+        try:
+            (_cctally_core.APP_DIR / "hwm-7d").write_text(
+                f"{week_start_date} {weekly_percent}\n"
+            )
+        except OSError:
+            pass
     # Unconditional pivot 2: race-defensive cleanup of stale pre-credit replays
     # (external claude-statusline can replay pre-credit --percent values that
     # land captured_at >= effective with pct ~= baseline and dominate the
@@ -2812,8 +2949,9 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
         cur_end_canon = _canonicalize_optional_iso(week_end_at, "record.cur")
         prior = conn.execute(
             "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
-            "WHERE week_end_at IS NOT NULL "
-            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+            "WHERE week_end_at IS NOT NULL AND account_key = ? "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (account_key,),
         ).fetchone()
         if prior and prior["week_end_at"] and cur_end_canon:
             prior_end_canon = _canonicalize_optional_iso(
@@ -2872,7 +3010,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     # then the glue below executes the decided I/O. The 5
                     # branch outcomes (fire-immediate / confirm / clear /
                     # arm / none) map 1:1 to the pre-extraction structure.
-                    marker = _read_reset_zero_marker()
+                    marker = _projection_read_reset_zero_marker(ctx)
                     armed = (
                         marker is not None
                         and marker[0] == week_start_date
@@ -2889,7 +3027,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     if decision == FIRE_IMMEDIATE:
                         # >=25pp goodwill credit — fire immediately, never
                         # debounced. Clear any pending arm (now moot).
-                        _clear_reset_zero_marker()
+                        _projection_clear_reset_zero_marker(ctx)
                         _fire_in_place_credit(
                             conn, week_start_date, cur_end_canon, weekly_percent,
                             observed_pre_credit_pct=float(prior_pct),
@@ -2915,11 +3053,11 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                         # Clear ONLY after the fire completes (P2a): a
                         # mid-fire crash leaves the marker armed so the next
                         # zero re-confirms + re-runs the idempotent pivots.
-                        _clear_reset_zero_marker()
+                        _projection_clear_reset_zero_marker(ctx)
                     elif decision == CLEAR_MARKER:
                         # Recovered toward baseline → transient zero, not a
                         # reset. Clear, do not fire.
-                        _clear_reset_zero_marker()
+                        _projection_clear_reset_zero_marker(ctx)
                     elif decision == ARM_MARKER:
                         # First ~0 → arm; do NOT fire. The write clamp
                         # suppresses this 0 (no event row yet), so the prior
@@ -2927,7 +3065,8 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                         # re-evaluates next tick. first_zero_iso is the
                         # _command_as_of() value (now_utc), NOT wall-clock —
                         # it becomes the effective anchor.
-                        _arm_reset_zero_marker(
+                        _projection_arm_reset_zero_marker(
+                            ctx,
                             week_start_date, cur_end_canon,
                             baseline_pct=float(prior_pct),
                             first_zero_iso=now_utc.isoformat(timespec="seconds"),
@@ -2973,7 +3112,9 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     "  FROM weekly_usage_snapshots "
                     " WHERE five_hour_window_key IS NOT NULL "
                     "   AND five_hour_percent IS NOT NULL "
-                    " ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+                    "   AND account_key = ? "
+                    " ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+                    (account_key,),
                 ).fetchone()
                 if (
                     prior_5h_row is not None
@@ -3136,13 +3277,14 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                         # event row is durable. File format
                         # matches the canonical writer:
                         # ``<key> <percent>\n``.
-                        try:
-                            (_cctally_core.APP_DIR / "hwm-5h").write_text(
-                                f"{int(five_hour_window_key)} "
-                                f"{float(five_hour_percent)}\n"
-                            )
-                        except OSError:
-                            pass
+                        if ctx is None or ctx.projection_writes:
+                            try:
+                                (_cctally_core.APP_DIR / "hwm-5h").write_text(
+                                    f"{int(five_hour_window_key)} "
+                                    f"{float(five_hour_percent)}\n"
+                                )
+                            except OSError:
+                                pass
                         # Stale-replica DELETE (spec §4.3).
                         # Defends against claude-statusline
                         # replaying the pre-credit
@@ -3548,7 +3690,7 @@ def _apply_credit(conn, plan, *, five_hour=(None, None, None), as_of=None,
 
     # 4e. Clear a stale same-week reset-zero marker so the next record-usage
     # tick can't confirm a phantom reset-to-zero off it.
-    _clear_reset_zero_marker()
+    _projection_clear_reset_zero_marker(ctx)
 
 
 def _count_stale_replays(conn, plan):
@@ -4094,6 +4236,11 @@ def cmd_record_usage(
     # Build the RAW observation (spec 4.2 / 5.3 -- raw capture only, NO derived
     # week columns; `_pipeline_claude_usage` canonicalizes the week boundaries +
     # the 5h window key at ingest). Append it, then run the single-flight cycle.
+    # The capture clock intentionally stays separate from CCTALLY_AS_OF in
+    # production. The harness-only pin lets deterministic CLI scenarios model a
+    # genuinely open historical block without pretending a years-old reset is
+    # current wall time.
+    capture_now = now_dt if os.environ.get("CCTALLY_TEST_PIN_CAPTURE") else None
     raw: dict[str, Any] = {
         "weekly_percent": weekly_percent,
         "resets_at": resets_at,
@@ -4105,7 +4252,7 @@ def cmd_record_usage(
         # carries `_command_as_of()` (below) so the hook preserves that split.
         # Captured ONCE here (append time) and journaled, so a delayed ingest is
         # deterministic (never the ingest wall clock).
-        "captured_at": now_utc_iso(),
+        "captured_at": now_utc_iso(capture_now),
     }
     if five_hour_percent is not None:
         raw["five_hour_percent"] = five_hour_percent
@@ -4539,6 +4686,7 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
                     lambda active_conn: c.sync_codex_cache(
                         active_conn, lock_timeout=0
                     ),
+                    origin="hook.codex_quota.sync",
                 )
             finally:
                 cache.close()
@@ -4717,6 +4865,7 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
                     cache_mod._run_cache_operation_with_recovery(
                         cache_conn,
                         lambda active_conn: sync_cache(active_conn),
+                        origin="hook.claude.sync",
                     )
                 )
                 ingested = int(stats.rows_changed)
@@ -5196,13 +5345,15 @@ def _derive_5h_window_key(conn, five_hour_resets_at_epoch):
     )
 
 
-def _run_dollar_axes(saved, *, conn, as_of, alert_sink):
+def _run_dollar_axes(saved, *, conn, as_of, alert_sink, enabled=True):
     """The four dollar-decoupled alert axes in cmd_record_usage's legacy order
     (budget → project-budget → codex-budget → projected). Runs on BOTH the accept
     path AND every dedup-skip tick (spec §4.5: USD spend can cross a $ threshold
     while the weekly/5h percent is flat). Passed-conn → the chokepoints fold into
     the cycle txn and re-raise on failure (invariant ii); their crossings' alert
     payloads land in `alert_sink` for post-commit dispatch."""
+    if not enabled:
+        return
     c = _cctally()
     c.maybe_record_budget_milestone(
         saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
@@ -5302,7 +5453,13 @@ def _pipeline_claude_usage(ctx, rec):
     account_key = rec.get("account") or _lib_accounts.UNATTRIBUTED
 
     # Week boundaries from resets_at (cmd_record_usage canonicalization).
-    week_end_at_dt = dt.datetime.fromtimestamp(resets_at, tz=dt.timezone.utc)
+    # Normalize before deriving the date keys as well as the ISO overrides:
+    # rounding a 23:30–23:59 boundary crosses midnight, and letting
+    # `_usage_snapshot_columns` normalize only the saved row would fork the
+    # milestone's retained cost window onto the prior calendar date.
+    week_end_at_dt = _cctally_core._normalize_week_boundary_dt(
+        dt.datetime.fromtimestamp(resets_at, tz=dt.timezone.utc)
+    )
     week_start_at_dt = week_end_at_dt - dt.timedelta(days=7)
     week_start_date = week_start_at_dt.date().isoformat()
     week_end_date = week_end_at_dt.date().isoformat()
@@ -5409,10 +5566,16 @@ def _pipeline_claude_usage(ctx, rec):
     #    crosses a $ threshold still derives it.
     c.maybe_record_milestone(
         saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
-        journal=(ctx, rec["id"]), account_key=account_key)
+        journal=(ctx, rec["id"]), account_key=account_key,
+        retained_selection=c.WeekSelection(
+            week_start=dt.date.fromisoformat(week_start_date),
+            week_end=dt.date.fromisoformat(week_end_date),
+            start_iso_override=week_start_at,
+            end_iso_override=week_end_at,
+        ))
     c.maybe_update_five_hour_block(
         saved, conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
-        account_key=account_key)
+        account_key=account_key, journal_ctx=ctx)
     # The dollar-decoupled axes resolve a CURRENT budget/period WINDOW from
     # "now" and must see the record's DETECTION clock (`as_of` = rec["at"] =
     # `_command_as_of()`), NOT the wall-clock capture stamp: legacy
@@ -5421,8 +5584,16 @@ def _pipeline_claude_usage(ctx, rec):
     # week's window (capture_at is the raw wall clock, which lands outside a
     # pinned fixture window and silently drops the crossing). Both collapse to
     # real-now in production; the split only matters under a pinned as_of.
-    _run_dollar_axes(saved, conn=conn, as_of=as_of,
-                     alert_sink=ctx.pending_alerts)
+    _run_dollar_axes(
+        saved,
+        conn=conn,
+        as_of=as_of,
+        alert_sink=ctx.pending_alerts,
+        # Budget/projected rows depend on historical config that was not retained
+        # in the journal. Task B classifies them as re-materialized projections:
+        # the planner retires stale latches and never fabricates old config.
+        enabled=(ctx.event_sink is None),
+    )
 
     # 4'. Window-rollover 5h-block heal (SKIP path only). A dedup skip swallows
     #     the snapshot insert, so `saved` (the dedup target — the LATEST stored
@@ -5457,12 +5628,12 @@ def _pipeline_claude_usage(ctx, rec):
                         "fiveHourWindowKey": int(five_hour_window_key),
                     },
                     conn=conn, as_of=capture_at, alert_sink=ctx.pending_alerts,
-                    account_key=account_key)
+                    account_key=account_key, journal_ctx=ctx)
 
     # 5. hwm-7d / hwm-5h projection files — ACCEPT path only (the monotonic
     #    writer; a dedup tick's percent is already <= the stored HWM). In-place
     #    credit force-writes live in detect_reset_and_credit.
-    if not skip:
+    if not skip and ctx.projection_writes:
         _write_hwm_files(week_start_date, weekly_percent,
                          five_hour_window_key, five_hour_percent)
 

@@ -165,3 +165,72 @@ def test_contended_returns_without_mutating(env):
         assert conn.execute("SELECT count(*) FROM session_files WHERE path=?", (str(gone),)).fetchone()[0] == 1
     finally:
         fcntl.flock(holder, fcntl.LOCK_UN); holder.close()
+
+
+# ---------------------------------------------------------------------------
+# #195 review gate P2a. Cache migration 030 arms the cache-write-split re-walk
+# by zeroing every per-file cursor. Both orphan gates read `size_bytes` as the
+# "this path had ingested bytes" bit (`_prune_orphaned_cache_entries` and
+# sync_cache's detect-only leg), and a path no longer on disk is never revisited
+# by the re-walk — so a blanket `size_bytes = 0` would erase that bit
+# PERMANENTLY and turn both gates into no-ops for every pre-upgrade orphan.
+# ---------------------------------------------------------------------------
+
+def _arm_030(ns, conn):
+    handler = next(m.handler for m in ns["_CACHE_MIGRATIONS"]
+                   if m.name == "030_session_entries_cache_creation_split")
+    handler(conn)
+    return handler
+
+
+def test_030_leaves_a_deleted_path_prunable(env):
+    ns, conn, conversations, projects = env
+    orphan = projects / "-proj-gone" / "s1.jsonl"
+    _write(orphan, "S1", [_assistant("m1", "r1", uuid="u1"),
+                          _assistant("m2", "r2", uuid="u2")])
+    _sync(ns, conn, conversations)
+    assert _counts(conn, conversations, str(orphan)) == (1, 2, 2)
+    import shutil; shutil.rmtree(orphan.parent)
+    _arm_030(ns, conn)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 1 and res.pruned_entries == 2, (
+        "030 destroyed the orphan evidence: --prune-orphans can never reclaim "
+        "this path again")
+    assert _counts(conn, conversations, str(orphan)) == (0, 0, 0)
+
+
+def test_030_leaves_a_deleted_path_visible_to_sync_detection(env):
+    """The D5a leg: an orphaned cache does not mirror disk, so sync_cache must
+    still invalidate the walk-complete marker after 030 has armed the re-walk."""
+    ns, conn, conversations, projects = env
+    live = projects / "-proj-live" / "a.jsonl"
+    gone = projects / "-proj-gone" / "b.jsonl"
+    _write(live, "S8", [_assistant("m1", "r1", uuid="u1")])
+    _write(gone, "S9", [_assistant("m2", "r2", uuid="u2")])
+    _sync(ns, conn, conversations)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+    ).fetchone() is not None, "guard: the clean walk must have set the marker"
+    import os; os.remove(gone)
+    _arm_030(ns, conn)
+    _sync(ns, conn, conversations)
+    assert conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key='claude_ingest_walk_complete'"
+    ).fetchone() is None, "030 hid the orphan from sync_cache's detect-only leg"
+
+
+def test_030_does_not_invent_orphans_for_never_ingested_rows(env):
+    """The inverse hazard: a `size_bytes = 0` row holds no session_entries, so
+    its absence from disk leaves no orphan. Fixtures deliberately seed such
+    rows; 030 must not promote them into orphan candidates."""
+    ns, conn, conversations, projects = env
+    live = projects / "-proj-live" / "a.jsonl"
+    _write(live, "S8", [_assistant("m1", "r1", uuid="u1")])
+    _sync(ns, conn, conversations)
+    conn.execute(
+        "INSERT INTO session_files(path, size_bytes, mtime_ns, last_byte_offset, "
+        "last_ingested_at) VALUES('/nowhere/synthetic.jsonl', 0, 0, 0, '2026-07-25T00:00:00Z')")
+    conn.commit()
+    _arm_030(ns, conn)
+    res = ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    assert res.pruned_files == 0 and res.residual_paths == []

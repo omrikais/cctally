@@ -33,8 +33,22 @@ import time
 import pytest
 
 import _cctally_core
+import _cctally_store
 
 from conftest import load_script, redirect_paths
+
+
+def _thread_write_scope():
+    """Re-declare the sanctioned stats-write scope inside a worker THREAD.
+
+    #386: the scope is a `ContextVar`, so `tests/conftest.py`'s autouse
+    `_stats_write_sanction` covers the main thread only — a `threading.Thread`
+    started from inside a scope does NOT inherit it. That is the property under
+    test in `test_scope_does_not_leak_across_threads` and the reason a
+    process-global boolean was rejected, so the correct fix here is for each
+    deliberate writer thread to declare itself, never to widen the scope.
+    """
+    return _cctally_store.stats_write_scope("test-concurrent-writer")
 
 # Matches the cache.db precedent at bin/_cctally_cache.py and the value
 # the fix installs in open_db(). The longest stats.db writer transaction is
@@ -96,15 +110,17 @@ def test_open_db_write_waits_for_concurrent_holder(ns):
     def worker() -> None:
         started = time.monotonic()
         try:
-            conn = ns["open_db"]()
-            conn.execute(
-                "INSERT INTO weekly_usage_snapshots "
-                "(captured_at_utc, week_start_date, week_end_date, "
-                " weekly_percent, payload_json) VALUES (?, ?, ?, ?, ?)",
-                ("2026-05-25T00:00:00Z", "2026-05-19", "2026-05-26", 55.0, "{}"),
-            )
-            conn.commit()
-            conn.close()
+            with _thread_write_scope():
+                conn = ns["open_db"]()
+                conn.execute(
+                    "INSERT INTO weekly_usage_snapshots "
+                    "(captured_at_utc, week_start_date, week_end_date, "
+                    " weekly_percent, payload_json) VALUES (?, ?, ?, ?, ?)",
+                    ("2026-05-25T00:00:00Z", "2026-05-19", "2026-05-26", 55.0,
+                     "{}"),
+                )
+                conn.commit()
+                conn.close()
             result["ok"] = True
         except Exception as exc:  # pragma: no cover - failure path asserted below
             result["error"] = exc
@@ -168,16 +184,18 @@ def test_concurrent_writers_no_lock_error(ns):
             return
         try:
             barrier.wait(timeout=10)  # release all writers at once
-            for i in range(iters):
-                conn.execute(
-                    "INSERT INTO weekly_usage_snapshots "
-                    "(captured_at_utc, week_start_date, week_end_date, "
-                    " weekly_percent, payload_json) VALUES (?, ?, ?, ?, ?)",
-                    (f"2026-05-25T00:00:{worker_id:02d}Z", "2026-05-19",
-                     "2026-05-26", float(worker_id * 10 + i), "{}"),
-                )
-                time.sleep(0.02)  # hold the write lock briefly to force contention
-                conn.commit()
+            with _thread_write_scope():
+                for i in range(iters):
+                    conn.execute(
+                        "INSERT INTO weekly_usage_snapshots "
+                        "(captured_at_utc, week_start_date, week_end_date, "
+                        " weekly_percent, payload_json) VALUES (?, ?, ?, ?, ?)",
+                        (f"2026-05-25T00:00:{worker_id:02d}Z", "2026-05-19",
+                         "2026-05-26", float(worker_id * 10 + i), "{}"),
+                    )
+                    # hold the write lock briefly to force contention
+                    time.sleep(0.02)
+                    conn.commit()
         except Exception as exc:  # pragma: no cover - asserted below
             errors.append(exc)
         finally:
@@ -236,17 +254,19 @@ def test_concurrent_milestone_crossing_keeps_exactly_one_row(ns):
             return
         try:
             barrier.wait(timeout=10)
-            conn.execute(
-                "INSERT OR IGNORE INTO percent_milestones "
-                "(captured_at_utc, week_start_date, week_end_date, "
-                " percent_threshold, cumulative_cost_usd, marginal_cost_usd, "
-                " usage_snapshot_id, cost_snapshot_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ("2026-05-25T00:00:00Z", week_start, "2026-05-26",
-                 threshold, 12.34, 0.5, 1, 1),
-            )
-            time.sleep(0.02)  # hold the write lock briefly to force contention
-            conn.commit()
+            with _thread_write_scope():
+                conn.execute(
+                    "INSERT OR IGNORE INTO percent_milestones "
+                    "(captured_at_utc, week_start_date, week_end_date, "
+                    " percent_threshold, cumulative_cost_usd, "
+                    " marginal_cost_usd, usage_snapshot_id, cost_snapshot_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("2026-05-25T00:00:00Z", week_start, "2026-05-26",
+                     threshold, 12.34, 0.5, 1, 1),
+                )
+                # hold the write lock briefly to force contention
+                time.sleep(0.02)
+                conn.commit()
         except Exception as exc:  # pragma: no cover - asserted below
             errors.append(exc)
         finally:

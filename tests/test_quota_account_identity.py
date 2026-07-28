@@ -300,8 +300,11 @@ def test_qaa_arming_id_and_row_are_account_qualified(tmp_path, monkeypatch):
     arming = [l for l in lines if l.get("t") == "evt"
               and (l.get("payload") or {}).get("kind") == "quota_alert_arming"]
     assert len(arming) == 1
-    assert arming[0]["id"] == f"qaa:codex:root-a:{ACCOUNT_A}:limit-primary:primary:300"
+    assert arming[0]["id"].startswith(
+        f"qaa:codex:root-a:{ACCOUNT_A}:limit-primary:primary:300:"
+    )
     assert arming[0]["payload"]["account_key"] == ACCOUNT_A
+    assert arming[0]["payload"]["journal_identity_version"] == 2
     # (b) the arming row is stamped with the account.
     conn = ns["open_db"]()
     try:

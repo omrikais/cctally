@@ -343,6 +343,7 @@ _SEMVER_RE = _lib_semver._SEMVER_RE
 _lib_pricing = _load_sibling("_lib_pricing")
 TIERED_THRESHOLD = _lib_pricing.TIERED_THRESHOLD
 CLAUDE_MODEL_PRICING = _lib_pricing.CLAUDE_MODEL_PRICING
+CLAUDE_FAST_MULTIPLIER_OVERRIDES = _lib_pricing.CLAUDE_FAST_MULTIPLIER_OVERRIDES
 CODEX_TIERED_THRESHOLD = _lib_pricing.CODEX_TIERED_THRESHOLD
 CODEX_MODEL_PRICING = _lib_pricing.CODEX_MODEL_PRICING
 CODEX_LEGACY_FALLBACK_MODEL = _lib_pricing.CODEX_LEGACY_FALLBACK_MODEL
@@ -353,6 +354,11 @@ _resolve_codex_pricing = _lib_pricing._resolve_codex_pricing
 _is_codex_fallback = _lib_pricing._is_codex_fallback
 _resolve_model_pricing = _lib_pricing._resolve_model_pricing
 _calculate_entry_cost = _lib_pricing._calculate_entry_cost
+_claude_fast_multiplier = _lib_pricing._claude_fast_multiplier
+# #195: the single construction point for every cost-feeding usage dict,
+# plus the derived 1-hour cache-write multiplier.
+claude_usage_dict = _lib_pricing.claude_usage_dict
+CACHE_WRITE_1H_MULTIPLIER = _lib_pricing.CACHE_WRITE_1H_MULTIPLIER
 _warn_unknown_codex_model = _lib_pricing._warn_unknown_codex_model
 _calculate_codex_entry_cost = _lib_pricing._calculate_codex_entry_cost
 _codex_fast_multiplier = _lib_pricing._codex_fast_multiplier
@@ -492,6 +498,14 @@ _clamp_end_ats_to_next_start = _lib_subscription_weeks._clamp_end_ats_to_next_st
 _apply_overlap_clamp_to_subweeks = _lib_subscription_weeks._apply_overlap_clamp_to_subweeks
 _apply_reset_events_to_subweeks = _lib_subscription_weeks._apply_reset_events_to_subweeks
 _compute_subscription_weeks = _lib_subscription_weeks._compute_subscription_weeks
+
+# Codex quota-pool classification (#373).  A pure leaf: stdlib only, no
+# cctally imports, so `_lib_jsonl` can consume it without dragging in the
+# quota kernel.  Loaded BEFORE `_lib_jsonl`, which imports from it.
+_lib_codex_pools = _load_sibling("_lib_codex_pools")
+codex_model_scoped_quota_pool = _lib_codex_pools.codex_model_scoped_quota_pool
+is_model_scoped_codex_quota = _lib_codex_pools.is_model_scoped_codex_quota
+codex_history_is_model_scoped = _lib_codex_pools.codex_history_is_model_scoped
 
 _lib_jsonl = _load_sibling("_lib_jsonl")
 UsageEntry = _lib_jsonl.UsageEntry
@@ -969,6 +983,9 @@ _run_pending_migrations = _cctally_db._run_pending_migrations
 _recover_version_ahead = _cctally_db._recover_version_ahead
 _log_migration_error = _cctally_db._log_migration_error
 _clear_migration_error_log_entries = _cctally_db._clear_migration_error_log_entries
+_reconcile_durable_applied_migration_errors = (
+    _cctally_db._reconcile_durable_applied_migration_errors
+)
 _render_migration_error_banner = _cctally_db._render_migration_error_banner
 _BANNER_SUPPRESSED_COMMANDS = _cctally_db._BANNER_SUPPRESSED_COMMANDS
 _print_migration_error_banner_if_needed = _cctally_db._print_migration_error_banner_if_needed
@@ -1114,6 +1131,20 @@ _coerce_payload_captured_at = _cctally_record._coerce_payload_captured_at
 _derive_week_from_payload = _cctally_record._derive_week_from_payload
 insert_usage_snapshot = _cctally_record.insert_usage_snapshot
 _saved_dict_from_usage_row = _cctally_record._saved_dict_from_usage_row
+
+# #372 Task B: side-effect-free Claude usage rederive planner. Loaded after the
+# record sibling so its scratch adapter can reuse the registered ingest hooks.
+_lib_rederive = _load_sibling("_lib_rederive")
+_cctally_rederive = _load_sibling("_cctally_rederive")
+plan_claude_usage_rederive = _cctally_rederive.plan_claude_usage
+read_rederive_journal_prefix = _cctally_rederive.read_rederive_journal_prefix
+preview_db_rederive = _cctally_rederive.preview_db_rederive
+apply_db_rederive = _cctally_rederive.apply_db_rederive
+cmd_db_rederive = _cctally_rederive.cmd_db_rederive
+
+# #402 Task B: preview-first append-only structural protocol acknowledgement.
+_cctally_journal_repair = _load_sibling("_cctally_journal_repair")
+cmd_db_journal_repair = _cctally_journal_repair.cmd_db_journal_repair
 
 # Phase F #21: ``bin/_cctally_update.py`` is loaded eagerly per spec §4.8
 # carve-out — ``tests/test_update.py`` reaches into ~30 symbols via
@@ -2018,15 +2049,23 @@ def _usage_entry_from_joined(je) -> "UsageEntry":
     drop the fast-tier flag and render ``<model>`` where the normal path
     renders ``<model>-fast``. ``je.usage_extra`` is ``{"speed": …}`` or
     ``None``, so the merge never shadows the token integers.
+
+    #195: the dict is built by ``claude_usage_dict``, NOT by hand. This is a
+    cost-feeding usage dict — ``_fold_entry`` prices from ``entry.usage`` —
+    so a hand-rolled literal here silently drops the cache-write TTL split
+    and under-prices the whole ``daily -i`` / ``daily -p`` branch (and makes
+    ``--debug`` report phantom pricing mismatches). ``getattr`` keeps the
+    adapter tolerant of the duck-typed joined-entry stand-ins that a couple
+    of call sites synthesize.
     """
-    usage = {
-        "input_tokens": je.input_tokens,
-        "output_tokens": je.output_tokens,
-        "cache_creation_input_tokens": je.cache_creation_tokens,
-        "cache_read_input_tokens": je.cache_read_tokens,
-    }
-    if je.usage_extra:
-        usage.update(je.usage_extra)
+    usage = claude_usage_dict(   # #195 chokepoint
+        input_tokens=je.input_tokens,
+        output_tokens=je.output_tokens,
+        cache_creation_tokens=je.cache_creation_tokens,
+        cache_read_tokens=je.cache_read_tokens,
+        cache_1h_tokens=getattr(je, "cache_1h_tokens", None),
+        speed=getattr(je, "speed", None),
+    )
     return UsageEntry(
         timestamp=je.timestamp,
         model=je.model,
@@ -3400,6 +3439,15 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # _spawn_background_update_check would write update-state.json/log. The
         # no-mutation contract (test_pricing_check_offline_does_not_mutate_
         # fresh_home) requires skipping the whole hook.
+        return
+    if (
+        command == "db"
+        and getattr(args, "db_action", None) == "journal-repair"
+    ):
+        # `db journal-repair` preview has the same literal no-mutation contract
+        # as doctor/pricing-check. In particular, do not create config/update/
+        # telemetry state after the preview handler has proved the journal
+        # prefix without writing.
         return
     if command == "repair-symlinks":
         return

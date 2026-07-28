@@ -489,7 +489,9 @@ def load_qualified_codex_entries(
         if sync:
             cache_mod = c._load_sibling("_cctally_cache")
             stats, conn = cache_mod._run_cache_operation_with_recovery(
-                conn, lambda active_conn: c.sync_codex_cache(active_conn)
+                conn,
+                lambda active_conn: c.sync_codex_cache(active_conn),
+                origin="source.analytics.codex_sync",
             )
             if stats.lock_contended:
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
@@ -2334,6 +2336,7 @@ def cmd_source_report(args: object) -> int:
                     cache_mod._run_cache_operation_with_recovery(
                         cache,
                         lambda active_conn: c.sync_codex_cache(active_conn),
+                        origin="source.report.codex_sync",
                     )
                 )
             finally:

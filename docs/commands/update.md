@@ -70,7 +70,7 @@ refresh state.
 | `--skip [VERSION]` | latest cached | Append `VERSION` to `skipped_versions`; you won't be reminded again about that exact version. Idempotent. |
 | `--remind-later [DAYS]` | 7 | Defer the banner for N days (range `[1, 365]`); `0` or `>365` exits 2. A newer version arriving overrides the deferral. |
 | `--version X.Y.Z` | (latest) | Install a pinned version. **npm only** — brew exits 2 with a manual `brew uninstall && brew install <tarball>` recipe, since Homebrew has no versioned formulae. Validation delegates to the existing `_SEMVER_RE`, so prerelease forms (`1.7.0-rc.3`) are accepted. |
-| `--dry-run` | off | Print the steps that would run; touch nothing (state file is not written, even by detection's tier-C `npm prefix -g` probe). |
+| `--dry-run` | off | Print the steps that would run; touch nothing (state file and refresh marker are not written, even by detection's tier-C `npm prefix -g` probe). An unpinned npm beta dry-run still resolves the live effective target so the preview is truthful. |
 | `--force` | off | Bypass the TTL gate on `--check` (force a fresh remote fetch). Ignored on install (install always ignores TTL). |
 | `--json` | off | Machine-readable output. Most useful with `--check`; install mode emits a single result envelope on completion. Suppresses the auto-suggest banner. |
 
@@ -166,7 +166,7 @@ these via `POST /api/settings`.
 Every cctally release is published to the **beta** channel first (npm dist-tag `beta`, GitHub Release marked prerelease); the maintainer later promotes a chosen release to **stable** (npm `latest`, GitHub "Latest", the Homebrew tap). Stable is the default and only sees promoted releases; beta sees every release as it ships. Opt in with `cctally config set update.channel beta` (opt back out with `stable`).
 
 - **Which version beta tracks.** The beta target is **SemVer-max(dist-tags.beta, dist-tags.latest)** — beta never regresses below the current stable. During the transition window before any beta dist-tag exists, an exact 404 on the beta leg falls back to `latest`; any other beta-leg failure (5xx, timeout, malformed / non-SemVer payload) preserves the prior cached target (last-known-good), never a silent bad target.
-- **Install pins the exact version.** On the beta channel, npm installs the **exact resolved version** — `npm install -g cctally@X.Y.Z` — never bare `@beta` (whose registry target can disagree with the advertised max, and which doesn't exist in the transition window). The CLI `--check` output, the `--json` envelope, and the dashboard badge/modal all present the same resolved target and command. Stable keeps `cctally@latest`. A pinned `--version X.Y.Z` remains the deliberate override on either channel.
+- **Install refreshes, then pins the exact version.** A user-initiated bare npm beta update resolves the live effective target before exact-version selection and before the no-op/downgrade guard, regardless of the background-check TTL. It installs `npm install -g cctally@X.Y.Z`, never bare `@beta` (whose registry target can disagree with the advertised max, and which does not exist in the transition window). A failed refresh preserves and uses the last-known-good cached target with a warning that names the registry/pinned-version remedies; without any cached target it fails instead of silently switching to `@latest`. `--dry-run` performs the same resolution in memory and writes neither state nor the refresh marker. Stable keeps `cctally@latest`. An explicit `--version X.Y.Z` remains the deliberate override and performs no channel refresh.
 - **No silent downgrade.** A bare `cctally update` refuses as a no-op (exit 0, explanatory line) when the resolved target is not SemVer-newer than the installed version — this makes a beta→stable flip-back safe (it won't quietly reinstall an older `@latest`). Use `--version X.Y.Z` to install a specific version anyway.
 - **Homebrew is stable only.** Homebrew tracks the stable channel; a beta opt-in on a brew install prints "beta channel unavailable for brew installs — use npm or source" and proceeds as a stable upgrade. `cctally doctor` WARNs on the same mismatch.
 - **Banner marker.** On the beta channel the auto-suggest banner reads `↑ cctally X.Y.Z (beta) available …`; the stable banner is unchanged.
@@ -179,16 +179,16 @@ header renders an amber `Update available` badge. Clicking it opens an
 
 - Shows current vs. latest, the install method, and the install command
   that will run. On the beta channel the latest version carries a `(beta)`
-  marker and the command is the exact-version form (`cctally@X.Y.Z`).
+  marker and the command is the exact-version form (`cctally@X.Y.Z`). Clicking
+  Update resolves the selected channel again on the server; if the registry
+  advanced while the modal was open, the running modal refreshes to the new
+  target before the subprocess starts.
 - The settings modal (`s`) carries an **Update channel** toggle (Stable /
   Beta), seeded from the SSE envelope's `update.configured_channel` and
   persisted via `POST /api/settings` like the other mirrored keys.
 - Streams stdout / stderr live from the install subprocess via SSE
   (`/api/update/stream/<run_id>`), the same way the install logs to
   `update.log`.
-- Surfaces the `cctally update --version <X.Y.Z>` flag through a
-  text input for npm installs only; brew shows the manual `brew
-  uninstall && brew install <tarball>` recipe instead.
 - Has **no abort UI** — closing the modal mid-install does NOT kill the
   subprocess. Aborting `npm install -g` / `brew upgrade` mid-run can
   leave the install half-applied; we'd rather let it complete and surface
@@ -201,7 +201,9 @@ header renders an amber `Update available` badge. Clicking it opens an
 
 CSRF: `POST /api/update` and `POST /api/update/dismiss` join the
 existing `_check_origin_csrf` gated set (Origin host:port vs. Host
-header). Read endpoints (`GET /api/update/status`, `GET
+header). `POST /api/update` treats an old browser's cached `version` field as
+an automatic-target hint rather than an explicit pin; explicit pins remain a
+CLI-only `--version` operation. Read endpoints (`GET /api/update/status`, `GET
 /api/update/stream/<run_id>`) are unguarded — they only return data
 already on disk.
 

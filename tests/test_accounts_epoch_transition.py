@@ -1,6 +1,7 @@
 """Epoch-transition coordinator (#341 Task 1, Steps 5-6, spec §2).
 
-STATS_INDEX_EPOCH 1000 -> 1001. The coordinator, in exact order: (1) resolve the
+The coordinator introduced for STATS_INDEX_EPOCH 1000 -> 1001 is reused
+idempotently by later epoch bumps. Its exact order is: (1) resolve the
 cutover identity WITHOUT opening stats.db (stable-read of ~/.claude.json;
 stably-absent -> unattributed); (2) atomically check/append the canonical cutover
 op (stable semantic id `accounts-cutover-v1`, dedup on retry); (3) capture the
@@ -48,8 +49,8 @@ def _write_claude_json(path, account_uuid):
 
 # --------------------------------------------------------------------------
 
-def test_epoch_is_1001(ns):
-    assert _cctally_core.STATS_INDEX_EPOCH == 1001
+def test_epoch_is_1004(ns):
+    assert _cctally_core.STATS_INDEX_EPOCH == 1004
 
 
 def test_transition_appends_op_with_resolved_identity(ns, tmp_path):

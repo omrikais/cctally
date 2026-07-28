@@ -60,6 +60,18 @@ trap 'rm -rf "$SCRATCH_ROOT"' EXIT
 PY_CLEAN_BIN="$SCRATCH_ROOT/.py-clean-bin"
 mkdir -p "$PY_CLEAN_BIN"
 ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
+# Pin the read-only Time Machine probe so Doctor goldens do not inherit the
+# runner's backup configuration. Individual included-root scenarios use a
+# resolved cloud-root path and therefore short-circuit before this stub.
+cat > "$PY_CLEAN_BIN/tmutil" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  destinationinfo) printf '%s\n' 'Name : Fixture Backup' ;;
+  isexcluded) printf '[Excluded] %s\n' "${2:-}" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$PY_CLEAN_BIN/tmutil"
 
 # Per-scenario PATH shape (issue #119). Default scrubbed PATH puts
 # $scratch/.local/bin first (so install.path passes) + $PY_CLEAN_BIN

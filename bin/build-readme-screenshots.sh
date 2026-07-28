@@ -24,14 +24,34 @@ DOCS_IMG="$REPO_ROOT/docs/img"
 # `cctally` sits on PATH) and the output dir (default docs/img; overridable so
 # readme-refresh can capture into a temp dir + copy back only manifest-listed
 # files). README_SCREENSHOTS_CONTRACT=1 is the capability marker it greps for.
+#
+# Dev/test knobs (issue #367 — NOT part of the capability contract above):
+#   README_SCREENSHOTS_SELFTEST=port       print `port=<n>` and exit 0
+#   README_SCREENSHOTS_SELFTEST=dashboard  launch, print `url=<url>`, exit 0
+#   README_SCREENSHOTS_WAIT_TICKS=<n>      banner-poll ticks, 0.1s each (default 150 => ~15s)
+#   README_SCREENSHOTS_READY_TICKS=<n>     readiness-poll ticks, up to 2.1s each
+#                                          when the probe times out (default 30 => ~60s)
 README_SCREENSHOTS_CONTRACT=1
 CCTALLY_BIN="${CCTALLY_BIN:-$REPO_ROOT/bin/cctally}"
 export CCTALLY_BIN
 OUT_DIR="${README_SCREENSHOTS_OUT_DIR:-$DOCS_IMG}"
-mkdir -p "$OUT_DIR"
 MARKETING_FIXTURE="$REPO_ROOT/tests/fixtures/readme/home"
-DASHBOARD_PORT="${DASHBOARD_PORT:-8789}"
-DASHBOARD_URL="http://127.0.0.1:$DASHBOARD_PORT/"
+
+# Port decision (issue #367). An explicit DASHBOARD_PORT is a PIN and still
+# refuses a busy port; with none set we hand the kernel --port 0 and read back
+# what it actually bound, so a dashboard already running on the maintainer's
+# 8789 is a non-event rather than a hard failure.
+DASHBOARD_PORT_EXPLICIT="${DASHBOARD_PORT:-}"
+DASHBOARD_PORT="${DASHBOARD_PORT_EXPLICIT:-0}"
+DASHBOARD_URL=""                                    # resolved after the bind
+# Banner poll: 0.1s per tick and nothing else, so 150 ticks is ~15s.
+WAIT_TICKS="${README_SCREENSHOTS_WAIT_TICKS:-150}"
+# Readiness poll: each FAILED tick also burns curl's own `--max-time 2`, so a
+# tick here costs up to 2.1s, not 0.1s. Budgeted separately (30 => ~60s worst
+# case) rather than reusing WAIT_TICKS, which at 150 would stall ~5 minutes
+# against a dashboard that accepts TCP and never answers. Connection-refused
+# ticks return instantly, so the common retry path is still ~0.1s each.
+READY_TICKS="${README_SCREENSHOTS_READY_TICKS:-30}"
 
 require() {
     local cmd="$1" install_hint="$2"
@@ -42,27 +62,39 @@ require() {
     fi
 }
 
-# 1. Verify dev tools (playwright is verified at import time inside
-#    bin/_capture_dashboard.py, with its own clean error message).
-require freeze "brew install charmbracelet/tap/freeze"
+# Only the tools the port decision and the dashboard launch need. `freeze` is
+# required further down, AFTER the selftest dispatch, so the port tests do not
+# need a charm.sh install on the runner.
 require python3 "(should be on PATH)"
+require curl "(should be on PATH)"
 
-# Defensive: refuse to start if something else is already serving the
-# dashboard URL (a parallel `cctally dashboard` collides on bind).
-if curl -fsS "$DASHBOARD_URL" >/dev/null 2>&1; then
-    echo "build-readme-screenshots: something is already serving $DASHBOARD_URL" >&2
-    echo "  stop your existing dashboard, OR re-run with DASHBOARD_PORT=18789" >&2
+# Any listener on 127.0.0.1:$1, HTTP or not — a TCP connect, not a GET, so a
+# non-HTTP process squatting the port is caught too.
+port_busy() {
+    python3 -c 'import socket,sys
+s = socket.socket()
+s.settimeout(0.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$1"
+}
+
+# Reject a non-numeric pin here rather than letting `int()` throw a raw
+# traceback out of port_busy — that traceback lands in the promote log looking
+# like a crash of the release tool, and the guard would then wrongly conclude
+# "not busy" and hand the bad value to argparse much later.
+if [[ -n $DASHBOARD_PORT_EXPLICIT && ! $DASHBOARD_PORT_EXPLICIT =~ ^[0-9]+$ ]]; then
+    echo "build-readme-screenshots: DASHBOARD_PORT must be a number, got '$DASHBOARD_PORT_EXPLICIT'" >&2
     exit 1
 fi
 
-# 2. Build marketing fixture (today UTC anchored). The fixture builder
-# normalizes `as_of` to THURSDAY 14:00 UTC of the containing week so the
-# forecast projection lands at ~103% (clearly WARN, fits the modal).
-AS_OF="$(date -u +'%Y-%m-%d')"
-echo "[1/5] Building marketing fixture (--as-of $AS_OF)"
-"$REPO_ROOT/bin/build-readme-fixtures.py" --as-of "$AS_OF" >/dev/null
+if [[ -n $DASHBOARD_PORT_EXPLICIT ]] && port_busy "$DASHBOARD_PORT_EXPLICIT"; then
+    echo "build-readme-screenshots: DASHBOARD_PORT=$DASHBOARD_PORT_EXPLICIT is already in use" >&2
+    echo "  free that port, or unset DASHBOARD_PORT to auto-select a free one" >&2
+    exit 1
+fi
 
-# 3. Stage under scratch dir; trap-based cleanup.
+# Scratch dir + trap, hoisted ahead of the fixture build so the selftest hook
+# can use them and so the trap covers more of the run. Nothing between the old
+# and new positions touches scratch state.
 SCRATCH="$(mktemp -d -t cctally-readme-XXXXXX)"
 DASH_PID=""
 cleanup() {
@@ -74,6 +106,110 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Echo whatever the dashboard wrote, one `  dashboard| ` prefixed line each, so
+# a failure never loses it. An EMPTY log is itself a diagnosis ("the process
+# produced no output at all" vs "it printed a traceback"), so say so explicitly
+# rather than emitting nothing — `sed` over an empty file prints no lines.
+dump_dashboard_log() {
+    if [[ -s "$SCRATCH/dashboard.log" ]]; then
+        sed 's/^/  dashboard| /' "$SCRATCH/dashboard.log" >&2
+    else
+        echo "  dashboard| (no output captured)" >&2
+    fi
+}
+
+# Launch the dashboard on $DASHBOARD_PORT (0 = kernel picks), then read the
+# port it actually bound out of its own startup banner. Sets DASH_PID and
+# DASHBOARD_URL; exits 1 with the captured log on any failure. (Issue #367.)
+start_dashboard() {
+    # Create the log BEFORE forking. The child applies its redirect after the
+    # fork, so the first `sed` below can otherwise race it and read a file that
+    # does not exist yet — under `set -e` that aborts the whole script with a
+    # bare "No such file or directory" instead of retrying.
+    : > "$SCRATCH/dashboard.log"
+    "$CCTALLY_BIN" dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser \
+        > "$SCRATCH/dashboard.log" 2>&1 &
+    DASH_PID=$!
+
+    # `dashboard: serving http://localhost:<port>/ — Ctrl-C to stop`
+    #
+    # Parsed WITHOUT a pipe on purpose: `sed … | head -1` takes SIGPIPE when
+    # head closes early, pipefail propagates 141, and the assignment then
+    # trips `set -e` — a load-dependent kill that a short log usually hides.
+    # `{ …p; q; }` stops at the first match inside sed itself.
+    #
+    # The address requires `https?://` so the all-interfaces header line
+    # ("dashboard: serving on all interfaces:") cannot enter the block and `q`
+    # out before the URL lines. With --host 127.0.0.1 that branch is
+    # unreachable; the anchoring means a future host change fails CLOSED.
+    local bound=""
+    local _tick
+    for _tick in $(seq 1 "$WAIT_TICKS"); do
+        bound=$(sed -nE '/^dashboard: serving https?:\/\//{ s#^dashboard: serving https?://[^/]*:([0-9]+)/.*#\1#p; q; }' \
+                    "$SCRATCH/dashboard.log")
+        [[ -n $bound ]] && break
+        kill -0 "$DASH_PID" 2>/dev/null || break     # child died — stop waiting
+        sleep 0.1
+    done
+    if [[ -z $bound ]]; then
+        echo "build-readme-screenshots: dashboard did not report a bound port" >&2
+        dump_dashboard_log
+        exit 1
+    fi
+    DASHBOARD_URL="http://127.0.0.1:$bound/"
+
+    # The banner prints once the socket is bound but BEFORE serve_forever()
+    # runs (bin/_cctally_dashboard.py:7191 vs :7196), so listening is not
+    # serving. Bounded probes: a bare `curl -fsS` has no timeout and a process
+    # that accepts TCP without answering would hang past the loop limit.
+    local ready=0
+    for _tick in $(seq 1 "$READY_TICKS"); do
+        if curl -fsS --connect-timeout 1 --max-time 2 "$DASHBOARD_URL" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        kill -0 "$DASH_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ $ready -ne 1 ]]; then
+        echo "build-readme-screenshots: dashboard at $DASHBOARD_URL never became ready" >&2
+        dump_dashboard_log
+        exit 1
+    fi
+}
+
+# --- selftest dispatch (issue #367) ---
+case "${README_SCREENSHOTS_SELFTEST:-}" in
+    port)
+        echo "port=$DASHBOARD_PORT"
+        exit 0
+        ;;
+    dashboard)
+        start_dashboard
+        echo "url=$DASHBOARD_URL"
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "build-readme-screenshots: unknown README_SCREENSHOTS_SELFTEST='${README_SCREENSHOTS_SELFTEST}'" >&2
+        exit 2
+        ;;
+esac
+
+# 1. Verify dev tools (playwright is verified at import time inside
+#    bin/_capture_dashboard.py, with its own clean error message).
+require freeze "brew install charmbracelet/tap/freeze"
+
+# 2. Build marketing fixture (today UTC anchored). The fixture builder
+# normalizes `as_of` to THURSDAY 14:00 UTC of the containing week so the
+# forecast projection lands at ~103% (clearly WARN, fits the modal).
+AS_OF="$(date -u +'%Y-%m-%d')"
+echo "[1/5] Building marketing fixture (--as-of $AS_OF)"
+"$REPO_ROOT/bin/build-readme-fixtures.py" --as-of "$AS_OF" >/dev/null
+
+# 3. Stage under the scratch dir created above (trap-based cleanup is already
+# armed at that point).
 mkdir -p "$SCRATCH/home"
 cp -R "$MARKETING_FIXTURE/." "$SCRATCH/home/"
 echo "[2/5] Staged marketing fixture at $SCRATCH/home"
@@ -181,19 +317,7 @@ FORCE_COLOR=1 PYTHONPATH="$ORIGINAL_USER_SITE${PYTHONPATH:+:$PYTHONPATH}" freeze
 echo "[4/5] Starting dashboard against marketing fixture"
 # NOTE: flag is `--no-browser`, NOT `--no-open` (which would error). See
 # `cctally dashboard --help`.
-"$CCTALLY_BIN" dashboard --host 127.0.0.1 --port "$DASHBOARD_PORT" --no-browser &
-DASH_PID=$!
-
-# Wait for dashboard to come up (poll up to 15s)
-ready=0
-for _ in $(seq 1 15); do
-    if curl -fsS "$DASHBOARD_URL" >/dev/null 2>&1; then ready=1; break; fi
-    sleep 1
-done
-if [[ $ready -ne 1 ]]; then
-    echo "build-readme-screenshots: marketing-fixture dashboard did not come up at $DASHBOARD_URL after 15s" >&2
-    exit 1
-fi
+start_dashboard
 
 # Capture all 4 shots — desktop, modal, mobile, AND warn — against the
 # single marketing-fixture dashboard. PYTHONPATH=ORIGINAL_USER_SITE for

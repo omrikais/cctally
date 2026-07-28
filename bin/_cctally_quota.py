@@ -43,7 +43,12 @@ from _lib_quota import (
     source_path_key,
 )
 from _lib_json_envelope import stamp_schema_version
-from _lib_jsonl import _codex_logical_limit_key, codex_model_scoped_quota_pool
+from _lib_jsonl import _codex_logical_limit_key
+from _lib_codex_pools import (
+    codex_history_is_model_scoped,
+    codex_model_scoped_quota_pool,
+    is_model_scoped_codex_quota,
+)
 
 
 UTC = dt.timezone.utc
@@ -748,7 +753,7 @@ def _quota_alert_payload(
 def _evaluate_quota_alerts(
     conn: sqlite3.Connection,
     *, observations: tuple[QuotaObservation, ...], alert_eligible_roots: set[str],
-    now: dt.datetime, now_iso: str, journal_emit=None,
+    now: dt.datetime, now_iso: str, journal_emit=None, journal_disarm=None,
 ) -> list[dict]:
     """Arm or claim quota alerts within the caller's stats transaction.
 
@@ -756,18 +761,42 @@ def _evaluate_quota_alerts(
     eligible observations can claim an alerted row. No non-terminal state is
     stored: the arming boundary plus unique terminal event key is sufficient.
     """
-    if not alert_eligible_roots:
-        return []
     global_enabled, quota_enabled, rules, config = _quota_alert_config()
     # Disabled delivery is entirely inert: it must not leave an arming
     # boundary that could turn disabled-period evidence into a later alert.
+    # This gate deliberately precedes the lifecycle-eligibility fast path:
+    # read-only report reconciles carry no eligible roots, but they must still
+    # durably disarm state after either user-facing switch is turned off.
     if not (global_enabled and quota_enabled):
-        placeholders = ", ".join("?" for _ in alert_eligible_roots)
+        # Scratch rebuild/rederive replay has no alert sink and must preserve
+        # the provider-owned state selected from the journal verbatim. Only the
+        # live single-flight reconcile supplies the durable disarm emitter.
+        if journal_disarm is None:
+            return []
+        rows = conn.execute(
+            """SELECT source, source_root_key, account_key,
+                       logical_limit_key, observed_slot, window_minutes
+                  FROM quota_alert_arming
+                 WHERE source='codex'"""
+        ).fetchall()
         conn.execute(
-            f"""DELETE FROM quota_alert_arming
-                  WHERE source='codex' AND source_root_key IN ({placeholders})""",
-            tuple(sorted(alert_eligible_roots)),
+            "DELETE FROM quota_alert_arming WHERE source='codex'"
         )
+        if journal_disarm is not None:
+            for row in rows:
+                journal_disarm(
+                    QuotaWindowIdentity(
+                        source=str(row["source"]),
+                        source_root_key=str(row["source_root_key"]),
+                        account_key=str(row["account_key"]),
+                        logical_limit_key=str(row["logical_limit_key"]),
+                        observed_slot=str(row["observed_slot"]),
+                        window_minutes=int(row["window_minutes"]),
+                    ),
+                    now_iso,
+                )
+        return []
+    if not alert_eligible_roots:
         return []
     histories = build_history(observations)
     queued: list[dict] = []
@@ -858,7 +887,8 @@ def _evaluate_quota_alerts(
 
 def _apply_quota_projection_rows(
     conn, *, observations, active_roots, now, now_iso,
-    sink, alert_eligible_roots, journal_emit=None, holder=None,
+    sink, alert_eligible_roots, journal_emit=None, journal_disarm=None,
+    holder=None,
 ):
     """Transaction-neutral quota projection apply (spec §5.3 "projection").
 
@@ -891,6 +921,7 @@ def _apply_quota_projection_rows(
         conn, observations=observations,
         alert_eligible_roots=alert_eligible_roots & active_roots,
         now=now, now_iso=now_iso, journal_emit=journal_emit,
+        journal_disarm=journal_disarm,
     )
     # The completion stamp is intentionally the final DML in the stats
     # transaction.  A pre-commit failure rolls all projection updates back;
@@ -1001,6 +1032,10 @@ def reconcile_codex_quota_projection(
     now_iso = _utc_iso(now)
 
     alert_eligible_roots = {str(key) for key in alert_eligible_root_keys}
+    global_alerts_enabled, quota_alerts_enabled, _rules, _config = (
+        _quota_alert_config()
+    )
+    delivery_enabled = global_alerts_enabled and quota_alerts_enabled
 
     try:
         cache = _cache_connection()
@@ -1031,8 +1066,16 @@ def reconcile_codex_quota_projection(
             if physical_sequence == cert_seq and active_roots <= set(cert_sigs):
                 stats_conn = _cctally_core.open_db()
                 try:
-                    if _stats_projection_signatures_match(
-                        stats_conn, active_roots, cert_sigs
+                    has_arming = bool(stats_conn.execute(
+                        "SELECT 1 FROM quota_alert_arming "
+                        "WHERE source='codex' LIMIT 1"
+                    ).fetchone())
+                    can_skip_delivery = delivery_enabled or not has_arming
+                    if (
+                        can_skip_delivery
+                        and _stats_projection_signatures_match(
+                            stats_conn, active_roots, cert_sigs
+                        )
                     ):
                         return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
                 finally:
@@ -1058,7 +1101,9 @@ def reconcile_codex_quota_projection(
         "signatures": None,
     }
 
-    def _apply_projection(conn, sink, *, journal_emit=None):
+    def _apply_projection(
+        conn, sink, *, journal_emit=None, journal_disarm=None,
+    ):
         # No configured roots and no existing interpreted history means there is
         # no stats work.  This preserves the existing empty-Codex fast path.
         # Delegates to the shared module-level apply so the live leg and the
@@ -1067,7 +1112,8 @@ def reconcile_codex_quota_projection(
             conn, observations=observations, active_roots=active_roots,
             now=now, now_iso=now_iso, sink=sink,
             alert_eligible_roots=alert_eligible_roots,
-            journal_emit=journal_emit, holder=holder,
+            journal_emit=journal_emit, journal_disarm=journal_disarm,
+            holder=holder,
         )
 
     import _cctally_journal as _jr
@@ -1076,15 +1122,16 @@ def reconcile_codex_quota_projection(
     def _codex_leg(ctx):
         def _emit_arming(identity, fingerprint, activated_at):
             # Item 5: journal the arming state change (`quota_alert_arming` evt).
-            # account_key (#341) is part of the qaa natural key (after the root):
-            # two accounts arming the same physical window produce DISTINCT evt
-            # ids + rows. This id MUST match the cutover export's natural_key_id
-            # ordering in _cctally_journal._CUTOVER_SPECS so a live re-emission and
-            # a cutover-exported arming for one identity converge as ONE record.
+            # account_key (#341) is part of the qaa state identity (after the
+            # root), while fingerprint + activation boundary make each real
+            # state transition a distinct rev-0 event (#372). Exact re-emission
+            # of one state still converges on one id. This order MUST match the
+            # cutover export's natural_key_id.
             eid = _jl.evt_id(
                 "qaa", identity.source, identity.source_root_key,
                 identity.account_key, identity.logical_limit_key,
                 identity.observed_slot, identity.window_minutes,
+                fingerprint, activated_at,
             )
             _jr.append_record(_jl.make_evt(
                 kind="quota_alert_arming", id=eid, at=activated_at,
@@ -1097,11 +1144,40 @@ def reconcile_codex_quota_projection(
                     "window_minutes": identity.window_minutes,
                     "rule_fingerprint": fingerprint,
                     "activated_at_utc": activated_at,
+                    "journal_identity_version": 2,
                 },
             ))
             ctx.events_emitted += 1
 
-        _apply_projection(ctx.conn, ctx.pending_alerts, journal_emit=_emit_arming)
+        def _emit_disarm(identity, disarmed_at):
+            eid = _jl.evt_id(
+                "qaa", identity.source, identity.source_root_key,
+                identity.account_key, identity.logical_limit_key,
+                identity.observed_slot, identity.window_minutes,
+                "disarmed", disarmed_at,
+            )
+            _jr.append_record(_jl.make_evt(
+                kind="quota_alert_arming", id=eid, at=disarmed_at,
+                payload={
+                    "source": identity.source,
+                    "source_root_key": identity.source_root_key,
+                    "account_key": identity.account_key,
+                    "logical_limit_key": identity.logical_limit_key,
+                    "observed_slot": identity.observed_slot,
+                    "window_minutes": identity.window_minutes,
+                    "state": "disarmed",
+                    "disarmed_at_utc": disarmed_at,
+                    "journal_identity_version": 2,
+                },
+            ))
+            ctx.events_emitted += 1
+
+        _apply_projection(
+            ctx.conn,
+            ctx.pending_alerts,
+            journal_emit=_emit_arming,
+            journal_disarm=_emit_disarm,
+        )
         # `_before_stats_commit` fires INSIDE the cycle txn, before COMMIT — a
         # raise rolls the whole cycle back, so the projection updates undo
         # together (the crash-consistency contract the callers test).
@@ -1321,7 +1397,19 @@ def codex_five_hour_percent_at_crossing(
     observations: Iterable[QuotaObservation] | None = None,
     *, cache_conn: sqlite3.Connection | None = None,
 ) -> float | None:
-    """Return the latest matching native five-hour percent at one crossing."""
+    """Return the latest matching native five-hour percent at one crossing.
+
+    #373: the 5h window must share the target identity's MODEL SCOPE, not just
+    its ``limit_id``. A separate model pool can reuse ``limit_id="codex"`` and
+    spell itself only in the interpreted key's ``modelPool`` or in
+    ``limit_name``, so the pre-existing ``limit_id`` equality lets it through
+    and a standard weekly crossing gets annotated with a foreign pool's 5h
+    percent. The rule is symmetric: a Spark weekly still correlates with Spark
+    5h rows, and never with standard ones.
+    """
+    target_model_scoped = is_model_scoped_codex_quota(
+        identity.logical_limit_key, identity.limit_name,
+    )
     if observations is not None:
         eligible = tuple(
             observation for observation in observations
@@ -1329,6 +1417,10 @@ def codex_five_hour_percent_at_crossing(
             and observation.identity.window_minutes == 300
             and observation.identity.observed_slot == identity.observed_slot
             and observation.identity.limit_id == identity.limit_id
+            and is_model_scoped_codex_quota(
+                observation.identity.logical_limit_key,
+                observation.identity.limit_name,
+            ) == target_model_scoped
             and observation.captured_at <= captured_at < observation.resets_at
         )
         if not eligible:
@@ -1356,7 +1448,7 @@ def codex_five_hour_percent_at_crossing(
     try:
         rows = cache.execute(
             """SELECT captured_at_utc, resets_at_utc, source_path, line_offset,
-                      used_percent
+                      used_percent, logical_limit_key, limit_name
                  FROM quota_window_snapshots
                 WHERE source='codex' AND source_root_key=?
                   AND window_minutes=300 AND observed_slot=? AND limit_id IS ?
@@ -1377,6 +1469,10 @@ def codex_five_hour_percent_at_crossing(
             physical = (observed_at, resets_at, str(row[2]), int(row[3]))
             used_percent = float(row[4])
         except (TypeError, ValueError, OverflowError):
+            continue
+        # Same model-scope rule as the in-memory branch above; the two must not
+        # disagree about which 5h window belongs to this identity's pool.
+        if is_model_scoped_codex_quota(row[5], row[6]) != target_model_scoped:
             continue
         if observed_at <= captured_at < resets_at:
             eligible.append((physical, used_percent))
@@ -1544,7 +1640,9 @@ def _sync_and_load(
         try:
             cache_mod = c._load_sibling("_cctally_cache")
             _, cache = cache_mod._run_cache_operation_with_recovery(
-                cache, lambda active_conn: c.sync_codex_cache(active_conn)
+                cache,
+                lambda active_conn: c.sync_codex_cache(active_conn),
+                origin="codex.quota.sync",
             )
         finally:
             cache.close()
@@ -1890,12 +1988,28 @@ def cmd_codex_percent_breakdown(args) -> int:
                 if block.resets_at == reset_at
             )
         else:
+            # #373: a separate model pool is not account-level standard quota,
+            # so it must not make the DEFAULT (no-selector) command ambiguous.
+            # Scoped to this branch only — `--reset-at` still reaches a foreign
+            # pool's retained history — and it falls back to the unfiltered set
+            # when no standard candidate survives, so a lone foreign pool (or an
+            # explicit `--limit-key` naming one) still renders rather than
+            # turning into an exit-2 for a window the user genuinely has.
+            # The baseline is resolved first because it is the §7.1 label
+            # authority for classification.
+            candidates = tuple(
+                (history, select_baseline(history.observations, as_of))
+                for history in histories
+            )
+            standard = tuple(
+                (history, baseline) for history, baseline in candidates
+                if not codex_history_is_model_scoped(history, baseline=baseline)
+            )
             matching = tuple(
                 (history, block)
-                for history in histories
+                for history, baseline in (standard or candidates)
                 if (
-                    (baseline := select_baseline(history.observations, as_of))
-                    is not None
+                    baseline is not None
                     and baseline.resets_at > as_of
                     and quota_freshness(
                         history.physical_observations, as_of,

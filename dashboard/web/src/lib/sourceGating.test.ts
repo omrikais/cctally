@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { gateSessions, warningForDomain, warningForSource } from './sourceGating';
+import {
+  gateSessions,
+  sourceDomainFreshness,
+  warningForDomain,
+  warningForSource,
+} from './sourceGating';
 import { resolveSourceView } from '../store/sourceView';
 import {
   makeAllSourceEntry,
@@ -44,6 +49,32 @@ describe('source warning selection', () => {
     expect(warningForDomain([projects], 'daily')).toBeNull();
     expect(warningForDomain([projects], 'projects')).toBe(projects);
     expect(warningForSource([projects])).toBe(projects);
+  });
+});
+
+describe('sourceDomainFreshness', () => {
+  it('selects the requested domain independently from provider freshness', () => {
+    const entry = makeCodexSourceEntry({
+      freshness: 'stale',
+      domain_freshness: {
+        hero: 'stale',
+        quota: 'stale',
+        sessions: 'fresh',
+      },
+    });
+
+    expect(sourceDomainFreshness(entry, 'hero')).toBe('stale');
+    expect(sourceDomainFreshness(entry, 'quota')).toBe('stale');
+    expect(sourceDomainFreshness(entry, 'sessions')).toBe('fresh');
+  });
+
+  it('falls back every domain to provider freshness for a legacy entry', () => {
+    const entry = makeCodexSourceEntry({ freshness: 'stale' });
+    delete entry.domain_freshness;
+
+    expect(sourceDomainFreshness(entry, 'hero')).toBe('stale');
+    expect(sourceDomainFreshness(entry, 'quota')).toBe('stale');
+    expect(sourceDomainFreshness(entry, 'sessions')).toBe('stale');
   });
 });
 
@@ -100,6 +131,23 @@ describe('gateSessions', () => {
       mode: 'degraded',
       noSuccessYet: false,
       warning: { message: 'warning read_model' },
+    });
+  });
+
+  it('keeps Sessions rendered when only provider/other domains are stale', () => {
+    const codex = makeCodexSourceEntry({
+      availability: 'partial',
+      freshness: 'stale',
+      domain_freshness: {
+        hero: 'stale',
+        quota: 'stale',
+        sessions: 'fresh',
+      },
+    });
+
+    expect(gateSessions(viewFor('codex', makeClaudeSourceEntry(), codex))).toMatchObject({
+      mode: 'render',
+      noSuccessYet: false,
     });
   });
 

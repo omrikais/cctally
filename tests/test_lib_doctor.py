@@ -70,6 +70,8 @@ def test_doctor_state_has_required_fields():
         "conversations_db_page_count", "conversations_db_freelist_count",
         # #344 Task B: privacy-safe repair-owner classification.
         "cache_repair_marker",
+        # #411: file-level backup/sync classification.
+        "backup_sync_state",
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
@@ -81,9 +83,16 @@ def test_doctor_state_has_required_fields():
         "update_channel",
         # DB journal redesign §9: append-only journal doctor legs.
         "journal_present", "journal_appendable", "journal_segment_count",
+        "journal_has_bytes",
         "journal_malformed_count", "journal_torn_tail_count",
         "journal_cursor_lag_bytes", "journal_hw_segment",
         "journal_cursor_segment", "journal_heal_incidents",
+        # #386: the stats sole-writer guard log leg (journal.writer_guard).
+        "journal_writer_guard",
+        # #374/#402: event conflicts, whole-batch taint, selector failure.
+        "journal_conflicts", "journal_protocol_violations",
+        "journal_protocol_acknowledged",
+        "journal_protocol_error",
         # #341 Task 3: multi-account health legs (accounts.identity/registry/
         # freshness/attribution) all read off this single gathered snapshot.
         "accounts_state",
@@ -788,6 +797,49 @@ def test_db_stats_file_absent_warn():
     r = L._check_db_stats_file(s)
     assert r.severity == "warn"
     assert "absent" in r.summary.lower() or "missing" in r.summary.lower()
+
+
+def test_db_stats_file_reports_interrupted_rebuild_before_fresh_install():
+    s = _state(
+        stats_db_status={
+            "path": "/missing/stats.db",
+            "user_version": 0,
+            "registry_size": 13,
+            "migrations": [],
+            "_file_exists": False,
+            "_interrupted_rebuild": {
+                "live": False,
+                "artifacts": ["stats.db.rebuilding-20260726T120000_000000"],
+                "journalHighWater": ["observations-2026-07.jsonl", 123],
+                "destinationExists": False,
+            },
+        }
+    )
+    r = L._check_db_stats_file(s)
+    assert r.severity == "warn"
+    assert "interrupted rebuild" in r.summary
+    assert "cctally report" in (r.remediation or "")
+
+
+def test_db_stats_file_reports_live_rebuild_before_fresh_install():
+    s = _state(
+        stats_db_status={
+            "path": "/missing/stats.db",
+            "user_version": 0,
+            "registry_size": 13,
+            "migrations": [],
+            "_file_exists": False,
+            "_interrupted_rebuild": {
+                "live": True,
+                "artifacts": ["stats.db.rebuilding-20260726T120000_000000"],
+                "journalHighWater": ["observations-2026-07.jsonl", 123],
+            },
+        }
+    )
+    r = L._check_db_stats_file(s)
+    assert r.severity == "warn"
+    assert "in progress" in r.summary
+    assert "Wait" in (r.remediation or "")
 
 
 def test_db_stats_file_open_failure_fails():

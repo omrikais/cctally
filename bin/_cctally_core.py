@@ -11,6 +11,7 @@ and the only legal monkeypatch target for the 23 promoted globals listed
 below. See docs/superpowers/specs/2026-05-22-cctally-core-data-globals.md.
 """
 from __future__ import annotations
+import contextvars
 import datetime as dt
 import math
 import os
@@ -338,7 +339,17 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # epoch-transition coordinator (``_cctally_journal.run_epoch_transition``):
 # resolve the cutover identity, append the canonical cutover op, then rebuild
 # account-scoped. See docs/superpowers/specs/2026-07-23-multi-account-design.md §2.
-STATS_INDEX_EPOCH = 1001
+# 1001 -> 1002 (#372 Task A): the disposable index gains the effective-event
+# revision summary consumed by correction planning/live replay. Rebuild selects
+# the highest completed revision before folding; the legacy migration registry
+# remains frozen.
+# 1002 -> 1003 (#402 Task A): persist the selector's bounded structural
+# correction-batch violations in the disposable index so shallow Dashboard/TUI
+# Doctor gathers cannot report false health without rescanning the whole journal.
+# 1003 -> 1004 (#410 Task B): pair the public journal cursor with the exact
+# prefix atomically applied to the materialized index. A cursor-only hand edit
+# can no longer skip an already-durable event and make its natural key look new.
+STATS_INDEX_EPOCH = 1004
 LEGACY_STATS_HEAD = 13
 
 
@@ -654,6 +665,93 @@ def ensure_dirs() -> None:
         os.chmod(APP_DIR, 0o700)
     except OSError as exc:
         eprint(f"[core] could not chmod data dir 0700 ({exc}); continuing")
+
+
+# === stats.db maintenance-hold tracking (#386) ======================
+#
+# `flock` conflicts are per open-file-DESCRIPTION and apply WITHIN a process:
+# holding LOCK_EX on one fd and then requesting LOCK_SH on a second fd of the
+# same file blocks forever. That matters because `_cctally_store`'s #386 opener
+# protocol takes `stats.db.maintenance.lock` SHARED around every live stats
+# open, while `run_stats_ingest`'s legacy/fresh branch already holds it
+# EXCLUSIVE when it calls `open_db()` (bin/_cctally_journal.py:2788). Without a
+# re-entrancy signal that is an unconditional self-deadlock on first open of a
+# pre-cutover install.
+#
+# A ContextVar, not a module global, and deliberately so: the suppressor must
+# fire only for the execution context that actually owns the lock. A dashboard
+# thread that does NOT own it and requests SHARED while another thread holds
+# EXCLUSIVE is correctly made to WAIT — that is the protocol working, not a
+# deadlock — and a process-global flag would wrongly wave it straight through
+# into a family being replaced underneath it.
+#
+# Every acquisition of STATS_LOCK_MAINTENANCE_PATH in bin/ that is HELD ACROSS
+# other work pairs with these (a site that takes the flock and releases it
+# before returning does not, and must not — see `stats_open_guarded`):
+#   bin/_cctally_journal.py  _acquire_maintenance_{shared,exclusive} / _release
+#   bin/_cctally_store.py    _heal_flock_blocking, reached through
+#                            _acquire_stats_maintenance_reentrant by the heal
+#                            hook and the epoch resolver
+#   bin/_cctally_db.py       cmd_db_rebuild, _acquire_db_admin_writer_flocks
+#                            (db skip / db unskip), _cmd_db_repair_exclusive,
+#                            _vacuum_one_db
+#   bin/_cctally_rederive.py _rederive_locks
+# Adding another acquisition site without noting it here reintroduces the hang.
+#
+# The opener (`_cctally_store.stats_open_guarded`) takes the lock SHARED and
+# releases it before handing the connection back, so it deliberately does NOT
+# note a hold — but it DOES consult `holds_stats_maintenance()` to skip the
+# acquire entirely when this context already owns the exclusive side.
+
+_STATS_MAINTENANCE_HELD = contextvars.ContextVar(
+    "cctally_stats_maintenance_held", default=0
+)
+
+
+def holds_stats_maintenance() -> bool:
+    """True when THIS execution context already holds stats.db.maintenance.lock."""
+    return _STATS_MAINTENANCE_HELD.get() > 0
+
+
+# === stats.db sanctioned-write scope (#386) =========================
+#
+# The state behind `_cctally_store.stats_write_scope` / `in_stats_write_scope`
+# / `holds_ingest_lock`. It lives HERE, beside the maintenance tracker, rather
+# than in `_cctally_store` for one concrete reason: `tests/conftest.py`'s
+# `load_script()` drops every cached `_cctally_*` sibling from `sys.modules`
+# (deliberately — see its docstring) but KEEPS `_cctally_core`. A ContextVar
+# owned by `_cctally_store` would therefore be silently replaced by a fresh,
+# empty one halfway through a test, so a scope entered before the reload would
+# stop counting and an authorized write would be denied. `_cctally_core` is the
+# kernel and is never reloaded, so the sanction survives.
+#
+# ContextVars, NOT module globals: the dashboard is threaded and a global would
+# let one sanctioned thread authorize another (spec section 6.1).
+
+_STATS_WRITE_SCOPE = contextvars.ContextVar(
+    "cctally_stats_write_scope", default=0
+)
+_STATS_INGEST_LOCK_HELD = contextvars.ContextVar(
+    "cctally_stats_ingest_held", default=0
+)
+_STATS_INTERRUPTED_RECOVERY_SUPPRESSED = contextvars.ContextVar(
+    "cctally_stats_interrupted_recovery_suppressed", default=0
+)
+
+
+def note_stats_maintenance_acquired() -> None:
+    """Record that this context now holds stats.db.maintenance.lock."""
+    _STATS_MAINTENANCE_HELD.set(_STATS_MAINTENANCE_HELD.get() + 1)
+
+
+def note_stats_maintenance_released() -> None:
+    """Record that this context released stats.db.maintenance.lock.
+
+    Clamped at zero rather than asserting: an unbalanced release is a bug, but
+    turning it into an exception inside a ``finally`` would mask the original
+    failure that got us there.
+    """
+    _STATS_MAINTENANCE_HELD.set(max(0, _STATS_MAINTENANCE_HELD.get() - 1))
 
 
 # === Alerts validation cluster ======================================
@@ -1289,6 +1387,9 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     _STATS_MIGRATIONS = c._STATS_MIGRATIONS
     _log_migration_error = c._log_migration_error
     _clear_migration_error_log_entries = c._clear_migration_error_log_entries
+    _reconcile_durable_applied_migration_errors = (
+        c._reconcile_durable_applied_migration_errors
+    )
     # Unified opener policy (spec §6.1). Call-time import so the shared PRAGMA
     # policy applies without a module-load cycle (_cctally_store imports this
     # module). Routed through importlib.import_module rather than a bare
@@ -1303,16 +1404,16 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     import importlib
     _cctally_store = importlib.import_module("_cctally_store")
 
-    repair_marker = db_path.with_name("stats.db.repairing")
-    if repair_marker.exists():
-        raise c.StatsDbMaintenanceError()
     ensure_dirs()
-    if repair_marker.exists():
-        raise c.StatsDbMaintenanceError()
-    conn = sqlite3.connect(db_path)
-    if repair_marker.exists():
-        conn.close()
-        raise c.StatsDbMaintenanceError()
+    # #386: the opener half of the physical-replacement protocol. This replaces
+    # three bare `repair_marker.exists()` checks around an unguarded connect —
+    # which observed no quarantine-pending record and held no maintenance lock,
+    # so a destructive maintenance path could publish its record, scan for
+    # handles, and still be raced by an opener arriving before the first rename.
+    # The guarded opener holds maintenance-SHARED across the marker/pending
+    # checks AND the connect. Scratch (`_target_path`) opens keep the old
+    # marker-only behaviour; see `_cctally_store.stats_open_guarded`.
+    conn = _cctally_store.stats_open_guarded(db_path)
     conn.row_factory = sqlite3.Row
     # #279 S1 F4: probe connect + initial PRAGMAs so a corrupt stats.db (the
     # non-re-derivable DB) surfaces as a one-line diagnosis + staged exit 3 instead of
@@ -1342,17 +1443,21 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # POSITIVELY classified corruption of the REAL stats index (never a
         # ``_target_path`` rebuild build — that path is disarmed to avoid
         # recursion), hand off to the store's HEAL_HOOK: it re-checks under the
-        # maintenance lock, writes the forensics bundle FIRST, quarantines the
-        # damaged family into an incident dir, rebuilds a fresh index from the
-        # journal, and returns True. A single retry of the connect+probe then
-        # runs against the fresh index; a second failure surfaces loudly. HEAL
-        # returns False (declined) for a non-corruption ``DatabaseError`` (BUSY,
-        # disk-full, permissions), the dev-checkout-on-prod guard, or when a
-        # concurrent healer already fixed it — all of which fall through to the
-        # original guided StatsDbCorruptError so the manual path still applies.
+        # maintenance lock, writes the forensics bundle FIRST, builds and
+        # validates a fresh index while the damaged family remains in place,
+        # then preserves that family and atomically publishes the replacement.
+        # A single retry of the connect+probe then runs against the fresh index;
+        # a second failure surfaces loudly. HEAL returns False (declined) for a
+        # non-corruption ``DatabaseError`` (BUSY, disk-full, permissions), the
+        # dev-checkout-on-prod guard, or when a concurrent healer already fixed
+        # it — all of which fall through to the original guided
+        # StatsDbCorruptError so the manual path still applies.
         heal = getattr(_cctally_store, "HEAL_HOOK", None)
         if _target_path is None and heal is not None and heal("stats", exc):
-            conn = sqlite3.connect(db_path)
+            # #386: the post-heal retry is an opener too. The heal released the
+            # maintenance lock before returning, so another maintenance path can
+            # legitimately own the family by now.
+            conn = _cctally_store.stats_open_guarded(db_path)
             conn.row_factory = sqlite3.Row
             try:
                 _cctally_store.apply_policy(conn, "stats")
@@ -1390,6 +1495,12 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             # STEADY STATE — zero schema work (spec §6.2/§7.1). Applies to a
             # ``_target_path`` open too: a rebuilt/scratch index is stamped at the
             # epoch, so opening it must be a pure connect + PRAGMA + version read.
+            # Only the live path owns the live migration-error sentinel: a
+            # scratch rebuild must not clear it before validated publication.
+            if _target_path is None:
+                _reconcile_durable_applied_migration_errors(
+                    conn, _STATS_MIGRATIONS, "stats.db"
+                )
             return conn
         if _target_path is None:
             if _uv > LEGACY_STATS_HEAD:
@@ -1421,778 +1532,841 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # surrounding schema apply (CREATE TABLE IF NOT EXISTS / add_column_if_missing
     # / dispatcher) still runs every open — Task 9 folds THAT under the
     # STATS_INDEX_EPOCH gate; this task only removes the recurring backfill cost.
-    _fixups_current = _cctally_store.stats_open_fixups_current(conn)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weekly_usage_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            captured_at_utc TEXT NOT NULL,
-            week_start_date TEXT NOT NULL,
-            week_end_date TEXT NOT NULL,
-            week_start_at TEXT,
-            week_end_at TEXT,
-            weekly_percent REAL NOT NULL,
-            page_url TEXT,
-            source TEXT NOT NULL DEFAULT 'userscript',
-            payload_json TEXT NOT NULL,
-            account_key TEXT NOT NULL DEFAULT 'unattributed'
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_usage_week_time
-        ON weekly_usage_snapshots(week_start_date, captured_at_utc DESC, id DESC)
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weekly_cost_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            captured_at_utc TEXT NOT NULL,
-            week_start_date TEXT NOT NULL,
-            week_end_date TEXT NOT NULL,
-            week_start_at TEXT,
-            week_end_at TEXT,
-            range_start_iso TEXT,
-            range_end_iso TEXT,
-            cost_usd REAL NOT NULL,
-            source TEXT NOT NULL DEFAULT 'cctally-range-cost',
-            mode TEXT NOT NULL DEFAULT 'auto',
-            project TEXT,
-            account_key TEXT NOT NULL DEFAULT 'unattributed'
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_cost_week_time
-        ON weekly_cost_snapshots(week_start_date, captured_at_utc DESC, id DESC)
-        """
-    )
-
-    add_column_if_missing(conn, "weekly_usage_snapshots", "week_start_at", "TEXT")
-    add_column_if_missing(conn, "weekly_usage_snapshots", "week_end_at", "TEXT")
-    # account_key (#341): the account dimension rides the STATS_INDEX_EPOCH bump
-    # (a fresh rebuild carries it via the CREATE TABLE above); this backstop keeps
-    # an already-1001 DB that predates the column consistent. DEFAULT
-    # 'unattributed' — every production writer passes the key explicitly (rev 4.1
-    # defensive-backstop rule), enforced by the structural writer-audit test.
-    add_column_if_missing(
-        conn, "weekly_usage_snapshots", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_percent", "REAL")
-    add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_resets_at", "TEXT")
-    # five_hour_window_key — canonical (10-min-floored epoch) key for
-    # jitter-tolerant equality. Anthropic's status-line API jitters
-    # rate_limits.5h.resets_at by ~seconds within the same physical 5h
-    # window; joining on the raw ISO string treats each jittered fetch as
-    # a new window, escaping the monotonic clamp at cmd_record_usage.
-    # Backfill is RESUMABLE: Python's sqlite3 auto-commits DDL,
-    # so a process killed mid-loop would leave the column added with NULL
-    # keys for unprocessed rows. The gating below detects that partial
-    # state on the next open_db() call (`five_hour_resets_at IS NOT NULL
-    # AND five_hour_window_key IS NULL`) and completes the backfill, so
-    # the original Bug B can't silently re-emerge for half-migrated rows.
-    needs_5h_key_backfill = add_column_if_missing(
-        conn, "weekly_usage_snapshots", "five_hour_window_key", "INTEGER"
-    )
-    # §6.2 backfill gate (Task 8): the resumable-partial probe + the backfill
-    # loop are open-time backfill work — skipped once the fixups marker is
-    # stamped. (The `add_column_if_missing` above is schema apply, Task 9's.)
-    if not _fixups_current:
-        if not needs_5h_key_backfill and conn.execute(
-            "SELECT 1 FROM weekly_usage_snapshots "
-            "WHERE five_hour_resets_at IS NOT NULL "
-            "  AND five_hour_window_key IS NULL "
-            "LIMIT 1"
-        ).fetchone() is not None:
-            needs_5h_key_backfill = True
-    else:
-        needs_5h_key_backfill = False
-
-    if needs_5h_key_backfill:
-        backfill_rows = conn.execute(
-            "SELECT id, five_hour_resets_at FROM weekly_usage_snapshots "
-            "WHERE five_hour_resets_at IS NOT NULL "
-            "  AND five_hour_window_key IS NULL"
-        ).fetchall()
-        for row in backfill_rows:
-            try:
-                iso = row[1]
-                d = parse_iso_datetime(iso, "five_hour_resets_at backfill")
-                epoch = int(d.timestamp())
-                key = _canonical_5h_window_key(epoch)
-                conn.execute(
-                    "UPDATE weekly_usage_snapshots "
-                    "SET five_hour_window_key = ? WHERE id = ?",
-                    (key, row[0]),
-                )
-            except (ValueError, TypeError) as exc:
-                eprint(f"[migration] skipped row {row[0]}: {exc}")
+    # ── #386: the OPEN-TIME MUTATION REGIME (spec §3.1 second clause) ──
+    # Everything below mutates stats.db: the full schema DDL, the quota
+    # projection schema, the migration dispatcher, two backfills, the fixups
+    # marker and the in-place cutover. Before #386 it ran under NO lock,
+    # reachable from any of the 57 production `open_db` call sites — so two
+    # commands racing a first open, an upgrade or a cutover both ran DDL on
+    # the same file. The guard takes `stats.db.maintenance.lock` EXCLUSIVE
+    # (re-entrant: the common case arrives from a caller that already holds
+    # it) and enters the sanctioned write scope the authorizer checks.
+    #
+    # It is BELOW the epoch gate deliberately: the steady-state open returns
+    # at `_uv == STATS_INDEX_EPOCH` above and never reaches here, so the hot
+    # path takes no exclusive lock at all.
+    with _cctally_store.stats_open_time_guard(live=_target_path is None):
+        _fixups_current = _cctally_store.stats_open_fixups_current(conn)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_weekly_usage_snapshots_5h_window_key "
-            "ON weekly_usage_snapshots(five_hour_window_key)"
+            """
+            CREATE TABLE IF NOT EXISTS weekly_usage_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                weekly_percent REAL NOT NULL,
+                page_url TEXT,
+                source TEXT NOT NULL DEFAULT 'userscript',
+                payload_json TEXT NOT NULL,
+                account_key TEXT NOT NULL DEFAULT 'unattributed'
+            )
+            """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_week_time
+            ON weekly_usage_snapshots(week_start_date, captured_at_utc DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_cost_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                range_start_iso TEXT,
+                range_end_iso TEXT,
+                cost_usd REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'cctally-range-cost',
+                mode TEXT NOT NULL DEFAULT 'auto',
+                project TEXT,
+                account_key TEXT NOT NULL DEFAULT 'unattributed'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cost_week_time
+            ON weekly_cost_snapshots(week_start_date, captured_at_utc DESC, id DESC)
+            """
+        )
+
+        add_column_if_missing(conn, "weekly_usage_snapshots", "week_start_at", "TEXT")
+        add_column_if_missing(conn, "weekly_usage_snapshots", "week_end_at", "TEXT")
+        # account_key (#341): the account dimension rides the STATS_INDEX_EPOCH bump
+        # (a fresh rebuild carries it via the CREATE TABLE above); this backstop keeps
+        # an already-1001 DB that predates the column consistent. DEFAULT
+        # 'unattributed' — every production writer passes the key explicitly (rev 4.1
+        # defensive-backstop rule), enforced by the structural writer-audit test.
+        add_column_if_missing(
+            conn, "weekly_usage_snapshots", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_percent", "REAL")
+        add_column_if_missing(conn, "weekly_usage_snapshots", "five_hour_resets_at", "TEXT")
+        # five_hour_window_key — canonical (10-min-floored epoch) key for
+        # jitter-tolerant equality. Anthropic's status-line API jitters
+        # rate_limits.5h.resets_at by ~seconds within the same physical 5h
+        # window; joining on the raw ISO string treats each jittered fetch as
+        # a new window, escaping the monotonic clamp at cmd_record_usage.
+        # Backfill is RESUMABLE: Python's sqlite3 auto-commits DDL,
+        # so a process killed mid-loop would leave the column added with NULL
+        # keys for unprocessed rows. The gating below detects that partial
+        # state on the next open_db() call (`five_hour_resets_at IS NOT NULL
+        # AND five_hour_window_key IS NULL`) and completes the backfill, so
+        # the original Bug B can't silently re-emerge for half-migrated rows.
+        needs_5h_key_backfill = add_column_if_missing(
+            conn, "weekly_usage_snapshots", "five_hour_window_key", "INTEGER"
+        )
+        # §6.2 backfill gate (Task 8): the resumable-partial probe + the backfill
+        # loop are open-time backfill work — skipped once the fixups marker is
+        # stamped. (The `add_column_if_missing` above is schema apply, Task 9's.)
+        if not _fixups_current:
+            if not needs_5h_key_backfill and conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                "WHERE five_hour_resets_at IS NOT NULL "
+                "  AND five_hour_window_key IS NULL "
+                "LIMIT 1"
+            ).fetchone() is not None:
+                needs_5h_key_backfill = True
+        else:
+            needs_5h_key_backfill = False
+
+        if needs_5h_key_backfill:
+            backfill_rows = conn.execute(
+                "SELECT id, five_hour_resets_at FROM weekly_usage_snapshots "
+                "WHERE five_hour_resets_at IS NOT NULL "
+                "  AND five_hour_window_key IS NULL"
+            ).fetchall()
+            for row in backfill_rows:
+                try:
+                    iso = row[1]
+                    d = parse_iso_datetime(iso, "five_hour_resets_at backfill")
+                    epoch = int(d.timestamp())
+                    key = _canonical_5h_window_key(epoch)
+                    conn.execute(
+                        "UPDATE weekly_usage_snapshots "
+                        "SET five_hour_window_key = ? WHERE id = ?",
+                        (key, row[0]),
+                    )
+                except (ValueError, TypeError) as exc:
+                    eprint(f"[migration] skipped row {row[0]}: {exc}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_weekly_usage_snapshots_5h_window_key "
+                "ON weekly_usage_snapshots(five_hour_window_key)"
+            )
+            conn.commit()
+
+        add_column_if_missing(conn, "weekly_cost_snapshots", "week_start_at", "TEXT")
+        add_column_if_missing(conn, "weekly_cost_snapshots", "week_end_at", "TEXT")
+        add_column_if_missing(conn, "weekly_cost_snapshots", "range_start_iso", "TEXT")
+        add_column_if_missing(conn, "weekly_cost_snapshots", "range_end_iso", "TEXT")
+        add_column_if_missing(
+            conn, "weekly_cost_snapshots", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_week_start_at_time
+            ON weekly_usage_snapshots(week_start_at, captured_at_utc DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cost_week_start_at_time
+            ON weekly_cost_snapshots(week_start_at, captured_at_utc DESC, id DESC)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS percent_milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                week_start_date TEXT NOT NULL,
+                week_end_date TEXT NOT NULL,
+                week_start_at TEXT,
+                week_end_at TEXT,
+                percent_threshold INTEGER NOT NULL,
+                cumulative_cost_usd REAL NOT NULL,
+                marginal_cost_usd REAL,
+                usage_snapshot_id INTEGER NOT NULL,
+                cost_snapshot_id INTEGER NOT NULL,
+                reset_event_id INTEGER NOT NULL DEFAULT 0,
+                account_key TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, week_start_date, percent_threshold, reset_event_id)
+            )
+            """
+        )
+
+        add_column_if_missing(conn, "percent_milestones", "five_hour_percent_at_crossing", "REAL")
+        add_column_if_missing(
+            conn, "percent_milestones", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        # reset_event_id: segment column added by migration 005. Fresh-install
+        # DBs get it via the live CREATE TABLE above + the dispatcher
+        # fast-stamps the migration. Existing pre-005 DBs trip the migration's
+        # rename-recreate-copy idiom (handler in _cctally_db.py); the handler's
+        # fast-path probe stamps the marker when the column is already present
+        # (covers the corner case where a partially-upgraded DB has the column
+        # but not the new UNIQUE — re-run is safe).
+
+        # alerted_at: populated by the alert-dispatch path when a milestone-INSERT
+        # row's threshold matches the user's configured alerts.weekly_thresholds /
+        # alerts.five_hour_thresholds (and alerts.enabled is true). NULL means
+        # "alerts were disabled at the moment of crossing OR the threshold wasn't
+        # in the configured list" — never "alert delivery failed" (dispatch is
+        # best-effort and write-once forward-only). The matching ALTER for
+        # `five_hour_milestones` lives right after that table's CREATE block
+        # below, since the table doesn't exist yet at this point in `open_db()`.
+        add_column_if_missing(conn, "percent_milestones", "alerted_at", "TEXT")
+
+        # Mid-week reset events: when Anthropic advances `rate_limits.seven_day.
+        # resets_at` before the previously-declared reset actually fires (i.e.,
+        # gives the user a fresh weekly window before the old one naturally
+        # expired), we record one row here so display + cost layers can treat
+        # the effective reset moment as the old week's end AND the new week's
+        # start — preventing the API's -7d-derived new week from overlapping
+        # the old week. Inserted by cmd_record_usage on detection; read by
+        # _apply_reset_events_to_weekrefs and the cost live-recompute path.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS week_reset_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at_utc        TEXT NOT NULL,
+                old_week_end_at        TEXT NOT NULL,
+                new_week_end_at        TEXT NOT NULL,
+                effective_reset_at_utc TEXT NOT NULL,
+                observed_pre_credit_pct REAL,
+                account_key TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, old_week_end_at, new_week_end_at)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "week_reset_events", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        _backfill_week_reset_events(conn)
+
+        # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
+        # Parallel concept to ``week_reset_events`` for the 5h dimension; lives
+        # adjacent in ``_apply_schema`` because the two carry the same kind of
+        # signal at different cadences. Diverges from weekly in that the payload
+        # is the *percent values* (prior + post) rather than boundary keys,
+        # because the 5h variant has a stable ``five_hour_window_key`` and only
+        # the percent moves. See spec
+        # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md §3.1
+        # for rationale.
+        #
+        # UNIQUE(five_hour_window_key, effective_reset_at_utc) — supports stacked
+        # credits across DISTINCT 10-min slots inside one block (see spec §2.3
+        # "Bounded stacked-credit resolution" for the cap statement: ~30 distinct
+        # slots per 5h block when floor matches ``_canonical_5h_window_key``'s
+        # 600-second floor; same-slot collisions silently absorbed by
+        # INSERT OR IGNORE — an intentional cap, not a bug).
+        #
+        # No FK per CLAUDE.md gotcha: FKs in this codebase are documentation-only
+        # (``PRAGMA foreign_keys`` not enabled). ``five_hour_window_key`` provides
+        # the join key without a formal FK.
+        #
+        # No ``_backfill_five_hour_reset_events`` call follows (forward-only ship
+        # per spec Q5; historical backfill deferred to a future issue).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_reset_events (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at_utc        TEXT NOT NULL,
+                five_hour_window_key   INTEGER NOT NULL,
+                prior_percent          REAL NOT NULL,
+                post_percent           REAL NOT NULL,
+                effective_reset_at_utc TEXT NOT NULL,
+                account_key            TEXT NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "five_hour_reset_events", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+
+        # ── five_hour_blocks (rollup, one row per API-anchored 5h block) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_blocks (
+                id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+                five_hour_window_key          INTEGER NOT NULL,
+                five_hour_resets_at           TEXT    NOT NULL,
+                block_start_at                TEXT    NOT NULL,
+                first_observed_at_utc         TEXT    NOT NULL,
+                last_observed_at_utc          TEXT    NOT NULL,
+                final_five_hour_percent       REAL    NOT NULL,
+                seven_day_pct_at_block_start  REAL,
+                seven_day_pct_at_block_end    REAL,
+                crossed_seven_day_reset       INTEGER NOT NULL DEFAULT 0,
+                total_input_tokens            INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens           INTEGER NOT NULL DEFAULT 0,
+                total_cache_create_tokens     INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens       INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd                REAL    NOT NULL DEFAULT 0,
+                is_closed                     INTEGER NOT NULL DEFAULT 0,
+                created_at_utc                TEXT    NOT NULL,
+                last_updated_at_utc           TEXT    NOT NULL,
+                account_key                   TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "five_hour_blocks", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_blocks_block_start
+            ON five_hour_blocks(block_start_at DESC)
+            """
+        )
+
+        # ── five_hour_milestones (per-percent crossings inside a 5h block) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_milestones (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id                    INTEGER NOT NULL,
+                five_hour_window_key        INTEGER NOT NULL,
+                percent_threshold           INTEGER NOT NULL,
+                captured_at_utc             TEXT    NOT NULL,
+                usage_snapshot_id           INTEGER NOT NULL,
+                block_input_tokens          INTEGER NOT NULL DEFAULT 0,
+                block_output_tokens         INTEGER NOT NULL DEFAULT 0,
+                block_cache_create_tokens   INTEGER NOT NULL DEFAULT 0,
+                block_cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                block_cost_usd              REAL    NOT NULL DEFAULT 0,
+                marginal_cost_usd           REAL,
+                seven_day_pct_at_crossing   REAL,
+                reset_event_id              INTEGER NOT NULL DEFAULT 0,
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, percent_threshold, reset_event_id),
+                FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_milestones_block
+            ON five_hour_milestones(block_id)
+            """
+        )
+
+        # alerted_at: see the matching ALTER on `percent_milestones` above for
+        # rationale. Same write-once forward-only semantics: the alert-dispatch
+        # path stamps this column on milestone-INSERT rows whose threshold
+        # matches the user's configured `alerts.five_hour_thresholds`. NULL =
+        # "alerts disabled at moment of crossing OR threshold not configured"
+        # — never "delivery failed".
+        add_column_if_missing(conn, "five_hour_milestones", "alerted_at", "TEXT")
+        add_column_if_missing(
+            conn, "five_hour_milestones", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+
+        # reset_event_id: segment column added by migration 006. Fresh-install
+        # DBs get it via the live CREATE TABLE above + the dispatcher fast-stamps
+        # the migration marker (the live DDL must carry the column AND the 3-col
+        # UNIQUE for fast-stamp to be safe — see spec §3.2). Existing pre-006
+        # DBs trip the migration's rename-recreate-copy idiom (handler in
+        # bin/_cctally_db.py); the handler's fast-path probe stamps the marker
+        # when the column is already present (covers the corner case where a
+        # partially-upgraded DB has the column but not the new UNIQUE — re-run
+        # is safe). Mirrors weekly migration 005 / `percent_milestones`.
+
+        # ── five_hour_block_models (per-(block, model) rollup-child) ──
+        # MUST be created BEFORE the parent-backfill gate below, because
+        # _backfill_five_hour_blocks writes into this table on the fresh-install
+        # path. UNIQUE keyed on (five_hour_window_key, model) — durable across
+        # parent rebuilds. Live writes use DELETE WHERE five_hour_window_key = ?.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_block_models (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id                    INTEGER NOT NULL,
+                five_hour_window_key        INTEGER NOT NULL,
+                model                       TEXT    NOT NULL,
+                input_tokens                INTEGER NOT NULL DEFAULT 0,
+                output_tokens               INTEGER NOT NULL DEFAULT 0,
+                cache_create_tokens         INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
+                cost_usd                    REAL    NOT NULL DEFAULT 0,
+                entry_count                 INTEGER NOT NULL DEFAULT 0,
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, model),
+                FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "five_hour_block_models", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_block_models_block
+            ON five_hour_block_models(block_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_block_models_window
+            ON five_hour_block_models(five_hour_window_key)
+            """
+        )
+
+        # ── five_hour_block_projects (per-(block, project_path) rollup-child) ──
+        # NULL session_files.project_path → '(unknown)' sentinel at write time,
+        # keeping reconcile invariant SUM(child.cost) == parent.total intact.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_block_projects (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id                    INTEGER NOT NULL,
+                five_hour_window_key        INTEGER NOT NULL,
+                project_path                TEXT    NOT NULL,
+                input_tokens                INTEGER NOT NULL DEFAULT 0,
+                output_tokens               INTEGER NOT NULL DEFAULT 0,
+                cache_create_tokens         INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
+                cost_usd                    REAL    NOT NULL DEFAULT 0,
+                entry_count                 INTEGER NOT NULL DEFAULT 0,
+                account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, five_hour_window_key, project_path),
+                FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "five_hour_block_projects", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_block_projects_block
+            ON five_hour_block_projects(block_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_five_hour_block_projects_window
+            ON five_hour_block_projects(five_hour_window_key)
+            """
+        )
+
+        # ── budget_milestones (equiv-$ budget threshold crossings — issue #19) ──
+        # Write-once, forward-only (the exact posture of `five_hour_milestones`). A
+        # mid-week quota reset re-anchors `week_start_at` (see
+        # `_resolve_current_budget_window`), so the new window naturally gets
+        # fresh rows under UNIQUE(week_start_at, period, threshold) — no
+        # `reset_event_id` segment column needed (unlike the percent/5h tables).
+        # `week_start_at` stores the effective/re-anchored ISO string from the
+        # resolver (`isoformat(timespec="seconds")`); the resolver's
+        # `parse_iso_datetime` returns a HOST-LOCAL tz-aware datetime, so this
+        # dedup key carries the host's UTC offset (e.g. `…T07:00:00-07:00`) —
+        # host-consistent, NOT portable across hosts, same posture as
+        # `five_hour_blocks.block_start_at`. Firing + reconcile + the dashboard
+        # envelope all read/write the identical string on a given host, so the
+        # UNIQUE dedup is exact. `alerted_at` is stamped BEFORE the osascript Popen
+        # (set-then-dispatch invariant); NULL = "recorded without dispatch" (the
+        # forward-only-from-set reconcile path) OR "not yet dispatched", never
+        # "delivery failed".
+        # Unified vendor-tagged table (#143): one row per (vendor, period_start_at,
+        # period, threshold). `vendor` ∈ 'claude'|'codex'. `period_start_at` is the
+        # resolved period-window start instant (subscription-week OR calendar
+        # period-start). `period` is the configured period at crossing; NULL = pre-012
+        # unknown. Owned by migration 012_unify_budget_milestones_vendor (merge of the
+        # former budget_milestones + codex_budget_milestones). The Codex table is NO
+        # LONGER live-created here — migration 012 drops it and this CREATE must not
+        # resurrect it; migration 011 is hardened to skip it when absent (#143).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor          TEXT    NOT NULL,
+                period_start_at TEXT    NOT NULL,
+                period          TEXT,
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                account_key     TEXT    NOT NULL DEFAULT '*',
+                UNIQUE(vendor, account_key, period_start_at, period, threshold)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "budget_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
+
+        # ── projected_milestones (week-average-pace projection crossings — #121) ──
+        # Write-once, forward-only — same posture as `budget_milestones` (no
+        # `reset_event_id` segment column). Two metrics share the table, keyed by
+        # `metric` ('weekly_pct' | 'budget_usd'); a level fires once the
+        # WEEK-AVERAGE projection (not the displayed high-end verdict) crosses
+        # `threshold`. `denominator` snapshots the target AT crossing (target_usd
+        # for budget_usd, 100.0 for weekly_pct) so the dashboard envelope renders
+        # context "$312 of $300" / "102% of cap" from the ROW, not from live config
+        # that may have changed since (Codex P0-4). A mid-week reset re-anchors
+        # `week_start_at` (new window → fresh rows under the UNIQUE key), the
+        # budget-pattern reset handling — hence NO `reset_event_id` column.
+        # `alerted_at` is stamped BEFORE the osascript Popen (set-then-dispatch).
+        # Schema owned by migration 011_budget_milestone_period_keys (the `period`
+        # column + the period-inclusive UNIQUE; see _cctally_db.py). `period` is
+        # NULL for pre-011 rows.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projected_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,   -- period-start instant (subscription-week OR calendar period-start; back-compat name)
+                period          TEXT,               -- configured period at crossing; NULL = pre-011 unknown (migration 011)
+                metric          TEXT    NOT NULL,   -- 'weekly_pct' | 'budget_usd' | 'codex_budget_usd'
+                threshold       INTEGER NOT NULL,   -- 90 | 100
+                projected_value REAL    NOT NULL,
+                denominator     REAL    NOT NULL,   -- target_usd (budget / codex_budget) | 100.0 (weekly)
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                account_key     TEXT    NOT NULL DEFAULT '*',  -- '*' for vendor-budget metrics; real account for weekly_pct (Task 3)
+                UNIQUE(account_key, week_start_at, period, metric, threshold)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "projected_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
+
+        # ── project_budget_milestones (per-project equiv-$ budget crossings) ──────
+        # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
+        # same posture as `budget_milestones` / `projected_milestones` (write-once,
+        # forward-only, framework-untracked). `project_key` is the NEW dimension in
+        # the UNIQUE key: each project crosses each threshold once per week,
+        # independently of every other project (issue #19 / #121, spec §5.1). It
+        # stores the canonical git-root (`ProjectKey.bucket_path`), matched by string
+        # equality against each session entry's resolved git-root. `budget_usd`
+        # snapshots the project's target AT crossing time so the dashboard renders
+        # "$26 of $25" from the ROW, not from live config that may have changed since
+        # (the Codex P0-4 lesson, already baked into `budget_milestones` /
+        # `projected_milestones`). A mid-week quota reset re-anchors `week_start_at`
+        # (new window → fresh rows under the UNIQUE key) — budget-pattern reset
+        # handling, hence NO `reset_event_id` segment column. `alerted_at` is stamped
+        # BEFORE dispatch (set-then-dispatch invariant); NULL = "recorded without
+        # dispatch" (forward-only-from-set reconcile) OR "not yet dispatched", never
+        # "delivery failed". Lives BEFORE the migration dispatcher: a plain CREATE on
+        # a framework-untracked table never touches `schema_migrations`, so the
+        # dispatcher's fresh-install snapshot is unaffected.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_budget_milestones (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_at   TEXT    NOT NULL,
+                project_key     TEXT    NOT NULL,   -- canonical git-root (bucket_path)
+                threshold       INTEGER NOT NULL,
+                budget_usd      REAL    NOT NULL,   -- project's target snapshotted AT crossing
+                spent_usd       REAL    NOT NULL,
+                consumption_pct REAL    NOT NULL,
+                crossed_at_utc  TEXT    NOT NULL,
+                alerted_at      TEXT,
+                account_key     TEXT    NOT NULL DEFAULT '*',  -- account-blind this epic (spec §6): always '*'
+                UNIQUE(account_key, week_start_at, project_key, threshold)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "project_budget_milestones", "account_key",
+            "TEXT NOT NULL DEFAULT '*'")
+
+        # In-place weekly partial-credit floor (issue #209, record-credit M2).
+        # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / NO user_version
+        # bump — the same framework-untracked posture as `project_budget_milestones`
+        # above. A `record-credit` invocation records a weekly credit (e.g.
+        # 46% -> 31%) WITHOUT writing a `week_reset_events` row: a credit lowers the
+        # current-7d clamp floor only and must NOT re-anchor the week window (the
+        # `week_reset_events`-driven window-resolution code would otherwise show a
+        # spurious "new week" and corrupt the forecast rate). `_reset_aware_floor`
+        # (below) unions this table with `week_reset_events` so the four MAX-clamp
+        # sites floor the current % to the post-credit value while the window stays
+        # put. `effective_at_utc` is `floor_to_hour(at)` in UTC; `applied_at_utc` is
+        # audit-only (kept out of goldens). Lives BEFORE the migration dispatcher: a
+        # plain CREATE on a framework-untracked table never touches
+        # `schema_migrations`, so the dispatcher's fresh-install snapshot is
+        # unaffected. See docs/superpowers/specs/2026-06-19-record-credit-weekly-design.md §2/§4a.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_credit_floors (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start_date         TEXT    NOT NULL,
+                effective_at_utc        TEXT    NOT NULL,
+                observed_pre_credit_pct REAL    NOT NULL,
+                applied_at_utc          TEXT    NOT NULL,
+                account_key             TEXT    NOT NULL DEFAULT 'unattributed',
+                UNIQUE(account_key, week_start_date, effective_at_utc)
+            )
+            """
+        )
+        add_column_if_missing(
+            conn, "weekly_credit_floors", "account_key",
+            "TEXT NOT NULL DEFAULT 'unattributed'")
+
+        # ── accounts registry (multi-account epic #341, spec §1/§2) ───────────────
+        # Derived from the journal like all stats.db state: `account_observe` op
+        # lines fold into rows here (via _apply_op_account_observe), `account_label`
+        # ops set the user label. Framework-untracked (plain CREATE TABLE IF NOT
+        # EXISTS, no migration / no user_version bump — same posture as
+        # weekly_credit_floors above), so it never touches `schema_migrations` and
+        # the stats-schema change rides the STATS_INDEX_EPOCH bump + rebuild, not a
+        # new stats migration (the frozen-registry rule). `last_seen_utc` is derived
+        # at fold time from the max `at` of any account-stamped line, NOT carried by
+        # the observe record. `label_source` records provenance for the
+        # user > switcher > auto precedence rule. A new empty table is byte-invisible
+        # to every existing render, preserving the R8 byte-stability contract.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                account_key    TEXT PRIMARY KEY,
+                provider       TEXT NOT NULL,
+                natural_id     TEXT,
+                email          TEXT,
+                label          TEXT,
+                plan_type      TEXT,
+                label_source   TEXT NOT NULL DEFAULT 'auto',
+                first_seen_utc TEXT,
+                last_seen_utc  TEXT
+            )
+            """
+        )
+
+        # Stats migration 013 owns durable quota interpretation.  Keep the current
+        # schema in the fresh-install path before the dispatcher, exactly like the
+        # existing live CREATE tables; its handler calls this same idempotent helper
+        # for an older stats.db and the dispatcher central-stamps on clean return.
+        # §6.2 backfill gate (Task 8): the quota-projection schema apply is one of
+        # the three open-time backfills — skipped once the fixups marker is stamped
+        # (the marker is set only AFTER this ran, so marker-present ⇒ tables present).
+        # Fresh installs read False and apply it here (the dispatcher fast-stamps 013
+        # without running its handler, so this open-time call is the sole creator).
+        if not _fixups_current:
+            _apply_quota_projection_schema(conn)
+
+        # Migration framework dispatcher. Replaces the prior inline gate stack
+        # (has_blocks + _migration_done) with the framework's _run_pending_-
+        # migrations entry point. See spec §2.3, §5.2 + the migration handlers
+        # decorated with @stats_migration further down in this file.
+        #
+        # MUST run BEFORE any DDL or write that touches `schema_migrations`
+        # (Codex P1 #1 fix on c3625ee + e7fdcc8): the dispatcher's fresh-install
+        # detection snapshots `schema_migrations`'s existence in sqlite_master
+        # BEFORE its own CREATE TABLE IF NOT EXISTS. Pre-creating the table
+        # earlier in open_db() (or letting `_backfill_five_hour_blocks` insert
+        # markers first) flips that snapshot to True on a brand-new DB and
+        # dead-codes the stamp-only fast path. The dispatcher is now the sole
+        # creator of `schema_migrations` + `schema_migrations_skipped`.
+        _run_pending_migrations(
+            conn, registry=_STATS_MIGRATIONS, db_label="stats.db",
+        )
+
+        # One-time historical backfill of five_hour_blocks (rollup only;
+        # milestones are forward-only per spec §4.3 / [Write-once milestones]).
+        # Idempotent via UNIQUE(five_hour_window_key) + INSERT OR IGNORE.
+        # Runs AFTER the dispatcher so `schema_migrations` exists for the
+        # marker INSERTs inside the backfill body, and so any fresh-install
+        # stamp-only path the dispatcher took above is already committed.
+        # §6.2 backfill gate (Task 8): the two probe SELECTs + the backfill + its
+        # migration-003 re-invocation are open-time backfill work — skipped once the
+        # fixups marker is stamped. Dead in the journal world (the ingest cycle writes
+        # blocks with their snapshots), so it fires only on a pre-journal upgrade DB's
+        # first open; after that the marker gates it out permanently.
+        if not _fixups_current:
+            existing = conn.execute(
+                "SELECT 1 FROM five_hour_blocks LIMIT 1"
+            ).fetchone()
+            has_snapshots = conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots "
+                "WHERE five_hour_window_key IS NOT NULL "
+                "  AND five_hour_percent     IS NOT NULL "
+                "LIMIT 1"
+            ).fetchone()
+            if not existing and has_snapshots:
+                inserted = _backfill_five_hour_blocks(conn)
+                # Re-run the 5h dedup migration AFTER backfill creates parents.
+                # The dispatcher above ran while five_hour_blocks was empty, so
+                # the dedup handler no-op'd and stamped its marker. Snapshot
+                # keys can carry jitter beyond the 600s canonical floor (the
+                # 003_* migration handles up to 1800s grouping), so the
+                # backfill's `DISTINCT five_hour_window_key` over those keys
+                # can produce duplicate parent rows for one physical 5h
+                # window. Without this re-invocation those duplicates persist
+                # forever — the marker says it ran. Handler owns its own
+                # BEGIN/COMMIT and is idempotent (no groups → no-op).
+                #
+                # Honor `db skip` here as well: if the operator marked 003 as
+                # skipped (e.g., poison pill on their machine), we must NOT
+                # back-door run the handler. Duplicates introduced by the
+                # backfill will persist until they `db unskip` — which is the
+                # explicit choice the skip records. Failure path mirrors the
+                # dispatcher's contract: route through _log_migration_error so
+                # the next interactive command renders the banner, and clear
+                # the log entry on success so the banner auto-dismisses.
+                if inserted > 0:
+                    target_name = "003_merge_5h_block_duplicates_v1"
+                    try:
+                        skipped = {
+                            row[0] for row in conn.execute(
+                                "SELECT name FROM schema_migrations_skipped"
+                            ).fetchall()
+                        }
+                    except sqlite3.OperationalError:
+                        skipped = set()
+                    if target_name not in skipped:
+                        for _m in _STATS_MIGRATIONS:
+                            if _m.name == target_name:
+                                qualified = f"stats.db:{target_name}"
+                                try:
+                                    _m.handler(conn)
+                                    _clear_migration_error_log_entries(qualified)
+                                except Exception as exc:
+                                    _log_migration_error(
+                                        name=qualified,
+                                        exc=exc,
+                                        tb=traceback.format_exc(),
+                                    )
+                                    eprint(f"[migration {qualified}] failed: {exc}")
+                                break
+
+        # ── Append-only journal replay-identity columns + ingest cursor ──
+        # (2026-07-22 DB journal redesign, spec §4.2 / §5.2). Every row a
+        # journal fold materializes carries the originating line's stable `id`
+        # in `journal_id`, with a partial UNIQUE index so the ingester's
+        # INSERT OR IGNORE fold is idempotent under replay/re-ingest. Runs AFTER
+        # the migration dispatcher so the columns land on the final (migrated)
+        # table shape — migrations 005/006 recreate percent/5h milestone tables
+        # and must not drop the column. All additive (add_column_if_missing /
+        # CREATE ... IF NOT EXISTS), framework-untracked — same posture as
+        # weekly_credit_floors / project_budget_milestones. Task 9 folds this
+        # under the STATS_INDEX_EPOCH version gate; until then it is idempotent
+        # per open (add_column_if_missing / IF NOT EXISTS no-op once present).
+        for _jtable in (
+            "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
+            "five_hour_reset_events", "five_hour_blocks", "weekly_credit_floors",
+            "percent_milestones", "five_hour_milestones", "budget_milestones",
+            "projected_milestones", "project_budget_milestones",
+        ):
+            add_column_if_missing(conn, _jtable, "journal_id", "TEXT")
+            conn.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_jtable}_journal_id "
+                f"ON {_jtable}(journal_id) WHERE journal_id IS NOT NULL"
+            )
+        # Companion partial index (spec §5.3 harvest / Task 6 gate P2): the ingest
+        # cycle's harvest scans every natural-keyed family for rows the pipeline
+        # inserted this cycle (`WHERE journal_id IS NULL`). A partial index over
+        # exactly those un-stamped rows keeps that scan O(this-cycle inserts), not
+        # O(table) — at the 10x envelope the stamped rows are ~all of the table, so
+        # a full scan would be pathological. Only the 8 HARVEST families need it
+        # (the Model-A / op-fold tables — weekly_usage_snapshots, weekly_cost_
+        # snapshots, weekly_credit_floors — are never harvest-scanned).
+        for _htable in (
+            "week_reset_events", "five_hour_reset_events", "five_hour_blocks",
+            "percent_milestones", "five_hour_milestones", "budget_milestones",
+            "projected_milestones", "project_budget_milestones",
+        ):
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{_htable}_journal_id_null "
+                f"ON {_htable}(id) WHERE journal_id IS NULL"
+            )
+        # Single-row segment+offset consumption watermark (spec §5.2). The
+        # applied_* pair is written atomically with the materialized rows and
+        # acts as the trusted prefix when a cursor-only hand edit advances the
+        # public pair without applying the skipped journal bytes (#410 Task B).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_cursor ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "segment TEXT NOT NULL, "
+            "offset INTEGER NOT NULL, "
+            "applied_segment TEXT, "
+            "applied_offset INTEGER)"
+        )
+        add_column_if_missing(
+            conn, "journal_cursor", "applied_segment", "TEXT"
+        )
+        add_column_if_missing(
+            conn, "journal_cursor", "applied_offset", "INTEGER"
+        )
+        # Schema-apply compatibility for legacy/test-mode paths that reach this
+        # DDL with a pre-pair cursor row. A released epoch-1003 index does NOT
+        # use this as an upgrade shortcut: the epoch mismatch rebuilds it into
+        # the complete epoch-1004 schema first.
+        conn.execute(
+            "UPDATE journal_cursor "
+            "SET applied_segment = segment, applied_offset = offset "
+            "WHERE applied_segment IS NULL AND applied_offset IS NULL"
+        )
+        # Disposable effective-event summary (#372 Task A). Durable truth remains
+        # the append-only journal; rebuild repopulates this table from the shared
+        # pure selector. The table lets live replay detect completed corrections
+        # without inventing family-specific inverse operations.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_effective_events ("
+            "event_id TEXT PRIMARY KEY, "
+            "rev INTEGER NOT NULL CHECK (rev >= 0), "
+            "status TEXT NOT NULL CHECK (status IN ('active','tombstone')), "
+            "content_hash TEXT NOT NULL, "
+            "batch_id TEXT, "
+            "event_json TEXT)"
+        )
+        # Disposable selector diagnostics (#402 Task A). The append-only journal
+        # remains authoritative; rebuild/live preflight replace this bounded
+        # summary after a complete correction-prefix selection.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_protocol_violations ("
+            "fingerprint TEXT PRIMARY KEY, "
+            "batch_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "violation_json TEXT NOT NULL)"
+        )
+
+        # §6.2 backfill gate (Task 8): stamp the one-shot marker AFTER the three
+        # open-time backfills ran, so the next open skips them (and their probes)
+        # entirely. The marker table DDL runs ONLY on this "fixups ran" path, never
+        # on the steady-state open. A crash before this commit leaves the marker
+        # unset and everything re-runs idempotently next open (invariant).
+        if not _fixups_current:
+            _cctally_store.mark_stats_open_fixups_done(conn)
+
         conn.commit()
 
-    add_column_if_missing(conn, "weekly_cost_snapshots", "week_start_at", "TEXT")
-    add_column_if_missing(conn, "weekly_cost_snapshots", "week_end_at", "TEXT")
-    add_column_if_missing(conn, "weekly_cost_snapshots", "range_start_iso", "TEXT")
-    add_column_if_missing(conn, "weekly_cost_snapshots", "range_end_iso", "TEXT")
-    add_column_if_missing(
-        conn, "weekly_cost_snapshots", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_usage_week_start_at_time
-        ON weekly_usage_snapshots(week_start_at, captured_at_utc DESC, id DESC)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_cost_week_start_at_time
-        ON weekly_cost_snapshots(week_start_at, captured_at_utc DESC, id DESC)
-        """
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS percent_milestones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            captured_at_utc TEXT NOT NULL,
-            week_start_date TEXT NOT NULL,
-            week_end_date TEXT NOT NULL,
-            week_start_at TEXT,
-            week_end_at TEXT,
-            percent_threshold INTEGER NOT NULL,
-            cumulative_cost_usd REAL NOT NULL,
-            marginal_cost_usd REAL,
-            usage_snapshot_id INTEGER NOT NULL,
-            cost_snapshot_id INTEGER NOT NULL,
-            reset_event_id INTEGER NOT NULL DEFAULT 0,
-            account_key TEXT NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, week_start_date, percent_threshold, reset_event_id)
-        )
-        """
-    )
-
-    add_column_if_missing(conn, "percent_milestones", "five_hour_percent_at_crossing", "REAL")
-    add_column_if_missing(
-        conn, "percent_milestones", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    # reset_event_id: segment column added by migration 005. Fresh-install
-    # DBs get it via the live CREATE TABLE above + the dispatcher
-    # fast-stamps the migration. Existing pre-005 DBs trip the migration's
-    # rename-recreate-copy idiom (handler in _cctally_db.py); the handler's
-    # fast-path probe stamps the marker when the column is already present
-    # (covers the corner case where a partially-upgraded DB has the column
-    # but not the new UNIQUE — re-run is safe).
-
-    # alerted_at: populated by the alert-dispatch path when a milestone-INSERT
-    # row's threshold matches the user's configured alerts.weekly_thresholds /
-    # alerts.five_hour_thresholds (and alerts.enabled is true). NULL means
-    # "alerts were disabled at the moment of crossing OR the threshold wasn't
-    # in the configured list" — never "alert delivery failed" (dispatch is
-    # best-effort and write-once forward-only). The matching ALTER for
-    # `five_hour_milestones` lives right after that table's CREATE block
-    # below, since the table doesn't exist yet at this point in `open_db()`.
-    add_column_if_missing(conn, "percent_milestones", "alerted_at", "TEXT")
-
-    # Mid-week reset events: when Anthropic advances `rate_limits.seven_day.
-    # resets_at` before the previously-declared reset actually fires (i.e.,
-    # gives the user a fresh weekly window before the old one naturally
-    # expired), we record one row here so display + cost layers can treat
-    # the effective reset moment as the old week's end AND the new week's
-    # start — preventing the API's -7d-derived new week from overlapping
-    # the old week. Inserted by cmd_record_usage on detection; read by
-    # _apply_reset_events_to_weekrefs and the cost live-recompute path.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS week_reset_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at_utc        TEXT NOT NULL,
-            old_week_end_at        TEXT NOT NULL,
-            new_week_end_at        TEXT NOT NULL,
-            effective_reset_at_utc TEXT NOT NULL,
-            observed_pre_credit_pct REAL,
-            account_key TEXT NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, old_week_end_at, new_week_end_at)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "week_reset_events", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    _backfill_week_reset_events(conn)
-
-    # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
-    # Parallel concept to ``week_reset_events`` for the 5h dimension; lives
-    # adjacent in ``_apply_schema`` because the two carry the same kind of
-    # signal at different cadences. Diverges from weekly in that the payload
-    # is the *percent values* (prior + post) rather than boundary keys,
-    # because the 5h variant has a stable ``five_hour_window_key`` and only
-    # the percent moves. See spec
-    # docs/superpowers/specs/2026-05-16-5h-in-place-credit-detection.md §3.1
-    # for rationale.
-    #
-    # UNIQUE(five_hour_window_key, effective_reset_at_utc) — supports stacked
-    # credits across DISTINCT 10-min slots inside one block (see spec §2.3
-    # "Bounded stacked-credit resolution" for the cap statement: ~30 distinct
-    # slots per 5h block when floor matches ``_canonical_5h_window_key``'s
-    # 600-second floor; same-slot collisions silently absorbed by
-    # INSERT OR IGNORE — an intentional cap, not a bug).
-    #
-    # No FK per CLAUDE.md gotcha: FKs in this codebase are documentation-only
-    # (``PRAGMA foreign_keys`` not enabled). ``five_hour_window_key`` provides
-    # the join key without a formal FK.
-    #
-    # No ``_backfill_five_hour_reset_events`` call follows (forward-only ship
-    # per spec Q5; historical backfill deferred to a future issue).
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS five_hour_reset_events (
-            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-            detected_at_utc        TEXT NOT NULL,
-            five_hour_window_key   INTEGER NOT NULL,
-            prior_percent          REAL NOT NULL,
-            post_percent           REAL NOT NULL,
-            effective_reset_at_utc TEXT NOT NULL,
-            account_key            TEXT NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "five_hour_reset_events", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-
-    # ── five_hour_blocks (rollup, one row per API-anchored 5h block) ──
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS five_hour_blocks (
-            id                            INTEGER PRIMARY KEY AUTOINCREMENT,
-            five_hour_window_key          INTEGER NOT NULL,
-            five_hour_resets_at           TEXT    NOT NULL,
-            block_start_at                TEXT    NOT NULL,
-            first_observed_at_utc         TEXT    NOT NULL,
-            last_observed_at_utc          TEXT    NOT NULL,
-            final_five_hour_percent       REAL    NOT NULL,
-            seven_day_pct_at_block_start  REAL,
-            seven_day_pct_at_block_end    REAL,
-            crossed_seven_day_reset       INTEGER NOT NULL DEFAULT 0,
-            total_input_tokens            INTEGER NOT NULL DEFAULT 0,
-            total_output_tokens           INTEGER NOT NULL DEFAULT 0,
-            total_cache_create_tokens     INTEGER NOT NULL DEFAULT 0,
-            total_cache_read_tokens       INTEGER NOT NULL DEFAULT 0,
-            total_cost_usd                REAL    NOT NULL DEFAULT 0,
-            is_closed                     INTEGER NOT NULL DEFAULT 0,
-            created_at_utc                TEXT    NOT NULL,
-            last_updated_at_utc           TEXT    NOT NULL,
-            account_key                   TEXT    NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, five_hour_window_key)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "five_hour_blocks", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_blocks_block_start
-        ON five_hour_blocks(block_start_at DESC)
-        """
-    )
-
-    # ── five_hour_milestones (per-percent crossings inside a 5h block) ──
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS five_hour_milestones (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_id                    INTEGER NOT NULL,
-            five_hour_window_key        INTEGER NOT NULL,
-            percent_threshold           INTEGER NOT NULL,
-            captured_at_utc             TEXT    NOT NULL,
-            usage_snapshot_id           INTEGER NOT NULL,
-            block_input_tokens          INTEGER NOT NULL DEFAULT 0,
-            block_output_tokens         INTEGER NOT NULL DEFAULT 0,
-            block_cache_create_tokens   INTEGER NOT NULL DEFAULT 0,
-            block_cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-            block_cost_usd              REAL    NOT NULL DEFAULT 0,
-            marginal_cost_usd           REAL,
-            seven_day_pct_at_crossing   REAL,
-            reset_event_id              INTEGER NOT NULL DEFAULT 0,
-            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, five_hour_window_key, percent_threshold, reset_event_id),
-            FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_milestones_block
-        ON five_hour_milestones(block_id)
-        """
-    )
-
-    # alerted_at: see the matching ALTER on `percent_milestones` above for
-    # rationale. Same write-once forward-only semantics: the alert-dispatch
-    # path stamps this column on milestone-INSERT rows whose threshold
-    # matches the user's configured `alerts.five_hour_thresholds`. NULL =
-    # "alerts disabled at moment of crossing OR threshold not configured"
-    # — never "delivery failed".
-    add_column_if_missing(conn, "five_hour_milestones", "alerted_at", "TEXT")
-    add_column_if_missing(
-        conn, "five_hour_milestones", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-
-    # reset_event_id: segment column added by migration 006. Fresh-install
-    # DBs get it via the live CREATE TABLE above + the dispatcher fast-stamps
-    # the migration marker (the live DDL must carry the column AND the 3-col
-    # UNIQUE for fast-stamp to be safe — see spec §3.2). Existing pre-006
-    # DBs trip the migration's rename-recreate-copy idiom (handler in
-    # bin/_cctally_db.py); the handler's fast-path probe stamps the marker
-    # when the column is already present (covers the corner case where a
-    # partially-upgraded DB has the column but not the new UNIQUE — re-run
-    # is safe). Mirrors weekly migration 005 / `percent_milestones`.
-
-    # ── five_hour_block_models (per-(block, model) rollup-child) ──
-    # MUST be created BEFORE the parent-backfill gate below, because
-    # _backfill_five_hour_blocks writes into this table on the fresh-install
-    # path. UNIQUE keyed on (five_hour_window_key, model) — durable across
-    # parent rebuilds. Live writes use DELETE WHERE five_hour_window_key = ?.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS five_hour_block_models (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_id                    INTEGER NOT NULL,
-            five_hour_window_key        INTEGER NOT NULL,
-            model                       TEXT    NOT NULL,
-            input_tokens                INTEGER NOT NULL DEFAULT 0,
-            output_tokens               INTEGER NOT NULL DEFAULT 0,
-            cache_create_tokens         INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
-            cost_usd                    REAL    NOT NULL DEFAULT 0,
-            entry_count                 INTEGER NOT NULL DEFAULT 0,
-            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, five_hour_window_key, model),
-            FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "five_hour_block_models", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_block_models_block
-        ON five_hour_block_models(block_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_block_models_window
-        ON five_hour_block_models(five_hour_window_key)
-        """
-    )
-
-    # ── five_hour_block_projects (per-(block, project_path) rollup-child) ──
-    # NULL session_files.project_path → '(unknown)' sentinel at write time,
-    # keeping reconcile invariant SUM(child.cost) == parent.total intact.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS five_hour_block_projects (
-            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_id                    INTEGER NOT NULL,
-            five_hour_window_key        INTEGER NOT NULL,
-            project_path                TEXT    NOT NULL,
-            input_tokens                INTEGER NOT NULL DEFAULT 0,
-            output_tokens               INTEGER NOT NULL DEFAULT 0,
-            cache_create_tokens         INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens           INTEGER NOT NULL DEFAULT 0,
-            cost_usd                    REAL    NOT NULL DEFAULT 0,
-            entry_count                 INTEGER NOT NULL DEFAULT 0,
-            account_key                 TEXT    NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, five_hour_window_key, project_path),
-            FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "five_hour_block_projects", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_block_projects_block
-        ON five_hour_block_projects(block_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_five_hour_block_projects_window
-        ON five_hour_block_projects(five_hour_window_key)
-        """
-    )
-
-    # ── budget_milestones (equiv-$ budget threshold crossings — issue #19) ──
-    # Write-once, forward-only (the exact posture of `five_hour_milestones`). A
-    # mid-week quota reset re-anchors `week_start_at` (see
-    # `_resolve_current_budget_window`), so the new window naturally gets
-    # fresh rows under UNIQUE(week_start_at, period, threshold) — no
-    # `reset_event_id` segment column needed (unlike the percent/5h tables).
-    # `week_start_at` stores the effective/re-anchored ISO string from the
-    # resolver (`isoformat(timespec="seconds")`); the resolver's
-    # `parse_iso_datetime` returns a HOST-LOCAL tz-aware datetime, so this
-    # dedup key carries the host's UTC offset (e.g. `…T07:00:00-07:00`) —
-    # host-consistent, NOT portable across hosts, same posture as
-    # `five_hour_blocks.block_start_at`. Firing + reconcile + the dashboard
-    # envelope all read/write the identical string on a given host, so the
-    # UNIQUE dedup is exact. `alerted_at` is stamped BEFORE the osascript Popen
-    # (set-then-dispatch invariant); NULL = "recorded without dispatch" (the
-    # forward-only-from-set reconcile path) OR "not yet dispatched", never
-    # "delivery failed".
-    # Unified vendor-tagged table (#143): one row per (vendor, period_start_at,
-    # period, threshold). `vendor` ∈ 'claude'|'codex'. `period_start_at` is the
-    # resolved period-window start instant (subscription-week OR calendar
-    # period-start). `period` is the configured period at crossing; NULL = pre-012
-    # unknown. Owned by migration 012_unify_budget_milestones_vendor (merge of the
-    # former budget_milestones + codex_budget_milestones). The Codex table is NO
-    # LONGER live-created here — migration 012 drops it and this CREATE must not
-    # resurrect it; migration 011 is hardened to skip it when absent (#143).
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS budget_milestones (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            vendor          TEXT    NOT NULL,
-            period_start_at TEXT    NOT NULL,
-            period          TEXT,
-            threshold       INTEGER NOT NULL,
-            budget_usd      REAL    NOT NULL,
-            spent_usd       REAL    NOT NULL,
-            consumption_pct REAL    NOT NULL,
-            crossed_at_utc  TEXT    NOT NULL,
-            alerted_at      TEXT,
-            account_key     TEXT    NOT NULL DEFAULT '*',
-            UNIQUE(vendor, account_key, period_start_at, period, threshold)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "budget_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
-
-    # ── projected_milestones (week-average-pace projection crossings — #121) ──
-    # Write-once, forward-only — same posture as `budget_milestones` (no
-    # `reset_event_id` segment column). Two metrics share the table, keyed by
-    # `metric` ('weekly_pct' | 'budget_usd'); a level fires once the
-    # WEEK-AVERAGE projection (not the displayed high-end verdict) crosses
-    # `threshold`. `denominator` snapshots the target AT crossing (target_usd
-    # for budget_usd, 100.0 for weekly_pct) so the dashboard envelope renders
-    # context "$312 of $300" / "102% of cap" from the ROW, not from live config
-    # that may have changed since (Codex P0-4). A mid-week reset re-anchors
-    # `week_start_at` (new window → fresh rows under the UNIQUE key), the
-    # budget-pattern reset handling — hence NO `reset_event_id` column.
-    # `alerted_at` is stamped BEFORE the osascript Popen (set-then-dispatch).
-    # Schema owned by migration 011_budget_milestone_period_keys (the `period`
-    # column + the period-inclusive UNIQUE; see _cctally_db.py). `period` is
-    # NULL for pre-011 rows.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS projected_milestones (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start_at   TEXT    NOT NULL,   -- period-start instant (subscription-week OR calendar period-start; back-compat name)
-            period          TEXT,               -- configured period at crossing; NULL = pre-011 unknown (migration 011)
-            metric          TEXT    NOT NULL,   -- 'weekly_pct' | 'budget_usd' | 'codex_budget_usd'
-            threshold       INTEGER NOT NULL,   -- 90 | 100
-            projected_value REAL    NOT NULL,
-            denominator     REAL    NOT NULL,   -- target_usd (budget / codex_budget) | 100.0 (weekly)
-            crossed_at_utc  TEXT    NOT NULL,
-            alerted_at      TEXT,
-            account_key     TEXT    NOT NULL DEFAULT '*',  -- '*' for vendor-budget metrics; real account for weekly_pct (Task 3)
-            UNIQUE(account_key, week_start_at, period, metric, threshold)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "projected_milestones", "account_key", "TEXT NOT NULL DEFAULT '*'")
-
-    # ── project_budget_milestones (per-project equiv-$ budget crossings) ──────
-    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / backfill — the
-    # same posture as `budget_milestones` / `projected_milestones` (write-once,
-    # forward-only, framework-untracked). `project_key` is the NEW dimension in
-    # the UNIQUE key: each project crosses each threshold once per week,
-    # independently of every other project (issue #19 / #121, spec §5.1). It
-    # stores the canonical git-root (`ProjectKey.bucket_path`), matched by string
-    # equality against each session entry's resolved git-root. `budget_usd`
-    # snapshots the project's target AT crossing time so the dashboard renders
-    # "$26 of $25" from the ROW, not from live config that may have changed since
-    # (the Codex P0-4 lesson, already baked into `budget_milestones` /
-    # `projected_milestones`). A mid-week quota reset re-anchors `week_start_at`
-    # (new window → fresh rows under the UNIQUE key) — budget-pattern reset
-    # handling, hence NO `reset_event_id` segment column. `alerted_at` is stamped
-    # BEFORE dispatch (set-then-dispatch invariant); NULL = "recorded without
-    # dispatch" (forward-only-from-set reconcile) OR "not yet dispatched", never
-    # "delivery failed". Lives BEFORE the migration dispatcher: a plain CREATE on
-    # a framework-untracked table never touches `schema_migrations`, so the
-    # dispatcher's fresh-install snapshot is unaffected.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS project_budget_milestones (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start_at   TEXT    NOT NULL,
-            project_key     TEXT    NOT NULL,   -- canonical git-root (bucket_path)
-            threshold       INTEGER NOT NULL,
-            budget_usd      REAL    NOT NULL,   -- project's target snapshotted AT crossing
-            spent_usd       REAL    NOT NULL,
-            consumption_pct REAL    NOT NULL,
-            crossed_at_utc  TEXT    NOT NULL,
-            alerted_at      TEXT,
-            account_key     TEXT    NOT NULL DEFAULT '*',  -- account-blind this epic (spec §6): always '*'
-            UNIQUE(account_key, week_start_at, project_key, threshold)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "project_budget_milestones", "account_key",
-        "TEXT NOT NULL DEFAULT '*'")
-
-    # In-place weekly partial-credit floor (issue #209, record-credit M2).
-    # Plain CREATE TABLE IF NOT EXISTS, NO migration handler / NO user_version
-    # bump — the same framework-untracked posture as `project_budget_milestones`
-    # above. A `record-credit` invocation records a weekly credit (e.g.
-    # 46% -> 31%) WITHOUT writing a `week_reset_events` row: a credit lowers the
-    # current-7d clamp floor only and must NOT re-anchor the week window (the
-    # `week_reset_events`-driven window-resolution code would otherwise show a
-    # spurious "new week" and corrupt the forecast rate). `_reset_aware_floor`
-    # (below) unions this table with `week_reset_events` so the four MAX-clamp
-    # sites floor the current % to the post-credit value while the window stays
-    # put. `effective_at_utc` is `floor_to_hour(at)` in UTC; `applied_at_utc` is
-    # audit-only (kept out of goldens). Lives BEFORE the migration dispatcher: a
-    # plain CREATE on a framework-untracked table never touches
-    # `schema_migrations`, so the dispatcher's fresh-install snapshot is
-    # unaffected. See docs/superpowers/specs/2026-06-19-record-credit-weekly-design.md §2/§4a.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS weekly_credit_floors (
-            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_start_date         TEXT    NOT NULL,
-            effective_at_utc        TEXT    NOT NULL,
-            observed_pre_credit_pct REAL    NOT NULL,
-            applied_at_utc          TEXT    NOT NULL,
-            account_key             TEXT    NOT NULL DEFAULT 'unattributed',
-            UNIQUE(account_key, week_start_date, effective_at_utc)
-        )
-        """
-    )
-    add_column_if_missing(
-        conn, "weekly_credit_floors", "account_key",
-        "TEXT NOT NULL DEFAULT 'unattributed'")
-
-    # ── accounts registry (multi-account epic #341, spec §1/§2) ───────────────
-    # Derived from the journal like all stats.db state: `account_observe` op
-    # lines fold into rows here (via _apply_op_account_observe), `account_label`
-    # ops set the user label. Framework-untracked (plain CREATE TABLE IF NOT
-    # EXISTS, no migration / no user_version bump — same posture as
-    # weekly_credit_floors above), so it never touches `schema_migrations` and
-    # the stats-schema change rides the STATS_INDEX_EPOCH bump + rebuild, not a
-    # new stats migration (the frozen-registry rule). `last_seen_utc` is derived
-    # at fold time from the max `at` of any account-stamped line, NOT carried by
-    # the observe record. `label_source` records provenance for the
-    # user > switcher > auto precedence rule. A new empty table is byte-invisible
-    # to every existing render, preserving the R8 byte-stability contract.
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_key    TEXT PRIMARY KEY,
-            provider       TEXT NOT NULL,
-            natural_id     TEXT,
-            email          TEXT,
-            label          TEXT,
-            plan_type      TEXT,
-            label_source   TEXT NOT NULL DEFAULT 'auto',
-            first_seen_utc TEXT,
-            last_seen_utc  TEXT
-        )
-        """
-    )
-
-    # Stats migration 013 owns durable quota interpretation.  Keep the current
-    # schema in the fresh-install path before the dispatcher, exactly like the
-    # existing live CREATE tables; its handler calls this same idempotent helper
-    # for an older stats.db and the dispatcher central-stamps on clean return.
-    # §6.2 backfill gate (Task 8): the quota-projection schema apply is one of
-    # the three open-time backfills — skipped once the fixups marker is stamped
-    # (the marker is set only AFTER this ran, so marker-present ⇒ tables present).
-    # Fresh installs read False and apply it here (the dispatcher fast-stamps 013
-    # without running its handler, so this open-time call is the sole creator).
-    if not _fixups_current:
-        _apply_quota_projection_schema(conn)
-
-    # Migration framework dispatcher. Replaces the prior inline gate stack
-    # (has_blocks + _migration_done) with the framework's _run_pending_-
-    # migrations entry point. See spec §2.3, §5.2 + the migration handlers
-    # decorated with @stats_migration further down in this file.
-    #
-    # MUST run BEFORE any DDL or write that touches `schema_migrations`
-    # (Codex P1 #1 fix on c3625ee + e7fdcc8): the dispatcher's fresh-install
-    # detection snapshots `schema_migrations`'s existence in sqlite_master
-    # BEFORE its own CREATE TABLE IF NOT EXISTS. Pre-creating the table
-    # earlier in open_db() (or letting `_backfill_five_hour_blocks` insert
-    # markers first) flips that snapshot to True on a brand-new DB and
-    # dead-codes the stamp-only fast path. The dispatcher is now the sole
-    # creator of `schema_migrations` + `schema_migrations_skipped`.
-    _run_pending_migrations(
-        conn, registry=_STATS_MIGRATIONS, db_label="stats.db",
-    )
-
-    # One-time historical backfill of five_hour_blocks (rollup only;
-    # milestones are forward-only per spec §4.3 / [Write-once milestones]).
-    # Idempotent via UNIQUE(five_hour_window_key) + INSERT OR IGNORE.
-    # Runs AFTER the dispatcher so `schema_migrations` exists for the
-    # marker INSERTs inside the backfill body, and so any fresh-install
-    # stamp-only path the dispatcher took above is already committed.
-    # §6.2 backfill gate (Task 8): the two probe SELECTs + the backfill + its
-    # migration-003 re-invocation are open-time backfill work — skipped once the
-    # fixups marker is stamped. Dead in the journal world (the ingest cycle writes
-    # blocks with their snapshots), so it fires only on a pre-journal upgrade DB's
-    # first open; after that the marker gates it out permanently.
-    if not _fixups_current:
-        existing = conn.execute(
-            "SELECT 1 FROM five_hour_blocks LIMIT 1"
-        ).fetchone()
-        has_snapshots = conn.execute(
-            "SELECT 1 FROM weekly_usage_snapshots "
-            "WHERE five_hour_window_key IS NOT NULL "
-            "  AND five_hour_percent     IS NOT NULL "
-            "LIMIT 1"
-        ).fetchone()
-        if not existing and has_snapshots:
-            inserted = _backfill_five_hour_blocks(conn)
-            # Re-run the 5h dedup migration AFTER backfill creates parents.
-            # The dispatcher above ran while five_hour_blocks was empty, so
-            # the dedup handler no-op'd and stamped its marker. Snapshot
-            # keys can carry jitter beyond the 600s canonical floor (the
-            # 003_* migration handles up to 1800s grouping), so the
-            # backfill's `DISTINCT five_hour_window_key` over those keys
-            # can produce duplicate parent rows for one physical 5h
-            # window. Without this re-invocation those duplicates persist
-            # forever — the marker says it ran. Handler owns its own
-            # BEGIN/COMMIT and is idempotent (no groups → no-op).
-            #
-            # Honor `db skip` here as well: if the operator marked 003 as
-            # skipped (e.g., poison pill on their machine), we must NOT
-            # back-door run the handler. Duplicates introduced by the
-            # backfill will persist until they `db unskip` — which is the
-            # explicit choice the skip records. Failure path mirrors the
-            # dispatcher's contract: route through _log_migration_error so
-            # the next interactive command renders the banner, and clear
-            # the log entry on success so the banner auto-dismisses.
-            if inserted > 0:
-                target_name = "003_merge_5h_block_duplicates_v1"
+        # ── Epoch stamp / in-place cutover (DB journal redesign §7.1/§8) ──
+        # The full schema is now applied (head 13 + journal_id columns + cursor). A
+        # ``_target_path`` build (rebuild scratch) stamps the epoch DIRECTLY (no
+        # export — the rebuild folds the journal itself). A real legacy install runs
+        # the cutover: export history to a bootstrap segment, stamp ``journal_id`` on
+        # every row, advance the cursor, and stamp the epoch — all atomic (spec §8).
+        # Under test mode (epoch disabled) neither runs, so the DB stays at
+        # len(registry) for the migration-framework harness.
+        if _epoch_engaged:
+            if _target_path is not None:
+                conn.execute(f"PRAGMA user_version = {STATS_INDEX_EPOCH}")
+                conn.commit()
+            elif conn.execute("PRAGMA user_version").fetchone()[0] == LEGACY_STATS_HEAD:
+                # Cut over ONLY once the legacy dispatcher reached the export baseline
+                # (head 13). A DEFERRED migration (MigrationGateNotMet — e.g. the
+                # 008/009/010 recompute gate) leaves user_version < 13; skip the
+                # cutover so the next open retries the dispatcher first, then cuts over
+                # (spec §8 step 1: "run any pending legacy stats migrations, reaching
+                # the export baseline"). Never journal a pre-recompute stats shape.
                 try:
-                    skipped = {
-                        row[0] for row in conn.execute(
-                            "SELECT name FROM schema_migrations_skipped"
-                        ).fetchall()
-                    }
-                except sqlite3.OperationalError:
-                    skipped = set()
-                if target_name not in skipped:
-                    for _m in _STATS_MIGRATIONS:
-                        if _m.name == target_name:
-                            qualified = f"stats.db:{target_name}"
-                            try:
-                                _m.handler(conn)
-                                _clear_migration_error_log_entries(qualified)
-                            except Exception as exc:
-                                _log_migration_error(
-                                    name=qualified,
-                                    exc=exc,
-                                    tb=traceback.format_exc(),
-                                )
-                                eprint(f"[migration {qualified}] failed: {exc}")
-                            break
-
-    # ── Append-only journal replay-identity columns + ingest cursor ──
-    # (2026-07-22 DB journal redesign, spec §4.2 / §5.2). Every row a
-    # journal fold materializes carries the originating line's stable `id`
-    # in `journal_id`, with a partial UNIQUE index so the ingester's
-    # INSERT OR IGNORE fold is idempotent under replay/re-ingest. Runs AFTER
-    # the migration dispatcher so the columns land on the final (migrated)
-    # table shape — migrations 005/006 recreate percent/5h milestone tables
-    # and must not drop the column. All additive (add_column_if_missing /
-    # CREATE ... IF NOT EXISTS), framework-untracked — same posture as
-    # weekly_credit_floors / project_budget_milestones. Task 9 folds this
-    # under the STATS_INDEX_EPOCH version gate; until then it is idempotent
-    # per open (add_column_if_missing / IF NOT EXISTS no-op once present).
-    for _jtable in (
-        "weekly_usage_snapshots", "weekly_cost_snapshots", "week_reset_events",
-        "five_hour_reset_events", "five_hour_blocks", "weekly_credit_floors",
-        "percent_milestones", "five_hour_milestones", "budget_milestones",
-        "projected_milestones", "project_budget_milestones",
-    ):
-        add_column_if_missing(conn, _jtable, "journal_id", "TEXT")
-        conn.execute(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_jtable}_journal_id "
-            f"ON {_jtable}(journal_id) WHERE journal_id IS NOT NULL"
-        )
-    # Companion partial index (spec §5.3 harvest / Task 6 gate P2): the ingest
-    # cycle's harvest scans every natural-keyed family for rows the pipeline
-    # inserted this cycle (`WHERE journal_id IS NULL`). A partial index over
-    # exactly those un-stamped rows keeps that scan O(this-cycle inserts), not
-    # O(table) — at the 10x envelope the stamped rows are ~all of the table, so
-    # a full scan would be pathological. Only the 8 HARVEST families need it
-    # (the Model-A / op-fold tables — weekly_usage_snapshots, weekly_cost_
-    # snapshots, weekly_credit_floors — are never harvest-scanned).
-    for _htable in (
-        "week_reset_events", "five_hour_reset_events", "five_hour_blocks",
-        "percent_milestones", "five_hour_milestones", "budget_milestones",
-        "projected_milestones", "project_budget_milestones",
-    ):
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{_htable}_journal_id_null "
-            f"ON {_htable}(id) WHERE journal_id IS NULL"
-        )
-    # Single-row segment+offset consumption watermark (spec §5.2). The cursor
-    # never advances past a byte range the ingest cycle did not read.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS journal_cursor ("
-        "id INTEGER PRIMARY KEY CHECK (id = 1), "
-        "segment TEXT NOT NULL, "
-        "offset INTEGER NOT NULL)"
-    )
-
-    # §6.2 backfill gate (Task 8): stamp the one-shot marker AFTER the three
-    # open-time backfills ran, so the next open skips them (and their probes)
-    # entirely. The marker table DDL runs ONLY on this "fixups ran" path, never
-    # on the steady-state open. A crash before this commit leaves the marker
-    # unset and everything re-runs idempotently next open (invariant).
-    if not _fixups_current:
-        _cctally_store.mark_stats_open_fixups_done(conn)
-
-    conn.commit()
-
-    # ── Epoch stamp / in-place cutover (DB journal redesign §7.1/§8) ──
-    # The full schema is now applied (head 13 + journal_id columns + cursor). A
-    # ``_target_path`` build (rebuild scratch) stamps the epoch DIRECTLY (no
-    # export — the rebuild folds the journal itself). A real legacy install runs
-    # the cutover: export history to a bootstrap segment, stamp ``journal_id`` on
-    # every row, advance the cursor, and stamp the epoch — all atomic (spec §8).
-    # Under test mode (epoch disabled) neither runs, so the DB stays at
-    # len(registry) for the migration-framework harness.
-    if _epoch_engaged:
-        if _target_path is not None:
-            conn.execute(f"PRAGMA user_version = {STATS_INDEX_EPOCH}")
-            conn.commit()
-        elif conn.execute("PRAGMA user_version").fetchone()[0] == LEGACY_STATS_HEAD:
-            # Cut over ONLY once the legacy dispatcher reached the export baseline
-            # (head 13). A DEFERRED migration (MigrationGateNotMet — e.g. the
-            # 008/009/010 recompute gate) leaves user_version < 13; skip the
-            # cutover so the next open retries the dispatcher first, then cuts over
-            # (spec §8 step 1: "run any pending legacy stats migrations, reaching
-            # the export baseline"). Never journal a pre-recompute stats shape.
-            importlib.import_module("_cctally_journal").run_cutover(conn)
-    return conn
+                    importlib.import_module("_cctally_journal").run_cutover(conn)
+                except BaseException:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
+        return conn
 
 
 # === WeekRef cluster ================================================

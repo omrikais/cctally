@@ -3,6 +3,10 @@
 Claude usage grouped by **subscription week** (anchored to `--resets-at`),
 with `Used %` and `$/1%` columns daily/monthly don't have.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Canonical form: [`cctally claude weekly`](claude.md) (this flat form remains as an alias).
 
 ## Synopsis

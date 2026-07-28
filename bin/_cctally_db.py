@@ -117,7 +117,7 @@ _CACHE_DISPATCH_WRITER_LOCK_HELD = contextvars.ContextVar(
 # (no shim drift); _lib_pricing is a stdlib-only leaf module so no cycle
 # risk. Other siblings (_cctally_record, _cctally_dashboard) follow the
 # same direct-import pattern.
-from _lib_pricing import _calculate_entry_cost
+from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 
 
 # Module-level back-ref shim for the one Z-high callable that STAYS in
@@ -276,11 +276,20 @@ class StatsDbCorruptError(sqlite3.DatabaseError):
 
 
 class StatsDbMaintenanceError(sqlite3.OperationalError):
-    """A guided repair owns stats.db; new cctally opens must stay out."""
+    """A guided repair owns stats.db; new cctally opens must stay out.
 
-    def __init__(self) -> None:
+    ``reason`` is optional and defaults to the historical repair wording, which
+    several regressions assert verbatim. #386 added a second cause — the
+    opener's BOUNDED wait for ``stats.db.maintenance.lock`` expiring while some
+    other maintenance command (rebuild / vacuum / rederive / skip / unskip)
+    holds it exclusive — which is not a `db repair` and must not claim to be.
+    """
+
+    def __init__(self, reason: "str | None" = None) -> None:
         super().__init__(
-            "stats.db repair is in progress; retry after the repair command exits"
+            reason
+            or "stats.db repair is in progress; retry after the repair "
+               "command exits"
         )
 
 
@@ -323,6 +332,15 @@ def _stats_corruption_guidance() -> str:
         "The repair command preserves the corrupt original before replacing "
         "anything; do not copy or restore the live DB by hand."
     )
+
+
+# #195: the cache_meta flag cache migration 030 sets to arm the one-time
+# cost-side re-walk that lands the cache-write TTL split on existing rows.
+# `sync_cache` reads it to select SESSION_ENTRY_UPSERT_SQL_REWALK (the chained
+# ON CONFLICT variant) and clears it at the end of a clean, non-targeted full
+# walk. Deliberately NOT `claude_ingest_walk_complete` — see the migration's
+# docstring for why reusing that marker is both unnecessary and over-broad.
+CACHE_CREATION_SPLIT_REWALK_KEY = "cache_creation_split_rewalk_pending"
 
 
 class MigrationGateNotMet(Exception):
@@ -667,17 +685,96 @@ def _forensics_iso(epoch_or_now) -> str:
     return d.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+class CorruptionProbeDisposition(str, enum.Enum):
+    """Whether the locked forensics probe confirmed physical corruption."""
+
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+
+
+@dataclass(frozen=True)
+class CorruptionForensicsResult:
+    """Typed result used by destructive recovery decision points."""
+
+    path: "pathlib.Path | None"
+    disposition: CorruptionProbeDisposition
+    reason: str
+    integrity_check: "tuple[str, ...] | str | None"
+
+
+_FORENSICS_ORIGIN_MAX = 160
+_FORENSICS_EXCEPTION_TYPE_MAX = 160
+_FORENSICS_EXCEPTION_MESSAGE_MAX = 512
+_FORENSICS_CALLSITE_TEXT_MAX = 160
+
+
+def _bounded_forensics_text(value: object, limit: int) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _corruption_trigger_record(
+    origin: str, exc: BaseException,
+) -> dict[str, object]:
+    """Build bounded, caller-owned trigger metadata without parsing display text."""
+    frames = traceback.extract_tb(exc.__traceback__, limit=32)
+    call_site: dict[str, object] | None = None
+    if frames:
+        frame = frames[-1]
+        call_site = {
+            "file": _bounded_forensics_text(
+                pathlib.Path(frame.filename).name,
+                _FORENSICS_CALLSITE_TEXT_MAX,
+            ),
+            "function": _bounded_forensics_text(
+                frame.name, _FORENSICS_CALLSITE_TEXT_MAX,
+            ),
+            "line": int(frame.lineno),
+        }
+    code = getattr(exc, "sqlite_errorcode", None)
+    name = getattr(exc, "sqlite_errorname", None)
+    exc_type = type(exc)
+    return {
+        "origin": _bounded_forensics_text(origin, _FORENSICS_ORIGIN_MAX),
+        "exceptionType": _bounded_forensics_text(
+            f"{exc_type.__module__}.{exc_type.__qualname__}",
+            _FORENSICS_EXCEPTION_TYPE_MAX,
+        ),
+        "message": _bounded_forensics_text(
+            exc, _FORENSICS_EXCEPTION_MESSAGE_MAX,
+        ),
+        "sqliteErrorCode": code if isinstance(code, int) else None,
+        "sqliteErrorName": name if isinstance(name, str) else None,
+        "tracebackCallSite": call_site,
+    }
+
+
 def write_corruption_forensics(
-    db_path, *, db_label: str = "stats",
-) -> "pathlib.Path | None":
+    db_path,
+    *,
+    db_label: str = "stats",
+    trigger_origin: "str | None" = None,
+    trigger_exception: "BaseException | None" = None,
+    return_result: bool = False,
+) -> "pathlib.Path | None | CorruptionForensicsResult":
     """Write the #336-defense-2 corruption forensics bundle FIRST — before any
     quarantine/rebuild disturbs the evidence (spec §6.3). Captures the file family
     sizes+mtimes, a best-effort ``PRAGMA integrity_check``, an ``lsof`` of the
     family, and a scan of running processes for known cloud-sync/backup holders.
-    Every leg degrades to a captured error string rather than raising, so a heal
-    never fails because forensics could not fully run. Returns the bundle path (or
-    None if it could not be written). Shared by the auto-heal HEAL_HOOK and
-    ``db rebuild`` (and, later, doctor's incident leg)."""
+    Every leg degrades to a captured error string rather than raising.
+
+    ``return_result=False`` preserves the historical path-or-None API for stats
+    heal/rebuild callers. Cache recovery opts into the typed result: only a
+    persisted bundle plus either a non-``ok`` integrity row or a positively
+    classified corruption failure during the probe confirms destructive
+    quarantine. Probe/write unavailability is always unconfirmed.
+    """
+    if (trigger_origin is None) != (trigger_exception is None):
+        raise ValueError(
+            "trigger_origin and trigger_exception must be supplied together"
+        )
     db_path = pathlib.Path(db_path)
     ts = _db_backup_timestamp()
     try:
@@ -692,9 +789,15 @@ def write_corruption_forensics(
         "path": str(db_path),
         "family": {},
         "integrityCheck": None,
+        "probeDisposition": CorruptionProbeDisposition.UNCONFIRMED.value,
+        "probeReason": "integrity_check_not_run",
         "lsof": None,
         "holders": [],
     }
+    if trigger_origin is not None and trigger_exception is not None:
+        bundle["trigger"] = _corruption_trigger_record(
+            trigger_origin, trigger_exception,
+        )
     for suffix in ("", "-wal", "-shm"):
         p = pathlib.Path(str(db_path) + suffix)
         try:
@@ -709,12 +812,34 @@ def write_corruption_forensics(
         try:
             c.execute("PRAGMA busy_timeout=2000")
             bundle["integrityCheck"] = [
-                r[0] for r in c.execute("PRAGMA integrity_check").fetchall()
+                str(r[0]) for r in c.execute("PRAGMA integrity_check").fetchall()
             ]
         finally:
             c.close()
+        rows = bundle["integrityCheck"]
+        assert isinstance(rows, list)
+        if any(row.strip().casefold() != "ok" for row in rows):
+            disposition = CorruptionProbeDisposition.CONFIRMED
+            reason = "integrity_check_non_ok"
+        elif len(rows) == 1 and rows[0].strip().casefold() == "ok":
+            disposition = CorruptionProbeDisposition.UNCONFIRMED
+            reason = "integrity_check_ok"
+        else:
+            disposition = CorruptionProbeDisposition.UNCONFIRMED
+            reason = "integrity_check_inconclusive"
     except Exception as exc:
-        bundle["integrityCheck"] = f"error: {exc}"
+        bundle["integrityCheck"] = (
+            "error: "
+            + _bounded_forensics_text(exc, _FORENSICS_EXCEPTION_MESSAGE_MAX)
+        )
+        if _is_sqlite_corruption_error(exc):
+            disposition = CorruptionProbeDisposition.CONFIRMED
+            reason = "integrity_check_corruption_error"
+        else:
+            disposition = CorruptionProbeDisposition.UNCONFIRMED
+            reason = "integrity_check_unavailable"
+    bundle["probeDisposition"] = disposition.value
+    bundle["probeReason"] = reason
     try:
         cp = subprocess.run(
             ["lsof", "--", str(db_path)],
@@ -741,8 +866,28 @@ def write_corruption_forensics(
         except OSError:
             pass
     except OSError:
-        return None
-    return out
+        result = CorruptionForensicsResult(
+            path=None,
+            disposition=CorruptionProbeDisposition.UNCONFIRMED,
+            reason="bundle_write_failed",
+            integrity_check=(
+                tuple(bundle["integrityCheck"])
+                if isinstance(bundle["integrityCheck"], list)
+                else bundle["integrityCheck"]
+            ),
+        )
+        return result if return_result else None
+    result = CorruptionForensicsResult(
+        path=out,
+        disposition=disposition,
+        reason=reason,
+        integrity_check=(
+            tuple(bundle["integrityCheck"])
+            if isinstance(bundle["integrityCheck"], list)
+            else bundle["integrityCheck"]
+        ),
+    )
+    return result if return_result else out
 
 
 def _quarantine_pending_path(db_path: pathlib.Path) -> pathlib.Path:
@@ -949,15 +1094,20 @@ def quarantine_db_family(
     return incident
 
 
+#: How many quarantined same-revision groups `db rebuild` names in TEXT output
+#: before summarising the rest (#374). `--json` always carries every group.
+_REBUILD_CONFLICT_SAMPLE = 10
+
+
 def cmd_db_rebuild(args: argparse.Namespace) -> int:
     """``db rebuild --db stats`` — explicit journal replay into a fresh index
-    (spec §9). Forensics-quarantines the current stats.db the SAME forensics-first
-    way auto-heal does (even when the DB is healthy — this is an operator's
-    deliberate reset), then rebuilds from the journal and reports counts +
-    duration. Held under the stats maintenance lock so it serializes with a
-    concurrent auto-heal. #146 prod guard: a dev/worktree binary refuses to
-    rebuild the real prod stats.db unless ``CCTALLY_ALLOW_PROD_MIGRATION=1``.
-    Exit 0 on success, 2 for the prod guard, 3 for a rebuild failure."""
+    (spec §9). Captures forensics first, builds and validates a fresh index while
+    the old one remains available, then lets the common rebuild cutover preserve
+    the old family and atomically publish the replacement. Held under the stats
+    maintenance lock so it serializes with a concurrent auto-heal. #146 prod
+    guard: a dev/worktree binary refuses to rebuild the real prod stats.db unless
+    ``CCTALLY_ALLOW_PROD_MIGRATION=1``. Exit 0 on success, 2 for the prod guard,
+    3 for a rebuild failure."""
     from _lib_json_envelope import stamp_schema_version
     import _cctally_journal
 
@@ -980,26 +1130,51 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
     incident = None
     try:
         fcntl.flock(maint_fd, fcntl.LOCK_EX)
+        # #386: record the hold so a nested live `open_db()` does not request
+        # SHARED on a second fd of this same file and self-deadlock.
+        _cctally_core.note_stats_maintenance_acquired()
         import _cctally_store
         # Symmetry with the auto-heal path (Task-8 P3-3): take the bounded ingest
         # lock so a concurrent ingest cycle can't write into the stats.db we are
         # about to quarantine + rebuild. Journal-is-truth makes this
         # correctness-neutral, but keeping the two rebuild paths identical avoids
         # a latent write-into-quarantined-inode surprise.
-        ingest_fd = _cctally_store._heal_flock_bounded(
-            _cctally_core.JOURNAL_INGEST_LOCK_PATH, 5.0)
+        # #386: the bounded acquire now returns None on timeout instead of an
+        # UNLOCKED fd, so "we are serialized" is no longer a claim the code makes
+        # about a lock it does not hold. A context that already holds the ingest
+        # lock IS the serialized writer and must not wait on itself.
+        if _cctally_store.holds_ingest_lock():
+            ingest_fd = None
+        else:
+            ingest_fd = _cctally_store._heal_flock_bounded(
+                _cctally_core.JOURNAL_INGEST_LOCK_PATH, 5.0)
+            if ingest_fd is None:
+                eprint(
+                    "cctally: stats.db rebuild declined: another ingest holds "
+                    "journal.ingest.lock. Retry shortly."
+                )
+                return 3
         try:
             if path.exists():
+                # Forensics FIRST. The common cutover performs the final drain
+                # check only after the scratch index is complete.
                 forensics = write_corruption_forensics(path, db_label="stats")
-                incident = quarantine_db_family(path)
-            result = _cctally_journal.rebuild_stats_index()
+            # #386: declare the sanctioned maintenance regime around the
+            # replacement — the rebuild writes its scratch index through an
+            # authorizer-armed `open_db(_target_path=...)` connection, and we
+            # hold maintenance exclusive, which is what spec §3.1 sanctions.
+            with _cctally_store.stats_write_scope("maintenance-rebuild"):
+                result = _cctally_journal.rebuild_stats_index()
+                incident = result.quarantine_dir
         except Exception as exc:
             eprint(f"cctally: stats.db rebuild failed: {exc}")
             return 3
         finally:
-            _cctally_store._heal_release_flock(ingest_fd)
+            if ingest_fd is not None:
+                _cctally_store._heal_release_flock(ingest_fd)
     finally:
         try:
+            _cctally_core.note_stats_maintenance_released()
             fcntl.flock(maint_fd, fcntl.LOCK_UN)
         finally:
             os.close(maint_fd)
@@ -1016,6 +1191,19 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
             "totalRows": total_rows,
             "quarantineDir": str(incident) if incident else None,
             "forensicsPath": str(forensics) if forensics else None,
+            # #374 — additive; DISTINCT from `db rederive --json`'s pre-existing
+            # `conflicts` key (command-validation failures). Exit stays 0.
+            "journalConflicts": [c.to_dict() for c in result.conflicts],
+            # #402 Task A — the usable index omitted every action from these
+            # whole tainted batches. Complete and deterministic in JSON.
+            "journalProtocolViolations": [
+                violation.to_dict()
+                for violation in result.protocol_violations
+            ],
+            "journalAcknowledgedProtocolViolations": [
+                violation.to_dict()
+                for violation in result.acknowledged_protocol_violations
+            ],
         }
         print(json.dumps(stamp_schema_version(payload, version=1)))
     else:
@@ -1028,6 +1216,40 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
         for tbl, n in result.rows_by_table.items():
             if n:
                 print(f"  {tbl}: {n}")
+        if result.conflicts:
+            print(
+                f"  {len(result.conflicts)} quarantined same-revision "
+                "group(s) — the first-written variant was used:"
+            )
+            # A real journal can carry hundreds of groups (292 on the maintainer's
+            # own), so the text view lists a sample and points at `--json` for the
+            # complete set, which is never truncated.
+            for conflict in result.conflicts[:_REBUILD_CONFLICT_SAMPLE]:
+                print(f"    {conflict.event_id} rev {conflict.rev} "
+                      f"({len(conflict.content_hashes)} variants)")
+            hidden = len(result.conflicts) - _REBUILD_CONFLICT_SAMPLE
+            if hidden > 0:
+                print(f"    ... and {hidden} more (see --json for all)")
+            print("  Resolve with: cctally db rederive --family claude-usage")
+        if result.protocol_violations:
+            print(
+                f"  {len(result.protocol_violations)} structural journal "
+                "protocol violation(s) — affected correction batches were "
+                "tainted and omitted:"
+            )
+            for violation in result.protocol_violations:
+                print(f"    {violation.batch_id}: {violation.kind}")
+        if result.acknowledged_protocol_violations:
+            print(
+                f"  {len(result.acknowledged_protocol_violations)} acknowledged "
+                "structural journal protocol violation(s) — affected correction "
+                "batches remain tainted and omitted:"
+            )
+            for violation in result.acknowledged_protocol_violations:
+                print(
+                    f"    {violation.batch_id}: {violation.kind} "
+                    f"(audit {violation.audit_id})"
+                )
         if incident is not None:
             print(f"  previous stats.db quarantined -> {incident}")
         if forensics is not None:
@@ -1145,6 +1367,30 @@ def _stamp_applied(conn, name, applied_at_utc=None):
     conn.commit()
 
 
+def _reconcile_durable_applied_migration_errors(
+    conn: sqlite3.Connection,
+    registry: list[Migration],
+    db_label: str,
+) -> None:
+    """Retry stale-sentinel cleanup for every durably applied migration."""
+    if not _cctally_core.MIGRATION_ERROR_LOG_PATH.exists():
+        return
+    try:
+        applied = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM schema_migrations"
+            ).fetchall()
+        }
+    except sqlite3.OperationalError:
+        return
+    for migration in registry:
+        if migration.name in applied:
+            _clear_migration_error_log_entries(
+                f"{db_label}:{migration.name}"
+            )
+
+
 def _run_pending_migrations(
     conn: sqlite3.Connection,
     *,
@@ -1167,7 +1413,12 @@ def _run_pending_migrations(
       - Fresh install (schema_migrations just CREATE'd, zero rows
         post-bootstrap, AND the DB's primary data table is empty or
         absent) → stamp every migration applied without invoking
-        handlers. The data-emptiness probe (D1) defends against the
+        handlers, commit the markers, then clear matching stale
+        migration-error sentinel entries. The marker commit precedes
+        sentinel cleanup so a failed commit preserves failure evidence;
+        later slow and fast opens retry cleanup for every durable applied
+        marker so an interruption after commit converges.
+        The data-emptiness probe (D1) defends against the
         pre-framework upgrade case where cache.db was populated by
         a pre-v1.12.0 build that wrote ``session_entries`` without
         ever creating ``schema_migrations`` — pre-fix that landscape
@@ -1239,6 +1490,9 @@ def _run_pending_migrations(
         # doesn't exist or doesn't contain a matching entry.
         _clear_migration_error_log_entries(
             f"{db_label}:_bootstrap_rename_legacy_markers"
+        )
+        _reconcile_durable_applied_migration_errors(
+            conn, registry, db_label,
         )
         return  # fast path
 
@@ -1321,6 +1575,9 @@ def _run_pending_migrations(
     skipped = {
         row[0] for row in conn.execute("SELECT name FROM schema_migrations_skipped").fetchall()
     }
+    _reconcile_durable_applied_migration_errors(
+        conn, registry, db_label,
+    )
 
     # D1 — fresh install requires BOTH "schema_migrations table did not
     # exist" AND "the DB's primary data table is empty (or absent)".
@@ -1406,17 +1663,19 @@ def _run_pending_migrations(
                 break
 
     now_iso = now_utc_iso()
+    stamp_only_applied: list[str] = []
     for m in registry:
         if m.name in applied or m.name in skipped:
             continue
+        qualified_name = f"{db_label}:{m.name}"
         if fresh_install:
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (name, applied_at_utc) VALUES (?, ?)",
                 (m.name, now_iso),
             )
             applied.add(m.name)
+            stamp_only_applied.append(qualified_name)
             continue
-        qualified_name = f"{db_label}:{m.name}"
         try:
             m.handler(conn)
             _stamp_applied(conn, m.name, now_iso)      # central stamp (#140)
@@ -1467,6 +1726,8 @@ def _run_pending_migrations(
 
     if fresh_install:
         conn.commit()  # commit fresh-install stamps so they're durable
+        for qualified_name in stamp_only_applied:
+            _clear_migration_error_log_entries(qualified_name)
 
     # Advance user_version only when every migration is applied OR skipped.
     if all((m.name in applied or m.name in skipped) for m in registry):
@@ -3271,6 +3532,14 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "codex_session_entries", "account_key", "TEXT")
     add_column_if_missing(conn, "codex_session_files", "account_key", "TEXT")
     add_column_if_missing(conn, "quota_window_snapshots", "account_key", "TEXT")
+    # #195: the cache-write TTL split. NULLable with NO DEFAULT — NULL is the
+    # "split unknown" sentinel a pre-#195 row produces for free, and a real
+    # zero (an all-5m turn) must stay distinguishable from it. Added via
+    # add_column_if_missing ONLY, never in the CREATE TABLE DDL (the
+    # account_key precedent): ALTER TABLE ADD COLUMN appends, so a column in
+    # both places would sit at a different ordinal on fresh vs migrated DBs.
+    add_column_if_missing(conn, "session_entries", "cache_create_1h_tokens", "INTEGER")
+    add_column_if_missing(conn, "session_entries", "cache_create_5m_tokens", "INTEGER")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_codex_files_source_root "
         "ON codex_session_files(source_root_key)"
@@ -5498,6 +5767,92 @@ def _029_backfill_claude_account(conn: sqlite3.Connection) -> None:
         raise
 
 
+@cache_migration("030_session_entries_cache_creation_split")
+def _030_session_entries_cache_creation_split(conn: sqlite3.Connection) -> None:
+    """#195: arm a one-time cost-side re-walk so existing session_entries rows
+    gain their cache-write TTL split.
+
+    The columns themselves arrive via add_column_if_missing (the column-addition
+    pattern); this migration exists only to arm the WALK. Note the lever: the
+    six _REINGEST_FLAG_KEYS drive _resumable_reingest_conversation_messages,
+    which re-walks conversation_messages and never touches session_entries. The
+    COST store's re-walk lever is the per-file cursor reset below: invalidating
+    ``size_bytes``/``last_byte_offset`` makes every file fail the
+    ``size == prev_size`` early-exit and take the ``size > prev_size`` branch
+    with ``start_offset = prev_offset == 0``, i.e. a full re-ingest from offset 0
+    WITHOUT tripping the truncation escalation (which would wipe).
+
+    Why ``-1`` and not ``0`` for the invalidated cursor
+    --------------------------------------------------
+    ``session_files.size_bytes`` is overloaded: it is the delta-resume cursor
+    AND the "this path had ingested bytes" bit that BOTH orphan gates read —
+    ``_prune_orphaned_cache_entries`` (``if sz and p not in on_disk``) and
+    ``sync_cache``'s detect-only leg (``if size_bytes and p not in
+    on_disk_paths``). A path no longer on disk is never revisited by the
+    re-walk, so a blanket ``size_bytes = 0`` would pin that bit to false
+    FOREVER and silently turn ``cache-sync --prune-orphans`` and the dashboard
+    self-heal into no-ops for every orphan that predated the upgrade. (The
+    truncation escalation in ``sync_cache`` may zero it because it DELETEs
+    ``session_entries`` first, so there is no orphaned accounting left to
+    reclaim; 030 deliberately preserves every row, so it may not.)
+
+    ``-1`` satisfies both roles at once: it is never equal to a real
+    ``st_size`` (so the early-exit misses), it is always LESS than one (so the
+    truncation branch cannot fire), and it is truthy in Python (so both orphan
+    gates still see the evidence). The ``CASE`` guard keeps genuine
+    ``size_bytes = 0`` rows at 0 — a never-ingested row holds no
+    ``session_entries``, so its absence from disk leaves no orphan, and
+    fixtures seed exactly such rows to stay out of the orphan set. The next
+    successful ingest of a surviving file overwrites the sentinel with its real
+    size, so it is transient for everything still on disk. Only these two
+    readers exist; grep ``session_files`` before adding a third.
+
+    Unlike the truncation path this does NOT wipe session_entries: rows are
+    preserved and UPSERTed in place, which is why sync_cache must use the
+    chained-conflict SQL variant while the walk is armed (see
+    SESSION_ENTRY_UPSERT_SQL_REWALK).
+
+    Why a DEDICATED flag rather than deleting ``claude_ingest_walk_complete``
+    (the spec's explicitly-designated open design point, resolved here on
+    measured evidence):
+
+    * That marker is not the re-walk mechanism — the cursor reset above is. The
+      truncation path deletes it because it WIPES the cache; this migration does
+      not wipe, so there is nothing to invalidate.
+    * The marker is the input to ``_gate_001_post_ingest_completed``, whose
+      protective concern is a HALF-POPULATED ``session_entries`` causing the
+      stats recomputes to zero out real dollars (spec D5). 030 preserves every
+      row, so that hazard does not exist; clearing the marker would defer stats
+      migrations 008/009/010 for a reason that is not real. Measured: deleting
+      it failed 60 tests across 12 modules with ``MigrationGateNotMet``.
+    * A dedicated flag is strictly TIGHTER as the ``rewalk_armed`` predicate.
+      Marker-absence is also true on a fresh cache, after truncation, after
+      orphan invalidation and after any unclean walk — all cases where the
+      chained clause is unnecessary (rows are wiped or absent, so no physical-key
+      conflict is possible). Scoping the flag to this migration keeps migration
+      020's deliberately LOUD duplicate-physical-key backstop intact on every
+      other ingest path, which is the resolution the spec states it prefers.
+
+    ``sync_cache`` clears the flag at the end of a clean, non-targeted full walk
+    — the same condition under which it (re)writes ``claude_ingest_walk_complete``.
+
+    Idempotent: re-running re-arms a walk that is already correct. NO self-stamp
+    — the dispatcher central-stamps on a clean return (#140); the handler commits
+    its own work first, per the cache-migration contract.
+    """
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (CACHE_CREATION_SPLIT_REWALK_KEY, "1"),
+    )
+    conn.execute(
+        "UPDATE session_files "
+        "SET size_bytes = CASE WHEN size_bytes > 0 THEN -1 ELSE size_bytes END, "
+        "    last_byte_offset = 0"
+    )
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
@@ -5634,7 +5989,7 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                 entries = cache_ro.execute(
                     "SELECT model, input_tokens, output_tokens, "
                     "cache_create_tokens, cache_read_tokens, "
-                    "usage_extra_json, cost_usd_raw "
+                    "usage_extra_json, cost_usd_raw, cache_create_1h_tokens, speed "
                     "FROM session_entries "
                     "WHERE timestamp_utc >= ? AND timestamp_utc <= ?",
                     (
@@ -5643,19 +5998,13 @@ def _008_recompute_weekly_cost_snapshots_dedup_fix(
                     ),
                 ).fetchall()
                 total = 0.0
-                for model, i, o, cc, cr, extras_json, raw in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    # #181: usage_extra_json is cost-irrelevant (cost is
-                    # token-only); parsed here only for pre-008 rows that may
-                    # still carry the legacy blob — NOT a speed reader, so the
-                    # write-side NULL going forward is safe.
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
+                for model, i, o, cc, cr, extras_json, raw, cc1h, speed in entries:
+                    if speed is None and extras_json:
+                        speed = json.loads(extras_json).get("speed")
+                    usage = claude_usage_dict(   # #195 chokepoint
+                        input_tokens=i, output_tokens=o,
+                        cache_creation_tokens=cc, cache_read_tokens=cr,
+                        cache_1h_tokens=cc1h, speed=speed)
                     total += _calculate_entry_cost(
                         model, usage, mode="auto", cost_usd=raw,
                     )
@@ -5937,7 +6286,7 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                     "SELECT se.model, se.input_tokens, se.output_tokens, "
                     "       se.cache_create_tokens, se.cache_read_tokens, "
                     "       se.usage_extra_json, se.cost_usd_raw, "
-                    "       sf.project_path "
+                    "       sf.project_path, se.cache_create_1h_tokens, se.speed "
                     "FROM session_entries se "
                     "LEFT JOIN session_files sf "
                     "  ON sf.path = se.source_path "
@@ -5960,20 +6309,14 @@ def _009_recompute_five_hour_blocks_dedup_fix(
                 by_project: dict[str, dict[str, Any]] = {}
                 for (
                     model, in_t, out_t, cc_t, cr_t,
-                    extras_json, raw_cost, project_path,
+                    extras_json, raw_cost, project_path, cc1h, speed,
                 ) in entries:
-                    usage = {
-                        "input_tokens": in_t,
-                        "output_tokens": out_t,
-                        "cache_creation_input_tokens": cc_t,
-                        "cache_read_input_tokens": cr_t,
-                    }
-                    # #181: usage_extra_json is cost-irrelevant (cost is
-                    # token-only); parsed here only for pre-008 rows that may
-                    # still carry the legacy blob — NOT a speed reader, so the
-                    # write-side NULL going forward is safe.
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
+                    if speed is None and extras_json:
+                        speed = json.loads(extras_json).get("speed")
+                    usage = claude_usage_dict(   # #195 chokepoint
+                        input_tokens=in_t, output_tokens=out_t,
+                        cache_creation_tokens=cc_t, cache_read_tokens=cr_t,
+                        cache_1h_tokens=cc1h, speed=speed)
                     cost = _calculate_entry_cost(
                         model, usage, mode="auto", cost_usd=raw_cost,
                     )
@@ -6106,9 +6449,10 @@ def _010_recompute_percent_milestones_dedup_fix(
 
     Scope (B2)
     ----------
-    ``percent_milestones`` is normally write-once forward-only (per
-    "Write-once milestones" gotcha): the cost-at-moment-of-crossing is
-    captured at insert time and never recomputed. After the upstream
+    A ``percent_milestones`` natural key denotes one durable logical first
+    crossing: its first captured cost, logical refs, and alert latch survive
+    disposable-index replacement and replay. An explicit audited correction
+    may supersede that fact at a higher journal revision. After the upstream
     dedup fix, every historical milestone's ``cumulative_cost_usd`` is
     inflated by the same factor that inflated
     ``weekly_cost_snapshots`` — keeping them as-recorded would leave
@@ -6129,9 +6473,9 @@ def _010_recompute_percent_milestones_dedup_fix(
         reset_event_id)``. First milestone of a week has
         ``marginal == cumulative``.
 
-    Forward-going behavior is unchanged — new crossings keep their
-    "write-once at moment of crossing" semantics. This migration only
-    rewrites the historical rows once.
+    Forward-going behavior is unchanged — new crossings keep their logical
+    first-capture semantics. This pre-journal migration only rewrites the
+    historical physical rows once.
 
     Timestamp comparison
     --------------------
@@ -6225,7 +6569,8 @@ def _010_recompute_percent_milestones_dedup_fix(
                 entries = cache_ro.execute(
                     "SELECT model, input_tokens, output_tokens, "
                     "       cache_create_tokens, cache_read_tokens, "
-                    "       usage_extra_json, cost_usd_raw "
+                    "       usage_extra_json, cost_usd_raw, cache_create_1h_tokens, "
+                    "       speed "
                     "FROM session_entries "
                     "WHERE timestamp_utc >= ? AND timestamp_utc <= ?",
                     (
@@ -6236,20 +6581,14 @@ def _010_recompute_percent_milestones_dedup_fix(
 
                 cumulative = 0.0
                 for (
-                    model, i, o, cc, cr, extras_json, raw,
+                    model, i, o, cc, cr, extras_json, raw, cc1h, speed,
                 ) in entries:
-                    usage = {
-                        "input_tokens": i,
-                        "output_tokens": o,
-                        "cache_creation_input_tokens": cc,
-                        "cache_read_input_tokens": cr,
-                    }
-                    # #181: usage_extra_json is cost-irrelevant (cost is
-                    # token-only); parsed here only for pre-008 rows that may
-                    # still carry the legacy blob — NOT a speed reader, so the
-                    # write-side NULL going forward is safe.
-                    if extras_json:
-                        usage.update(json.loads(extras_json))
+                    if speed is None and extras_json:
+                        speed = json.loads(extras_json).get("speed")
+                    usage = claude_usage_dict(   # #195 chokepoint
+                        input_tokens=i, output_tokens=o,
+                        cache_creation_tokens=cc, cache_read_tokens=cr,
+                        cache_1h_tokens=cc1h, speed=speed)
                     cumulative += _calculate_entry_cost(
                         model, usage, mode="auto", cost_usd=raw,
                     )
@@ -6560,10 +6899,25 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     Spec: docs/superpowers/specs/2026-05-06-migration-framework-design.md §4.2.
     Glyphs: ✓ applied, ✗ failed, · pending, ~ skipped.
     """
+    # #386: the stats leg now opens under the maintenance-shared replacement
+    # protocol, so it can legitimately DECLINE while a repair / quarantine owns
+    # the family. Report that the way doctor already reports the cache
+    # equivalent (`_open_error`) instead of surfacing a traceback.
+    try:
+        stats_status = _db_status_for(
+            _cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db")
+    except sqlite3.DatabaseError as exc:
+        stats_status = {
+            "path": str(_cctally_core.DB_PATH),
+            "user_version": 0,
+            "registry_size": len(_STATS_MIGRATIONS),
+            "migrations": [],
+            "_open_error": str(exc),
+        }
     payload = {
         "schema_version": 1,
         "databases": {
-            "stats.db": _db_status_for(_cctally_core.DB_PATH, _STATS_MIGRATIONS, "stats.db"),
+            "stats.db": stats_status,
             "cache.db": _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
             "conversations.db": _db_status_for(
                 _cctally_core.CONVERSATIONS_DB_PATH, _CONVERSATIONS_MIGRATIONS,
@@ -6582,6 +6936,8 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             f"{db_label} ({info['path']})  "
             f"version {info['user_version']} / {info['registry_size']} known{suffix}"
         )
+        if info.get("_open_error"):
+            print(f"  (not readable: {info['_open_error']})")
         for m in info["migrations"]:
             line = _db_status_format_row(m)
             print(line)
@@ -6590,7 +6946,11 @@ def cmd_db_status(args: argparse.Namespace) -> int:
 
 
 def _db_status_for(
-    db_path: pathlib.Path, registry: list[Migration], db_label: str,
+    db_path: pathlib.Path,
+    registry: list[Migration],
+    db_label: str,
+    *,
+    recover_interrupted_stats: bool = True,
 ) -> dict:
     """Build per-DB status dict.
 
@@ -6609,7 +6969,21 @@ def _db_status_for(
                 for m in registry
             ],
         }
-    conn = sqlite3.connect(db_path)
+    if db_path == _cctally_core.DB_PATH:
+        # #386: participate in the replacement protocol, and connect `mode=rw`
+        # so this diagnostic can never MATERIALISE the very stats.db a
+        # quarantine is trying to keep absent. The `exists()` check above is a
+        # TOCTOU, not a guarantee: a plain read-write `sqlite3.connect` recreates
+        # a file removed in the gap. Reached from `db status` and from
+        # `doctor_gather_state`.
+        import _cctally_store
+        conn = _cctally_store.stats_open_guarded(
+            db_path,
+            connect=lambda p: sqlite3.connect(f"file:{p}?mode=rw", uri=True),
+            recover_interruptions=recover_interrupted_stats,
+        )
+    else:
+        conn = sqlite3.connect(db_path)
     try:
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
         # Tolerate missing tables (e.g., cache.db never opened by framework).
@@ -6775,30 +7149,47 @@ def _db_path_for_label(db_label: str) -> pathlib.Path:
     raise ValueError(f"unknown db_label: {db_label}")
 
 
-def _acquire_cache_admin_writer_flocks(
+def _acquire_db_admin_writer_flocks(
     db_label: str,
     *,
     timeout: float = 15.0,
 ) -> "list[int] | None":
-    """Serialize raw cache admin mutations without affecting other stores."""
-    if db_label != "cache.db":
-        return []
+    """Serialize raw admin mutations for ``db_label`` without affecting others.
+
+    #386: this returned ``[]`` — no lock at all — for every non-cache DB, and
+    `db skip` / `db unskip` then ran raw DDL, a raw INSERT/DELETE and
+    ``PRAGMA user_version = 0`` against the live stats index. stats.db now takes
+    its maintenance lock EXCLUSIVE, which is the regime spec section 3.1 puts
+    administrative mutation in.
+    """
     from _lib_cache_writer_lock import acquire_ordered_flocks
 
-    return acquire_ordered_flocks(
-        [
-            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
-            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
-        ],
-        timeout=timeout,
-    )
+    if db_label == "cache.db":
+        return acquire_ordered_flocks(
+            [
+                (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+                (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+            ],
+            timeout=timeout,
+        )
+    if db_label == "stats.db":
+        held = acquire_ordered_flocks(
+            [(_cctally_core.STATS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX)],
+            timeout=timeout,
+        )
+        if held is not None:
+            _cctally_core.note_stats_maintenance_acquired()
+        return held
+    return []
 
 
-def _release_cache_admin_writer_flocks(held: list[int]) -> None:
+def _release_db_admin_writer_flocks(db_label: str, held: list[int]) -> None:
     if not held:
         return
     from _lib_cache_writer_lock import release_cache_writer_flocks
 
+    if db_label == "stats.db":
+        _cctally_core.note_stats_maintenance_released()
     release_cache_writer_flocks(held)
 
 
@@ -6827,14 +7218,14 @@ def cmd_db_skip(args: argparse.Namespace) -> int:
     # ~/.local/share/cctally/ yet, and sqlite3.connect() does NOT
     # create parent directories (only the DB file itself).
     path.parent.mkdir(parents=True, exist_ok=True)
-    held = _acquire_cache_admin_writer_flocks(db_label)
+    held = _acquire_db_admin_writer_flocks(db_label)
     if held is None:
-        eprint("cctally: cache.db writer busy; could not record migration skip.")
+        eprint(f"cctally: {db_label} is busy; could not record migration skip.")
         return 3
     try:
         conn = sqlite3.connect(path)
     except BaseException:
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(db_label, held)
         raise
     try:
         conn.execute(
@@ -6882,7 +7273,7 @@ def cmd_db_skip(args: argparse.Namespace) -> int:
         conn.commit()
     finally:
         conn.close()
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(db_label, held)
     print(f"Skipped: {name}")
     return 0
 
@@ -6921,14 +7312,14 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"cctally: {name} is not skipped; nothing to do.")
         return 0
-    held = _acquire_cache_admin_writer_flocks(db_label)
+    held = _acquire_db_admin_writer_flocks(db_label)
     if held is None:
-        eprint("cctally: cache.db writer busy; could not remove migration skip.")
+        eprint(f"cctally: {db_label} is busy; could not remove migration skip.")
         return 3
     try:
         conn = sqlite3.connect(path)
     except BaseException:
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(db_label, held)
         raise
     try:
         try:
@@ -6947,7 +7338,7 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
         conn.commit()
     finally:
         conn.close()
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(db_label, held)
     print(f"Unskipped: {name} (will run on next open).")
     return 0
 
@@ -6986,14 +7377,14 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         print(f"cctally: {label} not present; nothing to recover.")
         return 0
 
-    held = _acquire_cache_admin_writer_flocks(label)
+    held = _acquire_db_admin_writer_flocks(label)
     if held is None:
         eprint("cctally: cache.db writer busy; could not recover schema state.")
         return 3
     try:
         conn = sqlite3.connect(path)
     except BaseException:
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(label, held)
         raise
     try:
         cur_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -7017,7 +7408,7 @@ def cmd_db_recover(args: argparse.Namespace) -> int:
         return 0
     finally:
         conn.close()
-        _release_cache_admin_writer_flocks(held)
+        _release_db_admin_writer_flocks(label, held)
 
 
 def _db_backup_timestamp() -> str:
@@ -7235,6 +7626,14 @@ def _db_family_open_pids(path: pathlib.Path) -> "set[int] | None":
         for suffix in ("", "-wal", "-shm")
         if pathlib.Path(str(path) + suffix).exists()
     ]
+    if not family:
+        # #386: an ABSENT family cannot be open — and this guard is load-bearing,
+        # not defensive. `lsof -F p --` with no path operands lists EVERY open
+        # file on the machine, so without it this returns essentially every PID
+        # on the host and any caller gated on "is the family drained?" refuses
+        # forever. Surfaced by the stats drain gate; the cache callers only ever
+        # reached here with an existing family, which is why it lay dormant.
+        return set()
     lsof = shutil.which("lsof")
     if lsof:
         try:
@@ -7535,6 +7934,44 @@ def cmd_db_repair(args: argparse.Namespace) -> int:
 
 
 def _cmd_db_repair_exclusive(args: argparse.Namespace, path: pathlib.Path) -> int:
+    """Take maintenance exclusive, verify no pre-marker handle remains, then
+    enter the repair body.
+
+    #386: repair used to rely on its marker plus the lsof scan alone, so it
+    could race a command that honours `stats.db.maintenance.lock` and ignores
+    the marker (`db rebuild`, auto-heal, the epoch resolver, `db rederive`) —
+    two processes replacing the same file family at once. The ordering is
+    deliberate and unchanged: the MARKER is claimed first (in `cmd_db_repair`,
+    which fences new openers), THEN the lock, THEN the lsof drain check. Marker
+    before lsof is what lets repair succeed under a live storm; adding the lock
+    between them adds mutual exclusion against the lock-honouring paths without
+    disturbing that.
+    """
+    from _lib_cache_writer_lock import (
+        acquire_ordered_flocks,
+        release_cache_writer_flocks,
+    )
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    held = acquire_ordered_flocks(
+        [(_cctally_core.STATS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_EX)],
+        timeout=15.0,
+    )
+    if held is None:
+        eprint(
+            "cctally: stats.db repair declined: another maintenance operation "
+            "holds stats.db.maintenance.lock. Retry shortly."
+        )
+        return 3
+    _cctally_core.note_stats_maintenance_acquired()
+    try:
+        return _cmd_db_repair_locked(args, path)
+    finally:
+        _cctally_core.note_stats_maintenance_released()
+        release_cache_writer_flocks(held)
+
+
+def _cmd_db_repair_locked(args: argparse.Namespace, path: pathlib.Path) -> int:
     """Verify no pre-marker handle remains, then enter the repair body."""
     open_pids = _db_family_open_pids(path)
     if open_pids is None:
@@ -7547,7 +7984,8 @@ def _cmd_db_repair_exclusive(args: argparse.Namespace, path: pathlib.Path) -> in
         eprint(
             "cctally: stats.db is still open in process(es) "
             + ", ".join(str(pid) for pid in sorted(open_pids))
-            + ". Stop the dashboard and other cctally processes, then retry."
+            + ". The usual holder is a running `cctally dashboard` — stop it "
+            "first (and any `cctally tui`), then retry."
         )
         return 3
     return _cmd_db_repair_claimed(args, path)
@@ -7615,7 +8053,8 @@ def _cmd_db_repair_claimed(args: argparse.Namespace, path: pathlib.Path) -> int:
                 "cctally: could not establish a quiescent stats.db writer "
                 f"guard ({preflight_reason}). The DB is still in use or too "
                 "damaged to lock safely. "
-                "Stop the dashboard and other cctally processes, then retry; "
+                "The usual holder is a running `cctally dashboard` — stop it "
+                "first (and any `cctally tui`), then retry; "
                 "nothing was changed."
             )
             return 3
@@ -7807,9 +8246,23 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
             prefix=f".{output.name}.tmp-", dir=output.parent
         ) as scratch_raw:
             temp_path = pathlib.Path(scratch_raw) / output.name
-            source = sqlite3.connect(
-                f"file:{path}?mode=ro", uri=True, timeout=max(timeout_ms, 0) / 1000
-            )
+            # #386: `db backup --db stats` holds this handle across the entire
+            # `source.backup(destination)` loop — a long-lived READ TRANSACTION,
+            # which Stage 1 measured as the only thing that pins the stats WAL —
+            # so it participates in the replacement protocol. The `mode=ro` open
+            # is preserved verbatim through the `connect` seam.
+            def _backup_source_connect(_p, _timeout_ms=timeout_ms):
+                return sqlite3.connect(
+                    f"file:{_p}?mode=ro", uri=True,
+                    timeout=max(_timeout_ms, 0) / 1000,
+                )
+
+            if which == "stats":
+                import _cctally_store
+                source = _cctally_store.stats_open_guarded(
+                    path, connect=_backup_source_connect)
+            else:
+                source = _backup_source_connect(path)
             destination = sqlite3.connect(temp_path)
             try:
                 source.execute(f"PRAGMA busy_timeout={max(timeout_ms, 0)}")
@@ -7890,26 +8343,35 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
             print(f"cctally: no {label} database file present; nothing to drain.")
         return 0
 
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    # #386: the stats leg previously took NO advisory lock — the flock branch was
+    # gated `if which == "cache"` — while running a real
+    # `wal_checkpoint(TRUNCATE)` against the live family. Maintenance SHARED is
+    # the right strength: a checkpoint is not a physical replacement, it just
+    # must not overlap one.
+    lock_plan = {
+        "cache": [
+            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+        ],
+        "stats": [
+            (_cctally_core.STATS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+        ],
+    }[which]
+
     held: list[int] = []
     try:
-        if which == "cache":
-            from _lib_cache_writer_lock import acquire_ordered_flocks
-
-            acquired = acquire_ordered_flocks(
-                [
-                    (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
-                    (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
-                ],
-                timeout=max(timeout, 0) / 1000,
+        acquired = acquire_ordered_flocks(
+            lock_plan, timeout=max(timeout, 0) / 1000
+        )
+        if acquired is None:
+            wal_bytes = _cctally_cache._wal_file_size(path)
+            result = _cctally_cache.CheckpointResult(
+                label, wal_bytes, wal_bytes, 0, True, False
             )
-            if acquired is None:
-                wal_bytes = _cctally_cache._wal_file_size(path)
-                result = _cctally_cache.CheckpointResult(
-                    label, wal_bytes, wal_bytes, 0, True, False
-                )
-            else:
-                held = acquired
-        if which != "cache" or held:
+        else:
+            held = acquired
             conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
             try:
                 conn.execute(f"PRAGMA busy_timeout={timeout}")
@@ -8026,11 +8488,21 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
     # dedicated maintenance flock (F13/F7), then the provider flocks for
     # cache.db. All non-blocking: fail promptly rather than hang.
     conversation_store = path == core.CONVERSATIONS_DB_PATH
-    maintenance_path = (
-        core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
-        if conversation_store else core.CACHE_LOCK_MAINTENANCE_PATH
-    )
+    stats_store = path == core.DB_PATH
+    if conversation_store:
+        maintenance_path = core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    elif stats_store:
+        # #386: a stats VACUUM rewrites the ENTIRE database file under
+        # `locking_mode=EXCLUSIVE`. The two-way selection below sent every
+        # non-conversations DB — stats included — to the CACHE maintenance lock,
+        # so it serialized against the wrong database and not at all against
+        # stats ingest / auto-heal / rebuild / rederive. Standalone corruption
+        # vector; spec section 1.1 Gap D calls it the headline defect.
+        maintenance_path = core.STATS_LOCK_MAINTENANCE_PATH
+    else:
+        maintenance_path = core.CACHE_LOCK_MAINTENANCE_PATH
     maint_fh = open(maintenance_path, "w")
+    noted = False
     try:
         try:
             fcntl.flock(maint_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -8040,6 +8512,9 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
                 f"is running. Retry shortly."
             )
             return 3
+        if stats_store:
+            _cctally_core.note_stats_maintenance_acquired()
+            noted = True
         held = []
         try:
             if provider_locked:
@@ -8077,6 +8552,8 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
                 fh.close()
     finally:
         try:
+            if noted:
+                _cctally_core.note_stats_maintenance_released()
             fcntl.flock(maint_fh, fcntl.LOCK_UN)
         except OSError:
             pass

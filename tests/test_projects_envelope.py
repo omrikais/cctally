@@ -441,7 +441,12 @@ def _seed_conn(rows):
         "CREATE TABLE session_entries (id INTEGER PRIMARY KEY, source_path TEXT, "
         "timestamp_utc TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, "
         "cache_create_tokens INTEGER, cache_read_tokens INTEGER, cost_usd_raw REAL, "
-        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT)")
+        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT, "
+        "speed TEXT, "
+        # #195: NULLable split columns, last two ordinals (production adds
+        # them via add_column_if_missing); the projects cost SELECT reads
+        # cache_create_1h_tokens.
+        "cache_create_1h_tokens INTEGER, cache_create_5m_tokens INTEGER)")
     conn.execute("CREATE INDEX idx_entries_timestamp ON session_entries(timestamp_utc)")
     conn.execute("CREATE INDEX idx_entries_mutation_seq "
                  "ON session_entries(mutation_seq, mutation_min_ts)")

@@ -905,8 +905,8 @@ def test_stale_weekly_baseline_retains_the_hero_and_stamps_cycle_freshness(
     tmp_path, monkeypatch,
 ):
     """#350 build-time contract (spec §3.2, §3.4, §5.5). The stale-but-future
-    boundary keeps every backward-looking hero field, the envelope metadata is
-    untouched, and staleness rides the additive hero-local `cycle_freshness`."""
+    boundary keeps every backward-looking hero field, provider metadata is
+    untouched, and staleness rides the hero-local freshness fields."""
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     reset = NOW + dt.timedelta(days=2)
@@ -928,10 +928,14 @@ def test_stale_weekly_baseline_retains_the_hero_and_stamps_cycle_freshness(
             context, data_version="stale-cycle-v1",
         )
 
-        # Envelope metadata is deliberately UNTOUCHED (§3.4): five gates read
-        # availability/freshness as one meaning, so neither may move.
+        # Provider metadata remains coherent; the hero/quota axes move.
         assert state.availability == "ok"
         assert state.freshness == "fresh"
+        assert dict(state.domain_freshness) == {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
         assert state.warnings == ()
         assert state.capabilities["hero"].status == "supported"
         assert state.capabilities["hero"].semantics == "native-reset-cycle"
@@ -1002,7 +1006,12 @@ def test_stale_weekly_baseline_retains_the_hero_and_stamps_cycle_freshness(
         # the cycle-driven weekly periods genuinely differ without a live cycle.
         assert blanked.data["hero"]["cost_usd"] is None
         assert blanked.availability == "partial"
-        assert blanked.freshness == "stale"
+        assert blanked.freshness == "fresh"
+        assert dict(blanked.domain_freshness) == {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
         assert state.data["periods"]["weekly"] != blanked.data["periods"]["weekly"]
     finally:
         cache.close()
@@ -1013,7 +1022,7 @@ def test_fresh_live_cycle_omits_cycle_freshness_and_keeps_the_old_hero_wire(
     tmp_path, monkeypatch,
 ):
     """No golden exercises a live Codex cycle (all nine publish `empty`), so the
-    fresh path's byte stability is asserted directly (spec §5.5)."""
+    fresh hero-local shape and additive map are asserted directly."""
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     try:
@@ -1038,6 +1047,11 @@ def test_fresh_live_cycle_omits_cycle_freshness_and_keeps_the_old_hero_wire(
         assert state.capabilities["hero"].status == "supported"
         wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(state)
         assert "cycle_freshness" not in wire["data"]["hero"]
+        assert wire["domain_freshness"] == {
+            "hero": "fresh",
+            "quota": "fresh",
+            "sessions": "fresh",
+        }
     finally:
         cache.close()
         stats.close()
@@ -1077,6 +1091,26 @@ def test_build_records_the_cycle_decision_deadline_in_private_clock_data(
         stats.close()
 
 
+def test_source_wire_legacy_state_falls_back_to_provider_freshness():
+    legacy = SimpleNamespace(
+        availability="partial",
+        freshness="stale",
+        warnings=(),
+        data_version="legacy-v1",
+        last_success_at=None,
+        capabilities={},
+        data={"sessions": {"rows": ()}},
+    )
+
+    wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(legacy)
+
+    assert wire["domain_freshness"] == {
+        "hero": "stale",
+        "quota": "stale",
+        "sessions": "stale",
+    }
+
+
 def _codex_state_with_in_cycle_spend(
     cache, stats, source_module, monkeypatch, *, reset: dt.datetime,
     captured_at: dt.datetime, data_version: str,
@@ -1105,7 +1139,7 @@ def test_idle_clock_retains_actuals_for_a_stale_but_future_cycle(
     """#350 (spec §3.1, §3.3, §5.5). The idle clock no longer re-derives cycle
     validity — its public-history view is lossy, so it CANNOT resolve correctly
     (§2.3). It keeps only a cheap expiry guard, so a stale-but-future cycle
-    retains every backward-looking hero field and touches no envelope metadata."""
+    retains every backward-looking hero field and touches no provider metadata."""
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     reset = NOW + dt.timedelta(days=2)
@@ -1216,9 +1250,59 @@ def test_envelope_freshness_is_not_taken_from_the_last_retained_history_row(
         # Non-vacuity: the trailing (only) retained row really did go stale.
         assert refreshed.data["quota"]["histories"][-1]["freshness"] == "stale"
         assert refreshed.freshness == "fresh"
+        assert dict(refreshed.domain_freshness) == {
+            "hero": "fresh",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
     finally:
         cache.close()
         stats.close()
+
+
+def test_claude_idle_clock_advances_only_weekly_domain_freshness(monkeypatch):
+    ns = load_script()
+    tui = ns["_cctally_tui"]
+    state = tui.SourceDashboardState(
+        source="claude",
+        availability="ok",
+        freshness="fresh",
+        warnings=(),
+        data_version="claude-clock-v1",
+        last_success_at=NOW,
+        capabilities={
+            "hero": tui.CapabilityRecord("supported", "subscription-week"),
+            "quota": tui.CapabilityRecord("supported", "subscription-week"),
+            "sessions": tui.CapabilityRecord("supported", "legacy-session-rollup"),
+        },
+        data={"hero": {}, "quota": {}, "sessions": {"rows": ()}},
+        domain_freshness={"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
+    )
+    current_week = SimpleNamespace(latest_snapshot_at=NOW)
+    monkeypatch.setattr(tui, "_get_oauth_usage_config", lambda _config: {})
+    monkeypatch.setattr(
+        tui,
+        "_freshness_label",
+        lambda age, _config: "stale" if age > 3600 else "fresh",
+    )
+
+    same = tui._refresh_claude_source_clock(
+        state, current_week=current_week, now_utc=NOW, raw_config={},
+    )
+    stale = tui._refresh_claude_source_clock(
+        state,
+        current_week=current_week,
+        now_utc=NOW + dt.timedelta(hours=2),
+        raw_config={},
+    )
+
+    assert same is state
+    assert stale.freshness == "fresh"
+    assert dict(stale.domain_freshness) == {
+        "hero": "stale",
+        "quota": "stale",
+        "sessions": "fresh",
+    }
 
 
 def test_idle_clock_expiry_degrade_is_byte_identical_to_the_build_degrade(
@@ -1522,12 +1606,14 @@ def _seeded_context(tmp_path, monkeypatch):
     return ns, cache, stats
 
 
-def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
+def test_codex_session_name_stays_private_normalized_and_out_of_source_rows(
     tmp_path, monkeypatch,
 ):
     _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
     source_module = sys.modules["_cctally_dashboard_sources"]
     provider_root = tmp_path / "provider"
+    raw_title = "\x1b[31m  Fix   dashboard " + ("x" * 130) + "\x1b[0m"
+    expected_title = "Fix dashboard " + ("x" * 106) + "…"
     native_thread_id = cache.execute(
         "SELECT native_thread_id FROM codex_conversation_threads LIMIT 1"
     ).fetchone()[0]
@@ -1541,7 +1627,7 @@ def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
         state_db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
         state_db.execute(
             "INSERT INTO threads(id, title) VALUES (?, ?)",
-            (native_thread_id, "Fix dashboard cycle UI"),
+            (native_thread_id, raw_title),
         )
         state_db.commit()
     finally:
@@ -1549,7 +1635,7 @@ def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
 
     try:
         metadata = source_module._codex_conversation_metadata(cache)
-        assert "Fix dashboard cycle UI" in {
+        assert expected_title in {
             row["title"] for row in metadata.values()
         }, metadata
         _install_active_native_cycle(
@@ -1565,8 +1651,12 @@ def test_codex_session_name_uses_persisted_short_name_not_prompt_title(
             data_version="short-name-v1",
         )
 
-        labels = [row["label"] for row in state.data["sessions"]["rows"]]
-        assert "Fix dashboard cycle UI" in labels, (labels, metadata)
+        rows = state.data["sessions"]["rows"]
+        assert rows
+        assert all("label" not in row for row in rows)
+        assert expected_title in set(
+            getattr(state, "private_session_labels", {}).values()
+        )
         assert "beginning of the user's prompt" not in repr(state.data["sessions"])
     finally:
         cache.close()
@@ -1816,6 +1906,7 @@ def test_mixed_codex_metadata_preserves_accounting_and_keeps_qualified_projects(
         assert state.data["sessions"]["total_sessions"] == 2
         assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
         assert any(row["project"] == "project-red" for row in state.data["sessions"]["rows"])
+        assert all("label" not in row for row in state.data["sessions"]["rows"])
         assert ns["iter_codex_entries"](cache, START, NOW)
     finally:
         cache.close()
@@ -1856,6 +1947,12 @@ def test_partial_projects_disambiguate_duplicate_labels_without_identity_leaks()
     ]
     assert len({row["key"] for row in first["rows"]}) == 2
     public = repr(first)
+    assert {
+        session["label"]
+        for row in first["rows"]
+        for session in row["sessions"]
+    } == {"Session"}
+    assert "'A'" not in public and "'B'" not in public
     for secret in (
         "root-secret-a", "root-secret-b", "/Users/secret", "rollout-a.jsonl",
         "rollout-b.jsonl", "project:" + "a" * 24, "project:" + "b" * 24,
@@ -2760,6 +2857,114 @@ def test_dashboard_quota_read_model_caps_histories_active_rows_and_milestones():
         stats.close()
 
 
+def test_dashboard_quota_cap_reserves_freshest_model_scoped_history(monkeypatch):
+    """After active account rows, capped history retains the most recently
+    captured independent-pool fact.  Resource-key order is deliberately made
+    adverse so the asserted rule is recency, not an incidental digest order."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    monkeypatch.setattr(source_module, "SOURCE_HISTORY_LIMIT", 4)
+    cache = sqlite3.connect(":memory:")
+    stats = sqlite3.connect(":memory:")
+    now = dt.datetime(2026, 7, 20, 12, tzinfo=UTC)
+
+    active = [
+        _quota_observation(
+            root=f"active-{index}",
+            window_minutes=10_080,
+            resets_at=now + dt.timedelta(days=7),
+            captured_at=now - dt.timedelta(minutes=index + 1),
+            logical_limit_key=f"active-limit-{index}",
+            used_percent=20.0 + index,
+        )
+        for index in range(3)
+    ]
+    inactive_standard = [
+        _quota_observation(
+            root=f"inactive-{index}",
+            window_minutes=10_080,
+            resets_at=now - dt.timedelta(days=1),
+            captured_at=now - dt.timedelta(days=index + 1),
+            logical_limit_key=f"inactive-limit-{index}",
+        )
+        for index in range(2)
+    ]
+
+    model_specs = []
+    for index in range(4):
+        root = f"pool-{index}"
+        logical_limit_key = f"pool-limit-{index}"
+        key = source_module.dashboard_resource_key(
+            "quota", "codex", root, logical_limit_key, "primary", 10_080,
+        )
+        model_specs.append((key, root, logical_limit_key))
+    model_specs.sort()
+    model_scoped = [
+        _quota_observation(
+            root=root,
+            window_minutes=10_080,
+            resets_at=now + dt.timedelta(days=3),
+            # The old digest-order cap chooses model_specs[0], which is oldest.
+            captured_at=now - dt.timedelta(hours=len(model_specs) - index),
+            limit_name="GPT-5.3-Codex-Spark",
+            logical_limit_key=logical_limit_key,
+            used_percent=90.0 + index,
+        )
+        for index, (_key, root, logical_limit_key) in enumerate(model_specs)
+    ]
+    freshest_at = max(row.captured_at for row in model_scoped)
+
+    try:
+        quota = source_module._quota_read_model(
+            DashboardReadContext(
+                cache_conn=cache,
+                stats_conn=stats,
+                range_start=START,
+                now_utc=now,
+                display_tz_name="UTC",
+            ),
+            (*active, *inactive_standard, *model_scoped),
+        )
+    finally:
+        cache.close()
+        stats.close()
+
+    assert len(quota["histories"]) == 4
+    assert quota["summary"]["active_window_count"] == 3
+    assert quota["summary"]["latest_percent"] == 22.0
+    retained_pools = [
+        row for row in quota["histories"] if row.get("model_scoped")
+    ]
+    assert len(retained_pools) == 1
+    assert retained_pools[0]["captured_at"] == freshest_at.isoformat()
+    assert retained_pools[0]["current_percent"] > quota["summary"]["latest_percent"]
+
+    from _lib_dashboard_sources import SourceDashboardState
+    refreshed = source_module.refresh_codex_source_clock(
+        SourceDashboardState(
+            source="codex",
+            availability="ok",
+            freshness="fresh",
+            warnings=(),
+            data_version="issue-412-cap",
+            last_success_at=now,
+            capabilities={},
+            data={"quota": quota},
+        ),
+        now_utc=now + dt.timedelta(minutes=5),
+    )
+    refreshed_quota = refreshed.data["quota"]
+    assert [
+        (row["key"], row.get("model_scoped"), row["captured_at"])
+        for row in refreshed_quota["histories"]
+    ] == [
+        (row["key"], row.get("model_scoped"), row["captured_at"])
+        for row in quota["histories"]
+    ]
+    assert refreshed_quota["summary"]["active_window_count"] == 3
+    assert refreshed_quota["summary"]["latest_percent"] == 22.0
+    assert refreshed_quota["summary"]["freshness"] == "fresh"
+
+
 def test_dashboard_quota_milestones_include_native_window_and_accounting_costs():
     source_module = sys.modules["_cctally_dashboard_sources"]
     cache = sqlite3.connect(":memory:")
@@ -3208,11 +3413,21 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
                 root=_cache_root_key(cache), window_minutes=10_080,
                 resets_at=reset, captured_at=captured_at,
             ),
+            _quota_observation(
+                root=_cache_root_key(cache), window_minutes=300,
+                resets_at=NOW + dt.timedelta(hours=4), captured_at=captured_at,
+                logical_limit_key="five-hour-limit", line_offset=2,
+            ),
         ))
         initial_bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
         initial = initial_bundle.sources["codex"]
         assert initial.capabilities["hero"].status == "supported"
         assert "cycle_freshness" not in initial.data["hero"]
+        assert dict(initial.domain_freshness) == {
+            "hero": "fresh",
+            "quota": "fresh",
+            "sessions": "fresh",
+        }
         assert initial.clock_data["codex_next_decision_at"] == (
             captured_at + dt.timedelta(seconds=3600)
         )
@@ -3233,15 +3448,40 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
                 ),
             )
             before_bundle = _build_tick_bundle(
-                tui, stats, now_utc=NOW + dt.timedelta(minutes=20),
+                tui, stats, now_utc=NOW + dt.timedelta(minutes=30),
                 prior_bundle=initial_bundle,
             )
         before = before_bundle.sources["codex"]
         assert before.data_version == initial.data_version
         assert "cycle_freshness" not in before.data["hero"]
         assert before.data["hero"]["cost_usd"] == initial.data["hero"]["cost_usd"]
+        assert before.freshness == "fresh"
+        assert dict(before.domain_freshness) == {
+            "hero": "fresh",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
         assert before_bundle.sources["all"].data["combined"] is not None
         assert before_bundle.sources["all"].warnings == ()
+        assert dict(before_bundle.sources["all"].domain_freshness) == {
+            "hero": "fresh",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
+        envelope_module = sys.modules["_cctally_dashboard_envelope"]
+        before_envelope = envelope_module._source_bundle_to_envelope(before_bundle)
+        before_wire = before_envelope["sources"]["codex"]
+        assert before_wire["freshness"] == "fresh"
+        assert before_wire["domain_freshness"] == {
+            "hero": "fresh",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
+        assert "clock_data" not in before_wire
+        assert before_envelope["sources"]["all"]["data"]["combined"] is not None
+        assert set(
+            before_envelope["sources"]["all"]["data"]["providers"]
+        ) == {"claude", "codex"}
 
         # After the deadline: an authoritative rebuild stamps the marker while
         # every backward-looking actual survives.
@@ -3256,6 +3496,11 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
         assert after.capabilities["hero"].status == "supported"
         assert after.availability == "ok"
         assert after.freshness == "fresh"
+        assert dict(after.domain_freshness) == {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
 
         # #350 §3.5: All stops combining and states the real reason, without
         # degrading the Codex envelope.
@@ -3269,6 +3514,22 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
             "Codex quota evidence is stale, so combined totals are withheld."
         )
         assert (all_after.availability, all_after.freshness) == ("partial", "fresh")
+        assert dict(all_after.domain_freshness) == {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
+        after_envelope = envelope_module._source_bundle_to_envelope(after_bundle)
+        assert after_envelope["sources"]["codex"]["freshness"] == "fresh"
+        assert after_envelope["sources"]["codex"]["domain_freshness"] == {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
+        assert after_envelope["sources"]["all"]["data"]["combined"] is None
+        assert set(
+            after_envelope["sources"]["all"]["data"]["providers"]
+        ) == {"claude", "codex"}
     finally:
         cache.close()
         stats.close()

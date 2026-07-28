@@ -33,6 +33,10 @@ Record a usage-percent snapshot from the Claude Code status-line `rate_limits`
 data. Writes to `weekly_usage_snapshots` and, if the snapshot crosses a new
 integer percent, also to `percent_milestones`.
 
+> **Cost coverage:** Cumulative Claude costs stored on percent and five-hour
+> milestones are [transcript-derived lower
+> bounds](../claude-cost-coverage.md), not exact `/usage` billing totals.
+
 ## Synopsis
 
 ```

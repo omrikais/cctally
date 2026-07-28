@@ -39,6 +39,7 @@ def _provider_state(
     *,
     availability: str = "ok",
     freshness: str = "fresh",
+    domain_freshness: dict[str, str] | None = None,
     cost_usd: float = 0.0,
     total_tokens: int = 0,
     alerts: tuple[dict[str, object], ...] = (),
@@ -49,6 +50,7 @@ def _provider_state(
         source=source,
         availability=availability,
         freshness=freshness,
+        domain_freshness=domain_freshness,
         warnings=(),
         data_version=f"{source}-version",
         last_success_at=dt.datetime(2026, 7, 16, tzinfo=UTC),
@@ -79,6 +81,40 @@ def test_source_dashboard_state_recursively_freezes_published_values():
     with pytest.raises(TypeError):
         state.data["rows"][0]["value"] = 2
     assert state.data["labels"] == ("one",)
+
+
+def test_source_dashboard_state_freezes_and_validates_domain_freshness():
+    state = _provider_state(
+        "codex",
+        domain_freshness={"hero": "fresh", "quota": "stale", "sessions": "fresh"},
+    )
+
+    assert dict(state.domain_freshness) == {
+        "hero": "fresh",
+        "quota": "stale",
+        "sessions": "fresh",
+    }
+    with pytest.raises(TypeError):
+        state.domain_freshness["quota"] = "fresh"
+    with pytest.raises(ValueError, match="domain freshness"):
+        _provider_state(
+            "codex",
+            domain_freshness={"hero": "fresh", "quota": "aging", "sessions": "fresh"},
+        )
+    with pytest.raises(ValueError, match="domain freshness"):
+        _provider_state(
+            "codex",
+            domain_freshness={"hero": "fresh", "quota": "stale"},
+        )
+
+
+def test_domain_freshness_legacy_fallback_is_provider_freshness():
+    legacy = _provider_state("codex", freshness="stale")
+    object.__setattr__(legacy, "domain_freshness", None)
+
+    assert source_kernel.source_domain_freshness(legacy, "hero") == "stale"
+    assert source_kernel.source_domain_freshness(legacy, "quota") == "stale"
+    assert source_kernel.source_domain_freshness(legacy, "sessions") == "stale"
 
 
 def test_source_dashboard_bundle_is_frozen_with_stage_one_constants():
@@ -172,6 +208,51 @@ def test_all_composition_sums_only_compatible_cost_and_tokens():
     assert combined.data["providers"]["codex"]["budget"]["label"] == "codex calendar budget"
     assert "quota" not in combined.data["combined"]
     assert "budget" not in combined.data["combined"]
+    assert dict(combined.domain_freshness) == {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh",
+    }
+
+
+def test_all_composition_aggregates_each_domain_without_staling_the_provider():
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
+    codex = _provider_state(
+        "codex",
+        domain_freshness={"hero": "fresh", "quota": "stale", "sessions": "fresh"},
+        cost_usd=3.75,
+        total_tokens=70,
+    )
+
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    assert (combined.availability, combined.freshness) == ("ok", "fresh")
+    assert combined.data["combined"] == {"cost_usd": 6.25, "total_tokens": 100}
+    assert dict(combined.domain_freshness) == {
+        "hero": "fresh",
+        "quota": "stale",
+        "sessions": "fresh",
+    }
+
+
+def test_all_version_identity_includes_domain_freshness():
+    claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
+    fresh = source_kernel.compose_all_state(
+        claude,
+        _provider_state("codex", cost_usd=3.75, total_tokens=70),
+    )
+    quota_stale = source_kernel.compose_all_state(
+        claude,
+        _provider_state(
+            "codex",
+            domain_freshness={"hero": "fresh", "quota": "stale", "sessions": "fresh"},
+            cost_usd=3.75,
+            total_tokens=70,
+        ),
+    )
+
+    assert quota_stale.data == fresh.data
+    assert quota_stale.data_version != fresh.data_version
 
 
 @pytest.mark.parametrize(
@@ -215,6 +296,18 @@ def test_fresh_partial_provider_is_reusable_and_contributes_all_totals():
     assert combined.data["combined"] == {"cost_usd": 3.0, "total_tokens": 30}
 
 
+def test_domain_staleness_does_not_disable_provider_reuse():
+    codex = _provider_state(
+        "codex",
+        freshness="fresh",
+        domain_freshness={"hero": "fresh", "quota": "stale", "sessions": "fresh"},
+    )
+
+    assert source_kernel.reuse_coherent_source_state(
+        codex, data_version=codex.data_version,
+    ) is codex
+
+
 def test_all_composition_keeps_fresh_provider_sections_when_codex_hero_is_unavailable():
     claude = _provider_state("claude", cost_usd=1.0, total_tokens=10)
     codex = _provider_state(
@@ -247,7 +340,11 @@ def test_all_withholds_combined_totals_when_a_provider_cycle_is_stale():
     disclosure bug."""
     claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
     codex = _provider_state(
-        "codex", cost_usd=3.75, total_tokens=70, cycle_freshness="stale",
+        "codex",
+        domain_freshness={"hero": "stale", "quota": "stale", "sessions": "fresh"},
+        cost_usd=3.75,
+        total_tokens=70,
+        cycle_freshness="stale",
     )
 
     combined = source_kernel.compose_all_state(claude, codex)
@@ -262,6 +359,7 @@ def test_all_withholds_combined_totals_when_a_provider_cycle_is_stale():
     ]
     # The Codex envelope itself is NOT degraded by All composition.
     assert (codex.availability, codex.freshness, codex.warnings) == ("ok", "fresh", ())
+    assert source_kernel.source_domain_freshness(codex, "sessions") == "fresh"
     assert combined.data["providers"]["codex"]["hero"]["cost_usd"] == 3.75
 
 
@@ -370,6 +468,7 @@ def test_prior_state_degradation_retains_whole_prior_data_and_version():
     assert degraded.data_version == prior.data_version
     assert degraded.last_success_at == prior.last_success_at
     assert degraded.warnings == (warning,)
+    assert set(degraded.domain_freshness.values()) == {"stale"}
 
 
 def test_degrading_an_unavailable_prior_stays_unavailable_not_invalid_partial():
@@ -394,6 +493,7 @@ def test_degrading_an_unavailable_prior_stays_unavailable_not_invalid_partial():
     assert degraded.data_version == ""
     assert degraded.data is None
     assert degraded.warnings == (warning,)
+    assert set(degraded.domain_freshness.values()) == {"stale"}
 
 
 def test_unavailable_source_has_no_data_or_success_version():
@@ -407,6 +507,7 @@ def test_unavailable_source_has_no_data_or_success_version():
     assert unavailable.data_version == ""
     assert unavailable.last_success_at is None
     assert unavailable.warnings == (warning,)
+    assert set(unavailable.domain_freshness.values()) == {"stale"}
 
 
 def test_unchanged_coherent_provider_state_is_reused_by_identity():

@@ -211,7 +211,7 @@ export async function refreshUpdateState(): Promise<void> {
   }
 }
 
-export async function startUpdate(version?: string | null): Promise<void> {
+export async function startUpdate(): Promise<void> {
   // Reset prior run state so a Retry after a failed run starts fresh.
   dispatch({ type: 'RESET_UPDATE_RUN' });
   dispatch({
@@ -225,11 +225,10 @@ export async function startUpdate(version?: string | null): Promise<void> {
     startedAt: Date.now(),
   });
   try {
-    const body = version ? JSON.stringify({ version }) : '{}';
     const r = await fetch(UPDATE_START_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body,
+      body: '{}',
     });
     const json = await r.json().catch(() => ({}));
     if (r.status === 202 && typeof json.run_id === 'string') {

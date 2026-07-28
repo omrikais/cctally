@@ -1468,6 +1468,94 @@ def _resolved_install_target(state: dict, channel: str) -> "str | None":
     return None
 
 
+def _beta_refresh_fallback_message(state: dict) -> str:
+    """Actionable diagnostic for an install-time beta refresh failure."""
+    cached = state.get("latest_version")
+    status = state.get("check_status") or "fetch_failed"
+    detail = state.get("check_error")
+    reason = f"{status}: {detail}" if detail else str(status)
+    if cached:
+        return (
+            f"could not refresh beta update target ({reason}); using cached "
+            f"{cached}. Check npm registry access or rerun with "
+            "`cctally update --version X.Y.Z`."
+        )
+    return (
+        f"could not refresh beta update target ({reason}); no cached target "
+        "is available. Check npm registry access or rerun with "
+        "`cctally update --version X.Y.Z`."
+    )
+
+
+def _resolve_install_operation_target(
+    method: InstallMethod,
+    state: dict,
+    channel: str,
+    *,
+    explicit_version: "str | None",
+    persist_refresh: bool,
+) -> "tuple[str | None, dict, str | None]":
+    """Resolve one user-initiated install's truthful target.
+
+    Explicit pins and every non-beta-npm path are byte-preserving pass-throughs.
+    An unpinned npm beta operation resolves the live SemVer-max(beta, latest)
+    before no-op/downgrade decisions. Real installs reuse the canonical check
+    pipeline (including marker-first and last-known-good persistence); dry-runs
+    perform the same registry resolution against an in-memory state copy so
+    their no-mutation contract remains exact.
+
+    Returns ``(target, effective_state, warning)``. A failed refresh falls back
+    to the cached target when one exists and supplies an actionable warning.
+    """
+    c = _cctally()
+    if explicit_version is not None:
+        return (explicit_version, state, None)
+    if method.method != "npm" or channel != "beta":
+        return (c._resolved_install_target(state, channel), state, None)
+
+    effective = dict(state)
+    prior_cached_target = state.get("latest_version")
+    warning = None
+    if persist_refresh:
+        c._do_update_check()
+        effective = c._load_update_state() or effective
+        if effective.get("check_status") != "ok":
+            warning = _beta_refresh_fallback_message(effective)
+    else:
+        try:
+            latest, dist_tag = c._resolve_npm_channel_target("beta")
+            effective["latest_version"] = latest
+            effective["latest_version_channel"] = "beta"
+            effective["resolved_dist_tag"] = dist_tag
+        except UpdateCheckRateLimited as e:
+            effective["check_status"] = "rate_limited"
+            effective["check_error"] = str(e)[:200]
+        except (UpdateCheckNetworkError, UpdateCheckHTTPError) as e:
+            effective["check_status"] = "fetch_failed"
+            effective["check_error"] = str(e)[:200]
+        except UpdateCheckParseError as e:
+            effective["check_status"] = "parse_failed"
+            effective["check_error"] = str(e)[:200]
+        else:
+            effective["check_status"] = "ok"
+            effective["check_error"] = None
+        if effective.get("check_status") != "ok":
+            warning = _beta_refresh_fallback_message(effective)
+
+    # `_do_update_check` defaults a never-seen `latest_version` to the running
+    # version so banner formatting remains comparable. That synthetic value is
+    # not a last-known-good registry target and must not turn a failed first
+    # install-time refresh into a misleading successful no-op.
+    target = prior_cached_target if warning else effective.get("latest_version")
+    if target is None:
+        missing_cache_state = dict(effective)
+        missing_cache_state.pop("latest_version", None)
+        raise UpdateError(
+            _beta_refresh_fallback_message(missing_cache_state)
+        )
+    return (target, effective, warning)
+
+
 def _resolved_update_command(state: dict, config: "dict | None") -> str:
     """Channel-aware install command for the `--check` renderers / envelope.
 
@@ -1936,11 +2024,20 @@ def _do_update_install(
     channel = c.resolve_update_channel(config)
     state = c._load_update_state() or {}
 
-    # Beta resolves the exact target from the cached max(beta, latest); an
-    # explicit --version pin always wins (the deliberate override).
-    resolved_version = version
-    if resolved_version is None:
-        resolved_version = c._resolved_install_target(state, channel)
+    # A user-initiated bare beta operation refreshes before exact-target
+    # selection and before the no-op/downgrade guard. Dry-run resolves the same
+    # live target without writing state or the throttle marker.
+    resolved_version, state, refresh_warning = (
+        _resolve_install_operation_target(
+            method,
+            state,
+            channel,
+            explicit_version=version,
+            persist_refresh=not dry_run,
+        )
+    )
+    if refresh_warning:
+        print(f"Warning: {refresh_warning}", file=sys.stderr)
 
     # Downgrade refusal for a BARE (unpinned) install: no-op + exit 0 when
     # the resolved target is not SemVer-newer than the installed version.
@@ -2152,12 +2249,40 @@ class UpdateWorker:
         log_fd = None
         try:
             method = c._detect_install_method(mutate=True)
-            c._preflight_install(method, version)
+            config = c.load_config()
+            channel = c.resolve_update_channel(config)
+            state = c._load_update_state() or {}
+            resolved_version, _state, refresh_warning = (
+                _resolve_install_operation_target(
+                    method,
+                    state,
+                    channel,
+                    explicit_version=version,
+                    persist_refresh=True,
+                )
+            )
+            if refresh_warning:
+                self._emit(
+                    run_id,
+                    {"type": "stderr", "data": f"Warning: {refresh_warning}"},
+                )
+            if resolved_version is not None:
+                self._emit(
+                    run_id,
+                    {
+                        "type": "target",
+                        "version": resolved_version,
+                        "command": c._format_update_command(
+                            method.method, resolved_version
+                        ),
+                    },
+                )
+            c._preflight_install(method, resolved_version)
             _cctally_core.UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             lock_fd = c._acquire_update_lock()
             log_fd = open(_cctally_core.UPDATE_LOG_PATH, "a", encoding="utf-8")
             _log_update_event(log_fd, "INSTALL_START", method=method.method)
-            for step_name, cmd in c._build_update_steps(method, version):
+            for step_name, cmd in c._build_update_steps(method, resolved_version):
                 self._emit(run_id, {"type": "step", "name": step_name})
                 _log_update_event(log_fd, "STEP_START", name=step_name)
                 rc = c._run_streaming(
@@ -2176,7 +2301,7 @@ class UpdateWorker:
                     self._emit(run_id, {"type": "done", "success": False})
                     return
             _log_update_event(log_fd, "INSTALL_SUCCESS")
-            c._stamp_install_success_to_state(version, method)
+            c._stamp_install_success_to_state(resolved_version, method)
             entrypoint, exec_argv = c._resolve_execvp_target()
             self._emit(run_id, {"type": "execvp", "argv": exec_argv})
             try:

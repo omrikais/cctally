@@ -3,6 +3,10 @@
 Trend table of dollars per 1% weekly usage. The headline command of this
 project.
 
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Provider-aware report routing
 
 `cctally report` and `cctally report --source claude` preserve the existing

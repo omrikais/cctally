@@ -1745,6 +1745,11 @@
         }
       },
       "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
       "warnings": []
@@ -2644,6 +2649,11 @@
         }
       },
       "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
       "warnings": []
@@ -2797,6 +2807,11 @@
         }
       },
       "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "freshness": "fresh",
       "last_success_at": "2026-04-16T14:00:00Z",
       "warnings": []

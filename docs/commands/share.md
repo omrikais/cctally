@@ -4,6 +4,10 @@
 
 `cctally` has a cross-command shareable-output surface: the explicitly listed command families below accept a `--format {md,html,svg}` flag that produces a self-contained artifact suitable for chat paste, GitHub issue, or screenshot. This page is the single reference for the flag surface; per-command pages document the per-command chart and table layouts.
 
+> **Claude cost coverage:** Shared Claude dollar and token totals inherit the
+> [transcript-derived lower-bound contract](../claude-cost-coverage.md). Codex
+> accounting is unaffected.
+
 ## Supported subcommands
 
 `report`, `daily`, `monthly`, `weekly`, `forecast`, `project`, `five-hour-blocks`, `session`, the four `codex-*` accounting reports, and the source-aware `project`, `diff`, `range-cost`, `cache-report`, and `report` routes. The dashboard has its own share UI; its source-selection/history work remains deferred.

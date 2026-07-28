@@ -2,6 +2,11 @@
 
 One-line status string for Claude Code's `statusLine` hook.
 
+> **Cost coverage:** cctally-derived Claude session, day, and block costs are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. The `--cost-source cc` session value is supplied by
+> Claude Code instead.
+
 > Canonical form: [`cctally claude statusline`](claude.md) (this flat form remains as an alias).
 
 `cctally statusline` is a drop-in replacement for `ccusage statusline` —

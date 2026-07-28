@@ -193,7 +193,14 @@ def _alert_label_prefix(axis: str, account_key: "str | None") -> str:
         db_path = _cctally_core.DB_PATH
         if not db_path.exists():
             return ""
-        conn = _sq.connect(f"file:{db_path}?mode=ro", uri=True)
+        # #386: `mode=ro` is not exempt from the opener protocol — such a
+        # connection CREATES `-shm`/`-wal` when they are absent (measured). The
+        # enclosing `except Exception` degrades the label, never the alert.
+        import _cctally_store
+        conn = _cctally_store.stats_open_guarded(
+            db_path,
+            connect=lambda p: _sq.connect(f"file:{p}?mode=ro", uri=True),
+        )
         try:
             if _cctally_account.real_account_count(conn, vendor) <= 1:
                 return ""

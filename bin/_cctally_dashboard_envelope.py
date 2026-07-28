@@ -652,6 +652,11 @@ def _unavailable_source_wire() -> dict:
     return {
         "availability": "unavailable",
         "freshness": "stale",
+        "domain_freshness": {
+            "hero": "stale",
+            "quota": "stale",
+            "sessions": "stale",
+        },
         "warnings": [{
             "code": "source_build_failed",
             "message": "Source data could not be built.",
@@ -669,9 +674,23 @@ def _source_state_to_wire(state: object) -> dict:
     warnings = getattr(state, "warnings", ())
     capabilities = getattr(state, "capabilities", {})
     last_success_at = getattr(state, "last_success_at", None)
+    provider_freshness = getattr(state, "freshness", "stale")
+    raw_domain_freshness = getattr(state, "domain_freshness", None)
+    # Additive-transition fallback: an older in-memory state has no map, so
+    # every domain inherits its provider-generation value deterministically.
+    domain_freshness = {
+        domain: (
+            raw_domain_freshness.get(domain)
+            if isinstance(raw_domain_freshness, Mapping)
+            and raw_domain_freshness.get(domain) in ("fresh", "stale")
+            else provider_freshness
+        )
+        for domain in ("hero", "quota", "sessions")
+    }
     return {
         "availability": getattr(state, "availability"),
-        "freshness": getattr(state, "freshness"),
+        "freshness": provider_freshness,
+        "domain_freshness": domain_freshness,
         "warnings": [
             {
                 "code": warning.code,
@@ -791,10 +810,40 @@ def _build_alerts_envelope_array(
     return out[:limit]
 
 
-def _sync_failure_envelope(error: str | None) -> dict | None:
+def _sync_failure_envelope(
+    error: str | None,
+    attributions=(),
+) -> dict | None:
     """Classify a raw server sync failure into a privacy-safe UI contract."""
     if not error:
         return None
+
+    def attributed(database: str, *, corruption: bool = False) -> bool:
+        for item in attributions or ():
+            item_database = (
+                item.get("database") if isinstance(item, dict)
+                else getattr(item, "database", None)
+            )
+            item_corruption = (
+                item.get("corruption") if isinstance(item, dict)
+                else getattr(item, "corruption", False)
+            )
+            if item_database == database and (
+                not corruption or bool(item_corruption)
+            ):
+                return True
+        return False
+
+    # Typed stats ownership wins mixed failures. Raw error text is deliberately
+    # not consulted for database identity: it may contain both cache and stats
+    # messages and can carry private local paths.
+    if attributed("stats", corruption=True):
+        return {
+            "kind": "stats_corruption",
+            "label": "⚠ stats recovery needed",
+            "detail": "The dashboard statistics database could not be read safely.",
+            "action": "cctally db repair --db stats --yes",
+        }
 
     text = error.casefold()
     if (
@@ -818,7 +867,8 @@ def _sync_failure_envelope(error: str | None) -> dict | None:
 
     c = sys.modules["cctally"]
     if (
-        c._is_sqlite_corruption_error(error)
+        attributed("cache", corruption=True)
+        or c._is_sqlite_corruption_error(error)
         or "cache.db recovery" in text
         or "cache.db is still open" in text
     ):
@@ -846,10 +896,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     """Serialize a DataSnapshot into the JSON envelope consumed by the
     browser (design spec §2.2).
 
-    ``transcripts_visible`` gates the transcript-derived session ``title``
-    (#264 S3): the key is emitted ONLY when the flag is True AND the row has
-    a title, so False (the default) fails closed for any caller that forgets
-    to pass it — no ``title`` key, no leaked prompt content. The two
+    ``transcripts_visible`` gates transcript-derived Claude session ``title``
+    and Codex session ``label`` values: each key is emitted ONLY when the flag
+    is True AND the row has a private title, so False (the default) fails closed
+    for any caller that forgets to pass it — no leaked prompt content. The two
     browser-serving emit sites (``GET /api/data`` + the SSE loop) pass the
     per-request ``_transcripts_visible_to_request()`` — the SAME predicate
     that drives ``transcriptsEnabled`` and the per-row "open conversation"
@@ -1420,7 +1470,10 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # Privacy-safe classification for user-facing dashboard copy. Keep the
         # raw legacy field for API compatibility and diagnostics, but never
         # place it in visible text/title/aria surfaces.
-        "sync_failure":    _sync_failure_envelope(snap.last_sync_error),
+        "sync_failure":    _sync_failure_envelope(
+            snap.last_sync_error,
+            getattr(snap, "sync_failures", ()),
+        ),
 
         # F1 (server-resolves "local" → IANA): the browser never has to
         # guess. {tz, resolved_tz, offset_label, offset_seconds} computed
@@ -1651,6 +1704,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
     }
     envelope.update(_source_bundle_to_envelope(getattr(snap, "source_bundle", None)))
     _overlay_claude_source_session_titles(envelope, snap, transcripts_visible)
+    _overlay_codex_source_session_labels(envelope, snap, transcripts_visible)
     return envelope
 
 
@@ -1718,6 +1772,60 @@ def _overlay_claude_source_session_titles(
             title = titles.get(row.get("key"))
             if title is not None:
                 row["title"] = title
+
+
+def _codex_source_session_rows(envelope: dict) -> list:
+    """Return direct-Codex and All-tab Codex session row lists."""
+    sources = envelope.get("sources")
+    if not isinstance(sources, Mapping):
+        return []
+    out = []
+    candidates = [(sources.get("codex") or {}).get("data")]
+    all_data = (sources.get("all") or {}).get("data")
+    if isinstance(all_data, Mapping):
+        providers = all_data.get("providers")
+        if isinstance(providers, Mapping):
+            candidates.append(providers.get("codex"))
+    for data in candidates:
+        if not isinstance(data, Mapping):
+            continue
+        sessions = data.get("sessions")
+        if not isinstance(sessions, Mapping):
+            continue
+        rows = sessions.get("rows")
+        if isinstance(rows, list):
+            out.append(rows)
+    return out
+
+
+def _overlay_codex_source_session_labels(
+    envelope: dict, snap, transcripts_visible: bool,
+) -> None:
+    """Inject Codex task labels only into this request's source-row copies.
+
+    ``state_5.sqlite.threads.title`` is derived from transcript prompt content.
+    The frozen source state therefore retains it only in a server-private key
+    map, outside the published ``data`` tree. Closed requests return before
+    consulting that map; open requests match labels to direct and All rows by
+    their opaque resource keys. A missed call fails closed.
+    """
+    if not transcripts_visible:
+        return
+    bundle = getattr(snap, "source_bundle", None)
+    sources = getattr(bundle, "sources", None)
+    if not isinstance(sources, Mapping):
+        return
+    codex = sources.get("codex")
+    labels = getattr(codex, "private_session_labels", None)
+    if not isinstance(labels, Mapping) or not labels:
+        return
+    for rows in _codex_source_session_rows(envelope):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            label = labels.get(row.get("key"))
+            if isinstance(label, str) and label:
+                row["label"] = label
 
 
 def _session_detail_to_envelope(detail: "TuiSessionDetail") -> dict:

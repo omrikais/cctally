@@ -2951,6 +2951,48 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Emit JSON to stdout",
     )
     db_rebuild.set_defaults(func=c.cmd_db_rebuild)
+    db_rederive = db_sub.add_parser(
+        "rederive",
+        help="Preview or apply an append-only correction plan from retained truth",
+    )
+    db_rederive.add_argument(
+        "--family",
+        required=True,
+        help="Closed derivation family to re-run (initially: claude-usage)",
+    )
+    db_rederive.add_argument(
+        "--yes",
+        action="store_true",
+        help="Append the correction batch and rebuild stats.db (default: preview)",
+    )
+    db_rederive.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit schemaVersion 1 JSON to stdout",
+    )
+    db_rederive.set_defaults(func=c.cmd_db_rederive)
+    db_journal_repair = db_sub.add_parser(
+        "journal-repair",
+        help="Preview or acknowledge exact structural journal violations",
+    )
+    db_journal_repair.add_argument(
+        "--violation",
+        action="append",
+        default=[],
+        metavar="FINGERPRINT",
+        help="Exact violation fingerprint to acknowledge (repeatable)",
+    )
+    db_journal_repair.add_argument(
+        "--yes",
+        action="store_true",
+        help="Append the audit decision and rebuild stats.db (default: preview)",
+    )
+    db_journal_repair.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit schemaVersion 1 JSON to stdout",
+    )
+    db_journal_repair.set_defaults(func=c.cmd_db_journal_repair)
     db_repair = db_sub.add_parser(
         "repair",
         help="Recover a malformed pre-cutover stats.db through a verified fresh "

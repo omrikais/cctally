@@ -1017,6 +1017,61 @@ def test_codex_cycle_index_jitter_collapses_to_one_entry(ns):
     assert entry["milestone_count"] == 3
 
 
+def test_codex_cycle_index_selects_one_live_cycle_across_nearby_identities(ns):
+    """The live boundary may sit within the jitter floor of two distinct
+    identity clusters.  Its selected full identity must break that ambiguity:
+    one cycle is current/unclipped and the other keeps global successor
+    clipping, so the account timeline never overlaps."""
+    import _cctally_milestone_history as mh
+
+    conn = ns["open_db"]()
+    try:
+        _seed_quota_block(
+            conn,
+            source_root_key="root-a",
+            logical_limit_key="limit-a",
+            window_minutes=10080,
+            nominal_start_at_utc="2026-03-07T23:54:00+00:00",
+            resets_at_utc="2026-03-14T23:54:00+00:00",
+        )
+        _seed_quota_block(
+            conn,
+            source_root_key="root-b",
+            logical_limit_key="limit-b",
+            window_minutes=10080,
+            nominal_start_at_utc="2026-03-08T00:06:00+00:00",
+            resets_at_utc="2026-03-15T00:06:00+00:00",
+        )
+        conn.commit()
+        identity = types.SimpleNamespace(
+            source_root_keys=("root-a", "root-b"),
+            resets_at=_dt("2026-03-15T00:00:00+00:00"),
+            quota_identity=types.SimpleNamespace(
+                source_root_key="root-b",
+                logical_limit_key="limit-b",
+                observed_slot="primary",
+                window_minutes=10080,
+            ),
+        )
+        index = mh.build_codex_cycle_index(
+            conn,
+            identity=identity,
+            now_utc=_dt("2026-03-10T00:00:00+00:00"),
+        )
+    finally:
+        conn.close()
+
+    assert len(index) == 2
+    assert sum(entry["is_current"] for entry in index) == 1
+    by_start = {entry["start_at_utc"]: entry for entry in index}
+    earlier = by_start["2026-03-07T23:54:00Z"]
+    live = by_start["2026-03-08T00:06:00Z"]
+    assert live["is_current"] is True
+    assert live["end_at_utc"] == live["resets_at_utc"]
+    assert earlier["is_current"] is False
+    assert earlier["end_at_utc"] == live["start_at_utc"]
+
+
 def test_codex_cycle_detail_unions_member_milestones(ns, monkeypatch):
     import _cctally_milestone_history as mh
 
@@ -1426,6 +1481,115 @@ def test_api_milestones_codex_cycle_200(tmp_path, monkeypatch):
         assert body["key"] == key
         assert body["dividers"] == []
         assert "segments" in body and "blocks" in body
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+_DETAIL_AS_OF = "2026-07-26T00:00:00Z"
+_DETAIL_ROOT = "root-a"
+_DETAIL_LIMIT_KEY = "account"
+
+
+def _seed_codex_reanchored_cycles(conn):
+    """A seven-day cycle cut short by a genuine early re-anchor (#373).
+
+    The `Jul 21` cycle's own reset is still in the future at `_DETAIL_AS_OF`,
+    so `_codex_is_current`'s `cyc.reset > now_utc` fallthrough calls it current
+    even though the `Jul 25` re-anchor already ended it. That is precisely the
+    shape that made the detail route and the index disagree.
+    """
+    _seed_quota_block(
+        conn, source_root_key=_DETAIL_ROOT, logical_limit_key=_DETAIL_LIMIT_KEY,
+        window_minutes=10080, limit_id="codex",
+        nominal_start_at_utc="2026-07-21T17:02:32+00:00",
+        resets_at_utc="2026-07-28T17:02:32+00:00", current_percent=28.0,
+    )
+    _seed_quota_block(
+        conn, source_root_key=_DETAIL_ROOT, logical_limit_key=_DETAIL_LIMIT_KEY,
+        window_minutes=10080, limit_id="codex",
+        nominal_start_at_utc="2026-07-25T19:18:58+00:00",
+        resets_at_utc="2026-08-01T19:18:58+00:00", current_percent=2.0,
+    )
+
+
+def _seed_codex_live_weekly_evidence(cache_conn):
+    """The physical evidence the live-cycle resolver reads, so the detail route
+    can resolve the same `CodexCycleBoundary` the index was built with."""
+    cache_conn.execute(
+        "INSERT INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?, '/tmp/codex-root', ?, ?)",
+        (_DETAIL_ROOT, "2026-07-21T17:02:32Z", "2026-07-25T23:30:00Z"),
+    )
+    cache_conn.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc,"
+        " observed_slot, logical_limit_key, limit_id, limit_name, window_minutes,"
+        " used_percent, resets_at_utc) "
+        "VALUES ('codex', ?, '/tmp/rollout.jsonl', 1, '2026-07-25T23:30:00Z',"
+        " 'primary', ?, 'codex', NULL, 10080, 2.0, '2026-08-01T19:18:58Z')",
+        (_DETAIL_ROOT, _DETAIL_LIMIT_KEY),
+    )
+    cache_conn.commit()
+
+
+def test_api_milestones_codex_detail_agrees_with_the_index(tmp_path, monkeypatch):
+    """#373 — one cycle key must describe ONE cycle.
+
+    Browser QA caught `GET /api/milestones/codex/week/<key>` returning
+    `Jul 21–Jul 28` / `is_current: true` for the very key whose index entry said
+    `Jul 21–Jul 25` / `is_current: false`. The detail route has no envelope, so
+    it passed a stub identity with no `resets_at`; `_codex_is_current` then fell
+    through to `cyc.reset > now_utc` and marked every future-ending cycle
+    current — which both flipped the flag and, after #373's clip guard, left the
+    label unclipped.
+    """
+    monkeypatch.setenv("CCTALLY_AS_OF", _DETAIL_AS_OF)
+    ns = load_script()
+    srv = _boot_milestones_server(
+        ns, tmp_path, monkeypatch, seed=_seed_codex_reanchored_cycles,
+    )
+    try:
+        cache_conn = ns["open_cache_db"]()
+        try:
+            _seed_codex_live_weekly_evidence(cache_conn)
+        finally:
+            cache_conn.close()
+
+        import _cctally_dashboard_sources as ds
+        import _cctally_milestone_history as mh
+        now = _dt("2026-07-26T00:00:00+00:00")
+        conn = ns["open_db"]()
+        cache_conn = ns["open_cache_db"]()
+        try:
+            identity = ds.resolve_codex_cycle_detail_identity(
+                cache_conn, source_root_keys=(_DETAIL_ROOT,), now_utc=now,
+            )
+            # Positive precondition: the live boundary really did resolve, or
+            # the index below would fall through to the same broken proxy.
+            assert identity.resets_at == _dt("2026-08-01T19:18:58+00:00")
+            index = mh.build_codex_cycle_index(
+                conn, identity=identity, now_utc=now,
+            )
+        finally:
+            conn.close()
+            cache_conn.close()
+        entry = next(
+            e for e in index if e["start_at_utc"] == "2026-07-21T17:02:32Z"
+        )
+        # Positive precondition: the index really did clip this cycle short and
+        # call it historic, so there is a disagreement to detect.
+        assert entry["end_at_utc"] == "2026-07-25T19:18:58Z"
+        assert entry["is_current"] is False
+
+        status, body = _get(
+            srv, "/api/milestones/codex/week/" + _urlparse.quote(entry["key"], safe=""),
+        )
+        assert status == 200, (status, body)
+        assert body["end_at_utc"] == entry["end_at_utc"]
+        assert body["label"] == entry["label"]
+        assert body["is_current"] == entry["is_current"]
     finally:
         srv.shutdown()
         srv.server_close()

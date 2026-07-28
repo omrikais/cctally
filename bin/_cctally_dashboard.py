@@ -349,7 +349,8 @@ from _lib_display_tz import (
 )
 from _lib_aggregators import _aggregate_daily, _aggregate_monthly, _aggregate_weekly
 from _lib_fmt import stable_sum
-from _lib_pricing import _calculate_entry_cost, _chip_for_model, _short_model_name
+from _lib_pricing import (_calculate_entry_cost, _chip_for_model,
+                          _short_model_name, claude_usage_dict)
 from _lib_five_hour import _canonical_5h_window_key, _round_to_ten_minutes
 from _lib_subscription_weeks import _compute_subscription_weeks
 from _lib_blocks import _group_entries_into_blocks
@@ -2983,7 +2984,8 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
             "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
             "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
             "       e.cost_usd_raw, e.source_path, "
-            "       sf.session_id, sf.project_path "
+            "       sf.session_id, sf.project_path, "
+            "       e.cache_create_1h_tokens, e.speed "
             "FROM session_entries e "
             "LEFT JOIN session_files sf ON sf.path = e.source_path "
             "WHERE e.mutation_seq > ? AND +e.timestamp_utc >= ? AND +e.timestamp_utc <= ? "
@@ -2995,7 +2997,8 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
             "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
             "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
             "       e.cost_usd_raw, e.source_path, "
-            "       sf.session_id, sf.project_path "
+            "       sf.session_id, sf.project_path, "
+            "       e.cache_create_1h_tokens, e.speed "
             "FROM session_entries e "
             "LEFT JOIN session_files sf ON sf.path = e.source_path "
             "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
@@ -3060,7 +3063,7 @@ def _fold_projects_entry(
     c = _cctally()
     (entry_id, ts_iso, model, input_tok, output_tok,
      cache_create, cache_read, cost_raw, source_path,
-     session_id, project_path) = row
+     session_id, project_path, cache_1h, speed) = row
     if model == "<synthetic>":
         return None
     ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
@@ -3068,12 +3071,14 @@ def _fold_projects_entry(
         return None
     entry_cost = _calculate_entry_cost(
         model,
-        {
-            "input_tokens": input_tok or 0,
-            "output_tokens": output_tok or 0,
-            "cache_creation_input_tokens": cache_create or 0,
-            "cache_read_input_tokens": cache_read or 0,
-        },
+        claude_usage_dict(   # #195 chokepoint
+            input_tokens=input_tok,
+            output_tokens=output_tok,
+            cache_creation_tokens=cache_create,
+            cache_read_tokens=cache_read,
+            cache_1h_tokens=cache_1h,
+            speed=speed,
+        ),
         mode="auto",
         cost_usd=cost_raw,
     )
@@ -3457,7 +3462,7 @@ def _build_projects_envelope(
         ):
             (entry_id, ts_iso, model, input_tok, output_tok,
              cache_create, cache_read, cost_raw, source_path,
-             session_id, project_path) = row
+             session_id, project_path, cache_1h, speed) = row
             if model == "<synthetic>":
                 continue
             # Parse timestamp; assume Z / +00:00 — production iterators do
@@ -3470,12 +3475,14 @@ def _build_projects_envelope(
             # Entry cost via the shared pricing chokepoint.
             entry_cost = _calculate_entry_cost(
                 model,
-                {
-                    "input_tokens": input_tok or 0,
-                    "output_tokens": output_tok or 0,
-                    "cache_creation_input_tokens": cache_create or 0,
-                    "cache_read_input_tokens": cache_read or 0,
-                },
+                claude_usage_dict(   # #195 chokepoint
+                    input_tokens=input_tok,
+                    output_tokens=output_tok,
+                    cache_creation_tokens=cache_create,
+                    cache_read_tokens=cache_read,
+                    cache_1h_tokens=cache_1h,
+                    speed=speed,
+                ),
                 mode="auto",
                 cost_usd=cost_raw,
             )
@@ -3874,7 +3881,8 @@ def _project_detail_for_window(
         "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
         "       e.output_tokens, e.cache_create_tokens, "
         "       e.cache_read_tokens, e.cost_usd_raw, e.source_path, "
-        "       sf.session_id, sf.project_path "
+        "       sf.session_id, sf.project_path, e.cache_create_1h_tokens, "
+        "       e.speed "
         "FROM session_entries e "
         "INNER JOIN _drill_paths dp ON dp.path = e.source_path "
         "LEFT JOIN session_files sf ON sf.path = e.source_path "
@@ -3896,7 +3904,7 @@ def _project_detail_for_window(
     for row in entries_cur:
         (entry_id, ts_iso, model, input_tok, output_tok,
          cache_create, cache_read, cost_raw, source_path,
-         session_id, project_path) = row
+         session_id, project_path, cache_1h, speed) = row
         if model == "<synthetic>":
             continue
         # No need to call _resolve_project_key here — the INNER JOIN
@@ -3905,12 +3913,14 @@ def _project_detail_for_window(
         ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
         entry_cost = _calculate_entry_cost(
             model,
-            {
-                "input_tokens": input_tok or 0,
-                "output_tokens": output_tok or 0,
-                "cache_creation_input_tokens": cache_create or 0,
-                "cache_read_input_tokens": cache_read or 0,
-            },
+            claude_usage_dict(   # #195 chokepoint
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                cache_creation_tokens=cache_create,
+                cache_read_tokens=cache_read,
+                cache_1h_tokens=cache_1h,
+                speed=speed,
+            ),
             mode="auto",
             cost_usd=cost_raw,
         )
@@ -4324,9 +4334,7 @@ def _debug_source_counts(cache_conn, bundle) -> dict:
                 pass
     stats_conn = None
     try:
-        stats_conn = sqlite3.connect(
-            f"{_cctally_core.DB_PATH.as_uri()}?mode=ro", uri=True
-        )
+        stats_conn = _stats_ro_guarded()
         for source, tables in _DEBUG_SOURCE_STATS_TABLES.items():
             for table, where in tables:
                 try:
@@ -4344,6 +4352,29 @@ def _debug_source_counts(cache_conn, bundle) -> dict:
     return result
 
 
+def _stats_ro_guarded():
+    """A `mode=ro` stats connection that participates in the #386 opener protocol.
+
+    A read-only opener is NOT exempt. Measured on this platform: a `mode=ro`
+    connection to a WAL database whose sidecars are absent CREATES both
+    `stats.db-shm` and `stats.db-wal`. That is exactly the cross-generation
+    sidecar pairing spec §1.2 identifies as where SQLite's crash guarantees stop
+    applying once another process renames the main file underneath — so these
+    diagnostics must observe the repair marker and the quarantine-pending record
+    under maintenance-shared like every other opener.
+
+    Raises `StatsDbMaintenanceError` (an `sqlite3.OperationalError`) during a
+    replacement; both callers already degrade on `sqlite3.Error`.
+    """
+    import _cctally_store
+
+    return _cctally_store.stats_open_guarded(
+        _cctally_core.DB_PATH,
+        connect=lambda p: sqlite3.connect(
+            f"{pathlib.Path(p).as_uri()}?mode=ro", uri=True),
+    )
+
+
 def _debug_cache_state(cache_conn) -> dict:
     """On-demand signature legs + pending-reingest flags + generation.
 
@@ -4357,9 +4388,7 @@ def _debug_cache_state(cache_conn) -> dict:
     state: dict = {"generation": sc.current_generation()}
     stats_conn = None
     try:
-        stats_conn = sqlite3.connect(
-            f"{_cctally_core.DB_PATH.as_uri()}?mode=ro", uri=True
-        )
+        stats_conn = _stats_ro_guarded()
     except sqlite3.Error:
         stats_conn = None
     try:
@@ -6359,7 +6388,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         404 ``{code: "unknown_key", reason}`` for keys that don't resolve.
         """
         import re as _re
-        import types as _types
         import urllib.parse as _urlparse
         from _cctally_cache import open_cache_db
 
@@ -6403,7 +6431,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # matches its exact cycle without needing the hero-cycle identity —
             # this also keeps a just-closed former-current cycle fetchable when
             # the live hero cycle is momentarily unavailable, spec §2).
-            from _cctally_dashboard_sources import resolve_dashboard_source_semantics
+            from _cctally_dashboard_sources import (
+                resolve_codex_cycle_detail_identity,
+                resolve_dashboard_source_semantics,
+            )
             speed = resolve_dashboard_source_semantics(
                 load_config(), display_tz_name="UTC",
             ).speed
@@ -6422,7 +6453,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         "WHERE source='codex'"
                     )
                 }))
-                identity = _types.SimpleNamespace(source_root_keys=roots, resets_at=None)
+                # #373: resolve the SAME live boundary the cycle index was built
+                # with. A stub with no `resets_at` makes `_codex_is_current`
+                # fall through to `cyc.reset > now_utc`, which marks every
+                # future-ending cycle current — so one cycle key described two
+                # different cycles depending on which route answered.
+                identity = resolve_codex_cycle_detail_identity(
+                    cache_conn, source_root_keys=roots, now_utc=now_utc,
+                )
                 result = c.build_codex_cycle_detail(
                     stats_conn, cache_conn, identity=identity, key=key,
                     speed=speed, now_utc=now_utc,
@@ -6563,7 +6601,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def _handle_post_update(self) -> None:
         """POST /api/update — kick off an in-process update.
 
-        Body: ``{"version"?: "X.Y.Z"}``. CSRF-gated. Returns
+        Body: ``{}``. A legacy ``{"version": "X.Y.Z"}`` from an already-open
+        beta dashboard is accepted but treated as an auto-target hint, never
+        as an explicit user pin; the worker resolves the selected channel
+        afresh. CSRF-gated. Returns
         202 + ``{"run_id": ...}`` on accept; 409 + ``{"run_id_in_progress": ...}``
         when another run is already in progress.
         """
@@ -6584,7 +6625,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 400, {"error": "version must be a string"}
             )
             return
-        accepted, run_id = worker.start(version)
+        # The dashboard has no explicit-version input. Older clients sent the
+        # cached beta target here; trusting it as a pin recreates #342 whenever
+        # the registry advances while the modal is open.
+        accepted, run_id = worker.start(None)
         if accepted:
             self._respond_json(202, {"run_id": run_id})
         else:
@@ -6813,6 +6857,35 @@ def _dashboard_wait_for_signal(
 
 
 def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
+    """Build the first paint with one post-query stats heal/reopen at most."""
+
+    c = _cctally()
+    tui = c._cctally_tui
+    try:
+        return _dashboard_initial_snapshot_once(
+            args,
+            pinned_now=pinned_now,
+            display_tz_pref_override=display_tz_pref_override,
+            stats_heal_attempted=False,
+        )
+    except tui._StatsSnapshotCorruption as fault:
+        # The once-builder's finally has closed the cheap-seed stats handle.
+        tui._tui_heal_post_query_stats(fault.cause)
+        return _dashboard_initial_snapshot_once(
+            args,
+            pinned_now=pinned_now,
+            display_tz_pref_override=display_tz_pref_override,
+            stats_heal_attempted=True,
+        )
+
+
+def _dashboard_initial_snapshot_once(
+    args,
+    *,
+    pinned_now,
+    display_tz_pref_override,
+    stats_heal_attempted,
+):
     """#278 Theme A (A1): build the dashboard's first snapshot as a CHEAP
     partial on a normal launch so the HTTP port binds in ~110ms instead of
     waiting on the ~2.2s full aggregation. #179 already deferred the *ingest*
@@ -6862,22 +6935,58 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
     runtime_bind = getattr(args, "host", None)
     base = tui._tui_empty_snapshot(now_utc)
     errors: list[str] = []
+    sync_failures: list[tui.SyncFailureAttribution] = []
     cw = None
     fc = None
     fc_view = None
-    conn = open_db()
+    conn = None
     try:
+        conn = open_db()
+    except Exception as exc:  # noqa: BLE001 — retry-open must not block bind
+        if (
+            not stats_heal_attempted
+            or not c._is_sqlite_corruption_error(exc)
+        ):
+            raise
+        errors.append(f"stats-open: {exc}")
+        sync_failures.append(
+            tui.SyncFailureAttribution(
+                leg="stats-open",
+                database="stats",
+                corruption=True,
+            )
+        )
+    if conn is not None:
         try:
-            cw = tui._tui_build_current_week(conn, now_utc, skip_sync=True)
-        except Exception as exc:  # noqa: BLE001 — never block the bind
-            errors.append(f"current-week: {exc}")
-        try:
-            fc_view = tui._tui_build_forecast_view(conn, now_utc, skip_sync=True)
-            fc = fc_view.output if fc_view is not None else None
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"forecast: {exc}")
-    finally:
-        conn.close()
+            try:
+                cw = tui._tui_build_current_week(conn, now_utc, skip_sync=True)
+            except Exception as exc:  # noqa: BLE001 — never block the bind
+                tui._tui_capture_sync_failure(
+                    conn,
+                    errors,
+                    sync_failures,
+                    leg="current-week",
+                    database="stats_or_cache",
+                    exc=exc,
+                    stats_heal_attempted=stats_heal_attempted,
+                )
+            try:
+                fc_view = tui._tui_build_forecast_view(
+                    conn, now_utc, skip_sync=True
+                )
+                fc = fc_view.output if fc_view is not None else None
+            except Exception as exc:  # noqa: BLE001
+                tui._tui_capture_sync_failure(
+                    conn,
+                    errors,
+                    sync_failures,
+                    leg="forecast",
+                    database="stats_or_cache",
+                    exc=exc,
+                    stats_heal_attempted=stats_heal_attempted,
+                )
+        finally:
+            conn.close()
     # §1.3: run BOTH precomputes for real so the envelope serializes cleanly
     # without the per-connection inline-doctor fork or the config/update KeyErrors.
     doctor_payload = None
@@ -6897,6 +7006,7 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
         forecast_view=fc_view,
         last_sync_at=_time.monotonic(),
         last_sync_error=("; ".join(errors) if errors else None),
+        sync_failures=tuple(sync_failures),
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
         hydrating=True,

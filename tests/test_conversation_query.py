@@ -77,17 +77,18 @@ def _msg(c, **kw):
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
-           inp=0, out=0, cc=0, cr=0, cost_usd_raw=None):
+           inp=0, out=0, cc=0, cr=0, cost_usd_raw=None, speed=None):
     # cost_usd_raw is the vendor-provided override the cost helper honors when
     # present (bypassing token-derived math) — the #177 "same source row, not
     # same arithmetic" guard seeds it to prove tokens surface independently.
     c.execute(
         "INSERT OR IGNORE INTO session_entries "
         "(source_path,line_offset,timestamp_utc,model,msg_id,req_id,"
-        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,cost_usd_raw)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,"
+        " cost_usd_raw,speed)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (source_path, line_offset, "t", model, msg_id, req_id,
-         inp, out, cc, cr, cost_usd_raw))
+         inp, out, cc, cr, cost_usd_raw, speed))
 
 
 def test_list_conversations_groups_by_session_with_cost():
@@ -4200,11 +4201,18 @@ def _reference_turn_costs(c, keys):
             continue
         row = c.execute(
             "SELECT model, input_tokens, output_tokens, cache_create_tokens, "
-            "cache_read_tokens, cost_usd_raw FROM session_entries "
-            "WHERE msg_id=? AND req_id=?", (m, r)).fetchone()
+            "cache_read_tokens, cost_usd_raw, cache_create_1h_tokens "
+            "FROM session_entries WHERE msg_id=? AND req_id=?",
+            (m, r)).fetchone()
         if row is None:
             continue
-        out[(m, r)] = cq._entry_cost(*row)
+        # #195: the split is a REQUIRED keyword on `_entry_cost`, so the
+        # reference has to fetch it too — a reference that silently priced
+        # every 1-hour write at the 5-minute rate would make the parity
+        # assertion agree with the production helper only by both being wrong.
+        out[(m, r)] = cq._entry_cost(
+            *row[:6], cc_1h=row[6], speed=row[7] if len(row) > 7 else None
+        )
     return out
 
 

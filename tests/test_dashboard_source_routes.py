@@ -580,7 +580,8 @@ def test_codex_source_routes_build_real_relational_native_details_with_collision
             assert detail["model_breakdowns"]
             assert detail["input_tokens"] > 0
             assert detail["total_tokens"] > 0
-            assert detail["label"] == row["label"]
+            assert "label" not in row
+            assert detail["label"] is None
             assert detail["project"] == row["project"]
             assert detail["started_at"] == row["started_at"]
             assert detail["duration_min"] == row["duration_min"]

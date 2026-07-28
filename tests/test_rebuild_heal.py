@@ -229,6 +229,124 @@ def test_rebuild_fires_zero_alerts_and_cursor_at_high_water(ns, tmp_path, monkey
         rb.close()
 
 
+def test_rebuild_validation_failure_leaves_live_destination_untouched(
+    ns, tmp_path, monkeypatch
+):
+    """#388: validation is a publication gate, not a post-cutover diagnostic."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+
+    _seed_one_snapshot(jr, J)
+    before = _cctally_core.open_db()
+    try:
+        expected = before.execute(
+            "SELECT weekly_percent, journal_id "
+            "FROM weekly_usage_snapshots ORDER BY id"
+        ).fetchall()
+    finally:
+        before.close()
+
+    def reject(_conn, _high_water):
+        raise jr.JournalError("simulated representative B-tree validation failure")
+
+    monkeypatch.setattr(jr, "_validate_rebuilt_stats_index", reject)
+    with pytest.raises(jr.JournalError, match="representative B-tree"):
+        jr.rebuild_stats_index()
+
+    after = _cctally_core.open_db()
+    try:
+        actual = after.execute(
+            "SELECT weekly_percent, journal_id "
+            "FROM weekly_usage_snapshots ORDER BY id"
+        ).fetchall()
+    finally:
+        after.close()
+    assert actual == expected
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or not list(quarantine.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            "DROP TABLE quota_projection_state",
+            "table contract mismatch",
+        ),
+        (
+            "DROP INDEX idx_quota_blocks_active",
+            "index contract mismatch",
+        ),
+        (
+            "ALTER TABLE quota_projection_state "
+            "RENAME COLUMN physical_signature TO physical_signature_broken",
+            "schema definition mismatch",
+        ),
+        (
+            "PRAGMA user_version = 1000",
+            "has epoch 1000",
+        ),
+    ],
+)
+def test_rebuild_validator_rejects_each_publication_contract_clause(
+    ns, tmp_path, mutation, message
+):
+    """#388: schema names, indexes, definitions, and epoch are real gates."""
+    jr = _jr()
+    import _cctally_core
+
+    scratch = tmp_path / "validator.db"
+    conn = _cctally_core.open_db(_target_path=str(scratch))
+    try:
+        conn.execute(mutation)
+        conn.commit()
+        with pytest.raises(jr.JournalError, match=message):
+            jr._validate_rebuilt_stats_index(conn, None)
+    finally:
+        conn.close()
+
+
+def test_rebuild_validator_rejects_integrity_and_cursor_mismatch(ns, tmp_path):
+    jr = _jr()
+    import _cctally_core
+
+    scratch = tmp_path / "validator.db"
+    conn = _cctally_core.open_db(_target_path=str(scratch))
+    try:
+        class IntegrityFailure:
+            def execute(self, sql, *args):
+                if sql == "PRAGMA integrity_check":
+                    return [("database disk image is malformed",)]
+                return conn.execute(sql, *args)
+
+        with pytest.raises(jr.JournalError, match="failed integrity_check"):
+            jr._validate_rebuilt_stats_index(IntegrityFailure(), None)
+        with pytest.raises(jr.JournalError, match="pinned journal high-water"):
+            jr._validate_rebuilt_stats_index(conn, ("2099-01.jsonl", 7))
+    finally:
+        conn.close()
+
+
+def test_live_rebuild_fsyncs_quarantine_entry_in_app_dir(
+    ns, tmp_path, monkeypatch
+):
+    """#388: the quarantine root entry is durable before old sidecar removal."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+
+    _seed_one_snapshot(jr, J)
+    real_fsync_dir = jr._fsync_dir
+    fsynced = []
+
+    def record_fsync(path):
+        fsynced.append(pathlib.Path(path))
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(jr, "_fsync_dir", record_fsync)
+    jr.rebuild_stats_index()
+    assert _cctally_core.APP_DIR in fsynced
+
+
 def test_crash_replay_determinism(ns, tmp_path, monkeypatch):
     # Inject the §5.2 crash window: the cycle appended+fsync'd its evt lines but
     # the index COMMIT (and cursor advance) was lost. Raising in `_write_cursor`
@@ -534,3 +652,24 @@ def test_db_rebuild_command_json_envelope(ns, capsys):
     assert payload["totalRows"] >= 1
     assert payload["segmentsRead"] >= 1
     assert "durationSeconds" in payload
+
+
+def test_db_rebuild_prod_guard_precedes_common_cutover(
+    ns, monkeypatch, capsys
+):
+    """#388 must not move the #146 refusal behind scratch construction."""
+    import argparse
+    import _cctally_db
+    import _cctally_journal
+
+    monkeypatch.setattr(_cctally_db, "_would_block_prod_stats", lambda _path: True)
+
+    def forbidden_rebuild():
+        raise AssertionError("prod guard allowed rebuild construction")
+
+    monkeypatch.setattr(
+        _cctally_journal, "rebuild_stats_index", forbidden_rebuild
+    )
+    rc = ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=False))
+    assert rc == 2
+    assert "refusing to rebuild the prod stats.db" in capsys.readouterr().err

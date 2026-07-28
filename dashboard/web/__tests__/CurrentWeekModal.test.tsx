@@ -17,11 +17,9 @@ describe('<CurrentWeekModal />', () => {
     expect(pill).not.toBeNull();
     expect(pill?.classList.contains('m-pill')).toBe(true);
     expect(pill?.classList.contains('accent-green')).toBe(true);
-    // Fixture: week_label "Apr 21–28", reset "2026-04-28T00:00:00Z" → "Apr 28"
-    // Post-F1: literal " UTC" is gone — the offset suffix is rendered by
-    // datetime formatters (e.g. fmt.datetimeShortZ on the reset cell);
-    // the week-window pill is a pure date range with no clock time.
-    expect(pill?.textContent).toMatch(/Apr 21–28 → Apr 28/);
+    // A complete week_label already carries the effective range. The nominal
+    // reset is rendered separately in the mini-stat strip.
+    expect(pill?.textContent).toBe('Apr 21–28');
   });
 
   it('splits the big numeral into .int + .unit', () => {

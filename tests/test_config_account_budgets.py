@@ -9,7 +9,10 @@ validation, and the reserved-bucket / unknown-ref rejections.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -107,6 +110,54 @@ def test_unresolvable_ref_without_registry_exits_2(cc, capsys):
     # no accounts observed yet + a non-key ref -> clean exit 2 (never a crash)
     assert _set(cc, "budget.accounts", '{"nobody": 10}') == 2
     assert "no accounts observed yet" in capsys.readouterr().err
+
+
+def test_label_ref_during_stats_maintenance_names_the_hold(cc):
+    ka = _acc("claude", "uuid-a")
+    _seed([dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+                email="a@x.com", label="alice", label_source="auto")])
+
+    lock_path = _cctally_core.STATS_LOCK_MAINTENANCE_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [
+                sys.executable,
+                cc.__file__,
+                "config", "set", "budget.accounts", '{"alice": 50}',
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    err = result.stderr
+    assert "stats.db maintenance is in progress" in err
+    assert "no accounts observed yet" not in err
+    if _cctally_core.CONFIG_PATH.exists():
+        stored = json.loads(_cctally_core.CONFIG_PATH.read_text())
+        assert "accounts" not in stored.get("budget", {})
+
+
+def test_raw_key_during_stats_maintenance_remains_writable(
+    cc, monkeypatch,
+):
+    ka = _acc("claude", "uuid-a")
+    _seed([dict(at="2026-07-01T00:00:00Z", account_key=ka, provider="claude",
+                email="a@x.com", label="alice", label_source="auto")])
+
+    import _cctally_db
+    import _cctally_store
+
+    def maintenance_unavailable(*_args, **_kwargs):
+        raise _cctally_db.StatsDbMaintenanceError()
+
+    monkeypatch.setattr(_cctally_store, "stats_open_guarded",
+                        maintenance_unavailable)
+    key = "0123456789abcdef0123456789abcdef"
+    assert _set(cc, "budget.accounts", json.dumps({key: 25})) == 0
+    assert _stored_budget(cc)["accounts"] == {key: 25.0}
 
 
 def test_reserved_bucket_rejected(cc, capsys):

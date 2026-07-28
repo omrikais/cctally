@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost
+from _lib_pricing import claude_usage_dict as _claude_usage_dict
 
 
 # === Cache-report settings validator (spec 2026-05-21 §6) ================
@@ -406,12 +407,18 @@ def build_cache_report_snapshot(
                 timestamp=e.timestamp,
                 model=e.model,
                 cost_usd=e.cost_usd,
-                usage={
-                    "input_tokens": e.input_tokens,
-                    "output_tokens": e.output_tokens,
-                    "cache_creation_input_tokens": e.cache_creation_tokens,
-                    "cache_read_input_tokens": e.cache_read_tokens,
-                },
+                usage=_claude_usage_dict(   # #195 chokepoint
+                    input_tokens=e.input_tokens,
+                    output_tokens=e.output_tokens,
+                    cache_creation_tokens=e.cache_creation_tokens,
+                    cache_read_tokens=e.cache_read_tokens,
+                    # #195 / acceptance 7b: this bridge feeds BOTH the day-mode
+                    # cost_calculator AND _compute_entry_cache_dollars, so
+                    # dropping the split here would leave the dashboard's
+                    # Wasted $/Net $ 5m-priced while its total cost was correct.
+                    cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                    speed=getattr(e, "speed", None),
+                ),
             )
             for e in raw
         ]

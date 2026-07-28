@@ -21,8 +21,8 @@ interface UpdateStreamProps {
 //   step   — section header (.update-stream-step)
 //   exit   — neutral italic ("exited rc=N after Ts")
 //
-// `event_type === 'execvp' | 'done' | 'error_event' | 'heartbeat'` are
-// terminal/keep-alive events handled in the modal (status transitions);
+// `event_type === 'target' | 'execvp' | 'done' | 'error_event' | 'heartbeat'`
+// are target-refresh / terminal / keep-alive events handled in the modal;
 // they don't render here.
 export function UpdateStream({ events, maxLines = 500 }: UpdateStreamProps) {
   const scrollRef = useRef<HTMLPreElement>(null);

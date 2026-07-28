@@ -415,6 +415,11 @@ def test_dashboard_idle_dispatch_refreshes_quota_freshness_without_provider_aggr
     )
     first_codex = first.source_bundle.sources["codex"]
     assert first_codex.data["quota"]["summary"]["freshness"] == "fresh"
+    assert dict(first_codex.domain_freshness) == {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh",
+    }
 
     monkeypatch.setattr(
         ns["_cctally_tui"], "build_codex_source_state",
@@ -432,6 +437,12 @@ def test_dashboard_idle_dispatch_refreshes_quota_freshness_without_provider_aggr
     assert idle_codex.last_success_at == first_codex.last_success_at
     assert idle_codex.data["quota"]["summary"]["freshness"] == "stale"
     assert idle_codex.data["quota"]["histories"][0]["forecast"]["status"] == "stale"
+    assert idle_codex.freshness == "fresh"
+    assert dict(idle_codex.domain_freshness) == {
+        "hero": "fresh",
+        "quota": "stale",
+        "sessions": "fresh",
+    }
 
 
 def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation_moves(
@@ -1255,6 +1266,11 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
         assert first_codex.capabilities["hero"].status == "unavailable"
         assert first_codex.data["hero"]["cycle"] is None
         assert first_codex.warnings[0].code == "codex_projection_incoherent"
+        assert dict(first_codex.domain_freshness) == {
+            "hero": "fresh",
+            "quota": "stale",
+            "sessions": "fresh",
+        }
         physical_seq = _physical_seq(cache)
         dispatch_signature = tui._tui_compute_dispatch_signature(stats)
 
@@ -1300,6 +1316,11 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
             assert codex.capabilities["hero"].status == "unavailable"
             assert codex.data["hero"]["cycle"] is None
             assert codex.warnings[0].code == "codex_projection_incoherent"
+            assert dict(codex.domain_freshness) == {
+                "hero": "fresh",
+                "quota": "stale",
+                "sessions": "fresh",
+            }
             assert snapshot.source_bundle.sources["claude"] is first.source_bundle.sources["claude"]
             wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(codex)
             assert "clock_data" not in wire

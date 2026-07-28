@@ -7,6 +7,10 @@ end-of-period, and a verdict (`ok` / `warn` / `over`); `cctally budget set
 alerts are enabled, a desktop alert fires once per crossed threshold as actual
 spend passes it (see [Alert behavior](#alert-behavior)).
 
+> **Claude cost coverage:** Claude spend is a
+> [transcript-derived lower bound](../claude-cost-coverage.md), not an exact
+> `/usage` billing total. Codex accounting is unaffected.
+
 The Claude budget defaults to the **subscription week** (the original v1
 behavior) but can run over a **calendar week** or **calendar month** instead. A
 separate **Codex (OpenAI) budget** tracks Codex's *actual API dollars* over a

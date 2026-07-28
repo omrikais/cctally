@@ -30,6 +30,7 @@ def _reset_logger_state():
     root = logging.getLogger("cctally")
     for h in list(root.handlers):
         root.removeHandler(h)
+    root.propagate = True
 
 
 def _run_crashing(mod, monkeypatch, capsys, debug: bool):

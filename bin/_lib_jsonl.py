@@ -29,11 +29,27 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from _lib_codex_pools import codex_model_scoped_quota_pool
 from _lib_source_identity import canonical_identity_from_root_key
 
 
 def _eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+def _coerce_split_token(v):
+    """#195: drift-safe int coercion for a nested cache_creation subfield.
+    Returns None when the value is unusable, which makes the split UNKNOWN and
+    falls back to flat-token pricing. Mirrors the malformed-costUSD hardening
+    (#279 S3) — a drifted subfield must never abort a whole cache sync."""
+    if v is None:
+        return 0
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -203,6 +219,33 @@ def _classify_cost_entry(obj, path_str: str):
         # ingest path can't accidentally store these rows even if a downstream
         # loop forgets to double-check (see `sync_cache` in _cctally_cache.py).
         return None, "synthetic"
+
+    # #195: normalize the nested cache-write TTL breakdown into flat sibling
+    # keys at this single chokepoint, so wire-shape knowledge lives in exactly
+    # one function and both cost paths carry byte-identical dict shapes.
+    # Placed AFTER the reject gates so a skipped line never pays for it, and
+    # BEFORE the timestamp parse so it does not disturb the gating ORDER
+    # contract (type -> raw-timestamp -> usage -> model -> synthetic -> parse).
+    cc = usage.get("cache_creation")
+    if isinstance(cc, dict):
+        _h = _coerce_split_token(cc.get("ephemeral_1h_input_tokens"))
+        _m = _coerce_split_token(cc.get("ephemeral_5m_input_tokens"))
+        if _h is not None and _m is not None:
+            # Shallow copy: _iter_sync_entries walks this same parsed obj for
+            # conversation_messages rows and must not see synthesized keys.
+            usage = dict(usage)
+            usage["cache_creation_1h_input_tokens"] = _h
+            usage["cache_creation_5m_input_tokens"] = _m
+
+    # #413: only a retained string can be an authoritative effective tier.
+    # SQLite cannot bind container values, and letting a malformed object/list
+    # reach the cache write would reject the entire source file. Normalize every
+    # non-string value to the same absent/standard shape at this shared parser
+    # chokepoint so cache ingest and the direct fallback remain in lockstep.
+    speed = usage.get("speed")
+    if speed is not None and not isinstance(speed, str):
+        usage = dict(usage)
+        usage.pop("speed", None)
 
     try:
         ts = dt.datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
@@ -596,20 +639,6 @@ def _codex_logical_limit_key(
     if (model_pool := codex_model_scoped_quota_pool(model)) is not None:
         payload["modelPool"] = model_pool
     return _codex_canonical_json(payload)
-
-
-def codex_model_scoped_quota_pool(model: object) -> str | None:
-    """Return the native model pool when Codex documents it as separate.
-
-    GPT Codex Spark runs against its own allowance and does not consume the
-    standard Codex quota.  Native payloads currently reuse ``limit_id=codex``
-    and the same slot/duration as the standard pool, so the sticky rollout
-    model is the only retained discriminator.
-    """
-    if not isinstance(model, str):
-        return None
-    normalized = model.strip().lower()
-    return normalized if "-codex-spark" in normalized else None
 
 
 def _codex_quota_observations(

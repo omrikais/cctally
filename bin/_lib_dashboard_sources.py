@@ -17,6 +17,7 @@ PhysicalSource = Literal["claude", "codex"]
 DashboardSelection = Literal["claude", "codex", "all"]
 Availability = Literal["ok", "empty", "partial", "unavailable"]
 Freshness = Literal["fresh", "stale"]
+FreshnessDomain = Literal["hero", "quota", "sessions"]
 CapabilityStatus = Literal[
     "supported", "derived", "unavailable", "deferred", "not_applicable",
 ]
@@ -24,6 +25,7 @@ CapabilityStatus = Literal[
 SOURCE_SCHEMA_VERSION = 1
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
+SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
 
 _PHYSICAL_SOURCES = frozenset(("claude", "codex"))
 _SELECTIONS = frozenset(SOURCE_ORDER)
@@ -109,10 +111,19 @@ class SourceDashboardState:
     last_success_at: dt.datetime | None
     capabilities: Mapping[str, CapabilityRecord]
     data: Mapping[str, object] | None
+    # Domain freshness is orthogonal to provider-generation coherence. Legacy
+    # constructors may omit it; they deterministically inherit the provider
+    # value for every known domain.
+    domain_freshness: Mapping[str, Freshness] | None = None
     # Immutable, server-only facts used to advance an idle presentation clock.
     # They are deliberately separate from ``data`` so no internal accounting
     # evidence becomes part of the public source-envelope contract.
     clock_data: Mapping[str, object] | None = None
+    # Request-gated transcript content. This mapping is frozen with the source
+    # generation but is deliberately outside ``data``: source serialization
+    # publishes only ``data``, then the HTTP/SSE envelope layer injects a label
+    # into its request-local copies when that request's transcript gate is open.
+    private_session_labels: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         validate_dashboard_selection(self.source)
@@ -120,6 +131,16 @@ class SourceDashboardState:
             raise ValueError("unsupported availability")
         if self.freshness not in _FRESHNESS:
             raise ValueError("unsupported freshness")
+        domain_freshness = (
+            {domain: self.freshness for domain in SOURCE_FRESHNESS_DOMAINS}
+            if self.domain_freshness is None else dict(self.domain_freshness)
+        )
+        if set(domain_freshness) != set(SOURCE_FRESHNESS_DOMAINS):
+            raise ValueError(
+                "domain freshness must contain exactly hero, quota, and sessions"
+            )
+        if any(value not in _FRESHNESS for value in domain_freshness.values()):
+            raise ValueError("unsupported domain freshness")
         if not isinstance(self.data_version, str):
             raise ValueError("data_version must be a string")
         if self.availability != "unavailable":
@@ -141,10 +162,20 @@ class SourceDashboardState:
             raise ValueError("capabilities must contain CapabilityRecord values")
         object.__setattr__(self, "warnings", warnings)
         object.__setattr__(self, "capabilities", _freeze(capabilities))
+        object.__setattr__(self, "domain_freshness", _freeze(domain_freshness))
         if self.data is not None:
             object.__setattr__(self, "data", _freeze(self.data))
         if self.clock_data is not None:
             object.__setattr__(self, "clock_data", _freeze(self.clock_data))
+        if self.private_session_labels is not None:
+            private_session_labels = {
+                _nonempty_string(key, "private session label key"):
+                _nonempty_string(value, "private session label")
+                for key, value in self.private_session_labels.items()
+            }
+            object.__setattr__(
+                self, "private_session_labels", _freeze(private_session_labels),
+            )
 
 
 @dataclass(frozen=True)
@@ -246,7 +277,11 @@ def degrade_source_state(
         last_success_at=prior.last_success_at,
         capabilities=prior.capabilities,
         data=prior.data,
+        domain_freshness={
+            domain: "stale" for domain in SOURCE_FRESHNESS_DOMAINS
+        },
         clock_data=prior.clock_data,
+        private_session_labels=prior.private_session_labels,
     )
 
 
@@ -267,7 +302,26 @@ def unavailable_source_state(
         last_success_at=None,
         capabilities={},
         data=None,
+        domain_freshness={
+            domain: "stale" for domain in SOURCE_FRESHNESS_DOMAINS
+        },
     )
+
+
+def source_domain_freshness(
+    state: SourceDashboardState,
+    domain: FreshnessDomain,
+) -> Freshness:
+    """Return one domain value with the frozen legacy-provider fallback."""
+    if domain not in SOURCE_FRESHNESS_DOMAINS:
+        raise ValueError("unsupported freshness domain")
+    mapping = getattr(state, "domain_freshness", None)
+    if isinstance(mapping, Mapping):
+        value = mapping.get(domain)
+        if value in _FRESHNESS:
+            return value
+    provider = getattr(state, "freshness", "stale")
+    return provider if provider in _FRESHNESS else "stale"
 
 
 def _coherent_provider(state: SourceDashboardState) -> bool:
@@ -303,6 +357,8 @@ def _hero_cycle_is_stale(state: SourceDashboardState) -> bool:
     ``hero.cycle_freshness`` is additive and OMITTED while the cycle is fresh, so
     this is false for every provider and every generation that predates #350.
     """
+    if source_domain_freshness(state, "hero") == "stale":
+        return True
     if not isinstance(state.data, Mapping):
         return False
     hero = state.data.get("hero")
@@ -429,7 +485,15 @@ def compose_all_state(
     version_material = json.dumps(
         [
             claude.data_version, claude.availability, claude.freshness,
+            [
+                source_domain_freshness(claude, domain)
+                for domain in SOURCE_FRESHNESS_DOMAINS
+            ],
             codex.data_version, codex.availability, codex.freshness,
+            [
+                source_domain_freshness(codex, domain)
+                for domain in SOURCE_FRESHNESS_DOMAINS
+            ],
             combined is not None,
         ],
         separators=(",", ":"),
@@ -461,6 +525,17 @@ def compose_all_state(
                 "claude": claude.data,
                 "codex": codex.data,
             },
+        },
+        domain_freshness={
+            domain: (
+                "fresh"
+                if all(
+                    source_domain_freshness(state, domain) == "fresh"
+                    for state in (claude, codex)
+                )
+                else "stale"
+            )
+            for domain in SOURCE_FRESHNESS_DOMAINS
         },
     )
 

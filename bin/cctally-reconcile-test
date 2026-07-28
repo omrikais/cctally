@@ -4650,6 +4650,152 @@ upct_writeclamp_run_scn () {
 upct_writeclamp_run_scn U-PCT4a reset  "$SCRATCH_DIR/upct-w4-reset"  41
 upct_writeclamp_run_scn U-PCT4b credit "$SCRATCH_DIR/upct-w4-credit" 46
 
+# ----------------------------------------------------------------------------
+# R-TTL1/R-TTL2 (#195): the cache-write TTL split reconciles across both cost
+# paths, and it is NON-VACUOUS.
+#
+# Every pre-#195 fixture carries no nested `usage.cache_creation`, so the whole
+# suite exercises only the fallback branch — a green suite proves nothing about
+# the fix. This scenario is the one deliberately split-bearing fixture: its
+# JSONL carries `{ephemeral_1h_input_tokens, ephemeral_5m_input_tokens}`.
+#
+#   R-TTL1  the CACHE-backed cost path and the DIRECT-JSONL cost path agree
+#           within 1e-9 USD (they must carry byte-identical usage dict shapes,
+#           which is the whole point of normalizing at the ingest chokepoint).
+#   R-TTL2  the split-bearing cost is STRICTLY GREATER than the same fixture
+#           with the split stripped. Without this the invariant would pass on an
+#           implementation that silently ignored the split on both paths.
+# ----------------------------------------------------------------------------
+ttl_split_run () {
+    local name="R-TTL" h="$SCRATCH_DIR/ttl-split"
+    local out rc
+    mkdir -p "$h"
+    out=$(RECONCILE_BIN="$BIN" RECONCILE_HOME="$h" \
+          PYTHONPATH="$REPO_ROOT/bin" TZ=Etc/UTC python3 - <<'PYTTL' 2>&1); rc=$?
+import json, os, pathlib, shutil, subprocess, sys
+
+BIN = os.environ["RECONCILE_BIN"]
+HOME = pathlib.Path(os.environ["RECONCILE_HOME"])
+sys.path.insert(0, str(pathlib.Path(BIN).resolve().parent))
+import _fixture_builders as fb
+
+MODEL = "claude-opus-4-7"
+CC = 100_000          # flat cache-creation tokens per entry
+H = 60_000            # 1-hour portion
+
+def build(home: pathlib.Path, with_split: bool) -> None:
+    if home.exists():
+        shutil.rmtree(home)
+    projects = home / ".claude" / "projects" / "-ttl"
+    projects.mkdir(parents=True, exist_ok=True)
+    (home / ".local" / "share" / "cctally").mkdir(parents=True, exist_ok=True)
+    sid = "00000000-0000-0000-0000-00000000ttl1"
+    fb.emit_streaming_pair(
+        projects / f"{sid}.jsonl",
+        model=MODEL, msg_id="msg_ttl_1", req_id="req_ttl_1",
+        ts_intermediate="2026-04-30T10:00:00.100Z",
+        ts_final="2026-04-30T10:00:00.500Z",
+        intermediate_output_tokens=1, final_output_tokens=500,
+        cache_read_tokens=1_000, cache_create_tokens=CC,
+        cache_1h_tokens=(H if with_split else None),
+        input_tokens=10, session_id=sid, cwd="/ttl", append=False,
+    )
+
+def costs(home: pathlib.Path) -> "tuple[float, float]":
+    """(cache_backed_cost, direct_jsonl_cost) for the fixture window.
+
+    Drives the TWO INDEPENDENT cost paths directly rather than the CLI: after a
+    real `sync_cache()`, `iter_entries` reads the materialized split columns,
+    while `_collect_entries_direct` re-parses the JSONL through
+    `_classify_cost_entry`. Both must produce byte-identical usage dict shapes —
+    that is exactly what normalizing at the single ingest chokepoint buys — so
+    their summed cost must agree.
+    """
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["CCTALLY_DATA_DIR"] = str(home / ".local" / "share" / "cctally")
+    # The probe runs from the repo checkout; pin the data dir explicitly and
+    # suppress dev auto-detect so it can never touch the real dev/prod DBs.
+    env["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", PROBE], capture_output=True, text=True,
+        env=env, check=False)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"probe exited {proc.returncode}:\n{proc.stderr.strip()}\n"
+            f"stdout={proc.stdout.strip()[:400]}")
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    return payload["cached"], payload["direct"]
+
+PROBE = r"""
+import datetime as dt, importlib.util as ilu, json, os, pathlib, sys
+from importlib.machinery import SourceFileLoader
+
+BINDIR = os.environ["RECONCILE_BINDIR"]
+sys.path.insert(0, BINDIR)
+# _cctally_cache reaches back through sys.modules["cctally"], so the entry
+# point must be loaded before any cache call.
+_loader = SourceFileLoader("cctally", os.path.join(BINDIR, "cctally"))
+_spec = ilu.spec_from_loader("cctally", _loader)
+_mod = ilu.module_from_spec(_spec)
+sys.modules["cctally"] = _mod
+_loader.exec_module(_mod)
+import _cctally_cache as cache
+import _lib_pricing as pricing
+
+start = dt.datetime(2026, 4, 30, tzinfo=dt.timezone.utc)
+end = dt.datetime(2026, 5, 1, tzinfo=dt.timezone.utc)
+
+def total(entries):
+    return sum(pricing._calculate_entry_cost(e.model, e.usage, mode="auto",
+                                             cost_usd=e.cost_usd)
+               for e in entries)
+
+conn = cache.open_cache_db()
+cache.sync_cache(conn)
+cached = total(cache.iter_entries(conn, start, end))
+conn.close()
+direct = total(cache._collect_entries_direct(start, end))
+print(json.dumps({"cached": cached, "direct": direct}))
+"""
+
+os.environ["RECONCILE_BINDIR"] = str(pathlib.Path(BIN).resolve().parent)
+
+split_home = HOME / "with-split"
+plain_home = HOME / "no-split"
+build(split_home, True)
+build(plain_home, False)
+
+cached, direct = costs(split_home)
+plain, plain_direct = costs(plain_home)
+
+print(json.dumps({"cached": cached, "direct": direct,
+                  "plain": plain, "plain_direct": plain_direct}))
+if abs(cached - direct) >= 1e-9:
+    raise SystemExit(
+        f"R-TTL1: cache path {cached!r} != direct-JSONL path {direct!r} "
+        f"(delta {cached - direct!r}; tolerance 1e-9)")
+if abs(plain - plain_direct) >= 1e-9:
+    raise SystemExit(
+        f"R-TTL1: split-free fixture also diverges: {plain!r} vs {plain_direct!r}")
+if not cached > plain:
+    raise SystemExit(
+        f"R-TTL2 VACUOUS: split-bearing cost {cached!r} is not strictly greater "
+        f"than split-stripped cost {plain!r} - the 1h portion is being priced at "
+        f"the 5-minute rate, so this fixture proves nothing")
+PYTTL
+    if [ "$rc" -eq 0 ]; then
+        echo "PASS R-TTL1 ttl-split (cache path == direct-JSONL path, 1e-9)"
+        echo "PASS R-TTL2 ttl-split (split-bearing cost > split-stripped cost)"
+        pass_count=$((pass_count + 2))
+    else
+        echo "RECONCILE FAIL $name ttl-split: $out"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+ttl_split_run
+
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

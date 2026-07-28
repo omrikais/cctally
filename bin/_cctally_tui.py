@@ -1030,6 +1030,100 @@ def _tui_build_five_hour_milestones(
     return out
 
 
+@dataclass(frozen=True)
+class SyncFailureAttribution:
+    """Database ownership retained at the dashboard leg catch boundary.
+
+    The raw compatibility string remains on ``DataSnapshot.last_sync_error``;
+    this compact sidecar carries only the facts needed for truthful,
+    privacy-safe envelope classification.
+    """
+
+    leg: str
+    database: str
+    corruption: bool
+
+
+class _StatsSnapshotCorruption(Exception):
+    """Internal control signal for one post-query stats heal attempt."""
+
+    def __init__(self, cause: Exception) -> None:
+        self.cause = cause
+        super().__init__(str(cause))
+
+
+def _tui_attribute_corruption(
+    conn: sqlite3.Connection,
+    exc: Exception,
+    *,
+    database: str,
+) -> tuple[str, bool]:
+    """Classify corruption against the actual database at the catch site.
+
+    Mixed stats/cache builders can surface the same SQLite message from either
+    family.  Only after a corruption-shaped exception do we run the expensive
+    stats ``quick_check``: a failed/non-ok result positively attributes stats;
+    an intact stats family leaves the failure attributed to cache.  No path or
+    exception-text parsing is used for database identity.
+    """
+
+    corruption = bool(_cctally()._is_sqlite_corruption_error(exc))
+    attributed = database
+    if corruption and database == "stats_or_cache":
+        try:
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            stats_ok = len(rows) == 1 and tuple(rows[0]) == ("ok",)
+            attributed = "cache" if stats_ok else "stats"
+        except sqlite3.DatabaseError:
+            attributed = "stats"
+    return attributed, corruption
+
+
+def _tui_capture_sync_failure(
+    conn: sqlite3.Connection,
+    errors: list[str],
+    failures: list[SyncFailureAttribution],
+    *,
+    leg: str,
+    database: str,
+    exc: Exception,
+    stats_heal_attempted: bool,
+) -> None:
+    """Record one attributed leg failure or request the single stats retry."""
+
+    attributed_database, corruption = _tui_attribute_corruption(
+        conn, exc, database=database
+    )
+    failure = SyncFailureAttribution(
+        leg=leg,
+        database=attributed_database,
+        corruption=corruption,
+    )
+    if (
+        failure.database == "stats"
+        and failure.corruption
+        and not stats_heal_attempted
+    ):
+        raise _StatsSnapshotCorruption(exc)
+    failures.append(failure)
+    errors.append(f"{leg}: {exc}")
+
+
+def _tui_heal_post_query_stats(exc: Exception) -> bool:
+    """Invoke the existing stats replacement engine after all handles close."""
+
+    import _cctally_store
+
+    heal = getattr(_cctally_store, "HEAL_HOOK", None)
+    if heal is None:
+        return False
+    try:
+        return bool(heal("stats", exc, post_query=True))
+    except Exception as heal_exc:  # noqa: BLE001 — snapshot must still degrade
+        eprint(f"[heal] dashboard stats auto-heal failed: {heal_exc}")
+        return False
+
+
 @dataclass
 class DataSnapshot:
     """All data needed to render one TUI frame. Produced by sync thread,
@@ -1041,6 +1135,7 @@ class DataSnapshot:
     last_sync_at: float | None    # monotonic (time.monotonic())
     last_sync_error: str | None
     generated_at: dt.datetime     # wall-clock UTC for displayed timestamps
+    sync_failures: tuple[SyncFailureAttribution, ...] = ()
     # ---- v2 additions (spec §4.5) ----
     percent_milestones: list[TuiPercentMilestone] = field(default_factory=list)
     weekly_history: list[TuiTrendRow] = field(default_factory=list)
@@ -1922,7 +2017,8 @@ def _fetch_affected_session_entries(
     sql = (
         "SELECT se.timestamp_utc, se.model, se.input_tokens, se.output_tokens, "
         "  se.cache_create_tokens, se.cache_read_tokens, se.source_path, "
-        "  sf.session_id, sf.project_path, se.cost_usd_raw, se.speed "
+        "  sf.session_id, sf.project_path, se.cost_usd_raw, se.speed, "
+        "  se.cache_create_1h_tokens "
         "FROM session_entries se "
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ? "
@@ -1958,6 +2054,7 @@ def _fetch_affected_session_entries(
             project_path=row[8],
             cost_usd=row[9],
             usage_extra=({"speed": row[10]} if row[10] is not None else None),
+            cache_1h_tokens=row[11],   # #195
         )
         for row in rows
     ]
@@ -2038,7 +2135,7 @@ def _tui_build_session_detail_indexed(
             f"  se.input_tokens, se.output_tokens, "
             f"  se.cache_create_tokens, se.cache_read_tokens, "
             f"  se.source_path, sf.session_id, sf.project_path, "
-            f"  se.cost_usd_raw "
+            f"  se.cost_usd_raw, se.speed, se.cache_create_1h_tokens "
             f"FROM session_entries se "
             f"LEFT JOIN session_files sf ON sf.path = se.source_path "
             f"WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ? "
@@ -2058,6 +2155,8 @@ def _tui_build_session_detail_indexed(
                 session_id=row[7],
                 project_path=row[8],
                 cost_usd=row[9],
+                usage_extra=({"speed": row[10]} if row[10] is not None else None),
+                cache_1h_tokens=row[11],   # #195
             )
             for row in cur
         ]
@@ -2384,6 +2483,73 @@ def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object
     }
 
 
+def _tui_claude_domain_freshness(
+    source_data: dict[str, object] | None,
+) -> dict[str, str]:
+    """Derive Claude axes from its selected weekly snapshot evidence.
+
+    The legacy current-week label has a third presentation-only ``aging``
+    state. The source contract deliberately keeps the frozen fresh/stale
+    vocabulary: only the exact stale label moves the weekly hero/quota axes.
+    Missing evidence remains a capability/availability concern.
+    """
+    data = source_data if isinstance(source_data, dict) else {}
+    hero = data.get("hero")
+    current_week = hero.get("current_week") if isinstance(hero, dict) else None
+    freshness = (
+        current_week.get("freshness")
+        if isinstance(current_week, dict) else None
+    )
+    weekly = (
+        "stale"
+        if isinstance(freshness, dict) and freshness.get("label") == "stale"
+        else "fresh"
+    )
+    return {"hero": weekly, "quota": weekly, "sessions": "fresh"}
+
+
+def _refresh_claude_source_clock(
+    state: SourceDashboardState,
+    *,
+    current_week: object,
+    now_utc: dt.datetime,
+    raw_config: dict[str, object],
+) -> SourceDashboardState:
+    """Advance Claude's weekly axes from frozen snapshot evidence only."""
+    if state.source != "claude":
+        return state
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    captured = getattr(current_week, "latest_snapshot_at", None)
+    if not isinstance(captured, dt.datetime):
+        return state
+    if captured.tzinfo is None or captured.utcoffset() is None:
+        captured = captured.replace(tzinfo=dt.timezone.utc)
+    age_seconds = max(
+        0.0,
+        (
+            now_utc.astimezone(dt.timezone.utc)
+            - captured.astimezone(dt.timezone.utc)
+        ).total_seconds(),
+    )
+    try:
+        freshness_config = _get_oauth_usage_config(raw_config)
+    except Exception:
+        freshness_config = _OAUTH_USAGE_DEFAULTS
+    weekly = (
+        "stale"
+        if _freshness_label(age_seconds, freshness_config) == "stale"
+        else "fresh"
+    )
+    domain_freshness = dict(state.domain_freshness or {})
+    domain_freshness.update({"hero": weekly, "quota": weekly})
+    refreshed = dataclasses.replace(
+        state,
+        domain_freshness=domain_freshness,
+    )
+    return state if refreshed == state else refreshed
+
+
 def _tui_build_source_bundle(
     *,
     stats_conn,
@@ -2409,18 +2575,18 @@ def _tui_build_source_bundle(
     c = _cctally()
     cache_conn = c.open_cache_db()
     cache_read_tx = False
-    stats_read_tx = False
     try:
-        # Read both databases through stable snapshots.  cache.db and stats.db
-        # cannot share one SQLite transaction, so a post-build signature check
-        # below rejects a generation that moves while the two snapshots are
-        # being assembled.
+        # Keep cache.db on one stable snapshot, but leave stats.db in
+        # statement-scoped autocommit.  A dashboard source build can spend
+        # seconds folding provider rows; holding one stats read transaction
+        # across that CPU work pins every intervening WAL frame and defeats
+        # SQLite's default 1,000-page autocheckpoint (#393).  The before/after
+        # composite signature below is already the cross-database consistency
+        # gate: any stats generation movement rejects this build, so a long
+        # stats snapshot buys no correctness and creates unbounded WAL growth.
         if not cache_conn.in_transaction:
             cache_conn.execute("BEGIN")
             cache_read_tx = True
-        if not stats_conn.in_transaction:
-            stats_conn.execute("BEGIN")
-            stats_read_tx = True
         if common_range_start is None:
             common_range_start = now_utc - dt.timedelta(days=30)
         if common_range_start.tzinfo is None or common_range_start.utcoffset() is None:
@@ -2547,6 +2713,7 @@ def _tui_build_source_bundle(
                     ),
                     **({"accounts": claude_accounts} if claude_accounts else {}),
                 },
+                domain_freshness=_tui_claude_domain_freshness(claude_data),
             )
         if codex_ingest_failed:
             warning = SourceDashboardWarning(
@@ -2643,9 +2810,6 @@ def _tui_build_source_bundle(
         if cache_read_tx:
             cache_conn.rollback()
             cache_read_tx = False
-        if stats_read_tx:
-            stats_conn.rollback()
-            stats_read_tx = False
         post_stats_digest = codex_stats_digest(stats_conn)
         post_signature = c.compute_signature(
             cache_conn,
@@ -2662,8 +2826,6 @@ def _tui_build_source_bundle(
     finally:
         if cache_read_tx:
             cache_conn.rollback()
-        if stats_read_tx:
-            stats_conn.rollback()
         cache_conn.close()
 
 
@@ -2685,6 +2847,7 @@ def _tui_hydrating_source_bundle() -> SourceDashboardBundle:
         last_success_at=None,
         capabilities={},
         data=None,
+        domain_freshness={"hero": "stale", "quota": "stale", "sessions": "stale"},
     )
     codex = SourceDashboardState(
         source="codex",
@@ -2695,6 +2858,7 @@ def _tui_hydrating_source_bundle() -> SourceDashboardBundle:
         last_success_at=None,
         capabilities={},
         data=None,
+        domain_freshness={"hero": "stale", "quota": "stale", "sessions": "stale"},
     )
     return SourceDashboardBundle(
         source_schema_version=1,
@@ -2719,6 +2883,8 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
         state = bundle.sources.get(source)
         if not isinstance(state, SourceDashboardState):
             return False
+        # Idle eligibility is provider-generation coherence, deliberately not a
+        # hero/quota/sessions age aggregate.
         if (state.availability not in ("ok", "empty")
                 or state.freshness != "fresh"
                 or state.data is None):
@@ -2753,6 +2919,55 @@ def _tui_build_snapshot(
     display_tz_pref_override: "str | None" = None,
     precompute_envelope: bool = False,
     runtime_bind: "str | None" = None,
+) -> DataSnapshot:
+    """Build once, then perform at most one post-query stats heal/reopen."""
+
+    try:
+        return _tui_build_snapshot_once(
+            now_utc=now_utc,
+            skip_sync=skip_sync,
+            display_tz_pref_override=display_tz_pref_override,
+            precompute_envelope=precompute_envelope,
+            runtime_bind=runtime_bind,
+            stats_heal_attempted=False,
+        )
+    except _StatsSnapshotCorruption as fault:
+        # ``_tui_build_snapshot_once`` closes its live stats connection before
+        # this boundary. The replacement-capable hook can therefore satisfy
+        # the whole-family drain gate, and the retry opens the published family.
+        _tui_heal_post_query_stats(fault.cause)
+        try:
+            return _tui_build_snapshot_once(
+                now_utc=now_utc,
+                # The first attempt already completed the one cache ingest plan.
+                skip_sync=True,
+                display_tz_pref_override=display_tz_pref_override,
+                precompute_envelope=precompute_envelope,
+                runtime_bind=runtime_bind,
+                stats_heal_attempted=True,
+            )
+        except Exception as retry_exc:
+            # A fresh opener can still lose a race to damage/maintenance after
+            # the heal returns. Corruption on this one retry is a stable,
+            # typed degraded frame—not a third attempt or a dashboard crash.
+            if not _cctally()._is_sqlite_corruption_error(retry_exc):
+                raise
+            return _tui_stats_retry_degraded_snapshot(
+                now_utc=now_utc or dt.datetime.now(dt.timezone.utc),
+                exc=retry_exc,
+                precompute_envelope=precompute_envelope,
+                runtime_bind=runtime_bind,
+            )
+
+
+def _tui_build_snapshot_once(
+    *,
+    now_utc: dt.datetime | None = None,
+    skip_sync: bool = False,
+    display_tz_pref_override: "str | None" = None,
+    precompute_envelope: bool = False,
+    runtime_bind: "str | None" = None,
+    stats_heal_attempted: bool,
 ) -> DataSnapshot:
     """Single-shot build of a DataSnapshot from the DB + cache.
 
@@ -2803,6 +3018,23 @@ def _tui_build_snapshot(
     conn = open_db()
     try:
         errors: list[str] = []
+        sync_failures: list[SyncFailureAttribution] = []
+
+        def capture_failure(
+            leg: str,
+            database: str,
+            exc: Exception,
+        ) -> None:
+            _tui_capture_sync_failure(
+                conn,
+                errors,
+                sync_failures,
+                leg=leg,
+                database=database,
+                exc=exc,
+                stats_heal_attempted=stats_heal_attempted,
+            )
+
         cw: TuiCurrentWeek | None = None
         fc: Any | None = None
         trend: list[TuiTrendRow] = []
@@ -2851,6 +3083,7 @@ def _tui_build_snapshot(
                                 return None, exc
 
                         operations = [_claude_leg]
+                        operation_origins = ["view_model.claude.sync"]
                         if precompute_envelope:
                             def _codex_leg(active_conn):
                                 try:
@@ -2865,10 +3098,13 @@ def _tui_build_snapshot(
                                     return None, exc
 
                             operations.append(_codex_leg)
+                            operation_origins.append("view_model.codex.sync")
 
                         results, cache_conn = (
                             cache_mod._run_cache_plan_with_recovery(
-                                cache_conn, tuple(operations)
+                                cache_conn,
+                                tuple(operations),
+                                origins=tuple(operation_origins),
                             )
                         )
                         claude_ingest, claude_error = results[0]
@@ -2878,7 +3114,9 @@ def _tui_build_snapshot(
                             )
                         else:
                             claude_ingest_failed = True
-                            errors.append(f"sync-cache: {claude_error}")
+                            capture_failure(
+                                "sync-cache", "cache", claude_error
+                            )
                         if precompute_envelope:
                             codex_ingest, codex_error = results[1]
                             if codex_error is None:
@@ -2887,14 +3125,16 @@ def _tui_build_snapshot(
                                 )
                             else:
                                 codex_ingest_failed = True
-                                errors.append(f"sync-codex-cache: {codex_error}")
+                                capture_failure(
+                                    "sync-codex-cache", "cache", codex_error
+                                )
                     finally:
                         cache_conn.close()
                 except Exception as exc:
                     claude_ingest_failed = True
                     if precompute_envelope:
                         codex_ingest_failed = True
-                    errors.append(f"sync-cache-open: {exc}")
+                    capture_failure("sync-cache-open", "cache", exc)
         # Force pure reads for every view builder below, independent of the
         # caller's flag: the single ingest above is the only glob per tick.
         skip_sync = True
@@ -2963,13 +3203,13 @@ def _tui_build_snapshot(
                 if prior_snap is not None:
                     prior_source_bundle = getattr(prior_snap, "source_bundle", None)
             except Exception as exc:
-                errors.append(f"prior-source-bundle: {exc}")
+                capture_failure("prior-source-bundle", "other", exc)
             dispatch_sig = None
             with _perf.phase("signature"):
                 try:
                     dispatch_sig = _tui_compute_dispatch_signature(conn)
                 except Exception as exc:
-                    errors.append(f"dispatch-signature: {exc}")
+                    capture_failure("dispatch-signature", "stats_or_cache", exc)
                     dispatch_sig = None
             if dispatch_sig is not None:
                 # The idle decision keys on the DB signature AND a render key
@@ -2993,6 +3233,12 @@ def _tui_build_snapshot(
                 data_version = _snapshot_data_version(dispatch_sig)
                 if (prior_snap is not None and prior_key is not None
                         and dispatch_key == prior_key
+                        and not any(
+                            failure.database == "stats" and failure.corruption
+                            for failure in getattr(
+                                prior_snap, "sync_failures", ()
+                            )
+                        )
                         and not _snapshot_period_rolled_over(
                             prior_snap, now_utc, _build_display_tz)):
                     with _perf.phase("idle-decision"):
@@ -3109,12 +3355,12 @@ def _tui_build_snapshot(
                     finally:
                         _rc_cache_conn.close()
                 except Exception as exc:
-                    errors.append(f"snapshot-cache-reconcile: {exc}")
+                    capture_failure("snapshot-cache-reconcile", "cache", exc)
         with _perf.phase("build.current_week"):
             try:
                 cw = _tui_build_current_week(conn, now_utc, skip_sync=skip_sync)
             except Exception as exc:
-                errors.append(f"current-week: {exc}")
+                capture_failure("current-week", "stats_or_cache", exc)
         fc_view = None
         with _perf.phase("build.forecast"):
             try:
@@ -3128,7 +3374,7 @@ def _tui_build_snapshot(
                 )
                 fc = fc_view.output if fc_view is not None else None
             except Exception as exc:
-                errors.append(f"forecast: {exc}")
+                capture_failure("forecast", "stats_or_cache", exc)
         # Trend: source from build_trend_view so we capture the 3-sample
         # avg_dollars_per_pct alongside the rows. The TUI build path
         # historically called _tui_build_trend (which now wraps the
@@ -3146,7 +3392,7 @@ def _tui_build_snapshot(
                 trend = list(_trend_view.rows)
                 trend_avg_dpp = _trend_view.avg_dollars_per_pct
             except Exception as exc:
-                errors.append(f"trend: {exc}")
+                capture_failure("trend", "stats_or_cache", exc)
         with _perf.phase("build.sessions"):
             try:
                 # The sessions aggregator goes through
@@ -3164,14 +3410,14 @@ def _tui_build_snapshot(
                     with_titles=precompute_envelope,
                 )
             except Exception as exc:
-                errors.append(f"sessions: {exc}")
+                capture_failure("sessions", "cache", exc)
         # ---- v2 additions ----
         with _perf.phase("build.milestones"):
             try:
                 if cw is not None:
                     milestones = _tui_build_percent_milestones(conn)
             except Exception as exc:
-                errors.append(f"milestones: {exc}")
+                capture_failure("milestones", "stats", exc)
         history: list = []
         history_median_dpp: "float | None" = None
         with _perf.phase("build.weekly_history"):
@@ -3188,7 +3434,7 @@ def _tui_build_snapshot(
                 history = list(history_view.rows)
                 history_median_dpp = history_view.median_dpp_non_current_4w
             except Exception as exc:
-                errors.append(f"weekly-history: {exc}")
+                capture_failure("weekly-history", "stats_or_cache", exc)
         # ---- v2.1 additions: dashboard Weekly / Monthly panels ----
         # Sync-thread view-model totals (spec §6.6): sum directly over
         # the panel rows the dashboard ACTUALLY renders. The previous
@@ -3221,7 +3467,7 @@ def _tui_build_snapshot(
                     (r.total_tokens for r in weekly_periods), 0,
                 )
             except Exception as exc:
-                errors.append(f"weekly-periods: {exc}")
+                capture_failure("weekly-periods", "stats_or_cache", exc)
         # Sync-thread view-model totals (spec §6.6): sum-over-visible-rows
         # (same invariant as weekly above). Monthly has no Bug-K analogue,
         # but coupling the footer total to the panel-row source of truth
@@ -3243,7 +3489,7 @@ def _tui_build_snapshot(
                     (r.total_tokens for r in monthly_periods), 0,
                 )
             except Exception as exc:
-                errors.append(f"monthly-periods: {exc}")
+                capture_failure("monthly-periods", "cache", exc)
         # ---- v2.2 additions: dashboard Blocks / Daily panels ----
         # Issue #56: build the BlocksView once and read both rows
         # (presentation) and totals (envelope scalars) from the same
@@ -3266,7 +3512,7 @@ def _tui_build_snapshot(
                     blocks_total_cost_usd = _blocks_view.total_cost_usd
                     blocks_total_tokens = _blocks_view.total_tokens
             except Exception as exc:
-                errors.append(f"blocks-panel: {exc}")
+                capture_failure("blocks-panel", "stats_or_cache", exc)
         # Sync-thread view-model totals (Bundle 1 / spec §6.6):
         # sum-over-visible-rows (same invariant as weekly/monthly above).
         # Gap days in the materialized panel carry ``cost_usd=0.0`` /
@@ -3289,7 +3535,7 @@ def _tui_build_snapshot(
                     (r.total_tokens for r in daily_panel), 0,
                 )
             except Exception as exc:
-                errors.append(f"daily-panel: {exc}")
+                capture_failure("daily-panel", "cache", exc)
         # ---- threshold-actions T5: alerts envelope array ----
         # Precomputed at sync time so `snapshot_to_envelope` stays a pure
         # renderer (no DB I/O on the dashboard hot path; mirrors how
@@ -3299,7 +3545,7 @@ def _tui_build_snapshot(
             try:
                 alerts = _build_alerts_envelope_array(conn)
             except Exception as exc:
-                errors.append(f"alerts: {exc}")
+                capture_failure("alerts", "stats", exc)
         # ---- 5h in-place credit (v1.7.x) ----
         # Load 5h milestones (pre + post credit) for the current
         # block's window so CurrentWeekModal can render a merged
@@ -3313,7 +3559,7 @@ def _tui_build_snapshot(
                     win_key = cw.five_hour_block.get("five_hour_window_key")
                 fh_milestones = _tui_build_five_hour_milestones(conn, win_key)
             except Exception as exc:
-                errors.append(f"five-hour-milestones: {exc}")
+                capture_failure("five-hour-milestones", "stats", exc)
         # ---- hero-modal historical milestones week index (spec §1a/§3) ----
         # Built ONLY here on the non-idle rebuild (the idle short-circuit
         # returns before this phase and carries the prior index forward via
@@ -3325,7 +3571,7 @@ def _tui_build_snapshot(
             try:
                 week_index = sys.modules["cctally"].build_claude_week_index(conn)
             except Exception as exc:
-                errors.append(f"week-index: {exc}")
+                capture_failure("week-index", "stats", exc)
         # ---- Projects panel + modal envelope (spec §5.2, plan Task 1) -----
         # Per-tick aggregation lives on the sync thread; the dashboard's
         # pure ``snapshot_to_envelope`` reads ``snap.projects_envelope``
@@ -3375,7 +3621,7 @@ def _tui_build_snapshot(
                 use_projects_env_cache=use_projects_env_cache,
             )
         except Exception as exc:
-            errors.append(f"projects-envelope: {exc}")
+            capture_failure("projects-envelope", "stats_or_cache", exc)
         finally:
             try:
                 conn.execute("DROP VIEW IF EXISTS session_entries")
@@ -3435,7 +3681,9 @@ def _tui_build_snapshot(
                         )
                 sessions = annotated
             except Exception as exc:
-                errors.append(f"projects-cross-nav-bind: {exc}")
+                capture_failure(
+                    "projects-cross-nav-bind", "stats_or_cache", exc
+                )
 
         # Cache-report panel + modal envelope block (spec
         # 2026-05-21-cache-report-panel-design.md §5.2). Per-tick build
@@ -3470,7 +3718,7 @@ def _tui_build_snapshot(
                     use_cache_report_cache=use_cache_report_cache,
                 )
             except Exception as exc:
-                errors.append(f"cache-report: {exc}")
+                capture_failure("cache-report", "cache", exc)
 
         # ---- #268 M4: doctor / config / update-state precompute (spec §6) ----
         # Precompute the envelope's doctor / config / update-state reads ONCE
@@ -3488,14 +3736,14 @@ def _tui_build_snapshot(
                         now_utc, runtime_bind,
                     )
                 except Exception as exc:
-                    errors.append(f"doctor-precompute: {exc}")
+                    capture_failure("doctor-precompute", "other", exc)
             with _perf.phase("envelope.precompute"):
                 try:
                     envelope_precompute_block = _tui_precompute_envelope_config(
                         raw_config,
                     )
                 except Exception as exc:
-                    errors.append(f"envelope-precompute: {exc}")
+                    capture_failure("envelope-precompute", "other", exc)
 
         # Determine the shared visible interval before publishing either source.
         # The actual source bundle is built after ``snap`` exists, so Claude's
@@ -3514,6 +3762,7 @@ def _tui_build_snapshot(
             last_sync_at=time.monotonic(),
             last_sync_error=("; ".join(errors) if errors else None),
             generated_at=now_utc,
+            sync_failures=tuple(sync_failures),
             percent_milestones=milestones,
             weekly_history=history,
             weekly_periods=weekly_periods,
@@ -3590,11 +3839,12 @@ def _tui_build_snapshot(
             except Exception as exc:
                 # Public source warnings are stable/sanitized; the detailed
                 # exception remains only on the internal rebuild-error string.
-                errors.append(f"source-bundle: {exc}")
+                capture_failure("source-bundle", "stats_or_cache", exc)
                 source_bundle = prior_source_bundle
             snap = dataclasses.replace(
                 snap,
                 last_sync_error=("; ".join(errors) if errors else None),
+                sync_failures=tuple(sync_failures),
                 source_bundle=source_bundle,
             )
         # #268 M5.1: record the (signature+render key, snapshot) so the next
@@ -3616,6 +3866,9 @@ def _tui_build_snapshot(
                 generated_at=now_utc.isoformat(),
             )
         return snap
+    except _StatsSnapshotCorruption:
+        _p_snapshot.__exit__(*sys.exc_info())
+        raise
     finally:
         conn.close()
 
@@ -3835,16 +4088,22 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 _tui_source_bundle_can_idle(source_bundle)
                 and not codex_decision_deadline_passed(prior_codex, now_utc)
             ):
+                claude = _refresh_claude_source_clock(
+                    prior_claude,
+                    current_week=prior.current_week,
+                    now_utc=now_utc,
+                    raw_config=raw_config,
+                )
                 codex = refresh_codex_source_clock(prior_codex, now_utc=now_utc)
-                if codex is not prior_codex:
+                if claude is not prior_claude or codex is not prior_codex:
                     source_bundle = SourceDashboardBundle(
                         source_schema_version=source_bundle.source_schema_version,
                         default_source=source_bundle.default_source,
                         source_order=source_bundle.source_order,
                         sources={
-                            "claude": prior_claude,
+                            "claude": claude,
                             "codex": codex,
-                            "all": compose_all_state(prior_claude, codex),
+                            "all": compose_all_state(claude, codex),
                         },
                     )
             elif source_stats_conn is not None:
@@ -3896,6 +4155,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
         generated_at=now_utc,
         last_sync_at=time.monotonic(),
         last_sync_error=("; ".join(errors) if errors else None),
+        sync_failures=(),
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
         source_bundle=source_bundle,
@@ -3914,6 +4174,44 @@ def _tui_empty_snapshot(now_utc: dt.datetime) -> DataSnapshot:
         percent_milestones=[], weekly_history=[],
         weekly_periods=[], monthly_periods=[],
         blocks_panel=[], daily_panel=[],
+    )
+
+
+def _tui_stats_retry_degraded_snapshot(
+    *,
+    now_utc: dt.datetime,
+    exc: Exception,
+    precompute_envelope: bool,
+    runtime_bind: "str | None",
+) -> DataSnapshot:
+    """Return a stable typed frame when the one fresh retry cannot open."""
+
+    errors = [f"stats-open: {exc}"]
+    doctor_payload = None
+    envelope_precompute = None
+    if precompute_envelope:
+        try:
+            envelope_precompute = _tui_precompute_envelope_config(load_config())
+        except Exception as precompute_exc:  # noqa: BLE001
+            errors.append(f"envelope-precompute: {precompute_exc}")
+        try:
+            doctor_payload = _tui_precompute_doctor_payload(now_utc, runtime_bind)
+        except Exception as doctor_exc:  # noqa: BLE001
+            errors.append(f"doctor-precompute: {doctor_exc}")
+    return dataclasses.replace(
+        _tui_empty_snapshot(now_utc),
+        last_sync_at=time.monotonic(),
+        last_sync_error="; ".join(errors),
+        sync_failures=(
+            SyncFailureAttribution(
+                leg="stats-open",
+                database="stats",
+                corruption=True,
+            ),
+        ),
+        doctor_payload=doctor_payload,
+        envelope_precompute=envelope_precompute,
+        hydrating=False,
     )
 
 
@@ -6248,6 +6546,10 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                             ),
                             lambda active_conn: sync_codex_cache(active_conn),
                         ),
+                        origins=(
+                            "dashboard.refresh.claude_sync",
+                            "dashboard.refresh.codex_sync",
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 — surfaced on the snap
                     sync_error = f"sync-cache: {exc}"
@@ -6281,6 +6583,10 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             crashed = dataclasses.replace(
                 prev,
                 last_sync_error=f"sync crashed: {exc}",
+                # The new crash supersedes the prior typed leg failures. Keeping
+                # them would let a stale stats attribution win this unrelated
+                # failure in the privacy-safe envelope classifier.
+                sync_failures=(),
                 generated_at=dt.datetime.now(dt.timezone.utc),
                 # #278 §1.4.1: a crash-carry snapshot is stable (not mid-
                 # assembly); clear the latch even if ``prev`` was a hydrating

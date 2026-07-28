@@ -39,12 +39,36 @@ describe('S4 source envelope wire shape (guard)', () => {
 
     // Each value is a SourceEntry — assert the discriminating field directly on
     // the flat path the runtime reads (`env.sources.claude.availability`).
-    const claude = sources.claude as { availability?: unknown } | undefined;
-    const codex = sources.codex as { availability?: unknown } | undefined;
-    const all = sources.all as { availability?: unknown } | undefined;
+    const claude = sources.claude as {
+      availability?: unknown;
+      domain_freshness?: unknown;
+    } | undefined;
+    const codex = sources.codex as {
+      availability?: unknown;
+      domain_freshness?: unknown;
+    } | undefined;
+    const all = sources.all as {
+      availability?: unknown;
+      domain_freshness?: unknown;
+    } | undefined;
     expect(typeof claude?.availability).toBe('string');
     expect(typeof codex?.availability).toBe('string');
     expect(typeof all?.availability).toBe('string');
+    expect(claude?.domain_freshness).toEqual({
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    });
+    expect(codex?.domain_freshness).toEqual({
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    });
+    expect(all?.domain_freshness).toEqual({
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    });
   });
 
   it('the test-utils builder convention encodes the SAME flat/top-level shape', () => {
@@ -60,5 +84,10 @@ describe('S4 source envelope wire shape (guard)', () => {
     // No phantom nesting in the builder either.
     expect('sources' in sources).toBe(false);
     expect((sources.claude as { availability?: unknown }).availability).toBe('ok');
+    expect((sources.codex as { domain_freshness?: unknown }).domain_freshness).toEqual({
+      hero: 'fresh',
+      quota: 'fresh',
+      sessions: 'fresh',
+    });
   });
 });

@@ -3,6 +3,10 @@
 Compute the USD cost for a subscription week and store it in
 `weekly_cost_snapshots`.
 
+> **Cost coverage:** The stored Claude cost is a
+> [transcript-derived lower bound](../claude-cost-coverage.md), not an exact
+> `/usage` billing total.
+
 ## Synopsis
 
 ```

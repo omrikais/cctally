@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
+import signal
 import sqlite3
 import sys
 import time
@@ -55,10 +57,41 @@ _QUOTA_DEDUP_INDEX_NAME = ".quota-observation-keys"
 _QUOTA_DEDUP_DIR: str | None = None
 _QUOTA_DEDUP_KEYS: set[str] = set()
 _QUOTA_DEDUP_LOADED = False
+_HIGH_WATER_UNSET = object()
 
 
 class JournalError(Exception):
     """A structural journal-append failure (line too long, unrepairable tail)."""
+
+
+class CorrectionRebuildRequired(JournalError):
+    """A completed correction cannot be applied incrementally to a live index.
+
+    The recovery boundary needs more than a message: it must rebuild through
+    the exact completed-batch commit that triggered the mismatch, then
+    revalidate the exact effective metadata under exclusive ownership.
+    """
+
+    def __init__(
+        self,
+        message,
+        *,
+        batch_id=None,
+        event_id=None,
+        high_water=None,
+        expected_metadata=None,
+        recovery_eligible=False,
+    ):
+        super().__init__(message)
+        self.batch_id = batch_id
+        self.event_id = event_id
+        self.high_water = high_water
+        self.expected_metadata = expected_metadata
+        self.recovery_eligible = recovery_eligible
+
+
+class CorrectionRecoveryError(JournalError):
+    """Bounded correction recovery could not safely replace the live index."""
 
 
 # --------------------------------------------------------------------------
@@ -338,6 +371,92 @@ def append_record(
         _release_leaf_lock(lock_fd)
 
 
+def append_records(
+    records: list[dict],
+    *,
+    now_utc: dt.datetime | None = None,
+    expected_high_water=_HIGH_WATER_UNSET,
+    line_hook=None,
+) -> tuple[str, int]:
+    """Append one ordered record group under a single leaf-lock hold.
+
+    The group is not transactionally atomic across a power loss: a crash can
+    leave complete prefix lines plus one torn final line, exactly like the
+    single-record appender. It *is* non-interleavable with other appenders, so a
+    correction batch remains physically ordered. ``expected_high_water`` is
+    checked while holding the same leaf lock that performs the append, closing
+    the plan/revalidate/append race.
+    """
+    if not isinstance(records, list) or not records:
+        raise ValueError("journal record group must be a non-empty list")
+    if now_utc is None:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+    encoded = []
+    for record in records:
+        data = _lib_journal.encode_line(record)
+        if len(data) > _MAX_LINE_BYTES:
+            raise JournalError(
+                f"journal line is {len(data)} bytes, exceeds the "
+                f"{_MAX_LINE_BYTES}-byte limit (spec §4.3)"
+            )
+        encoded.append(data)
+
+    journal_dir = _cctally_core.JOURNAL_DIR
+    seg_name = _lib_journal.segment_name(now_utc)
+    seg_path = journal_dir / seg_name
+    dir_created = not journal_dir.exists()
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    if dir_created:
+        try:
+            os.chmod(journal_dir, 0o700)
+        except OSError:
+            pass
+
+    lock_fd = _acquire_leaf_lock()
+    try:
+        segments = list_segments()
+        actual_high_water = None
+        if segments:
+            latest = segments[-1]
+            actual_high_water = (
+                latest,
+                os.stat(journal_dir / latest).st_size,
+            )
+        if (
+            expected_high_water is not _HIGH_WATER_UNSET
+            and actual_high_water != expected_high_water
+        ):
+            raise JournalError(
+                "journal high-water changed before correction append "
+                f"(expected {expected_high_water!r}, found {actual_high_water!r})"
+            )
+
+        seg_created = not seg_path.exists()
+        fd = os.open(str(seg_path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            if seg_created:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+            _repair_torn_tail(fd)
+            for index, data in enumerate(encoded, start=1):
+                _write_all(fd, data)
+                if line_hook is not None:
+                    line_hook(index)
+            os.fsync(fd)
+            end_offset = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if seg_created:
+            _fsync_dir(journal_dir)
+        if dir_created:
+            _fsync_dir(journal_dir.parent)
+        return (seg_name, end_offset)
+    finally:
+        _release_leaf_lock(lock_fd)
+
+
 def list_segments() -> list[str]:
     """Journal segment basenames in canonical order (spec §4.1): bootstrap
     segments first, then observation segments, each class lexicographic.
@@ -358,6 +477,36 @@ def list_segments() -> list[str]:
     return sorted(names, key=_lib_journal.segment_sort_key)
 
 
+def _has_retained_journal_bytes(segment_sizes) -> bool:
+    """Whether any canonical journal segment retains replayable bytes."""
+    return any(int(size) > 0 for size in segment_sizes)
+
+
+def _journal_rebuild_snapshot() -> tuple[tuple[str, int] | None, bool]:
+    """Snapshot the canonical high-water and retained-byte truth together.
+
+    A freshly created newest segment can legitimately be empty while older
+    immutable segments still contain the durable rebuild source.  Holding the
+    leaf lock across both facts keeps the epoch resolver from making its
+    fail-closed decision against two different journal states.
+    """
+    lock_fd = _acquire_leaf_lock()
+    try:
+        segments = list_segments()
+        if not segments:
+            return None, False
+        sizes = [
+            os.stat(_cctally_core.JOURNAL_DIR / segment).st_size
+            for segment in segments
+        ]
+        return (
+            (segments[-1], sizes[-1]),
+            _has_retained_journal_bytes(sizes),
+        )
+    finally:
+        _release_leaf_lock(lock_fd)
+
+
 def journal_high_water() -> tuple[str, int] | None:
     """Snapshot ``(latest segment basename, size)`` under a µs leaf-lock hold.
 
@@ -365,16 +514,8 @@ def journal_high_water() -> tuple[str, int] | None:
     cycle takes this snapshot and consumes only ``cursor → HW`` so a line
     appended after the snapshot belongs to the next cycle (spec §5.2.1).
     Returns ``None`` when no segment exists yet."""
-    lock_fd = _acquire_leaf_lock()
-    try:
-        segments = list_segments()
-        if not segments:
-            return None
-        latest = segments[-1]
-        size = os.stat(_cctally_core.JOURNAL_DIR / latest).st_size
-        return (latest, size)
-    finally:
-        _release_leaf_lock(lock_fd)
+    high_water, _has_bytes = _journal_rebuild_snapshot()
+    return high_water
 
 
 # ==========================================================================
@@ -449,6 +590,9 @@ class IngestResult:
     malformed: int            # lines in range that failed to decode (spec §4.4)
     events_emitted: int       # evt lines emitted this cycle (Model-A + harvest)
     alerts: list              # alert payloads dispatched post-commit (step 6)
+    # #374: same-revision divergences handled this cycle — emissions withheld at
+    # the write boundary plus journal evts the preflight reader quarantined.
+    conflicts_dropped: int = 0
     # Exception discipline (6b-gate P2): the exception that aborted the cycle on
     # an OPPORTUNISTIC ingest — the txn rolled back, the cursor did NOT advance
     # (invariant ii), and `run_stats_ingest` logged it loudly and returned
@@ -490,9 +634,36 @@ class IngestContext:
     # (reset INSERT OR IGNORE rowcount == 1), so a crash-replayed reset never
     # re-suppresses with a divergent list.
     suppression_map: dict = field(default_factory=dict)
+    # Task B rederive seam. Normal ingest leaves both defaults unchanged.
+    # A scratch planner supplies an in-memory sink so derived events are captured
+    # instead of appended to the durable journal, and disables projection-file
+    # writes while still exercising the same SQLite derivation/fold code.
+    event_sink: "list | None" = None
+    projection_writes: bool = True
+    # Scratch replay reconstructs ephemeral marker state in memory. A planner
+    # shares this dict across its per-record contexts.
+    projection_state: dict = field(default_factory=dict)
+    # #374 write boundary: emissions WITHHELD this cycle because they would have
+    # violated the same-revision rule. Each entry is a `DroppedConflict`; the row
+    # was converged from the already-journaled effective event instead.
+    conflicts_dropped: list = field(default_factory=list)
 
     def as_of_for(self, record: dict) -> str:
         return record["at"]
+
+
+@dataclass(frozen=True)
+class DroppedConflict:
+    """One live emission withheld at the write boundary (#374 §6).
+
+    The journal is append-only, so a divergent line can never be un-written —
+    the only durable defence is to never append it. The row is converged from
+    the effective event instead, and the rejected content is reported here.
+    """
+
+    event_id: str
+    rev: int
+    rejected_hash: str
 
 
 @dataclass(frozen=True)
@@ -615,27 +786,161 @@ def _release_ingest_lock(fd: int) -> None:
         os.close(fd)
 
 
+def _acquire_maintenance_shared(mode: str, timeout_s: float) -> int | None:
+    """Acquire the stats maintenance lock shared, before the ingest lock."""
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    if mode == "opportunistic":
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            _cctally_core.note_stats_maintenance_acquired()
+            return fd
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return None
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                _cctally_core.note_stats_maintenance_acquired()
+                return fd
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return None
+                time.sleep(0.02)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _acquire_maintenance_exclusive(mode: str, timeout_s: float) -> int | None:
+    """Acquire the stats maintenance lock exclusively for legacy cutover."""
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    if mode == "opportunistic":
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _cctally_core.note_stats_maintenance_acquired()
+            return fd
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return None
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _cctally_core.note_stats_maintenance_acquired()
+                return fd
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return None
+                time.sleep(0.02)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _release_maintenance_shared(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        # #386: paired with the note in both acquire helpers. `open_db()` takes
+        # this same lock SHARED on a fresh fd, and flock conflicts are
+        # process-wide across descriptions, so the legacy/fresh ingest branch
+        # (which holds it EXCLUSIVE across its `open_db()`) would self-deadlock
+        # without the re-entrancy signal.
+        _cctally_core.note_stats_maintenance_released()
+        os.close(fd)
+
+
+def _downgrade_maintenance_shared(fd: int) -> None:
+    """Atomically downgrade a held maintenance lock from EX to SH."""
+    fcntl.flock(fd, fcntl.LOCK_SH)
+
+
+def _stats_db_identity():
+    """Return the current stats main-file identity, or ``None`` if absent."""
+    try:
+        stat = os.stat(_cctally_core.DB_PATH)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _stats_db_user_version() -> int | None:
+    """Read the main file's raw epoch without invoking schema or heal paths."""
+    try:
+        conn = sqlite3.connect(
+            f"file:{_cctally_core.DB_PATH}?mode=ro",
+            uri=True,
+        )
+    except sqlite3.Error:
+        return None
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # cursor (spec §5.2.2: segment-aware, prior-month tails covered)
 # --------------------------------------------------------------------------
 
 def _read_cursor(conn: sqlite3.Connection) -> tuple[str, int] | None:
     """Return `(segment_basename, offset)` from `journal_cursor`, or None when
-    nothing has been consumed yet (start of the first segment)."""
+    nothing has been consumed yet (start of the first segment).
+
+    ``applied_segment`` / ``applied_offset`` are the trusted duplicate written
+    in the same stats transaction as every materialized row (#410 Task B). A
+    cursor-only hand edit can therefore no longer skip durable events and make
+    their natural keys appear new: on disagreement, resume from the last
+    atomically applied prefix and let the normal replay heal both pairs."""
     row = conn.execute(
-        "SELECT segment, offset FROM journal_cursor WHERE id = 1"
+        "SELECT segment, offset, applied_segment, applied_offset "
+        "FROM journal_cursor WHERE id = 1"
     ).fetchone()
     if row is None:
         return None
-    return (row[0], int(row[1]))
+    public = (str(row[0]), int(row[1]))
+    if row[2] is None or row[3] is None:
+        raise JournalError(
+            "journal cursor applied-prefix guard is incomplete; "
+            "run cctally db rebuild --db stats"
+        )
+    applied = (str(row[2]), int(row[3]))
+    if public != applied:
+        print(
+            f"[journal] cursor-only advancement detected: public={public!r}, "
+            f"applied={applied!r}; replaying from the applied prefix",
+            file=sys.stderr,
+        )
+    return applied
 
 
 def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
     conn.execute(
-        "INSERT INTO journal_cursor (id, segment, offset) VALUES (1, ?, ?) "
+        "INSERT INTO journal_cursor "
+        "(id, segment, offset, applied_segment, applied_offset) "
+        "VALUES (1, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET segment = excluded.segment, "
-        "offset = excluded.offset",
-        (segment, offset),
+        "offset = excluded.offset, "
+        "applied_segment = excluded.applied_segment, "
+        "applied_offset = excluded.applied_offset",
+        (segment, offset, segment, offset),
     )
 
 
@@ -688,6 +993,49 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
             continue
         lines.extend(_read_segment_lines(seg_path, lo, hi))
     return lines
+
+
+def journal_prefix_hash(high_water) -> "str | None":
+    """Hash exact raw segment bytes through one canonical high-water."""
+    if high_water is None:
+        return None
+    digest = hashlib.sha256()
+    found = False
+    for segment in list_segments():
+        path = _cctally_core.JOURNAL_DIR / segment
+        size = high_water[1] if segment == high_water[0] else path.stat().st_size
+        data = path.read_bytes()[:size]
+        if len(data) != size:
+            raise OSError(f"journal segment changed while reading: {segment}")
+        name = segment.encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+        if segment == high_water[0]:
+            found = True
+            break
+    if not found:
+        raise OSError(
+            f"journal high-water segment is unavailable: {high_water[0]}"
+        )
+    return "sha256:" + digest.hexdigest()
+
+
+def _capture_protocol_prefix_evidence(record, prior_high_water, evidence) -> None:
+    """Capture the actual raw prefix immediately preceding one audit record."""
+    if (
+        record.get("t") == "op"
+        and isinstance(record.get("payload"), dict)
+        and record["payload"].get("kind")
+        == _lib_journal._PROTOCOL_RESOLUTION_KIND
+    ):
+        evidence.append(
+            (
+                prior_high_water,
+                journal_prefix_hash(prior_high_water),
+            )
+        )
 
 
 # --------------------------------------------------------------------------
@@ -832,14 +1180,18 @@ def _resolve_ref(conn: sqlite3.Connection, table: str, logical_id) -> int | None
     return int(row[0])
 
 
-def _insert_or_ignore(conn: sqlite3.Connection, table: str, cols: dict):
+def _insert_or_ignore(
+    conn: sqlite3.Connection, table: str, cols: dict, *, strict: bool = False
+):
     keys = list(cols.keys())
     colnames = ", ".join(keys)
     placeholders = ", ".join("?" for _ in keys)
-    return conn.execute(
-        f"INSERT OR IGNORE INTO {table} ({colnames}) VALUES ({placeholders})",
-        tuple(cols[k] for k in keys),
+    statement = (
+        f"INSERT OR IGNORE INTO {table} ({colnames}) VALUES ({placeholders})"
     )
+    if strict:
+        statement = statement.replace("INSERT OR IGNORE", "INSERT", 1)
+    return conn.execute(statement, tuple(cols[k] for k in keys))
 
 
 def _reverse_ref(conn: sqlite3.Connection, ref_table: str, rowid) -> "str | None":
@@ -1253,6 +1605,34 @@ _BLOCK_CHILDREN = (
 _BLOCK_CHILD_KEYS = frozenset(k for k, _t in _BLOCK_CHILDREN)
 
 
+def _replace_block_children(
+    conn, block_id, parent_account, parent_window, children
+) -> None:
+    """Materialize one frozen block's child sets exactly.
+
+    A close event owns the complete model/project membership, so replay and
+    convergence replace both sets rather than relying on natural-key
+    ``INSERT OR IGNORE``. This removes stale children and restores missing
+    children while preserving the parent rowid used by milestone FKs.
+    """
+    for payload_key, child_table in _BLOCK_CHILDREN:
+        if parent_account is None:
+            predicate = "five_hour_window_key = ?"
+            params = (int(parent_window),)
+        else:
+            predicate = "account_key = ? AND five_hour_window_key = ?"
+            params = (parent_account, int(parent_window))
+        conn.execute(
+            f"DELETE FROM {child_table} WHERE {predicate}", params
+        )
+        for child in children.get(payload_key, []):
+            cols = dict(child)
+            cols["block_id"] = int(block_id)
+            if parent_account is not None:
+                cols["account_key"] = parent_account
+            _insert_or_ignore(conn, child_table, cols, strict=True)
+
+
 def _apply_generic_evt(conn, evt):
     """Fold an evt line into its target table (spec §5.3), returning the sqlite
     cursor of the `INSERT OR IGNORE`.
@@ -1278,28 +1658,37 @@ def _apply_generic_evt(conn, evt):
             cols[key] = value
     # Re-derive any projection-FK columns from a journaled natural-key column
     # (spec §5.3 — e.g. five_hour_milestones.block_id from five_hour_window_key,
-    # since the open block is a projection with no logical id). Composite
-    # (account_key, <lookup_col>) when the row carries an account (#341, review
-    # finding 3): a shared physical 5h window resolves THIS account's block, so a
-    # milestone child never attaches to another account's block. 0 when absent.
+    # since the open block is a projection with no logical id).
     acct = cols.get("account_key")
     for column, (ref_table, lookup_col) in spec.derived_fk.items():
-        if acct is not None:
-            row = conn.execute(
-                f"SELECT id FROM {ref_table} "
-                f"WHERE {lookup_col} = ? AND account_key = ?",
-                (cols.get(lookup_col), acct),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                f"SELECT id FROM {ref_table} WHERE {lookup_col} = ?",
-                (cols.get(lookup_col),),
-            ).fetchone()
-        cols[column] = int(row[0]) if row is not None else 0
+        cols[column] = _derived_fk_value(
+            conn, ref_table, lookup_col, cols.get(lookup_col), acct)
     return _insert_or_ignore(conn, spec.table, cols)
 
 
-def _apply_weekly_credit_effects(conn, evt):
+def _derived_fk_value(conn, ref_table, lookup_col, lookup_value, account_key):
+    """Resolve one derived (re-derived-at-fold) FK column (spec §5.3).
+
+    Composite `(account_key, <lookup_col>)` when the row carries an account
+    (#341, review finding 3): a shared physical 5h window resolves THIS
+    account's block, so a milestone never attaches to another account's block.
+    0 when unresolvable. The SINGLE home of this rule — the fold applier and the
+    #374 duplicate-path validation must agree by construction, not by copy."""
+    if account_key is not None:
+        row = conn.execute(
+            f"SELECT id FROM {ref_table} "
+            f"WHERE {lookup_col} = ? AND account_key = ?",
+            (lookup_value, account_key),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            f"SELECT id FROM {ref_table} WHERE {lookup_col} = ?",
+            (lookup_value,),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _apply_weekly_credit_effects(conn, evt, *, projection_writes=True):
     """Apply a `weekly_credit_effects` evt (spec §5.3 event+effects). The
     same-window sub-25pp credit writes NO reset row, so its DESTRUCTIVE effects
     ride this vehicle: delete the stale-replica snapshots by their logical
@@ -1326,7 +1715,7 @@ def _apply_weekly_credit_effects(conn, evt):
         conn.execute(
             "DELETE FROM weekly_credit_floors WHERE journal_id = ?", (logical_id,))
     floor = payload.get("hwm_floor")
-    if floor:
+    if floor and projection_writes:
         try:
             (_cctally_core.APP_DIR / "hwm-7d").write_text(
                 f"{floor['week_start_date']} {floor['weekly_percent']}\n"
@@ -1340,17 +1729,30 @@ def _apply_quota_alert_arming(conn, evt):
     """Fold a `quota_alert_arming` evt (spec §5.3 "state", Task 7 Item 5). The
     quota-alert arming boundary is journaled state — its `activated_at_utc` is a
     forward-only alert boundary that MUST survive a stats.db rebuild so the
-    reconcile honors it (no historical re-fires). Applied as an UPSERT on the
-    arming natural key, in canonical order, so the latest state per key wins and
-    re-applying an already-present evt is a clean no-op. `quota_alert_arming` has
-    no `journal_id` column (it is not in the Task-4 additive list); idempotence
-    is the natural-key upsert, not a journal_id INSERT OR IGNORE."""
+    reconcile honors it (no historical re-fires). Activation records UPSERT the
+    natural key; explicit disarm records DELETE that same account-qualified key.
+    Canonical replay therefore leaves the latest retained state in force, and
+    re-applying either transition is a clean no-op. `quota_alert_arming` has no
+    `journal_id` column (it is not in the Task-4 additive list); idempotence is
+    the natural-key upsert/delete, not a journal_id INSERT OR IGNORE."""
     p = evt.get("payload") or {}
     # account_key (#341) is part of the arming identity/UNIQUE. A live-emitted evt
     # carries payload.account_key; a legacy (pre-#341) cutover-exported arming has
     # none -> normalise to the sentinel (Codex legacy -> unattributed) so the
     # NOT NULL column always receives a value.
     account_key = p.get("account_key") or _lib_accounts.UNATTRIBUTED
+    if p.get("state") == "disarmed":
+        conn.execute(
+            "DELETE FROM quota_alert_arming "
+            "WHERE source=? AND source_root_key=? AND account_key=? "
+            "AND logical_limit_key=? AND observed_slot=? AND window_minutes=?",
+            (
+                p.get("source"), p.get("source_root_key"), account_key,
+                p.get("logical_limit_key"), p.get("observed_slot"),
+                p.get("window_minutes"),
+            ),
+        )
+        return None
     conn.execute(
         "INSERT INTO quota_alert_arming "
         "(source, source_root_key, logical_limit_key, observed_slot, "
@@ -1368,12 +1770,14 @@ def _apply_quota_alert_arming(conn, evt):
 
 
 def _apply_block_close(conn, evt):
-    """Fold a `five_hour_block_close` evt (spec §5.3): insert the frozen parent
-    block (`INSERT OR IGNORE` on window-key / journal_id), then its embedded
-    `_models`/`_projects` rollup children under the resolved parent block_id
-    (each idempotent on its own natural key). Live harvest only STAMPS the
-    parent's journal_id — 6b's close hook already wrote parent+children — so this
-    insert path runs for replay/rebuild."""
+    """Fold one authoritative frozen-block fact.
+
+    A replay may meet an existing open projection under the same
+    ``(account_key, five_hour_window_key)`` natural key. ``INSERT OR IGNORE``
+    alone would silently leave that mutable row and its children in place, so
+    the event now converges the existing parent in place and replaces both
+    child sets exactly. The parent rowid is preserved for milestone FKs.
+    """
     payload = evt.get("payload") or {}
     parent = {"journal_id": evt["id"]}
     children = {}
@@ -1385,40 +1789,39 @@ def _apply_block_close(conn, evt):
             continue
         parent[key] = value
     _insert_or_ignore(conn, "five_hour_blocks", parent)
-    # Composite (account_key, five_hour_window_key) parent resolution (#341,
-    # review finding 3): a shared physical window resolves THIS account's block
-    # so its rollup children attach to the right parent.
+
     p_acct = parent.get("account_key")
     if p_acct is not None:
         prow = conn.execute(
-            "SELECT id FROM five_hour_blocks "
+            "SELECT id, journal_id, account_key, five_hour_window_key "
+            "FROM five_hour_blocks "
             "WHERE five_hour_window_key = ? AND account_key = ?",
             (parent.get("five_hour_window_key"), p_acct),
         ).fetchone()
     else:
         prow = conn.execute(
-            "SELECT id FROM five_hour_blocks WHERE five_hour_window_key = ?",
+            "SELECT id, journal_id, account_key, five_hour_window_key "
+            "FROM five_hour_blocks "
+            "WHERE five_hour_window_key = ?",
             (parent.get("five_hour_window_key"),),
         ).fetchone()
     if prow is None:
-        return None
+        raise JournalError(
+            f"five_hour_block_close {evt['id']} did not materialize its parent"
+        )
     block_id = int(prow[0])
-    for payload_key, child_table in _BLOCK_CHILDREN:
-        for child in children.get(payload_key, []):
-            cols = dict(child)
-            cols["block_id"] = block_id
-            # Force each child under the PARENT's account (#341 P2-2, 8a review):
-            # a no-op on the live/already-stamped path (children already agree),
-            # but on the legacy rebuild path _normalize_legacy_account_stamp
-            # re-derives ONLY the parent's payload.account_key — the embedded
-            # _models/_projects children stay unstamped and would otherwise take
-            # the schema DEFAULT 'unattributed', mismatching their parent and
-            # splitting the composite (account_key, window, model/project) UNIQUE
-            # partition. Guarded on p_acct so a truly account-less rebuild (no
-            # cutover mapping) leaves the DEFAULT untouched.
-            if p_acct is not None:
-                cols["account_key"] = p_acct
-            _insert_or_ignore(conn, child_table, cols)
+    existing_journal_id = prow[1]
+    if existing_journal_id not in (None, evt["id"]):
+        raise JournalError(
+            f"five_hour_block_close {evt['id']} collided with "
+            f"{existing_journal_id} on its parent natural key"
+        )
+    assignments = ", ".join(f"{name} = ?" for name in parent)
+    conn.execute(
+        f"UPDATE five_hour_blocks SET {assignments} WHERE id = ?",
+        (*parent.values(), block_id),
+    )
+    _replace_block_children(conn, block_id, prow[2], prow[3], children)
     return None
 
 
@@ -1452,13 +1855,16 @@ def _apply_reset_with_suppression(conn, evt):
     return None
 
 
-def _apply_evt(conn, evt):
+def _apply_evt(conn, evt, *, projection_writes=True):
     """Dispatch one evt line to its fold applier by `payload.kind` (step 4a
     replay + the emit_model_a apply path). A kind with a bespoke `applier`
     (weekly_credit_effects, five_hour_block_close) uses it; everything else
     goes through the generic column-map fold. Apply-only: NO alert dispatch,
     NO ctx — replay is structurally unable to fire alerts (spec §5.2 step 4a)."""
     spec = _EVT_SPECS.get((evt.get("payload") or {}).get("kind"))
+    if spec is not None and spec.applier is _apply_weekly_credit_effects:
+        return spec.applier(
+            conn, evt, projection_writes=projection_writes)
     if spec is not None and spec.applier is not None:
         return spec.applier(conn, evt)
     return _apply_generic_evt(conn, evt)
@@ -1594,9 +2000,34 @@ def emit_model_a(ctx, *, kind, evt_id, table, columns, refs=None, at=None):
         payload.update(refs)
     evt = _lib_journal.make_evt(kind=kind, id=evt_id, at=(at or _now_iso()),
                                 payload=payload)
-    append_record(evt)
-    ctx.events_emitted += 1
-    _apply_evt(ctx.conn, evt)
+    if ctx.event_sink is not None:
+        # SCRATCH planning (`db rederive`, spec §6): capture EVERY derived
+        # candidate — never classify, never drop, or the very divergence the
+        # planner exists to correct would be filtered out of `desired_events`
+        # and the diff would report a false no-op. Model-A events are still
+        # APPLIED to the private scratch projection because callers consume the
+        # returned rowid immediately (`snapshot_accept` stores it before
+        # milestone/block derivation). Live effective metadata is never read or
+        # written. Discriminated on `is not None` — the sink is `list | None`
+        # and an EMPTY sink list is falsy.
+        ctx.event_sink.append(evt)
+        ctx.events_emitted += 1
+        _apply_evt(ctx.conn, evt, projection_writes=ctx.projection_writes)
+    else:
+        decision = _classify_live_effective_event(ctx.conn, evt)
+        if decision == CLASSIFY_CONFLICT:
+            # No append, no metadata mutation — converge the row instead.
+            _record_dropped_conflict(ctx, evt)
+            _converge_row_from_effective(ctx.conn, evt_id, table=table)
+        else:
+            # `new` AND `duplicate` both still append: crash-replay convergence
+            # and two-bootstrap idempotency are built on that.
+            append_record(evt)
+            ctx.events_emitted += 1
+            if decision == CLASSIFY_NEW:
+                _record_new_effective_event(ctx.conn, evt)
+                _apply_evt(
+                    ctx.conn, evt, projection_writes=ctx.projection_writes)
     if table is None:
         return None
     row = ctx.conn.execute(
@@ -1657,6 +2088,71 @@ def _build_harvest_evt(ctx, spec, row):
     return _lib_journal.make_evt(kind=spec.kind, id=eid, at=at, payload=payload)
 
 
+def _emit_harvest_row(ctx, spec, row):
+    """Journal and stamp one already-selected natural-keyed row."""
+    conn = ctx.conn
+    evt = _build_harvest_evt(ctx, spec, row)
+    if ctx.event_sink is not None:
+        # Scratch planning: capture + stamp the PRIVATE projection so a later
+        # raw record does not re-harvest the same row and its downstream FKs
+        # still resolve. Never classify, drop, or touch live metadata.
+        ctx.event_sink.append(evt)
+        ctx.events_emitted += 1
+        conn.execute(
+            f"UPDATE {spec.table} SET journal_id = ? WHERE id = ?",
+            (evt["id"], row["id"]),
+        )
+        return evt
+
+    decision = _classify_live_effective_event(conn, evt)
+    if decision == CLASSIFY_CONFLICT:
+        _record_dropped_conflict(ctx, evt)
+        _converge_row_from_effective(
+            conn, evt["id"], table=spec.table, rowid=row["id"]
+        )
+        return evt
+
+    append_record(evt)
+    ctx.events_emitted += 1
+    if decision == CLASSIFY_NEW:
+        _record_new_effective_event(conn, evt)
+    else:
+        # An exact crash-retry duplicate still validates excluded derived FKs
+        # before it stamps the physical row.
+        _validate_excluded_derived_fks(conn, spec, row)
+    conn.execute(
+        f"UPDATE {spec.table} SET journal_id = ? WHERE id = ?",
+        (evt["id"], row["id"]),
+    )
+    return evt
+
+
+def freeze_five_hour_block_close(ctx, block_id: int):
+    """Freeze one closed block immediately as a complete replayable fact.
+
+    Unlike the end-of-cycle table scan, this surface also accepts an already
+    stamped row so a lost-commit retry can re-emit the exact duplicate selected
+    by its retained closure trigger. It never derives from cache state itself;
+    the parent and both child sets present at this call are the durable boundary.
+    """
+    spec = next(
+        item for item in _HARVEST_SPECS
+        if item.kind == "five_hour_block_close"
+    )
+    row = ctx.conn.execute(
+        "SELECT * FROM five_hour_blocks WHERE id = ?", (int(block_id),)
+    ).fetchone()
+    if row is None:
+        raise JournalError(
+            f"cannot freeze five_hour_block_close: missing block {block_id}"
+        )
+    if int(row["is_closed"]) != 1:
+        raise JournalError(
+            f"cannot freeze five_hour_block_close: block {block_id} is open"
+        )
+    return _emit_harvest_row(ctx, spec, row)
+
+
 def _harvest(ctx) -> None:
     """Step 4c: journal + stamp every natural-keyed row inserted this cycle
     (`journal_id IS NULL`). Families harvest in dependency order so a referenced
@@ -1672,13 +2168,7 @@ def _harvest(ctx) -> None:
             f"SELECT * FROM {spec.table} WHERE {where} ORDER BY id"
         ).fetchall()
         for row in rows:
-            evt = _build_harvest_evt(ctx, spec, row)
-            append_record(evt)
-            ctx.events_emitted += 1
-            conn.execute(
-                f"UPDATE {spec.table} SET journal_id = ? WHERE id = ?",
-                (evt["id"], row["id"]),
-            )
+            _emit_harvest_row(ctx, spec, row)
 
 
 # --------------------------------------------------------------------------
@@ -1853,6 +2343,543 @@ def _fold_order(evt) -> int:
     return (_EVT_SPECS.get(kind) or _UNKNOWN_EVT_SPEC).order
 
 
+def _write_effective_metadata(conn, selection) -> None:
+    """Replace the disposable effective-event summary from a pure selection."""
+    conn.execute("DELETE FROM journal_effective_events")
+    for event_id, selected in selection.by_id.items():
+        event_json = None
+        if selected.record is not None:
+            event_json = (
+                _lib_journal.encode_line(selected.record)
+                .decode("utf-8")
+                .rstrip("\n")
+            )
+        conn.execute(
+            "INSERT INTO journal_effective_events "
+            "(event_id, rev, status, content_hash, batch_id, event_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                selected.rev,
+                selected.status,
+                selected.content_hash,
+                selected.batch_id,
+                event_json,
+            ),
+        )
+    _write_protocol_violations(
+        conn,
+        selection.protocol_violations,
+        selection.acknowledged_protocol_violations,
+    )
+
+
+def _write_protocol_violations(conn, violations, acknowledged=()) -> None:
+    """Replace the disposable structural-violation summary."""
+    conn.execute("DELETE FROM journal_protocol_violations")
+    rows = [*violations, *acknowledged]
+    rows.sort(
+        key=lambda violation: (
+            violation.batch_id,
+            violation.kind,
+            violation.fingerprint,
+        )
+    )
+    for violation in rows:
+        conn.execute(
+            "INSERT INTO journal_protocol_violations "
+            "(fingerprint, batch_id, kind, violation_json) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                violation.fingerprint,
+                violation.batch_id,
+                violation.kind,
+                json.dumps(
+                    violation.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+
+
+def _metadata_row(conn, event_id):
+    return conn.execute(
+        "SELECT rev, status, content_hash, batch_id "
+        "FROM journal_effective_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+
+
+def _metadata_event_record(conn, event_id):
+    row = conn.execute(
+        "SELECT event_json FROM journal_effective_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return _lib_journal.decode_line(row[0].encode("utf-8"))
+
+
+def _legacy_qaa_can_advance(conn, selected) -> bool:
+    return (
+        _lib_journal.is_legacy_quota_arming_record(selected.record)
+        and _lib_journal.is_legacy_quota_arming_record(
+            _metadata_event_record(conn, selected.event_id)
+        )
+    )
+
+
+def _insert_effective_metadata(conn, selected) -> None:
+    event_json = None
+    if selected.record is not None:
+        event_json = (
+            _lib_journal.encode_line(selected.record).decode("utf-8").rstrip("\n")
+        )
+    conn.execute(
+        "INSERT INTO journal_effective_events "
+        "(event_id, rev, status, content_hash, batch_id, event_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            selected.event_id,
+            selected.rev,
+            selected.status,
+            selected.content_hash,
+            selected.batch_id,
+            event_json,
+        ),
+    )
+
+
+CLASSIFY_NEW = "new"
+CLASSIFY_DUPLICATE = "duplicate"
+CLASSIFY_CONFLICT = "conflict"
+
+
+def _classify_live_effective_event(conn, evt) -> str:
+    """Decide what a freshly derived evt means against the live effective
+    metadata — WITHOUT mutating anything (#374 §6).
+
+    The whole point of the split is ordering: both emit paths call this BEFORE
+    `append_record`, so a conflicting emission is never written. Previously the
+    append ran first and the check raised afterwards, so the divergent line
+    landed in the append-only journal and the rollback could not take it back —
+    poisoning every subsequent rebuild.
+
+    Returns `CLASSIFY_NEW` (no prior effective event, or a legacy `qaa` state
+    stream that may advance), `CLASSIFY_DUPLICATE` (byte-identical to the prior
+    effective event) or `CLASSIFY_CONFLICT` (same revision, different content).
+    Raises `CorrectionRebuildRequired` on a revision mismatch — a completed
+    correction batch outranks any live emission and stays FATAL.
+    """
+    selected = _lib_journal.resolve_effective_events([evt]).by_id[evt["id"]]
+    prior = _metadata_row(conn, selected.event_id)
+    if prior is None:
+        return CLASSIFY_NEW
+    prior_rev, prior_status, prior_hash, prior_batch = prior
+    if int(prior_rev) == selected.rev:
+        if prior_status != selected.status or prior_hash != selected.content_hash:
+            if _legacy_qaa_can_advance(conn, selected):
+                return CLASSIFY_NEW
+            return CLASSIFY_CONFLICT
+        return CLASSIFY_DUPLICATE
+    raise CorrectionRebuildRequired(
+        f"event {selected.event_id} rev {selected.rev} conflicts with effective "
+        f"rev {prior_rev} from {prior_batch or 'base journal'}",
+        batch_id=prior_batch,
+        event_id=selected.event_id,
+        high_water=_correction_commit_high_water(prior_batch),
+        expected_metadata=(
+            int(prior_rev),
+            prior_status,
+            prior_hash,
+            prior_batch,
+        ),
+    )
+
+
+def _record_new_effective_event(conn, evt) -> None:
+    """Write the effective-metadata row for a `CLASSIFY_NEW` emission. The
+    DELETE covers the legacy `qaa` advance (the only case where a prior row is
+    replaced rather than absent)."""
+    selected = _lib_journal.resolve_effective_events([evt]).by_id[evt["id"]]
+    if _metadata_row(conn, selected.event_id) is not None:
+        conn.execute(
+            "DELETE FROM journal_effective_events WHERE event_id = ?",
+            (selected.event_id,),
+        )
+    _insert_effective_metadata(conn, selected)
+
+
+def _record_live_effective_event(conn, evt) -> bool:
+    """Record a newly folded base event; return False when the caller must NOT
+    apply it — an exact duplicate, or a quarantined same-revision conflict.
+
+    Retained for the step-4a replay site, whose conflicts the preflight reader
+    has already dropped. The emit paths use the classifier directly so they can
+    withhold the append and converge the row."""
+    decision = _classify_live_effective_event(conn, evt)
+    if decision == CLASSIFY_NEW:
+        _record_new_effective_event(conn, evt)
+        return True
+    return False
+
+
+def _record_dropped_conflict(ctx, evt) -> None:
+    """Count + report one withheld emission (spec §8: a one-line stderr note per
+    dropped emission, and a count on the cycle summary)."""
+    selected = _lib_journal.resolve_effective_events([evt]).by_id[evt["id"]]
+    ctx.conflicts_dropped.append(
+        DroppedConflict(
+            event_id=selected.event_id,
+            rev=selected.rev,
+            rejected_hash=selected.content_hash,
+        )
+    )
+    print(
+        f"[journal] withheld a divergent emission for {selected.event_id} "
+        f"rev {selected.rev}; converged the row from the journaled event",
+        file=sys.stderr,
+    )
+
+
+def _effective_event_for_convergence(conn, event_id) -> dict:
+    """The ACTIVE, validated journal record the live row must converge to.
+
+    Fails closed (#374 §6): `decode_line` only checks that the value is an object
+    with a string `t`, and a tombstoned selection deliberately stores
+    `event_json` as NULL — so a same-revision active-vs-tombstone conflict has no
+    record to converge from. Missing, tombstoned, or hash-mismatched metadata
+    raises here and the caller therefore NEVER stamps."""
+    row = conn.execute(
+        "SELECT rev, status, content_hash, event_json "
+        "FROM journal_effective_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        raise _lib_journal.JournalProtocolError(
+            f"cannot converge {event_id}: no effective metadata")
+    _rev, status, content_hash, event_json = row
+    if status != "active" or event_json is None:
+        raise _lib_journal.JournalProtocolError(
+            f"cannot converge {event_id}: effective selection is {status!r} "
+            "with no retained record")
+    record = _lib_journal.decode_line(event_json.encode("utf-8"))
+    if (
+        record is None
+        or record.get("t") != "evt"
+        or record.get("id") != event_id
+        or not isinstance(record.get("payload"), dict)
+    ):
+        raise _lib_journal.JournalProtocolError(
+            f"cannot converge {event_id}: retained record is not a matching evt")
+    if _lib_journal._sha256_canonical(record) != content_hash:
+        raise _lib_journal.JournalProtocolError(
+            f"cannot converge {event_id}: retained record hash mismatch")
+    return record
+
+
+# Effect keys that ride an evt payload but are NOT target-table columns.
+_EVT_EFFECT_KEYS = frozenset(
+    {"kind", "suppression", "suppression_table", "floor_suppression", "hwm_floor"}
+)
+
+
+def _evt_target_columns(conn, evt, spec) -> tuple:
+    """Decode one evt payload into `(columns, children)` for its target row —
+    the same mapping `_apply_generic_evt` performs, but WITHOUT inserting, so a
+    convergence can UPDATE an existing physical row."""
+    payload = evt.get("payload") or {}
+    cols = {"journal_id": evt["id"]}
+    children: dict = {}
+    for key, value in payload.items():
+        if key in _EVT_EFFECT_KEYS:
+            continue
+        if key in _BLOCK_CHILD_KEYS:
+            children[key] = value or []
+            continue
+        if key in spec.fk_refs:
+            column, ref_table = spec.fk_refs[key]
+            cols[column] = _resolve_ref(conn, ref_table, value)
+        else:
+            cols[key] = value
+    acct = cols.get("account_key")
+    for column, (ref_table, lookup_col) in spec.derived_fk.items():
+        cols[column] = _derived_fk_value(
+            conn, ref_table, lookup_col, cols.get(lookup_col), acct)
+    return cols, children
+
+
+CONVERGE_DROPPED = "dropped"
+CONVERGE_APPLIED = "converged"
+
+
+def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> str:
+    """Bring the live physical row into agreement with the already-journaled
+    effective event, and stamp `journal_id` in the SAME operation (#374 §6).
+
+    This is an EXPLICIT row-convergence operation, deliberately NOT a generic
+    re-run of an arbitrary fold applier: `_apply_generic_evt` ends in
+    `INSERT OR IGNORE`, and effect-bearing appliers cannot safely run out of
+    canonical order. `five_hour_block_close` is the strengthened exception:
+    its ordinary fold also converges the parent and exact child sets so orphan
+    replay freezes an existing projection before raw derivation. Keeping the
+    explicit convergence path still avoids invoking destructive effects and
+    supports row-targeted conflict repair.
+
+    Effect-bearing families are NOT converged. `event_json` is authoritative row
+    *data*, never permission to invoke every applier: `_apply_weekly_credit_
+    effects` performs destructive deletes and writes a non-transactional HWM
+    projection, and the reset appliers replay suppression deletes. Replaying an
+    older effective event at the CURRENT execution point is not equivalent to
+    folding it at its canonical journal position. So an effects-only family
+    (`spec.table is None`) returns `CONVERGE_DROPPED` and nothing is replayed.
+
+    A family WITH a table but no physical row carrying the event id is also
+    `CONVERGE_DROPPED`: convergence updates what exists, it never materialises a
+    row (see the `rowid is None` branch).
+    """
+    record = _effective_event_for_convergence(conn, event_id)
+    spec = _EVT_SPECS.get((record.get("payload") or {}).get("kind"))
+    if spec is None or spec.table is None:
+        return CONVERGE_DROPPED
+    target = spec.table
+    if table is not None and table != target:
+        raise JournalError(
+            f"convergence target mismatch for {event_id}: {table} != {target}")
+    cols, children = _evt_target_columns(conn, record, spec)
+    if rowid is None:
+        row = conn.execute(
+            f"SELECT id FROM {target} WHERE journal_id = ?", (event_id,)
+        ).fetchone()
+        rowid = int(row[0]) if row is not None else None
+    if rowid is None:
+        # NOTHING to converge — and materializing a row here would be wrong twice
+        # over (#374 review). A row absent because a suppression effect
+        # deliberately DELETED it would be resurrected, so the live index and a
+        # rebuild would diverge — the very contract convergence exists to hold.
+        # And an insert swallowed by a natural-key UNIQUE would leave the
+        # follow-up lookup empty and abort the whole cycle on a `JournalError`.
+        # Drop and report; the emission was already withheld by the caller.
+        print(
+            f"[journal] no live row for {event_id} in {target}; "
+            "dropped the divergent emission without materializing one",
+            file=sys.stderr,
+        )
+        return CONVERGE_DROPPED
+    assignments = ", ".join(f"{name} = ?" for name in cols)
+    conn.execute(
+        f"UPDATE {target} SET {assignments} WHERE id = ?",
+        (*cols.values(), int(rowid)),
+    )
+    if spec.applier is _apply_block_close:
+        identity = conn.execute(
+            "SELECT account_key, five_hour_window_key "
+            "FROM five_hour_blocks WHERE id = ?",
+            (int(rowid),),
+        ).fetchone()
+        if identity is None:
+            raise JournalError(
+                f"convergence target vanished for {event_id}"
+            )
+        _replace_block_children(
+            conn, int(rowid), identity[0], identity[1], children
+        )
+    return CONVERGE_APPLIED
+
+
+def _validate_excluded_derived_fks(conn, spec, row) -> None:
+    """Validate every column the harvest EXCLUDES from the evt, before the
+    duplicate path stamps the row (#374 §6 / acceptance 8).
+
+    Byte identity of the emitted event proves the JOURNALED columns match. It
+    proves nothing about the excluded ones: `_build_harvest_evt` omits
+    `journal_id`, physical ids and derived-FK columns, and
+    `five_hour_milestones.block_id` is deliberately derived rather than
+    journaled — so a milestone pointing at the WRONG block can emit an otherwise
+    byte-identical event. The canonical logical dump also excludes `block_id`
+    and would not catch it.
+
+    An unresolvable reference is NOT an error on its own. `_derived_fk_value`
+    returns 0 as the "no such parent" sentinel and the fold appliers store that
+    same 0, so a legitimately parentless row — e.g. a `five_hour_milestones` row
+    whose `five_hour_blocks` replica the 5h-credit stale-replica DELETE removed —
+    carries `actual == expected == 0` and is in agreement. Raising on that shape
+    escaped `_harvest`, rolled the cycle back, left the row unstamped and made
+    every later cycle repeat it (#374 review). ONLY disagreement is fatal."""
+    if not spec.derived_fk:
+        return
+    keys = set(row.keys())
+    account_key = row["account_key"] if "account_key" in keys else None
+    for column, (ref_table, lookup_col) in spec.derived_fk.items():
+        expected = _derived_fk_value(
+            conn, ref_table, lookup_col, row[lookup_col], account_key)
+        actual = row[column]
+        if int(actual) != expected:
+            raise JournalError(
+                f"harvest {spec.kind}: derived FK {column}={actual!r} does not "
+                f"resolve to {ref_table}.{lookup_col}={row[lookup_col]!r} "
+                f"(re-derived {expected})")
+
+
+def _full_effective_selection(hw):
+    records = []
+    evidence = []
+    prior_high_water = None
+    if hw is not None:
+        for segment, offset, raw in _read_range(None, hw):
+            record = _lib_journal.decode_line(raw)
+            if record is not None:
+                _capture_protocol_prefix_evidence(
+                    record,
+                    prior_high_water,
+                    evidence,
+                )
+                records.append(record)
+            prior_high_water = (segment, offset + len(raw) + 1)
+    cutover_claude = resolve_cutover_claude_account()
+    for record in records:
+        _normalize_legacy_account_stamp(record, cutover_claude)
+    return _lib_journal.resolve_effective_events(
+        records,
+        protocol_prefix_evidence=evidence,
+    )
+
+
+def _correction_commit_high_water(batch_id, hw=None):
+    """Return the exact end offset of one completed-batch commit marker.
+
+    The batch was already structurally validated either by the full effective
+    selector or by the live metadata row that names it. The earliest matching
+    commit is the narrowest complete prefix and remains stable even when later
+    journal bytes or crash-replayed duplicate markers exist.
+    """
+    if not batch_id:
+        return None
+    if hw is None:
+        hw = journal_high_water()
+    if hw is None:
+        return None
+    for segment, offset, raw in _read_range(None, hw):
+        record = _lib_journal.decode_line(raw)
+        if (
+            record is not None
+            and record.get("t") == "correction_batch"
+            and record.get("phase") == "commit"
+            and record.get("id") == batch_id
+        ):
+            return (segment, offset + len(raw) + 1)
+    return None
+
+
+def _preflight_live_events(
+    conn, records, hw, conflicts=None, protocol_scan=None
+):
+    """Validate unread evt/correction records before the stats transaction.
+
+    A READER (#374 §6): the evt records it inspects are already durably in the
+    journal, so same-revision divergence must NOT raise here — that raise wedged
+    every cycle over an already-poisoned journal, exactly like the rebuild. The
+    divergent evt is DROPPED from the apply set, the prior effective event
+    stands, and the group is appended to `conflicts` when a sink is supplied.
+    `CorrectionRebuildRequired` stays fatal."""
+    event_records = [record for record in records if record.get("t") == "evt"]
+    selected_new = _lib_journal.resolve_effective_events(event_records)
+    if conflicts is not None:
+        conflicts.extend(selected_new.conflicts)
+    to_apply = []
+    for evt in selected_new.active:
+        selected = selected_new.by_id[evt["id"]]
+        prior = _metadata_row(conn, selected.event_id)
+        if prior is None:
+            to_apply.append(evt)
+            continue
+        prior_rev, prior_status, prior_hash, prior_batch = prior
+        if int(prior_rev) == selected.rev:
+            if prior_status != selected.status or prior_hash != selected.content_hash:
+                if _legacy_qaa_can_advance(conn, selected):
+                    to_apply.append(evt)
+                    continue
+                if conflicts is not None:
+                    conflicts.append(
+                        _lib_journal.EventConflict(
+                            event_id=selected.event_id,
+                            rev=selected.rev,
+                            content_hashes=tuple(
+                                sorted({prior_hash, selected.content_hash})),
+                            selected_hash=prior_hash,
+                        )
+                    )
+                print(
+                    f"[journal] quarantined a divergent journal event for "
+                    f"{selected.event_id} rev {selected.rev}; the prior "
+                    "effective event stands",
+                    file=sys.stderr,
+                )
+                continue
+            continue
+        raise CorrectionRebuildRequired(
+            f"event {selected.event_id} rev {selected.rev} conflicts with "
+            f"effective rev {prior_rev} from {prior_batch or 'base journal'}",
+            batch_id=prior_batch,
+            event_id=selected.event_id,
+            high_water=_correction_commit_high_water(prior_batch, hw),
+            expected_metadata=(
+                int(prior_rev),
+                prior_status,
+                prior_hash,
+                prior_batch,
+            ),
+        )
+
+    if any(
+        record.get("t") in {"correction", "correction_batch"}
+        or (
+            record.get("t") == "op"
+            and isinstance(record.get("payload"), dict)
+            and record["payload"].get("kind")
+            == _lib_journal._PROTOCOL_RESOLUTION_KIND
+        )
+        for record in records
+    ):
+        full = _full_effective_selection(hw)
+        if protocol_scan is not None:
+            protocol_scan["scanned"] = True
+            protocol_scan["violations"] = full.protocol_violations
+            protocol_scan["acknowledged"] = (
+                full.acknowledged_protocol_violations
+            )
+        for selected in full.by_id.values():
+            if selected.batch_id is None:
+                continue
+            prior = _metadata_row(conn, selected.event_id)
+            if prior is not None:
+                prior_tuple = (int(prior[0]), prior[1], prior[2], prior[3])
+                selected_tuple = (
+                    selected.rev,
+                    selected.status,
+                    selected.content_hash,
+                    selected.batch_id,
+                )
+                if prior_tuple == selected_tuple:
+                    continue
+            raise CorrectionRebuildRequired(
+                f"completed correction batch {selected.batch_id} requires "
+                "stats index rebuild",
+                batch_id=selected.batch_id,
+                event_id=selected.event_id,
+                high_water=_correction_commit_high_water(selected.batch_id, hw),
+                expected_metadata=(
+                    selected.rev,
+                    selected.status,
+                    selected.content_hash,
+                    selected.batch_id,
+                ),
+                recovery_eligible=True,
+            )
+    return to_apply
+
+
 # --------------------------------------------------------------------------
 # the cycle (spec §5.2, revision 3)
 # --------------------------------------------------------------------------
@@ -1909,7 +2936,17 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
 
     records = [r for (r, _s, _o) in decoded]
     batch = [r for r in records if r.get("t") in ("obs", "op")]
-    journal_evts = [r for r in records if r.get("t") == "evt"]
+    # #374: the preflight reader quarantines same-revision divergence instead of
+    # raising; the groups it drops are counted on the cycle summary.
+    preflight_conflicts: list = []
+    protocol_scan: dict = {}
+    journal_evts = _preflight_live_events(
+        conn,
+        records,
+        cursor_target,
+        conflicts=preflight_conflicts,
+        protocol_scan=protocol_scan,
+    )
 
     # Step 4: ONE BEGIN IMMEDIATE — replay + pipeline + derived-fact journaling +
     # cursor advance, atomic (§5.2 crash boundary). A crash before COMMIT rolls
@@ -1925,7 +2962,8 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # before a referencing one (milestones); NO ctx, so replay is
         # structurally unable to fire an alert (§5.2 step 4a).
         for evt in sorted(journal_evts, key=_fold_order):
-            _apply_evt(conn, evt)
+            if _record_live_effective_event(conn, evt):
+                _apply_evt(conn, evt)
         # 4b. Per-record sequential pipeline over obs/op in canonical order —
         # sequential is REQUIRED (reset/credit detection precedes the same
         # record's snapshot-accept; a reset-spanning batch needs prior records'
@@ -1969,6 +3007,16 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # no-op when the batch carries no account stamps (byte-stable on a
         # pre-multi-account single-account install).
         _derive_account_last_seen(conn, records)
+        # A full correction-prefix preflight is authoritative for the
+        # disposable protocol summary. Replace it in the same transaction as
+        # the cursor so shallow Doctor paths observe either the old complete
+        # result or the new complete result, never an in-between state.
+        if protocol_scan.get("scanned"):
+            _write_protocol_violations(
+                conn,
+                protocol_scan.get("violations", ()),
+                protocol_scan.get("acknowledged", ()),
+            )
         # 4d. Advance the cursor (to HW, or to the cache-leg prefix boundary).
         # `cursor_target is None` ONLY on a reconcile-only cycle over a still-
         # empty journal (§5.2 above): there are no consumed lines to advance
@@ -2000,14 +3048,21 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         (ALERT_DISPATCHER or _dispatch_pending_alerts)(alerts)
 
     return IngestResult(ran=True, consumed=len(records), malformed=malformed,
-                        events_emitted=ctx.events_emitted, alerts=alerts)
+                        events_emitted=ctx.events_emitted, alerts=alerts,
+                        conflicts_dropped=(len(ctx.conflicts_dropped)
+                                           + len(preflight_conflicts)))
 
 
-def run_stats_ingest(*, mode: str = "opportunistic", timeout_s: float = 10.0,
-                     conn: sqlite3.Connection | None = None,
-                     reconcile_config=None, codex_apply=None,
-                     post_commit=None) -> IngestResult:
-    """Run one ingest cycle as the single-flight stats.db writer (spec §5.1/§5.2).
+def _run_stats_ingest_once(
+    *,
+    mode: str = "opportunistic",
+    timeout_s: float = 10.0,
+    conn: sqlite3.Connection | None = None,
+    reconcile_config=None,
+    codex_apply=None,
+    post_commit=None,
+) -> IngestResult:
+    """Run one single-flight attempt, without correction-recovery orchestration.
 
     `mode="opportunistic"` takes the ingest lock non-blocking (busy → `ran=False`;
     the current holder consumes the lines). `mode="authoritative"` waits up to
@@ -2040,17 +3095,112 @@ def run_stats_ingest(*, mode: str = "opportunistic", timeout_s: float = 10.0,
     never broken; an AUTHORITATIVE ingest re-raises so its caller (record-usage,
     record-credit, sync-week, statusline publication) sees the failure.
     """
-    lock_fd = _acquire_ingest_lock(mode, timeout_s)
-    if lock_fd is None:
-        return IngestResult(ran=False, consumed=0, malformed=0,
-                            events_emitted=0, alerts=[])
     own_conn = conn is None
+    maintenance_fd = None
+    lock_fd = None
     try:
+        # Let open_db resolve an epoch mismatch or classified corruption before
+        # this caller owns any lock. It can therefore take maintenance EX ->
+        # ingest in the required order. A fresh/legacy DB is different: its
+        # open runs the one-time schema/cutover path, so serialize that whole
+        # path under maintenance EX and downgrade to SH before taking ingest.
+        # For a current/mismatched epoch, open first, then take maintenance SH
+        # and verify the main-file identity did not change across the open; if
+        # a sibling rebuilt in that gap, discard the stale handle and retry.
         if own_conn:
-            conn = _cctally_core.open_db()
+            while True:
+                raw_epoch = _stats_db_user_version()
+                if (
+                    raw_epoch is None
+                    or raw_epoch <= _cctally_core.LEGACY_STATS_HEAD
+                ):
+                    maintenance_fd = _acquire_maintenance_exclusive(
+                        mode, timeout_s
+                    )
+                    if maintenance_fd is None:
+                        return IngestResult(
+                            ran=False,
+                            consumed=0,
+                            malformed=0,
+                            events_emitted=0,
+                            alerts=[],
+                    )
+                    identity_before = _stats_db_identity()
+                    conn = _cctally_core.open_db()
+                    _downgrade_maintenance_shared(maintenance_fd)
+                else:
+                    identity_before = _stats_db_identity()
+                    conn = _cctally_core.open_db()
+                    maintenance_fd = _acquire_maintenance_shared(
+                        mode, timeout_s
+                    )
+                if maintenance_fd is None:
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    return IngestResult(
+                        ran=False,
+                        consumed=0,
+                        malformed=0,
+                        events_emitted=0,
+                        alerts=[],
+                    )
+                identity_after = _stats_db_identity()
+                opened_epoch = conn.execute("PRAGMA user_version").fetchone()[0]
+                epoch_ok = (
+                    opened_epoch <= _cctally_core.LEGACY_STATS_HEAD
+                    or opened_epoch == _cctally_core.STATS_INDEX_EPOCH
+                )
+                if (
+                    identity_before == identity_after
+                    and epoch_ok
+                ):
+                    break
+                _release_maintenance_shared(maintenance_fd)
+                maintenance_fd = None
+                conn.close()
+                conn = None
+        else:
+            maintenance_fd = _acquire_maintenance_shared(mode, timeout_s)
+            if maintenance_fd is None:
+                return IngestResult(
+                    ran=False,
+                    consumed=0,
+                    malformed=0,
+                    events_emitted=0,
+                    alerts=[],
+                )
+
+        lock_fd = _acquire_ingest_lock(mode, timeout_s)
+        if lock_fd is None:
+            if own_conn and conn is not None:
+                conn.close()
+                conn = None
+            return IngestResult(
+                ran=False,
+                consumed=0,
+                malformed=0,
+                events_emitted=0,
+                alerts=[],
+            )
         try:
-            return _run_cycle(conn, reconcile_config=reconcile_config,
-                              codex_apply=codex_apply, post_commit=post_commit)
+            # #386: declare the sanctioned steady-state write regime for the
+            # duration of the cycle. Two consumers: the Stage 3 authorizer, and
+            # `holds_ingest_lock()` — a corruption surfacing from INSIDE the
+            # cycle (via a nested `open_db()`, e.g. the cross-DB stats read on
+            # the quota leg) reaches the heal hook while this process already
+            # owns journal.ingest.lock, and the heal must recognise itself as
+            # the serialized writer rather than wait 5s for a lock it holds.
+            import _cctally_store
+            with _cctally_store.stats_write_scope("ingest", ingest_lock=True):
+                return _run_cycle(conn, reconcile_config=reconcile_config,
+                                  codex_apply=codex_apply,
+                                  post_commit=post_commit)
+        except CorrectionRebuildRequired:
+            # The public boundary must unwind its transaction, internally owned
+            # connection, ingest lock, and maintenance-shared lock before it can
+            # seek maintenance EXCLUSIVE in total order.
+            raise
         except Exception as exc:
             if mode == "authoritative":
                 raise
@@ -2065,7 +3215,242 @@ def run_stats_ingest(*, mode: str = "opportunistic", timeout_s: float = 10.0,
             if own_conn and conn is not None:
                 conn.close()
     finally:
-        _release_ingest_lock(lock_fd)
+        if lock_fd is not None:
+            _release_ingest_lock(lock_fd)
+        if maintenance_fd is not None:
+            _release_maintenance_shared(maintenance_fd)
+
+
+def _correction_recovery_guidance(cause) -> str:
+    detail = str(cause)
+    lower = detail.lower()
+    holder = (
+        "open handle" in lower
+        or "family is still open" in lower
+        or "open in process" in lower
+    )
+    prefix = ""
+    if holder:
+        prefix = (
+            "stop the dashboard or other process holding stats.db open, then "
+        )
+    return (
+        f"{detail}; {prefix}run `cctally db rebuild --db stats` and retry"
+    )
+
+
+def _correction_error_result(error) -> IngestResult:
+    print(
+        f"[ingest] correction recovery declined, cursor unmoved: {error}",
+        file=sys.stderr,
+    )
+    return IngestResult(
+        ran=True,
+        consumed=0,
+        malformed=0,
+        events_emitted=0,
+        alerts=[],
+        error=error,
+    )
+
+
+def _correction_index_converged(signal: CorrectionRebuildRequired) -> bool:
+    """Revalidate the triggering effective row without open-time mutation."""
+    if signal.event_id is None or signal.expected_metadata is None:
+        return False
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    if not path.exists():
+        return False
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    try:
+        row = conn.execute(
+            "SELECT rev, status, content_hash, batch_id "
+            "FROM journal_effective_events WHERE event_id = ?",
+            (signal.event_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return (
+            int(row[0]),
+            row[1],
+            row[2],
+            row[3],
+        ) == tuple(signal.expected_metadata)
+    finally:
+        conn.close()
+
+
+def _correction_scratch_mains() -> set[pathlib.Path]:
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    prefix = path.name + ".rebuilding-"
+    return {
+        member
+        for member in path.parent.glob(prefix + "*")
+        if not member.name.endswith(("-wal", "-shm"))
+    }
+
+
+def _cleanup_new_correction_scratches(before: set[pathlib.Path]) -> None:
+    for scratch in _correction_scratch_mains() - before:
+        try:
+            _remove_db_family(scratch)
+        except OSError:
+            pass
+
+
+def _recover_completed_correction(
+    signal: CorrectionRebuildRequired,
+    *,
+    mode: str,
+    timeout_s: float,
+) -> None:
+    """Revalidate and, when still needed, replace through the trigger prefix."""
+    if (
+        signal.batch_id is None
+        or signal.event_id is None
+        or signal.high_water is None
+        or signal.expected_metadata is None
+    ):
+        raise CorrectionRecoveryError(
+            _correction_recovery_guidance(
+                "completed correction lacks an exact validated commit high-water"
+            )
+        )
+
+    maintenance_fd = _acquire_maintenance_exclusive(mode, timeout_s)
+    if maintenance_fd is None:
+        raise CorrectionRecoveryError(
+            _correction_recovery_guidance(
+                "stats maintenance lock is busy"
+            )
+        )
+    ingest_fd = None
+    try:
+        ingest_fd = _acquire_ingest_lock(mode, timeout_s)
+        if ingest_fd is None:
+            raise CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    "another ingest holds journal.ingest.lock"
+                )
+            )
+
+        # A sibling may have rebuilt after the original attempt unwound. The
+        # locked re-check prevents redundant preservation/publication.
+        try:
+            converged = _correction_index_converged(signal)
+        except Exception as exc:
+            raise CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    f"correction revalidation failed: {exc}"
+                )
+            ) from exc
+        if converged:
+            return
+
+        import _cctally_db
+        if _cctally_db._would_block_prod_stats(_cctally_core.DB_PATH):
+            raise CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    "refusing to rebuild the prod stats.db from a dev checkout"
+                )
+            )
+
+        import _cctally_store
+        scratches_before = _correction_scratch_mains()
+        try:
+            with _cctally_store.stats_write_scope(
+                "maintenance-correction-rebuild",
+                ingest_lock=True,
+            ):
+                rebuild_stats_index(high_water=signal.high_water)
+        except BaseException as exc:
+            _cleanup_new_correction_scratches(scratches_before)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise CorrectionRecoveryError(
+                _correction_recovery_guidance(exc)
+            ) from exc
+    finally:
+        if ingest_fd is not None:
+            _release_ingest_lock(ingest_fd)
+        _release_maintenance_shared(maintenance_fd)
+
+
+def run_stats_ingest(
+    *,
+    mode: str = "opportunistic",
+    timeout_s: float = 10.0,
+    conn: sqlite3.Connection | None = None,
+    reconcile_config=None,
+    codex_apply=None,
+    post_commit=None,
+) -> IngestResult:
+    """Run one cycle, healing one completed-correction mismatch when safe.
+
+    The initial attempt fully unwinds before recovery seeks maintenance
+    EXCLUSIVE then ingest. Recovery revalidates, rebuilds through the exact
+    triggering commit, releases both locks, and retries once on a freshly opened
+    current-family connection. Caller-owned connections are never closed or
+    replaced. A second correction signal is surfaced with the manual remedy.
+    """
+    kwargs = {
+        "mode": mode,
+        "timeout_s": timeout_s,
+        "conn": conn,
+        "reconcile_config": reconcile_config,
+        "codex_apply": codex_apply,
+        "post_commit": post_commit,
+    }
+    try:
+        return _run_stats_ingest_once(**kwargs)
+    except CorrectionRebuildRequired as signal:
+        if not signal.recovery_eligible:
+            raise
+        if conn is not None:
+            raise CorrectionRebuildRequired(
+                _correction_recovery_guidance(
+                    "automatic correction recovery cannot replace a "
+                    "caller-owned stats.db connection"
+                ),
+                batch_id=signal.batch_id,
+                event_id=signal.event_id,
+                high_water=signal.high_water,
+                expected_metadata=signal.expected_metadata,
+                recovery_eligible=True,
+            ) from signal
+
+        try:
+            _recover_completed_correction(
+                signal,
+                mode=mode,
+                timeout_s=timeout_s,
+            )
+        except CorrectionRecoveryError as exc:
+            if mode == "authoritative":
+                raise
+            return _correction_error_result(exc)
+
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["conn"] = None
+        try:
+            result = _run_stats_ingest_once(**retry_kwargs)
+        except Exception as exc:
+            wrapped = CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    f"single correction-recovery retry failed: {exc}"
+                )
+            )
+            if mode == "authoritative":
+                raise wrapped from exc
+            return _correction_error_result(wrapped)
+        if result.error is not None:
+            wrapped = CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    f"single correction-recovery retry failed: {result.error}"
+                )
+            )
+            return _correction_error_result(wrapped)
+        return result
 
 
 # ==========================================================================
@@ -2133,14 +3518,29 @@ class RebuildResult:
     duration_s: float         # wall time of the whole rebuild
     segments_read: int        # journal segments folded
     lines_folded: int         # op + evt lines applied (obs are rederive input)
+    # #374: divergent same-revision groups quarantined behind a lowest-sequence
+    # provisional winner. The rebuild COMPLETES and exits 0 — reporting them is
+    # how we refuse to assert that a guessed winner is authoritative.
+    conflicts: tuple = ()
+    # #402 Task A: whole correction batches omitted after one of the seven
+    # enumerated structural violations. The usable index still publishes, but
+    # every operator surface must report that intended corrections were omitted.
+    protocol_violations: tuple = ()
+    # #402 Task B: exact violations the operator acknowledged as omitted. The
+    # batches remain tainted; this is diagnostic/audit state, never validity.
+    acknowledged_protocol_violations: tuple = ()
+    quarantine_dir: "pathlib.Path | None" = None
 
 
-def _remove_db_sidecars(path) -> None:
+def _remove_db_sidecars_strict(path) -> None:
+    """Remove both sidecars or fail before publishing a replacement main file."""
     for suffix in ("-wal", "-shm"):
+        candidate = pathlib.Path(str(path) + suffix)
         try:
-            pathlib.Path(str(path) + suffix).unlink()
-        except OSError:
+            candidate.unlink()
+        except FileNotFoundError:
             pass
+    _fsync_dir(pathlib.Path(path).parent)
 
 
 def _remove_db_family(path) -> None:
@@ -2149,6 +3549,426 @@ def _remove_db_family(path) -> None:
             pathlib.Path(str(path) + suffix).unlink()
         except OSError:
             pass
+
+
+def _stats_rebuild_test_pause(point: str) -> None:
+    """Private process-control seam for the #388 interrupted-rebuild tests."""
+    if os.environ.get("CCTALLY_TEST_STATS_REBUILD_PAUSE_AT") != point:
+        return
+    marker = os.environ.get("CCTALLY_TEST_STATS_REBUILD_MARKER")
+    if not marker:
+        return
+    pathlib.Path(marker).write_text(f"{os.getpid()}\n")
+    os.kill(os.getpid(), signal.SIGSTOP)
+
+
+_REBUILD_REQUIRED_TABLES = frozenset(
+    {
+        "accounts",
+        "budget_milestones",
+        "five_hour_block_models",
+        "five_hour_block_projects",
+        "five_hour_blocks",
+        "five_hour_milestones",
+        "five_hour_reset_events",
+        "journal_cursor",
+        "journal_effective_events",
+        "journal_protocol_violations",
+        "percent_milestones",
+        "project_budget_milestones",
+        "projected_milestones",
+        "quota_alert_arming",
+        "quota_percent_milestones",
+        "quota_projection_state",
+        "quota_threshold_events",
+        "quota_window_blocks",
+        "schema_migrations",
+        "schema_migrations_skipped",
+        "stats_open_fixups",
+        "week_reset_events",
+        "weekly_cost_snapshots",
+        "weekly_credit_floors",
+        "weekly_usage_snapshots",
+    }
+)
+_REBUILD_REQUIRED_INDEXES = frozenset(
+    {
+        "idx_budget_milestones_journal_id",
+        "idx_budget_milestones_journal_id_null",
+        "idx_cost_week_start_at_time",
+        "idx_cost_week_time",
+        "idx_five_hour_block_models_block",
+        "idx_five_hour_block_models_window",
+        "idx_five_hour_block_projects_block",
+        "idx_five_hour_block_projects_window",
+        "idx_five_hour_blocks_block_start",
+        "idx_five_hour_blocks_journal_id",
+        "idx_five_hour_blocks_journal_id_null",
+        "idx_five_hour_milestones_block",
+        "idx_five_hour_milestones_journal_id",
+        "idx_five_hour_milestones_journal_id_null",
+        "idx_five_hour_reset_events_journal_id",
+        "idx_five_hour_reset_events_journal_id_null",
+        "idx_percent_milestones_journal_id",
+        "idx_percent_milestones_journal_id_null",
+        "idx_project_budget_milestones_journal_id",
+        "idx_project_budget_milestones_journal_id_null",
+        "idx_projected_milestones_journal_id",
+        "idx_projected_milestones_journal_id_null",
+        "idx_quota_blocks_active",
+        "idx_quota_milestones_active",
+        "idx_quota_threshold_events_active",
+        "idx_usage_week_start_at_time",
+        "idx_usage_week_time",
+        "idx_week_reset_events_journal_id",
+        "idx_week_reset_events_journal_id_null",
+        "idx_weekly_cost_snapshots_journal_id",
+        "idx_weekly_credit_floors_journal_id",
+        "idx_weekly_usage_snapshots_5h_window_key",
+        "idx_weekly_usage_snapshots_journal_id",
+    }
+)
+# SHA-256 of the current epoch's non-internal table/index sqlite_schema rows,
+# ordered by (type, name).  Unlike table-name checks, this catches a silently
+# omitted column, constraint, partial predicate, or index definition.  An epoch
+# schema change must update this contract alongside STATS_INDEX_EPOCH.
+_REBUILD_SCHEMA_FINGERPRINT = (
+    "3e0ec46a965c9fa10ac827cfd1656c66ecae50ed289e3aa1c34d2cf6a3e5c4a3"
+)
+
+
+def _stats_schema_fingerprint(conn: sqlite3.Connection) -> str:
+    rows = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE type IN ('table', 'index') "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+    ]
+    payload = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_rebuilt_stats_index(
+    conn: sqlite3.Connection, high_water: "tuple[str, int] | None"
+) -> None:
+    """Validate the scratch index before it is eligible for publication."""
+    integrity = [str(row[0]) for row in conn.execute("PRAGMA integrity_check")]
+    if integrity != ["ok"]:
+        raise JournalError(
+            "rebuilt stats index failed integrity_check: " + "; ".join(integrity)
+        )
+
+    epoch = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if epoch != _cctally_core.STATS_INDEX_EPOCH:
+        raise JournalError(
+            f"rebuilt stats index has epoch {epoch}, expected "
+            f"{_cctally_core.STATS_INDEX_EPOCH}"
+        )
+
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    missing_tables = sorted(_REBUILD_REQUIRED_TABLES - tables)
+    unexpected_tables = sorted(tables - _REBUILD_REQUIRED_TABLES)
+    if missing_tables or unexpected_tables:
+        raise JournalError(
+            "rebuilt stats index table contract mismatch"
+            f"; missing={missing_tables!r}; unexpected={unexpected_tables!r}"
+        )
+
+    indexes = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    missing_indexes = sorted(_REBUILD_REQUIRED_INDEXES - indexes)
+    unexpected_indexes = sorted(indexes - _REBUILD_REQUIRED_INDEXES)
+    if missing_indexes or unexpected_indexes:
+        raise JournalError(
+            "rebuilt stats index index contract mismatch"
+            f"; missing={missing_indexes!r}; unexpected={unexpected_indexes!r}"
+        )
+
+    schema_fingerprint = _stats_schema_fingerprint(conn)
+    if schema_fingerprint != _REBUILD_SCHEMA_FINGERPRINT:
+        raise JournalError(
+            "rebuilt stats index schema definition mismatch: "
+            f"{schema_fingerprint}, expected {_REBUILD_SCHEMA_FINGERPRINT}"
+        )
+
+    # Force representative table and cursor B-tree reads.  Header readability
+    # and a constant-only SELECT do not establish that the index is usable.
+    conn.execute(
+        "SELECT id, journal_id FROM weekly_usage_snapshots "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchall()
+    cursor_row = conn.execute(
+        "SELECT segment, offset, applied_segment, applied_offset "
+        "FROM journal_cursor WHERE id = 1"
+    ).fetchone()
+    actual_cursor = (
+        (str(cursor_row[0]), int(cursor_row[1]))
+        if cursor_row is not None
+        else None
+    )
+    applied_cursor = (
+        (str(cursor_row[2]), int(cursor_row[3]))
+        if cursor_row is not None
+        and cursor_row[2] is not None
+        and cursor_row[3] is not None
+        else None
+    )
+    if actual_cursor != high_water or applied_cursor != high_water:
+        raise JournalError(
+            "rebuilt stats index cursor contract "
+            f"(public={actual_cursor!r}, applied={applied_cursor!r}) "
+            f"does not match pinned journal high-water {high_water!r}"
+        )
+
+
+def stats_index_matches_journal_prefix(
+    path: pathlib.Path, high_water: "tuple[str, int] | None"
+) -> bool:
+    """Whether ``path`` is a fully valid materialization of ``high_water``.
+
+    This is intentionally stronger than "the index has rows": it validates the
+    full Task A publication contract and compares the disposable effective-event
+    summary with the canonical journal selection.  A legitimate empty index
+    therefore matches an empty selection, while a valid-looking empty/partial
+    index over data-bearing journal events does not.
+    """
+    if not pathlib.Path(path).exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            _validate_rebuilt_stats_index(conn, high_water)
+            decoded: list[dict] = []
+            protocol_evidence = []
+            prior_high_water = None
+            if high_water is not None:
+                for segment, offset, raw in _read_range(None, high_water):
+                    record = _lib_journal.decode_line(raw)
+                    if record is not None:
+                        _capture_protocol_prefix_evidence(
+                            record,
+                            prior_high_water,
+                            protocol_evidence,
+                        )
+                        decoded.append(record)
+                    prior_high_water = (
+                        segment,
+                        offset + len(raw) + 1,
+                    )
+            cutover_claude = resolve_cutover_claude_account()
+            for record in decoded:
+                _normalize_legacy_account_stamp(record, cutover_claude)
+            selection = _lib_journal.resolve_effective_events(
+                decoded,
+                protocol_prefix_evidence=protocol_evidence,
+            )
+            expected = []
+            for event_id, selected in selection.by_id.items():
+                event_json = None
+                if selected.record is not None:
+                    event_json = (
+                        _lib_journal.encode_line(selected.record)
+                        .decode("utf-8")
+                        .rstrip("\n")
+                    )
+                expected.append(
+                    (
+                        event_id,
+                        selected.rev,
+                        selected.status,
+                        selected.content_hash,
+                        selected.batch_id,
+                        event_json,
+                    )
+                )
+            expected.sort(key=lambda row: row[0])
+            actual = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT event_id, rev, status, content_hash, batch_id, "
+                    "event_json FROM journal_effective_events ORDER BY event_id"
+                )
+            ]
+            if actual != expected:
+                return False
+            expected_violation_rows = [
+                *selection.protocol_violations,
+                *selection.acknowledged_protocol_violations,
+            ]
+            expected_violation_rows.sort(
+                key=lambda violation: (
+                    violation.batch_id,
+                    violation.kind,
+                    violation.fingerprint,
+                )
+            )
+            expected_violations = [
+                json.dumps(
+                    violation.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for violation in expected_violation_rows
+            ]
+            actual_violations = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT violation_json FROM journal_protocol_violations "
+                    "ORDER BY batch_id, kind, fingerprint"
+                )
+            ]
+            if actual_violations != expected_violations:
+                return False
+            for record in selection.active:
+                if record.get("t") != "evt":
+                    continue
+                spec = _EVT_SPECS.get((record.get("payload") or {}).get("kind"))
+                if spec is None or spec.table is None:
+                    continue
+                row = conn.execute(
+                    f"SELECT id FROM {spec.table} WHERE journal_id = ?",
+                    (record["id"],),
+                ).fetchone()
+                if row is None:
+                    return False
+                if spec.applier is _apply_block_close:
+                    block_id = int(row[0])
+                    payload = record.get("payload") or {}
+                    for payload_key, child_table in _BLOCK_CHILDREN:
+                        child_count = conn.execute(
+                            f"SELECT COUNT(*) FROM {child_table} WHERE block_id = ?",
+                            (block_id,),
+                        ).fetchone()[0]
+                        if int(child_count) != len(payload.get(payload_key) or ()):
+                            return False
+            return True
+        finally:
+            conn.close()
+    except (
+        OSError,
+        sqlite3.DatabaseError,
+        JournalError,
+        _lib_journal.JournalProtocolError,
+    ):
+        return False
+
+
+def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> None:
+    """Checkpoint a readable old index so removing its sidecars is kill-safe."""
+    import _cctally_db
+
+    try:
+        conn = sqlite3.connect(str(path), timeout=15.0)
+        try:
+            conn.execute("PRAGMA schema_version").fetchone()
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None and int(checkpoint[0]) != 0:
+                raise JournalError(
+                    "old stats index WAL could not be drained before cutover"
+                )
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        # Auto-heal necessarily starts from an unreadable family. Preserve its
+        # exact bytes below, then publish the already-validated replacement.
+        if _cctally_db._is_sqlite_corruption_error(exc):
+            return
+        raise
+
+
+def _preserve_stats_family_for_cutover(path: pathlib.Path) -> pathlib.Path:
+    """Durably copy the old family into quarantine without removing the main."""
+    import _cctally_db
+
+    root = _cctally_core.APP_DIR / "quarantine"
+    root.mkdir(parents=True, exist_ok=True)
+    # The quarantine entry itself must survive power loss before any old
+    # sidecar can be removed. fsyncing only the new root/incident cannot make
+    # the root's directory entry durable in APP_DIR.
+    _fsync_dir(_cctally_core.APP_DIR)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+    incident = root / f"{path.name}-{stamp}"
+    incident.mkdir(mode=0o700)
+    destination = incident / path.name
+    members = [
+        pathlib.Path(str(path) + suffix).name
+        for suffix in ("", "-wal", "-shm")
+        if pathlib.Path(str(path) + suffix).exists()
+    ]
+    if not members:
+        raise OSError(f"no database family exists to preserve at {path}")
+    _cctally_db._copy_db_family(path, destination)
+    manifest = {
+        "schemaVersion": 1,
+        "quarantinedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z"),
+        "originalPath": str(path),
+        "movedFiles": members,
+        "complete": True,
+        "cutoverProtocol": "preserve-then-atomic-replace-v1",
+    }
+    _cctally_db._atomic_write_private_json(incident / "manifest.json", manifest)
+    _fsync_dir(incident)
+    _fsync_dir(root)
+    return incident
+
+
+def _publish_rebuilt_stats_index(
+    *,
+    scratch: pathlib.Path,
+    destination: pathlib.Path,
+    preserve_existing: bool,
+    before_swap=None,
+) -> "pathlib.Path | None":
+    """Publish one validated, closed, sidecar-free scratch index atomically."""
+    import _cctally_store
+
+    family_exists = any(
+        pathlib.Path(str(destination) + suffix).exists()
+        for suffix in ("", "-wal", "-shm")
+    )
+    incident = None
+    if family_exists:
+        blocked = _cctally_store._stats_family_drained(destination)
+        if blocked is not None:
+            raise JournalError(f"stats.db cutover declined: {blocked}")
+        _cctally_store._stats_storm_test_pause("stats_replace_drained")
+        if preserve_existing:
+            # Preserve the exact pre-cutover family, including a committed WAL
+            # and SHM, before checkpointing mutates or removes those sidecars.
+            incident = _preserve_stats_family_for_cutover(destination)
+        if destination.exists():
+            _prepare_existing_stats_for_cutover(destination)
+        # The old main stays present and, when it was readable, fully
+        # checkpointed. A kill from here until os.replace therefore still
+        # leaves a usable old destination while preventing stale sidecars from
+        # being paired with the replacement main.
+        _remove_db_sidecars_strict(destination)
+
+    if before_swap is not None:
+        before_swap()
+    _stats_rebuild_test_pause("rebuild_before_cutover")
+    os.replace(str(scratch), str(destination))
+    _fsync_dir(destination.parent)
+    return incident
 
 
 def _rebuild_quota_cache_leg(records) -> None:
@@ -2209,7 +4029,13 @@ def _rebuild_quota_cache_leg(records) -> None:
         release_cache_writer_flocks(held)
 
 
-def rebuild_stats_index(*, target_path=None) -> RebuildResult:
+def rebuild_stats_index(
+    *,
+    target_path=None,
+    high_water: "tuple[str, int] | None" = None,
+    update_quota_cache: bool = True,
+    before_swap=None,
+) -> RebuildResult:
     """Build a FRESH stats index from the journal alone (spec §5.4).
 
     Replays every segment in canonical `(segment, offset)` order into a fresh
@@ -2219,10 +4045,14 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
     no alerts, no `reconcile_config` (see the module note above). Post-rebuild the
     cursor equals the journal high-water.
 
-    `target_path` selects the destination (default `DB_PATH`). The caller
-    (auto-heal HEAL_HOOK / `db rebuild`) forensics-quarantines the damaged/old DB
-    FIRST, so the destination is absent at swap time; a `target_path` build (used
-    by determinism tests) writes an independent index without touching `DB_PATH`.
+    `target_path` selects the destination (default `DB_PATH`). `high_water`
+    optionally pins the exact inclusive journal prefix; later bytes stay beyond
+    the rebuilt cursor. `update_quota_cache=False` is the Task-C Claude-only
+    path whose caller already holds a stable cache exclusion. The common
+    cutover keeps a live destination in place until its validated replacement
+    is ready, preserves the old family, detaches old sidecars, and atomically
+    replaces the main file. A `target_path` build uses the same atomic
+    publication but does not create a live-family quarantine incident.
     """
     start = time.monotonic()
     dest = (pathlib.Path(target_path) if target_path is not None
@@ -2231,8 +4061,19 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
     # HW snapshot at the START — lines appended during the rebuild are past HW
     # and belong to the next ingest cycle (they replay idempotently); mirrors the
     # live cycle's §5.2.1 HW-prefix rule.
-    hw = journal_high_water()
+    hw = high_water if high_water is not None else journal_high_water()
     segments = list_segments()
+    if hw is not None:
+        if hw[0] not in segments:
+            raise JournalError(
+                f"rebuild high-water segment is missing: {hw[0]}"
+            )
+        current_size = os.path.getsize(_cctally_core.JOURNAL_DIR / hw[0])
+        if hw[1] < 0 or hw[1] > current_size:
+            raise JournalError(
+                f"rebuild high-water offset is invalid for {hw[0]}: {hw[1]}"
+            )
+        segments = segments[:segments.index(hw[0]) + 1]
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
     scratch = dest.with_name(dest.name + f".rebuilding-{stamp}")
@@ -2246,13 +4087,28 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
     lines_folded = 0
     try:
         decoded: list = []
+        protocol_evidence = []
+        prior_high_water = None
         if hw is not None:
-            for _seg, _off, raw in _read_range(None, hw):
+            for segment, offset, raw in _read_range(None, hw):
                 rec = _lib_journal.decode_line(raw)
                 if rec is None:
                     malformed += 1
+                    prior_high_water = (
+                        segment,
+                        offset + len(raw) + 1,
+                    )
                     continue
+                _capture_protocol_prefix_evidence(
+                    rec,
+                    prior_high_water,
+                    protocol_evidence,
+                )
                 decoded.append(rec)
+                prior_high_water = (
+                    segment,
+                    offset + len(raw) + 1,
+                )
 
         # Legacy account normalisation (#341, spec §2 / handoff item 2): a
         # pre-#341 real-account line lacks an account stamp — inject the cutover
@@ -2265,9 +4121,18 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
         for rec in decoded:
             _normalize_legacy_account_stamp(rec, cutover_claude)
 
+        # Resolve corrections BEFORE either disposable index is mutated. A
+        # malformed revision, divergent same-revision candidate, or invalid
+        # committed manifest leaves the existing destination untouched.
+        effective = _lib_journal.resolve_effective_events(
+            decoded,
+            protocol_prefix_evidence=protocol_evidence,
+        )
+
         # Cache leg BEFORE any stats txn (provider-flock lock-order): journal
         # Codex quota obs -> cache.db quota_window_snapshots.
-        _rebuild_quota_cache_leg(decoded)
+        if update_quota_cache:
+            _rebuild_quota_cache_leg(decoded)
 
         # One ordered fold stream: op-folds (order 5) + evts, keyed by
         # (fold_order, canonical seq) so referenced families resolve before
@@ -2278,16 +4143,19 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
             kind = (rec.get("payload") or {}).get("kind")
             if t == "op" and kind in FOLD_APPLIERS:
                 stream.append((_OP_FOLD_ORDER, seq, "op", rec))
-            elif t == "evt":
-                stream.append((_fold_order(rec), seq, "evt", rec))
+        for seq, rec in enumerate(effective.active):
+            stream.append((_fold_order(rec), seq, "evt", rec))
         stream.sort(key=lambda x: (x[0], x[1]))
         structural = [s for s in stream if s[0] < _REBUILD_MILESTONE_ORDER]
         tail = [s for s in stream if s[0] >= _REBUILD_MILESTONE_ORDER]
+
+        _stats_rebuild_test_pause("rebuild_fold_started")
 
         # Phase 1 (txn A) — structural folds: op floors, snapshot_accept, cost
         # snapshots, resets+suppression, block_close, arming, credit effects.
         conn.execute("BEGIN IMMEDIATE")
         try:
+            _write_effective_metadata(conn, effective)
             for _order, _seq, kind, rec in structural:
                 if kind == "op":
                     FOLD_APPLIERS[(rec.get("payload") or {}).get("kind")](conn, rec)
@@ -2350,21 +4218,35 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
             except sqlite3.Error:
                 rows_by_table[tbl] = 0
         # Drain the WAL into the main file so the atomic rename carries all data.
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0]) != 0:
+            raise JournalError("rebuilt stats index WAL could not be drained")
+        _validate_rebuilt_stats_index(conn, hw)
+        _stats_rebuild_test_pause("rebuild_scratch_complete")
     finally:
         conn.close()
 
-    # Atomic swap: the freshly-built scratch becomes the destination. Its WAL was
-    # drained above; drop the empty sidecars, rename, and clear any stale
-    # destination sidecars (a fresh open recreates its own).
-    _remove_db_sidecars(scratch)
-    os.replace(str(scratch), str(dest))
-    _remove_db_sidecars(dest)
+    # Closed, drained, validated, and durable before the old family is touched.
+    _remove_db_sidecars_strict(scratch)
+    with scratch.open("rb") as handle:
+        os.fsync(handle.fileno())
+    _fsync_dir(scratch.parent)
+    incident = _publish_rebuilt_stats_index(
+        scratch=scratch,
+        destination=dest,
+        preserve_existing=target_path is None,
+        before_swap=before_swap,
+    )
 
     return RebuildResult(
         rows_by_table=rows_by_table, malformed=malformed,
         duration_s=time.monotonic() - start, segments_read=len(segments),
-        lines_folded=lines_folded,
+        lines_folded=lines_folded, conflicts=effective.conflicts,
+        protocol_violations=effective.protocol_violations,
+        acknowledged_protocol_violations=(
+            effective.acknowledged_protocol_violations
+        ),
+        quarantine_dir=incident,
     )
 
 
@@ -2396,10 +4278,26 @@ def rebuild_stats_index(*, target_path=None) -> RebuildResult:
 # the stamping runs; a re-run after any crash re-exports byte-identical lines
 # (ids are `b:<table>:<rowid>`, independent of the retry's timestamp), so a
 # duplicate/leftover bootstrap folds idempotently (`INSERT OR IGNORE`). The
-# cutover does NOT take the ingest lock (open_db reaches it from INSIDE
-# run_stats_ingest's own ingest-lock hold — re-acquiring would self-deadlock):
-# single-flight of the STAMP is provided by `BEGIN IMMEDIATE`, and concurrent
-# cutovers converge by id.
+# cutover does NOT take the ingest lock. **The conclusion is right; the reason
+# once written here was false and is corrected (#386).** It was: "open_db
+# reaches it from INSIDE run_stats_ingest's own ingest-lock hold — re-acquiring
+# would self-deadlock." It does not: `run_stats_ingest` takes maintenance
+# EXCLUSIVE *before* `open_db()` on the legacy/fresh branch and only acquires
+# `journal.ingest.lock` after `open_db` has returned, so cutover never runs
+# under an ingest hold from that path.
+#
+# The real reason is that cutover runs under maintenance-EXCLUSIVE — since #386,
+# unconditionally, via `_cctally_store.stats_open_time_guard()` around
+# `open_db`'s whole open-time mutation region, whichever command reached it.
+# Maintenance-exclusive already serializes it against ingest, so the ingest lock
+# would add nothing; single-flight of the STAMP is provided by `BEGIN
+# IMMEDIATE`, and concurrent cutovers converge by id.
+#
+# DO NOT "fix" this by making cutover take the ingest lock. `holds_ingest_lock()`
+# now exists, and the deleted sentence reads like an invitation to add the
+# acquire with a re-entrancy check. Taking maintenance then ingest here would be
+# in lock order and would not deadlock — it would simply be a second, redundant
+# lock on a path that already holds the stronger one.
 
 
 def _cutover_iso(dt_utc: dt.datetime) -> str:
@@ -2434,9 +4332,8 @@ class _CutoverSpec:
     # (quota_alert_arming): its fold applier converges by NATURAL-KEY upsert, so
     # there is nothing to stamp back and it is excluded from the no-NULL-survivors
     # invariant (§8). When `natural_key_id` is set, the exported evt id is the
-    # natural-key form (`<natural_key_prefix>:<col>:<col>…`) matching the LIVE
-    # emission (so a cutover-exported record and a later live re-emission share
-    # one id) instead of the `b:<table>:<rowid>` bootstrap id.
+    # state-instance form (`<natural_key_prefix>:<col>:<col>…`) matching the LIVE
+    # emission, instead of the `b:<table>:<rowid>` bootstrap id.
     stamp: bool = True
     natural_key_prefix: str = ""    # evt_id kind prefix (e.g. "qaa")
     natural_key_id: tuple = ()      # columns forming the natural-key evt id
@@ -2480,22 +4377,17 @@ _CUTOVER_SPECS = (
     # forward-only alert clock (`activated_at_utc`) that must survive rebuild so
     # the reconcile honors it (no historical re-fires). No journal_id column →
     # NOT stamped; the fold applier upserts by natural key. The evt id is the
-    # `qaa:` natural-key form (matching the live emission in
-    # `_cctally_quota._codex_leg._emit_arming`), so a cutover-exported arming
-    # record and a later live re-emission for the same identity are ONE record.
+    # `qaa:` state-instance form (matching the live emission in
+    # `_cctally_quota._codex_leg._emit_arming`): the natural row key is followed
+    # by fingerprint + activation boundary so distinct state transitions never
+    # collide at rev 0, while exact re-emission of one state converges.
     _CutoverSpec("quota_alert_arming", "quota_alert_arming", "evt",
                  "activated_at_utc", stamp=False, natural_key_prefix="qaa",
                  natural_key_id=("source", "source_root_key", "account_key",
                                  "logical_limit_key", "observed_slot",
-                                 "window_minutes")),
+                                 "window_minutes", "rule_fingerprint",
+                                 "activated_at_utc")),
 )
-
-# Journal-covered stats tables whose rows get a `journal_id` stamp at cutover.
-# five_hour_blocks stamps only its CLOSED rows (open blocks stay NULL — they are
-# re-materialized projections). `stamp=False` families (quota_alert_arming: no
-# journal_id column) are excluded — they converge by natural-key upsert.
-_CUTOVER_STAMP_TABLES = tuple(s.table for s in _CUTOVER_SPECS if s.stamp)
-
 
 def _export_stats_table(conn, spec) -> list:
     """Return `[(line_record, rowid), ...]` for every row of `spec.table`
@@ -2528,13 +4420,13 @@ def _export_stats_table(conn, spec) -> list:
             payload[payload_key] = [
                 {k: cr[k] for k in cr.keys() if k not in ("id", "block_id")}
                 for cr in child_rows]
+        if spec.kind == "quota_alert_arming":
+            payload["journal_identity_version"] = 2
         if spec.natural_key_id:
-            # §5.3 "state" family: the evt id is the natural-key form (matching
-            # the live emission), NOT the b:<table>:<rowid> bootstrap id. A legacy
-            # (pre-#341) stats.db has no `account_key` column, so a natural-key
-            # component absent from the row is the sentinel (#341): the exported
-            # qaa id becomes `qaa:...:unattributed:...`, matching what a live
-            # re-emission for the unattributed identity would build.
+            # §5.3 "state" family: the evt id is the state-instance form (matching
+            # the live emission), NOT the b:<table>:<rowid> bootstrap id. A
+            # legacy (pre-#341) stats.db has no `account_key` column, so that
+            # missing component is the sentinel (#341).
             row_cols = set(row.keys())
             bid = _lib_journal.evt_id(
                 spec.natural_key_prefix,
@@ -2704,9 +4596,10 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
 # Account epoch-transition coordinator (#341, spec §2)
 # ==========================================================================
 #
-# Epoch 1000 -> 1001 adds the account dimension. An existing epoch-1000 stats.db
-# reaches `resolve_stats_epoch_mismatch`, which runs this coordinator BEFORE the
-# rebuild, in exact order (spec §2, review finding 1):
+# The epoch-transition coordinator was introduced when 1000 -> 1001 added the
+# account dimension. Later disposable-index epoch bumps reuse it idempotently:
+# `resolve_stats_epoch_mismatch` runs this coordinator BEFORE the rebuild, in
+# exact order (spec §2, review finding 1):
 #   (1) resolve the cutover identity WITHOUT opening stats.db — a stable-read of
 #       ~/.claude.json; stably-absent / torn -> `unattributed` (never a guess);
 #   (2) atomically check/append the canonical cutover op (stable semantic id
@@ -2796,7 +4689,8 @@ def run_epoch_transition(*, claude_json_path=None) -> str:
     identity, check/append the canonical cutover op, THEN rebuild — in that exact
     order, so the op is inside the rebuild's input. Returns the resolved
     ``claude_legacy_account``. Exposed for tests; the epoch-mismatch path calls
-    it (under the maintenance + ingest locks) after quarantining the old index."""
+    it under the maintenance + ingest locks, and the rebuild's common cutover
+    preserves the old index only after the replacement is validated."""
     claude_key = _resolve_claude_cutover_identity(claude_json_path)
     recorded = append_accounts_cutover_op(claude_key)
     rebuild_stats_index()

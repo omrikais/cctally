@@ -32,6 +32,7 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import subprocess
 import sys
 
 import _cctally_core
@@ -40,26 +41,204 @@ from _cctally_core import _now_utc, eprint, now_utc_iso, parse_iso_datetime
 from _lib_dashboard_json import encode_dashboard_json
 
 
+#: Record types the deep journal conflict scan retains (#374). The selector
+#: (`_lib_journal.resolve_effective_events`) reads only `evt`, `correction` and
+#: `correction_batch`; `op` is kept because the rebuild-equivalent account
+#: normalization is defined over evt/op records. Everything else — above all the
+#: `obs` lines, ~97% of a real journal — is dropped as it is decoded, so the deep
+#: gather's peak RSS tracks the decision history rather than the whole journal.
+_CONFLICT_SCAN_RECORD_TYPES = frozenset(
+    {"evt", "correction", "correction_batch", "op"})
+
+#: Doctor needs only recent evidence for this diagnostic. Bound both line count
+#: and bytes so a corrupt single-line file cannot defeat the tail limit.
+_GUARD_LOG_TAIL_LINES = 256
+_GUARD_LOG_TAIL_BYTES = 64 * 1024
+
+
 def _cctally():
     """Resolve the current `cctally` module at call-time (spec §3.1)."""
     return sys.modules["cctally"]
 
 
+def _stats_ro_guarded():
+    """A `mode=ro` stats connection that participates in the #386 opener protocol.
+
+    Read-only does not mean side-effect-free: measured on this platform, a
+    `mode=ro` connection to a WAL database with absent sidecars CREATES
+    `stats.db-shm` and `stats.db-wal`. Spec §3.1's third clause therefore
+    covers these diagnostics, and both callers already degrade on
+    `sqlite3.Error` (which `StatsDbMaintenanceError` is).
+    """
+    import _cctally_store
+
+    return _cctally_store.stats_open_guarded(
+        _cctally_core.DB_PATH,
+        connect=lambda p: sqlite3.connect(f"file:{p}?mode=ro", uri=True),
+    )
+
+
 def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
     """One auto-heal artifact record for the doctor journal leg (§9). Parses the
-    ``%Y%m%dT%H%M%SZ`` timestamp trailing the name (quarantine dir
-    ``<db>.db-<ts>`` or forensics file ``<db>.db-corruption-forensics-<ts>.json``)
-    into an age; a name that doesn't parse degrades to ``age_s=None``."""
+    legacy ``%Y%m%dT%H%M%SZ`` or collision-safe rebuild
+    ``%Y%m%dT%H%M%S_%f`` timestamp trailing the name (quarantine dir
+    ``<db>.db-<ts>`` or forensics file
+    ``<db>.db-corruption-forensics-<ts>.json``) into an age; a name that
+    doesn't parse degrades to ``age_s=None``."""
     base = name[:-5] if name.endswith(".json") else name
     ts = base.rsplit("-", 1)[-1]
     age_s = None
-    try:
-        parsed = dt.datetime.strptime(ts, "%Y%m%dT%H%M%SZ").replace(
-            tzinfo=dt.timezone.utc)
-        age_s = int((now_utc - parsed).total_seconds())
-    except ValueError:
-        pass
+    for timestamp_format in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S_%f"):
+        try:
+            parsed = dt.datetime.strptime(ts, timestamp_format).replace(
+                tzinfo=dt.timezone.utc)
+            age_s = int((now_utc - parsed).total_seconds())
+            break
+        except ValueError:
+            continue
     return {"kind": kind, "name": name, "age_s": age_s}
+
+
+def _read_guard_log_tail(path) -> list[str]:
+    """Read at most the configured byte and line tail from one guard log."""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        read_size = min(size, _GUARD_LOG_TAIL_BYTES)
+        fh.seek(size - read_size)
+        raw = fh.read(read_size)
+    if size > read_size:
+        # The byte window may start mid-line. Drop that fragment so every
+        # reported entry is one complete writer-guard record.
+        _, separator, raw = raw.partition(b"\n")
+        if not separator:
+            raw = b""
+    lines = [
+        line for line in raw.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    return lines[-_GUARD_LOG_TAIL_LINES:]
+
+
+def _gather_backup_sync_state(
+    app_dir,
+    *,
+    platform_name: str | None = None,
+    home_dir=None,
+    probe_time_machine: bool = True,
+    which=shutil.which,
+    run=subprocess.run,
+) -> dict:
+    """Classify known macOS file-level backup/sync coverage without mutation."""
+    platform_name = platform_name or sys.platform
+    if platform_name != "darwin":
+        return {"status": "unsupported", "provider": None}
+
+    try:
+        app_path = pathlib.Path(app_dir).resolve(strict=False)
+        home = pathlib.Path(
+            home_dir if home_dir is not None else pathlib.Path.home()
+        ).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return {"status": "unavailable", "provider": None}
+
+    def inside(root) -> bool:
+        try:
+            app_path.relative_to(pathlib.Path(root).resolve(strict=False))
+            return True
+        except (ValueError, OSError, RuntimeError):
+            return False
+
+    if inside(home / "Library/Mobile Documents/com~apple~CloudDocs"):
+        return {"status": "included", "provider": "iCloud Drive"}
+    if inside(home / "Dropbox"):
+        return {"status": "included", "provider": "Dropbox"}
+    cloud_storage = home / "Library/CloudStorage"
+    if inside(cloud_storage):
+        try:
+            relative = app_path.relative_to(cloud_storage.resolve(strict=False))
+        except (ValueError, OSError, RuntimeError):
+            relative = pathlib.Path()
+        if relative.parts and relative.parts[0].lower().startswith("dropbox"):
+            return {"status": "included", "provider": "Dropbox"}
+
+    # The dashboard gathers Doctor state on every envelope rebuild. Keep that
+    # hot path subprocess-free; the CLI's deep gather performs the bounded
+    # Time Machine probes below. Static cloud-root classification above is safe
+    # and cheap in either mode.
+    if not probe_time_machine:
+        return {"status": "unavailable", "provider": "Time Machine"}
+
+    try:
+        tmutil = which("tmutil")
+    except Exception:
+        tmutil = None
+    if not tmutil:
+        return {"status": "unavailable", "provider": "Time Machine"}
+    try:
+        destinations = run(
+            [tmutil, "destinationinfo"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable", "provider": "Time Machine"}
+    destination_text = f"{destinations.stdout}\n{destinations.stderr}".lower()
+    if destinations.returncode != 0:
+        status = (
+            "absent"
+            if "no destinations configured" in destination_text
+            else "unavailable"
+        )
+        return {"status": status, "provider": "Time Machine"}
+    if not destinations.stdout.strip():
+        return {"status": "unavailable", "provider": "Time Machine"}
+    try:
+        exclusion = run(
+            [tmutil, "isexcluded", str(app_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable", "provider": "Time Machine"}
+    if exclusion.returncode != 0:
+        return {"status": "unavailable", "provider": "Time Machine"}
+    output = exclusion.stdout.strip().lower()
+    if output.startswith("[excluded]"):
+        return {"status": "excluded", "provider": "Time Machine"}
+    if output.startswith("[included]"):
+        return {"status": "included", "provider": "Time Machine"}
+    return {"status": "unavailable", "provider": "Time Machine"}
+
+
+def _gather_writer_guard_log(now_utc: dt.datetime):
+    """Gather the bounded writer-guard tail; absent/unreadable is normal."""
+    import _cctally_store as _store_mod_guard
+
+    guard_path = _store_mod_guard._guard_log_path()
+    if not guard_path.exists():
+        return None
+    lines = _read_guard_log_tail(guard_path)
+    newest_age = None
+    if lines:
+        stamp = lines[-1].split("\t", 1)[0]
+        try:
+            when = _cctally_core.parse_iso_datetime(stamp, "guard log")
+            newest_age = max(0, int((now_utc - when).total_seconds()))
+        except Exception:
+            newest_age = None
+    return {
+        "entries": len(lines),
+        "newest_age_s": newest_age,
+        "path": str(guard_path),
+        "sample": lines[-1] if lines else None,
+    }
 
 
 def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
@@ -203,7 +382,10 @@ def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
     if not _cctally_core.DB_PATH.exists():
         return state
     try:
-        conn = sqlite3.connect(f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True)
+        # #386: a `mode=ro` reader participates in the opener protocol too —
+        # measured, it CREATES `-shm`/`-wal` when they are absent. See
+        # `_cctally_store.stats_open_guarded`.
+        conn = _stats_ro_guarded()
     except sqlite3.Error:
         return state
     try:
@@ -314,13 +496,16 @@ def doctor_gather_state(
             cache_lock.close()
             cache_lock = None
 
-        return _doctor_gather_state_impl(
-            now_utc=now_utc,
-            runtime_bind=runtime_bind,
-            deep=deep,
-            _cache_probe_allowed=cache_probe_allowed,
-            _cache_repair_marker=cache_repair_marker,
-        )
+        import _cctally_store
+
+        with _cctally_store.suppress_interrupted_stats_recovery():
+            return _doctor_gather_state_impl(
+                now_utc=now_utc,
+                runtime_bind=runtime_bind,
+                deep=deep,
+                _cache_probe_allowed=cache_probe_allowed,
+                _cache_repair_marker=cache_repair_marker,
+            )
     finally:
         if cache_lock is not None:
             try:
@@ -353,6 +538,11 @@ def _doctor_gather_state_impl(
     c = _cctally()
     if now_utc is None:
         now_utc = _now_utc()
+
+    backup_sync_state = _gather_backup_sync_state(
+        _cctally_core.APP_DIR,
+        probe_time_machine=deep,
+    )
 
     # ── Install ──────────────────────────────────────────────────────
     # #279 S2 F5d: guard the only two unguarded statements in the
@@ -449,9 +639,29 @@ def _doctor_gather_state_impl(
 
     # ── DB ───────────────────────────────────────────────────────────
     try:
-        stats_db_status = c._db_status_for(_cctally_core.DB_PATH, c._STATS_MIGRATIONS, "stats.db")
+        import _cctally_store
+
+        interrupted = _cctally_store.stats_interrupted_rebuild_evidence(
+            _cctally_core.DB_PATH
+        )
+        if interrupted is not None and interrupted.get("live") is True:
+            stats_db_status = {
+                "path": str(_cctally_core.DB_PATH),
+                "user_version": 0,
+                "registry_size": len(c._STATS_MIGRATIONS),
+                "migrations": [],
+            }
+        else:
+            stats_db_status = c._db_status_for(
+                _cctally_core.DB_PATH,
+                c._STATS_MIGRATIONS,
+                "stats.db",
+                recover_interrupted_stats=False,
+            )
         if not _cctally_core.DB_PATH.exists():
             stats_db_status["_file_exists"] = False
+        if interrupted is not None:
+            stats_db_status["_interrupted_rebuild"] = interrupted
     except sqlite3.Error as exc:
         stats_db_status = {"path": str(_cctally_core.DB_PATH), "user_version": 0,
                            "registry_size": len(c._STATS_MIGRATIONS),
@@ -494,7 +704,15 @@ def _doctor_gather_state_impl(
     credited_weeks: list[dict] | None = None
     try:
         if _cctally_core.DB_PATH.exists():
-            conn = sqlite3.connect(str(_cctally_core.DB_PATH))
+            # #386 spec section 3.1, third clause: EVERY opener of the live stats
+            # family participates in the replacement protocol, read-only probes
+            # included. The open mode stays read-WRITE deliberately — switching a
+            # WAL DB whose `-shm` may be absent to `mode=ro` fails
+            # SQLITE_CANTOPEN, which is not corruption and has been misread as
+            # such on this project twice. Participation, not read-only-ness, is
+            # what the clause requires.
+            import _cctally_store as _store_mod
+            conn = _store_mod.stats_open_guarded(_cctally_core.DB_PATH)
             try:
                 try:
                     row = conn.execute(
@@ -876,7 +1094,15 @@ def _doctor_gather_state_impl(
                     _path.exists()
                     and (_label != "cache" or _cache_probe_allowed)
                 ):
-                    _conn = sqlite3.connect(str(_path))
+                    # #386: the stats leg holds a read-write handle for the whole
+                    # of a full quick_check — the longest-lived stats handle any
+                    # diagnostic takes — so it participates in the replacement
+                    # protocol. The cache leg keeps its own opener.
+                    if _label == "stats":
+                        import _cctally_store as _store_mod
+                        _conn = _store_mod.stats_open_guarded(_path)
+                    else:
+                        _conn = sqlite3.connect(str(_path))
                     try:
                         _row = _conn.execute(
                             "PRAGMA quick_check(1)").fetchone()
@@ -1068,11 +1294,16 @@ def _doctor_gather_state_impl(
     journal_present = False
     journal_appendable = None
     journal_segment_count = 0
+    journal_has_bytes = False
     journal_malformed_count = None
     journal_torn_tail_count = None
     journal_cursor_lag_bytes = None
     journal_hw_segment = None
     journal_cursor_segment = None
+    journal_conflicts = None
+    journal_protocol_violations = None
+    journal_protocol_acknowledged = None
+    journal_protocol_error = None
     try:
         jdir = _cctally_core.JOURNAL_DIR
         journal_present = jdir.exists()
@@ -1087,6 +1318,35 @@ def _doctor_gather_state_impl(
             except Exception:
                 segs = []
             journal_segment_count = len(segs)
+            # #402: the disposable stats index persists the most recent complete
+            # selector result. Shallow Dashboard/TUI gathers read that bounded
+            # summary instead of rescanning a production-sized journal and
+            # therefore cannot turn known taint into a false OK.
+            try:
+                if _cctally_core.DB_PATH.exists():
+                    pc = _stats_ro_guarded()
+                    try:
+                        protocol_rows = [
+                            json.loads(str(row[0]))
+                            for row in pc.execute(
+                                "SELECT violation_json "
+                                "FROM journal_protocol_violations "
+                                "ORDER BY batch_id, kind, fingerprint"
+                            )
+                        ]
+                        journal_protocol_violations = [
+                            item for item in protocol_rows
+                            if not item.get("auditId")
+                        ]
+                        journal_protocol_acknowledged = [
+                            item for item in protocol_rows
+                            if item.get("auditId")
+                        ]
+                    finally:
+                        pc.close()
+            except (sqlite3.Error, ValueError, TypeError):
+                journal_protocol_violations = None
+                journal_protocol_acknowledged = None
             sizes: dict = {}
             for seg in segs:
                 try:
@@ -1095,12 +1355,19 @@ def _doctor_gather_state_impl(
                     sizes[seg] = 0
             if segs:
                 journal_hw_segment = segs[-1]
+                journal_has_bytes = _jr._has_retained_journal_bytes(
+                    sizes.values()
+                )
             # deep-gated malformed / torn-tail scan (reads the whole journal;
             # the dashboard's per-rebuild gather stays deep=False so it never
             # pays this at the 10× envelope — mirrors the quick_check legs).
             if deep and segs:
                 malformed = 0
                 torn = 0
+                decoded_records: list = []
+                protocol_evidence = []
+                prior_high_water = None
+                cutover_value = None
                 for seg in segs:
                     try:
                         data = (jdir / seg).read_bytes()
@@ -1113,24 +1380,124 @@ def _doctor_gather_state_impl(
                     # every element except the last is a complete line; the last
                     # is either "" (ended in \n) or the torn partial — not a
                     # mid-file line, so it is never counted as malformed.
+                    offset = 0
                     for raw in data.split(b"\n")[:-1]:
-                        if raw and _jl.decode_line(raw) is None:
+                        if not raw:
+                            prior_high_water = (seg, offset + 1)
+                            offset += 1
+                            continue
+                        record = _jl.decode_line(raw)
+                        if record is None:
                             malformed += 1
+                            prior_high_water = (
+                                seg,
+                                offset + len(raw) + 1,
+                            )
+                            offset += len(raw) + 1
+                            continue
+                        _jr._capture_protocol_prefix_evidence(
+                            record,
+                            prior_high_water,
+                            protocol_evidence,
+                        )
+                        # first cutover op wins, exactly as
+                        # `find_accounts_cutover_op` scans — captured here so the
+                        # conflict scan does not decode the whole journal twice.
+                        if (cutover_value is None
+                                and record.get("id") == _jr.CUTOVER_OP_ID):
+                            payload = record.get("payload")
+                            if isinstance(payload, dict):
+                                cutover_value = payload.get(
+                                    "claude_legacy_account")
+                        # RETAIN ONLY what the selector consumes. `obs` lines are
+                        # ~97% of a real journal (984k of 1.02M) and
+                        # `resolve_effective_events` ignores them entirely —
+                        # keeping them cost 4.3 GB of peak RSS for an identical
+                        # result (#374 review).
+                        if record.get("t") in _CONFLICT_SCAN_RECORD_TYPES:
+                            decoded_records.append(record)
+                        prior_high_water = (
+                            seg,
+                            offset + len(raw) + 1,
+                        )
+                        offset += len(raw) + 1
                 journal_malformed_count = malformed
                 journal_torn_tail_count = torn
+                # #374: same-revision quarantine, via the SHARED selector over
+                # rebuild-equivalent input. Raw `(id, rev)` grouping would report
+                # lower-revision groups a completed rev-1 batch legitimately
+                # superseded, and false account conflicts that the rebuild's
+                # `_normalize_legacy_account_stamp` resolves — so normalize
+                # exactly as `rebuild_stats_index` does, then select.
+                try:
+                    cutover_claude = (
+                        cutover_value if cutover_value is not None
+                        else _jr.resolve_cutover_claude_account()
+                    )
+                    for record in decoded_records:
+                        _jr._normalize_legacy_account_stamp(
+                            record, cutover_claude)
+                    selection = _jl.resolve_effective_events(
+                        decoded_records,
+                        protocol_prefix_evidence=protocol_evidence,
+                    )
+                except _jl.JournalProtocolError as exc:
+                    # Out-of-scope malformed known record: selection did not
+                    # finish, so conflicts/tainted-batch results are unavailable.
+                    journal_protocol_error = str(exc)
+                    journal_conflicts = None
+                    journal_protocol_violations = None
+                    journal_protocol_acknowledged = None
+                except Exception:
+                    journal_conflicts = None
+                    journal_protocol_violations = None
+                    journal_protocol_acknowledged = None
+                else:
+                    journal_conflicts = [
+                        conflict.to_dict() for conflict in selection.conflicts
+                    ]
+                    journal_protocol_violations = [
+                        violation.to_dict()
+                        for violation in selection.protocol_violations
+                    ]
+                    journal_protocol_acknowledged = [
+                        violation.to_dict()
+                        for violation in (
+                            selection.acknowledged_protocol_violations
+                        )
+                    ]
             # ingest cursor lag: unconsumed bytes between the stats index cursor
             # and the journal high-water, in canonical (segment, offset) order.
             cursor = None
             try:
                 if _cctally_core.DB_PATH.exists():
-                    jc = sqlite3.connect(
-                        f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True)
+                    jc = _stats_ro_guarded()   # #386 opener protocol
                     try:
-                        crow = jc.execute(
-                            "SELECT segment, offset FROM journal_cursor "
-                            "WHERE id = 1").fetchone()
-                        if crow:
-                            cursor = (crow[0], int(crow[1]))
+                        cursor_columns = {
+                            str(row[1])
+                            for row in jc.execute(
+                                "PRAGMA table_info(journal_cursor)"
+                            )
+                        }
+                        if {
+                            "applied_segment", "applied_offset"
+                        } <= cursor_columns:
+                            crow = jc.execute(
+                                "SELECT segment, offset, applied_segment, "
+                                "applied_offset FROM journal_cursor "
+                                "WHERE id = 1").fetchone()
+                            if (
+                                crow is not None
+                                and crow[2] is not None
+                                and crow[3] is not None
+                            ):
+                                cursor = (crow[2], int(crow[3]))
+                        else:
+                            legacy = jc.execute(
+                                "SELECT segment, offset FROM journal_cursor "
+                                "WHERE id = 1").fetchone()
+                            if legacy is not None:
+                                cursor = (legacy[0], int(legacy[1]))
                     except sqlite3.OperationalError:
                         pass  # pre-cutover DB has no journal_cursor table
                     finally:
@@ -1180,6 +1547,16 @@ def _doctor_gather_state_impl(
         _incidents.sort(key=lambda d: (d["age_s"] is None,
                                        d["age_s"] if d["age_s"] is not None else 0))
         journal_heal_incidents = _incidents
+
+    # #386/#389 stats sole-writer guard log (spec §6.4). Read-only, fail-soft: an
+    # absent log is the NORMAL state and must read as INFO, never as a gather
+    # failure. Read only the bounded tail; rotation and cross-process throttling
+    # bound the writer side independently.
+    journal_writer_guard = None
+    try:
+        journal_writer_guard = _gather_writer_guard_log(now_utc)
+    except (OSError, Exception):
+        journal_writer_guard = None
 
     cctally_version_tuple = _lib_changelog._read_latest_changelog_version()
     cctally_version = (
@@ -1251,6 +1628,11 @@ def _doctor_gather_state_impl(
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,
+        # #374: quarantined same-revision groups + structural protocol violation.
+        journal_conflicts=journal_conflicts,
+        journal_protocol_violations=journal_protocol_violations,
+        journal_protocol_acknowledged=journal_protocol_acknowledged,
+        journal_protocol_error=journal_protocol_error,
         # #315: read-only cache free-page evidence for the reclaim hint.
         cache_db_page_count=cache_db_page_count,
         cache_db_freelist_count=cache_db_freelist_count,
@@ -1266,15 +1648,18 @@ def _doctor_gather_state_impl(
         journal_present=journal_present,
         journal_appendable=journal_appendable,
         journal_segment_count=journal_segment_count,
+        journal_has_bytes=journal_has_bytes,
         journal_malformed_count=journal_malformed_count,
         journal_torn_tail_count=journal_torn_tail_count,
         journal_cursor_lag_bytes=journal_cursor_lag_bytes,
         journal_hw_segment=journal_hw_segment,
         journal_cursor_segment=journal_cursor_segment,
         journal_heal_incidents=journal_heal_incidents,
+        journal_writer_guard=journal_writer_guard,
         # Multi-account attribution legs (#341).
         accounts_state=_gather_accounts_state(now_utc),
         cache_repair_marker=cache_repair_marker,
+        backup_sync_state=backup_sync_state,
     )
 
 

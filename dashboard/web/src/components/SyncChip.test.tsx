@@ -61,6 +61,29 @@ describe('SyncChip freshness (SYNC-1)', () => {
     expect(span.className).toContain('sync-error');
   });
 
+  it('renders an actionable server stats-corruption state without raw detail', () => {
+    mocked.env = {
+      sync_age_s: null,
+      last_sync_error: 'raw /private/stats.db path must not render',
+      sync_failure: {
+        kind: 'stats_corruption',
+        label: '⚠ stats recovery needed',
+        detail: 'The dashboard statistics database could not be read safely.',
+        action: 'cctally db repair --db stats --yes',
+      },
+    };
+
+    const { container } = render(<SyncChip />);
+    const span = container.querySelector('#sync-chip')!;
+    expect(span.textContent).toBe('⚠ stats recovery needed');
+    expect(span.getAttribute('title')).toContain(
+      'cctally db repair --db stats --yes',
+    );
+    expect(span.getAttribute('title')).not.toContain('/private/stats.db');
+    expect(span.getAttribute('aria-label')).not.toContain('/private/stats.db');
+    expect(span.className).toContain('sync-error');
+  });
+
   it('distinguishes active server maintenance from a client disconnect', () => {
     mocked.env = {
       sync_age_s: null,

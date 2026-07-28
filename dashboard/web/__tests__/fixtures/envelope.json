@@ -663,6 +663,7 @@
     "claude": {
       "availability": "ok",
       "freshness": "fresh",
+      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
       "warnings": [],
       "data_version": "claude:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
@@ -735,6 +736,7 @@
     "codex": {
       "availability": "ok",
       "freshness": "fresh",
+      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
       "warnings": [],
       "data_version": "codex:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
@@ -860,6 +862,7 @@
     "all": {
       "availability": "ok",
       "freshness": "fresh",
+      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
       "warnings": [],
       "data_version": "all:v1",
       "last_success_at": "2026-04-24T13:07:00Z",

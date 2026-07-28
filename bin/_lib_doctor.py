@@ -250,6 +250,10 @@ class DoctorState:
     #   * journal_appendable — the dir is writable (os.access W_OK); None when
     #     absent or the probe errored.
     #   * journal_segment_count — number of segments (bootstrap + monthly).
+    #   * journal_has_bytes — at least one canonical segment retains bytes.
+    #     A merely-created journal/ directory (or wholly empty segment set)
+    #     cannot rebuild a disposable stats index; an empty newest segment does
+    #     not hide replayable bytes in older immutable segments.
     #   * journal_malformed_count / journal_torn_tail_count — mid-file malformed
     #     lines (external damage → WARN) and torn final lines (a known crash
     #     artifact healed by the next append → INFO). None = not scanned (the
@@ -266,12 +270,37 @@ class DoctorState:
     journal_present: bool = False
     journal_appendable: Optional[bool] = None
     journal_segment_count: int = 0
+    journal_has_bytes: bool = False
     journal_malformed_count: Optional[int] = None
     journal_torn_tail_count: Optional[int] = None
     journal_cursor_lag_bytes: Optional[int] = None
     journal_hw_segment: Optional[str] = None
     journal_cursor_segment: Optional[str] = None
     journal_heal_incidents: Optional[list] = None
+    #   * journal_writer_guard (#386) — the stats sole-writer guard's log
+    #     (logs/stats-writer-guard.log). `None` = the log is absent (the normal
+    #     state, and NOT an error); otherwise
+    #     {entries, newest_age_s, path, sample} where `sample` is the most
+    #     recent line. On an installed build the authorizer LOGS instead of
+    #     raising, so this leg is the only surface a field violation reaches.
+    journal_writer_guard: Optional[dict] = None
+    #   * journal_conflicts (#374) — the quarantined same-revision groups the
+    #     SHARED selector reports, each an `EventConflict.to_dict()`. `None` =
+    #     not scanned (shallow gather, no journal, or the selector raised);
+    #     `[]` = selection completed cleanly. Deep-gated, like the malformed
+    #     scan, because it decodes every line and normalizes account stamps
+    #     exactly as `rebuild_stats_index` does — raw `(id, rev)` grouping would
+    #     report superseded revisions and false account conflicts.
+    #   * journal_protocol_violations (#402) — completed selector results for
+    #     whole tainted correction batches. `[]` means a clean deep scan;
+    #     `None` means not scanned or the selector failed.
+    #   * journal_protocol_error (#374) — an out-of-scope fatal
+    #     `JournalProtocolError` raised by that same selector. Mutually
+    #     exclusive with conflicts/violations because selection did not finish.
+    journal_conflicts: Optional[list] = None
+    journal_protocol_violations: Optional[list] = None
+    journal_protocol_acknowledged: Optional[list] = None
+    journal_protocol_error: Optional[str] = None
     # Multi-account attribution (#341). A dict (None when unavailable) with:
     #   * claude_identity_status — "identified" | "stably_absent" | "torn"
     #   * claude_email — the active Claude email (or None)
@@ -286,6 +315,10 @@ class DoctorState:
     # cache.db.repairing. {exists, live, reason}; None only when gather itself
     # could not inspect the marker. Doctor never reclaims or deletes it.
     cache_repair_marker: Optional[dict] = None
+    # #411: read-only, fail-soft classification of whether APP_DIR is inside a
+    # known file-level backup/sync root. Only provider/status are retained so
+    # reports never expose the machine-specific data path.
+    backup_sync_state: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -675,12 +708,41 @@ def _db_file_check(label_id: str, label_title: str, status: Optional[dict],
             remediation="Re-run; see stderr",
             details={"reason": "gather returned None"},
         )
+    interrupted = status.get("_interrupted_rebuild")
+    if interrupted and interrupted.get("live") is True:
+        return CheckResult(
+            id=label_id,
+            title=label_title,
+            severity="warn",
+            summary="stats.db rebuild is in progress",
+            remediation="Wait for the active rebuild to finish, then re-run Doctor.",
+            details={
+                "path": status["path"],
+                "interrupted_rebuild": interrupted,
+            },
+        )
     if status.get("_open_error"):
         return CheckResult(
             id=label_id, title=label_title,
             severity="fail", summary=f"could not open: {status['_open_error']}",
             remediation=rebuild_hint,
             details={"exception": status["_open_error"], "path": status["path"]},
+        )
+    if interrupted and interrupted.get("live") is False:
+        return CheckResult(
+            id=label_id,
+            title=label_title,
+            severity="warn",
+            summary="interrupted rebuild detected; next guarded open will recover",
+            remediation=(
+                "Run `cctally report` or restart `cctally dashboard` to retry "
+                "automatic recovery. If recovery fails, run "
+                "`cctally db rebuild --db stats`."
+            ),
+            details={
+                "path": status["path"],
+                "interrupted_rebuild": interrupted,
+            },
         )
     if status.get("_file_exists") is False:
         return CheckResult(
@@ -804,9 +866,10 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
       * ``uv == epoch`` (a cut-over install)      → HEALTHY (steady state)
       * ``uv <= legacy_head`` (pre-cutover, ≤13)  → HEALTHY (cuts over on open)
       * ``uv > legacy_head`` AND ``!= epoch``      → §7.1 index MISMATCH: WARN.
-        It self-heals by journal REBUILD on the next open (never bricks, unlike
-        the retired #145 version-ahead FAIL), so the remediation points at
-        `db rebuild --db stats`, NOT the retired `db recover --db stats`.
+        With retained journal bytes it self-heals by journal REBUILD on the next
+        open; without them it fails closed and asks the operator to restore the
+        durable source. The remediation never points at the retired
+        `db recover --db stats`.
 
     cache.db is unchanged (issue #145): a ``user_version`` past the cache
     registry head auto-heals on the next open → WARN. doctor reads raw
@@ -836,11 +899,27 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
 
     stats = _eval_stats(s.stats_db_status)
     cache = _eval_cache(s.cache_db_status)
-    details = {"stats.db": stats, "cache.db": cache}
     stats_mismatch = bool(stats and stats["mismatch"])
     cache_ahead = bool(cache and cache["ahead"])
+    if stats_mismatch:
+        stats["journal_present"] = bool(s.journal_present)
+        stats["journal_has_bytes"] = bool(s.journal_has_bytes)
+    details = {"stats.db": stats, "cache.db": cache}
 
     if stats_mismatch:
+        if not s.journal_has_bytes:
+            return CheckResult(
+                id="db.version_ahead", title="Version ahead", severity="warn",
+                summary=(
+                    f"stats.db index mismatch (v{stats['user_version']} ≠ epoch "
+                    f"v{stats['epoch']}) — no journal data available"
+                ),
+                remediation=(
+                    "Restore the journal/ directory from backup, then run "
+                    "`cctally db rebuild --db stats`"
+                ),
+                details=details,
+            )
         return CheckResult(
             id="db.version_ahead", title="Version ahead", severity="warn",
             summary=(f"stats.db index mismatch (v{stats['user_version']} ≠ epoch "
@@ -1541,6 +1620,42 @@ def _check_safety_dashboard_bind(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_safety_backup_sync(s: DoctorState) -> CheckResult:
+    state = (
+        s.backup_sync_state
+        if isinstance(s.backup_sync_state, dict)
+        else {"status": "unavailable", "provider": None}
+    )
+    status = state.get("status")
+    provider = state.get("provider")
+    details = {"status": status, "provider": provider}
+    if status == "included" and provider:
+        return CheckResult(
+            id="safety.backup_sync", title="Backup/sync",
+            severity="warn",
+            summary=f"cctally data is inside {provider}",
+            remediation=(
+                "Exclude the cctally data directory from file-level backup/sync "
+                "and use `cctally db backup --db stats` or `--db cache` for "
+                "consistent SQLite snapshots"
+            ),
+            details=details,
+        )
+    summaries = {
+        "absent": "no configured file-level backup/sync detected",
+        "excluded": f"cctally data excluded from {provider or 'backup/sync'}",
+        "unsupported": "backup/sync probe unsupported on this platform",
+        "unavailable": "backup/sync probe unavailable",
+    }
+    return CheckResult(
+        id="safety.backup_sync", title="Backup/sync",
+        severity="ok",
+        summary=summaries.get(status, "backup/sync state unavailable"),
+        remediation=None,
+        details=details,
+    )
+
+
 def _check_safety_config_json_valid(s: DoctorState) -> CheckResult:
     if s.config_json_error is None:
         return CheckResult(
@@ -2082,6 +2197,225 @@ def _check_journal_auto_heal(s: DoctorState) -> CheckResult:
     )
 
 
+#: A guard entry inside this window is actionable; older ones are history.
+_WRITER_GUARD_RECENT_SECONDS = 7 * 24 * 3600
+
+
+def _check_journal_writer_guard(s: DoctorState) -> CheckResult:
+    """Unsanctioned stats.db writes recorded by the #386 authorizer (spec §6.4).
+
+    On a dev checkout the guard RAISES, so a violation is loud at the call site.
+    On an installed build it appends one throttled line to
+    `logs/stats-writer-guard.log` and lets the write through — deliberately, so
+    the guard can never break a user's command. This leg is therefore the ONLY
+    surface such a violation reaches in the field.
+
+    INFO when the log is absent or empty (the normal state — an absent log is
+    not a failure), WARN when it holds entries newer than 7 days.
+    """
+    guard = s.journal_writer_guard
+    if not guard or not guard.get("entries"):
+        return CheckResult(
+            id="journal.writer_guard", title="Stats writer guard", severity="ok",
+            summary="no unsanctioned stats.db writes recorded", remediation=None,
+            details={"entries": 0},
+        )
+    entries = int(guard.get("entries") or 0)
+    age_s = guard.get("newest_age_s")
+    path = guard.get("path")
+    details = {
+        "entries": entries,
+        "newestAgeS": age_s,
+        "path": path,
+        "sample": guard.get("sample"),
+    }
+    if age_s is not None and age_s <= _WRITER_GUARD_RECENT_SECONDS:
+        return CheckResult(
+            id="journal.writer_guard", title="Stats writer guard", severity="warn",
+            summary=(
+                f"{entries} unsanctioned stats.db write(s) recorded, newest "
+                f"{age_s // 3600}h ago"
+            ),
+            remediation=(
+                "A code path wrote stats.db outside the ingest cycle and outside "
+                f"the maintenance lock (#386). Inspect {path} and report it — "
+                "the write was allowed through, so no data was lost."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        id="journal.writer_guard", title="Stats writer guard", severity="ok",
+        summary=f"{entries} unsanctioned write(s), none recent", remediation=None,
+        details=details,
+    )
+
+
+# #374: the families `db rederive` owns. A quarantined group outside this set
+# (a retained `qaa:` state stream, or an unknown prefix from a newer binary) is
+# still reported, but `db rederive` is the WRONG remedy for it and the leg must
+# not promise one it cannot deliver.
+_REDERIVABLE_CONFLICT_PREFIXES = (
+    "sa:", "wcs:", "wce:", "wr:", "fhc:", "fhbc:", "pm:", "fhm:",
+    "bm:", "pjm:", "pbm:",
+)
+
+
+def _check_journal_conflicts(s: DoctorState) -> CheckResult:
+    """Divergent same-revision EVENT groups quarantined behind a provisional
+    winner (#374). WARN — never FAIL: the index is complete and usable, we
+    simply refuse to assert that a guessed winner is authoritative.
+
+    Emitted only when selection COMPLETES. When the shared selector raised a
+    structural violation there is no conflicts result to report, so this leg
+    reports itself unavailable and `journal.protocol` carries the FAIL."""
+    if s.journal_protocol_error:
+        return CheckResult(
+            id="journal.conflicts", title="Journal conflicts", severity="ok",
+            summary="unavailable (structural protocol violation)",
+            remediation=None,
+            details={"scanned": True, "available": False, "conflicts": None},
+        )
+    if s.journal_conflicts is None:
+        return CheckResult(
+            id="journal.conflicts", title="Journal conflicts", severity="ok",
+            summary="not scanned", remediation=None,
+            details={"scanned": False, "available": None, "conflicts": None},
+        )
+    conflicts = list(s.journal_conflicts)
+    if not conflicts:
+        return CheckResult(
+            id="journal.conflicts", title="Journal conflicts", severity="ok",
+            summary="no quarantined events", remediation=None,
+            details={"scanned": True, "available": True, "conflicts": []},
+        )
+    details = {"scanned": True, "available": True, "conflicts": conflicts}
+    rederivable = [
+        c for c in conflicts
+        if str(c.get("eventId") or "").startswith(_REDERIVABLE_CONFLICT_PREFIXES)
+    ]
+    if rederivable:
+        remediation = (
+            "Run `cctally db rederive --family claude-usage` to supersede the "
+            "quarantined group(s) at the next revision; until then the index "
+            "uses the first-written variant"
+        )
+    else:
+        remediation = (
+            "These groups are outside the claude-usage rederive family — the "
+            "index uses the first-written variant; report the event ids if the "
+            "affected data looks wrong"
+        )
+    return CheckResult(
+        id="journal.conflicts", title="Journal conflicts", severity="warn",
+        summary=(f"{len(conflicts)} quarantined same-revision group(s) "
+                 "behind a provisional winner"),
+        remediation=remediation, details=details,
+    )
+
+
+def _check_journal_protocol(s: DoctorState) -> CheckResult:
+    """Report selector failure or whole-batch tainting without false health."""
+    if (
+        not s.journal_protocol_error
+        and s.journal_protocol_violations is None
+        and s.journal_protocol_acknowledged is None
+    ):
+        return CheckResult(
+            id="journal.protocol", title="Journal protocol", severity="ok",
+            summary="not scanned", remediation=None,
+            details={
+                "scanned": False,
+                "error": None,
+                "violations": None,
+            },
+        )
+    violations = list(s.journal_protocol_violations or [])
+    acknowledged = list(s.journal_protocol_acknowledged or [])
+    if not s.journal_protocol_error and not violations and not acknowledged:
+        return CheckResult(
+            id="journal.protocol", title="Journal protocol", severity="ok",
+            summary="no protocol violations", remediation=None,
+            details={
+                "scanned": True,
+                "error": None,
+                "violations": [],
+            },
+        )
+    if violations:
+        batch_kinds = [
+            f"{item.get('batchId')}: {item.get('kind')}"
+            for item in violations[:10]
+        ]
+        selected = violations[:10]
+        apply_command = "cctally db journal-repair " + " ".join(
+            f"--violation {item.get('fingerprint')}"
+            for item in selected
+        ) + " --yes"
+        return CheckResult(
+            id="journal.protocol", title="Journal protocol", severity="fail",
+            summary=(
+                f"{len(violations)} structural violation(s); index rebuilt "
+                "with tainted correction batches omitted"
+            ),
+            remediation=(
+                "The index is usable, but the named correction batches were "
+                "omitted. Preview with `cctally db journal-repair`, then apply "
+                f"the exact current selection with `{apply_command}`. Do not "
+                "edit journal segments by hand"
+            ),
+            details={
+                "scanned": True,
+                "error": None,
+                "violations": violations,
+                "sample": batch_kinds,
+                "previewCommand": "cctally db journal-repair",
+                "applyCommand": apply_command,
+                **(
+                    {"acknowledgedViolations": acknowledged}
+                    if acknowledged else {}
+                ),
+            },
+        )
+    if acknowledged:
+        return CheckResult(
+            id="journal.protocol", title="Journal protocol", severity="warn",
+            summary=(
+                f"{len(acknowledged)} acknowledged structural violation(s); "
+                "tainted correction batches remain omitted"
+            ),
+            remediation=(
+                "The operator audit is durable and the index is usable. The "
+                "named correction batches remain omitted; inspect the audit "
+                "details before relying on the affected history"
+            ),
+            details={
+                "scanned": True,
+                "error": None,
+                "violations": [],
+                "acknowledgedViolations": acknowledged,
+                "sample": [
+                    f"{item.get('batchId')}: {item.get('kind')}"
+                    for item in acknowledged[:10]
+                ],
+                "previewCommand": "cctally db journal-repair",
+                "applyCommand": None,
+            },
+        )
+    return CheckResult(
+        id="journal.protocol", title="Journal protocol", severity="fail",
+        summary="journal selector failed before rebuild",
+        remediation=(
+            "A journal record is invalid outside the recoverable structural "
+            "batch classes. Capture the journal segments and open an issue"
+        ),
+        details={
+            "scanned": True,
+            "error": str(s.journal_protocol_error),
+            "violations": None,
+        },
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -2246,6 +2580,9 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("journal.integrity", "_check_journal_integrity"),
         ("journal.index_freshness", "_check_journal_index_freshness"),
         ("journal.auto_heal", "_check_journal_auto_heal"),
+        ("journal.writer_guard", "_check_journal_writer_guard"),
+        ("journal.conflicts", "_check_journal_conflicts"),
+        ("journal.protocol", "_check_journal_protocol"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),
@@ -2271,6 +2608,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     )),
     ("safety", "Safety", (
         ("safety.dashboard_bind", "_check_safety_dashboard_bind"),
+        ("safety.backup_sync", "_check_safety_backup_sync"),
         ("safety.config_json_valid", "_check_safety_config_json_valid"),
         ("safety.update_state", "_check_safety_update_state"),
         ("safety.update_suppress", "_check_safety_update_suppress"),

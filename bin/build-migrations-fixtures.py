@@ -4761,6 +4761,173 @@ def build_per_migration_029_backfill_claude_account(scenario_dir: Path) -> None:
     _build_post(pre, post)
 
 
+def build_per_migration_030_session_entries_cache_creation_split(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for cache migration
+    ``030_session_entries_cache_creation_split`` (#195).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — full production cache schema (via ``_apply_cache_schema``,
+        so ``session_entries.cache_create_1h_tokens`` / ``.cache_create_5m_tokens``
+        already exist — they are added by ``add_column_if_missing``, NOT this
+        migration), a ``schema_migrations`` table carrying cache 001-029 (an
+        existing install at the 029 head), a ``claude_ingest_walk_complete``
+        marker (which this migration must LEAVE ALONE), two ``session_files``
+        rows with non-zero ``size_bytes``/``last_byte_offset`` plus one
+        never-ingested ``size_bytes = 0`` row, and two ``session_entries`` rows
+        whose split columns are NULL (pre-#195).
+      * ``post.sqlite`` — after running the production 030 handler: the
+        ``cache_creation_split_rewalk_pending`` flag is set, the two ingested
+        file cursors are invalidated to the ``-1`` sentinel (which misses the
+        ``size == prev_size`` early-exit while staying TRUTHY for the two
+        orphan gates that read ``size_bytes`` as the had-ingested-bytes bit),
+        the never-ingested row stays at 0 (it holds no ``session_entries``, so
+        it must not be promoted into an orphan candidate),
+        ``claude_ingest_walk_complete`` is UNCHANGED (it gates the stats
+        recomputes and 030 preserves every row, so there is nothing to
+        invalidate), and the entry rows are UNTOUCHED. The dispatcher
+        central-stamps the 030 marker (#140).
+
+    Every value is fixed (no machine state) so a regen is byte-idempotent (#197).
+    Loaded by ``tests/test_migration_030_cache_creation_split.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    _PRIOR_CHAIN = tuple(
+        f"{n:03d}_{s}" for n, s in [
+            (1, "dedup_highest_wins"),
+            (2, "conversation_messages_backfill"),
+            (3, "conversation_reingest_tool_ids"),
+            (4, "conversation_reingest_subagent_kind"),
+            (5, "conversation_reingest_meta"),
+            (6, "conversation_reingest_source_tool_use_id"),
+            (7, "conversation_reingest_enrichment"),
+            (8, "session_entries_speed_backfill"),
+            (9, "conversation_media_reingest"),
+            (10, "conversation_search_split"),
+            (11, "conversation_promote_command_args"),
+            (12, "create_conversation_ai_titles"),
+            (13, "create_conversation_sessions"),
+            (14, "conversation_queued_prompt_reingest"),
+            (15, "conversation_sessions_filter_columns"),
+            (16, "drop_search_aux"),
+            (17, "arm_nested_agent_reingest"),
+            (18, "create_conversation_title_fts"),
+            (19, "create_conversation_file_touches"),
+            (20, "session_entries_physical_unique"),
+            (21, "index_conversation_messages_cwd"),
+            (22, "index_conversation_messages_model"),
+            (23, "conversation_sessions_enrichment_columns"),
+            (24, "codex_fused_ingest_rebuild"),
+            (25, "codex_conversation_normalization"),
+            (26, "codex_conversation_key_backfill"),
+            (27, "codex_fork_preamble_rebuild"),
+            (28, "split_conversation_store"),
+            (29, "backfill_claude_account"),
+        ]
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-15T12:00:00Z"),
+                )
+            # A prior clean walk left the marker behind.
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES(?, ?)",
+                ("claude_ingest_walk_complete", "2026-07-15T12:00:00Z"),
+            )
+            # Two tracked files with advanced cursors — the walk lever the
+            # handler must reset so `size == prev_size` stops short-circuiting.
+            # `/p/c.jsonl` is the never-ingested control: `size_bytes = 0` is
+            # the "holds no session_entries" bit both orphan gates read, so the
+            # handler must leave it at 0 rather than promoting it to the
+            # invalidation sentinel.
+            conn.executemany(
+                "INSERT INTO session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+                "VALUES (?,?,?,?,?)",
+                [("/p/a.jsonl", 4096, 0, 4096, "2026-07-01T10:05:00Z"),
+                 ("/p/b.jsonl", 8192, 0, 8192, "2026-07-01T10:06:00Z"),
+                 ("/p/c.jsonl", 0, 0, 0, "2026-07-01T10:07:00Z")],
+            )
+            # Pre-#195 cost rows: the split columns exist but are NULL.
+            conn.executemany(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, "
+                " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [("/p/a.jsonl", 0, "2026-07-01T10:00:00Z", "claude-opus-5",
+                  10, 20, 1000, 5),
+                 ("/p/b.jsonl", 0, "2026-07-01T10:01:00Z", "claude-opus-5",
+                  11, 21, 2000, 6)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "030_session_entries_cache_creation_split":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("030_session_entries_cache_creation_split not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("030_session_entries_cache_creation_split", "2026-07-15T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -5375,6 +5542,10 @@ def main() -> int:
     )
     build_per_migration_029_backfill_claude_account(
         FIXTURES_ROOT / "per-migration" / "029_backfill_claude_account"
+    )
+    build_per_migration_030_session_entries_cache_creation_split(
+        FIXTURES_ROOT / "per-migration"
+        / "030_session_entries_cache_creation_split"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

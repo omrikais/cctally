@@ -410,7 +410,7 @@ PY
     # the pre-gate state by clearing it — otherwise the gated backfill correctly
     # no-ops and the NULL key would (correctly, for a marked DB) stay NULL.
     # Task 9 §7.1/§8: the epoch gate SUBSUMES the fixups gate — a steady-state
-    # (user_version == STATS_INDEX_EPOCH == 1000) open does zero schema work, so a
+    # (user_version == current STATS_INDEX_EPOCH) open does zero schema work, so a
     # genuine pre-journal upgrade DB must ALSO sit at the legacy head (<= 13). The
     # next stats-DB open then runs the schema apply (incl. the resumable window-key
     # backfill) and cuts the DB over to the epoch.

@@ -4,6 +4,10 @@ Claude-source usage reports under a hierarchical subgroup. Drop-in for
 `ccusage claude <cmd>` — paste a `ccusage claude …` command verbatim and it
 runs offline.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Each leaf shares its engine with the matching flat `cctally <cmd>` alias —
 > the output (table / `--json` / exit code) is identical. The flat forms
 > (`cctally daily`, …) remain fully supported as back-compat aliases; the

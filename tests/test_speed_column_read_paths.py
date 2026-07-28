@@ -120,8 +120,11 @@ RANGE = (dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc),
 def test_iter_entries_surfaces_speed_from_column(cctally_module, fixture_builders, tmp_path):
     cc = cctally_module
     conn = _open_cache(cc, tmp_path / "cache.db")
-    _seed(fixture_builders, conn)
-    rows = cc.iter_entries(conn, *RANGE)
+    try:
+        _seed(fixture_builders, conn)
+        rows = cc.iter_entries(conn, *RANGE)
+    finally:
+        conn.close()
     fast = [e for e in rows if e.usage.get("speed") == "fast"]
     normal = [e for e in rows if "speed" not in e.usage]
     assert len(fast) == 1, "fast-tier row must carry usage['speed']=='fast'"
@@ -151,5 +154,8 @@ def test_read_paths_do_not_parse_json(cctally_module, fixture_builders, tmp_path
         raise AssertionError("read path parsed JSON — #181 regression")
 
     monkeypatch.setattr(cache_mod.json, "loads", _boom)
-    assert cc.iter_entries(conn, *RANGE)            # no JSON parse
-    assert cc.get_claude_session_entries(*RANGE, skip_sync=True)
+    try:
+        assert cc.iter_entries(conn, *RANGE)        # no JSON parse
+        assert cc.get_claude_session_entries(*RANGE, skip_sync=True)
+    finally:
+        conn.close()

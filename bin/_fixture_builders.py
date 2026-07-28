@@ -25,6 +25,7 @@ Stdlib only. No external dependencies.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import sqlite3
 from pathlib import Path
@@ -208,7 +209,7 @@ def create_stats_db(path: Path) -> None:
     if path.exists():
         path.unlink()
     register_fixture_db(path)
-    with sqlite3.connect(path) as conn:
+    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
         # Match production's open_db(): fixtures must be WAL so a first
         # open by the harness doesn't flip bytes 18/19 of the DB header.
         conn.execute("PRAGMA journal_mode=WAL")
@@ -1184,6 +1185,25 @@ def _self_test_codex_seeders() -> None:
     print("OK: codex seeders")
 
 
+def _with_ttl_split(usage: dict, cache_create_tokens: int,
+                    cache_1h_tokens: "Optional[int]") -> dict:
+    """Attach the nested Anthropic cache-write TTL breakdown to a WIRE-shape
+    `usage` object when the caller asked for one (#195).
+
+    `None` means "no breakdown at all" — the pre-#195 shape every other fixture
+    keeps, which selects the pricing kernel's unchanged branch. When set, the
+    5-minute half is the REMAINDER, mirroring the kernel's own rule that the
+    flat total stays authoritative.
+    """
+    if cache_1h_tokens is None:
+        return usage
+    usage["cache_creation"] = {
+        "ephemeral_1h_input_tokens": cache_1h_tokens,
+        "ephemeral_5m_input_tokens": cache_create_tokens - cache_1h_tokens,
+    }
+    return usage
+
+
 def emit_streaming_pair(
     jsonl_path: Path,
     *,
@@ -1196,6 +1216,7 @@ def emit_streaming_pair(
     final_output_tokens: int,
     cache_read_tokens: int = 0,
     cache_create_tokens: int = 0,
+    cache_1h_tokens: Optional[int] = None,
     input_tokens: int = 1,
     session_id: Optional[str] = None,
     cwd: Optional[str] = None,
@@ -1230,6 +1251,14 @@ def emit_streaming_pair(
         final_output_tokens: the real output token count; this is the row
             that must survive dedup.
         cache_read_tokens / cache_create_tokens: identical on both rows.
+        cache_1h_tokens: when not ``None``, both rows also carry the nested
+            Anthropic ``usage.cache_creation`` TTL breakdown
+            (``{ephemeral_1h_input_tokens, ephemeral_5m_input_tokens}``) with
+            the 5-minute half derived as ``cache_create_tokens -
+            cache_1h_tokens`` (#195). Use this in AT MOST one or two scenarios
+            per harness: every other fixture must stay split-free so the
+            byte-stability guarantee keeps its coverage — a split-bearing
+            fixture takes the NEW pricing branch by design.
         input_tokens: identical on both rows (default ``1``, matches the
             streaming-intermediate shape).
         session_id / cwd: optional. When provided, written as ``sessionId``
@@ -1247,12 +1276,12 @@ def emit_streaming_pair(
         "message": {
             "id": msg_id,
             "model": model,
-            "usage": {
+            "usage": _with_ttl_split({
                 "input_tokens": input_tokens,
                 "output_tokens": intermediate_output_tokens,
                 "cache_creation_input_tokens": cache_create_tokens,
                 "cache_read_input_tokens": cache_read_tokens,
-            },
+            }, cache_create_tokens, cache_1h_tokens),
         },
     }
     final: dict = {
@@ -1262,13 +1291,13 @@ def emit_streaming_pair(
         "message": {
             "id": msg_id,
             "model": model,
-            "usage": {
+            "usage": _with_ttl_split({
                 "input_tokens": input_tokens,
                 "output_tokens": final_output_tokens,
                 "cache_creation_input_tokens": cache_create_tokens,
                 "cache_read_input_tokens": cache_read_tokens,
                 "speed": "standard",
-            },
+            }, cache_create_tokens, cache_1h_tokens),
         },
     }
     if session_id is not None:

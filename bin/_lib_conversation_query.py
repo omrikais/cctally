@@ -21,7 +21,7 @@ from datetime import datetime as _datetime, timezone as _timezone
 # Public surface (Plan 2): shipped in the npm tarball + brew formula + public
 # mirror — imported by the dashboard's conversation endpoints at runtime.
 
-from _lib_pricing import _calculate_entry_cost, _chip_for_model
+from _lib_pricing import _calculate_entry_cost, _chip_for_model, claude_usage_dict
 # #178: the on-demand load-full re-read helper re-stringifies a raw tool_result
 # content block the same way the parser does at ingest — reuse the parser's
 # _stringify so the full (un-capped) result text matches the cached/capped one.
@@ -546,16 +546,22 @@ def _iso_ms(ts):
         return None
 
 
-def _entry_cost(model, inp, out, cc, cr, cost_usd_raw) -> float:
+def _entry_cost(
+    model, inp, out, cc, cr, cost_usd_raw, *, cc_1h, speed
+) -> float:
     """Cost for one session_entries row via the shared pricing helper. Tokens →
     the helper's usage dict. cost_usd_raw is passed as the optional override the
-    helper already understands (it is often NULL — never the primary source)."""
-    usage = {
-        "input_tokens": inp or 0,
-        "output_tokens": out or 0,
-        "cache_creation_input_tokens": cc or 0,
-        "cache_read_input_tokens": cr or 0,
-    }
+    helper already understands (it is often NULL — never the primary source).
+
+    `cc_1h` (#195) is a REQUIRED keyword, inherited verbatim from
+    `claude_usage_dict`: this is a thin shim over the builder, so a default here
+    would re-open the exact hazard the builder's required keyword closes — a
+    caller that forgets the split does not raise, it silently prices every
+    1-hour cache write at the 5-minute rate. Pass an explicit None for a
+    genuinely unknown split; that reads as a declaration at the call site."""
+    usage = claude_usage_dict(
+        input_tokens=inp, output_tokens=out, cache_creation_tokens=cc,
+        cache_read_tokens=cr, cache_1h_tokens=cc_1h, speed=speed)
     return _calculate_entry_cost(model or "", usage, cost_usd=cost_usd_raw)
 
 
@@ -576,26 +582,49 @@ _CACHE_FAILURE_CACHE_FLOOR = 20_000      # prior cache must be meaningful to "lo
 _CACHE_FAILURE_CREATE_FLOOR = 20_000     # the re-creation must be substantial / real cost
 
 
-def _cache_failure_wasted_usd(model, lost):
+def _cache_failure_wasted_usd(model, lost, *, speed):
     """Marginal extra paid by re-creating `lost` previously-cached tokens at the
     cache-WRITE rate instead of reading them at the cache-READ rate. Reuses the
     pricing chokepoint `_calculate_entry_cost` (zero on unknown models — the
     helper emits its own one-shot stderr warning, never raises). NEVER summed into
-    any cost-snapshot / budget / reconciled figure — a display-only estimate."""
-    write = _calculate_entry_cost(model or "", {"cache_creation_input_tokens": lost})
-    read = _calculate_entry_cost(model or "", {"cache_read_input_tokens": lost})
+    any cost-snapshot / budget / reconciled figure — a display-only estimate.
+    The lost-prefix subset has no authoritative mapping to the source row's
+    5m/1h write buckets, so this preserves the existing 5m estimate while
+    applying the retained effective speed tier."""
+    write = _calculate_entry_cost(
+        model or "",
+        claude_usage_dict(
+            cache_1h_tokens=None, speed=speed, cache_creation_tokens=lost
+        ),
+    )
+    read = _calculate_entry_cost(
+        model or "",
+        claude_usage_dict(
+            cache_1h_tokens=None, speed=speed, cache_read_tokens=lost
+        ),
+    )
     return write - read
 
 
-def _cache_read_saved_usd(model, cache_read):
+def _cache_read_saved_usd(model, cache_read, *, speed):
     """Marginal USD the cache SAVED this turn: the `cache_read` prefix priced at
     the full input rate minus its actual cache-READ rate. Display-only (same
     caveat as `_cache_failure_wasted_usd`): NEVER summed into a cost-snapshot /
     budget / reconciled figure. `input_tokens` and `cache_read_input_tokens` are
     independent keys in the Claude `_calculate_entry_cost` (no subset
     subtraction), so passing each alone yields the two rates cleanly."""
-    full = _calculate_entry_cost(model or "", {"input_tokens": cache_read})
-    read = _calculate_entry_cost(model or "", {"cache_read_input_tokens": cache_read})
+    full = _calculate_entry_cost(
+        model or "",
+        claude_usage_dict(
+            cache_1h_tokens=None, speed=speed, input_tokens=cache_read
+        ),
+    )
+    read = _calculate_entry_cost(
+        model or "",
+        claude_usage_dict(
+            cache_1h_tokens=None, speed=speed, cache_read_tokens=cache_read
+        ),
+    )
     return full - read
 
 
@@ -606,21 +635,24 @@ def _cache_read_saved_usd(model, cache_read):
 # a document-ordered list of these and feed it to the ONE predicate below — the
 # rule is implemented exactly once (U1, #217 S1).
 class _CFEvent:
-    __slots__ = ("compaction", "key", "cc", "cr", "model")
+    __slots__ = ("compaction", "key", "cc", "cr", "model", "speed")
 
-    def __init__(self, *, compaction=False, key=None, cc=0, cr=0, model=None):
+    def __init__(
+        self, *, compaction=False, key=None, cc=0, cr=0, model=None, speed=None
+    ):
         self.compaction = compaction
         self.key = key
         self.cc = cc
         self.cr = cr
         self.model = model
+        self.speed = speed
 
 
 def _iter_cache_failures(events):
     """The single cache-failure rule (spec §1), as a generator over a
     document-ordered ``_CFEvent`` stream. Yields ``(index, prev_cached, lost,
-    model)`` for each FLAGGED assistant event — ``index`` is the event's position
-    in ``events`` so a caller can map a flag back to its source item.
+    model, speed)`` for each FLAGGED assistant event — ``index`` is the event's
+    position in ``events`` so a caller can map a flag back to its source item.
 
     Maintains a running-max of ``cache_read`` keyed by the event's ``key``
     (``(subagent_key, model)`` — ``None`` subagent_key = main session). The key
@@ -660,7 +692,7 @@ def _iter_cache_failures(events):
                 and total > 0
                 and cc / total >= _CACHE_FAILURE_RECREATE_FRACTION):
             lost = min(cc, max(0, rm - cr))
-            yield (i, rm, lost, ev.model)
+            yield (i, rm, lost, ev.model, ev.speed)
         running_max[ev.key] = max(rm, cr)
 
 
@@ -695,7 +727,8 @@ def _cache_failure_events_from_items(items):
             key=(it.get("subagent_key"), it.get("model")),
             cc=tok.get("cache_creation", 0) or 0,
             cr=tok.get("cache_read", 0) or 0,
-            model=it.get("model")))
+            model=it.get("model"),
+            speed=it.get("_speed")))
         sources.append(it)
     return events, sources
 
@@ -719,11 +752,13 @@ def _stamp_cache_failures(items):
         est_wasted_usd   = write(lost) - read(lost)
     """
     events, sources = _cache_failure_events_from_items(items)
-    for idx, prev_cached, lost, model in _iter_cache_failures(events):
+    for idx, prev_cached, lost, model, speed in _iter_cache_failures(events):
         sources[idx]["cache_failure"] = {
             "tokens_recreated": lost,
             "prev_cached": prev_cached,
-            "est_wasted_usd": _cache_failure_wasted_usd(model, lost),
+            "est_wasted_usd": _cache_failure_wasted_usd(
+                model, lost, speed=speed
+            ),
         }
 
 
@@ -901,10 +936,15 @@ def _turn_costs_for_keys(conn, keys):
         cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
         params = [v for pair in chunk for v in pair]
         sql = ("SELECT msg_id, req_id, model, input_tokens, output_tokens, "
-               "cache_create_tokens, cache_read_tokens, cost_usd_raw "
+               "cache_create_tokens, cache_read_tokens, cost_usd_raw, "
+               "cache_create_1h_tokens, speed "
                "FROM session_entries WHERE " + cond)
-        for m, r, model, inp, out, cc, cr, raw in conn.execute(sql, params):
-            costs[(m, r)] = _entry_cost(model, inp, out, cc, cr, raw)
+        for m, r, model, inp, out, cc, cr, raw, cc1h, speed in conn.execute(
+            sql, params
+        ):
+            costs[(m, r)] = _entry_cost(
+                model, inp, out, cc, cr, raw, cc_1h=cc1h, speed=speed
+            )
     return costs
 
 
@@ -1539,7 +1579,7 @@ def _turn_cost_map(conn, turn_keys):
 
 
 def _turn_usage_map(conn, turn_keys):
-    """{(msg_id, req_id): {"input","output","cache_creation","cache_read"}} for
+    """{(msg_id, req_id): {tokens..., "speed"}} for
     the given non-null turn keys, read from the SAME deduped session_entries row
     cost is computed from (#177). This is a SEPARATE sibling of _turn_cost_map —
     that one returns a float and is also consumed by the search path
@@ -1557,11 +1597,12 @@ def _turn_usage_map(conn, turn_keys):
         cond = " OR ".join("(msg_id=? AND req_id=?)" for _ in chunk)
         params = [v for pair in chunk for v in pair]
         sql = ("SELECT msg_id, req_id, input_tokens, output_tokens, "
-               "cache_create_tokens, cache_read_tokens "
+               "cache_create_tokens, cache_read_tokens, speed "
                "FROM session_entries WHERE " + cond)
-        for m, r, inp, out, cc, cr in conn.execute(sql, params):
+        for m, r, inp, out, cc, cr, speed in conn.execute(sql, params):
             usage[(m, r)] = {"input": inp or 0, "output": out or 0,
-                             "cache_creation": cc or 0, "cache_read": cr or 0}
+                             "cache_creation": cc or 0, "cache_read": cr or 0,
+                             "speed": speed}
     return usage
 
 
@@ -1981,7 +2022,11 @@ def _assemble_session(conn, session_id):
             # key has no session_entries row (omitted, not zero-filled).
             tok = usage.get((it["_msg_id"], it["_req_id"]))
             if tok is not None:
-                it["tokens"] = tok
+                # `speed` is an internal pricing input, not part of the public
+                # token-count object. Keep it alongside the assembled item for
+                # cache financials and strip it from reader page copies.
+                it["tokens"] = {k: v for k, v in tok.items() if k != "speed"}
+                it["_speed"] = tok.get("speed")
             del it["_msg_id"]
             del it["_req_id"]
             it.pop("_has_prose", None)
@@ -2276,6 +2321,7 @@ def get_conversation(conn, session_id, *, after=None, before=None, tail=False,
     patched = []
     for it in page:
         nit = dict(it)
+        nit.pop("_speed", None)
         nit["anchor"] = {**it["anchor"], "session_id": session_id}
         if nit.get("text"):
             nit["text"] = _strip_ansi(nit["text"])
@@ -2422,7 +2468,9 @@ def get_conversation_outline(conn, session_id):
                     tokens[k] += tok.get(k, 0)
                 cr_tokens = tok.get("cache_read", 0) or 0
                 if cr_tokens > 0:
-                    cache_saved += _cache_read_saved_usd(it.get("model"), cr_tokens)
+                    cache_saved += _cache_read_saved_usd(
+                        it.get("model"), cr_tokens, speed=it.get("_speed")
+                    )
             # Copy the cache-failure marker onto the OutlineTurn exactly where
             # tokens is copied (assistant-only, rides the same source row) and
             # accumulate the session-level aggregate (spec §2).

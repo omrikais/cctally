@@ -124,15 +124,76 @@ test('a session row opens its detail modal via the title button', async ({ page 
   await expect(page.locator('[role="dialog"]').first()).toBeVisible();
 });
 
-test('a long session title ellipsizes while Cost stays in bounds at span-6', async ({ page }) => {
+test('a representative session title is readable at the 1440px span-6 layout', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/');
-  const titleBtn = page.locator('#panel-sessions .sess-open-title').first();
+  const representativeTitle = 'Main prompt 0 spawning a subagent.';
+  expect(representativeTitle.length).toBeGreaterThanOrEqual(30);
+  expect(representativeTitle.length).toBeLessThanOrEqual(36);
+  const titleBtn = page.getByRole('button', {
+    name: `Open session details: ${representativeTitle}`,
+  });
+  await expect(titleBtn).toHaveCount(1);
   await expect(titleBtn).toBeVisible();
-  const clipped = await titleBtn.evaluate(
-    (el) => el.scrollWidth > el.clientWidth || el.textContent!.length < 40,
+  const geometry = await titleBtn.evaluate(
+    (el) => ({
+      clientWidth: el.clientWidth,
+      scrollWidth: el.scrollWidth,
+      clientHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+    }),
   );
-  expect(clipped).toBe(true); // ellipsized OR legitimately short — never spilling the card
+  expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth + 1);
+  expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight + 1);
+
+  const rowHeights = await page.locator('#panel-sessions .sess-table tbody tr').evaluateAll(
+    (rows) => rows.map((row) => row.getBoundingClientRect().height),
+  );
+  expect(Math.max(...rowHeights) - Math.min(...rowHeights)).toBeLessThanOrEqual(1);
+});
+
+test('the densest All-source Sessions variant keeps labels, titles, and Cost in bounds', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'All (partial)' }).click();
+  await expect(page.locator('#panel-sessions')).toHaveAttribute('data-source', 'all');
+
+  const representativeTitle = 'Main prompt 0 spawning a subagent.';
+  const titleBtn = page.getByRole('button', {
+    name: `Open claude session details: ${representativeTitle}`,
+  });
+  await expect(titleBtn).toHaveCount(1);
+  const titleGeometry = await titleBtn.evaluate(
+    (el) => ({
+      clientWidth: el.clientWidth,
+      scrollWidth: el.scrollWidth,
+      clientHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+    }),
+  );
+  expect(titleGeometry.scrollWidth).toBeLessThanOrEqual(titleGeometry.clientWidth + 1);
+  expect(titleGeometry.scrollHeight).toBeLessThanOrEqual(titleGeometry.clientHeight + 1);
+
+  const body = page.locator('#panel-sessions .panel-body');
+  const bodyBox = (await body.boundingBox())!;
+  const costRights = await page.locator(
+    '#panel-sessions .sess-table tbody td.num:not(.cache)',
+  ).evaluateAll((cells) => cells.map((cell) => cell.getBoundingClientRect().right));
+  expect(costRights.every((right) => right <= bodyBox.x + bodyBox.width + 1)).toBe(true);
+
+  const sourceLabels = await page.locator(
+    '#panel-sessions .sess-table tbody .source-chip',
+  ).evaluateAll((chips) => chips.map((chip) => chip.textContent?.trim()));
+  expect(sourceLabels).toContain('Claude');
+  expect(sourceLabels).toContain('Codex');
+
+  const rowHeights = await page.locator('#panel-sessions .sess-table tbody tr').evaluateAll(
+    (rows) => rows.map((row) => row.getBoundingClientRect().height),
+  );
+  expect(Math.max(...rowHeights) - Math.min(...rowHeights)).toBeLessThanOrEqual(1);
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+  )).toBe(true);
 });
 
 // #293 S3 — stacked-card summary bounds. Fixture-independent computed-style

@@ -2733,6 +2733,7 @@ def _setup_install(args: argparse.Namespace) -> int:
                             lambda active_conn: c.sync_cache(
                                 active_conn, progress=progress.sync_callback
                             ),
+                            origin="setup.bootstrap.claude_sync",
                         )
                     )
                 finally:

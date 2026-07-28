@@ -859,6 +859,7 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
                     lambda active_conn: sync_codex_cache(
                         active_conn, only_paths=set(to_ingest)
                     ),
+                    origin="dashboard.conversation.codex_sync",
                 )
             finally:
                 core.close()

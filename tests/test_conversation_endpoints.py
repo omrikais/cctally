@@ -130,9 +130,9 @@ def _seed_cache(ns):
     cache.close()
 
 
-def _make_snapshot(ns):
+def _make_snapshot(ns, *, with_codex_label=False):
     DataSnapshot = ns["DataSnapshot"]
-    return DataSnapshot(
+    snapshot = DataSnapshot(
         current_week=None, forecast=None, trend=[], sessions=[],
         last_sync_at=None, last_sync_error=None,
         generated_at=dt.datetime(2026, 6, 3, 12, 0, tzinfo=dt.timezone.utc),
@@ -140,9 +140,44 @@ def _make_snapshot(ns):
         weekly_periods=[], monthly_periods=[],
         blocks_panel=[], daily_panel=[],
     )
+    if with_codex_label:
+        from _lib_dashboard_sources import (
+            SourceDashboardBundle,
+            SourceDashboardState,
+            compose_all_state,
+        )
+        now = snapshot.generated_at
+        key = "session:codex-private"
+        claude = SourceDashboardState(
+            source="claude", availability="empty", freshness="fresh",
+            warnings=(), data_version="claude-v1", last_success_at=now,
+            capabilities={}, data={"sessions": {"rows": ()}},
+        )
+        codex = SourceDashboardState(
+            source="codex", availability="ok", freshness="fresh",
+            warnings=(), data_version="codex-v1", last_success_at=now,
+            capabilities={},
+            data={"sessions": {"rows": ({"key": key, "source": "codex"},)}},
+        )
+        object.__setattr__(
+            codex, "private_session_labels", {key: "Private first prompt"},
+        )
+        snapshot.source_bundle = SourceDashboardBundle(
+            source_schema_version=1, default_source="claude",
+            source_order=("claude", "codex", "all"),
+            sources={
+                "claude": claude,
+                "codex": codex,
+                "all": compose_all_state(claude, codex),
+            },
+        )
+    return snapshot
 
 
-def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
+def _boot(
+    ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
+    with_codex_label=False,
+):
     """Seed the cache and start a server with the given bind/expose posture.
 
     Returns the running ThreadingTCPServer; caller must ``srv.shutdown()``.
@@ -155,7 +190,9 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False):
     SnapshotRef = ns["_SnapshotRef"]
     SSEHub = ns["SSEHub"]
 
-    HandlerCls.snapshot_ref = SnapshotRef(_make_snapshot(ns))
+    HandlerCls.snapshot_ref = SnapshotRef(
+        _make_snapshot(ns, with_codex_label=with_codex_label)
+    )
     HandlerCls.hub = SSEHub()
     HandlerCls.sync_lock = threading.Lock()
     HandlerCls.run_sync_now = staticmethod(lambda: None)
@@ -702,6 +739,43 @@ def test_api_data_transcripts_enabled_is_host_aware(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_api_data_codex_labels_follow_the_request_gate_without_contamination(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    srv = _boot(
+        ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False,
+        with_codex_label=True,
+    )
+    try:
+        port = srv.server_address[1]
+
+        def labels(payload):
+            sources = payload["sources"]
+            return (
+                sources["codex"]["data"]["sessions"]["rows"][0].get("label"),
+                sources["all"]["data"]["providers"]["codex"]["sessions"]["rows"][0].get("label"),
+            )
+
+        status, body = _get(port, "/api/data")
+        opened = json.loads(body)
+        assert status == 200 and opened["transcriptsEnabled"] is True
+        assert labels(opened) == ("Private first prompt", "Private first prompt")
+
+        status, body = _get(port, "/api/data", host="machine.local:8789")
+        closed = json.loads(body)
+        assert status == 200 and closed["transcriptsEnabled"] is False
+        assert labels(closed) == (None, None)
+
+        status, body = _get(port, "/api/data")
+        reopened = json.loads(body)
+        assert status == 200 and labels(reopened) == (
+            "Private first prompt", "Private first prompt",
+        )
+    finally:
+        srv.shutdown()
+
+
 def _first_sse_update_envelope(port, *, host=None, timeout=5.0):
     """Open ``GET /api/events``, publish a snapshot, and return the parsed
     JSON envelope from the first ``event: update`` block on the stream.
@@ -910,6 +984,47 @@ def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
         env = _first_sse_update_envelope(port, host="machine.local:8789")
         assert "transcriptsEnabled" in env, env
         assert env["transcriptsEnabled"] is False
+    finally:
+        srv.shutdown()
+
+
+def test_sse_codex_labels_follow_each_connection_transcript_gate(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    srv = _boot(
+        ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False,
+        with_codex_label=True,
+    )
+    try:
+        port = srv.server_address[1]
+        HandlerCls = ns["DashboardHTTPHandler"]
+        snapshot = _make_snapshot(ns, with_codex_label=True)
+        HandlerCls.hub.publish(snapshot)
+
+        opened = _first_sse_update_envelope(port)
+        assert opened["transcriptsEnabled"] is True
+        assert (
+            opened["sources"]["codex"]["data"]["sessions"]["rows"][0]["label"]
+            == "Private first prompt"
+        )
+        assert (
+            opened["sources"]["all"]["data"]["providers"]["codex"]
+            ["sessions"]["rows"][0]["label"]
+            == "Private first prompt"
+        )
+
+        closed = _first_sse_update_envelope(
+            port, host="machine.local:8789",
+        )
+        assert closed["transcriptsEnabled"] is False
+        assert "label" not in (
+            closed["sources"]["codex"]["data"]["sessions"]["rows"][0]
+        )
+        assert "label" not in (
+            closed["sources"]["all"]["data"]["providers"]["codex"]
+            ["sessions"]["rows"][0]
+        )
     finally:
         srv.shutdown()
 

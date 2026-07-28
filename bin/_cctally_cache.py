@@ -103,11 +103,12 @@ import fcntl
 import json
 import os
 import pathlib
+import select
 import signal
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterator, NamedTuple
 
 
@@ -197,6 +198,10 @@ _perf = _load_lib("_lib_perf")
 # _arm_rollup_backfill_on_pricing_change so a test may monkeypatch it.
 PRICING_SNAPSHOT_DATE = _load_lib("_lib_pricing").PRICING_SNAPSHOT_DATE
 
+# #195: the single construction point for every cost-feeding usage dict. Bound
+# from the same circular-safe stdlib leaf as PRICING_SNAPSHOT_DATE above.
+claude_usage_dict = _load_lib("_lib_pricing").claude_usage_dict
+
 # Shared by the fused per-file walk AND backfill_conversation_messages so the
 # column list, placeholders, and tuple order live in ONE place — a column
 # add/reorder can't silently desync the two ingest paths (which would land
@@ -222,6 +227,129 @@ _AI_TITLE_UPSERT_SQL = (
     "ON CONFLICT(session_id) DO UPDATE SET "
     "ai_title=excluded.ai_title, source_path=excluded.source_path, byte_offset=excluded.byte_offset"
 )
+
+# ---------------------------------------------------------------------------
+# session_entries upsert (#195: extracted from the inline string in sync_cache
+# so the steady-state and re-walk variants share ONE body).
+#
+# ccusage-parity ON CONFLICT DO UPDATE: higher-token total wins on conflict;
+# speed-set breaks ties. The partial UNIQUE index `idx_entries_dedup` restricts
+# the conflict target to (msg_id IS NOT NULL AND req_id IS NOT NULL), so the
+# WHERE clause on the conflict target MUST repeat that predicate verbatim —
+# bare `ON CONFLICT(msg_id, req_id)` raises OperationalError. NULL-keyed rows
+# fall through to a plain INSERT, unchanged.
+#
+# `source_path` is INTENTIONALLY OMITTED from the DO UPDATE SET clause: it
+# stays pinned to whichever JSONL FIRST INSERTed the (msg_id, req_id) row. The
+# downstream `LEFT JOIN session_files ON sf.path = se.source_path` uses
+# source_path to attribute tokens to a `project_path`. If a later UPSERT from a
+# different file flipped source_path, the row's project attribution would move
+# with the winner — `cctally project` would mis-aggregate. Sticky source_path
+# matches pre-dedup INSERT OR IGNORE behavior and the operator's mental model.
+# (`line_offset` is similarly sticky for the same reason — the offset only
+# makes sense within the file that originally wrote the row.)
+#
+# `account_key` is DELIBERATELY OMITTED from DO UPDATE SET too (#341,
+# first-stamp-wins): a resumed session replaying identical bytes under a
+# different account is the SAME message and keeps the first observed stamp.
+_SESSION_ENTRY_SET = """
+                               timestamp_utc = excluded.timestamp_utc,
+                               model = excluded.model,
+                               input_tokens = excluded.input_tokens,
+                               output_tokens = excluded.output_tokens,
+                               cache_create_tokens = excluded.cache_create_tokens,
+                               cache_read_tokens = excluded.cache_read_tokens,
+                               cache_create_1h_tokens = excluded.cache_create_1h_tokens,
+                               cache_create_5m_tokens = excluded.cache_create_5m_tokens,
+                               usage_extra_json = excluded.usage_extra_json,
+                               speed = excluded.speed,
+                               cost_usd_raw = excluded.cost_usd_raw,
+                               -- #270: stamp the change. mutation_seq advances
+                               -- exactly when this guarded UPSERT's WHERE passes
+                               -- (incl. the equal-tokens speed-tiebreak branch,
+                               -- Codex-2d). mutation_min_ts accumulates the
+                               -- EARLIEST event time the row has held —
+                               -- session_entries.mutation_min_ts is the OLD
+                               -- (pre-update) value, excluded.timestamp_utc the
+                               -- finalization's new time — so a finalization
+                               -- that moves the row across a bucket boundary
+                               -- still lets the closed-bucket watermark reach
+                               -- the OLD bucket (spec §6/§7b). The SET reads
+                               -- pre-update column values, unaffected by the
+                               -- sibling timestamp_utc = excluded.timestamp_utc.
+                               -- COALESCE(mutation_min_ts, timestamp_utc) guards
+                               -- a LEGACY row (written before these columns
+                               -- existed: mutation_min_ts NULL): SQLite scalar
+                               -- MIN(NULL, x) is NULL, which would strand the
+                               -- watermark; the pre-update timestamp_utc is that
+                               -- legacy row's old event time, so both its old
+                               -- and new buckets stay reachable. No-op for
+                               -- non-legacy rows (mutation_min_ts already set).
+                               mutation_seq = excluded.mutation_seq,
+                               mutation_min_ts = MIN(COALESCE(session_entries.mutation_min_ts,
+                                                              session_entries.timestamp_utc),
+                                                     excluded.timestamp_utc)"""
+
+# The third guard branch (#195) mirrors the existing `speed` tiebreak: a replay
+# of IDENTICAL bytes has an EQUAL token sum, so without it the enrichment can
+# never land on an existing row.
+_SESSION_ENTRY_GUARD = """
+                           WHERE
+                               (excluded.input_tokens + excluded.output_tokens
+                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
+                               >
+                               (session_entries.input_tokens + session_entries.output_tokens
+                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+                            OR (
+                               (excluded.input_tokens + excluded.output_tokens
+                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
+                               =
+                               (session_entries.input_tokens + session_entries.output_tokens
+                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+                               AND excluded.speed IS NOT NULL
+                               AND session_entries.speed IS NULL
+                            )
+                            OR (
+                               (excluded.input_tokens + excluded.output_tokens
+                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
+                               =
+                               (session_entries.input_tokens + session_entries.output_tokens
+                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
+                               AND excluded.cache_create_1h_tokens IS NOT NULL
+                               AND session_entries.cache_create_1h_tokens IS NULL
+                            )"""
+
+# Column order is the bind order of the tuples built in `sync_cache` (13 walk
+# columns, then the two #195 split columns, then the three #270/#341 stamps
+# appended by `stamped_rows`). Keep the two in lockstep.
+_SESSION_ENTRY_HEAD = """INSERT INTO session_entries
+                           (source_path, line_offset, timestamp_utc, model,
+                            msg_id, req_id, input_tokens, output_tokens,
+                            cache_create_tokens, cache_read_tokens,
+                            usage_extra_json, speed, cost_usd_raw,
+                            cache_create_1h_tokens, cache_create_5m_tokens,
+                            mutation_seq, mutation_min_ts, account_key)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(msg_id, req_id)
+                           WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
+                           DO UPDATE SET"""
+
+# Steady state: ONE conflict target. A duplicate physical key stays a LOUD
+# IntegrityError — migration 020 calls those "strictly ingest-bug artifacts"
+# and that backstop must not be silently converted into an update.
+SESSION_ENTRY_UPSERT_SQL = _SESSION_ENTRY_HEAD + _SESSION_ENTRY_SET + _SESSION_ENTRY_GUARD
+
+# Re-walk only (#195 migration 030): rows are NOT wiped first, so a row the
+# partial dedup index does not cover (NULL msg_id and/or req_id) collides on
+# idx_entries_physical instead. SQLite does not route that through the first
+# target's handler, so it needs its own clause or the whole per-file
+# transaction rolls back and that file is silently skipped forever.
+SESSION_ENTRY_UPSERT_SQL_REWALK = (
+    SESSION_ENTRY_UPSERT_SQL
+    + """
+                           ON CONFLICT(source_path, line_offset)
+                           DO UPDATE SET"""
+    + _SESSION_ENTRY_SET + _SESSION_ENTRY_GUARD)
 
 
 def _conv_row_tuple(m, path_str):
@@ -1714,6 +1842,15 @@ def _ensure_session_files_row(conn: sqlite3.Connection, source_path: str) -> Non
 # Read at call time in cmd_cache_sync so tests can monkeypatch it low.
 _REBUILD_LOCK_TIMEOUT_SECONDS = 30.0
 
+# #395: an explicit transcript rebuild runs each provider in a disposable child
+# process. A provider phase may legitimately be large, so the production bound
+# measures time without a phase/file progress event, not total wall time. The
+# important contract is that a truly stuck phase is finite and process-level
+# (SQLite/Python work is never unsafely cancelled in the parent). Tests patch
+# this module constant to exercise the real timeout path quickly.
+_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS = 30.0 * 60.0
+_TRANSCRIPT_REBUILD_KILL_GRACE_SECONDS = 1.0
+
 
 # Orphan-warning throttle: warn only when the detected orphan set CHANGES,
 # so a long-lived dashboard doesn't re-spam the "[cache] N tracked file(s) no
@@ -2604,6 +2741,19 @@ def sync_cache(
         # "walk" phase (never per-row — Section 2 rule: volume is a count, not
         # N timed phases). Opened via the context-manager protocol so the hot
         # loop body below is not reindented; counts recorded after the loop.
+        # #195: is the cache-write-split re-walk armed? Computed ONCE per
+        # sync_cache call, before the file loop, so every file in this walk uses
+        # one statement. Cache migration 030 sets this flag and zeroes the
+        # per-file cursors; the end-of-walk block below clears it after a clean,
+        # non-targeted full walk. While armed, the chained-conflict variant is
+        # used so a replayed NULL-key row updates in place instead of raising
+        # IntegrityError and rolling back its whole file. Scoped to THIS flag
+        # (not marker-absence) so migration 020's loud duplicate-physical-key
+        # backstop stays intact on every other ingest path.
+        rewalk_armed = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
+        ).fetchone() is not None
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
         for jp in paths:
@@ -2679,6 +2829,13 @@ def sync_cache(
                             # serializing the deeply-nested blob the read paths
                             # used to json.loads per row.
                             speed = usage.get("speed")
+                            # #195: the cache-write TTL split, normalized out of
+                            # the nested `usage.cache_creation` by
+                            # `_classify_cost_entry`. Absent keys stay None,
+                            # which stores NULL — the "split unknown" sentinel
+                            # the pricing kernel branches on.
+                            h = usage.get("cache_creation_1h_input_tokens")
+                            m = usage.get("cache_creation_5m_input_tokens")
                             rows.append((
                                 path_str,
                                 offset,
@@ -2690,6 +2847,7 @@ def sync_cache(
                                 None,    # usage_extra_json — bloat no longer written (#181)
                                 speed,   # materialized speed column
                                 entry.cost_usd,
+                                h, m,    # #195 cache-write TTL split
                             ))
                         if mrow is not None:
                             conv_rows.append(_conv_row_tuple(mrow, path_str))
@@ -2770,68 +2928,14 @@ def sync_cache(
                     # (`line_offset` is similarly sticky for the same
                     # reason — the offset only makes sense within the
                     # file that originally wrote the row.)
-                    conn.executemany(
-                        """INSERT INTO session_entries
-                           (source_path, line_offset, timestamp_utc, model,
-                            msg_id, req_id, input_tokens, output_tokens,
-                            cache_create_tokens, cache_read_tokens,
-                            usage_extra_json, speed, cost_usd_raw,
-                            mutation_seq, mutation_min_ts, account_key)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(msg_id, req_id)
-                           WHERE msg_id IS NOT NULL AND req_id IS NOT NULL
-                           DO UPDATE SET
-                               timestamp_utc = excluded.timestamp_utc,
-                               model = excluded.model,
-                               input_tokens = excluded.input_tokens,
-                               output_tokens = excluded.output_tokens,
-                               cache_create_tokens = excluded.cache_create_tokens,
-                               cache_read_tokens = excluded.cache_read_tokens,
-                               usage_extra_json = excluded.usage_extra_json,
-                               speed = excluded.speed,
-                               cost_usd_raw = excluded.cost_usd_raw,
-                               -- #270: stamp the change. mutation_seq advances
-                               -- exactly when this guarded UPSERT's WHERE passes
-                               -- (incl. the equal-tokens speed-tiebreak branch,
-                               -- Codex-2d). mutation_min_ts accumulates the
-                               -- EARLIEST event time the row has held —
-                               -- session_entries.mutation_min_ts is the OLD
-                               -- (pre-update) value, excluded.timestamp_utc the
-                               -- finalization's new time — so a finalization
-                               -- that moves the row across a bucket boundary
-                               -- still lets the closed-bucket watermark reach
-                               -- the OLD bucket (spec §6/§7b). The SET reads
-                               -- pre-update column values, unaffected by the
-                               -- sibling timestamp_utc = excluded.timestamp_utc.
-                               -- COALESCE(mutation_min_ts, timestamp_utc) guards
-                               -- a LEGACY row (written before these columns
-                               -- existed: mutation_min_ts NULL): SQLite scalar
-                               -- MIN(NULL, x) is NULL, which would strand the
-                               -- watermark; the pre-update timestamp_utc is that
-                               -- legacy row's old event time, so both its old
-                               -- and new buckets stay reachable. No-op for
-                               -- non-legacy rows (mutation_min_ts already set).
-                               mutation_seq = excluded.mutation_seq,
-                               mutation_min_ts = MIN(COALESCE(session_entries.mutation_min_ts,
-                                                              session_entries.timestamp_utc),
-                                                     excluded.timestamp_utc)
-                           WHERE
-                               (excluded.input_tokens + excluded.output_tokens
-                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
-                               >
-                               (session_entries.input_tokens + session_entries.output_tokens
-                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-                            OR (
-                               (excluded.input_tokens + excluded.output_tokens
-                                + excluded.cache_create_tokens + excluded.cache_read_tokens)
-                               =
-                               (session_entries.input_tokens + session_entries.output_tokens
-                                + session_entries.cache_create_tokens + session_entries.cache_read_tokens)
-                               AND excluded.speed IS NOT NULL
-                               AND session_entries.speed IS NULL
-                            )""",
-                        stamped_rows,
-                    )
+                    # #195: while the re-walk is armed, rows are NOT wiped
+                    # first, so a row the partial dedup index does not cover
+                    # collides on idx_entries_physical and would roll back the
+                    # whole per-file transaction. Steady state keeps the
+                    # single-target SQL and its LOUD physical-key backstop.
+                    _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK if rewalk_armed
+                            else SESSION_ENTRY_UPSERT_SQL)
+                    conn.executemany(_sql, stamped_rows)
                     stats.rows_changed += conn.total_changes - before
                 # Conversation message ingest (Plan 1). Lands in the SAME
                 # per-file write transaction as session_entries so the cost
@@ -2963,6 +3067,14 @@ def sync_cache(
                 "VALUES('claude_ingest_walk_complete', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (dt.datetime.now(dt.timezone.utc).isoformat(),),
+            )
+            # #195: the same clean-full-walk condition retires the split
+            # re-walk arming flag, so steady state goes back to the
+            # single-target UPSERT and its loud physical-key backstop. An
+            # unclean or targeted walk leaves it armed and retries next time.
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key=?",
+                (_cctally_db_sib.CACHE_CREATION_SPLIT_REWALK_KEY,),
             )
             conn.commit()
         # #279 S2 F1: rolling parse-health record. Anomaly-delta-gated so
@@ -3664,7 +3776,7 @@ def iter_entries(
     sql = (
         "SELECT timestamp_utc, model, input_tokens, output_tokens, "
         "cache_create_tokens, cache_read_tokens, speed, "
-        "cost_usd_raw, source_path "
+        "cost_usd_raw, source_path, cache_create_1h_tokens "
         "FROM session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
     )
@@ -3698,18 +3810,16 @@ def iter_entries(
 
     entries: list[UsageEntry] = []
     for row in conn.execute(sql, params):
-        usage: dict[str, Any] = {
-            "input_tokens":                row[2],
-            "output_tokens":               row[3],
-            "cache_creation_input_tokens": row[4],
-            "cache_read_input_tokens":     row[5],
-        }
-        # speed is the only non-token usage key any consumer reads (#181);
-        # materialized into its own column so this hot path never parses JSON.
-        # `is not None` (not truthiness) so an empty-string speed still surfaces,
-        # mirroring the SQL `json_extract(...) IS NOT NULL` parity.
-        if row[6] is not None:
-            usage["speed"] = row[6]
+        # #195: one construction point for every cost-feeding usage dict.
+        # `cache_1h_tokens` is a REQUIRED keyword — see claude_usage_dict.
+        usage: dict[str, Any] = claude_usage_dict(
+            input_tokens=row[2],
+            output_tokens=row[3],
+            cache_creation_tokens=row[4],
+            cache_read_tokens=row[5],
+            cache_1h_tokens=row[9],
+            speed=row[6],
+        )
         entries.append(UsageEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),
             model=row[1],
@@ -3753,7 +3863,8 @@ def iter_entries_with_id(
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
     sql = (
         "SELECT id, timestamp_utc, model, input_tokens, output_tokens, "
-        "cache_create_tokens, cache_read_tokens, speed, cost_usd_raw, source_path "
+        "cache_create_tokens, cache_read_tokens, speed, cost_usd_raw, source_path, "
+        "cache_create_1h_tokens "
         "FROM session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ?"
     )
@@ -3770,14 +3881,14 @@ def iter_entries_with_id(
 
     out: list[tuple[int, UsageEntry]] = []
     for row in conn.execute(sql, params):
-        usage: dict[str, Any] = {
-            "input_tokens":                row[3],
-            "output_tokens":               row[4],
-            "cache_creation_input_tokens": row[5],
-            "cache_read_input_tokens":     row[6],
-        }
-        if row[7] is not None:  # speed (materialized column, #181)
-            usage["speed"] = row[7]
+        usage: dict[str, Any] = claude_usage_dict(   # #195 chokepoint
+            input_tokens=row[3],
+            output_tokens=row[4],
+            cache_creation_tokens=row[5],
+            cache_read_tokens=row[6],
+            cache_1h_tokens=row[10],
+            speed=row[7],
+        )
         out.append((row[0], UsageEntry(
             timestamp=dt.datetime.fromisoformat(row[1]),
             model=row[2],
@@ -3870,6 +3981,18 @@ class _JoinedClaudeEntry:
     # them (else `daily -i`/`-p` lose fast-tier model labels). None when
     # the row has no extras.
     usage_extra: dict | None = None
+    # #195: the 1-hour portion of `cache_creation_tokens`, or None when the
+    # split is unknown (a pre-#195 cache row, or a JSONL entry with no nested
+    # `cache_creation` breakdown). None is the sentinel the pricing kernel
+    # branches on to reproduce pre-#195 behavior byte-identically.
+    cache_1h_tokens: int | None = None
+
+    @property
+    def speed(self):
+        """Authoritative effective tier retained from ``message.usage.speed``."""
+        if self.usage_extra is None:
+            return None
+        return self.usage_extra.get("speed")
 
 
 def get_claude_session_entries(
@@ -3911,7 +4034,9 @@ def get_claude_session_entries(
 
     if not skip_sync:
         stats, conn = _run_cache_operation_with_recovery(
-            conn, lambda active_conn: sync_cache(active_conn)
+            conn,
+            lambda active_conn: sync_cache(active_conn),
+            origin="claude.session_entries.sync",
         )
         if stats.lock_contended:
             # Partial cache window: a concurrent ingest may have committed some
@@ -3919,6 +4044,7 @@ def get_claude_session_entries(
             # JSONL parse — same rationale as `get_entries`.
             # #341: fail closed on an account-scoped read — the direct-JSONL
             # fallback carries no account identity (exit 3, not a mislabel).
+            conn.close()
             _guard_account_attribution(account_key, "concurrent ingest")
             eprint(
                 "[cache] concurrent ingest in progress; "
@@ -3938,7 +4064,7 @@ def get_claude_session_entries(
         "  se.cache_create_tokens, se.cache_read_tokens, "
         "  se.source_path, "
         "  sf.session_id, sf.project_path, "
-        "  se.cost_usd_raw, se.speed "
+        "  se.cost_usd_raw, se.speed, se.cache_create_1h_tokens "
         "FROM session_entries se "
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ?"
@@ -3972,7 +4098,10 @@ def get_claude_session_entries(
     # which plan SQLite picks for either window.
     sql += " ORDER BY se.timestamp_utc ASC, se.id ASC"
 
-    rows = conn.execute(sql, params).fetchall()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
 
     return [
         _JoinedClaudeEntry(
@@ -3990,6 +4119,9 @@ def get_claude_session_entries(
             # {"speed": …} shape _usage_entry_from_joined already merges, with
             # zero JSON parsing. `is not None` so an empty-string speed surfaces.
             usage_extra=({"speed": row[10]} if row[10] is not None else None),
+            # #195: NULL == split unknown; carried through so the pricing
+            # kernel can price the 1h portion at 2x base input.
+            cache_1h_tokens=row[11],
         )
         for row in rows
     ]
@@ -4104,6 +4236,9 @@ def _direct_parse_claude_session_entries(
     _token_keys = {
         "input_tokens", "output_tokens",
         "cache_creation_input_tokens", "cache_read_input_tokens",
+        # #195: the normalized TTL split rides its own dataclass field and its
+        # own columns, so it must NOT double-ride into usage_extra.
+        "cache_creation_1h_input_tokens", "cache_creation_5m_input_tokens",
     }
     for entry, source_path in flat:
         usage = entry.usage
@@ -4127,6 +4262,7 @@ def _direct_parse_claude_session_entries(
             project_path=cwd,
             cost_usd=entry.cost_usd,
             usage_extra=(extras or None),
+            cache_1h_tokens=usage.get("cache_creation_1h_input_tokens"),
         ))
 
     return results
@@ -4966,7 +5102,9 @@ def get_codex_entries(
         # classified corruption closes the handle, quarantines once, and
         # restarts on a fresh family (reassigning `conn`, closed in finally).
         stats, conn = _run_cache_operation_with_recovery(
-            conn, lambda active_conn: sync_codex_cache(active_conn)
+            conn,
+            lambda active_conn: sync_codex_cache(active_conn),
+            origin="codex.entries.sync",
         )
         if stats.lock_contended:
             # Sync commits file-by-file, so contention on the ingest lock
@@ -5086,7 +5224,9 @@ def get_entries(
     try:
         if not skip_sync:
             stats, conn = _run_cache_operation_with_recovery(
-                conn, lambda active_conn: sync_cache(active_conn)
+                conn,
+                lambda active_conn: sync_cache(active_conn),
+                origin="claude.entries.sync",
             )
             if stats.lock_contended:
                 # Sync commits file-by-file, so contention on the ingest lock
@@ -5108,10 +5248,7 @@ def get_entries(
         return iter_entries(
             conn, range_start, range_end, project=project, account_key=account_key)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
 
 def _harden_cache_sidecars() -> None:
@@ -5229,12 +5366,22 @@ def _cache_open_guarded() -> sqlite3.Connection:
                         f"cache.db maintenance is in progress ({marker})"
                     )
                 return conn
-            except Exception:
+            except Exception as exc:
                 if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                    if (
+                        isinstance(exc, sqlite3.DatabaseError)
+                        and _cctally_db_sib._is_sqlite_corruption_error(exc)
+                    ):
+                        # Keep the triggering handle alive until recovery owns
+                        # marker + maintenance-EX. Closing it here would run
+                        # SQLite's last-close checkpoint before that boundary.
+                        setattr(exc, "_cctally_cache_connection", conn)
+                        conn = None
+                    else:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
                 raise
             finally:
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -5245,34 +5392,203 @@ def _cache_open_guarded() -> sqlite3.Connection:
         lock_fh.close()
 
 
-def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
+def _set_cache_no_checkpoint_on_close(
+    conn: sqlite3.Connection, disabled: bool,
+) -> None:
+    """Set SQLite's per-connection checkpoint-on-close policy.
+
+    Python 3.12 added ``Connection.setconfig``. cctally still supports 3.11,
+    so CPython 3.11 reaches the same SQLite API through its supported-version
+    ``pysqlite_Connection`` layout and the stdlib extension's linked SQLite
+    symbol. This helper is reached only after a classified cache failure;
+    ordinary opens never depend on the implementation-specific adapter.
+    """
+    option = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
+    setconfig = getattr(conn, "setconfig", None)
+    if option is not None and setconfig is not None:
+        setconfig(option, bool(disabled))
+        return
+
+    _set_cache_no_checkpoint_on_close_cpython(conn, disabled)
+
+
+def _set_cache_no_checkpoint_on_close_cpython(
+    conn: sqlite3.Connection, disabled: bool,
+) -> None:
+    """Python 3.11 compatibility adapter for sqlite3_db_config()."""
+    if sys.implementation.name != "cpython":
+        raise sqlite3.NotSupportedError(
+            "cache recovery requires SQLite no-checkpoint-on-close support"
+        )
+
+    # CPython 3.11's public sqlite3 module does not expose db_config(), but its
+    # connection layout begins with PyObject_HEAD followed by ``sqlite3 *db``.
+    # The layout and audit-visible handle are defined by Modules/_sqlite in
+    # every supported CPython release. Load sqlite3_db_config from the same
+    # extension dependency so we never bind a different SQLite instance.
+    import _sqlite3
+    import ctypes
+
+    sqlite_lib = ctypes.CDLL(_sqlite3.__file__)
+    db_config = sqlite_lib.sqlite3_db_config
+    db_config.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    db_config.restype = ctypes.c_int
+    pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    db_pointer = ctypes.c_void_p.from_address(
+        id(conn) + (2 * pointer_size)
+    ).value
+    if not db_pointer:
+        raise sqlite3.NotSupportedError(
+            "cache recovery could not resolve the SQLite connection handle"
+        )
+    current = ctypes.c_int()
+    rc = db_config(
+        ctypes.c_void_p(db_pointer),
+        1006,  # SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
+        ctypes.c_int(1 if disabled else 0),
+        ctypes.byref(current),
+    )
+    if rc != sqlite3.SQLITE_OK or current.value != int(bool(disabled)):
+        raise sqlite3.NotSupportedError(
+            "cache recovery could not configure SQLite close checkpointing"
+        )
+
+
+@dataclass(frozen=True)
+class _CacheShmSnapshot:
+    existed: bool
+    data: bytes
+
+
+def _capture_cache_shm_snapshot(db_path: pathlib.Path) -> _CacheShmSnapshot:
+    shm = pathlib.Path(f"{db_path}-shm")
+    try:
+        return _CacheShmSnapshot(existed=True, data=shm.read_bytes())
+    except FileNotFoundError:
+        return _CacheShmSnapshot(existed=False, data=b"")
+
+
+def _restore_cache_shm_snapshot(
+    db_path: pathlib.Path, snapshot: _CacheShmSnapshot,
+) -> None:
+    """Undo read-mark changes made by the locked read-only probe.
+
+    The WAL index is transient, but Task A's preservation contract is stronger:
+    a declined heal retains all three family members byte-for-byte. With every
+    SQLite handle drained under maintenance-exclusive, restoring the exact
+    pre-probe SHM bytes is safe and preserves its inode when it already existed.
+    """
+    shm = pathlib.Path(f"{db_path}-shm")
+    if not snapshot.existed:
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    with shm.open("r+b") as fh:
+        fh.seek(0)
+        fh.write(snapshot.data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _close_cache_trigger_connection(
+    conn: sqlite3.Connection, db_path: pathlib.Path,
+) -> None:
+    """Drain the triggering handle without a last-close checkpoint.
+
+    Modern Python and CPython 3.11 use SQLite's native db_config option. An
+    alternate Python 3.11 implementation falls back to a short-lived read-only
+    keeper: with another connection present, closing the trigger is not the
+    last read/write close. The keeper may update transient SHM read marks, so
+    their exact pre-keeper bytes are restored while maintenance-EX excludes
+    every other cache opener.
+    """
+    try:
+        _set_cache_no_checkpoint_on_close(conn, True)
+    except sqlite3.NotSupportedError:
+        snapshot = _capture_cache_shm_snapshot(db_path)
+        keeper = None
+        try:
+            keeper = sqlite3.connect(
+                db_path.resolve().as_uri() + "?mode=ro", uri=True,
+            )
+            keeper.execute("PRAGMA schema_version").fetchone()
+            conn.close()
+        finally:
+            if keeper is not None:
+                keeper.close()
+        _restore_cache_shm_snapshot(db_path, snapshot)
+    else:
+        conn.close()
+
+
+def _close_cache_trigger_connection_best_effort(
+    conn: sqlite3.Connection,
+) -> None:
+    """Close an unclaimed trigger handle without enabling destructive recovery."""
+    try:
+        _set_cache_no_checkpoint_on_close(conn, True)
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _recover_corrupt_cache(
+    exc: sqlite3.DatabaseError,
+    *,
+    origin: str,
+    active_conn: sqlite3.Connection | None = None,
+) -> bool:
     """Quarantine a corrupt cache family only after every reader has drained.
 
-    Returns True after a safe quarantine, so the caller may create a fresh
-    re-derivable cache. Raises a guided DatabaseError when recovery cannot prove
-    exclusivity; callers then use their established direct-JSONL fallback.
+    Returns True only after a locked forensics probe confirms corruption and
+    whole-family quarantine completes, so the caller may create a fresh
+    re-derivable cache. An unconfirmed trigger returns False after preserving
+    the family and emitting its incident path; the caller then propagates the
+    original exception through its established direct-JSONL/error fallback.
+    Raises a guided DatabaseError when recovery cannot prove exclusivity.
     """
     if not _cctally_db_sib._is_sqlite_corruption_error(exc):
         return False
+    if not origin.strip():
+        raise ValueError("cache recovery origin must be non-empty")
 
     path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
     try:
         claim, reason = _cctally_db_sib._claim_repair_marker(path)
     except OSError as marker_exc:
+        if active_conn is not None:
+            _close_cache_trigger_connection_best_effort(active_conn)
         raise sqlite3.DatabaseError(
             f"cache.db recovery could not claim maintenance: {marker_exc}"
         ) from exc
     if claim is None:
+        if active_conn is not None:
+            _close_cache_trigger_connection_best_effort(active_conn)
         raise sqlite3.DatabaseError(
             f"cache.db maintenance is in progress: {reason}"
         ) from exc
     _cache_storm_test_pause("cache_repair_claimed")
 
     lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fh = open(lock_path, "a+")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, "a+")
+    except OSError:
+        if active_conn is not None:
+            _close_cache_trigger_connection_best_effort(active_conn)
+        _cctally_db_sib._release_repair_marker(path, claim)
+        raise
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        if active_conn is not None:
+            _close_cache_trigger_connection(active_conn, path)
+            active_conn = None
         open_pids = _cctally_db_sib._db_family_open_pids(path)
         if open_pids is None:
             raise sqlite3.DatabaseError(
@@ -5286,8 +5602,54 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
                 + "; leaving the live family untouched"
             ) from exc
 
-        _cctally_db_sib.write_corruption_forensics(path, db_label="cache")
+        # Capture only after marker + maintenance-EX + handle drain. A writer
+        # that completed before the marker is legitimate current state; taking
+        # this snapshot earlier and restoring it after the probe would overwrite
+        # that writer's newer WAL index.
+        shm_snapshot = _capture_cache_shm_snapshot(path)
+        try:
+            forensics = _cctally_db_sib.write_corruption_forensics(
+                path,
+                db_label="cache",
+                trigger_origin=origin,
+                trigger_exception=exc,
+                return_result=True,
+            )
+        except Exception as forensics_exc:
+            if shm_snapshot is not None:
+                _restore_cache_shm_snapshot(path, shm_snapshot)
+            eprint(
+                "[cache] destructive recovery declined for classified trigger "
+                f"at {origin}: forensics was unavailable "
+                f"({forensics_exc}; forensics: unavailable); leaving the "
+                "cache.db file family untouched"
+            )
+            return False
+        assert isinstance(
+            forensics, _cctally_db_sib.CorruptionForensicsResult,
+        )
+        if shm_snapshot is not None:
+            try:
+                _restore_cache_shm_snapshot(path, shm_snapshot)
+            except OSError as restore_exc:
+                raise sqlite3.DatabaseError(
+                    "cache.db recovery could not restore the exact pre-probe "
+                    f"WAL-index bytes: {restore_exc}"
+                ) from exc
         _cache_storm_test_pause("cache_repair_forensics")
+        if (
+            forensics.disposition
+            is not _cctally_db_sib.CorruptionProbeDisposition.CONFIRMED
+            or forensics.path is None
+        ):
+            bundle = str(forensics.path) if forensics.path is not None else "unavailable"
+            eprint(
+                "[cache] destructive recovery declined for classified trigger "
+                f"at {origin}: corruption was not confirmed "
+                f"({forensics.reason}; forensics: {bundle}); leaving the "
+                "cache.db file family untouched"
+            )
+            return False
         try:
             incident = _cctally_db_sib.quarantine_db_family(path, strict=True)
         except OSError as quarantine_exc:
@@ -5302,6 +5664,8 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
         )
         return True
     finally:
+        if active_conn is not None:
+            _close_cache_trigger_connection_best_effort(active_conn)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         finally:
@@ -5312,32 +5676,45 @@ def _recover_corrupt_cache(exc: sqlite3.DatabaseError) -> bool:
 def _run_cache_operation_with_recovery(
     conn: sqlite3.Connection,
     operation: Callable[[sqlite3.Connection], Any],
+    *,
+    origin: str,
 ) -> "tuple[Any, sqlite3.Connection]":
-    results, replacement = _run_cache_plan_with_recovery(conn, (operation,))
+    results, replacement = _run_cache_plan_with_recovery(
+        conn, (operation,), origins=(origin,),
+    )
     return results[0], replacement
 
 
 def _run_cache_plan_with_recovery(
     conn: sqlite3.Connection,
     operations: "tuple[Callable[[sqlite3.Connection], Any], ...]",
+    *,
+    origins: "tuple[str, ...]",
 ) -> "tuple[tuple[Any, ...], sqlite3.Connection]":
     """Run a provider plan, recovering once and restarting from its first leg.
 
-    The connection that observed corruption is closed before the destructive
-    maintenance handshake. Because cache.db is one shared physical family, a
+    The connection that observed corruption is drained only after the repair
+    marker and maintenance-exclusive lock exclude new openers. Because cache.db
+    is one shared physical family, a
     recovery in a later provider leg invalidates every earlier result; the
     complete requested plan therefore restarts against the replacement family.
     A second classified failure closes the replacement and propagates without a
     second quarantine attempt.
     """
+    if len(operations) != len(origins):
+        raise ValueError("cache recovery origins must match operation count")
+    if any(not origin.strip() for origin in origins):
+        raise ValueError("cache recovery origins must be non-empty")
     if not operations:
         return (), conn
     active = conn
     recovered = False
     while True:
         try:
-            results = tuple(operation(active) for operation in operations)
-            return results, active
+            results: list[Any] = []
+            for operation, origin in zip(operations, origins):
+                results.append(operation(active))
+            return tuple(results), active
         except sqlite3.DatabaseError as exc:
             if (
                 recovered
@@ -5345,8 +5722,9 @@ def _run_cache_plan_with_recovery(
             ):
                 active.close()
                 raise
-            active.close()
-            if not _recover_corrupt_cache(exc):
+            if not _recover_corrupt_cache(
+                exc, origin=origin, active_conn=active,
+            ):
                 raise
             active = open_cache_db()
             _cache_storm_test_pause("cache_repair_recreated")
@@ -5378,7 +5756,13 @@ def open_cache_db() -> sqlite3.Connection:
     try:
         conn = _cache_open_guarded()
     except sqlite3.DatabaseError as exc:
-        if not _recover_corrupt_cache(exc):
+        if not _recover_corrupt_cache(
+            exc,
+            origin="cache.open",
+            active_conn=getattr(
+                exc, "_cctally_cache_connection", None,
+            ),
+        ):
             raise
         # One retry only. A second failure surfaces to the existing direct-JSONL
         # fallback instead of looping through destructive recovery.
@@ -5405,6 +5789,9 @@ def open_cache_db() -> sqlite3.Connection:
         # only. Persistent/schema PRAGMAs and every DDL/DML migration path are
         # reserved for the globally serialized branch below.
         _cctally_store.apply_connection_policy(conn, "cache")
+        _cctally_db_sib._reconcile_durable_applied_migration_errors(
+            conn, _CACHE_MIGRATIONS, "cache.db",
+        )
         return conn
 
     from _lib_cache_writer_lock import (
@@ -5823,12 +6210,23 @@ def _prepare_claude_conversation_maintenance(
     _consume_file_touches(conn)
 
 
+def _report_conversation_progress(
+    progress: "Callable[[str, Any], None] | None",
+    phase: str,
+    stats: "IngestStats | CodexIngestStats",
+) -> None:
+    """Emit one optional #395 transcript-rebuild phase observation."""
+    if progress is not None:
+        progress(phase, stats)
+
+
 def sync_claude_conversations(
     conn: sqlite3.Connection,
     *,
     rebuild: bool = False,
     lock_timeout: "float | None" = None,
     only_paths: "set[str] | None" = None,
+    progress: "Callable[[str, IngestStats], None] | None" = None,
 ) -> IngestStats:
     """Delta-sync Claude transcript/search rows into conversations.db (#320).
 
@@ -5842,6 +6240,7 @@ def sync_claude_conversations(
     _cctally_core.CONVERSATIONS_LOCK_PATH.touch()
     lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_PATH, "w")
     try:
+        _report_conversation_progress(progress, "lock", stats)
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             stats.lock_contended = True
             return stats
@@ -5863,7 +6262,17 @@ def sync_claude_conversations(
                 stats.deferred_reason = "pending_global_flags"
                 return stats
         rebuild = rebuild or pending_rebuild
+        if rebuild:
+            # Commit the retry marker before the destructive clear. A killed
+            # #395 worker therefore leaves a partial transcript store visibly
+            # pending instead of advancing it to a false-complete state.
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("conversation_rebuild_claude_pending", "1"),
+            )
+            conn.commit()
 
+        _report_conversation_progress(progress, "prepare", stats)
         _prepare_claude_conversation_maintenance(
             conn, rebuild=rebuild, targeted=targeted
         )
@@ -5886,6 +6295,7 @@ def sync_claude_conversations(
             else list(_iter_claude_jsonl_files())
         )
         stats.files_total = len(paths)
+        _report_conversation_progress(progress, "ingest", stats)
         existing = {
             row[0]: (row[1], row[2], row[3])
             for row in conn.execute(
@@ -5919,11 +6329,13 @@ def sync_claude_conversations(
                 st = jp.stat()
             except OSError:
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
             size, mtime_ns = st.st_size, st.st_mtime_ns
             prev = existing.get(path_str)
             if prev is not None and size == prev[0]:
                 stats.files_skipped_unchanged += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
             truncated = prev is not None and size < prev[0]
             if targeted and truncated:
@@ -5951,6 +6363,7 @@ def sync_claude_conversations(
             except OSError as exc:
                 eprint(f"[conversations] could not read {jp}: {exc}")
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
 
             try:
@@ -6004,11 +6417,14 @@ def sync_claude_conversations(
                 touched_sessions.update(
                     row[0] for row in conv_rows if row[0] is not None
                 )
+                _report_conversation_progress(progress, "ingest", stats)
             except sqlite3.DatabaseError as exc:
                 conn.rollback()
                 eprint(f"[conversations] db error on {jp}: {exc}")
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
 
+        _report_conversation_progress(progress, "rollup", stats)
         _arm_rollup_backfill_on_pricing_change(conn)
         if _conversation_sessions_backfill_pending(conn):
             _recompute_conversation_sessions(conn)
@@ -6026,6 +6442,7 @@ def sync_claude_conversations(
                 "WHERE key='conversation_rebuild_claude_pending'"
             )
             conn.commit()
+        _report_conversation_progress(progress, "checkpoint", stats)
         _harden_conversation_sidecars()
         _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
         did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
@@ -6036,7 +6453,9 @@ def sync_claude_conversations(
             pass
         lock_fh.close()
     if did_from_zero_replay:
+        _report_conversation_progress(progress, "retention", stats)
         _force_retention_prune_after_replay()
+    _report_conversation_progress(progress, "complete", stats)
     return stats
 
 
@@ -6053,6 +6472,7 @@ def sync_codex_conversations(
     rebuild: bool = False,
     lock_timeout: "float | None" = None,
     only_paths: "set[str] | None" = None,
+    progress: "Callable[[str, CodexIngestStats], None] | None" = None,
 ) -> CodexIngestStats:
     """Delta-sync Codex events/search rows into conversations.db (#320)."""
     stats = CodexIngestStats()
@@ -6061,6 +6481,7 @@ def sync_codex_conversations(
     _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
     lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
     try:
+        _report_conversation_progress(progress, "lock", stats)
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             stats.lock_contended = True
             return stats
@@ -6089,6 +6510,12 @@ def sync_codex_conversations(
             return stats
         rebuild = rebuild or pending_rebuild or contract_rebuild
         if rebuild:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+                ("conversation_rebuild_codex_pending", "1"),
+            )
+            conn.commit()
+            _report_conversation_progress(progress, "prepare", stats)
             _clear_codex_conversation_store(conn)
             conn.commit()
 
@@ -6102,6 +6529,7 @@ def sync_codex_conversations(
             else _discover_codex_files_with_roots()
         )
         stats.files_total = len(files)
+        _report_conversation_progress(progress, "ingest", stats)
         existing = {
             row[0]: tuple(row[1:])
             for row in conn.execute(
@@ -6163,11 +6591,13 @@ def sync_codex_conversations(
                 st = jp.stat()
             except OSError:
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
             size, mtime_ns = st.st_size, st.st_mtime_ns
             prev = existing.get(path_str)
             if prev is not None and size == prev[0] and prev[3] == discovered.source_root_key:
                 stats.files_skipped_unchanged += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
             reset_file = (
                 prev is not None
@@ -6250,6 +6680,7 @@ def sync_codex_conversations(
             except OSError as exc:
                 eprint(f"[codex-conversations] could not read {jp}: {exc}")
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
 
             try:
@@ -6267,6 +6698,7 @@ def sync_codex_conversations(
                     f"[codex-conversations] normalization failed for {jp}: {exc}"
                 )
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
                 continue
             affected_keys = {
                 row[0]
@@ -6356,11 +6788,14 @@ def sync_codex_conversations(
                 )
                 conn.commit()
                 stats.files_processed += 1
+                _report_conversation_progress(progress, "ingest", stats)
             except sqlite3.DatabaseError as exc:
                 conn.rollback()
                 eprint(f"[codex-conversations] db error on {jp}: {exc}")
                 stats.files_failed += 1
+                _report_conversation_progress(progress, "ingest", stats)
 
+        _report_conversation_progress(progress, "finalize", stats)
         if only_paths is None and stats.files_failed == 0:
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
@@ -6374,6 +6809,7 @@ def sync_codex_conversations(
                 "WHERE key='conversation_rebuild_codex_pending'"
             )
             conn.commit()
+        _report_conversation_progress(progress, "checkpoint", stats)
         _harden_conversation_sidecars()
         _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
         did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
@@ -6384,8 +6820,267 @@ def sync_codex_conversations(
             pass
         lock_fh.close()
     if did_from_zero_replay:
+        _report_conversation_progress(progress, "retention", stats)
         _force_retention_prune_after_replay()
+    _report_conversation_progress(progress, "complete", stats)
     return stats
+
+
+class _TranscriptRebuildOutcome(NamedTuple):
+    stats: "IngestStats | CodexIngestStats | None"
+    timed_out: bool
+    phase: str
+    error: "str | None"
+    elapsed_seconds: float
+
+
+def _write_transcript_worker_event(fd: int, payload: dict[str, Any]) -> None:
+    """Write one PIPE_BUF-sized JSON event from the isolated #395 worker."""
+    encoded = (
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8", errors="replace")
+    try:
+        os.write(fd, encoded)
+    except OSError:
+        pass
+
+
+def _test_transcript_stall_requested(provider: str, phase: str) -> bool:
+    """Pytest-only real-subprocess fault seam for #395 containment evidence."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return os.environ.get("CCTALLY_TEST_CACHE_SYNC_STALL_PHASE") == (
+        f"{provider}:{phase}"
+    )
+
+
+def _transcript_rebuild_timeout_seconds() -> float:
+    timeout = _TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raw = os.environ.get("CCTALLY_TEST_CACHE_SYNC_PHASE_TIMEOUT_SECONDS")
+        if raw is not None:
+            try:
+                timeout = float(raw)
+            except ValueError:
+                pass
+    return max(0.01, float(timeout))
+
+
+def _terminate_transcript_worker(pid: int) -> int:
+    """Bounded SIGTERM -> SIGKILL reap for one explicit rebuild worker."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + _TRANSCRIPT_REBUILD_KILL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return status
+        time.sleep(0.02)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    _done, status = os.waitpid(pid, 0)
+    return status
+
+
+def _run_transcript_rebuild_worker(
+    provider: str,
+    *,
+    lock_timeout: "float | None",
+) -> _TranscriptRebuildOutcome:
+    """Run one destructive transcript provider leg in a kill-safe child.
+
+    Core cache connections are already closed before this boundary. The child
+    owns its conversations.db connection and provider flock; SIGKILL therefore
+    lets SQLite roll back only the active transaction while preserving prior
+    per-file commits and the durable pending marker.
+    """
+    read_fd, write_fd = os.pipe()
+    started = time.monotonic()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+
+        def emit(payload: dict[str, Any]) -> None:
+            _write_transcript_worker_event(write_fd, payload)
+
+        def progress(phase: str, stats: Any) -> None:
+            emit({
+                "event": "progress",
+                "phase": phase,
+                "filesDone": (
+                    stats.files_processed
+                    + stats.files_skipped_unchanged
+                    + stats.files_failed
+                ),
+                "filesTotal": stats.files_total,
+            })
+            if _test_transcript_stall_requested(provider, phase):
+                while True:
+                    time.sleep(0.05)
+
+        conn = None
+        try:
+            emit({"event": "progress", "phase": "open", "filesDone": 0,
+                  "filesTotal": 0})
+            conn = open_conversations_db()
+            emit({"event": "progress", "phase": "sync-start", "filesDone": 0,
+                  "filesTotal": 0})
+            sync = (
+                sync_claude_conversations
+                if provider == "claude"
+                else sync_codex_conversations
+            )
+            stats = sync(
+                conn,
+                rebuild=True,
+                lock_timeout=lock_timeout,
+                progress=progress,
+            )
+            emit({"event": "progress", "phase": "close", "filesDone": 0,
+                  "filesTotal": 0})
+            conn.close()
+            conn = None
+            emit({
+                "event": "result",
+                "stats": asdict(stats),
+                "statsType": type(stats).__name__,
+            })
+        except BaseException as exc:  # child reports; parent owns CLI wording
+            emit({
+                "event": "error",
+                "errorType": type(exc).__name__,
+                "message": str(exc),
+            })
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            os.close(write_fd)
+            os._exit(0)
+
+    os.close(write_fd)
+    os.set_blocking(read_fd, False)
+    buffer = b""
+    last_phase = "spawn"
+    result_payload: "dict[str, Any] | None" = None
+    error_payload: "dict[str, Any] | None" = None
+    last_reported_done = -1
+    last_progress_at = started
+
+    def consume(chunk: bytes) -> None:
+        nonlocal buffer, last_phase, result_payload, error_payload
+        nonlocal last_reported_done, last_progress_at
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            kind = event.get("event")
+            if kind == "progress":
+                last_progress_at = time.monotonic()
+                phase = str(event.get("phase") or "unknown")
+                elapsed = time.monotonic() - started
+                if phase != last_phase:
+                    last_phase = phase
+                    eprint(
+                        f"[cache-sync] {provider} transcripts phase={phase} "
+                        f"(+{elapsed:.1f}s)"
+                    )
+                done = int(event.get("filesDone") or 0)
+                total = int(event.get("filesTotal") or 0)
+                if (
+                    phase == "ingest"
+                    and done != last_reported_done
+                    and (done > 0 and (done % 200 == 0 or done == total))
+                ):
+                    last_reported_done = done
+                    eprint(
+                        f"[cache-sync] {provider} transcripts: "
+                        f"{done}/{total} files (+{elapsed:.1f}s)"
+                    )
+            elif kind == "result":
+                result_payload = event
+            elif kind == "error":
+                error_payload = event
+
+    timeout = _transcript_rebuild_timeout_seconds()
+    status = None
+    timed_out = False
+    try:
+        while True:
+            ready, _writable, _exceptional = select.select(
+                [read_fd], [], [], 0.05
+            )
+            if ready:
+                try:
+                    chunk = os.read(read_fd, 65_536)
+                except BlockingIOError:
+                    chunk = b""
+                if chunk:
+                    consume(chunk)
+            done, child_status = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                status = child_status
+                break
+            if time.monotonic() - last_progress_at >= timeout:
+                timed_out = True
+                status = _terminate_transcript_worker(pid)
+                break
+    except BaseException:
+        _terminate_transcript_worker(pid)
+        raise
+    finally:
+        while True:
+            try:
+                chunk = os.read(read_fd, 65_536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            consume(chunk)
+        os.close(read_fd)
+
+    elapsed = time.monotonic() - started
+    if timed_out:
+        return _TranscriptRebuildOutcome(
+            None, True, last_phase, None, elapsed
+        )
+    if error_payload is not None:
+        message = str(error_payload.get("message") or "unknown error")
+        error_type = str(error_payload.get("errorType") or "Error")
+        return _TranscriptRebuildOutcome(
+            None, False, last_phase, f"{error_type}: {message}", elapsed
+        )
+    if status != 0 or result_payload is None:
+        return _TranscriptRebuildOutcome(
+            None,
+            False,
+            last_phase,
+            f"worker exited without a result (status={status})",
+            elapsed,
+        )
+    stats_type = result_payload.get("statsType")
+    stats_data = result_payload.get("stats")
+    if not isinstance(stats_data, dict):
+        return _TranscriptRebuildOutcome(
+            None, False, last_phase, "worker returned invalid stats", elapsed
+        )
+    stats = (
+        IngestStats(**stats_data)
+        if stats_type == "IngestStats"
+        else CodexIngestStats(**stats_data)
+    )
+    return _TranscriptRebuildOutcome(stats, False, last_phase, None, elapsed)
 
 
 # === Region 7: cmd_cache_sync (was bin/cctally:11563-11616) ===
@@ -6507,6 +7202,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     _p_root.__enter__()
 
     plan: list[Callable[[sqlite3.Connection], Any]] = []
+    plan_origins: list[str] = []
 
     if source in ("claude", "all"):
         def _sync_claude_leg(active_conn: sqlite3.Connection) -> IngestStats:
@@ -6519,6 +7215,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 )
 
         plan.append(_sync_claude_leg)
+        plan_origins.append("cache_sync.cli.claude")
 
     if source in ("codex", "all"):
         def _sync_codex_leg(
@@ -6533,9 +7230,12 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 )
 
         plan.append(_sync_codex_leg)
+        plan_origins.append("cache_sync.cli.codex")
 
     try:
-        plan_results, conn = _run_cache_plan_with_recovery(conn, tuple(plan))
+        plan_results, conn = _run_cache_plan_with_recovery(
+            conn, tuple(plan), origins=tuple(plan_origins),
+        )
     except (OSError, sqlite3.DatabaseError) as exc:
         eprint(f"[cache-sync] failed: {exc}")
         _p_root.__exit__(type(exc), exc, exc.__traceback__)
@@ -6600,53 +7300,116 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     # #320: transcript/search ingestion is a second physical database with its
     # own cursors and flocks. Run it only after the core providers have
     # committed so a slow/failed transcript pass can never roll back accounting
-    # or quota state.
-    try:
-        conversation_conn = open_conversations_db()
-    except (OSError, sqlite3.DatabaseError) as exc:
-        eprint(
-            f"[cache-sync] transcript store unavailable ({exc}); "
-            "core accounting/quota sync is complete"
-        )
-        _p_root.__exit__(None, None, None)
-        if _perf.enabled():
-            _perf.flush_stderr(_perf.current_root())
-        return 1 if args.rebuild else (1 if contended else 0)
-    try:
-        if source in ("claude", "all"):
-            conv_stats = sync_claude_conversations(
-                conversation_conn, rebuild=args.rebuild, lock_timeout=lt
+    # or quota state. #395 contains each explicit provider rebuild in its own
+    # process so a stuck SQLite/parser/normalization phase has a real finite
+    # boundary without unsafe thread cancellation.
+    if args.rebuild:
+        providers = [
+            provider
+            for provider in ("claude", "codex")
+            if source in (provider, "all")
+        ]
+        for provider in providers:
+            outcome = _run_transcript_rebuild_worker(
+                provider, lock_timeout=lt
             )
+            retry = (
+                "Re-run `cctally cache-sync "
+                f"--source {provider} --rebuild`."
+            )
+            if outcome.timed_out:
+                eprint(
+                    "[cache-sync] transcript rebuild timed out: "
+                    f"provider={provider} store=conversations.db "
+                    f"phase={outcome.phase} after "
+                    f"{_transcript_rebuild_timeout_seconds():.1f}s without "
+                    f"progress (+{outcome.elapsed_seconds:.1f}s total); "
+                    "core accounting/quota sync is complete; any partial "
+                    f"transcript state remains retry-safe and incomplete. {retry}"
+                )
+                _p_root.__exit__(None, None, None)
+                if _perf.enabled():
+                    _perf.flush_stderr(_perf.current_root())
+                return 1
+            if outcome.error is not None or outcome.stats is None:
+                eprint(
+                    "[cache-sync] transcript rebuild failed: "
+                    f"provider={provider} store=conversations.db "
+                    f"phase={outcome.phase} ({outcome.error}); "
+                    f"core accounting/quota sync is complete. {retry}"
+                )
+                _p_root.__exit__(None, None, None)
+                if _perf.enabled():
+                    _perf.flush_stderr(_perf.current_root())
+                return 1
+            conv_stats = outcome.stats
             if conv_stats.lock_contended:
                 eprint(
-                    "[cache-sync] transcript sync skipped (claude): "
-                    "another process holds the conversations lock"
+                    "[cache-sync] transcript rebuild incomplete: "
+                    f"provider={provider} store=conversations.db phase=lock "
+                    "(another process holds the conversations lock); "
+                    f"core accounting/quota sync is complete. {retry}"
                 )
-                contended = contended or bool(args.rebuild)
+                contended = True
+            elif conv_stats.files_failed:
+                eprint(
+                    "[cache-sync] transcript rebuild incomplete: "
+                    f"provider={provider} store=conversations.db phase=ingest "
+                    f"({conv_stats.files_failed} file(s) failed); "
+                    f"core accounting/quota sync is complete. {retry}"
+                )
+                contended = True
             else:
                 eprint(
-                    f"[cache-sync] claude transcripts done: "
+                    f"[cache-sync] {provider} transcripts done: "
                     f"{conv_stats.files_processed} processed, "
                     f"{conv_stats.files_skipped_unchanged} skipped"
                 )
-        if source in ("codex", "all"):
-            conv_stats = sync_codex_conversations(
-                conversation_conn, rebuild=args.rebuild, lock_timeout=lt
+    else:
+        try:
+            conversation_conn = open_conversations_db()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            eprint(
+                f"[cache-sync] transcript store unavailable ({exc}); "
+                "core accounting/quota sync is complete"
             )
-            if conv_stats.lock_contended:
-                eprint(
-                    "[cache-sync] transcript sync skipped (codex): "
-                    "another process holds the conversations lock"
+            _p_root.__exit__(None, None, None)
+            if _perf.enabled():
+                _perf.flush_stderr(_perf.current_root())
+            return 1 if contended else 0
+        try:
+            if source in ("claude", "all"):
+                conv_stats = sync_claude_conversations(
+                    conversation_conn, rebuild=False, lock_timeout=lt
                 )
-                contended = contended or bool(args.rebuild)
-            else:
-                eprint(
-                    f"[cache-sync] codex transcripts done: "
-                    f"{conv_stats.files_processed} processed, "
-                    f"{conv_stats.files_skipped_unchanged} skipped"
+                if conv_stats.lock_contended:
+                    eprint(
+                        "[cache-sync] transcript sync skipped (claude): "
+                        "another process holds the conversations lock"
+                    )
+                else:
+                    eprint(
+                        f"[cache-sync] claude transcripts done: "
+                        f"{conv_stats.files_processed} processed, "
+                        f"{conv_stats.files_skipped_unchanged} skipped"
+                    )
+            if source in ("codex", "all"):
+                conv_stats = sync_codex_conversations(
+                    conversation_conn, rebuild=False, lock_timeout=lt
                 )
-    finally:
-        conversation_conn.close()
+                if conv_stats.lock_contended:
+                    eprint(
+                        "[cache-sync] transcript sync skipped (codex): "
+                        "another process holds the conversations lock"
+                    )
+                else:
+                    eprint(
+                        f"[cache-sync] codex transcripts done: "
+                        f"{conv_stats.files_processed} processed, "
+                        f"{conv_stats.files_skipped_unchanged} skipped"
+                    )
+        finally:
+            conversation_conn.close()
 
     _p_root.__exit__(None, None, None)
     # #276 perf: when tracing is enabled, flush the completed "cache-sync"

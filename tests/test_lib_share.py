@@ -848,6 +848,26 @@ def test_render_md_notes_become_blockquotes():
     assert "> 5h reset crossed week" in out
 
 
+def test_notes_render_visibly_in_every_artifact_format():
+    base = _make_minimal_snapshot()
+    snap = _lib_share.ShareSnapshot(
+        **{
+            **base.__dict__,
+            "notes": (
+                "Codex current-week spend is based on stale provider-cycle evidence.",
+            ),
+        },
+    )
+    for format in ("md", "html", "svg"):
+        out = _lib_share.render(
+            snap, format=format, theme="light", branding=False,
+        )
+        assert (
+            "Codex current-week spend is based on stale provider-cycle evidence."
+            in out
+        )
+
+
 # --- Task 15: anonymization mapping ---
 
 

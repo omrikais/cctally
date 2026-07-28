@@ -25,13 +25,14 @@ host-local offset while boundaries are canonical UTC).
 from __future__ import annotations
 
 import datetime as dt
-import json
 import sqlite3
 import sys
 from dataclasses import replace
 
 from _cctally_core import make_week_ref, parse_iso_datetime
 from _cctally_quota import codex_quota_breakdown
+from _lib_accounts import UNATTRIBUTED
+from _lib_codex_pools import is_model_scoped_codex_quota
 from _lib_dashboard_sources import dashboard_resource_key
 from _lib_display_tz import _resolve_display_tz_obj, format_display_dt
 from _lib_json_envelope import _iso_z
@@ -479,22 +480,6 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
 # per-identity — the spec-faithful realization for the disambiguated index.
 
 
-def _is_model_scoped_codex_quota(logical_limit_key) -> bool:
-    """Whether an interpreted native identity is a per-model pool (outside the
-    account-level standard quota). Mirrors the source builder's check."""
-    if not isinstance(logical_limit_key, str):
-        return False
-    try:
-        payload = json.loads(logical_limit_key)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and isinstance(payload.get("modelPool"), str)
-        and bool(payload["modelPool"].strip())
-    )
-
-
 def _parse_utc(value) -> "dt.datetime | None":
     if not value:
         return None
@@ -520,7 +505,8 @@ class _CodexCycle:
 
     __slots__ = (
         "root", "limit", "slot", "window", "limit_id", "limit_name",
-        "start", "reset", "end", "current_percent", "members",
+        "account_key", "start", "reset", "end", "current_percent", "members",
+        "is_current",
     )
 
     def __init__(self, row):
@@ -528,6 +514,11 @@ class _CodexCycle:
         self.limit = row["logical_limit_key"]
         self.slot = row["observed_slot"]
         self.window = int(row["window_minutes"])
+        # #373 root cause 3: `account_key` participates in QuotaWindowIdentity
+        # equality by #341 design, so every identity this class is used to
+        # reconstruct — and every query against the account-stamped projection
+        # tables reached from it — must carry it.
+        self.account_key = row["account_key"]
         self.limit_id = row["limit_id"]
         self.limit_name = row["limit_name"]
         self.start = _parse_utc(row["nominal_start_at_utc"])
@@ -538,6 +529,7 @@ class _CodexCycle:
             None if cp is None or isinstance(cp, bool) else float(cp)
         )
         self.members = None
+        self.is_current = False
 
     @property
     def cluster_members(self) -> list:
@@ -608,8 +600,40 @@ def _canonical_identity_cycles(cycles: list) -> list:
     ]
 
 
-def _select_physical_cycles(cycles: list, *, preferred_identity=None) -> list:
-    """Select one full identity per physical reset boundary, then clip globally."""
+def _boundary_has_live_reset(boundary) -> bool:
+    """Whether a boundary object actually names a live cycle.
+
+    The §7.4 guard needs a REAL live boundary. The former future-reset proxy was
+    true for EVERY future-ending cycle, so arming the guard on a stub boundary
+    suppressed every clip and made a historic cycle whose nominal reset had not
+    yet passed render its full seven-day length. That is how one cycle key came
+    back as ``Jul 21–Jul 28`` from the detail while the index said
+    ``Jul 21–Jul 25`` (#373). With no live boundary the correct behaviour is to
+    select no current cycle and clip exactly as before.
+    """
+    return getattr(boundary, "resets_at", None) is not None
+
+
+def _select_physical_cycles(cycles: list, *, preferred_identity=None,
+                            current_boundary=None, now_utc=None) -> list:
+    """Select one full identity per physical reset boundary, then clip globally.
+
+    #373 §7.4: the cycle the LIVE baseline marks current is never clipped by a
+    successor — it ends at its own reset. Every other cycle clips exactly as
+    before, and no identity axis enters the clip (§6 Q3: cross-identity
+    clipping is what collapses the concurrent secondary/primary weekly windows
+    into one non-overlapping timeline).
+
+    ``current_boundary`` is a ``CodexCycleBoundary``.  Its reset can sit within
+    the jitter floor of more than one DISTINCT identity cluster, so proximity
+    is only the candidate filter.  ``_select_live_physical_cycle`` resolves one
+    physical cycle (preferring the boundary's selected full identity), and that
+    object supplies both the no-clip guard and rendered ``is_current`` fact.
+
+    Suppressing a clip can restore an entire ROW, not merely lengthen one: the
+    ``end > start`` filter below runs after clipping, so a live cycle whose
+    successor starts at the same instant would otherwise be dropped outright.
+    """
     identity_cycles = _canonical_identity_cycles(cycles)
     selected = [
         _choose_physical_cycle(cluster, preferred_identity=preferred_identity)
@@ -618,14 +642,23 @@ def _select_physical_cycles(cycles: list, *, preferred_identity=None) -> list:
         )
     ]
     selected.sort(key=lambda c: (c.start, c.reset, c.identity_parts))
+    live_boundary = (
+        current_boundary if _boundary_has_live_reset(current_boundary) else None
+    )
+    live_cycle = _select_live_physical_cycle(selected, live_boundary)
     for index, cyc in enumerate(selected):
+        cyc.is_current = cyc is live_cycle
+        if cyc.is_current:
+            cyc.end = cyc.reset
+            continue
         next_start = selected[index + 1].start if index + 1 < len(selected) else None
         cyc.end = min(cyc.reset, next_start) if next_start is not None else cyc.reset
     return [c for c in selected if c.end > c.start]
 
 
 def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
-                       preferred_identity=None) -> list:
+                       preferred_identity=None, current_boundary=None,
+                       now_utc=None) -> list:
     """Unbounded reset-defined 7-day cycles, one selected identity per boundary."""
     roots = tuple(sorted({r for r in root_keys if isinstance(r, str) and r}))
     if not roots:
@@ -634,8 +667,8 @@ def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
     orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
     rows = stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
-        "       window_minutes, limit_id, limit_name, resets_at_utc, "
-        "       nominal_start_at_utc, current_percent "
+        "       window_minutes, limit_id, limit_name, account_key, "
+        "       resets_at_utc, nominal_start_at_utc, current_percent "
         "FROM quota_window_blocks "
         "WHERE source='codex' AND window_minutes=10080 "
         f"{orphan_clause}"
@@ -646,14 +679,17 @@ def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
 
     cycles: list = []
     for row in rows:
-        if _is_model_scoped_codex_quota(row["logical_limit_key"]):
+        if is_model_scoped_codex_quota(row["logical_limit_key"], row["limit_name"]):
             continue
         cyc = _CodexCycle(row)
         if cyc.start is None or cyc.reset is None or cyc.reset <= cyc.start:
             continue
         cycles.append(cyc)
 
-    selected = _select_physical_cycles(cycles, preferred_identity=preferred_identity)
+    selected = _select_physical_cycles(
+        cycles, preferred_identity=preferred_identity,
+        current_boundary=current_boundary, now_utc=now_utc,
+    )
     selected.sort(key=lambda c: c.start, reverse=True)
     return selected
 
@@ -675,24 +711,53 @@ def _canonicalize_codex_cluster(members: list) -> "_CodexCycle":
     return rep
 
 
-def _codex_is_current(cyc, identity, now_utc) -> bool:
-    identity_reset = getattr(identity, "resets_at", None)
-    if identity_reset is not None:
-        try:
-            target = identity_reset.astimezone(UTC)
-        except (AttributeError, ValueError):
-            target = None
-        if target is not None:
-            # The live boundary's reset (``select_baseline``) need not be the
-            # cluster's max jittered reset, so match against ANY member within
-            # the jitter floor — distinct clusters are > floor apart, so only
-            # the live cluster can match.
-            return any(
-                abs((m.reset - target).total_seconds())
-                <= _mh.CODEX_CYCLE_JITTER_FLOOR_SECONDS
-                for m in cyc.cluster_members
-            )
-    return cyc.reset > now_utc
+def _select_live_physical_cycle(cycles: list, boundary):
+    """Resolve at most one physical cycle for the live boundary.
+
+    Jitter clustering is identity-local before the cross-identity physical
+    selection.  Two distinct clusters may therefore be more than one jitter
+    floor apart from each other while each remains within the floor of the
+    boundary reset.  Prefer the boundary's already-selected full quota
+    identity, then the closest member reset, with stable scalar tie-breakers.
+    """
+    if boundary is None:
+        return None
+    try:
+        target = boundary.resets_at.astimezone(UTC)
+    except (AttributeError, ValueError):
+        return None
+    candidates = [
+        cyc for cyc in cycles
+        if any(
+            abs((member.reset - target).total_seconds())
+            <= _mh.CODEX_CYCLE_JITTER_FLOOR_SECONDS
+            for member in cyc.cluster_members
+        )
+    ]
+    if not candidates:
+        return None
+    preferred_identity = getattr(boundary, "quota_identity", None)
+    preferred = [
+        cyc for cyc in candidates if _identity_matches_cycle(preferred_identity, cyc)
+    ]
+    pool = preferred or candidates
+
+    def _rank(cyc):
+        distance = min(
+            abs((member.reset - target).total_seconds())
+            for member in cyc.cluster_members
+        )
+        current_rank = (
+            float("inf") if cyc.current_percent is None else -cyc.current_percent
+        )
+        return (
+            distance,
+            current_rank,
+            cyc.reset,
+            cyc.identity_parts,
+        )
+
+    return min(pool, key=_rank)
 
 
 def _codex_milestone_count(stats_conn, cyc) -> tuple[int, str | None]:
@@ -702,29 +767,47 @@ def _codex_milestone_count(stats_conn, cyc) -> tuple[int, str | None]:
     row = stats_conn.execute(
         "SELECT COUNT(DISTINCT percent_threshold), MAX(captured_at_utc) "
         "FROM quota_percent_milestones "
-        "WHERE source='codex' AND source_root_key=? AND logical_limit_key=? "
+        "WHERE source='codex' AND source_root_key=? AND account_key=? "
+        "  AND logical_limit_key=? "
         "  AND observed_slot=? AND window_minutes=? "
         f"  AND unixepoch(resets_at_utc) IN ({placeholders}) AND orphaned_at IS NULL",
-        (cyc.root, cyc.limit, cyc.slot, cyc.window, *resets),
+        (cyc.root, cyc.account_key, cyc.limit, cyc.slot, cyc.window, *resets),
     ).fetchone()
     return int(row[0] or 0), row[1]
 
 
 def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
-    """Every retained 5h block on the selected root intersecting [start, end)."""
+    """Every retained 5h block on the selected root intersecting [start, end).
+
+    The account filter admits the cycle's own key OR the ``unattributed``
+    sentinel, and deliberately NOT strict equality. Unlike
+    ``_codex_milestone_count`` — whose block and milestone parameters both come
+    from one ``block.identity`` and so cannot disagree — this query spans
+    identities, selecting by root plus time range. The 300-minute windows are a
+    separate physical-window group from the weekly one and
+    ``adopt_unidentified_observations`` resolves attribution PER GROUP, so a
+    decorated install can legitimately carry the weekly window under a real
+    account while its 5h windows are still unattributed. Strict equality would
+    then match nothing and the cycle would render 0 blocks (#373).
+
+    The widening is one-directional on purpose: an unattributed CYCLE never
+    picks up another account's identified 5h rows, which would violate #341's
+    never-combine rule.
+    """
     orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
     return stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
-        "       window_minutes, limit_id, limit_name, resets_at_utc, "
-        "       nominal_start_at_utc, current_percent "
+        "       window_minutes, limit_id, limit_name, account_key, "
+        "       resets_at_utc, nominal_start_at_utc, current_percent "
         "FROM quota_window_blocks "
         "WHERE source='codex' AND window_minutes=300 "
         f"{orphan_clause}"
-        "AND source_root_key=? "
+        "AND source_root_key=? AND account_key IN (?,?) "
         "AND unixepoch(nominal_start_at_utc) < unixepoch(?) "
         "AND unixepoch(resets_at_utc) > unixepoch(?) "
         "ORDER BY unixepoch(nominal_start_at_utc) ASC",
-        (cyc.root, cyc.end.astimezone(UTC).isoformat(),
+        (cyc.root, cyc.account_key, UNATTRIBUTED,
+         cyc.end.astimezone(UTC).isoformat(),
          cyc.start.astimezone(UTC).isoformat()),
     ).fetchall()
 
@@ -755,7 +838,7 @@ def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False) -> lis
     return clusters
 
 
-def _codex_cycle_entry(stats_conn, cyc, identity, now_utc, tz) -> dict:
+def _codex_cycle_entry(stats_conn, cyc, tz) -> dict:
     milestone_count, max_captured = _codex_milestone_count(stats_conn, cyc)
     block_count = len(_codex_five_hour_clusters(stats_conn, cyc))
     key = cyc.key
@@ -765,7 +848,7 @@ def _codex_cycle_entry(stats_conn, cyc, identity, now_utc, tz) -> dict:
         "end_at_utc": _iso_z(cyc.end),
         "resets_at_utc": _iso_z(cyc.reset),
         "label": _codex_cycle_label(cyc, tz),
-        "is_current": _codex_is_current(cyc, identity, now_utc),
+        "is_current": bool(cyc.is_current),
         "milestone_count": milestone_count,
         "block_count": block_count,
         "detail_stamp": _mh.compute_detail_stamp(
@@ -793,8 +876,9 @@ def build_codex_cycle_index(stats_conn, *, identity, now_utc) -> list:
     cycles = _load_codex_cycles(
         stats_conn, getattr(identity, "source_root_keys", ()),
         preferred_identity=getattr(identity, "quota_identity", None),
+        current_boundary=identity, now_utc=now,
     )
-    return [_codex_cycle_entry(stats_conn, c, identity, now, tz) for c in cycles]
+    return [_codex_cycle_entry(stats_conn, c, tz) for c in cycles]
 
 
 def _shape_codex_milestone(row, *, key_parts, block_key) -> dict:
@@ -844,8 +928,8 @@ def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn)
         ident = QuotaWindowIdentity(
             source="codex", source_root_key=member.root,
             logical_limit_key=member.limit, observed_slot=member.slot,
-            window_minutes=member.window, limit_id=member.limit_id,
-            limit_name=member.limit_name,
+            window_minutes=member.window, account_key=member.account_key,
+            limit_id=member.limit_id, limit_name=member.limit_name,
         )
         breakdown = _codex_breakdown_rows(
             ident, member.reset, speed, cache_conn, stats_conn
@@ -917,6 +1001,7 @@ def build_codex_cycle_detail(
         cycles = _load_codex_cycles(
             stats_conn, getattr(identity, "source_root_keys", ()),
             preferred_identity=getattr(identity, "quota_identity", None),
+            current_boundary=identity, now_utc=now,
         )
     except sqlite3.Error:
         return (None, "projection_incoherent")
@@ -929,6 +1014,7 @@ def build_codex_cycle_detail(
                 stats_conn, getattr(identity, "source_root_keys", ()),
                 include_orphaned=True,
                 preferred_identity=getattr(identity, "quota_identity", None),
+                current_boundary=identity, now_utc=now,
             )
         except sqlite3.Error:
             return (None, "projection_incoherent")
@@ -945,7 +1031,7 @@ def build_codex_cycle_detail(
     if blocks is None:
         return (None, "projection_incoherent")
 
-    entry = _codex_cycle_entry(stats_conn, match, identity, now, tz)
+    entry = _codex_cycle_entry(stats_conn, match, tz)
     return {
         "source": "codex",
         "key": entry["key"],

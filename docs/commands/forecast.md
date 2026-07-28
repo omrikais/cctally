@@ -9,6 +9,10 @@ output from the same computation:
 - `--status-line`: a compact one-line segment sized for embedding in
   `~/.claude/statusline-command.sh`.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 ## When it helps
 
 Mid-week, glance at the status line; if the projection range creeps

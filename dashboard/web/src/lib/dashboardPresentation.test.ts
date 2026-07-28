@@ -144,6 +144,51 @@ describe('provider-neutral dashboard presentation adapters', () => {
     });
   });
 
+  it('degrades Forecast from quota freshness while provider freshness stays coherent', () => {
+    const env = cloneFixture();
+    env.sources!.codex.domain_freshness = {
+      hero: 'fresh',
+      quota: 'stale',
+      sessions: 'fresh',
+    };
+
+    expect(presentationForecastComposition(env, 'codex').sections[0]).toMatchObject({
+      source: 'codex',
+      status: 'degraded',
+      reason: 'Codex quota data is stale.',
+    });
+  });
+
+  it('keeps the accounting-backed Cache report available when Sessions is fresh', () => {
+    const env = cloneFixture();
+    env.sources!.codex.data!.cache_report = structuredClone(env.cache_report!);
+    env.sources!.codex.freshness = 'stale';
+    env.sources!.codex.domain_freshness = {
+      hero: 'stale',
+      quota: 'stale',
+      sessions: 'fresh',
+    };
+
+    expect(presentationCacheReportComposition(env, 'codex').sections[0]).toMatchObject({
+      source: 'codex',
+      status: 'available',
+      reason: null,
+    });
+  });
+
+  it('preserves provider-freshness fallback for legacy presentation entries', () => {
+    const env = cloneFixture();
+    env.sources!.codex.data!.cache_report = structuredClone(env.cache_report!);
+    env.sources!.codex.freshness = 'stale';
+    delete env.sources!.codex.domain_freshness;
+
+    expect(presentationCacheReportComposition(env, 'codex').sections[0]).toMatchObject({
+      source: 'codex',
+      status: 'degraded',
+      reason: 'Codex data is stale.',
+    });
+  });
+
   it('labels an empty provider-native Cache report without hiding the other provider', () => {
     const env = cloneFixture();
     const codexReport = structuredClone(env.cache_report!);

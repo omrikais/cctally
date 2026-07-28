@@ -127,6 +127,18 @@ def test_two_accounts_share_five_hour_window_key_two_blocks(ns):
                     account=key_b, five_hour_percent=25.0,
                     five_hour_resets_at=fh_resets), now_utc=FIXED)
     jr.run_stats_ingest(mode="authoritative")
+    # The first retained post-reset observation for each account closes that
+    # account's row independently, even though both share the same window key.
+    # No session cache is seeded here, so both complete child sets are empty.
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T13:05:00Z", weekly_percent=7.0,
+                    account=key_a, five_hour_percent=30.0,
+                    five_hour_resets_at=fh_resets), now_utc=FIXED)
+    jr.append_record(
+        _claude_obs(J, at="2026-01-04T13:06:00Z", weekly_percent=8.0,
+                    account=key_b, five_hour_percent=35.0,
+                    five_hour_resets_at=fh_resets), now_utc=FIXED)
+    jr.run_stats_ingest(mode="authoritative")
 
     conn = ns["open_db"]()
     try:
@@ -138,10 +150,22 @@ def test_two_accounts_share_five_hour_window_key_two_blocks(ns):
             f"five_hour_blocks row (got {count} — collapsed by "
             "ON CONFLICT(five_hour_window_key))")
         blocks = conn.execute(
-            "SELECT account_key, five_hour_window_key FROM five_hour_blocks "
+            "SELECT account_key, five_hour_window_key, is_closed, journal_id "
+            "FROM five_hour_blocks "
             "ORDER BY account_key"
         ).fetchall()
         window_keys = {r[1] for r in blocks}
+        assert all(r[2] == 1 for r in blocks)
+        assert {r[3] for r in blocks} == {
+            f"fhbc:{key_a}:{next(iter(window_keys))}",
+            f"fhbc:{key_b}:{next(iter(window_keys))}",
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_block_models"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_block_projects"
+        ).fetchone()[0] == 0
     finally:
         conn.close()
     assert len(window_keys) == 1, "both blocks share the one physical window key"

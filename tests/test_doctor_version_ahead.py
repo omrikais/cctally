@@ -1,7 +1,7 @@
 """doctor db.version_ahead check — pure kernel, no DB.
 
 DB journal redesign §7.1: stats.db is a DISPOSABLE index stamped at
-``STATS_INDEX_EPOCH`` (1000), NOT a versioned migration target. So the
+``STATS_INDEX_EPOCH`` (supplied explicitly below), NOT a migration target. So the
 version leg classifies stats.db by the EPOCH model, not "ahead of the
 registry head":
 
@@ -30,7 +30,10 @@ from conftest import load_script
 sys.path.insert(0, str(pathlib.Path(load_script()["__file__"]).resolve().parent))
 
 
-def _check(stats_uv, stats_rs, cache_uv, cache_rs, *, stats_epoch=1000):
+def _check(
+    stats_uv, stats_rs, cache_uv, cache_rs, *,
+    stats_epoch=1000, journal_present=True, journal_has_bytes=True,
+):
     import _lib_doctor
     from dataclasses import fields
 
@@ -40,6 +43,8 @@ def _check(stats_uv, stats_rs, cache_uv, cache_rs, *, stats_epoch=1000):
         "epoch": stats_epoch,
     }
     kwargs["cache_db_status"] = {"user_version": cache_uv, "registry_size": cache_rs}
+    kwargs["journal_present"] = journal_present
+    kwargs["journal_has_bytes"] = journal_has_bytes
     s = _lib_doctor.DoctorState(**kwargs)
     return _lib_doctor._check_db_version_ahead(s)
 
@@ -70,6 +75,36 @@ def test_stats_epoch_mismatch_warns_and_points_at_rebuild():
     assert "db rebuild --db stats" in (r.remediation or "")
     assert "db recover --db stats" not in (r.remediation or "")
     assert r.details["stats.db"]["mismatch"] is True
+
+
+def test_stats_epoch_mismatch_without_journal_reports_hard_error():
+    r = _check(
+        99, 13, 2, 2,
+        journal_present=False,
+        journal_has_bytes=False,
+    )
+
+    assert r.severity == "warn"
+    assert "no journal" in r.summary
+    assert "rebuilds from journal" not in r.summary
+    assert "Auto-heals" not in (r.remediation or "")
+    assert "restore" in (r.remediation or "").lower()
+    assert r.details["stats.db"]["journal_present"] is False
+    assert r.details["stats.db"]["journal_has_bytes"] is False
+
+
+def test_stats_epoch_mismatch_with_empty_journal_reports_hard_error():
+    r = _check(
+        99, 13, 2, 2,
+        journal_present=True,
+        journal_has_bytes=False,
+    )
+
+    assert r.severity == "warn"
+    assert "no journal data" in r.summary
+    assert "rebuilds from journal" not in r.summary
+    assert r.details["stats.db"]["journal_present"] is True
+    assert r.details["stats.db"]["journal_has_bytes"] is False
 
 
 def test_cache_ahead_warn():

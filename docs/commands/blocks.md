@@ -2,6 +2,10 @@
 
 Claude usage grouped by 5-hour session block.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Canonical form: [`cctally claude blocks`](claude.md) (this flat form remains as an alias).
 
 > **Which 5h command?** `blocks` (this page) is the ccusage-compatible per-window view (includes `~`-prefixed heuristic rows when no recorded reset covers a window); [`five-hour-blocks`](five-hour-blocks.md) is the API-anchored analytics view with model/project rollups and 7d drift; [`five-hour-breakdown`](five-hour-breakdown.md) drills into per-percent milestones inside one block.

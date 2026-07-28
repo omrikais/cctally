@@ -1086,8 +1086,12 @@ class TestVersionCheckPipeline:
         assert state["check_error"] is None
         assert state["source"] == "github-formula"
         assert "checked_at_utc" in state
-        # latest_version_url is the public-repo release tag URL.
-        assert state["latest_version_url"].endswith("/releases/tag/v1.7.2")
+        # The stable update surface lands on the exact target GitHub Release.
+        # Promotion may widen that release's mutable body to the stable span,
+        # but the updater's target/tag URL semantics stay unchanged (#403).
+        assert state["latest_version_url"] == (
+            "https://github.com/omrikais/cctally/releases/tag/v1.7.2"
+        )
 
     def test_do_update_check_preserves_last_known_good_on_network_error(
         self, ns, update_paths, tmp_path, monkeypatch
@@ -1277,8 +1281,12 @@ class TestBetaChannelCheck:
         self, ns, update_paths, tmp_path, monkeypatch
     ):
         marker = update_paths / "update-check.last-fetch"
+        marker.touch()
+        os.utime(marker, ns=(1_600_000_000_000_000_000,) * 2)
+        old_marker_mtime_ns = marker.stat().st_mtime_ns
 
         def _boom():
+            assert marker.stat().st_mtime_ns > old_marker_mtime_ns
             raise ns["UpdateCheckNetworkError"]("beta leg 503")
 
         state = self._drive_npm_check(
@@ -1294,10 +1302,12 @@ class TestBetaChannelCheck:
         # Whole resolution failed → last-known-good preserved.
         assert state["latest_version"] == "1.6.0"
         assert state["check_status"] == "fetch_failed"
-        # Marker still touched FIRST (crash safety / no retry storm).
-        assert marker.exists()
         # Attempted channel recorded even though the fetch failed.
         assert state["last_attempt_channel"] == "beta"
+        # The freshly advanced marker and matching attempted channel prevent
+        # an immediate retry through the normal TTL gate.
+        config = {"update": {"channel": "beta", "check": {"ttl_hours": 24}}}
+        assert ns["_is_update_check_due"](config) is False
 
     def test_beta_leg_non_semver_preserves_prior(
         self, ns, update_paths, tmp_path, monkeypatch
@@ -1443,6 +1453,160 @@ class TestBetaChannelInstallAndBanner:
         assert "up to date" in out.lower()
         assert "1.8.0" in out  # names the resolved target
 
+    def test_bare_beta_refreshes_before_target_selection_and_no_op(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        """Regression #342/#397: cached A must not suppress live B."""
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        cached = {
+            "_schema": 1,
+            "install": {"method": "npm"},
+            "current_version": "1.8.0",
+            "latest_version": "1.8.0",
+            "latest_version_channel": "beta",
+            "resolved_dist_tag": "beta",
+        }
+        monkeypatch.setitem(ns, "_load_update_state", lambda: dict(cached))
+        saves: list[dict] = []
+        monkeypatch.setitem(ns, "_save_update_state", lambda state: saves.append(state))
+        resolutions: list[str] = []
+
+        def resolve(channel):
+            resolutions.append(channel)
+            return ("1.9.0", "beta")
+
+        monkeypatch.setitem(ns, "_resolve_npm_channel_target", resolve)
+
+        rc = ns["_do_update_install"](
+            version=None, dry_run=True, output_json=False
+        )
+
+        assert rc == 0
+        assert resolutions == ["beta"]
+        assert saves == [], "dry-run must not persist refreshed state"
+        out = capsys.readouterr().out
+        assert "cctally@1.9.0" in out
+        assert "up to date" not in out.lower()
+        assert "cctally@1.8.0" not in out
+
+    def test_bare_beta_refresh_failure_uses_last_known_good_with_diagnostic(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        cached = {
+            "_schema": 1,
+            "install": {"method": "npm"},
+            "current_version": "1.7.0",
+            "latest_version": "1.8.0",
+            "latest_version_channel": "beta",
+            "resolved_dist_tag": "beta",
+            "checked_at_utc": "2026-07-20T00:00:00+00:00",
+        }
+        monkeypatch.setitem(ns, "_load_update_state", lambda: dict(cached))
+        saves: list[dict] = []
+        monkeypatch.setitem(ns, "_save_update_state", lambda state: saves.append(state))
+
+        def fail(_channel):
+            raise ns["UpdateCheckNetworkError"]("registry unavailable")
+
+        monkeypatch.setitem(ns, "_resolve_npm_channel_target", fail)
+
+        rc = ns["_do_update_install"](
+            version=None, dry_run=True, output_json=False
+        )
+
+        assert rc == 0
+        assert saves == [], "failed dry-run refresh must preserve cached bytes"
+        captured = capsys.readouterr()
+        assert "cctally@1.8.0" in captured.out
+        assert "could not refresh beta update target" in captured.err
+        assert "using cached 1.8.0" in captured.err
+        assert "--version X.Y.Z" in captured.err
+
+    def test_bare_beta_refresh_failure_persists_attempt_without_clobbering_lkg(
+        self, ns, update_paths, tmp_path, monkeypatch, capsys
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        original = {
+            "_schema": 1,
+            "install": {"method": "npm"},
+            "current_version": "1.8.0",
+            "latest_version": "1.8.0",
+            "latest_version_channel": "beta",
+            "resolved_dist_tag": "beta",
+            "checked_at_utc": "2026-07-20T00:00:00+00:00",
+            "check_status": "ok",
+        }
+        ns["UPDATE_STATE_PATH"].write_text(json.dumps(original))
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version", lambda: ("1.8.0",)
+        )
+
+        def fail(_channel):
+            raise ns["UpdateCheckNetworkError"]("registry unavailable")
+
+        monkeypatch.setitem(ns, "_resolve_npm_channel_target", fail)
+        monkeypatch.setitem(
+            ns, "_acquire_update_lock",
+            lambda: (_ for _ in ()).throw(AssertionError("no-op must not lock")),
+        )
+
+        rc = ns["_do_update_install"](
+            version=None, dry_run=False, output_json=False
+        )
+
+        assert rc == 0
+        persisted = json.loads(ns["UPDATE_STATE_PATH"].read_text())
+        assert persisted["latest_version"] == "1.8.0"
+        assert persisted["latest_version_channel"] == "beta"
+        assert persisted["resolved_dist_tag"] == "beta"
+        assert persisted["last_attempt_channel"] == "beta"
+        assert persisted["check_status"] == "fetch_failed"
+        assert "registry unavailable" in persisted["check_error"]
+        captured = capsys.readouterr()
+        assert "using cached 1.8.0" in captured.err
+        assert "up to date" in captured.out.lower()
+
+    def test_bare_beta_refresh_failure_without_cached_target_fails_closed(
+        self, ns, update_paths, tmp_path, monkeypatch
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        monkeypatch.setitem(
+            ns,
+            "_load_update_state",
+            lambda: {
+                "_schema": 1,
+                "install": {"method": "npm"},
+                "current_version": "1.8.0",
+            },
+        )
+
+        def fail(_channel):
+            raise ns["UpdateCheckNetworkError"]("registry unavailable")
+
+        monkeypatch.setitem(ns, "_resolve_npm_channel_target", fail)
+
+        with pytest.raises(ns["UpdateError"], match="no cached target"):
+            ns["_do_update_install"](
+                version=None, dry_run=True, output_json=False
+            )
+
     def test_explicit_version_pin_overrides_downgrade_refusal(
         self, ns, update_paths, tmp_path, monkeypatch
     ):
@@ -1455,6 +1619,13 @@ class TestBetaChannelInstallAndBanner:
             ns, "_load_update_state",
             lambda: {"install": {"method": "npm"},
                      "current_version": "1.9.0", "latest_version": "1.8.0"},
+        )
+        monkeypatch.setitem(
+            ns,
+            "_resolve_npm_channel_target",
+            lambda _channel: (_ for _ in ()).throw(
+                AssertionError("explicit pin must not refresh the channel")
+            ),
         )
         # dry_run so no subprocess: a --version pin is the deliberate override.
         rc = ns["_do_update_install"](
@@ -1474,6 +1645,9 @@ class TestBetaChannelInstallAndBanner:
             ns, "_load_update_state",
             lambda: {"install": {"method": "npm"},
                      "current_version": "1.5.0", "latest_version": "1.9.0"},
+        )
+        monkeypatch.setitem(
+            ns, "_resolve_npm_channel_target", lambda _channel: ("1.9.0", "beta")
         )
         rc = ns["_do_update_install"](
             version=None, dry_run=True, output_json=False
@@ -2509,6 +2683,63 @@ class TestUpdateWorker:
             "teardown will race the stamp write"
         )
 
+    def test_unpinned_beta_refreshes_and_emits_truthful_target(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+
+        redirect_paths(ns, monkeypatch, tmp_path)
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(
+            ns, "load_config", lambda *a, **k: {"update": {"channel": "beta"}}
+        )
+        ns["UPDATE_STATE_PATH"].write_text(json.dumps({
+            "_schema": 1,
+            "install": {"method": "npm"},
+            "current_version": "1.8.0",
+            "latest_version": "1.8.0",
+            "latest_version_channel": "beta",
+            "resolved_dist_tag": "beta",
+        }))
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version", lambda: ("1.8.0",)
+        )
+        monkeypatch.setitem(
+            ns, "_resolve_npm_channel_target", lambda channel: ("1.9.0", "beta")
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 1)
+        monkeypatch.setitem(ns, "_release_update_lock", lambda _fd: None)
+        captured_commands: list[list[str]] = []
+
+        def capture(cmd, *, on_stdout, on_stderr, log_fd):
+            captured_commands.append(list(cmd))
+            return 1
+
+        monkeypatch.setitem(ns, "_run_streaming", capture)
+
+        worker = ns["UpdateWorker"]()
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=5.0)
+
+        assert captured_commands == [
+            ["npm", "install", "-g", "cctally@1.9.0"]
+        ]
+        target_events = [event for event in events if event["type"] == "target"]
+        assert target_events == [{
+            "type": "target",
+            "version": "1.9.0",
+            "command": "npm install -g cctally@1.9.0",
+        }]
+        persisted = json.loads(ns["UPDATE_STATE_PATH"].read_text())
+        assert persisted["latest_version"] == "1.9.0"
+        assert persisted["latest_version_channel"] == "beta"
+        assert persisted["resolved_dist_tag"] == "beta"
+
     def test_failure_emits_done_event_and_skips_execvp(
         self, tmp_path, monkeypatch
     ):
@@ -3107,6 +3338,31 @@ class TestUpdateAPI:
         finally:
             srv.shutdown()
             t.join(timeout=2)
+            srv.server_close()
+
+    def test_post_update_treats_client_cached_version_as_auto_target(
+        self, tmp_path, monkeypatch
+    ):
+        ns = load_script()
+        from conftest import redirect_paths
+        redirect_paths(ns, monkeypatch, tmp_path)
+        self._wire_handler(ns)
+        stub = self._install_stub_worker(ns, monkeypatch, busy=False)
+        srv, t, port = self._serve(ns)
+        try:
+            r = self._post(
+                "127.0.0.1", port, "/api/update",
+                body=json.dumps({"version": "1.8.0"}).encode(),
+                origin=f"127.0.0.1:{port}",
+                host_header=f"127.0.0.1:{port}",
+            )
+            assert r.status == 202
+            assert json.loads(r.read().decode("utf-8")) == {"run_id": "rid-new"}
+            assert stub.start_calls == [None]
+        finally:
+            srv.shutdown()
+            t.join(timeout=2)
+            srv.server_close()
 
     def test_post_update_409_when_busy(self, tmp_path, monkeypatch):
         ns = load_script()

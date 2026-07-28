@@ -111,7 +111,15 @@ def _open_with_full_schema(path: pathlib.Path) -> sqlite3.Connection:
             -- the projects-envelope current-week accumulator seeks its warm delta
             -- by `mutation_seq > ?`, so the fixture rows must carry it.
             mutation_seq        INTEGER NOT NULL DEFAULT 0,
-            mutation_min_ts     TEXT
+            mutation_min_ts     TEXT,
+            -- #195: the cache-write TTL split. NULLable, NO DEFAULT — NULL is
+            -- the "split unknown" sentinel. Mirrors production, where both
+            -- arrive via add_column_if_missing (so they are the LAST two
+            -- ordinals); these fixtures are read with a plain sqlite3.connect
+            -- that never applies the production schema, so they must be
+            -- declared here or every cost SELECT raises "no such column".
+            cache_create_1h_tokens INTEGER,
+            cache_create_5m_tokens INTEGER
         );
         CREATE INDEX idx_entries_timestamp
             ON session_entries(timestamp_utc);

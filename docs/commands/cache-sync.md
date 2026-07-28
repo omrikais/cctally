@@ -33,7 +33,7 @@ run. Use `cache-sync` when you want to:
 
 | Flag | Description |
 | --- | --- |
-| `--rebuild` | Drop all cached entries and re-ingest from scratch. Waits up to 30s for the cache lock and exits non-zero if it can't acquire it (see Notes). |
+| `--rebuild` | Drop all cached entries and re-ingest from scratch. Waits up to 30s for each provider lock; each transcript-provider phase has a 30-minute no-progress ceiling and exits non-zero if incomplete (see Notes). |
 | `--prune-orphans` | Remove cache rows for source files no longer on disk, without a full rebuild (Claude cache only). |
 | `--prune-conversations` | Prune conversation transcripts older than `conversation.retention_days` (default 90) right now, without a full rebuild. Reports the rows removed per provider. See `--prune-conversations` below. |
 | `--source {claude,codex,all}` | Which ingest half to sync/rebuild. Default `all`. |
@@ -72,16 +72,39 @@ cctally cache-sync --source claude
   store is unavailable, a routine sync reports that degradation but retains a
   successful core result; an explicit `--rebuild` exits non-zero because the
   requested full rebuild was incomplete.
+- Large histories can spend much longer rebuilding transcript/search rows than
+  compact accounting rows. Explicit rebuilds report the active transcript
+  provider and phase (`open`, `sync-start`, `lock`, `prepare`, `ingest`,
+  `rollup`/`finalize`, `checkpoint`, `retention`, `close`) with monotonic
+  elapsed time, plus file progress every 200 files.
+- Each explicit Claude or Codex transcript rebuild runs in its own process with
+  a 30-minute no-progress ceiling. Each phase transition or completed/skipped
+  source file refreshes that bound, so a large rebuild that is still advancing
+  is not stopped by an arbitrary total wall-clock limit. If a phase emits no
+  progress for 30 minutes, cctally terminates the worker, exits non-zero, and names
+  `provider=… store=conversations.db phase=…`. Already-committed core
+  accounting/quota rows remain intact. SQLite rolls back only the active
+  transcript transaction and previously committed transcript files remain
+  integrity-clean. If the clean full walk/finalization had not completed, its
+  durable provider rebuild marker also keeps the partial store retry-required.
+  In every phase, re-run the provider-specific command printed in the diagnostic.
 - Concurrent ingests are serialized by `fcntl.flock` on
   `cache.db.lock` / `cache.db.codex.lock` for accounting and
   `conversations.db.lock` / `conversations.db.codex.lock` for transcripts.
   Routine auto-syncs that lose the race read the existing store without blocking.
-- `--rebuild` is different: it waits up to 30 seconds for the cache lock, then exits non-zero if it still can't acquire it (for example while a dashboard is actively syncing), instead of silently doing nothing and reporting success. Re-run it once the other process releases the lock. `--prune-orphans` behaves the same way.
+- `--rebuild` is different: it waits up to 30 seconds for each cache or
+  transcript provider lock, then exits non-zero if it still can't acquire one
+  (for example while a dashboard is actively syncing), instead of silently
+  doing nothing and reporting success. Re-run it once the other process
+  releases the lock. `--prune-orphans` behaves the same way for the cache lock.
 - Corrupt-file recovery is classifier-gated: lock contention, permissions,
   disk-full errors, and SQL mistakes are never destructive recovery signals.
-  Recovery writes a forensics bundle first, quarantines the complete SQLite
-  family only after the maintenance lock and open-handle drain checks pass,
-  recreates the cache, and retries the requested provider plan once. If
+  Recovery writes a forensics bundle with the precise trigger origin, then
+  quarantines the complete SQLite family only after the maintenance lock and
+  open-handle drain checks pass **and** `integrity_check` confirms corruption.
+  An `ok`, unavailable, or unwritable probe preserves the family and propagates
+  the original failure. Confirmed recovery recreates the cache and retries the
+  requested provider plan once. If
   corruption occurs in the Codex leg of `--source all`, Claude is re-ingested
   again on the replacement family; a failed or contended provider walk remains
   non-zero.

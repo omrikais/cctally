@@ -4,7 +4,7 @@
 export type Verdict = 'ok' | 'cap' | 'capped';
 
 export interface SyncFailure {
-  kind: 'cache_corruption' | 'maintenance_active' | 'maintenance_stale' | 'server_sync';
+  kind: 'cache_corruption' | 'stats_corruption' | 'maintenance_active' | 'maintenance_stale' | 'server_sync';
   label: string;
   detail: string;
   action: string | null;
@@ -827,6 +827,10 @@ export type SourceName = 'claude' | 'codex';
 export type DashboardSelection = SourceName | 'all';
 export type SourceAvailability = 'ok' | 'empty' | 'partial' | 'unavailable';
 export type SourceFreshness = 'fresh' | 'stale';
+export type SourceFreshnessDomain = 'hero' | 'quota' | 'sessions';
+export type SourceDomainFreshness = Readonly<
+  Record<SourceFreshnessDomain, SourceFreshness>
+>;
 export type CapabilityStatus =
   | 'supported'
   | 'derived'
@@ -854,6 +858,10 @@ export interface SourceWarning {
 export interface SourceEntry<TData> {
   availability: SourceAvailability;
   freshness: SourceFreshness;
+  // Additive in #396. Older in-memory states/envelopes omit this map, so every
+  // consumer must resolve it through sourceDomainFreshness rather than reading
+  // the optional field directly.
+  domain_freshness?: SourceDomainFreshness;
   warnings: SourceWarning[];
   data_version: string;
   last_success_at: string | null;
@@ -913,6 +921,8 @@ export interface CodexQuotaSummary {
 export interface CodexQuotaHistoryRow {
   key: string;
   source: 'codex';
+  /** Present only on windows outside account-level standard quota (#373). */
+  model_scoped?: true;
   label: string;
   observed_slot: number;
   window_minutes: number | null;

@@ -28,6 +28,16 @@ def _reset_logger_state():
     root = logging.getLogger("cctally")
     for h in list(root.handlers):
         root.removeHandler(h)
+    # Logger objects are process-global. Restore the stdlib default so the
+    # next test cannot inherit _lib_log's non-propagating configuration.
+    root.propagate = True
+
+
+def test_logger_cleanup_restores_stdlib_propagation():
+    root = logging.getLogger("cctally")
+    root.propagate = False
+    _reset_logger_state()
+    assert root.propagate is True
 
 
 def test_env_truthy_matches_core_truthy_env(monkeypatch):

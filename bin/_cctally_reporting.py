@@ -376,64 +376,69 @@ def cmd_weekly(args: argparse.Namespace) -> int:
 
     conn = open_db()
 
-    # Build the subscription-week list spanning the range. Boundaries are
-    # anchored in `weekly_usage_snapshots` when available and otherwise
-    # extrapolated (see `_compute_subscription_weeks`). Pass the
-    # `--config`-honoring resolved config (issue #88) so the no-snapshot
-    # calendar-week fallback uses the explicit override's `week_start`.
-    weeks = c._compute_subscription_weeks(
-        conn, range_start, range_end, config=config,
-        account_key=acct_key,  # #341: None = merged (all-accounts) read
-    )
-
-    # Fetch entries and aggregate.
-    # Cover each SubWeek's full [start_ts, end_ts) on the range_start side —
-    # `_compute_subscription_weeks` can emit weeks whose start_ts precedes
-    # range_start (any week overlapping the range). Without widening, boundary
-    # weeks get tail-only cost divided by full-week usedPct → understated
-    # totalCost and $/1%. range_end stays as the upper bound so historical
-    # `--until <past>` queries still clip the tail week (paired with the
-    # as_of_utc bound on get_latest_usage_for_week below).
-    if weeks:
-        fetch_start = min(
-            range_start,
-            parse_iso_datetime(weeks[0].start_ts, "week_start_at"),
+    try:
+        # Build the subscription-week list spanning the range. Boundaries are
+        # anchored in `weekly_usage_snapshots` when available and otherwise
+        # extrapolated (see `_compute_subscription_weeks`). Pass the
+        # `--config`-honoring resolved config (issue #88) so the no-snapshot
+        # calendar-week fallback uses the explicit override's `week_start`.
+        weeks = c._compute_subscription_weeks(
+            conn, range_start, range_end, config=config,
+            account_key=acct_key,  # #341: None = merged (all-accounts) read
         )
-    else:
-        fetch_start = range_start
-    all_entries = c.get_entries(fetch_start, range_end, account_key=acct_key)
 
-    c._emit_debug_samples_if_set(
-        args, all_entries, command_label="weekly",
-    )
+        # Fetch entries and aggregate.
+        # Cover each SubWeek's full [start_ts, end_ts) on the range_start side —
+        # `_compute_subscription_weeks` can emit weeks whose start_ts precedes
+        # range_start (any week overlapping the range). Without widening,
+        # boundary weeks get tail-only cost divided by full-week usedPct →
+        # understated totalCost and $/1%. range_end stays as the upper bound so
+        # historical `--until <past>` queries still clip the tail week (paired
+        # with the as_of_utc bound on get_latest_usage_for_week below).
+        if weeks:
+            fetch_start = min(
+                range_start,
+                parse_iso_datetime(weeks[0].start_ts, "week_start_at"),
+            )
+        else:
+            fetch_start = range_start
+        all_entries = c.get_entries(
+            fetch_start, range_end, account_key=acct_key
+        )
 
-    # Bound the usage-snapshot lookup to `<= range_end` so historical
-    # `--until <past date>` queries pick the usage% that was current at
-    # the end of the requested window rather than the globally latest
-    # snapshot for the week. Cost is already truncated to `range_end` by
-    # `_aggregate_weekly`, so using a later usedPct would produce a
-    # silently wrong $/1%. Match the stored `captured_at_utc` format
-    # (see now_utc_iso): UTC, seconds precision, `Z` suffix — otherwise
-    # lexicographic string compare inside SQLite would misorder `+00:00`
-    # vs. `Z` at the same instant.
-    as_of_utc = (
-        range_end.astimezone(dt.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+        c._emit_debug_samples_if_set(
+            args, all_entries, command_label="weekly",
+        )
 
-    # Build the unified weekly view (spec §5.3): runs _aggregate_weekly,
-    # overlays weekly_usage_snapshots per WeekRef. view.aggregated is
-    # the BucketUsage tuple newest-first; view.overlay is the parallel
-    # (used_pct, dollar_per_pct) tuple. We reverse both for CLI's
-    # default asc rendering so the existing renderer's len-equality
-    # assertions stay aligned.
-    view = c.build_weekly_view(
-        conn, all_entries, weeks=weeks, now_utc=now_utc,
-        display_tz=args._resolved_tz, as_of_utc=as_of_utc, mode=args.mode,
-        account_key=acct_key,
-    )
+        # Bound the usage-snapshot lookup to `<= range_end` so historical
+        # `--until <past date>` queries pick the usage% that was current at
+        # the end of the requested window rather than the globally latest
+        # snapshot for the week. Cost is already truncated to `range_end` by
+        # `_aggregate_weekly`, so using a later usedPct would produce a
+        # silently wrong $/1%. Match the stored `captured_at_utc` format
+        # (see now_utc_iso): UTC, seconds precision, `Z` suffix — otherwise
+        # lexicographic string compare inside SQLite would misorder `+00:00`
+        # vs. `Z` at the same instant.
+        as_of_utc = (
+            range_end.astimezone(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        # Build the unified weekly view (spec §5.3): runs _aggregate_weekly,
+        # overlays weekly_usage_snapshots per WeekRef. view.aggregated is
+        # the BucketUsage tuple newest-first; view.overlay is the parallel
+        # (used_pct, dollar_per_pct) tuple. We reverse both for CLI's
+        # default asc rendering so the existing renderer's len-equality
+        # assertions stay aligned.
+        view = c.build_weekly_view(
+            conn, all_entries, weeks=weeks, now_utc=now_utc,
+            display_tz=args._resolved_tz, as_of_utc=as_of_utc, mode=args.mode,
+            account_key=acct_key,
+        )
+    finally:
+        conn.close()
     buckets = list(reversed(view.aggregated))
     overlay = list(reversed(view.overlay))
 

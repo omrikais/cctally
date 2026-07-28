@@ -46,6 +46,28 @@ def _jr():
     return _cctally_journal
 
 
+class _TrackedConnection(sqlite3.Connection):
+    closed = False
+
+    def close(self):
+        self.closed = True
+        super().close()
+
+
+def _track_connections(monkeypatch):
+    real_connect = sqlite3.connect
+    opened = []
+
+    def tracked_connect(*args, **kwargs):
+        kwargs.setdefault("factory", _TrackedConnection)
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    return opened
+
+
 # --- canonical logical dump (spec §10; ORDER BY natural key; drop rowid FKs) ---
 
 _DUMP_TABLES = (
@@ -303,7 +325,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1001  # #341 account-dimension bump (was 1000)
+    assert core.STATS_INDEX_EPOCH == 1004  # #410 applied-prefix cursor guard
     assert core.LEGACY_STATS_HEAD == 13
 
 
@@ -472,7 +494,11 @@ def _percent_breakdown_json(ns, capsys):
 
 
 def test_reader_output_byte_identical_pre_post_cutover(ns, capsys, monkeypatch):
+    import _cctally_percent_breakdown as pb
     import _cctally_store as st
+    # percent-breakdown calls now_utc_iso() directly, so CCTALLY_AS_OF does not
+    # reach its generatedAt field. Pin that clock seam across both renders.
+    monkeypatch.setattr(pb, "now_utc_iso", lambda: "2026-01-10T00:00:00Z")
     # A mutable toggle drives the epoch gate WITHOUT monkeypatch.undo() (which
     # would reset the redirect_paths patches back to the real prod dir — the
     # documented gotcha). BEFORE: gate OFF, so open_db reads the uv=13 fixture
@@ -564,6 +590,25 @@ def test_crash_before_rename_retries_clean(ns, monkeypatch):
         conn.close()
 
 
+def test_cutover_failure_closes_every_opened_connection(ns, monkeypatch):
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    opened = _track_connections(monkeypatch)
+    monkeypatch.setattr(
+        jr,
+        "_write_bootstrap_segment",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            RuntimeError("simulated bootstrap publication failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="bootstrap publication"):
+        core.open_db()
+
+    assert opened
+    assert all(conn.closed for conn in opened)
+
+
 def test_crash_after_rename_mid_txn_rolls_back_and_retries(ns, monkeypatch):
     _build_legacy_install(ns)
     core, jr = _core(), _jr()
@@ -646,6 +691,12 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
     live = core.open_db()  # cutover -> uv=1000, bootstrap exists
     before = _canonical_dump(live)
     live.close()
+    # A writer can create the next canonical segment before its first append.
+    # Replayable bytes in the older bootstrap still make the journal a valid
+    # rebuild source even though journal_high_water() ends at offset zero.
+    empty_latest = core.JOURNAL_DIR / "observations-9999-12.jsonl"
+    empty_latest.touch()
+    assert _jr().journal_high_water() == (empty_latest.name, 0)
     # bump to a FUTURE epoch (a newer binary touched it) — a mismatch on THIS
     # binary that must resolve by journal rebuild, NOT by corruption heal.
     conn = sqlite3.connect(core.DB_PATH)

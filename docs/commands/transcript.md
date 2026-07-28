@@ -6,6 +6,11 @@ Both subcommands read the conversation store (`~/.local/share/cctally/conversati
 
 Both sources are addressable. `export` takes either a Claude `sessionId` **or** an opaque `v1.` conversation key (Codex conversations are only addressable by their `v1.` key); `search` picks the provider with `--source {claude,codex}` (default `claude`). Absent qualification, the Claude behavior is byte-identical to before.
 
+> **Claude cost coverage:** Claude conversation cost metadata and search cost
+> filters are [transcript-derived lower
+> bounds](../claude-cost-coverage.md), not exact `/usage` billing totals.
+> Codex accounting is unaffected.
+
 The CLI exports one resolved conversation at a time. The dashboard's
 mixed-source comparison copy action composes two such whole exports as separate
 source-labelled Run A / Run B sections; it does not merge provider transcript

@@ -135,12 +135,14 @@ def _sum_cost_by_project(
             continue
         cost = c._calculate_entry_cost(
             entry.model,
-            {
-                "input_tokens": entry.input_tokens,
-                "output_tokens": entry.output_tokens,
-                "cache_creation_input_tokens": entry.cache_creation_tokens,
-                "cache_read_input_tokens": entry.cache_read_tokens,
-            },
+            c.claude_usage_dict(   # #195 chokepoint
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
+            ),
             mode=mode,
             cost_usd=entry.cost_usd,
         )
@@ -208,12 +210,14 @@ def _accumulate_entry_into_bucket(
     else:
         cost = c._calculate_entry_cost(
             entry.model,
-            {
-                "input_tokens": entry.input_tokens,
-                "output_tokens": entry.output_tokens,
-                "cache_creation_input_tokens": entry.cache_creation_tokens,
-                "cache_read_input_tokens": entry.cache_read_tokens,
-            },
+            c.claude_usage_dict(   # #195 chokepoint
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
+            ),
             mode="auto",
             cost_usd=entry.cost_usd,
         )
@@ -555,12 +559,14 @@ def cmd_project(args: argparse.Namespace) -> int:
 
         entry_cost = c._calculate_entry_cost(
             entry.model,
-            {
-                "input_tokens": entry.input_tokens,
-                "output_tokens": entry.output_tokens,
-                "cache_creation_input_tokens": entry.cache_creation_tokens,
-                "cache_read_input_tokens": entry.cache_read_tokens,
-            },
+            c.claude_usage_dict(   # #195 chokepoint
+                input_tokens=entry.input_tokens,
+                output_tokens=entry.output_tokens,
+                cache_creation_tokens=entry.cache_creation_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+                speed=getattr(entry, "speed", None),
+            ),
             mode="auto",
             cost_usd=entry.cost_usd,
         )

@@ -26,8 +26,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/42 applied
-  ⚠ Pending migrations       42 pending
+  ✓ Migrations               0/43 applied
+  ⚠ Pending migrations       43 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -38,6 +38,9 @@ Journal
   ✓ Journal integrity        no journal
   ✓ Journal index            no cursor yet
   ✓ Auto-heal                no auto-heal incidents
+  ✓ Stats writer guard       no unsanctioned stats.db writes recorded
+  ✓ Journal conflicts        not scanned
+  ✓ Journal protocol         not scanned
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -58,6 +61,7 @@ Pricing
   ✓ Coverage                 all observed models priced
 Safety
   ✓ Dashboard bind           config: loopback
+  ✓ Backup/sync              cctally data excluded from Time Machine
   ✓ config.json              absent or parses cleanly
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
@@ -66,4 +70,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 40 OK · 8 WARN · 0 FAIL
+Summary: 44 OK · 8 WARN · 0 FAIL

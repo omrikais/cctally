@@ -4,7 +4,13 @@
 // shells exist. This module therefore owns only the live source-state consumers:
 // warning selection for status/panel chrome and Sessions hydration/degradation.
 
-import type { SourceName, SourceWarning } from '../types/envelope';
+import type {
+  SourceEntry,
+  SourceFreshness,
+  SourceFreshnessDomain,
+  SourceName,
+  SourceWarning,
+} from '../types/envelope';
 import {
   isHydratingEntry,
   resolveSourceView,
@@ -70,6 +76,19 @@ function rec(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+// The one frontend compatibility seam for #396's additive map. Do not scatter
+// `?.[domain] ?? freshness` across consumers: older envelopes deterministically
+// inherit provider freshness for every domain.
+export function sourceDomainFreshness(
+  entry: SourceEntry<unknown>,
+  domain: SourceFreshnessDomain,
+): SourceFreshness {
+  const domainValue = entry.domain_freshness?.[domain];
+  return domainValue === 'fresh' || domainValue === 'stale'
+    ? domainValue
+    : entry.freshness;
+}
+
 function gatePhysicalSessions(view: SourceView, source: SourceName): PanelGate {
   const entry = view.entry;
 
@@ -103,7 +122,7 @@ function gatePhysicalSessions(view: SourceView, source: SourceName): PanelGate {
   }
 
   if (entry.availability === 'partial'
-      && (entry.freshness === 'stale' || warning != null)) {
+      && (sourceDomainFreshness(entry, 'sessions') === 'stale' || warning != null)) {
     return { mode: 'degraded', warning, noSuccessYet };
   }
   if (status !== 'supported' && status !== 'derived') {

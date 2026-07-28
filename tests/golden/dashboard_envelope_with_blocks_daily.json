@@ -163,6 +163,11 @@
       "capabilities": {},
       "data": null,
       "data_version": "",
+      "domain_freshness": {
+        "hero": "stale",
+        "quota": "stale",
+        "sessions": "stale"
+      },
       "freshness": "stale",
       "last_success_at": null,
       "warnings": [
@@ -178,6 +183,11 @@
       "capabilities": {},
       "data": null,
       "data_version": "",
+      "domain_freshness": {
+        "hero": "stale",
+        "quota": "stale",
+        "sessions": "stale"
+      },
       "freshness": "stale",
       "last_success_at": null,
       "warnings": [
@@ -193,6 +203,11 @@
       "capabilities": {},
       "data": null,
       "data_version": "",
+      "domain_freshness": {
+        "hero": "stale",
+        "quota": "stale",
+        "sessions": "stale"
+      },
       "freshness": "stale",
       "last_success_at": null,
       "warnings": [

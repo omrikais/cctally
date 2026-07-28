@@ -3,6 +3,10 @@
 Claude usage grouped by calendar month. Drop-in replacement for
 `ccusage monthly`, offline.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Canonical form: [`cctally claude monthly`](claude.md) (this flat form remains as an alias).
 
 ## Synopsis

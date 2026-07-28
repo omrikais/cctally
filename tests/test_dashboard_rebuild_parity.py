@@ -272,7 +272,14 @@ CREATE TABLE session_entries (
     -- watermark / signature leg read. `_ins_entry` stamps mutation_seq == id
     -- and advances the counter, so the seq path == the id path (pure inserts).
     mutation_seq        INTEGER NOT NULL DEFAULT 0,
-    mutation_min_ts     TEXT
+    mutation_min_ts     TEXT,
+    speed               TEXT,
+    -- #195: the cache-write TTL split (NULLable; NULL == split unknown).
+    -- Production adds both via add_column_if_missing, so they are the
+    -- LAST two ordinals; a hand-written mirror must declare them or a
+    -- cost SELECT raises "no such column: cache_create_1h_tokens".
+    cache_create_1h_tokens INTEGER,
+    cache_create_5m_tokens INTEGER
 );
 CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -2657,7 +2664,12 @@ def test_projects_env_reconstruction_picks_global_earliest_week_key():
         "output_tokens INTEGER, cache_create_tokens INTEGER, "
         "cache_read_tokens INTEGER, cost_usd_raw REAL, "
         # #270 §8: the accumulator reads MAX(mutation_seq) + seeks the seq index.
-        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT)"
+        "mutation_seq INTEGER NOT NULL DEFAULT 0, mutation_min_ts TEXT, "
+        "speed TEXT, "
+        # #195: NULLable split columns, last two ordinals (production adds
+        # them via add_column_if_missing); the projects cost SELECT reads
+        # cache_create_1h_tokens.
+        "cache_create_1h_tokens INTEGER, cache_create_5m_tokens INTEGER)"
     )
     conn.execute(
         "CREATE INDEX idx_entries_mutation_seq "

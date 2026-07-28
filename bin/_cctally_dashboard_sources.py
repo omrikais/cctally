@@ -49,7 +49,13 @@ from _lib_quota import (
     select_baseline,
     stale_after_seconds,
 )
-from _lib_jsonl import CodexEntry, codex_model_scoped_quota_pool
+from _lib_jsonl import CodexEntry
+from _lib_codex_pools import (
+    codex_history_is_model_scoped,
+    codex_model_scoped_quota_pool,
+    is_model_scoped_codex_quota,
+)
+from _lib_codex_conversation import _display_title as _codex_display_title
 from _lib_fmt import stable_sum
 from _lib_aggregators import _aggregate_codex_buckets
 from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
@@ -158,19 +164,22 @@ class CodexWeeklyPeriod:
     used_percent: float | None = None
 
 
-def _is_model_scoped_codex_quota(logical_limit_key: object) -> bool:
-    """Whether an interpreted native identity belongs outside standard quota."""
-    if not isinstance(logical_limit_key, str):
-        return False
-    try:
-        payload = json.loads(logical_limit_key)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and isinstance(payload.get("modelPool"), str)
-        and bool(payload["modelPool"].strip())
-    )
+def _codex_history_row_is_model_scoped(row: object) -> bool:
+    """Whether a SERIALIZED Codex quota history row sits outside account quota.
+
+    The single predicate both the initial build (``_quota_read_model``) and the
+    idle refresh (``refresh_codex_source_clock``) consult, so the two paths
+    cannot drift apart: the build stamps ``model_scoped`` from
+    ``codex_history_is_model_scoped`` and then asks THIS function about the row
+    it just built, and the refresh — which only ever sees the serialized row —
+    asks the same function. Fixing one path and not the other is exactly how
+    the quota summary and its idle refresh would disagree (#373 spec §7.2).
+
+    The key is additive and OMITTED when false (spec §7.3), so a row without it
+    is standard account quota and every fixture that has no model-scoped window
+    serializes byte-identically.
+    """
+    return bool(isinstance(row, Mapping) and row.get("model_scoped"))
 
 
 def _resolve_codex_weekly_cycle(
@@ -212,11 +221,13 @@ def _resolve_codex_weekly_cycle(
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
             continue
-        if _is_model_scoped_codex_quota(history.identity.logical_limit_key):
+        # The baseline observation is the §7.1 label authority, so it is
+        # resolved BEFORE classification wherever the call site has one.
+        baseline = select_baseline(history.observations, now_utc)
+        if codex_history_is_model_scoped(history, baseline=baseline):
             continue
         account = history.identity.account_key
         accounts_seen.add(account)
-        baseline = select_baseline(history.observations, now_utc)
         if baseline is None or baseline.resets_at <= now_utc:
             continue
         state = quota_freshness(history.physical_observations, now_utc).state
@@ -283,6 +294,66 @@ def _resolve_codex_weekly_cycle(
     return cycles
 
 
+def resolve_codex_cycle_detail_identity(
+    cache_conn,
+    *,
+    source_root_keys: Iterable[str],
+    now_utc: dt.datetime,
+):
+    """The live-cycle identity for a per-request Codex cycle-DETAIL read (#373).
+
+    The cycle INDEX is built with the hero's live ``CodexCycleBoundary``; the
+    detail route runs outside the snapshot build and has no envelope, so it used
+    to pass a stub carrying no ``resets_at``. The former future-reset proxy then
+    reported ``is_current: true`` for every future-ending cycle — including a
+    historic one that an early re-anchor had already closed. Resolving the same
+    boundary here is what makes one cycle key describe one cycle on both routes.
+
+    ``source_root_keys`` scopes the returned identity's cycle LOOKUP (the caller
+    passes every retained Codex root, so a just-closed cycle stays fetchable);
+    the live boundary itself is resolved from the active roots' observations,
+    exactly as the source build does.
+
+    Degrades to a bare-roots identity — today's behaviour — whenever no live
+    cycle resolves. The clip guard stays unarmed on that identity by design
+    (``_boundary_has_live_reset``), so the detail keeps clipping as it did
+    before #373 rather than trusting the proxy.
+    """
+    identity = SimpleNamespace(
+        source_root_keys=tuple(source_root_keys),
+        resets_at=None,
+        quota_identity=None,
+    )
+    if cache_conn is None:
+        return identity
+    try:
+        active_roots = tuple(sorted(
+            str(row[0]) for row in cache_conn.execute(
+                "SELECT source_root_key FROM codex_source_roots"
+            )
+        ))
+        if not active_roots:
+            return identity
+        observations = load_codex_quota_observations(
+            source_root_keys=active_roots,
+            cache_conn=cache_conn,
+            captured_at_or_after=(
+                now_utc - dt.timedelta(days=DASHBOARD_QUOTA_RECENT_DAYS)
+            ),
+            active_at=now_utc,
+            max_rows=DASHBOARD_QUOTA_OBSERVATION_LIMIT,
+        )
+        cycles = _resolve_codex_weekly_cycle(observations, now_utc)
+    except (sqlite3.Error, CodexCycleUnavailable, ValueError):
+        return identity
+    if not cycles:
+        return identity
+    boundary = cycles[0]
+    identity.resets_at = boundary.resets_at
+    identity.quota_identity = boundary.quota_identity
+    return identity
+
+
 def _codex_next_decision_at(
     observations: Iterable[object],
     cycles: Iterable[CodexCycleBoundary],
@@ -326,9 +397,9 @@ def _codex_next_decision_at(
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
             continue
-        if _is_model_scoped_codex_quota(history.identity.logical_limit_key):
-            continue
         baseline = select_baseline(history.observations, now_utc)
+        if codex_history_is_model_scoped(history, baseline=baseline):
+            continue
         if baseline is not None and baseline.resets_at > now_utc:
             latest = latest_physical_observation(history.physical_observations)
             if latest is not None:
@@ -395,7 +466,7 @@ def _codex_weekly_periods(
     placeholders = ",".join("?" for _ in roots)
     try:
         rows = stats_conn.execute(
-            "SELECT source_root_key, logical_limit_key, resets_at_utc, "
+            "SELECT source_root_key, logical_limit_key, limit_name, resets_at_utc, "
             "nominal_start_at_utc, current_percent "
             "FROM quota_window_blocks "
             "WHERE source='codex' AND window_minutes=10080 "
@@ -407,10 +478,18 @@ def _codex_weekly_periods(
     except sqlite3.Error:
         rows = ()
 
-    raw_boundaries: list[tuple[dt.datetime, dt.datetime, set[str], list[float]]] = []
+    # #373 §7.4: the fifth element marks the LIVE boundary, which is never
+    # clipped by a successor. Durable rows are never live on their own — only
+    # the caller's `active_cycle` is — but the jitter-merge below folds the
+    # live boundary together with its own durable row, so the flag is OR-ed on
+    # merge rather than taken from either side.
+    raw_boundaries: list[
+        tuple[dt.datetime, dt.datetime, set[str], list[float], bool]
+    ] = []
 
-    for root_key, logical_limit_key, resets_at_raw, start_at_raw, current_percent in rows:
-        if _is_model_scoped_codex_quota(logical_limit_key):
+    for (root_key, logical_limit_key, limit_name, resets_at_raw,
+         start_at_raw, current_percent) in rows:
+        if is_model_scoped_codex_quota(logical_limit_key, limit_name):
             continue
         try:
             start_at = dt.datetime.fromisoformat(str(start_at_raw).replace("Z", "+00:00"))
@@ -426,18 +505,23 @@ def _codex_weekly_periods(
         used_values = []
         if isinstance(current_percent, (int, float)) and not isinstance(current_percent, bool):
             used_values.append(float(current_percent))
-        raw_boundaries.append((start_at, resets_at, {str(root_key)}, used_values))
+        raw_boundaries.append((start_at, resets_at, {str(root_key)}, used_values, False))
 
+    # `active_cycle is None` is the case §7.4 calls out explicitly: no boundary
+    # is live, so nothing is exempt and every period clips exactly as before.
     if active_cycle is not None:
         raw_boundaries.append((
             active_cycle.start_at.astimezone(UTC),
             active_cycle.resets_at.astimezone(UTC),
             set(active_cycle.source_root_keys),
             [active_cycle.used_percent] if active_cycle.used_percent is not None else [],
+            True,
         ))
 
-    ordered: list[tuple[dt.datetime, dt.datetime, set[str], list[float]]] = []
-    for start_at, resets_at, period_roots, used_values in sorted(
+    ordered: list[
+        tuple[dt.datetime, dt.datetime, set[str], list[float], bool]
+    ] = []
+    for start_at, resets_at, period_roots, used_values, is_live in sorted(
         raw_boundaries, key=lambda item: (item[0], item[1]),
     ):
         if (
@@ -445,17 +529,23 @@ def _codex_weekly_periods(
             and (start_at - ordered[-1][0]).total_seconds()
             < _FIVE_HOUR_JITTER_FLOOR_SECONDS
         ):
-            first_start, latest_reset, existing_roots, existing_used = ordered[-1]
+            first_start, latest_reset, existing_roots, existing_used, existing_live = ordered[-1]
             existing_roots.update(period_roots)
             existing_used.extend(used_values)
             ordered[-1] = (
                 first_start, max(latest_reset, resets_at), existing_roots, existing_used,
+                existing_live or is_live,
             )
         else:
-            ordered.append((start_at, resets_at, set(period_roots), list(used_values)))
+            ordered.append((
+                start_at, resets_at, set(period_roots), list(used_values), is_live,
+            ))
     periods: list[CodexWeeklyPeriod] = []
-    for index, (start_at, resets_at, period_roots, used_values) in enumerate(ordered):
+    for index, (start_at, resets_at, period_roots, used_values, is_live) in enumerate(ordered):
         next_start = ordered[index + 1][0] if index + 1 < len(ordered) else None
+        # The live cycle always ends at its own reset (#373 §7.4).
+        if is_live:
+            next_start = None
         end_at = min(resets_at, next_start) if next_start is not None else resets_at
         if end_at <= start_at:
             continue
@@ -1058,7 +1148,9 @@ def _codex_conversation_metadata(
                         f"SELECT id, title FROM threads WHERE id IN ({placeholders})",
                         batch,
                     ):
-                        clean_title = " ".join(str(title or "").split())
+                        clean_title = _codex_display_title(
+                            str(title) if title is not None else None
+                        )
                         if clean_title:
                             short_names[str(thread_id)] = clean_title
             except (OSError, sqlite3.Error):
@@ -1123,6 +1215,7 @@ def _session_wire(
     view: Any,
     *,
     metadata: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
+    private_labels: dict[str, str] | None = None,
 ) -> dict[str, object]:
     rows = []
     for row in view.rows:
@@ -1148,7 +1241,11 @@ def _session_wire(
                     )
                 )
             ), None)
-        title = str(row_metadata.get("title") or "").strip() if row_metadata else ""
+        title = _codex_display_title(
+            str(row_metadata.get("title"))
+            if row_metadata and row_metadata.get("title") is not None
+            else None
+        )
         project = str(row_metadata.get("project_label") or "").strip() if row_metadata else ""
         started_at = row_metadata.get("started_at") if row_metadata else None
         duration_min = None
@@ -1158,12 +1255,14 @@ def _session_wire(
                 duration_min = max(0, round((row.last_activity.astimezone(UTC) - started_dt.astimezone(UTC)).total_seconds() / 60))
             except (TypeError, ValueError):
                 started_at = None
+        key = dashboard_resource_key(
+            "session", "codex", root_identity, row.session_id_path,
+        )
+        if title and private_labels is not None:
+            private_labels[key] = title
         rows.append({
-            "key": dashboard_resource_key(
-                "session", "codex", root_identity, row.session_id_path,
-            ),
+            "key": key,
             "source": "codex",
-            "label": title or None,
             "project": project or None,
             "project_key": row_metadata.get("project_key") if row_metadata else None,
             "started_at": started_at,
@@ -1454,9 +1553,16 @@ def _quota_read_model(
         baseline = select_baseline(history.observations, context.now_utc)
         freshness = quota_freshness(history.physical_observations, context.now_utc)
         forecast = forecast_quota(history.physical_observations, context.now_utc)
-        history_rows.append({
+        # #373: a window outside account-level standard quota (a separate model
+        # pool such as GPT-5.3-Codex-Spark) stays LISTED — a legitimate
+        # independent pool must remain visible — but is excluded from every
+        # account-level aggregate below. `baseline` is the label authority when
+        # one exists (spec §7.1).
+        model_scoped = codex_history_is_model_scoped(history, baseline=baseline)
+        row = {
             "key": dashboard_resource_key("quota", "codex", *key_parts),
             "source": "codex",
+            **({"model_scoped": True} if model_scoped else {}),
             **({"account_key": identity.account_key} if _codex_decorated else {}),
             "label": _native_limit_label(identity.limit_name, identity.window_minutes),
             "observed_slot": identity.observed_slot,
@@ -1479,7 +1585,10 @@ def _quota_read_model(
                 "sample_span_seconds": forecast.sample_span_seconds,
                 "confidence": forecast.confidence,
             },
-        })
+        }
+        history_rows.append(row)
+        if _codex_history_row_is_model_scoped(row):
+            continue
         if baseline is not None and baseline.resets_at > context.now_utc:
             active_rows.append({
                 "key": dashboard_resource_key("quota", "codex", *key_parts),
@@ -1597,10 +1706,28 @@ def _quota_read_model(
         "fresh" if active_rows and all(row["freshness"] == "fresh" for row in active_rows)
         else ("unavailable" if not active_rows else "stale")
     )
-    # Active identities are presentation-critical.  Keep them ahead of
-    # inactive retained history before enforcing the public cardinality cap.
+    # Active account identities are presentation-critical. Independent
+    # model-scoped pools are also legitimate provider facts, so reserve the
+    # remaining cap space for their newest captures before inactive account
+    # history. Opaque resource-key order is only a stable tie-breaker.
     active_keys = {str(row["key"]) for row in active_rows}
-    history_rows.sort(key=lambda row: (str(row["key"]) not in active_keys, str(row["key"])))
+
+    def _history_retention_key(row):
+        key = str(row["key"])
+        if key in active_keys:
+            return (0, 0.0, key)
+        if _codex_history_row_is_model_scoped(row):
+            captured_at = row.get("captured_at")
+            try:
+                captured_epoch = dt.datetime.fromisoformat(
+                    str(captured_at).replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                captured_epoch = float("-inf")
+            return (1, -captured_epoch, key)
+        return (2, 0.0, key)
+
+    history_rows.sort(key=_history_retention_key)
     history_rows = history_rows[:SOURCE_HISTORY_LIMIT]
     milestone_rows.sort(key=lambda row: str(row["captured_at"]), reverse=True)
     milestone_rows = milestone_rows[:SOURCE_HISTORY_LIMIT]
@@ -1730,6 +1857,7 @@ def refresh_codex_source_clock(
     warnings = state.warnings
     availability = state.availability
     freshness = state.freshness
+    domain_freshness = dict(state.domain_freshness or {})
     if isinstance(quota, Mapping):
         quota = dict(quota)
         refreshed_histories: list[dict[str, object]] = []
@@ -1780,7 +1908,12 @@ def refresh_codex_source_clock(
                         100.0, max(float(current), float(current) + float(rate) * remaining / 3600),
                     )
                 history["forecast"] = forecast
-                if reset is not None and reset > now_utc and current is not None:
+                # #373: same rule as the initial build, through the same
+                # predicate, so the two paths cannot drift.
+                if (
+                    not _codex_history_row_is_model_scoped(history)
+                    and reset is not None and reset > now_utc and current is not None
+                ):
                     active_rows.append({
                         "key": history.get("key"),
                         "current_percent": current,
@@ -1814,6 +1947,13 @@ def refresh_codex_source_clock(
             ),
             "active": active_rows,
         })
+        # Only account-level active histories reach ``active_rows``; the shared
+        # model-scoped predicate above excludes foreign pools. An unavailable
+        # active set is a capability/data-availability fact, not invented
+        # staleness, so only the exact stale verdict moves this axis.
+        domain_freshness["quota"] = (
+            "stale" if summary["freshness"] == "stale" else "fresh"
+        )
         quota["summary"] = summary
         data["quota"] = quota
         quota_changed = bool(refreshed_histories)
@@ -1891,9 +2031,11 @@ def refresh_codex_source_clock(
         last_success_at=state.last_success_at,
         capabilities=capabilities,
         data=data,
+        domain_freshness=domain_freshness,
         clock_data=state.clock_data,
+        private_session_labels=state.private_session_labels,
     )
-    return state if refreshed_state.data == state.data else refreshed_state
+    return state if refreshed_state == state else refreshed_state
 
 
 def _alerts_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
@@ -2043,7 +2185,10 @@ def _partial_projects_wire(
             "reasoning_output_tokens": 0, "total_tokens": 0,
         })
         session_totals = group["session_rows"].setdefault(identity, {
-            "label": str(row_metadata.get("title") or "Session"),
+            # A persisted Codex task title is transcript-derived content. The
+            # partial project projection is shared across every dashboard
+            # client, so retain only a non-sensitive generic label here.
+            "label": "Session",
             "last_activity": timestamp.astimezone(UTC).isoformat(),
             "cost_usd": 0.0, "input_tokens": 0, "cached_input_tokens": 0,
             "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 0,
@@ -2211,7 +2356,12 @@ def _codex_account_five_hour_percent(
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 300:
             continue
+        # #373: the retained `codex_bengalfox` 5h rows are on the PRIMARY slot —
+        # the same slot this account aggregate reads — so a foreign pool at 95%
+        # would win the max outright over the real account window.
         baseline = select_baseline(history.observations, now_utc)
+        if codex_history_is_model_scoped(history, baseline=baseline):
+            continue
         if baseline is None or baseline.resets_at <= now_utc:
             continue
         acct = history.identity.account_key
@@ -2666,10 +2816,13 @@ def build_codex_source_state(
             # degrade to the byte-stable undecorated shape.
             accounts_wire = []
             hero_cycles_wire = []
+    private_session_labels: dict[str, str] = {}
     return SourceDashboardState(
         source="codex",
         availability=availability,
-        freshness=("stale" if cycle_reason == "stale" else "fresh"),
+        # A successful source build is one coherent provider generation. Quota
+        # observation age and weekly-cycle evidence live on their own axes.
+        freshness="fresh",
         warnings=tuple(warnings),
         data_version=data_version,
         last_success_at=context.now_utc,
@@ -2717,9 +2870,8 @@ def build_codex_source_state(
                 ),
                 # #350 (spec §3.4): additive, hero-local staleness disclosure.
                 # OMITTED when the cycle is fresh — never emitted as "fresh" —
-                # which is what keeps every existing envelope golden byte-
-                # identical. availability/freshness/warnings/capabilities stay
-                # untouched because five separate gates read them as one meaning.
+                # for the legacy client transition. Provider metadata remains
+                # coherent; ``domain_freshness.hero`` owns the shared axis.
                 **(
                     {"cycle_freshness": "stale"}
                     if cycle is not None and not hero_failure and cycle.evidence_stale
@@ -2736,7 +2888,11 @@ def build_codex_source_state(
                 "monthly": _period_wire(monthly),
                 "weekly": _period_wire(weekly),
             },
-            "sessions": _session_wire(sessions, metadata=conversation_metadata),
+            "sessions": _session_wire(
+                sessions,
+                metadata=conversation_metadata,
+                private_labels=private_session_labels,
+            ),
             "quota": quota,
             "budget": {
                 "status": configured_budget,
@@ -2751,6 +2907,24 @@ def build_codex_source_state(
             },
             "cache_report": cache_report,
         },
+        domain_freshness={
+            "hero": (
+                "stale"
+                if cycle_reason == "stale"
+                or (
+                    cycle is not None
+                    and not hero_failure
+                    and cycle.evidence_stale
+                )
+                else "fresh"
+            ),
+            "quota": (
+                "stale"
+                if quota["summary"]["freshness"] == "stale"
+                else "fresh"
+            ),
+            "sessions": "fresh",
+        },
         clock_data={
             "codex_budget_cost_events": budget_cost_events,
             # #350 spec §3.3: when the tick passes this instant it must rebuild
@@ -2760,4 +2934,5 @@ def build_codex_source_state(
                 quota_observations, cycles_all, context.now_utc,
             ),
         },
+        private_session_labels=private_session_labels,
     )

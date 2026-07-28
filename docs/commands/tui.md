@@ -4,6 +4,10 @@ Live refreshing dashboard for subscription usage, spend, and recent-session
 activity. Renders with `rich`; background daemon thread keeps the data
 fresh while the main thread handles keys and redraws.
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > **Maintenance status:** the TUI is in **bugfix-only maintenance mode** as of
 > the 2026-07-12 disposition decision. Both layout variants below keep working
 > and remain fully supported, but the TUI no longer tracks new dashboard

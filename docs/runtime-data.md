@@ -12,23 +12,23 @@ All persistent state lives under `~/.local/share/cctally/` (a dev checkout uses 
 | `conversations.db` | Yes — `cache-sync --rebuild` or the dashboard conversation worker | Transcript prose/events, browse rollups, and full-text indexes. Independently re-derived from the same JSONL without blocking core accounting refresh. |
 | `cache.db.repairing` | Yes — normally removed when recovery finishes; a stale owner is reclaimed by the next cache open/rebuild | No user data. It is an atomic repair-owner record (PID + process-start identity + claim token), not a lock file to delete by hand. |
 | `cache.db.quarantine-pending.json` | Yes — removed only after every snapshotted family member reaches one completed quarantine incident | No user data. Durable interruption state for a partially moved cache main/WAL/SHM family; leave it for the next opener/rebuild to resume. |
-| `quarantine/cache.db-*`, `logs/cache-corruption-forensics-*` | No — retained incident evidence | The damaged SQLite family and its diagnostic metadata. Safe recovery creates these before rebuilding; preserve them when investigating recurring corruption. |
+| `quarantine/cache.db-*`, `logs/cache-corruption-forensics-*` | No — retained incident evidence | A confirmed damaged SQLite family and its diagnostic metadata. An unconfirmed classified trigger creates only the forensics bundle and leaves the live family byte-for-byte in place; preserve either artifact when investigating recurring failures. |
 | `cache.db.lock`, `cache.db.codex.lock`, `conversations.db.lock`, `conversations.db.codex.lock`, `conversations.db.maintenance.lock`, `config.json.lock` | Yes — `fcntl.flock` files, re-created on demand | Nothing — they carry no data. |
 | `config.json` | Yes, **but only to defaults** | Your saved settings (`display.tz`, the `dashboard.*` keys, `telemetry.enabled`, week-start, budget, alert config, …). It comes back empty/default — your preferences are not recovered. See [configuration.md](configuration.md). |
 | `install_id` | Yes, **but as a new identity** | Your anonymous telemetry identity rotates — a fresh random id mints on the next beat, so the install count may count you once more. Equivalent to `cctally telemetry reset`. Never leaves your machine. |
 | `hwm-7d`, `hwm-5h` | Yes — climbs back from snapshots | The 7-day / 5-hour high-water-mark floor used by the status line and reports. It re-derives from `weekly_usage_snapshots` and re-climbs on subsequent ticks. |
 | `pending-reset-zero-7d` | Yes — re-armed on the next tick | A transient reset-to-zero debounce marker. At worst the debounce re-arms (a real weekly reset then fires one tick later). Best-effort. |
 | `update-state.json`, `update-suppress.json`, `update-check.last-fetch`, `update.lock`, `update.log`(`.1`) | Yes | Update-check bookkeeping plus your "skip this version" suppression — regenerating loses a dismissed-version choice and the last-check time (a fresh check just fires sooner). No user data. |
-| `hook-tick.last-fetch`(`.lock`), `logs/` (`hook-tick.log`(`.1`), `migration-errors.log`, `record-usage` output) | Yes | Throttle timestamps and diagnostic logs only — no usage data. `logs/` re-creates on the next background call. |
+| `hook-tick.last-fetch`(`.lock`), `logs/` (`hook-tick.log`(`.1`), `stats-writer-guard.log`(`.1`, `.lock`, `.last`), `migration-errors.log`, `record-usage` output) | Yes | Throttle timestamps and diagnostic logs only — no usage data. `logs/` re-creates on the next background call. The stats-writer guard log keeps one rotated 1 MiB generation. |
 | `telemetry.last-beat`, `telemetry.notice-shown`, `telemetry.first-seen` | Yes | Telemetry cadence markers (last-beat time, the one-time first-run notice flag, the first-seen grace anchor). Regenerating them may re-show the notice or re-open the 24-hour opt-out grace. |
 | `stats.db.bak-*` | **No** — a manual backup | Whatever snapshot of `stats.db` you (or a recovery step) saved. It is a *backup*, not re-derivable; if it is your only copy of some history, that history is gone with it. |
 | `data.db`, `usage.db` | n/a — legacy | Files from earlier iterations with no current writer. Safe to remove. |
 
 ## `stats.db` schema
 
-A **disposable index** materialized from the append-only journal (`~/.local/share/cctally/journal/`), which is the durable truth since the DB journal redesign (§7.1). `stats.db` is stamped at a single `STATS_INDEX_EPOCH` (1000) rather than versioned by migrations; its 13-migration legacy registry is **frozen** (only used to bring a pre-cutover install to the export baseline). A version mismatch — newer or older binary — self-heals by **rebuild from the journal** (`cctally db rebuild --db stats`); `DowngradeDetected`-bricking no longer applies to `stats.db`, and `db recover --db stats` is retired. Corruption self-heals the same way (forensics → quarantine → rebuild, no human step). A schema change bumps the epoch, never adds a stats migration.
+A **disposable index** materialized from the append-only journal (`~/.local/share/cctally/journal/`), which is the durable truth since the DB journal redesign (§7.1). `stats.db` is stamped at a single `STATS_INDEX_EPOCH` (1004) rather than versioned by migrations; its 13-migration legacy registry is **frozen** (only used to bring a pre-cutover install to the export baseline). A version mismatch — newer or older binary — self-heals by **rebuild from the journal** (`cctally db rebuild --db stats`); `DowngradeDetected`-bricking no longer applies to `stats.db`, and `db recover --db stats` is retired. Corruption self-heals the same way (forensics → quarantine → rebuild, no human step). A schema change bumps the epoch, never adds a stats migration.
 
-The live schema is **15 tables**. The three original snapshot tables keep their full detail below; the rest are the 5-hour, reset/credit, budget, and framework-ledger tables added since.
+The live schema includes the snapshot tables below plus the 5-hour, reset/credit, budget, account, journal-index, and framework-ledger tables added since.
 
 | Table | Purpose |
 | --- | --- |
@@ -45,6 +45,8 @@ The live schema is **15 tables**. The three original snapshot tables keep their 
 | `budget_milestones` | Vendor-tagged budget-threshold crossings — `UNIQUE(vendor, period_start_at, period, threshold)`, `vendor ∈ {claude, codex}`. |
 | `project_budget_milestones` | Per-project budget-threshold crossings. |
 | `projected_milestones` | Projected-pace alert crossings (the forecast "on track to cap" axis). |
+| `journal_effective_events` | Disposable highest-completed-revision summary for journal event ids; active rows carry canonical event JSON and tombstones carry no body. |
+| `journal_protocol_violations` | Disposable bounded summary of unacknowledged and operator-acknowledged structural correction-batch omissions. Acknowledged rows retain their audit id and reviewed journal prefix so shallow Doctor surfaces can report WARN without rescanning segments. |
 | `schema_migrations` | Migration-framework ledger — applied handlers (name + timestamp). |
 | `schema_migrations_skipped` | Migration-framework ledger — skipped handlers (name + timestamp + reason). |
 
@@ -69,9 +71,13 @@ One row per `sync-week` invocation. Stores the computed USD cost for a week wind
 Fully re-derivable from JSONL through `cache-sync --rebuild`. It carries the
 compact Claude and Codex accounting/quota estates. Transcript/search state lives
 separately in `conversations.db`; do not unlink either SQLite family beneath a
-live process. Classified corruption is preserved in forensics/quarantine only
-after the maintenance handshake proves the main/WAL/SHM family has no live
-handles. The failed open or ingest is retried once against the recreated cache;
+live process. A classified corruption trigger reaches recovery only after the
+maintenance handshake proves the main/WAL/SHM family has no live handles, then
+quarantine is allowed only if the persisted forensics probe confirms corruption.
+A sole `integrity_check` result of `ok`, an unavailable probe, an unrelated
+probe error, or an unwritable bundle preserves the original family and
+propagates the triggering failure. The failed open or ingest is retried once
+against the recreated cache only after confirmation;
 `--source claude|codex|all` still controls which provider rows are re-derived,
 and `all` restarts both provider legs if either leg triggers family replacement.
 An atomic pending-quarantine record makes the three family renames resumable;

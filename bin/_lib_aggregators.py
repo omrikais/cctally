@@ -69,6 +69,8 @@ CodexEntry = _lib_jsonl.CodexEntry
 
 _lib_pricing = _load_lib("_lib_pricing")
 _calculate_entry_cost = _lib_pricing._calculate_entry_cost
+# #195: the single construction point for every cost-feeding usage dict.
+claude_usage_dict = _lib_pricing.claude_usage_dict
 _calculate_codex_entry_cost = _lib_pricing._calculate_codex_entry_cost
 _is_codex_fallback = _lib_pricing._is_codex_fallback
 
@@ -800,12 +802,14 @@ def _aggregate_claude_sessions(
             if entry.project_path:
                 sess["project_path"] = entry.project_path
 
-        usage = {
-            "input_tokens": entry.input_tokens,
-            "output_tokens": entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens": entry.cache_read_tokens,
-        }
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        )
         cost = _calculate_entry_cost(entry.model, usage, mode=mode, cost_usd=entry.cost_usd)
 
         sess["input"] += entry.input_tokens

@@ -101,7 +101,11 @@ export function BlocksPanel() {
   const rows = allRows;
   const codexEntry = resolveSourceView(env, 'codex').entry;
   const codex = codexEntry?.data as CodexSourceData | undefined;
-  const codexHasFiveHourWindow = codex?.quota.histories.some((row) => row.window_minutes === 300) ?? false;
+  // #373: a foreign quota pool's 5h window is not the account's, so it must
+  // not claim the account has a 5-hour limit at all.
+  const codexHasFiveHourWindow = codex?.quota.histories.some(
+    (row) => row.window_minutes === 300 && !row.model_scoped,
+  ) ?? false;
   const blocksScope = activeSource === 'codex'
     ? `${codexHasFiveHourWindow ? '5h' : 'optional 5h'} · current cycle`
     : activeSource === 'all'

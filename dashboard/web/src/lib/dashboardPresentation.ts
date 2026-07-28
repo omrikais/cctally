@@ -13,10 +13,12 @@ import type {
   PeriodRow,
   SourceName,
   SourceEntry,
+  SourceFreshnessDomain,
   SourceWarning,
   TrendRow,
 } from '../types/envelope';
 import { modelChipClass } from './model';
+import { sourceDomainFreshness } from './sourceGating';
 
 // Provider-neutral presentation adapters.  The dashboard cards consume these
 // shapes; provider-specific wire vocabulary ends here.  Claude remains the
@@ -64,20 +66,26 @@ function providerSection<T>(
   env: Envelope | null,
   source: SourceName,
   value: T | null,
-  domains: string[],
+  warningDomains: string[],
+  freshnessDomains: SourceFreshnessDomain[],
   unavailableCopy: string,
 ): ProviderPresentationSection<T> {
   const entry = providerEntry(env, source);
   const relevantWarning = entry?.warnings.find((warning) =>
     warning.domain == null
-      || domains.includes(warning.domain)
+      || warningDomains.includes(warning.domain)
       || warning.domain === 'ingest'
       || warning.domain === 'read_model',
   );
-  const unsupportedDomain = domains.find((domain) => {
+  const unsupportedDomain = warningDomains.find((domain) => {
     const status = entry?.capabilities[domain]?.status;
     return status === 'unavailable' || status === 'deferred';
   });
+  const staleDomain = entry == null
+    ? undefined
+    : freshnessDomains.find(
+      (domain) => sourceDomainFreshness(entry, domain) === 'stale',
+    );
 
   if (value == null) {
     const status: ProviderSectionStatus = entry?.availability === 'empty'
@@ -94,14 +102,16 @@ function providerSection<T>(
     };
   }
 
-  if (relevantWarning != null || entry?.freshness === 'stale' || unsupportedDomain != null) {
+  if (relevantWarning != null || staleDomain != null || unsupportedDomain != null) {
     return {
       source,
       label: providerLabel(source),
       status: 'degraded',
       reason: relevantWarning?.message
-        ?? (entry?.freshness === 'stale'
-          ? `${providerLabel(source)} data is stale.`
+        ?? (staleDomain != null
+          ? entry?.domain_freshness == null
+            ? `${providerLabel(source)} data is stale.`
+            : `${providerLabel(source)} ${staleDomain} data is stale.`
           : entry?.capabilities[unsupportedDomain!]?.semantics ?? unavailableCopy),
       value,
     };
@@ -518,8 +528,13 @@ export function presentationForecast(env: Envelope | null, selection: SourceName
     };
   }
   const codex = presentationProviders(env, selection).codex;
-  const weekly = codex?.quota.histories.find((row) => row.window_minutes === 10_080)
-    ?? codex?.quota.histories[0];
+  // #373: exclude windows outside account-level standard quota from BOTH the
+  // primary lookup and the fallback — a separate model pool must never become
+  // the account's forecast.
+  const accountHistories = (codex?.quota.histories ?? [])
+    .filter((row) => !row.model_scoped);
+  const weekly = accountHistories.find((row) => row.window_minutes === 10_080)
+    ?? accountHistories[0];
   const forecast = weekly?.forecast;
   const projected = forecast?.status === 'ok' ? forecast.projected_percent : null;
   const budget = codex?.budget.status;
@@ -545,19 +560,25 @@ export function presentationForecastComposition(
     sections: compositionSources(selection).map((source) => {
       const value = presentationForecast(env, source);
       const codex = source === 'codex' ? presentationProviders(env, source).codex : null;
-      const nativeForecast = codex?.quota.histories.find(
+      // #373: the same account-level exclusion `presentationForecast` applies,
+      // over the SAME three reads — the primary lookup, the `[0]` fallback and
+      // the capability probe. A foreign pool's stale forecast must not degrade
+      // the account's section, and its presence must not stand in for the
+      // account having a forecast at all.
+      const accountHistories = (codex?.quota.histories ?? [])
+        .filter((row) => !row.model_scoped);
+      const nativeForecast = accountHistories.find(
         (row) => row.window_minutes === 10_080,
-      )?.forecast ?? codex?.quota.histories[0]?.forecast;
+      )?.forecast ?? accountHistories[0]?.forecast;
       const hasForecast = source === 'claude'
         ? (env?.forecast ?? env?.sources?.claude?.data?.hero.forecast) != null
-        : codex?.quota.histories.some(
-          (row) => row.forecast != null,
-        ) === true;
+        : accountHistories.some((row) => row.forecast != null);
       const section = providerSection(
         env,
         source,
         hasForecast ? value : null,
         source === 'claude' ? ['hero', 'quota', 'budget'] : ['quota', 'budget'],
+        source === 'claude' ? ['hero', 'quota'] : ['quota'],
         `${providerLabel(source)} forecast is unavailable.`,
       );
       if (source === 'codex' && section.value != null && nativeForecast?.status !== 'ok') {
@@ -702,6 +723,7 @@ export function presentationCacheReportComposition(
         source,
         value,
         ['forensics'],
+        ['sessions'],
         `${providerLabel(source)} cache report is unavailable.`,
       );
       if (section.value?.is_empty && section.status === 'available') {

@@ -110,6 +110,8 @@ def _load_lib(name: str):
 
 _lib_pricing = _load_lib("_lib_pricing")
 _calculate_entry_cost = _lib_pricing._calculate_entry_cost
+# #195: the single construction point for every cost-feeding usage dict.
+claude_usage_dict = _lib_pricing.claude_usage_dict
 
 _lib_display_tz = _load_lib("_lib_display_tz")
 _resolve_tz = _lib_display_tz._resolve_tz
@@ -512,12 +514,14 @@ def _diff_aggregate_overall(
             continue
         cost += _calculate_entry_cost(
             e.model,
-            {
-                "input_tokens": e.input_tokens,
-                "output_tokens": e.output_tokens,
-                "cache_creation_input_tokens": e.cache_creation_tokens,
-                "cache_read_input_tokens": e.cache_read_tokens,
-            },
+            claude_usage_dict(   # #195 chokepoint
+                input_tokens=e.input_tokens,
+                output_tokens=e.output_tokens,
+                cache_creation_tokens=e.cache_creation_tokens,
+                cache_read_tokens=e.cache_read_tokens,
+                cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                speed=getattr(e, "speed", None),
+            ),
             mode="auto",
             cost_usd=e.cost_usd,
         )
@@ -552,9 +556,12 @@ def _diff_aggregate_models(
         })
         b["cost"] += _calculate_entry_cost(
             e.model,
-            {"input_tokens": e.input_tokens, "output_tokens": e.output_tokens,
-             "cache_creation_input_tokens": e.cache_creation_tokens,
-             "cache_read_input_tokens": e.cache_read_tokens},
+            claude_usage_dict(   # #195 chokepoint
+                input_tokens=e.input_tokens, output_tokens=e.output_tokens,
+                cache_creation_tokens=e.cache_creation_tokens,
+                cache_read_tokens=e.cache_read_tokens,
+                cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                speed=getattr(e, "speed", None)),
             mode="auto", cost_usd=e.cost_usd,
         )
         b["ti"] += e.input_tokens
@@ -593,9 +600,12 @@ def _diff_aggregate_projects(
         })
         b["cost"] += _calculate_entry_cost(
             e.model,
-            {"input_tokens": e.input_tokens, "output_tokens": e.output_tokens,
-             "cache_creation_input_tokens": e.cache_creation_tokens,
-             "cache_read_input_tokens": e.cache_read_tokens},
+            claude_usage_dict(   # #195 chokepoint
+                input_tokens=e.input_tokens, output_tokens=e.output_tokens,
+                cache_creation_tokens=e.cache_creation_tokens,
+                cache_read_tokens=e.cache_read_tokens,
+                cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                speed=getattr(e, "speed", None)),
             mode="auto", cost_usd=e.cost_usd,
         )
         b["ti"] += e.input_tokens
@@ -639,9 +649,12 @@ def _diff_aggregate_cache(
             continue
         cost += _calculate_entry_cost(
             e.model,
-            {"input_tokens": e.input_tokens, "output_tokens": e.output_tokens,
-             "cache_creation_input_tokens": e.cache_creation_tokens,
-             "cache_read_input_tokens": e.cache_read_tokens},
+            claude_usage_dict(   # #195 chokepoint
+                input_tokens=e.input_tokens, output_tokens=e.output_tokens,
+                cache_creation_tokens=e.cache_creation_tokens,
+                cache_read_tokens=e.cache_read_tokens,
+                cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
+                speed=getattr(e, "speed", None)),
             mode="auto", cost_usd=e.cost_usd,
         )
         tcr += e.cache_read_tokens

@@ -1439,16 +1439,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    card widens. Thresholds/caps are ui-qa-gate-tuned starting values; the
    normative invariant is "Cost never clips at span-6 across 1200→1920." */
 @media (width > 640px) {
-  /* Fold Dur into Started + shed Cache once the card is tight (≤720px). */
+  /* Fold Dur into Started + shed Cache and Project once the card is tight
+     (≤720px). Project remains available from the row detail and Projects card;
+     spending its narrow column on a uniform two-line Session title keeps the
+     median 30–36-character label readable in the default 1440px span-6 bento. */
   @container sessions (max-width: 720px) {
     #panel-sessions .sess-table td.dur,
     #panel-sessions .sess-table th[data-col="duration"] { display: none; }
     #panel-sessions .sess-table .dur-fold { display: inline; }
     #panel-sessions .sess-table td.cache,
     #panel-sessions .sess-table th[data-col="cache"] { display: none; }
-  }
-  /* Tightest (≤600px): additionally shed Project. */
-  @container sessions (max-width: 600px) {
     #panel-sessions .sess-table td.project,
     #panel-sessions .sess-table th[data-col="project"] { display: none; }
   }
@@ -1458,10 +1458,19 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   @container sessions (max-width: 600px) {
     #panel-sessions .sess-table tbody td.session { max-width: 95px; }
   }
-  /* Tight — Cache shed, Dur folded, Project back. */
+  /* Tight — Cache + Project shed, Dur folded. The title gets the remaining
+     width and every row reserves exactly two lines so density stays uniform. */
   @container sessions (600px < width <= 720px) {
-    #panel-sessions .sess-table tbody td.session { max-width: 115px; }
-    #panel-sessions .sess-table tbody td.project { max-width: 55px; }
+    #panel-sessions .sess-table tbody td.session { max-width: 200px; }
+    #panel-sessions .sess-table tbody td.session .sess-open-title {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      min-height: 2.7em;
+      max-height: 2.7em;
+      line-height: 1.35;
+      white-space: normal;
+    }
   }
   /* Medium — all columns, modest caps. */
   @container sessions (720px < width <= 840px) {
@@ -1920,6 +1929,20 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 button.mcw-weeknav-btn, button.mcw-blocknav-btn {
   border: none; cursor: pointer; font: inherit; line-height: 1;
   padding: 2px 8px;
+  /* #373 ui-qa (WCAG 2.5.8): the drawn pill is 24x18, so HEIGHT is the failing
+     axis. The visible box is deliberately left alone — growing it to 24px would
+     push the whole chipstrip 4px taller on every viewport — and the TARGET is
+     enlarged instead by a vertical-only ::before overhang, the idiom this file
+     already uses for the topbar chips. The overhang is anchored to the button
+     itself (position: relative here), so it cannot mis-anchor to an unpositioned
+     ancestor, and it never grows horizontally into the adjacent week pill. */
+  position: relative;
+  min-width: 24px;
+}
+button.mcw-weeknav-btn::before, button.mcw-blocknav-btn::before {
+  content: ""; position: absolute; left: 0; right: 0;
+  top: 50%; transform: translateY(-50%);
+  height: 24px;
 }
 button.mcw-weeknav-btn:disabled, button.mcw-blocknav-btn:disabled {
   opacity: 0.35; cursor: default;

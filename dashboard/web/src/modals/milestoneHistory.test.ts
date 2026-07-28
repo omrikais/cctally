@@ -64,6 +64,29 @@ describe('stepWeek', () => {
   it('returns null for an empty index', () => {
     expect(stepWeek([], null, 1)).toBe(null);
   });
+
+  // #373 root cause 2: any index whose NEWEST entry is not the current cycle
+  // disabled navigation in both directions, because position 0 was hard-coded
+  // as the current selection.
+  const foreignFirst: WeekIndexEntry[] = [
+    entry('foreign-newer'),
+    entry('current', { is_current: true }),
+    entry('older'),
+  ];
+
+  it('steps older from the current cycle even when a newer entry precedes it', () => {
+    expect(stepWeek(foreignFirst, null, 1)).toBe('older');
+  });
+
+  it('keeps newer-than-current unreachable', () => {
+    // Contract from spec §6 Q4: null selection + newer direction is always null.
+    expect(stepWeek(foreignFirst, null, -1)).toBeNull();
+  });
+
+  it('falls back to position 0 when no entry is current', () => {
+    const historic = foreignFirst.map((e) => ({ ...e, is_current: false }));
+    expect(stepWeek(historic, null, 1)).toBe('current');
+  });
 });
 
 describe('fetchWeekDetail', () => {

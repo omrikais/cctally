@@ -1,7 +1,8 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Nine actions: `status`, `skip`,
-`unskip`, `rebuild`, `recover`, `repair`, `backup`, `checkpoint`, and `vacuum`.
+Migration / DB-management subcommand. Eleven actions: `status`, `skip`,
+`unskip`, `rebuild`, `rederive`, `journal-repair`, `recover`, `repair`,
+`backup`, `checkpoint`, and `vacuum`.
 
 ## Synopsis
 
@@ -10,6 +11,8 @@ cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
 cctally db rebuild --db stats [--json]
+cctally db rederive --family claude-usage [--yes] [--json]
+cctally db journal-repair [--violation <fingerprint> ...] [--yes] [--json]
 cctally db recover --db cache [--yes]   # --db stats is retired (see below)
 cctally db repair --db stats --yes
 cctally db backup --db {cache,stats} [--output <path>]
@@ -28,7 +31,7 @@ poison-pill escape.
 
 **`stats.db` is different since the journal redesign (§7.1):** it is a
 disposable index materialized from the append-only journal, stamped at a
-single `STATS_INDEX_EPOCH` (1000) rather than versioned by migrations.
+single `STATS_INDEX_EPOCH` (1004) rather than versioned by migrations.
 Its 13-migration legacy registry is **frozen** — no new stats migration is
 ever written; a schema change bumps the epoch, and any version mismatch
 self-heals by **rebuild** (`db rebuild --db stats`), never by trim-and-revert.
@@ -126,7 +129,7 @@ live ingest cycle. Journal replay is side-effect-free — a rebuild
 | Flag | Description |
 | --- | --- |
 | `--db stats` | **Required.** Only `stats.db` is journal-backed. cache.db / conversations.db rebuild from surviving provider JSONL — use `cctally cache-sync --rebuild`. |
-| `--json` | Emit a `schemaVersion: 1` envelope (`segmentsRead`, `linesFolded`, `malformed`, `durationSeconds`, `rowsByTable`, `totalRows`, `quarantineDir`, `forensicsPath`) instead of text. |
+| `--json` | Emit a `schemaVersion: 1` envelope (`segmentsRead`, `linesFolded`, `malformed`, `durationSeconds`, `rowsByTable`, `totalRows`, `quarantineDir`, `forensicsPath`, `journalConflicts`, `journalProtocolViolations`, `journalAcknowledgedProtocolViolations`) instead of text. |
 
 - **Prod guard (issue #146).** A **dev/worktree checkout** binary
   refuses to rebuild the real prod `stats.db` (`~/.local/share/cctally`)
@@ -136,10 +139,196 @@ live ingest cycle. Journal replay is side-effect-free — a rebuild
   corruption (forensics → quarantine → rebuild → retry, no human step);
   `db rebuild` is the manual, on-demand form.
 
+### Quarantined same-revision groups (#374)
+
+A journal written by a pre-quarantine binary can contain two or more `evt`
+lines sharing an `(id, rev)` with different content — a state the append-only
+journal can never un-write. The rebuild no longer aborts on that: it selects the
+**first-written** variant as a provisional winner and reports the group. The
+text summary prints the count, up to ten event ids with their revision and
+variant count (an `... and N more` line stands in for the rest), and the
+`db rederive` remedy; `--json` carries every group in an additive
+`journalConflicts` array of `{eventId, revision, contentHashes, selectedHash}`.
+
+**Exit code stays `0`** — the index is complete and usable. `doctor` reports the
+same groups at WARN under `journal.conflicts`, and
+`cctally db rederive --family claude-usage` resolves them by superseding each
+group at the next revision.
+
+`journalConflicts` is deliberately a **different key** from the `conflicts` key
+documented for `db rederive --json` below, which means command-validation
+failures. The two are never interchangeable.
+
+### Tainted structural correction batches (#402 Task A)
+
+The selector recognizes seven structural classes: marker conflict, commit
+without begin, begin/commit manifest mismatch, record-order violation, manifest
+action-sequence mismatch, manifest actions-hash mismatch, and duplicate
+action-sequence conflict. The affected correction batch is tainted as a whole;
+none of its markers or actions enter the rebuilt index. Valid batches before or
+after it still participate normally, so the highest valid revision wins.
+
+The rebuild exits `0` with a usable index and names each omitted batch/kind in
+text. `--json` carries unacknowledged omissions in the complete deterministic
+`journalProtocolViolations` array. Acknowledged omissions remain visible in
+`journalAcknowledgedProtocolViolations`, augmented with `auditId`,
+`journalHighWater`, and `journalPrefixHash`. Acknowledgement never makes a
+tainted batch effective. Invalid record field shapes still fail the selector
+and the rebuild.
+
 ### Exit codes
 
-`0` rebuilt; `2` the #146 prod guard refused a dev-checkout rebuild of
-the real prod stats.db; `3` the rebuild itself failed.
+`0` rebuilt — including when event groups were quarantined or structural
+batches were tainted and omitted; `2` the #146 prod guard refused a
+dev-checkout rebuild of the real prod stats.db; `3` the rebuild itself failed.
+
+## `cctally db journal-repair [--violation <fingerprint> ...] [--yes]`
+
+Previews and records an operator decision to keep exact structurally invalid
+correction batches quarantined. It is not generic SQLite recovery and does not
+rederive or choose a correction action.
+
+Preview is the default:
+
+```
+cctally db journal-repair
+cctally db journal-repair --json
+```
+
+It reports the pinned journal high-water and prefix hash plus deterministic
+unacknowledged and acknowledged violation arrays. Preview is strictly
+read-only: it does not create a DB, SQLite sidecar, lock file, config/update
+state, cursor/HWM file, journal line, or alert.
+
+Mutation requires both an explicit fingerprint selection and `--yes`:
+
+```
+cctally db journal-repair \
+  --violation sha256:<exact-fingerprint> \
+  --yes
+```
+
+`--violation` is repeatable. A bare `--yes`, a duplicate or unknown
+fingerprint, or a selection whose journal prefix changes before the repair
+locks are acquired is rejected before append. Re-run the preview and select
+the current exact fingerprints.
+
+Apply takes the stats maintenance lock and journal ingest lock in the
+repository order, revalidates the initial preview, and appends one
+`journal_protocol_resolution` audit record. The audit names each exact
+`{batch_id, kind, fingerprint}` and binds the decision to the reviewed raw
+journal prefix. Existing segment bytes are never edited; they remain an exact
+prefix followed by the single audit line. The command then rebuilds only
+through that audit line via the common scratch build, validation, handle-drain,
+and atomic cutover path.
+
+The invalid batch remains wholly tainted after acknowledgement. A later
+divergent marker/action or reused batch id produces a new fingerprint and
+returns to the unacknowledged list. Repeating the same exact invocation appends
+nothing (`already-resolved`). If the process dies after audit append or during
+scratch rebuild, the next identical invocation reports `recovered` after
+publishing one usable index from the one durable audit. A live stats reader
+causes a safe refusal; stop the dashboard or other holder, then rerun the
+identical command. If any post-audit rebuild stage fails, exit remains `3` and
+JSON still reports the durable acknowledgement and audit id rather than the
+stale pre-append state.
+
+`--json` emits a `schemaVersion: 1` envelope with
+`status`, `journalHighWater`, `journalPrefixHash`,
+`unacknowledgedViolations`, `acknowledgedViolations`,
+`selectedViolations`, `auditId`, `rebuild`, and `errors`. Successful apply also
+includes the reviewed prefix fields. Keys evolve additively.
+
+### Exit codes
+
+`0` preview, applied, recovered, or already resolved; `2` selection,
+locked-prefix revalidation, malformed-protocol, or prod-guard refusal; `3`
+lock, append, live-handle, or rebuild failure.
+
+## `cctally db rederive --family claude-usage [--yes]`
+
+Re-runs the closed Claude-usage derivation family over retained raw Claude
+observations and operator records using the current code, then compares that
+result with the journal's effective decisions. It corrects derivation bugs; it
+does not edit hand-entered account labels or other operator truth.
+
+The command is **preview-only by default**. Preview fixes an append-only journal
+prefix, copies a stable `cache.db`/WAL prefix to disposable scratch, opens that
+copy in a read-only SQLite transaction, and reports the deterministic plan
+without creating source lock/WAL files, appending journal records,
+replacing `stats.db`, writing config/HWM files, refreshing a provider, or
+dispatching alerts. Add `--yes` to append one manifest-checked correction batch
+and atomically rebuild the disposable stats index.
+
+```
+cctally db rederive --family claude-usage
+cctally db rederive --family claude-usage --json
+cctally db rederive --family claude-usage --yes
+```
+
+The apply path:
+
+1. Locks stats maintenance, cache maintenance, journal ingest, and the cache
+   writer in the established total order.
+2. Plans against one journal high-water and one stable read-only cache view.
+3. Revalidates that high-water while holding the journal leaf lock, then
+   appends the whole ordered batch without interleaving.
+4. Rebuilds only through the batch commit high-water. A raw observation
+   appended afterward remains unread for the next normal ingest cycle.
+
+Original journal lines are never rewritten or deleted. A crash before the
+commit leaves an ineffective incomplete batch; retry appends the same
+deterministic batch to completion. A crash after commit but before/during the
+stats swap leaves the correction durable; rerun the same command with `--yes`
+to recover it without appending a divergent second batch. A successful rerun is
+a clean no-op. Rebuild never dispatches historical alerts.
+
+`stats.db` is disposable, so no automatic backup is required. If you want a
+point-in-time copy for manual comparison, run `cctally db backup --db stats`
+before apply. Back up `cache.db` separately if the retained cost source itself
+needs archival; `db rederive` reads but never mutates it.
+
+The initial `claude-usage` family covers accepted weekly usage, weekly cost,
+weekly and five-hour reset/credit decisions, closed five-hour blocks, and their
+dependent milestones. Historical budget/projected configuration is not
+retained, so those stale Claude latches are retired and re-materialize from
+current config on later live activity. Codex quota and Codex budget/projection
+state remain outside this family. Missing cache tables/columns, account-specific
+cost inputs, or a known cache-write TTL split fail before mutation.
+
+| Flag | Description |
+| --- | --- |
+| `--family claude-usage` | **Required.** The only supported family in this release. |
+| `--yes` | Apply the previewed plan, or finish recovery of a completed batch. Without it, the command is read-only. |
+| `--json` | Emit a stamped `schemaVersion: 1` object. |
+
+JSON always includes `status`, `family`, `journalHighWater`, `batchId`,
+`planHash`, `actionCounts`, `conflicts`, `journalConflicts`, `dataGaps`,
+`errors`, `rebuild`, and `noOp`. If a readable journal exists, input and
+retained-source errors preserve the already-captured `journalHighWater`.
+`status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`,
+`missing-source`, or `failed`. New optional keys may be added without a schema
+version bump.
+
+`conflicts` is a list of **command-validation failure messages** (unsupported
+family, the prod guard, a structural journal protocol error).
+`journalConflicts` (#374) is a different thing entirely: the quarantined
+same-revision groups this plan will resolve, each
+`{eventId, revision, contentHashes, selectedHash}`. A conflicted group is
+superseded at the next revision **even when the provisional winner already
+matches the desired re-derivation** — otherwise the plan would report `retain`
+and the group would survive in the append-only journal forever.
+
+The dev/worktree-to-production guard applies to `--yes`: use the installed
+binary for the real `~/.local/share/cctally` data, or explicitly set
+`CCTALLY_ALLOW_PROD_MIGRATION=1`. Preview remains safe from a checkout because
+it does not mutate the target data.
+
+### Exit codes
+
+`0` preview, apply, recovery, or no-op; `2` unsupported input, a journal
+protocol conflict, missing retained source data, or the production guard; `3`
+lock contention, cache/SQLite I/O, append, or rebuild failure.
 
 ## `cctally db recover --db cache [--yes]`
 

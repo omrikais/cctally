@@ -37,6 +37,10 @@ One page per subcommand. Pages follow a consistent shape:
 
 ## Claude usage rollups
 
+Claude dollar and token totals follow the shared
+[Claude cost coverage contract](../claude-cost-coverage.md): they are
+transcript-derived lower bounds, not exact `/usage` billing totals.
+
 | Command | Page |
 | --- | --- |
 | `daily` | [daily.md](daily.md) |

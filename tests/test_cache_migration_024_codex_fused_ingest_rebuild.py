@@ -277,10 +277,11 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # Head is 30 after #195 appended 030_session_entries_cache_creation_split
+        # (29 after #341's 029_backfill_claude_account); the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 29
+        assert _version(conn) == 30
     finally:
         conn.close()
 
@@ -311,10 +312,11 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # Head is 30 after #195 appended 030_session_entries_cache_creation_split
+        # (29 after #341's 029_backfill_claude_account); the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 29
+        assert _version(conn) == 30
     finally:
         conn.close()
 
@@ -346,10 +348,11 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 29 after #341 appended 029_backfill_claude_account; the
+        # Head is 30 after #195 appended 030_session_entries_cache_creation_split
+        # (29 after #341's 029_backfill_claude_account); the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 29
+        assert _version(conn) == 30
     finally:
         conn.close()
 

@@ -6,6 +6,7 @@ import http.client
 import json
 import socketserver
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -208,6 +209,51 @@ def _sessions_recipe(source):
     }
 
 
+def _current_week_recipe(source, digest):
+    return {
+        "snapshot": {
+            "panel": "current-week",
+            "template_id": "current-week-recap",
+            "source": source,
+            "options": {
+                "format": "html", "theme": "light",
+                "reveal_projects": False, "no_branding": False,
+                "show_chart": True, "show_table": True,
+            },
+            "data_digest_at_add": digest,
+            "kernel_version": 1,
+        },
+    }
+
+
+def _set_hero_freshness(ns, *, claude=None, codex=None):
+    snap = ns["DashboardHTTPHandler"].snapshot_ref.get()
+    old_claude = snap.source_bundle.sources["claude"]
+    old_codex = snap.source_bundle.sources["codex"]
+
+    def changed(state, value):
+        if value is None:
+            return state
+        domain_freshness = dict(state.domain_freshness)
+        domain_freshness["hero"] = value
+        return replace(state, domain_freshness=domain_freshness)
+
+    new_claude = changed(old_claude, claude)
+    new_codex = changed(old_codex, codex)
+    snap.source_bundle = SourceDashboardBundle(
+        source_schema_version=1,
+        default_source="claude",
+        source_order=("claude", "codex", "all"),
+        sources={
+            "claude": new_claude,
+            "codex": new_codex,
+            "all": compose_all_state(new_claude, new_codex),
+        },
+    )
+    ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](snap)
+    return old_claude, old_codex, new_claude, new_codex
+
+
 def test_source_share_defaults_omitted_source_to_legacy_claude_response(monkeypatch, tmp_path):
     ns = load_script()
     share_lib = ns["_share_load_lib"]()
@@ -310,6 +356,218 @@ def test_codex_current_week_share_uses_canonical_week_period_and_token_chrome(
         assert (snapshot.period.end - snapshot.period.start) > dt.timedelta(days=1)
         assert [column.label for column in snapshot.columns] == ["Week", "Tokens", "$ Cost"]
         assert "Current data" not in result["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_current_week_hero_freshness_changes_disclosure_digest_and_composer_drift(
+    monkeypatch, tmp_path,
+):
+    """RED for #400: weekly rows and provider data_version stay byte-identical
+    while the panel-local hero freshness changes."""
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    note = "Codex current-week spend is based on stale provider-cycle evidence."
+    try:
+        fresh_by_format = {}
+        for fmt in ("md", "html", "svg"):
+            status, result = _render(
+                server,
+                source_marker="codex",
+                panel="current-week",
+                template_id="current-week-recap",
+                options={"format": fmt},
+            )
+            assert status == 200
+            assert note not in result["body"]
+            assert "$2.00" in result["body"]
+            fresh_by_format[fmt] = result
+
+        assert len({
+            result["snapshot"]["data_digest"]
+            for result in fresh_by_format.values()
+        }) == 1
+        fresh_digest = fresh_by_format["md"]["snapshot"]["data_digest"]
+
+        status, weekly_fresh = _render(
+            server,
+            source_marker="codex",
+            panel="weekly",
+            template_id="weekly-recap",
+        )
+        assert status == 200
+
+        old_claude, old_codex, new_claude, new_codex = _set_hero_freshness(
+            ns, codex="stale",
+        )
+        assert old_codex.data_version == new_codex.data_version == "codex-v1"
+        assert old_codex.data["periods"]["weekly"] == new_codex.data["periods"]["weekly"]
+        assert old_claude.data_version == new_claude.data_version == "claude-v1"
+
+        stale_by_format = {}
+        for fmt in ("md", "html", "svg"):
+            status, result = _render(
+                server,
+                source_marker="codex",
+                panel="current-week",
+                template_id="current-week-recap",
+                options={"format": fmt},
+            )
+            assert status == 200
+            assert note in result["body"]
+            assert "$2.00" in result["body"]
+            stale_by_format[fmt] = result
+
+        stale_digests = {
+            result["snapshot"]["data_digest"]
+            for result in stale_by_format.values()
+        }
+        assert len(stale_digests) == 1
+        stale_digest = stale_by_format["md"]["snapshot"]["data_digest"]
+        assert stale_digest != fresh_digest
+
+        status, weekly_stale = _render(
+            server,
+            source_marker="codex",
+            panel="weekly",
+            template_id="weekly-recap",
+        )
+        assert status == 200
+        assert weekly_stale["snapshot"]["data_digest"] == weekly_fresh["snapshot"]["data_digest"]
+        assert note not in weekly_stale["body"]
+
+        status, composed = _request(server, "POST", "/api/share/compose", {
+            "title": "Current week", "theme": "light", "format": "html",
+            "no_branding": False, "reveal_projects": False,
+            "sections": [_current_week_recipe("codex", fresh_digest)],
+        })
+        assert status == 200
+        section = composed["snapshot"]["section_results"][0]
+        assert section["data_digest_at_add"] == fresh_digest
+        assert section["data_digest_now"] == stale_digest
+        assert section["drift_detected"] is True
+        assert note in composed["body"]
+        assert "$2.00" in composed["body"]
+
+        status, refreshed = _request(server, "POST", "/api/share/compose", {
+            "title": "Current week", "theme": "light", "format": "html",
+            "no_branding": False, "reveal_projects": False,
+            "sections": [_current_week_recipe("codex", stale_digest)],
+        })
+        assert status == 200
+        section = refreshed["snapshot"]["section_results"][0]
+        assert section["data_digest_now"] == stale_digest
+        assert section["drift_detected"] is False
+        assert note in refreshed["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("claude_freshness", "codex_freshness", "expected", "absent"),
+    (
+        ("fresh", "stale", "Codex current-week spend", "Claude current-week spend"),
+        ("stale", "fresh", "Claude current-week spend", "Codex current-week spend"),
+    ),
+)
+def test_all_current_week_disclosure_stays_provider_local(
+    monkeypatch, tmp_path, claude_freshness, codex_freshness, expected, absent,
+):
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    try:
+        _set_hero_freshness(
+            ns, claude=claude_freshness, codex=codex_freshness,
+        )
+        for fmt in ("md", "html", "svg"):
+            status, result = _render(
+                server,
+                source_marker="all",
+                panel="current-week",
+                template_id="current-week-recap",
+                options={"format": fmt},
+            )
+            assert status == 200
+            assert expected in result["body"]
+            assert absent not in result["body"]
+            assert "Claude" in result["body"]
+            assert "Codex" in result["body"]
+            assert "$2.00" in result["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_explicit_claude_current_week_retains_actual_and_digests_hero_freshness(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    note = "Claude current-week spend is based on stale provider-cycle evidence."
+    try:
+        status, fresh = _render(
+            server,
+            source_marker="claude",
+            panel="current-week",
+            template_id="current-week-recap",
+        )
+        assert status == 200
+        assert note not in fresh["body"]
+        assert "$0.00" in fresh["body"]
+
+        old_claude, _old_codex, new_claude, _new_codex = _set_hero_freshness(
+            ns, claude="stale",
+        )
+        assert old_claude.data_version == new_claude.data_version == "claude-v1"
+        assert (
+            old_claude.data["periods"]["weekly"]
+            == new_claude.data["periods"]["weekly"]
+        )
+
+        status, stale = _render(
+            server,
+            source_marker="claude",
+            panel="current-week",
+            template_id="current-week-recap",
+        )
+        assert status == 200
+        assert note in stale["body"]
+        assert "$0.00" in stale["body"]
+        assert stale["snapshot"]["data_digest"] != fresh["snapshot"]["data_digest"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    try:
+        status, fresh = _render(
+            server,
+            source_marker=None,
+            panel="current-week",
+            template_id="current-week-recap",
+        )
+        assert status == 200
+        _set_hero_freshness(ns, claude="stale")
+        status, stale = _render(
+            server,
+            source_marker=None,
+            panel="current-week",
+            template_id="current-week-recap",
+        )
+        assert status == 200
+        assert stale == fresh
+        assert "stale provider-cycle evidence" not in stale["body"]
     finally:
         server.shutdown()
         server.server_close()

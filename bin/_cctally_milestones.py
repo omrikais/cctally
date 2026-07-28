@@ -16,6 +16,7 @@ reached via the call-time _cctally() accessor (ns-patchable). No _lib_ kernel.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import sqlite3
 import sys
@@ -40,6 +41,34 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+def _own_conn_stats_guard():
+    """The sanctioned regime for the three ``own_conn`` reconcile branches (#386).
+
+    ``_reconcile_budget_on_config_write``, its Codex twin, and
+    ``_reconcile_project_budget_milestones_on_write`` each accept ``conn=None``
+    and then ``open_db()`` → write → ``commit()`` → ``close()``. That branch
+    writes stats.db OUTSIDE the ingest cycle and outside every lock — the
+    R1-RESIDUAL the #386 mutation inventory recorded. No production caller
+    reaches it today (all nine route through ``reconcile_budget_config`` with
+    ``conn=ctx.conn``; only ``bin/cctally-reconcile-test`` calls it directly),
+    but it is one careless caller away from being real, and the whole body sits
+    inside a best-effort ``except Exception`` that would swallow the authorizer's
+    denial into a log line — a silently-dropped milestone, not a loud failure.
+
+    Rather than delete a branch a live harness depends on, the branch is ROUTED:
+    it becomes a genuine spec §3.1 administrative writer, holding
+    ``stats.db.maintenance.lock`` exclusive (re-entrant — a caller that already
+    owns it is not made to wait on itself) for the duration and declaring the
+    sanctioned scope the authorizer checks. Self-sanctioning WITHOUT the lock
+    was the option rejected: it would have made the guard agree with a writer
+    that is still unserialized.
+    """
+    import _cctally_store
+
+    return _cctally_store.stats_open_time_guard()
+
+
+
 @dataclass
 class WeekCostResult:
     week_start: dt.date
@@ -59,9 +88,17 @@ def compute_week_cost(
     end_iso_override: str | None = None,
     *,
     account_key: "str | None" = None,
+    as_of: "str | None" = None,
 ) -> WeekCostResult:
+    # `as_of` (#372 Task B) makes historical rederivation range-bounded by the
+    # retained triggering record instead of leaking later cache rows through the
+    # host wall clock. Normal callers omit it and retain the existing behavior.
     # internal fallback: host-local intentional
-    now_local = dt.datetime.now().astimezone()
+    now_local = (
+        parse_iso_datetime(as_of, "asOf").astimezone()
+        if as_of is not None
+        else dt.datetime.now().astimezone()
+    )
     start_dt_override = (
         parse_iso_datetime(start_iso_override, "weekStartAt")
         if start_iso_override
@@ -82,22 +119,35 @@ def compute_week_cost(
         start_iso = format_local_iso(week_start, end_of_day=False)
 
     if end_dt_override is not None:
-        in_current_window = (
-            start_dt_override is not None
-            and start_dt_override <= now_local < end_dt_override
-        )
-        end_iso = (
-            now_local.isoformat(timespec="seconds")
-            if in_current_window
-            else end_dt_override.isoformat(timespec="seconds")
-        )
+        if as_of is not None:
+            # A historical custom sync may name a window that starts after the
+            # op. The retained clock is an unconditional upper bound.
+            end_iso = min(now_local, end_dt_override).isoformat(
+                timespec="seconds"
+            )
+        else:
+            in_current_window = (
+                start_dt_override is not None
+                and start_dt_override <= now_local < end_dt_override
+            )
+            end_iso = (
+                now_local.isoformat(timespec="seconds")
+                if in_current_window
+                else end_dt_override.isoformat(timespec="seconds")
+            )
     else:
-        is_current_week = week_start <= now_local.date() <= week_end
-        end_iso = (
-            now_local.isoformat(timespec="seconds")
-            if is_current_week
-            else format_local_iso(week_end, end_of_day=True)
+        declared_end = parse_iso_datetime(
+            format_local_iso(week_end, end_of_day=True), "weekEnd"
         )
+        if as_of is not None:
+            end_iso = min(now_local, declared_end).isoformat(timespec="seconds")
+        else:
+            is_current_week = week_start <= now_local.date() <= week_end
+            end_iso = (
+                now_local.isoformat(timespec="seconds")
+                if is_current_week
+                else declared_end.isoformat(timespec="seconds")
+            )
 
     start_dt = parse_iso_datetime(start_iso, "start")
     end_dt = parse_iso_datetime(end_iso, "end")
@@ -857,32 +907,38 @@ def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_o
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
         now_utc = _as_of_or_command(as_of)
-        if own_conn:
-            conn = open_db()
-        try:
-            ladders = []
-            if amount_usd is not None:
-                ladders.append(("*", amount_usd))
-            ladders.extend((k, v) for k, v in accounts.items())
-            for acct_key, acct_usd in ladders:
-                _reconcile_budget_milestones_on_set(
-                    conn,
-                    vendor="codex",
-                    target=acct_usd,
-                    thresholds=thresholds,
-                    now_utc=now_utc,
-                    period=codex["period"],
-                    config=config,
-                    tz=tz,
-                    as_of=as_of,
-                    commit=False,
-                    account_key=acct_key,
-                )
+        # #386 R1-RESIDUAL: an own_conn write is an ADMINISTRATIVE stats
+        # writer — outside the ingest cycle and, before this, outside every
+        # lock. It now takes the maintenance lock + the sanctioned scope.
+        # See _own_conn_stats_guard.
+        with (_own_conn_stats_guard() if own_conn
+              else contextlib.nullcontext()):
             if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
+                conn = open_db()
+            try:
+                ladders = []
+                if amount_usd is not None:
+                    ladders.append(("*", amount_usd))
+                ladders.extend((k, v) for k, v in accounts.items())
+                for acct_key, acct_usd in ladders:
+                    _reconcile_budget_milestones_on_set(
+                        conn,
+                        vendor="codex",
+                        target=acct_usd,
+                        thresholds=thresholds,
+                        now_utc=now_utc,
+                        period=codex["period"],
+                        config=config,
+                        tz=tz,
+                        as_of=as_of,
+                        commit=False,
+                        account_key=acct_key,
+                    )
+                if own_conn:
+                    conn.commit()
+            finally:
+                if own_conn:
+                    conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(f"[codex-budget-milestone] reconcile on set failed: {exc}")
 
@@ -915,32 +971,38 @@ def _reconcile_budget_on_config_write(validated_budget, *, conn=None, as_of=None
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
         now_utc = _as_of_or_command(as_of)
-        if own_conn:
-            conn = open_db()
-        try:
-            ladders = []
-            if weekly_usd is not None:
-                ladders.append(("*", weekly_usd))
-            ladders.extend((k, v) for k, v in accounts.items())
-            for acct_key, acct_usd in ladders:
-                _reconcile_budget_milestones_on_set(
-                    conn,
-                    vendor="claude",
-                    target=acct_usd,
-                    thresholds=thresholds,
-                    now_utc=now_utc,
-                    period=period,
-                    config=config,
-                    tz=tz,
-                    as_of=as_of,
-                    commit=False,
-                    account_key=acct_key,
-                )
+        # #386 R1-RESIDUAL: an own_conn write is an ADMINISTRATIVE stats
+        # writer — outside the ingest cycle and, before this, outside every
+        # lock. It now takes the maintenance lock + the sanctioned scope.
+        # See _own_conn_stats_guard.
+        with (_own_conn_stats_guard() if own_conn
+              else contextlib.nullcontext()):
             if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
+                conn = open_db()
+            try:
+                ladders = []
+                if weekly_usd is not None:
+                    ladders.append(("*", weekly_usd))
+                ladders.extend((k, v) for k, v in accounts.items())
+                for acct_key, acct_usd in ladders:
+                    _reconcile_budget_milestones_on_set(
+                        conn,
+                        vendor="claude",
+                        target=acct_usd,
+                        thresholds=thresholds,
+                        now_utc=now_utc,
+                        period=period,
+                        config=config,
+                        tz=tz,
+                        as_of=as_of,
+                        commit=False,
+                        account_key=acct_key,
+                    )
+                if own_conn:
+                    conn.commit()
+            finally:
+                if own_conn:
+                    conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(f"[budget-milestone] reconcile on set failed: {exc}")
 
@@ -1018,53 +1080,59 @@ def _reconcile_project_budget_milestones_on_write(
     c = _cctally()
     own_conn = conn is None
     try:
-        if own_conn:
-            conn = open_db()
-        try:
-            now_utc = _as_of_or_command(as_of)
-            window = c._resolve_current_budget_window(conn, now_utc)
-            if window is None:
-                return
-            week_start_at, _week_end_at = window
-            week_key = week_start_at.isoformat(timespec="seconds")
-            by_proj = c._sum_cost_by_project(week_start_at, now_utc, mode="auto")
-            items = (
-                projects.items()
-                if touched_projects is None
-                else [
-                    (k, v) for k, v in projects.items()
-                    if k in touched_projects
-                ]
-            )
-            # Same crossing arithmetic as firing, via the shared generator
-            # (#130). Reconcile differs ONLY in the tail: UPDATE alerted_at with
-            # NO dispatch (retroactive-storm suppression). `items` already
-            # honors touched_projects filtering above.
-            for project_key, t, spent, target, consumption_pct in c._project_crossings(
-                items, thresholds, by_proj
-            ):
-                insert_project_budget_milestone(
-                    conn,
-                    week_start_at=week_key,
-                    project_key=project_key,
-                    threshold=t,
-                    budget_usd=target,
-                    spent_usd=spent,
-                    consumption_pct=consumption_pct,
-                    commit=False,
-                    as_of=as_of,
-                )
-                conn.execute(
-                    "UPDATE project_budget_milestones SET alerted_at = ? "
-                    "WHERE week_start_at = ? AND project_key = ? "
-                    "  AND threshold = ? AND alerted_at IS NULL",
-                    (as_of or now_utc_iso(), week_key, project_key, t),
-                )
+        # #386 R1-RESIDUAL: an own_conn write is an ADMINISTRATIVE stats
+        # writer — outside the ingest cycle and, before this, outside every
+        # lock. It now takes the maintenance lock + the sanctioned scope.
+        # See _own_conn_stats_guard.
+        with (_own_conn_stats_guard() if own_conn
+              else contextlib.nullcontext()):
             if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
+                conn = open_db()
+            try:
+                now_utc = _as_of_or_command(as_of)
+                window = c._resolve_current_budget_window(conn, now_utc)
+                if window is None:
+                    return
+                week_start_at, _week_end_at = window
+                week_key = week_start_at.isoformat(timespec="seconds")
+                by_proj = c._sum_cost_by_project(week_start_at, now_utc, mode="auto")
+                items = (
+                    projects.items()
+                    if touched_projects is None
+                    else [
+                        (k, v) for k, v in projects.items()
+                        if k in touched_projects
+                    ]
+                )
+                # Same crossing arithmetic as firing, via the shared generator
+                # (#130). Reconcile differs ONLY in the tail: UPDATE alerted_at with
+                # NO dispatch (retroactive-storm suppression). `items` already
+                # honors touched_projects filtering above.
+                for project_key, t, spent, target, consumption_pct in c._project_crossings(
+                    items, thresholds, by_proj
+                ):
+                    insert_project_budget_milestone(
+                        conn,
+                        week_start_at=week_key,
+                        project_key=project_key,
+                        threshold=t,
+                        budget_usd=target,
+                        spent_usd=spent,
+                        consumption_pct=consumption_pct,
+                        commit=False,
+                        as_of=as_of,
+                    )
+                    conn.execute(
+                        "UPDATE project_budget_milestones SET alerted_at = ? "
+                        "WHERE week_start_at = ? AND project_key = ? "
+                        "  AND threshold = ? AND alerted_at IS NULL",
+                        (as_of or now_utc_iso(), week_key, project_key, t),
+                    )
+                if own_conn:
+                    conn.commit()
+            finally:
+                if own_conn:
+                    conn.close()
     except Exception as exc:  # best-effort; never fail the write
         eprint(
             f"[project-budget-milestone] reconcile on write failed: {exc}"

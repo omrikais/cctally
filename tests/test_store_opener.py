@@ -111,6 +111,73 @@ def test_second_open_cache_executes_zero_ddl(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_second_open_cache_reconciles_durable_migration_error_without_ddl(
+    tmp_path, monkeypatch
+):
+    """The version-current fast opener retries stale sentinel cleanup."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _store, _db = _fresh_siblings()
+    ns["open_cache_db"]().close()
+
+    applied_name = _db._CACHE_MIGRATIONS[-1].name
+    qualified_name = f"cache.db:{applied_name}"
+    _cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.MIGRATION_ERROR_LOG_PATH.write_text(
+        f"[2026-07-24T10:00:00Z] {qualified_name}\n"
+        "  RuntimeError: stale cache failure\n"
+        "  Traceback: stale cache traceback\n\n"
+        "[2026-07-24T10:01:00Z] stats.db:999_unresolved\n"
+        "  RuntimeError: live stats failure\n"
+        "  Traceback: live stats traceback\n\n"
+    )
+
+    counter = _DdlCounter()
+    monkeypatch.setattr(_store, "_TRACE_HOOK", counter)
+    ns["open_cache_db"]().close()
+
+    assert counter.count == 0, (
+        f"sentinel reconciliation must not re-run schema DDL: {counter.statements}"
+    )
+    remaining = _cctally_core.MIGRATION_ERROR_LOG_PATH.read_text()
+    assert qualified_name not in remaining
+    assert "stats.db:999_unresolved" in remaining
+
+
+def test_epoch_current_stats_open_reconciles_durable_migration_error(
+    tmp_path, monkeypatch
+):
+    """The live epoch fast path retries stale stats sentinel cleanup."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _store, _db = _fresh_siblings()
+    first = ns["open_db"]()
+    try:
+        assert first.execute("PRAGMA user_version").fetchone()[0] == (
+            _cctally_core.STATS_INDEX_EPOCH
+        )
+    finally:
+        first.close()
+
+    applied_name = _db._STATS_MIGRATIONS[-1].name
+    qualified_name = f"stats.db:{applied_name}"
+    _cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _cctally_core.MIGRATION_ERROR_LOG_PATH.write_text(
+        f"[2026-07-24T10:00:00Z] {qualified_name}\n"
+        "  RuntimeError: stale stats failure\n"
+        "  Traceback: stale stats traceback\n\n"
+        "[2026-07-24T10:01:00Z] cache.db:999_unresolved\n"
+        "  RuntimeError: live cache failure\n"
+        "  Traceback: live cache traceback\n\n"
+    )
+
+    ns["open_db"]().close()
+
+    remaining = _cctally_core.MIGRATION_ERROR_LOG_PATH.read_text()
+    assert qualified_name not in remaining
+    assert "cache.db:999_unresolved" in remaining
+
+
 # --------------------------------------------------------------------------
 # (c) bumping the registry head re-triggers apply exactly once
 # --------------------------------------------------------------------------

@@ -10,6 +10,41 @@ import _fixture_builders as fb
 from _cctally_db import _CACHE_MIGRATIONS, _STATS_MIGRATIONS
 
 
+def test_create_stats_db_closes_builder_connection(monkeypatch, tmp_path):
+    """The fixture transaction context must not leave its connection open."""
+    real_connect = sqlite3.connect
+    opened = []
+
+    class TrackingConnection(sqlite3.Connection):
+        explicitly_closed = False
+
+        def close(self):
+            self.explicitly_closed = True
+            return super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(fb.sqlite3, "connect", tracking_connect)
+    db = tmp_path / "stats.db"
+    fb.create_stats_db(db)
+
+    assert len(opened) == 1
+    assert opened[0].explicitly_closed
+
+    check = real_connect(db)
+    try:
+        assert check.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='weekly_usage_snapshots'"
+        ).fetchone() == ("weekly_usage_snapshots",)
+    finally:
+        check.close()
+
+
 def test_stamp_marks_every_registered_migration_and_advances_user_version():
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "stats.db"

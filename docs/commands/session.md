@@ -4,6 +4,10 @@ Claude usage grouped by `sessionId`. Resumed sessions (same `sessionId`
 across multiple JSONL files via `claude --resume`) collapse into a single
 row. 11-column layout that parallels [`codex-session`](codex-session.md).
 
+> **Cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 > Canonical form: [`cctally claude session`](claude.md) (this flat form remains as an alias).
 
 ## Synopsis

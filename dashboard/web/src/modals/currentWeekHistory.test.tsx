@@ -466,3 +466,78 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     expect(within(claude).getByText('Jul 16–Jul 18')).toBeTruthy();
   });
 });
+
+describe('current-cycle range and reset semantics (#412 Task B)', () => {
+  it('renders a complete Claude week label exactly once', () => {
+    const env = makeEnv(INDEX);
+    env.header.week_label = 'May 15–22';
+    env.current_week!.reset_at_utc = '2026-05-22T00:00:00Z';
+    updateSnapshot(env);
+
+    render(<CurrentWeekModal />);
+
+    expect(document.querySelector('#mcw-week-pill')).toHaveTextContent(/^May 15–22$/);
+    expect(document.querySelector('#mcw-week-pill')).not.toHaveTextContent('→ May 22');
+  });
+
+  it('labels the reset-derived Claude fallback when the week label is absent', () => {
+    const env = makeEnv(INDEX);
+    env.header.week_label = null;
+    env.current_week!.reset_at_utc = '2026-05-22T00:00:00Z';
+    updateSnapshot(env);
+
+    render(<CurrentWeekModal />);
+
+    expect(document.querySelector('#mcw-week-pill')).toHaveTextContent(/^Resets May 22$/);
+  });
+
+  it('keeps the ordinary reset label when a Codex historic range ends at its nominal reset', async () => {
+    const equal = {
+      ...CODEX_IDX[1],
+      start_at_utc: '2026-04-16T00:00:00Z',
+      end_at_utc: '2026-04-23T00:00:00Z',
+      resets_at_utc: '2026-04-23T00:00:00Z',
+    };
+    mockFetch({
+      source: 'codex', ...equal, segments: [{ key: 'equal', milestones: [] }],
+      dividers: [], blocks: [],
+    });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
+    updateSnapshot(codexEnvWithIndex([CODEX_IDX[0], equal]));
+
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+
+    await screen.findByText('Apr 16–Apr 23');
+    const mini = document.querySelector<HTMLElement>('#mcw-mini')!;
+    expect(within(mini).getByText(/^reset$/i)).toBeTruthy();
+    expect(within(mini).queryByText(/nominal reset/i)).toBeNull();
+  });
+
+  it('labels a later nominal reset without rewriting the effective clipped Codex range', async () => {
+    const clipped = {
+      ...CODEX_IDX[1],
+      start_at_utc: '2026-07-13T00:00:00Z',
+      end_at_utc: '2026-07-20T00:00:00Z',
+      resets_at_utc: '2026-07-27T00:00:00Z',
+      label: 'Jul 13–20',
+    };
+    mockFetch({
+      source: 'codex', ...clipped, segments: [{ key: 'clipped', milestones: [] }],
+      dividers: [], blocks: [],
+    });
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
+    updateSnapshot(codexEnvWithIndex([CODEX_IDX[0], clipped]));
+
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older week'));
+
+    await screen.findByText('Jul 13–Jul 20');
+    expect(document.querySelector('#mcw-week-pill')).toHaveTextContent(/^Jul 13–Jul 20$/);
+    const mini = document.querySelector<HTMLElement>('#mcw-mini')!;
+    expect(within(mini).getByText(/nominal reset/i)).toBeTruthy();
+    expect(mini).toHaveTextContent('Jul 27');
+  });
+});

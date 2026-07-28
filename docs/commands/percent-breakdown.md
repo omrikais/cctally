@@ -2,6 +2,10 @@
 
 Per-percent cumulative and marginal cost milestones for a single week.
 
+> **Cost coverage:** Stored Claude milestone costs are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals.
+
 ## Synopsis
 
 ```

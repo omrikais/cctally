@@ -191,20 +191,22 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 29,
+                            "registry_size": 30,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1001,
+                            "epoch": 1004,
+                            "journal_has_bytes": false,
+                            "journal_present": false,
                             "legacy_head": 13,
                             "mismatch": true,
                             "user_version": 99
                         }
                     },
                     "id": "db.version_ahead",
-                    "remediation": "Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`",
+                    "remediation": "Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`",
                     "severity": "warn",
-                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1001) \u2014 rebuilds from journal",
+                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1004) \u2014 no journal data available",
                     "title": "Version ahead"
                 },
                 {
@@ -242,7 +244,8 @@
                                     "026_codex_conversation_key_backfill",
                                     "027_codex_fork_preamble_rebuild",
                                     "028_split_conversation_store",
-                                    "029_backfill_claude_account"
+                                    "029_backfill_claude_account",
+                                    "030_session_entries_cache_creation_split"
                                 ],
                                 "skipped": []
                             },
@@ -270,7 +273,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/42 applied",
+                    "summary": "0/43 applied",
                     "title": "Migrations"
                 },
                 {
@@ -443,13 +446,17 @@
                             [
                                 "cache.db",
                                 "029_backfill_claude_account"
+                            ],
+                            [
+                                "cache.db",
+                                "030_session_entries_cache_creation_split"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "42 pending",
+                    "summary": "43 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -542,6 +549,37 @@
                     "severity": "ok",
                     "summary": "no auto-heal incidents",
                     "title": "Auto-heal"
+                },
+                {
+                    "details": {
+                        "entries": 0
+                    },
+                    "id": "journal.writer_guard",
+                    "severity": "ok",
+                    "summary": "no unsanctioned stats.db writes recorded",
+                    "title": "Stats writer guard"
+                },
+                {
+                    "details": {
+                        "available": null,
+                        "conflicts": null,
+                        "scanned": false
+                    },
+                    "id": "journal.conflicts",
+                    "severity": "ok",
+                    "summary": "not scanned",
+                    "title": "Journal conflicts"
+                },
+                {
+                    "details": {
+                        "error": null,
+                        "scanned": false,
+                        "violations": null
+                    },
+                    "id": "journal.protocol",
+                    "severity": "ok",
+                    "summary": "not scanned",
+                    "title": "Journal protocol"
                 }
             ],
             "id": "journal",
@@ -746,6 +784,16 @@
                     "title": "Dashboard bind"
                 },
                 {
+                    "details": {
+                        "provider": "Time Machine",
+                        "status": "excluded"
+                    },
+                    "id": "safety.backup_sync",
+                    "severity": "ok",
+                    "summary": "cctally data excluded from Time Machine",
+                    "title": "Backup/sync"
+                },
+                {
                     "details": {},
                     "id": "safety.config_json_valid",
                     "severity": "ok",
@@ -808,7 +856,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 42,
+            "ok": 46,
             "warn": 6
         },
         "severity": "warn"

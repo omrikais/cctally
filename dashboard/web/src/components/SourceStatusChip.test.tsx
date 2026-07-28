@@ -30,6 +30,30 @@ describe('SourceStatusChip (§6.8)', () => {
     expect(chip).not.toHaveClass('is-degraded');
   });
 
+  it('keeps provider status fresh when only hero and quota domains are stale', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.codex = {
+          ...b.sources.codex,
+          freshness: 'fresh',
+          domain_freshness: {
+            hero: 'stale',
+            quota: 'stale',
+            sessions: 'fresh',
+          },
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<SourceStatusChip />);
+
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip).toHaveTextContent('fresh');
+    expect(chip).toHaveAttribute('title', 'fresh');
+    expect(chip).toHaveAttribute('aria-label', 'codex source status: fresh');
+    expect(chip).not.toHaveClass('is-stale');
+  });
+
   it('shows generic concise copy + degraded style for an unscoped partial/stale warning', () => {
     updateSnapshot(
       envWith((b) => {

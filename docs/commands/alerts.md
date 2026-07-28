@@ -7,6 +7,11 @@ percent crossing — no extra wiring beyond enabling the feature. The OS
 popup is dispatched cross-platform — `osascript` on macOS, `notify-send`
 on Linux, or a custom command (see [Dispatch backends](#dispatch-backends)).
 
+> **Cost coverage:** Claude costs shown in weekly, five-hour, or budget alert
+> payloads are [transcript-derived lower
+> bounds](../claude-cost-coverage.md), not exact `/usage` billing totals.
+> Codex budget alerts use the separate Codex accounting source.
+
 ## When it helps
 
 You're pacing fine right now, but a long agent run mid-week could push

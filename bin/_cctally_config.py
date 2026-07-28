@@ -434,8 +434,10 @@ def _config_codex_leaf_value(config: dict, key: str) -> object:
     return list(value) if isinstance(value, list) else value
 
 
-def _resolve_one_account_budget_ref(conn, ref: object, provider: str,
-                                    label: str) -> str:
+def _resolve_one_account_budget_ref(
+    conn, ref: object, provider: str, label: str,
+    *, stats_maintenance_unavailable: bool = False,
+) -> str:
     """Resolve one per-account-budget ref to an immutable account_key at WRITE
     time (#341, spec §6 — a later label rename must never retarget the budget).
 
@@ -456,6 +458,12 @@ def _resolve_one_account_budget_ref(conn, ref: object, provider: str,
     if _re.fullmatch(r"[0-9a-f]{32}", ref):
         return ref  # already an immutable account_key
     if conn is None:
+        if stats_maintenance_unavailable:
+            raise _BudgetConfigError(
+                f"{label}: cannot resolve account ref {ref!r} while stats.db "
+                "maintenance is in progress; retry after it completes or use "
+                "the 32-hex account key"
+            )
         raise _BudgetConfigError(
             f"{label}: cannot resolve account ref {ref!r} — no accounts observed "
             "yet; use the 32-hex account key"
@@ -475,13 +483,44 @@ def _normalize_account_budget_refs(raw_obj: dict, provider: str,
     (validated numerically by ``_validate_account_budget_map`` under the lock)."""
     import sqlite3
     conn = None
+    stats_maintenance_unavailable = False
     try:
         db_path = _cctally_core.DB_PATH
         if db_path.exists():
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            # #386: `mode=ro` is not exempt from the opener protocol — measured,
+            # it CREATES `-shm`/`-wal` when they are absent.
+            #
+            # LOCK ORDER, deliberately noted: this runs under
+            # `config_writer_lock`, so it takes `stats.db.maintenance.lock`
+            # SHARED while holding it. That edge is safe because it is one-way —
+            # no stats maintenance path writes config.json, so no holder of the
+            # stats maintenance lock ever waits on `config_writer_lock`. Adding
+            # such a writer would create a cycle; don't.
+            #
+            # A database read failure degrades to `conn = None`, which preserves
+            # raw 32-hex account-key writes but cannot resolve label/email/prefix
+            # refs. A bounded maintenance-lock timeout is distinguished below
+            # so the user is told to retry after maintenance instead of being
+            # told that no accounts have been observed.
+            import _cctally_store
+            import _cctally_db
+            try:
+                conn = _cctally_store.stats_open_guarded(
+                    db_path,
+                    connect=lambda p: sqlite3.connect(
+                        f"file:{p}?mode=ro", uri=True),
+                )
+            except _cctally_db.StatsDbMaintenanceError:
+                stats_maintenance_unavailable = True
+                conn = None
+            except sqlite3.DatabaseError:
+                conn = None
         out: dict = {}
         for ref, val in raw_obj.items():
-            key = _resolve_one_account_budget_ref(conn, ref, provider, label)
+            key = _resolve_one_account_budget_ref(
+                conn, ref, provider, label,
+                stats_maintenance_unavailable=stats_maintenance_unavailable,
+            )
             out[key] = val
         return out
     finally:

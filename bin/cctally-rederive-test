@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# Production-shaped CLI acceptance harness for #372 Task C.
+
+set -uo pipefail
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRATCH="$(mktemp -d -t cctally-rederive-XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+export REPO_ROOT
+
+FAKE_HOME="$SCRATCH/home"
+mkdir -p "$FAKE_HOME"
+export HOME="$FAKE_HOME"
+export TZ=Etc/UTC
+export NO_COLOR=1
+export CCTALLY_DISABLE_TELEMETRY=1
+
+pass_count=0
+fail_count=0
+
+pass () {
+    echo "PASS $1"
+    pass_count=$((pass_count + 1))
+}
+
+fail () {
+    echo "FAIL $1"
+    fail_count=$((fail_count + 1))
+}
+
+python3 - <<'PY' >"$SCRATCH/seed.log" 2>&1
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(os.environ["REPO_ROOT"])
+path = root / "bin" / "cctally"
+loader = importlib.machinery.SourceFileLoader("cctally", str(path))
+spec = importlib.util.spec_from_loader("cctally", loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["cctally"] = mod
+loader.exec_module(mod)
+
+import _cctally_journal as runtime
+import _cctally_core as core
+import _lib_journal as journal
+
+at = "2099-01-01T12:00:00Z"
+source = "/tmp/claude/projects/repo/session.jsonl"
+cache = mod.open_cache_db()
+cache.execute(
+    "INSERT INTO session_files "
+    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+    "session_id,project_path) VALUES (?,?,?,?,?,?,?)",
+    (source, 100, 1, 100, at, "session-a", "/repo"),
+)
+cache.execute(
+    "INSERT INTO session_entries "
+    "(source_path,line_offset,timestamp_utc,model,input_tokens,output_tokens,"
+    "cache_create_tokens,cache_read_tokens,cache_create_1h_tokens,account_key) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    (
+        source, 0, "2099-01-01T11:00:00+00:00",
+        "claude-3-5-sonnet-20241022", 0, 0, 100, 0, 40, "acct-a",
+    ),
+)
+cache.execute(
+    "INSERT INTO codex_source_roots "
+    "(source_root_key,canonical_root_path,first_seen_utc,last_seen_utc) "
+    "VALUES (?,?,?,?)",
+    ("root-a", "/codex/root-a", at, at),
+)
+cache.execute(
+    "INSERT INTO quota_window_snapshots "
+    "(source,source_root_key,source_path,line_offset,captured_at_utc,"
+    "observed_slot,logical_limit_key,limit_id,limit_name,window_minutes,"
+    "used_percent,resets_at_utc,plan_type,account_key) "
+    "VALUES ('codex',?,?,?,?,?,'limit-primary','native-primary','Primary',"
+    "300,25.0,'2099-01-01T15:00:00Z','pro','unattributed')",
+    ("root-a", "/codex/root-a/rollout.jsonl", 10, at, "primary"),
+)
+cache.commit()
+resets = int(dt.datetime(
+    2099, 1, 5, 0, 0, tzinfo=dt.timezone.utc
+).timestamp())
+obs = journal.make_obs(
+    at=at,
+    src="record-usage",
+    provider="claude",
+    account="acct-a",
+    payload={
+        "captured_at": at,
+        "source": "statusline",
+        "weekly_percent": 10.0,
+        "resets_at": resets,
+        "five_hour_percent": 10.0,
+        "five_hour_resets_at": "2099-01-01T15:00:00Z",
+    },
+)
+desired = mod.plan_claude_usage_rederive(
+    [obs],
+    cache_conn=cache,
+    journal_high_water=("observations-2026-07.jsonl", 1),
+)
+cache.close()
+wrong = []
+for action in desired.actions:
+    payload = dict(action.payload or {})
+    if payload.get("kind") == "snapshot_accept":
+        payload["weekly_percent"] = 99.0
+    if payload.get("kind") == "weekly_cost_snapshot":
+        payload["cost_usd"] += 5.0
+    wrong.append(journal.make_evt(
+        kind=payload.pop("kind"),
+        id=action.event_id,
+        at=action.at,
+        payload=payload,
+    ))
+snapshot_action = next(
+    action for action in desired.actions
+    if (action.payload or {}).get("kind") == "snapshot_accept"
+)
+obsolete_snapshot = dict(snapshot_action.payload)
+obsolete_snapshot.pop("kind")
+stale_key = 987654
+stale = [
+    journal.make_evt(
+        kind="snapshot_accept", id="sa:obsolete-identity",
+        at=snapshot_action.at, payload=obsolete_snapshot,
+    ),
+    journal.make_evt(
+        kind="weekly_credit_effects", id="wce:obsolete", at=at,
+        payload={"suppression": []},
+    ),
+    journal.make_evt(
+        kind="week_reset", id="wr:obsolete", at=at,
+        payload={
+            "detected_at_utc": at,
+            "old_week_end_at": "2099-01-04T00:00:00Z",
+            "new_week_end_at": "2099-01-05T00:00:00Z",
+            "effective_reset_at_utc": at,
+            "observed_pre_credit_pct": 60.0,
+            "account_key": "acct-a",
+            "suppression": [],
+        },
+    ),
+    journal.make_evt(
+        kind="five_hour_credit", id="fhc:obsolete", at=at,
+        payload={
+            "detected_at_utc": at,
+            "five_hour_window_key": stale_key,
+            "prior_percent": 80.0,
+            "post_percent": 10.0,
+            "effective_reset_at_utc": at,
+            "account_key": "acct-a",
+            "suppression": [],
+        },
+    ),
+    journal.make_evt(
+        kind="five_hour_block_close", id="fhbc:obsolete", at=at,
+        payload={
+            "five_hour_window_key": stale_key,
+            "five_hour_resets_at": "2098-12-31T15:00:00Z",
+            "block_start_at": "2098-12-31T10:00:00Z",
+            "first_observed_at_utc": "2098-12-31T10:00:00Z",
+            "last_observed_at_utc": "2098-12-31T14:55:00Z",
+            "final_five_hour_percent": 80.0,
+            "created_at_utc": "2098-12-31T10:00:00Z",
+            "last_updated_at_utc": "2098-12-31T14:55:00Z",
+            "is_closed": 1,
+            "total_cost_usd": 1.0,
+            "account_key": "acct-a",
+            "_models": [{
+                "five_hour_window_key": stale_key,
+                "model": "claude-opus-4",
+                "cost_usd": 1.0,
+                "entry_count": 1,
+                "account_key": "acct-a",
+            }],
+            "_projects": [{
+                "five_hour_window_key": stale_key,
+                "project_path": "/repo/obsolete",
+                "cost_usd": 1.0,
+                "entry_count": 1,
+                "account_key": "acct-a",
+            }],
+        },
+    ),
+]
+retained = [
+    journal.make_account_observe(
+        at="2099-01-01T11:55:00Z", account_key="acct-a",
+        provider="claude", natural_id="uuid-a", email="a@example.test",
+    ),
+    journal.make_account_label(
+        at="2099-01-01T11:56:00Z", account_key="acct-a",
+        provider="claude", label="Primary",
+    ),
+    journal.make_evt(
+        kind="budget", id="bm:codex-keep", at=at,
+        payload={
+            "vendor": "codex", "period_start_at": "2099-01-01T00:00:00Z",
+            "period": "monthly", "threshold": 90, "budget_usd": 100.0,
+            "spent_usd": 90.0, "consumption_pct": 90.0,
+            "crossed_at_utc": at, "account_key": "*",
+        },
+    ),
+    journal.make_evt(
+        kind="projected", id="pjm:codex-keep", at=at,
+        payload={
+            "week_start_at": "2099-01-01T00:00:00Z", "period": "monthly",
+            "metric": "codex_budget_usd", "threshold": 90,
+            "projected_value": 95.0, "denominator": 100.0,
+            "crossed_at_utc": at, "account_key": "*",
+        },
+    ),
+    journal.make_evt(
+        kind="quota_alert_arming", id="qaa:codex-keep", at=at,
+        payload={
+            "source": "codex", "source_root_key": "root-a",
+            "logical_limit_key": "limit-primary", "observed_slot": "primary",
+            "window_minutes": 300, "rule_fingerprint": "rules-v1",
+            "activated_at_utc": at, "account_key": "unattributed",
+        },
+    ),
+]
+fixed = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
+for record in [*retained, obs, *wrong, *stale]:
+    runtime.append_record(record, now_utc=fixed)
+runtime.rebuild_stats_index(update_quota_cache=False)
+core.APP_DIR.joinpath("hwm-7d").write_text("sentinel-week 77\n")
+core.APP_DIR.joinpath("hwm-5h").write_text("sentinel-block 44\n")
+segment = next(core.JOURNAL_DIR.glob("observations-*.jsonl"))
+(pathlib.Path(os.environ["HOME"]).parent / "original-segment.jsonl").write_bytes(
+    segment.read_bytes()
+)
+PY
+
+if [ "$?" -eq 0 ]; then
+    pass "seed deliberately wrong live journal/index"
+else
+    fail "seed deliberately wrong live journal/index"
+    sed -n '1,160p' "$SCRATCH/seed.log"
+fi
+
+fingerprint () {
+    python3 - "$HOME" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / ".local/share/cctally"
+h = hashlib.sha256()
+for path in sorted(root.rglob("*")):
+    h.update(path.relative_to(root).as_posix().encode())
+    h.update(b"\0dir\0" if path.is_dir() else b"\0file\0")
+    if path.is_file():
+        h.update(path.read_bytes())
+print(h.hexdigest())
+PY
+}
+
+manifest () {
+    python3 - "$HOME" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / ".local/share/cctally"
+for path in sorted(root.rglob("*")):
+    rel = path.relative_to(root).as_posix()
+    if path.is_dir():
+        print(f"dir  {rel}")
+    else:
+        print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}")
+PY
+}
+
+find "$HOME/.local/share/cctally" -type f -name '*.lock' -delete
+manifest >"$SCRATCH/before-preview.manifest"
+before_preview="$(fingerprint)"
+preview_json="$("$REPO_ROOT/bin/cctally" db rederive \
+    --family claude-usage --json 2>"$SCRATCH/preview.err")"
+preview_rc=$?
+after_preview="$(fingerprint)"
+manifest >"$SCRATCH/after-preview.manifest"
+if [ "$preview_rc" -eq 0 ] && [ "$before_preview" = "$after_preview" ] && \
+   PREVIEW_JSON="$preview_json" python3 - <<'PY'
+import json
+import os
+p = json.loads(os.environ["PREVIEW_JSON"])
+assert p["schemaVersion"] == 1
+assert p["status"] == "preview"
+assert p["batchId"]
+assert p["actionCounts"]["supersede"] >= 2
+assert p["actionCounts"]["tombstone"] >= 5
+assert p["conflicts"] == []
+assert p["dataGaps"] == []
+assert p["errors"] == []
+assert p["rebuild"] is None
+assert p["noOp"] is False
+PY
+then
+    pass "preview JSON and byte-for-byte immutability"
+else
+    fail "preview JSON and byte-for-byte immutability"
+    printf '%s\n' "$preview_json"
+    sed -n '1,120p' "$SCRATCH/preview.err"
+    diff -u "$SCRATCH/before-preview.manifest" "$SCRATCH/after-preview.manifest"
+fi
+
+unsupported_json="$("$REPO_ROOT/bin/cctally" db rederive \
+    --family future-family --json 2>"$SCRATCH/unsupported.err")"
+unsupported_rc=$?
+if [ "$unsupported_rc" -eq 2 ] && \
+   UNSUPPORTED_JSON="$unsupported_json" python3 - <<'PY'
+import json
+import os
+p = json.loads(os.environ["UNSUPPORTED_JSON"])
+assert p["schemaVersion"] == 1
+assert p["status"] == "conflict"
+assert p["family"] == "future-family"
+assert p["journalHighWater"]["offset"] > 0
+assert p["conflicts"]
+PY
+then
+    pass "unsupported family returns the stable JSON error envelope"
+else
+    fail "unsupported family returns the stable JSON error envelope"
+    printf '%s\n' "$unsupported_json"
+    sed -n '1,120p' "$SCRATCH/unsupported.err"
+fi
+
+(
+    "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
+        >"$SCRATCH/apply-1.json" 2>"$SCRATCH/apply-1.err"
+    echo "$?" >"$SCRATCH/apply-1.rc"
+) &
+apply_pid_1=$!
+(
+    "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
+        >"$SCRATCH/apply-2.json" 2>"$SCRATCH/apply-2.err"
+    echo "$?" >"$SCRATCH/apply-2.rc"
+) &
+apply_pid_2=$!
+wait "$apply_pid_1"
+wait "$apply_pid_2"
+apply_json_1="$(cat "$SCRATCH/apply-1.json")"
+apply_json_2="$(cat "$SCRATCH/apply-2.json")"
+apply_rc_1="$(cat "$SCRATCH/apply-1.rc")"
+apply_rc_2="$(cat "$SCRATCH/apply-2.rc")"
+if [ "$apply_rc_1" -eq 0 ] && [ "$apply_rc_2" -eq 0 ] && \
+   PREVIEW_JSON="$preview_json" APPLY_JSON_1="$apply_json_1" \
+   APPLY_JSON_2="$apply_json_2" python3 - <<'PY'
+import json
+import os
+preview = json.loads(os.environ["PREVIEW_JSON"])
+results = [
+    json.loads(os.environ["APPLY_JSON_1"]),
+    json.loads(os.environ["APPLY_JSON_2"]),
+]
+assert sorted(result["status"] for result in results) == ["applied", "no-op"]
+applied = next(result for result in results if result["status"] == "applied")
+assert applied["status"] == "applied"
+assert applied["batchId"] == preview["batchId"]
+assert applied["rebuild"]["linesFolded"] > 0
+assert applied["noOp"] is False
+PY
+then
+    pass "concurrent apply serializes to one audited batch and one no-op"
+else
+    fail "concurrent apply serializes to one audited batch and one no-op"
+    printf '%s\n%s\n' "$apply_json_1" "$apply_json_2"
+    sed -n '1,120p' "$SCRATCH/apply-1.err"
+    sed -n '1,120p' "$SCRATCH/apply-2.err"
+fi
+apply_json="$(
+    APPLY_JSON_1="$apply_json_1" APPLY_JSON_2="$apply_json_2" python3 - <<'PY'
+import json
+import os
+for name in ("APPLY_JSON_1", "APPLY_JSON_2"):
+    value = json.loads(os.environ[name])
+    if value["status"] == "applied":
+        print(json.dumps(value, separators=(",", ":")))
+        break
+PY
+)"
+
+before_noop="$(fingerprint)"
+noop_json="$("$REPO_ROOT/bin/cctally" db rederive \
+    --family claude-usage --yes --json 2>"$SCRATCH/noop.err")"
+noop_rc=$?
+after_noop="$(fingerprint)"
+if [ "$noop_rc" -eq 0 ] && [ "$before_noop" = "$after_noop" ] && \
+   NOOP_JSON="$noop_json" python3 - <<'PY'
+import json
+import os
+p = json.loads(os.environ["NOOP_JSON"])
+assert p["status"] == "no-op"
+assert p["noOp"] is True
+assert p["rebuild"] is None
+PY
+then
+    pass "second apply is a write-free no-op"
+else
+    fail "second apply is a write-free no-op"
+    printf '%s\n' "$noop_json"
+    sed -n '1,120p' "$SCRATCH/noop.err"
+fi
+
+APPLY_JSON="$apply_json" python3 - <<'PY' >"$SCRATCH/verify.log" 2>&1
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sqlite3
+import sys
+
+root = pathlib.Path(os.environ["REPO_ROOT"])
+path = root / "bin" / "cctally"
+loader = importlib.machinery.SourceFileLoader("cctally", str(path))
+spec = importlib.util.spec_from_loader("cctally", loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["cctally"] = mod
+loader.exec_module(mod)
+import _cctally_journal as runtime
+import _cctally_core as core
+
+applied = json.loads(os.environ["APPLY_JSON"])
+conn = sqlite3.connect(mod.DB_PATH)
+try:
+    value = conn.execute(
+        "SELECT weekly_percent FROM weekly_usage_snapshots "
+        "ORDER BY captured_at_utc DESC LIMIT 1"
+    ).fetchone()[0]
+    assert value == 10.0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM journal_effective_events WHERE batch_id=?",
+        (applied["batchId"],),
+    ).fetchone()[0] > 0
+    assert conn.execute(
+        "SELECT label FROM accounts WHERE account_key='acct-a'"
+    ).fetchone()[0] == "Primary"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM five_hour_blocks WHERE five_hour_window_key=987654"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM five_hour_block_models "
+        "WHERE five_hour_window_key=987654"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM five_hour_block_projects "
+        "WHERE five_hour_window_key=987654"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM five_hour_blocks WHERE is_closed=0"
+    ).fetchone()[0] >= 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM budget_milestones WHERE vendor='codex'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM projected_milestones "
+        "WHERE metric='codex_budget_usd'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM quota_alert_arming"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM quota_window_blocks"
+    ).fetchone()[0] >= 1
+finally:
+    conn.close()
+assert core.APP_DIR.joinpath("hwm-7d").read_bytes() == b"sentinel-week 77\n"
+assert core.APP_DIR.joinpath("hwm-5h").read_bytes() == b"sentinel-block 44\n"
+
+segment = next(core.JOURNAL_DIR.glob("observations-*.jsonl"))
+original = pathlib.Path(os.environ["HOME"]).parent / "original-segment.jsonl"
+assert segment.read_bytes().startswith(original.read_bytes())
+
+independent = pathlib.Path(os.environ["HOME"]).parent / "independent.db"
+runtime.rebuild_stats_index(
+    target_path=independent,
+    update_quota_cache=False,
+)
+
+def dump(db):
+    conn = sqlite3.connect(db)
+    try:
+        out = {}
+        for table in (
+            "weekly_usage_snapshots",
+            "weekly_cost_snapshots",
+            "week_reset_events",
+            "five_hour_reset_events",
+            "five_hour_blocks",
+            "five_hour_block_models",
+            "five_hour_block_projects",
+            "weekly_credit_floors",
+            "percent_milestones",
+            "five_hour_milestones",
+            "budget_milestones",
+            "projected_milestones",
+            "project_budget_milestones",
+            "quota_alert_arming",
+            "quota_window_blocks",
+            "quota_percent_milestones",
+            "quota_threshold_events",
+            "accounts",
+            "journal_effective_events",
+            "journal_cursor",
+        ):
+            columns = [
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                if row[1] not in {
+                    "id", "usage_snapshot_id", "cost_snapshot_id",
+                    "reset_event_id", "block_id",
+                    "created_at_utc", "last_updated_at_utc", "is_closed",
+                    "generation",
+                }
+            ]
+            out[table] = conn.execute(
+                "SELECT " + ",".join(columns) + f" FROM {table} "
+                + "ORDER BY " + ",".join(columns)
+            ).fetchall()
+        return out
+    finally:
+        conn.close()
+
+assert dump(mod.DB_PATH) == dump(independent)
+PY
+if [ "$?" -eq 0 ]; then
+    pass "corrected live index equals independent rebuild and preserves originals"
+else
+    fail "corrected live index equals independent rebuild and preserves originals"
+    sed -n '1,160p' "$SCRATCH/verify.log"
+fi
+
+echo "passed: $pass_count  failed: $fail_count"
+[ "$fail_count" -eq 0 ]

@@ -3,6 +3,10 @@
 Compute USD cost for an arbitrary absolute time range from Claude, Codex, or
 both providers' local session data.
 
+> **Claude cost coverage:** Claude dollar and token totals are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Synopsis
 
 ```

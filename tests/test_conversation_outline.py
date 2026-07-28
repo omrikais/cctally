@@ -9,6 +9,7 @@ aggregation (Codex F8). Standalone-by-convention: the ``_conn``/``_msg``/
 ``_entry`` helpers are copied verbatim from ``test_conversation_query.py``.
 """
 import sqlite3, sys, pathlib
+import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 import _cctally_db as db
 import _lib_conversation_query as cq
@@ -54,17 +55,18 @@ def _msg(c, **kw):
 
 
 def _entry(c, *, source_path, line_offset, model, msg_id, req_id,
-           inp=0, out=0, cc=0, cr=0, cost_usd_raw=None):
+           inp=0, out=0, cc=0, cr=0, cost_usd_raw=None, speed=None):
     # cost_usd_raw is the vendor-provided override the cost helper honors when
     # present (bypassing token-derived math) — the #177 "same source row, not
     # same arithmetic" guard seeds it to prove tokens surface independently.
     c.execute(
         "INSERT OR IGNORE INTO session_entries "
         "(source_path,line_offset,timestamp_utc,model,msg_id,req_id,"
-        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,cost_usd_raw)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        " input_tokens,output_tokens,cache_create_tokens,cache_read_tokens,"
+        " cost_usd_raw,speed)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (source_path, line_offset, "t", model, msg_id, req_id,
-         inp, out, cc, cr, cost_usd_raw))
+         inp, out, cc, cr, cost_usd_raw, speed))
 
 
 # ---------------------------------------------------------------------------
@@ -268,21 +270,23 @@ def test_outline_counts_recovered_compaction_as_meta_not_human():
 # Task 2: cache-failure flag copied onto OutlineTurn + stats.cache_failures
 # aggregate. A healthy prime turn + a collapse turn through the shared assembly.
 # ---------------------------------------------------------------------------
-def _seed_cache_failure(c, sid="cfo"):
+def _seed_cache_failure(c, sid="cfo", speed=None):
     # prime: healthy turn establishing a high running-max cache_read.
     _msg(c, session_id=sid, uuid="a1", source_path="a.jsonl", byte_offset=0,
          timestamp_utc="2026-06-01T00:00:00Z", entry_type="assistant",
          text="primed", model=_MODEL, msg_id="m1", req_id="r1",
          blocks_json=_json.dumps([{"kind": "text", "text": "primed"}]))
     _entry(c, source_path="a.jsonl", line_offset=0, model=_MODEL,
-           msg_id="m1", req_id="r1", inp=10, out=20, cc=1_000, cr=130_000)
+           msg_id="m1", req_id="r1", inp=10, out=20, cc=1_000, cr=130_000,
+           speed=speed)
     # collapse: cache_read -> 0, cache_creation balloons -> a cache failure.
     _msg(c, session_id=sid, uuid="a2", source_path="a.jsonl", byte_offset=1,
          timestamp_utc="2026-06-01T00:00:05Z", entry_type="assistant",
          text="rebuilt", model=_MODEL, msg_id="m2", req_id="r2",
          blocks_json=_json.dumps([{"kind": "text", "text": "rebuilt"}]))
     _entry(c, source_path="a.jsonl", line_offset=1, model=_MODEL,
-           msg_id="m2", req_id="r2", inp=10, out=20, cc=134_000, cr=0)
+           msg_id="m2", req_id="r2", inp=10, out=20, cc=134_000, cr=0,
+           speed=speed)
 
 
 def test_outline_copies_cache_failure_onto_failing_turn():
@@ -416,9 +420,28 @@ def test_outline_cache_saved_usd_present_and_positive():
     _seed_cache_failure(c)                      # a1 has cr=130_000
     stats = cq.get_conversation_outline(c, "cfo")["stats"]
     assert "cache_saved_usd" in stats
-    expected = cq._cache_read_saved_usd(_MODEL, 130_000)   # a2 has cr=0 -> no add
+    expected = cq._cache_read_saved_usd(
+        _MODEL, 130_000, speed=None
+    )   # a2 has cr=0 -> no add
     assert expected > 0
     assert abs(stats["cache_saved_usd"] - expected) < 1e-12
+
+
+def test_outline_fast_cache_financials_use_effective_tier():
+    standard = _conn()
+    _seed_cache_failure(standard, sid="std", speed="standard")
+    standard_stats = cq.get_conversation_outline(standard, "std")["stats"]
+
+    fast = _conn()
+    _seed_cache_failure(fast, sid="fast", speed="fast")
+    fast_stats = cq.get_conversation_outline(fast, "fast")["stats"]
+
+    assert fast_stats["cache_saved_usd"] == pytest.approx(
+        standard_stats["cache_saved_usd"] * 2.0, abs=1e-12
+    )
+    assert fast_stats["cache_failures"]["est_wasted_usd"] == pytest.approx(
+        standard_stats["cache_failures"]["est_wasted_usd"] * 2.0, abs=1e-12
+    )
 
 
 def test_outline_cache_saved_usd_zero_without_cache_reads():
@@ -502,7 +525,8 @@ def test_outline_subagent_costs_keystone_cost_once():
     sc = out["subagent_costs"]
     assert "abc" in sc
     # Independent: the cost helper over the subagent turn's exact usage row.
-    expected = round(cq._entry_cost(_MODEL, 10, 20, 0, 0, None), 6)
+    expected = round(cq._entry_cost(
+        _MODEL, 10, 20, 0, 0, None, cc_1h=None, speed=None), 6)
     assert expected > 0
     assert abs(sc["abc"] - expected) < 1e-9
     # The main-session cost is NOT in the map (None subagent_key is excluded).
@@ -539,7 +563,8 @@ def test_outline_subagent_costs_covers_empty_meta_bucket():
     assert "xyz" not in (out["subagent_meta"] or {})
     # ...but its cost is still covered.
     assert "xyz" in out["subagent_costs"]
-    expected = round(cq._entry_cost(_MODEL, 50, 60, 0, 0, None), 6)
+    expected = round(cq._entry_cost(
+        _MODEL, 50, 60, 0, 0, None, cc_1h=None, speed=None), 6)
     assert abs(out["subagent_costs"]["xyz"] - expected) < 1e-9
 
 
@@ -582,8 +607,10 @@ def test_outline_subagent_costs_sum_matches_bucket_total():
     _entry(c, source_path="/agents/agent-q.jsonl", line_offset=1, model=_MODEL,
            msg_id="mb", req_id="rb", inp=300, out=400, cc=0, cr=0)
     out = cq.get_conversation_outline(c, "ms")
-    a = round(cq._entry_cost(_MODEL, 100, 200, 0, 0, None), 6)
-    b = round(cq._entry_cost(_MODEL, 300, 400, 0, 0, None), 6)
+    a = round(cq._entry_cost(
+        _MODEL, 100, 200, 0, 0, None, cc_1h=None, speed=None), 6)
+    b = round(cq._entry_cost(
+        _MODEL, 300, 400, 0, 0, None, cc_1h=None, speed=None), 6)
     assert abs(out["subagent_costs"]["q"] - (a + b)) < 1e-9
 
 

@@ -51,6 +51,7 @@ from _cctally_core import (
 def cmd_sync_week(
     args: argparse.Namespace, *, conn=None, as_of: "str | None" = None,
     journal: "tuple | None" = None, account_key: str = "unattributed",
+    retained_selection=None,
 ) -> int:
     """Compute + persist the week's cost snapshot.
 
@@ -58,8 +59,11 @@ def cmd_sync_week(
     ``conn`` runs the cost-snapshot insert on the caller's connection (no
     internal open/commit/close), and ``as_of`` (ISO-Z) stamps the snapshot's
     ``captured_at_utc``. Both defaults keep the legacy own-connection,
-    wall-clock behavior — so `record`/`maybe_record_milestone`'s existing
-    bare `cmd_sync_week(ns)` calls are byte-identical.
+    wall-clock behavior. ``retained_selection`` is the internal replay seam:
+    milestone derivation passes the triggering observation's canonical
+    ``WeekSelection`` so a later usage row cannot replace its exact subscription
+    window. Operator ``sync-week`` callers omit it and keep latest-week
+    resolution.
 
     Design A (DB journal redesign §5.3, Model-A ``weekly_cost_snapshot``):
     ``journal=(ctx, id_base)`` routes the ``insert_cost_snapshot`` THROUGH
@@ -88,12 +92,14 @@ def cmd_sync_week(
     if own_conn:
         conn = open_db()
     try:
-        selection = c.pick_week_selection(
-            conn,
-            args.week_start,
-            args.week_end,
-            week_start_name,
-        )
+        selection = retained_selection
+        if selection is None:
+            selection = c.pick_week_selection(
+                conn,
+                args.week_start,
+                args.week_end,
+                week_start_name,
+            )
         week_start = selection.week_start
         week_end = selection.week_end
         result = c.compute_week_cost(
@@ -109,6 +115,9 @@ def cmd_sync_week(
             # carries the merged cost of every account sharing the week. Default
             # `unattributed` matches all-NULL legacy rows -> byte-stable.
             account_key=account_key,
+            # Historical rederive must not include cache rows captured after the
+            # triggering obs/op. Default None preserves normal wall-clock sync.
+            as_of=as_of,
         )
         week_start_at = selection.start_iso_override or format_local_iso(week_start, end_of_day=False)
         week_end_at = selection.end_iso_override or format_local_iso(week_end, end_of_day=True)

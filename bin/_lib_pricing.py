@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-07-24"
+PRICING_SNAPSHOT_DATE = "2026-07-28"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -99,7 +99,7 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-07-24 (see PRICING_SNAPSHOT_DATE)
+# - Captured/verified: 2026-07-28 (see PRICING_SNAPSHOT_DATE)
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 #   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
@@ -121,15 +121,29 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   published ID/alias table). LiteLLM has no opus-5 entry yet, so this table is
 #   simply ahead of it — `ahead_of_litellm` is never a drift finding, so no
 #   PRICING_DRIFT_ALLOWLIST entry is needed.
-#
-# Known gap — Claude *fast mode* is not modelled. Anthropic bills fast mode at a
-# premium ($10/$50 per MTok on Opus 5 and Opus 4.8; $30/$150 on Opus 4.7), and
-# Claude Code records the tier per assistant entry at `message.usage.speed`
-# ("standard" | "fast"), so it IS derivable from the JSONL we already ingest —
-# but this table is one rate per model and `_calculate_entry_cost` ignores speed,
-# so a fast-mode entry is priced at the standard rate (2x undercount on Opus 5).
-# The Codex side already carries the shape for this
-# (`_calculate_codex_entry_cost(..., speed=...)` + its fast-tier multiplier).
+#   2026-07-25 (#195): no VALUES changed. The snapshot date is bumped because
+#   cache WRITES are now priced by TTL — the 1-hour rate is DERIVED as
+#   `input_cost_per_token * CACHE_WRITE_1H_MULTIPLIER` (2.0) rather than stored
+#   per-model, so it is automatically correct for any model added later and
+#   cannot be silently missed the way an explicit field can be. The stored
+#   `cache_creation_input_token_cost` remains the 5-minute (1.25x) rate. The
+#   bump is also the deliberate fingerprint bust that re-arms the conversation
+#   rollup's materialized cost (`_arm_rollup_backfill_on_pricing_change`).
+#   2026-07-28 (#413): modelled Claude fast mode from the authoritative retained
+#   `message.usage.speed` value. Current Opus 5/4.8 fast rows are $10/$50 per
+#   MTok (2x standard). Historical effective-fast Opus 4.6/4.7 rows retain
+#   their documented $30/$150 rate (6x standard). Current Opus 4.6 fallback
+#   reports `speed="standard"` and is therefore never premium-priced. Prompt
+#   cache multipliers stack on the fast base rate. This snapshot bump is the
+#   pricing-fingerprint bust for safe conversation-rollup rederivation; durable
+#   journaled milestones and weekly snapshots are not rewritten.
+# Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
+# 2x for a 1-hour write; reads are 0.1x under both. Documented as applying
+# consistently across all supported models, so the 1h rate is DERIVED from
+# input_cost_per_token rather than stored per-model — a model added later
+# cannot silently miss it (#195).
+CACHE_WRITE_1H_MULTIPLIER = 2.0
+
 CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
     "claude-3-5-haiku-20241022": {
         "input_cost_per_token": 8e-07,
@@ -334,6 +348,35 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_read_input_token_cost": 3e-07,
     },
 }
+
+# Anthropic fast-mode pricing is genuinely model-specific. Unsupported models
+# deliberately have no fallback multiplier: only a retained authoritative
+# `usage.speed == "fast"` row on one of these exact model IDs is premium-priced.
+# The 4.6/4.7 entries are historical retention rules; current new fast requests
+# are supported only on Opus 5 and Opus 4.8.
+CLAUDE_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
+    "claude-opus-4-6": 6.0,
+    "claude-opus-4-6-20260205": 6.0,
+    "claude-opus-4-7": 6.0,
+    "claude-opus-4-7-20260416": 6.0,
+    "claude-opus-4-8": 2.0,
+    "claude-opus-5": 2.0,
+}
+
+
+def _strip_anthropic_model_prefix(model: str) -> str:
+    """Return the pricing-table model ID behind supported provider aliases."""
+    for prefix in ("anthropic/", "anthropic."):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
+def _claude_fast_multiplier(model: str) -> float:
+    """Fast-tier multiplier for a retained Claude model (standard = 1.0)."""
+    return CLAUDE_FAST_MULTIPLIER_OVERRIDES.get(
+        _strip_anthropic_model_prefix(model), 1.0
+    )
 
 _unknown_model_warnings: set[str] = set()
 
@@ -740,16 +783,80 @@ def _resolve_model_pricing(model: str, warn: bool = True) -> dict[str, Any] | No
     pricing = CLAUDE_MODEL_PRICING.get(model)
     if pricing is not None:
         return pricing
-    for prefix in ("anthropic/", "anthropic."):
-        if model.startswith(prefix):
-            stripped = model[len(prefix):]
-            pricing = CLAUDE_MODEL_PRICING.get(stripped)
-            if pricing is not None:
-                return pricing
+    stripped = _strip_anthropic_model_prefix(model)
+    if stripped != model:
+        pricing = CLAUDE_MODEL_PRICING.get(stripped)
+        if pricing is not None:
+            return pricing
     if warn and model not in _unknown_model_warnings:
         _unknown_model_warnings.add(model)
         _eprint(f"[cost] unknown model, treating cost as $0: {model}")
     return None
+
+
+def claude_usage_dict(*, cache_1h_tokens, speed, input_tokens=0, output_tokens=0,
+                      cache_creation_tokens=0, cache_read_tokens=0, **extra) -> dict:
+    """Canonical usage dict for `_calculate_entry_cost` (#195).
+
+    `cache_1h_tokens` and `speed` are REQUIRED keywords: a site that forgets
+    either raises
+    TypeError instead of silently pricing every 1-hour cache write at the
+    5-minute rate. Pass an explicit None for a genuinely unknown or synthetic
+    split — that reads as a deliberate declaration at the call site.
+
+    None OMITS the key entirely, which is the exact sentinel
+    `_calculate_entry_cost` branches on for "price as before #195".
+    """
+    usage = {
+        "input_tokens": input_tokens or 0,
+        "output_tokens": output_tokens or 0,
+        "cache_creation_input_tokens": cache_creation_tokens or 0,
+        "cache_read_input_tokens": cache_read_tokens or 0,
+    }
+    if cache_1h_tokens is not None:
+        usage["cache_creation_1h_input_tokens"] = int(cache_1h_tokens)
+    if speed is not None:
+        usage["speed"] = speed
+    usage.update(extra)
+    return usage
+
+
+def _cache_create_cost(pricing: dict, flat: int, h_raw, tiered) -> float:
+    """USD for one entry's cache-CREATION tokens, priced by TTL (#195).
+
+    `flat` is the authoritative total (`cache_creation_input_tokens`); `h_raw`
+    is the 1-hour portion or None when the split is unknown. The 5-minute
+    quantity is the REMAINDER (flat - h), never the stored 5m column, so
+    priced tokens always equal `cache_create_tokens` and a breakdown that
+    disagrees with the flat total cannot bill tokens at $0.
+
+    `tiered` is the caller's `_tiered` closure, reused verbatim for the
+    h == 0 path so that path is byte-identical to pre-#195 behavior.
+    """
+    if flat <= 0:
+        return tiered(flat, "cache_creation_input_token_cost",
+                      "cache_creation_input_token_cost_above_200k_tokens")
+    h = 0 if h_raw is None else max(0, min(int(h_raw), flat))
+    if h == 0:
+        # Split unknown (pre-#195 row / no breakdown) OR genuinely all-5m.
+        # BOTH execute the pre-change expression VERBATIM. This early return
+        # is the byte-stability guarantee, not an optimization: the
+        # proportional form below is NOT float-identical to `_tiered` for a
+        # model with no above-200k cache-write rate (#195 gate P1-2).
+        return tiered(flat, "cache_creation_input_token_cost",
+                      "cache_creation_input_token_cost_above_200k_tokens")
+
+    below = min(flat, TIERED_THRESHOLD)
+    above = max(0, flat - TIERED_THRESHOLD)
+    frac = h / flat
+    base = pricing.get("input_cost_per_token", 0.0)
+    r1h = base * CACHE_WRITE_1H_MULTIPLIER
+    r1h_200k = pricing.get("input_cost_per_token_above_200k_tokens", base) \
+        * CACHE_WRITE_1H_MULTIPLIER
+    r5m = pricing.get("cache_creation_input_token_cost", 0.0)
+    r5m_200k = pricing.get("cache_creation_input_token_cost_above_200k_tokens", r5m)
+    return ((below * frac) * r1h + (above * frac) * r1h_200k
+            + (below * (1 - frac)) * r5m + (above * (1 - frac)) * r5m_200k)
 
 
 def _calculate_entry_cost(
@@ -789,10 +896,19 @@ def _calculate_entry_cost(
         "output_cost_per_token",
         "output_cost_per_token_above_200k_tokens",
     )
-    cache_create_cost = _tiered(
+    # `flat` is passed RAW, exactly as the pre-#195 `_tiered(...)` call did.
+    # Coercing it here would be an unflagged behavior change in both
+    # directions: `int()` truncates a fractional count, and it would newly
+    # ACCEPT a numeric string that `_tiered`'s `tokens <= 0` used to reject.
+    # `_cache_create_cost` needs no coercion — every use of `flat` is
+    # arithmetic or comparison, and the `h_raw` side does its own `int()`
+    # inside the clamp (which IS load-bearing there: `min(int(h_raw), flat)`
+    # is what pins the 1h portion to whole tokens).
+    cache_create_cost = _cache_create_cost(
+        pricing,
         usage.get("cache_creation_input_tokens", 0),
-        "cache_creation_input_token_cost",
-        "cache_creation_input_token_cost_above_200k_tokens",
+        usage.get("cache_creation_1h_input_tokens"),
+        _tiered,
     )
     cache_read_cost = _tiered(
         usage.get("cache_read_input_tokens", 0),
@@ -800,7 +916,10 @@ def _calculate_entry_cost(
         "cache_read_input_token_cost_above_200k_tokens",
     )
     total = input_cost + output_cost + cache_create_cost + cache_read_cost
-
+    if usage.get("speed") == "fast":
+        multiplier = _claude_fast_multiplier(model)
+        if multiplier != 1.0:
+            return total * multiplier
     return total
 
 

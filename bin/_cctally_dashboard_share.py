@@ -47,8 +47,9 @@ from zoneinfo import ZoneInfo
 from _cctally_core import open_db, parse_iso_datetime
 from _cctally_config import save_config, _load_config_unlocked
 from _lib_fmt import stable_sum
-from _lib_pricing import _calculate_entry_cost
+from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 from _lib_five_hour import _canonical_5h_window_key
+from _lib_dashboard_sources import source_domain_freshness
 
 
 # Share-CLI helpers consumed by the dashboard's share-data builders.
@@ -395,12 +396,14 @@ def _share_top_projects_for_range(
         # an empty top_projects.
         return []
     for entry in entries:
-        usage = {
-            "input_tokens":                entry.input_tokens,
-            "output_tokens":               entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens":     entry.cache_read_tokens,
-        }
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        )
         cost = _calculate_entry_cost(
             entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
         )
@@ -434,12 +437,14 @@ def _share_all_projects_for_range(
     except Exception:
         return bucket
     for entry in entries:
-        usage = {
-            "input_tokens":                entry.input_tokens,
-            "output_tokens":               entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens":     entry.cache_read_tokens,
-        }
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        )
         cost = _calculate_entry_cost(
             entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
         )
@@ -477,12 +482,14 @@ def _share_per_day_per_project_for_range(
     except Exception:
         return out
     for entry in entries:
-        usage = {
-            "input_tokens":                entry.input_tokens,
-            "output_tokens":               entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens":     entry.cache_read_tokens,
-        }
+        usage = claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        )
         cost = _calculate_entry_cost(
             entry.model, usage, mode="auto", cost_usd=entry.cost_usd,
         )
@@ -1645,6 +1652,20 @@ def _share_state_domain(state, panel: str):
     return data.get(panel)
 
 
+def _share_apply_current_week_freshness(snapshot, state, panel: str):
+    """Qualify retained current-week actuals with provider-local evidence age."""
+    if (
+        panel != "current-week"
+        or source_domain_freshness(state, "hero") != "stale"
+    ):
+        return snapshot
+    provider = "Claude" if state.source == "claude" else "Codex"
+    note = (
+        f"{provider} current-week spend is based on stale provider-cycle evidence."
+    )
+    return replace(snapshot, notes=tuple(snapshot.notes) + (note,))
+
+
 def _share_digest_input(*, panel: str, template_id: str, source: str,
                         source_explicit: bool, states, snapshots,
                         panel_data, account: "str | None" = None):
@@ -1665,6 +1686,10 @@ def _share_digest_input(*, panel: str, template_id: str, source: str,
             "source": state.source,
             "data_version": state.data_version,
             "availability": state.availability,
+            **(
+                {"hero_freshness": source_domain_freshness(state, "hero")}
+                if panel == "current-week" else {}
+            ),
             "period": {
                 "start": snapshot.period.start,
                 "end": snapshot.period.end,
@@ -1712,6 +1737,9 @@ def _share_build_source_snapshots(*, ls, template, template_id: str,
         # does not carry the additive S4 source bundle.
         if source_explicit or source == "all":
             claude_state = _source_state_for_share(data_snap, "claude")
+            claude_snapshot = _share_apply_current_week_freshness(
+                claude_snapshot, claude_state, panel,
+            )
 
     codex_snapshot = None
     codex_state = None
@@ -1725,6 +1753,9 @@ def _share_build_source_snapshots(*, ls, template, template_id: str,
             panel=panel,
             template_id=template_id,
             options=options,
+        )
+        codex_snapshot = _share_apply_current_week_freshness(
+            codex_snapshot, codex_state, panel,
         )
 
     if source == "claude":

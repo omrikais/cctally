@@ -4,6 +4,10 @@ Launch a live web dashboard rendering your current subscription usage,
 forecast, $/1% trend, and recent sessions. Coexists with the `tui`
 subcommand — use `tui` over SSH or when a browser isn't available.
 
+> **Claude cost coverage:** Claude dollar and token totals in the dashboard are
+> [transcript-derived lower bounds](../claude-cost-coverage.md), not exact
+> `/usage` billing totals. Codex accounting is unaffected.
+
 ## Usage
 
 ```
@@ -181,6 +185,14 @@ trigger OAuth fetches.
 ## Startup sync
 
 The dashboard binds its HTTP port immediately and serves the current cached snapshot; the first full sync (and any pending one-time conversation-enrichment reingest) runs in the background and is pushed to the page over SSE when it completes. On a large transcript history the background reingest is resumable — interrupting the dashboard mid-sync and relaunching resumes where it left off rather than restarting. To start without any sync, use `--no-sync`; to consume a pending reingest in one foreground pass, run `cctally cache-sync` (or `cache-sync --rebuild`).
+
+If a dashboard statistics query discovers a corrupt `stats.db` index, the
+dashboard closes its live database handle, attempts one safe rebuild from the
+append-only journal, and reconnects automatically. When a rebuild is not safe
+(for example, no retained journal or another process still owns the family),
+the server continues serving a degraded snapshot and the sync chip points to
+`cctally db repair --db stats --yes`. Cache corruption keeps its separate
+`cctally cache-sync --rebuild` action.
 
 ## Transcript retention
 

@@ -152,9 +152,11 @@ export interface UpdateStreamEvent {
   // are terminal; `error_event` is a terminal failure. `step` events
   // render as section headers in the stream viewer; stdout/stderr line
   // by line.
-  type: 'stdout' | 'stderr' | 'step' | 'exit' | 'execvp' | 'error_event' | 'done' | 'heartbeat';
+  type: 'stdout' | 'stderr' | 'target' | 'step' | 'exit' | 'execvp' | 'error_event' | 'done' | 'heartbeat';
   data?: string;
   name?: string;
+  version?: string;
+  command?: string;
   rc?: number;
   step?: string;
   message?: string;

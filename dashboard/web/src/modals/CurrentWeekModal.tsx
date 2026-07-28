@@ -49,9 +49,8 @@ function formatWeekWindow(
   // the reset cell below) carries the offset itself, and the week-label
   // pill is a pure date range, so no offset-tail is appropriate here.
   const endShort = fmt.dateShort(resetIso, ctx);
-  if (weekLabel && endShort) return `${weekLabel} → ${endShort}`;
   if (weekLabel) return weekLabel;
-  if (endShort) return `→ ${endShort}`;
+  if (endShort) return `Resets ${endShort}`;
   return '—';
 }
 
@@ -59,6 +58,14 @@ function formatCycleRange(entry: WeekIndexEntry, ctx: FmtCtx): string {
   const start = fmt.dateShort(entry.start_at_utc, ctx);
   const end = fmt.dateShort(entry.end_at_utc, ctx);
   return start && end ? `${start}–${end}` : entry.label;
+}
+
+function hasDistinctNominalReset(entry: WeekIndexEntry): boolean {
+  const effectiveEnd = entry.end_at_utc ? Date.parse(entry.end_at_utc) : Number.NaN;
+  const nominalReset = entry.resets_at_utc ? Date.parse(entry.resets_at_utc) : Number.NaN;
+  return Number.isFinite(effectiveEnd)
+    && Number.isFinite(nominalReset)
+    && nominalReset > effectiveEnd;
 }
 
 // Split a percent float into integer and ".decimal%" tail so the modal
@@ -491,7 +498,10 @@ function CodexCurrentCycleModal({
   const isHistoric = weekKey != null;
 
   const weeklyHistories = codex?.quota.histories
-    .filter((row) => row.window_minutes === 10_080) ?? [];
+    .filter((row) => row.window_minutes === 10_080)
+    // #373: a window outside account-level standard quota (a separate model
+    // pool) stays listed in the envelope but is not this account's week.
+    .filter((row) => !row.model_scoped) ?? [];
   const activeWeeklyKeys = new Set(
     hero?.quota.active
       .filter((row) => row.resets_at === cycle?.resets_at)
@@ -523,7 +533,14 @@ function CodexCurrentCycleModal({
       && row.resets_at === cycle?.resets_at
       && inCycle(row))
     .sort((a, b) => a.percent - b.percent || a.captured_at.localeCompare(b.captured_at));
-  const fiveHourHistory = codex?.quota.histories.find((row) => row.window_minutes === 300);
+  // #373: the account's 5h window, not merely the first 300-minute row. The
+  // retained foreign-pool 5h rows sit on the PRIMARY slot and Codex stopped
+  // emitting standard 300-minute windows on 2026-07-12, so an unfiltered
+  // `.find` resolves to the foreign pool whenever the standard history is
+  // absent — which then anchors the current block and the 5h milestone filter.
+  const fiveHourHistory = codex?.quota.histories.find(
+    (row) => row.window_minutes === 300 && !row.model_scoped,
+  );
   const currentFiveHourBlock = codex?.quota.blocks.find((row) =>
     row.window_minutes === 300
     && row.is_active
@@ -628,6 +645,9 @@ function CodexCurrentCycleModal({
   const resetCell = isHistoric && selectedEntry
     ? selectedEntry.resets_at_utc ?? selectedEntry.end_at_utc
     : cycle?.resets_at;
+  const resetLabel = isHistoric && selectedEntry && hasDistinctNominalReset(selectedEntry)
+    ? 'nominal reset'
+    : 'reset';
   const singleId = (value: string) => embedded ? undefined : value;
 
   // Keyboard (single-provider variants only; embedded registers nothing).
@@ -716,7 +736,7 @@ function CodexCurrentCycleModal({
           <div className="mcw-mini" id={singleId('mcw-mini')}>
             <div className="s"><span className="k">spent</span><span className="v v-magenta">{fmt.usd2(spent)}</span></div>
             <div className="s"><span className="k">$ / 1%</span><span className="v v-cyan">{fmt.usd3(dpp)}</span></div>
-            <div className="s"><span className="k">reset</span><span className="v">{fmt.datetimeShortZ(resetCell, ctx)}</span></div>
+            <div className="s"><span className="k">{resetLabel}</span><span className="v">{fmt.datetimeShortZ(resetCell, ctx)}</span></div>
           </div>
         </div>
 

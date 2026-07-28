@@ -209,12 +209,14 @@ def _claude_usage_entries(module, joined):
     return tuple(module.UsageEntry(
         timestamp=entry.timestamp,
         model=entry.model,
-        usage={
-            "input_tokens": entry.input_tokens,
-            "output_tokens": entry.output_tokens,
-            "cache_creation_input_tokens": entry.cache_creation_tokens,
-            "cache_read_input_tokens": entry.cache_read_tokens,
-        },
+        usage=module.claude_usage_dict(   # #195 chokepoint
+            input_tokens=entry.input_tokens,
+            output_tokens=entry.output_tokens,
+            cache_creation_tokens=entry.cache_creation_tokens,
+            cache_read_tokens=entry.cache_read_tokens,
+            cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
+            speed=getattr(entry, "speed", None),
+        ),
         cost_usd=entry.cost_usd,
         source_path=entry.source_path,
     ) for entry in joined)
