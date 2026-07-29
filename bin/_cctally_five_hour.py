@@ -1526,15 +1526,30 @@ def _backfill_five_hour_blocks(
         # shared physical 5h window observed by two accounts yields two distinct
         # open blocks so rebuild reproduces per-account ownership.
         keys_sql = """
-                SELECT DISTINCT five_hour_window_key, account_key
-                  FROM weekly_usage_snapshots
-                 WHERE five_hour_window_key IS NOT NULL
-                   AND five_hour_percent     IS NOT NULL
+                SELECT DISTINCT snapshots.five_hour_window_key,
+                                snapshots.account_key
+                  FROM weekly_usage_snapshots AS snapshots
+                 WHERE snapshots.five_hour_window_key IS NOT NULL
+                   AND snapshots.five_hour_percent     IS NOT NULL
         """
         if only_missing:
             keys_sql += (
-                "   AND (five_hour_window_key, account_key) NOT IN "
-                "(SELECT five_hour_window_key, account_key FROM five_hour_blocks)"
+                "   AND snapshots.id = ("
+                "       SELECT latest.id"
+                "         FROM weekly_usage_snapshots AS latest"
+                "        WHERE latest.account_key IS snapshots.account_key"
+                "          AND latest.five_hour_window_key IS NOT NULL"
+                "          AND latest.five_hour_percent IS NOT NULL"
+                "        ORDER BY unixepoch(latest.captured_at_utc) DESC,"
+                "                 latest.id DESC"
+                "        LIMIT 1"
+                "   )"
+                "   AND NOT EXISTS ("
+                "       SELECT 1 FROM five_hour_blocks AS blocks"
+                "        WHERE blocks.five_hour_window_key ="
+                "              snapshots.five_hour_window_key"
+                "          AND blocks.account_key IS snapshots.account_key"
+                "   )"
             )
         keys = [(int(r[0]), r[1]) for r in conn.execute(keys_sql).fetchall()]
 
@@ -1784,4 +1799,3 @@ def _backfill_five_hour_blocks(
         eprint(f"[5h-block backfill] failed: {exc}")
         return 0
     return inserted
-

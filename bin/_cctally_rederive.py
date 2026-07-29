@@ -397,12 +397,25 @@ def plan_claude_usage(
         )
     with tempfile.TemporaryDirectory(prefix="cctally-rederive-") as tmp:
         desired = _derive_desired_events(records, cache_conn, Path(tmp))
+    # #426: the scratch replay only sees RETAINED sources, so it can never
+    # reproduce the pre-cutover rows the journal exported as `b:<table>:<rowid>`
+    # evt lines. Hold them out of the diff instead of retiring them. Evidence is
+    # counted in OBSERVATIONS alone — an operator record is replay input but
+    # derives nothing on its own, and the cutover re-emits some of them
+    # (`weekly_credit_floor`) carrying their original historical timestamp.
+    preserved = _lib_rederive.preserved_history(
+        records,
+        evidence_retained=any(
+            record.get("t") == "obs" for record in raw_records
+        ),
+    )
     return _lib_rederive.build_claude_usage_plan(
         selection=selection,
         desired_events=desired,
         journal_high_water=journal_high_water,
         cache_fingerprint=cache_fingerprint,
         config_fingerprint=config_fingerprint,
+        preserved_events=preserved.values(),
         conflicted_event_ids=owned_conflicted_event_ids(selection),
     )
 
@@ -868,6 +881,9 @@ def _command_payload(
         "batchId": batch_id,
         "planHash": None if plan is None else plan.plan_hash,
         "actionCounts": counts,
+        # #426: how many owned events the plan held OUT of the diff because no
+        # retained source can re-derive them (pre-cutover exported history).
+        "preservedEventCount": 0 if plan is None else plan.preserved_event_count,
         # `conflicts` is the LEGACY key and keeps its meaning: command-validation
         # failure messages (unsupported family, prod guard, structural journal
         # protocol errors). #374's quarantined same-revision GROUPS ride the new

@@ -228,10 +228,16 @@ def _resolve_codex_weekly_cycle(
             continue
         account = history.identity.account_key
         accounts_seen.add(account)
-        if baseline is None or baseline.resets_at <= now_utc:
+        # #428: the CANONICAL anchor, never the raw provider reset. Blocks and
+        # milestones are keyed on the anchor (#416 §4.1), so publishing the raw
+        # value here mints a second spelling of one window — and the client's
+        # current-cycle milestone filter matches `resets_at` exactly, so the
+        # ladder empties for precisely the jittered cycles canonicalization
+        # exists to collapse. Liveness rides the same instant the hero shows.
+        if baseline is None or baseline.canonical_resets_at <= now_utc:
             continue
         state = quota_freshness(history.physical_observations, now_utc).state
-        boundary = (history.identity.window_minutes, baseline.resets_at)
+        boundary = (history.identity.window_minutes, baseline.canonical_resets_at)
         if state == "fresh":
             bucket = fresh_by_account
         elif state == "stale":
@@ -431,7 +437,9 @@ def _codex_next_decision_at(
         baseline = select_baseline(history.observations, now_utc)
         if codex_history_is_model_scoped(history, baseline=baseline):
             continue
-        if baseline is not None and baseline.resets_at > now_utc:
+        # #428: the anchor, so the decision deadline describes the same window
+        # the hero publishes rather than a jitter sibling up to 600s away.
+        if baseline is not None and baseline.canonical_resets_at > now_utc:
             latest = latest_physical_observation(history.physical_observations)
             if latest is not None:
                 candidates.append(
@@ -1747,12 +1755,15 @@ def _quota_read_model(
         history_rows.append(row)
         if _codex_history_row_is_model_scoped(row):
             continue
-        if baseline is not None and baseline.resets_at > context.now_utc:
+        # #428: the client compares `active[].resets_at` against
+        # `hero.cycle.resets_at` (`activeWeeklyKeys`) to decide which weekly
+        # history is the live one, so both must carry the SAME anchor.
+        if baseline is not None and baseline.canonical_resets_at > context.now_utc:
             active_rows.append({
                 "key": dashboard_resource_key("quota", "codex", *key_parts),
                 "current_percent": baseline.used_percent,
                 "captured_at": baseline.captured_at.astimezone(UTC).isoformat(),
-                "resets_at": baseline.resets_at.astimezone(UTC).isoformat(),
+                "resets_at": baseline.canonical_resets_at.astimezone(UTC).isoformat(),
                 "freshness": freshness.state,
                 "stale_after_seconds": freshness.stale_after_seconds,
             })
@@ -2554,7 +2565,9 @@ def _codex_account_five_hour_percent(
         baseline = select_baseline(history.observations, now_utc)
         if codex_history_is_model_scoped(history, baseline=baseline):
             continue
-        if baseline is None or baseline.resets_at <= now_utc:
+        # #428: the anchor — a 5h window whose raw reset has passed but whose
+        # canonical anchor has not is still live and still owns its percent.
+        if baseline is None or baseline.canonical_resets_at <= now_utc:
             continue
         acct = history.identity.account_key
         pct = float(baseline.used_percent)

@@ -20,6 +20,18 @@ from collections.abc import Iterable, Mapping
 
 FAMILY = "claude-usage"
 
+# Prefix of a correction batch this family authored. Only its own destructive
+# batches may be undone by :func:`build_claude_usage_plan` (#426) — a tombstone
+# written by anyone else is a deliberate retirement and stays retired.
+_FAMILY_BATCH_PREFIX = f"rederive:{FAMILY}:"
+
+# Id shape minted by the journal cutover exporter (`_lib_journal.bootstrap_id`,
+# `b:<table>:<rowid>`) for a row that predates the journal. The family's own
+# derivation only ever mints natural-key ids (`sa:`, `wcs:`, `pm:`, …), and the
+# cutover runs once per install, so this prefix identifies exactly the events a
+# replay can never reproduce — independently of any timestamp (#426).
+_CUTOVER_EXPORT_ID_PREFIX = "b:"
+
 
 class RederiveError(RuntimeError):
     """Base error for a plan that cannot be produced truthfully."""
@@ -173,6 +185,74 @@ def validate_claude_cache_contract(tables: Mapping[str, set[str]]) -> None:
         )
 
 
+def preserved_history(records: Iterable[Mapping], *,
+                      evidence_retained: bool) -> dict[str, Mapping]:
+    """Owned events the current re-derivation cannot reach, keyed by event id.
+
+    Two independent, deterministic reasons an event can have no retained source
+    behind it — so a replay-derived desired set can never contain it:
+
+    * its id was minted by the cutover exporter (``b:<table>:<rowid>``). The
+      journal only starts recording observations AT the cutover, so those
+      exported lines ARE the pre-journal truth; the family's own derivation
+      mints natural keys and can never produce them.
+    * nothing is retained at all (``evidence_retained=False``) — every desired
+      set is then empty, so a diff could only ever be destructive.
+
+    Diffing such an event anyway put it in the "current but not desired" branch
+    and TOMBSTONED it: one ``db rederive --yes`` retired every pre-cutover
+    weekly usage/cost snapshot on a real install (#426). Those events are
+    preserved instead — never tombstoned, never rewritten from a re-derivation
+    that does not cover them. Everything the retained observations DO cover
+    still diffs normally, so an obsolete derivation still retires.
+
+    The returned record is the highest-revision non-tombstone line for that id
+    — a rev-0 evt, or a replacement from a committed correction batch — i.e.
+    exactly the payload the selector would choose if no tombstone existed.
+    """
+    committed = {
+        record.get("id") for record in records
+        if record.get("t") == "correction_batch"
+        and record.get("phase") == "commit"
+    }
+    best: dict[str, tuple[int, int, Mapping]] = {}
+    for sequence, record in enumerate(records):
+        if record.get("t") == "evt":
+            candidate = record
+        elif (
+            record.get("t") == "correction"
+            and record.get("action") == "replace"
+            and record.get("batch") in committed
+        ):
+            candidate = {
+                "v": record.get("v"),
+                "t": "evt",
+                "id": record.get("id"),
+                "rev": record.get("rev", 0),
+                "at": record.get("at"),
+                "src": "ingest",
+                "payload": dict(record.get("payload") or {}),
+            }
+        else:
+            continue
+        event_id = candidate.get("id")
+        if not isinstance(event_id, str) or not event_id:
+            continue
+        if not _is_owned_event(candidate):
+            continue
+        if evidence_retained and not event_id.startswith(
+            _CUTOVER_EXPORT_ID_PREFIX
+        ):
+            continue  # the retained observations can re-derive it
+        revision = candidate.get("rev", 0)
+        if not isinstance(revision, int):
+            revision = 0
+        prior = best.get(event_id)
+        if prior is None or (revision, sequence) >= (prior[0], prior[1]):
+            best[event_id] = (revision, sequence, candidate)
+    return {event_id: entry[2] for event_id, entry in best.items()}
+
+
 def _canonical_bytes(value) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -266,6 +346,7 @@ class RederivePlan:
     counts: Mapping[str, int]
     actions: tuple[PlanAction, ...]
     retained_event_count: int
+    preserved_event_count: int = 0
 
     def _body(self) -> dict:
         return {
@@ -281,6 +362,7 @@ class RederivePlan:
             "configFingerprint": self.config_fingerprint,
             "counts": dict(self.counts),
             "retainedEventCount": self.retained_event_count,
+            "preservedEventCount": self.preserved_event_count,
             "payloadHashes": sorted(action.payload_hash for action in self.actions),
             "actions": [action.to_dict() for action in self.actions],
         }
@@ -317,8 +399,18 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
                             journal_high_water: "tuple[str, int] | None",
                             cache_fingerprint: str,
                             config_fingerprint: str,
+                            preserved_events: Iterable[Mapping],
                             conflicted_event_ids=frozenset()) -> RederivePlan:
     """Diff current effective events against one scratch-derived desired set.
+
+    ``preserved_events`` (#426) names the owned events the re-derivation cannot
+    reach — see :func:`preserved_history`. They are held OUT of the diff, so
+    the "current but not desired" branch below can never retire history the
+    replay was never able to reproduce. The keyword is deliberately required:
+    defaulting it to empty is exactly the data-loss bug it exists to prevent.
+    A preserved event is only ever acted on to make it durable again —
+    re-affirmed at ``rev + 1`` when its group is quarantined (#374), or revived
+    at ``rev + 1`` when THIS family's own earlier batch tombstoned it.
 
     ``conflicted_event_ids`` (#374) names the event ids this family owns whose
     same-revision group the selector QUARANTINED at the winning revision. They
@@ -344,14 +436,43 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         and selected.record is not None
         and not _is_owned_event(selected.record)
     )
+    preserved = {}
+    for record in preserved_events:
+        event_id = record.get("id")
+        if isinstance(event_id, str) and event_id and event_id not in desired:
+            preserved[event_id] = record
     counts = {"retain": 0, "supersede": 0, "tombstone": 0, "add": 0}
     actions: list[PlanAction] = []
 
-    for event_id in sorted(set(current) | set(desired)):
+    for event_id in sorted(set(current) | set(desired) | set(preserved)):
         current_record = current.get(event_id)
         desired_record = desired.get(event_id)
         selected = selection.by_id.get(event_id)
-        if current_record is not None and desired_record is not None:
+        preserved_record = preserved.get(event_id)
+        if preserved_record is not None:
+            # Un-re-derivable history: retain it, or restore it when this
+            # family's own earlier plan retired it (#426).
+            revive = (
+                selected is not None
+                and selected.status == "tombstone"
+                and str(selected.batch_id or "").startswith(_FAMILY_BATCH_PREFIX)
+            )
+            reaffirm = (
+                selected is not None
+                and selected.status == "active"
+                and event_id in conflicted_event_ids
+            )
+            if not (revive or reaffirm):
+                counts["retain"] += 1
+                continue
+            source = (
+                selected.record if reaffirm else preserved_record
+            )
+            revision = int(selected.rev) + 1
+            disposition = "supersede"
+            at = str(source["at"])
+            payload = dict(source.get("payload") or {})
+        elif current_record is not None and desired_record is not None:
             desired_record = _preserve_non_derivable_state(
                 current_record, desired_record
             )
@@ -404,4 +525,5 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         counts=counts,
         actions=tuple(actions),
         retained_event_count=retained_event_count,
+        preserved_event_count=len(preserved),
     )

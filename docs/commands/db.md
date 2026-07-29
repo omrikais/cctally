@@ -296,6 +296,26 @@ current config on later live activity. Codex quota and Codex budget/projection
 state remain outside this family. Missing cache tables/columns, account-specific
 cost inputs, or a known cache-write TTL split fail before mutation.
 
+**Pre-cutover history is preserved, never re-derived (#426).** Observations are
+only journaled from the cutover onwards, so the rows the cutover exported as
+`b:<table>:<rowid>` lines are themselves the only durable truth for everything
+older — no replay can reproduce them, because the family's own derivation only
+ever mints natural keys (`sa:`, `wcs:`, `pm:`, …). Those events are held out of
+the diff entirely: never tombstoned, never rewritten from a re-derivation that
+does not cover them. The same protection covers every owned event when no Claude
+observation is retained at all, since a diff against an empty desired set can
+only be destructive. `preservedEventCount` in the JSON reports how many events a
+plan protected. Everything the retained observations do cover still diffs
+normally, so an obsolete derivation still retires.
+
+If an earlier `claude-usage` batch already retired that history — a
+`db rederive --yes` before this fix dropped every pre-cutover weekly usage and
+cost snapshot, collapsing a 12-week `$/1%` trend to the weeks since the cutover
+— the next plan **revives** it at `rev + 1` from the journal's own retained
+lines. Run `cctally db rederive --family claude-usage` and apply it with `--yes`
+to restore the history. A tombstone written by anything other than this family's
+own re-derivation is a deliberate retirement and is left alone.
+
 | Flag | Description |
 | --- | --- |
 | `--family claude-usage` | **Required.** The only supported family in this release. |
@@ -303,8 +323,8 @@ cost inputs, or a known cache-write TTL split fail before mutation.
 | `--json` | Emit a stamped `schemaVersion: 1` object. |
 
 JSON always includes `status`, `family`, `journalHighWater`, `batchId`,
-`planHash`, `actionCounts`, `conflicts`, `journalConflicts`, `dataGaps`,
-`errors`, `rebuild`, and `noOp`. If a readable journal exists, input and
+`planHash`, `actionCounts`, `preservedEventCount`, `conflicts`,
+`journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and
 retained-source errors preserve the already-captured `journalHighWater`.
 `status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`,
 `missing-source`, or `failed`. New optional keys may be added without a schema

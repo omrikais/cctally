@@ -73,6 +73,7 @@ def test_plan_classifies_retain_supersede_tombstone_and_add_stably(cctally_modul
         journal_high_water=("observations-2026-07.jsonl", 1234),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
     )
     second = rederive.build_claude_usage_plan(
         selection=selection,
@@ -80,6 +81,7 @@ def test_plan_classifies_retain_supersede_tombstone_and_add_stably(cctally_modul
         journal_high_water=("observations-2026-07.jsonl", 1234),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
     )
 
     assert first.to_bytes() == second.to_bytes()
@@ -130,6 +132,7 @@ def test_percent_milestone_plan_preserves_non_derivable_alert_latch(
         "journal_high_water": ("observations-2026-07.jsonl", 1234),
         "cache_fingerprint": "sha256:cache",
         "config_fingerprint": "sha256:config",
+        "preserved_events": (),
     }
 
     retained = rederive.build_claude_usage_plan(
@@ -173,6 +176,7 @@ def test_claude_family_preserves_codex_owned_budget_and_projection_events(
         journal_high_water=("observations-2026-07.jsonl", 100),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
     )
 
     assert plan.actions == ()
@@ -191,6 +195,7 @@ def test_applying_plan_through_task_a_seam_makes_next_plan_empty(cctally_module)
         journal_high_water=("observations-2026-07.jsonl", 10),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
     )
     correction = journal.make_correction_batch(
         batch_id="batch:test",
@@ -206,6 +211,7 @@ def test_applying_plan_through_task_a_seam_makes_next_plan_empty(cctally_module)
         journal_high_water=("observations-2026-07.jsonl", 20),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
     )
 
     assert second.actions == ()
@@ -1194,6 +1200,7 @@ def _plan(rederive, selection, desired, conflicted=frozenset()):
         journal_high_water=("observations-2026-07.jsonl", 1234),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
+        preserved_events=(),
         conflicted_event_ids=conflicted,
     )
 
@@ -1327,3 +1334,256 @@ def test_forced_supersede_leaves_a_tombstone_disposition_alone(cctally_module):
 
     assert plan.counts == {"retain": 0, "supersede": 0, "tombstone": 1, "add": 0}
     assert plan.actions[0].revision == 1
+
+
+# ==========================================================================
+# #426 — pre-cutover history the family cannot re-derive
+#
+# The journal cutover exports the pre-journal stats rows as `b:<table>:<rowid>`
+# evt lines. Nothing behind them is retained: Claude usage observations only
+# start being journaled AT the cutover, so a scratch replay of retained
+# observations can never reproduce them. The plan diffed them anyway, so every
+# exported row landed in the "current but not desired" branch and was
+# TOMBSTONED — one `db rederive --yes` retired months of weekly usage/cost
+# history (27 weeks -> 2 on the reporter's install) and every later rebuild
+# faithfully replayed the tombstones.
+# ==========================================================================
+
+HISTORY_AT = "2026-03-09T18:20:42.723Z"
+
+
+def _bootstrap_snapshot(journal, rowid, *, at=HISTORY_AT, weekly_percent=27.0):
+    """One cutover-exported `weekly_usage_snapshots` row, as the real bootstrap
+    segment writes it."""
+    return journal.make_evt(
+        kind="snapshot_accept",
+        id=journal.bootstrap_id("weekly_usage_snapshots", rowid),
+        at=at,
+        payload={
+            "captured_at_utc": at,
+            "five_hour_percent": None,
+            "five_hour_resets_at": None,
+            "five_hour_window_key": None,
+            "page_url": "https://claude.ai/settings/usage",
+            "payload_json": "{}",
+            "source": "tampermonkey",
+            "week_start_date": "2026-03-06",
+            "week_end_date": "2026-03-13",
+            "week_start_at": "2026-03-06T10:00:00+02:00",
+            "week_end_at": "2026-03-13T10:00:00+02:00",
+            "weekly_percent": weekly_percent,
+        },
+    )
+
+
+def _tombstone_batch(journal, event_id, *, batch_id, at=AT, rev=1):
+    return journal.make_correction_batch(
+        batch_id=batch_id,
+        family="claude-usage",
+        at=at,
+        actions=[{
+            "action": "tombstone",
+            "id": event_id,
+            "rev": rev,
+            "at": HISTORY_AT,
+            "payload": None,
+        }],
+    )
+
+
+def test_pre_cutover_history_is_preserved_not_tombstoned(tmp_path, monkeypatch):
+    """The reporter's bug: history exported at cutover must survive a rederive."""
+    mod = _isolated(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    cache = _seed_cache(mod)
+    history = _bootstrap_snapshot(journal, 16)
+    obs = _raw_obs(journal)
+
+    plan = mod.plan_claude_usage_rederive(
+        [history, obs],
+        cache_conn=cache,
+        journal_high_water=("observations-2026-07.jsonl", 500),
+    )
+
+    dispositions = {a.event_id: a.disposition for a in plan.actions}
+    assert history["id"] not in dispositions
+    assert plan.counts["tombstone"] == 0
+    assert plan.counts["retain"] >= 1
+    # The retained-observation window still re-derives normally.
+    assert plan.counts["add"] >= 3
+    cache.close()
+
+
+def test_derivable_window_events_still_retire_when_no_longer_derived(
+    tmp_path, monkeypatch
+):
+    """The preservation rule is scoped to what the family cannot re-derive: a
+    stale event INSIDE the retained window must still tombstone."""
+    mod = _isolated(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    cache = _seed_cache(mod)
+    obs = _raw_obs(journal)
+    stale = journal.make_evt(
+        kind="snapshot_accept",
+        id="sa:acct-a:stale",
+        at="2026-07-26T00:00:00Z",  # after the retained-observation floor
+        payload={"weekly_percent": 99.0},
+    )
+
+    plan = mod.plan_claude_usage_rederive(
+        [obs, stale],
+        cache_conn=cache,
+        journal_high_water=("observations-2026-07.jsonl", 500),
+    )
+
+    assert [a.disposition for a in plan.actions if a.event_id == "sa:acct-a:stale"] == [
+        "tombstone"
+    ]
+    cache.close()
+
+
+def test_history_retired_by_a_prior_rederive_batch_is_revived(
+    tmp_path, monkeypatch
+):
+    """Recovery leg: the append-only journal keeps the wrongly-tombstoned
+    history, so a plan built by the fixed planner restores it at rev + 1."""
+    mod = _isolated(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    cache = _seed_cache(mod)
+    history = _bootstrap_snapshot(journal, 16)
+    batch = _tombstone_batch(
+        journal, history["id"],
+        batch_id="rederive:claude-usage:430771d9",
+    )
+    obs = _raw_obs(journal)
+
+    plan = mod.plan_claude_usage_rederive(
+        [history, *batch, obs],
+        cache_conn=cache,
+        journal_high_water=("observations-2026-07.jsonl", 500),
+    )
+
+    revive = next(a for a in plan.actions if a.event_id == history["id"])
+    assert revive.disposition == "supersede"
+    assert revive.revision == 2
+    assert revive.at == history["at"]
+    # Every original field comes back untouched; the #341 legacy-account stamp
+    # is the one addition, and it is exactly what a rebuild fold would apply.
+    assert {
+        key: value for key, value in revive.payload.items()
+        if key in history["payload"]
+    } == dict(history["payload"])
+    assert revive.payload["account_key"] == "unattributed"
+
+    settled = journal.resolve_effective_events([
+        history,
+        *batch,
+        *journal.make_correction_batch(
+            batch_id="rederive:claude-usage:recovery",
+            family="claude-usage",
+            at=AT,
+            actions=plan.to_correction_actions(),
+        ),
+    ])
+    selected = settled.by_id[history["id"]]
+    assert selected.status == "active"
+    assert selected.record["payload"] == revive.payload
+    cache.close()
+
+
+def test_history_retired_by_another_family_is_left_alone(tmp_path, monkeypatch):
+    """Only this family's own destructive batches are undone — a deliberate
+    operator retirement stays retired."""
+    mod = _isolated(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    cache = _seed_cache(mod)
+    history = _bootstrap_snapshot(journal, 16)
+    batch = _tombstone_batch(
+        journal, history["id"], batch_id="operator:retire-duplicate",
+    )
+    obs = _raw_obs(journal)
+
+    plan = mod.plan_claude_usage_rederive(
+        [history, *batch, obs],
+        cache_conn=cache,
+        journal_high_water=("observations-2026-07.jsonl", 500),
+    )
+
+    assert history["id"] not in {a.event_id for a in plan.actions}
+    cache.close()
+
+
+def test_operator_records_alone_are_not_re_derivation_evidence(
+    tmp_path, monkeypatch
+):
+    """Evidence is counted in observations. An operator record is replay INPUT
+    but derives nothing on its own — and the cutover re-emits some of them with
+    their original historical timestamps — so a journal carrying only operator
+    records can produce no desired set, and must plan nothing destructive."""
+    mod = _isolated(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    cache = _seed_cache(mod)
+    credit_op = journal.make_op(
+        at="2026-06-19T09:22:43Z",
+        src="bootstrap",
+        payload={
+            "kind": "weekly_credit_floor",
+            "week_start_date": "2026-06-18",
+            "effective_at_utc": "2026-06-19T09:22:43Z",
+            "observed_pre_credit_pct": 46.0,
+            "account_key": "acct-a",
+        },
+    )
+    # A family-minted id, so preservation here can only come from the
+    # no-evidence rail — not from the cutover-export id rule.
+    derived = journal.make_evt(
+        kind="snapshot_accept",
+        id="sa:acct-a:no-evidence",
+        at="2026-07-04T09:00:00Z",
+        payload={"weekly_percent": 42.0},
+    )
+
+    plan = mod.plan_claude_usage_rederive(
+        [credit_op, derived],
+        cache_conn=cache,
+        journal_high_water=("observations-2026-07.jsonl", 500),
+    )
+
+    assert plan.actions == ()
+    assert plan.counts["tombstone"] == 0
+    assert plan.preserved_event_count == 1
+    cache.close()
+
+
+def test_a_journal_without_retained_evidence_plans_no_destruction(cctally_module):
+    """Kernel form of the same rail, over a cutover-exported event."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    history = _bootstrap_snapshot(journal, 16)
+    selection = journal.resolve_effective_events([history])
+
+    preserved = rederive.preserved_history([history], evidence_retained=False)
+    assert set(preserved) == {history["id"]}
+    # ... and the cutover-export rule alone preserves it even WITH evidence.
+    assert set(
+        rederive.preserved_history([history], evidence_retained=True)
+    ) == {history["id"]}
+
+    plan = rederive.build_claude_usage_plan(
+        selection=selection,
+        desired_events=[],
+        journal_high_water=("observations-2026-07.jsonl", 1234),
+        cache_fingerprint="sha256:cache",
+        config_fingerprint="sha256:config",
+        preserved_events=preserved.values(),
+    )
+
+    assert plan.counts == {"retain": 1, "supersede": 0, "tombstone": 0, "add": 0}
+    assert plan.actions == ()
+    assert plan.preserved_event_count == 1
