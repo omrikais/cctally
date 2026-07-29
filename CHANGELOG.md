@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.84.1] - 2026-07-29
+
+### Fixed
+- Internal (maintainer-only): Linux release CI now exercises transcript-recovery integration fixtures without requiring the hosted runner's filesystem to support copy-on-write reflinks. The test-only copy seam is reachable only under pytest; production recovery still fails closed when a filesystem cannot make the bounded main/WAL clone. The Projects fixture guard also keeps byte-for-byte determinism between builds made by the same SQLite engine while comparing committed fixtures by canonical schema and row content across SQLite versions, whose valid B-tree page layouts can differ. This supersedes the failed public Linux gate for v1.84.0.
+
 ## [1.84.0] - 2026-07-29
 
 ### Added

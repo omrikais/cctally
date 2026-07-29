@@ -59,6 +59,7 @@ def _stage_sources(tmp_path: pathlib.Path) -> tuple[dict[str, str], pathlib.Path
         "CCTALLY_DATA_DIR": str(data),
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
+        "CCTALLY_TEST_CONVERSATION_PROBE_COPY": "1",
         "TZ": "Etc/UTC",
     })
     return env, data

@@ -6933,7 +6933,17 @@ def _clone_conversation_probe_member(
     source: pathlib.Path,
     destination: pathlib.Path,
 ) -> None:
-    """Bounded same-volume COW clone; never fall back to a byte copy."""
+    """Bounded same-volume COW clone; production never falls back to a copy."""
+    if (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and os.environ.get("CCTALLY_TEST_CONVERSATION_PROBE_COPY") == "1"
+    ):
+        # Hosted Linux workspaces commonly reject FICLONE.  Integration tests
+        # opt into a small-fixture byte copy so they can exercise the recovery
+        # protocol; the PYTEST_CURRENT_TEST guard keeps this seam unreachable
+        # from production, where clone unavailability must still fail closed.
+        shutil.copyfile(source, destination)
+        return
     cp = shutil.which("cp")
     if cp is None:
         raise OSError(

@@ -28,6 +28,31 @@ def _sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _logical_snapshot(path: pathlib.Path) -> tuple:
+    """Canonical schema + row content, independent of SQLite page layout."""
+    with closing(sqlite3.connect(path)) as conn:
+        schema = tuple(conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE sql IS NOT NULL ORDER BY type, name"
+        ).fetchall())
+        tables = [
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type='table' ORDER BY name"
+            )
+        ]
+        rows = []
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            rows.append((
+                table,
+                tuple(conn.execute(
+                    f"SELECT * FROM {quoted} ORDER BY rowid"
+                ).fetchall()),
+            ))
+    return schema, tuple(rows)
+
+
 def _build(out_dir: pathlib.Path) -> None:
     env = os.environ.copy()
     env["TZ"] = "Etc/UTC"
@@ -46,7 +71,7 @@ def test_projects_fixture_declares_planner_stats_policy():
     assert builder.PLANNER_STATS_POLICY == "absent"
 
 
-def test_projects_fixtures_rebuild_byte_exact_without_planner_stats(tmp_path):
+def test_projects_fixtures_rebuild_stably_without_planner_stats(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"
     _build(first)
@@ -55,8 +80,11 @@ def test_projects_fixtures_rebuild_byte_exact_without_planner_stats(tmp_path):
     names = ("multi-week.db", "single-week.db", "edge-cases.db")
     first_hashes = {name: _sha256(first / name) for name in names}
     second_hashes = {name: _sha256(second / name) for name in names}
-    committed_hashes = {name: _sha256(COMMITTED / name) for name in names}
-    assert first_hashes == second_hashes == committed_hashes
+    assert first_hashes == second_hashes
+    for name in names:
+        assert _logical_snapshot(first / name) == _logical_snapshot(
+            COMMITTED / name
+        )
 
     with closing(sqlite3.connect(first / "multi-week.db")) as conn:
         stat_tables = conn.execute(

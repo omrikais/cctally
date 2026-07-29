@@ -8,6 +8,7 @@ from conftest import load_script, redirect_paths
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)

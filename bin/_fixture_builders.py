@@ -45,8 +45,11 @@ FIXED_LAST_INGESTED_AT = "2026-04-15T15:00:00Z"
 # normalization, the byte differs across Python interpreter sqlite3
 # library versions (e.g. cpython 3.13's bundled lib is 3.53.0, 3.14's is
 # 3.53.1), so every harness rebuild on a different interpreter dirties
-# the in-tree fixtures by exactly one byte per file. Zeroing the field
-# makes builder output byte-deterministic across SQLite library bumps.
+# the in-tree fixtures by exactly one byte per file. Zeroing removes that
+# known header drift. It does not promise identical B-tree page layout
+# across SQLite engines; cross-engine fixture checks must compare canonical
+# schema and row content unless that fixture family separately proves byte
+# stability.
 _SQLITE_HEADER_LIBRARY_WRITE_VERSION_OFFSET = 96
 _SQLITE_HEADER_LIBRARY_WRITE_VERSION_LEN = 4
 

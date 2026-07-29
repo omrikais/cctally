@@ -354,6 +354,7 @@ def _isolated_codex_world(tmp_path):
         "CCTALLY_DATA_DIR": str(data),
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
+        "CCTALLY_TEST_CONVERSATION_PROBE_COPY": "1",
         "TZ": "Etc/UTC",
     })
     return env, data, codex_home, rollout

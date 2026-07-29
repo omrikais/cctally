@@ -77,6 +77,7 @@ def _stage_sources(
         "CCTALLY_DATA_DIR": str(data),
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
+        "CCTALLY_TEST_CONVERSATION_PROBE_COPY": "1",
         "TZ": "Etc/UTC",
     })
     return env, data
@@ -575,6 +576,41 @@ def test_probe_snapshot_copy_failure_preserves_live_family(
     assert _family_snapshot(path) == before
     assert not list((path.parent / "quarantine").glob("conversations.db-*"))
     assert not path.with_name("conversations.db.recovery.json").exists()
+
+
+def test_probe_snapshot_test_copy_seam_requires_pytest_guard(
+    tmp_path, monkeypatch,
+):
+    """The portable integration seam is inert outside an active pytest case."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = ns["_cctally_cache"]
+    source = tmp_path / "source.db"
+    destination = tmp_path / "snapshot.db"
+    source.write_bytes(b"probe source")
+    monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(cache_mod.sys, "platform", "linux")
+    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/bin/cp")
+
+    def fail_clone(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, "", "clone support unavailable",
+        )
+
+    monkeypatch.setattr(cache_mod.subprocess, "run", fail_clone)
+    with pytest.raises(OSError, match="clone support unavailable"):
+        cache_mod._clone_conversation_probe_member(source, destination)
+    assert not destination.exists()
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "portable probe integration")
+
+    def unexpected_subprocess(*_args, **_kwargs):
+        raise AssertionError("pytest copy seam must not invoke cp")
+
+    monkeypatch.setattr(cache_mod.subprocess, "run", unexpected_subprocess)
+    cache_mod._clone_conversation_probe_member(source, destination)
+    assert destination.read_bytes() == b"probe source"
 
 
 def test_probe_snapshot_uses_bounded_cow_clone_and_cleans_stale_dirs(
