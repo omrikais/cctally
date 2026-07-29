@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import json
 import os
+import pathlib
 import shutil
 import stat
 import sys
@@ -175,6 +176,51 @@ def test_codex_hook_write_uses_backup_atomic_permissions_and_status_json(runtime
     assert row["state"] == "installed_trust_unobservable"
     assert row["requires_review"] is None
     assert row["stop_count"] == row["subagent_stop_count"] == 1
+
+
+def test_npm_shim_hook_status_reinstall_and_uninstall_lifecycle(
+    runtime, monkeypatch, capsys,
+):
+    ns, home = runtime
+    binary = str(
+        home.parent / "lib" / "node_modules" / "cctally"
+        / "bin" / "cctally-npm-shim.js"
+    )
+    setup = sys.modules["_cctally_setup"]
+    monkeypatch.setattr(
+        setup,
+        "_setup_resolve_hook_target",
+        lambda _repo_root: pathlib.Path(binary),
+    )
+
+    installed = ns["_setup_manage_codex_hooks"]("install", binary)
+    first_row = installed["roots"][0]
+    assert first_row["state"] == "installed_review_required"
+    assert first_row["changes"] == {"Stop": 1, "SubagentStop": 1}
+
+    hooks_path = home / "hooks.json"
+    first_document = json.loads(hooks_path.read_text())
+    for event in ("Stop", "SubagentStop"):
+        assert len(_handlers(first_document, event)) == 1
+
+    assert ns["_setup_status"](argparse.Namespace(json=True)) == 0
+    status_row = json.loads(capsys.readouterr().out)["codex_hooks"]["roots"][0]
+    assert status_row["state"] == "installed_trust_unobservable"
+    assert status_row["stop_count"] == status_row["subagent_stop_count"] == 1
+
+    reinstalled = ns["_setup_manage_codex_hooks"]("install", binary)
+    assert reinstalled["roots"][0]["changes"] == {
+        "Stop": 0,
+        "SubagentStop": 0,
+    }
+    assert json.loads(hooks_path.read_text()) == first_document
+
+    uninstalled = ns["_setup_manage_codex_hooks"]("uninstall", binary)
+    assert uninstalled["roots"][0]["changes"] == {
+        "Stop": 1,
+        "SubagentStop": 1,
+    }
+    assert json.loads(hooks_path.read_text()) == {}
 
 
 def test_codex_hook_write_waits_for_the_lock_before_creating_a_backup(
