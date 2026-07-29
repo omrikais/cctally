@@ -42,7 +42,12 @@ SCENARIO="multi-project"
 # Per-run scratch dir for the regenerated fixture (cache.db + real .git roots
 # + any test-process SQLite writes). Keeps the in-tree fixture byte-stable
 # across runs; the committed tree holds only input.env + golden-*.txt.
-SCRATCH_DIR=$(mktemp -d -t cctally-daily-instances-XXXXXX)
+#
+# Keep "lib" deliberately present in the shared ancestor. The project filter
+# is a documented substring match over the full path, so the lib-only scenarios
+# below must use their unique `repos/lib` segment rather than accidentally
+# relying on an ancestor that happens not to contain the basename.
+SCRATCH_DIR=$(mktemp -d -t cctally-daily-instances-shared-lib-XXXXXX)
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 export GOLDEN_DIFF_TMPDIR="$SCRATCH_DIR"
 
@@ -125,7 +130,7 @@ run_scenario "instances-alias-collision" "instances-alias-collision" \
 run_scenario "instances-order-desc" "instances-desc" \
     --instances --order desc --since 20260520 --until 20260521
 run_scenario "project-filter-lib" "project-filter" \
-    -p lib --since 20260520 --until 20260521
+    -p repos/lib --since 20260520 --until 20260521
 run_scenario "project-filter-app-json" "project-filter-app-json" \
     -p app --json --since 20260520 --until 20260521
 
@@ -151,16 +156,17 @@ alias_json_keys_stable () {
 alias_json_keys_stable
 
 # ── --format + -p: the -p filter survives into the share artifact ──────────
-# `daily -p lib --format md` must produce an artifact whose headline total
+# `daily -p repos/lib --format md` must produce an artifact whose headline total
 # equals the lib-only filtered total (NOT the all-projects total). We compare
-# the artifact's "**Sum:** $X" against `daily -p lib --json | .totals.totalCost`
+# the artifact's "**Sum:** $X" against
+# `daily -p repos/lib --json | .totals.totalCost`
 # — asserting on the total sidesteps share version/hash churn while proving
 # the filter reached the snapshot.
 format_p_filter_survives () {
     local name="format-p-filter-survives"
     local out_md="$SCRATCH_DIR/out-lib.md"
     HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
-        "$BIN" daily -p lib --format md --output "$out_md" \
+        "$BIN" daily -p repos/lib --format md --output "$out_md" \
         --since 20260520 --until 20260521 >/dev/null 2>&1
     if [ ! -f "$out_md" ]; then
         echo "FAIL $name: artifact not written"
@@ -170,7 +176,7 @@ format_p_filter_survives () {
     # Filtered total from the JSON path (authoritative).
     local lib_total
     lib_total=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$AS_OF" \
-        "$BIN" daily -p lib --json --since 20260520 --until 20260521 2>/dev/null \
+        "$BIN" daily -p repos/lib --json --since 20260520 --until 20260521 2>/dev/null \
         | python3 -c "import json,sys; print(f\"{json.load(sys.stdin)['totals']['totalCost']:.2f}\")")
     # Headline "**Sum:** $X" from the markdown artifact.
     local art_sum

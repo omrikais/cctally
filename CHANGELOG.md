@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.85.1] - 2026-07-29
+
+### Fixed
+- Internal (maintainer-only): the daily project-filter fixture now selects its target by a unique path segment while deliberately placing the same basename in the shared scratch ancestor, preventing a random temporary-directory collision from failing one Linux release matrix lane.
+
 ## [1.85.0] - 2026-07-29
 
 ### Fixed
