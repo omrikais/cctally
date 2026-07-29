@@ -5,7 +5,7 @@ import { PeriodDetailCard } from './PeriodDetailCard';
 import { PeriodTable } from './PeriodTable';
 import { KeyHintFooter } from '../components/KeyHintFooter';
 import { ShareIcon } from '../components/ShareIcon';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useKeymap } from '../hooks/useKeymap';
 import { keyOf, stepPeriod, type PeriodVariant } from './periodNav';
 import { dailyToPeriodRow } from './historyData';
@@ -80,13 +80,17 @@ function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSel
 }
 
 export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panelLabel, triggerId, wide }: Props) {
-  const env = useSnapshot();
   // Bound when OPEN_MODAL fires. A source switch changes the board behind the
   // modal, never the period rows or share target already in front of the user.
   const source = useSyncExternalStore(
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,
   );
+  // #416 — the expansion of a scoped panel stays scoped. `DailyPanel` /
+  // `WeeklyPanel` / `MonthlyPanel` all read `useScopedSnapshot()`, so reading
+  // the unscoped snapshot here painted every account's rows under the focused
+  // account's chip.
+  const env = useScopedSnapshot(source);
 
   // Day seeds from a heatmap-cell deep-link (openDailyDate); week/month seed
   // null → effectiveKey clamps to the first (current) row.

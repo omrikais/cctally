@@ -94,7 +94,7 @@ _OPAQUE_PROJECT_KEY_RE = re.compile(r"^project:[0-9a-f]{24}$")
 _QUALIFIED_CODEX_ENTRIES_SQL = """
     SELECT entries.timestamp_utc, entries.session_id, entries.source_path,
            entries.source_root_key,
-           entries.conversation_key, entries.model,
+           entries.conversation_key, entries.model, entries.account_key,
            entries.input_tokens, entries.cached_input_tokens,
            entries.output_tokens, entries.reasoning_output_tokens,
            entries.total_tokens, threads.cwd, threads.git_json,
@@ -577,6 +577,9 @@ def load_qualified_codex_entries(
             reasoning_output_tokens=int(row["reasoning_output_tokens"]),
             total_tokens=int(row["total_tokens"]),
             cost_usd=cost_usd,
+            # NULL ≡ unattributed — the cache-read rule (#416 §5.2). Carried,
+            # never grouped; see the field's comment on `QualifiedCodexEntry`.
+            account_key=str(row["account_key"] or _lib_accounts.UNATTRIBUTED),
         ))
     return tuple(result)
 

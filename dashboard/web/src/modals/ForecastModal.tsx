@@ -1,19 +1,23 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { resolveVerdict } from '../lib/verdict';
 import { fmt } from '../lib/fmt';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
+import { sourceAccounts } from '../store/accountFocus';
 import {
+  codexLiveQuotaKeys,
+  presentationCodexAccountForecasts,
   presentationForecast,
   presentationForecastComposition,
   presentationPeriodRows,
+  type CodexAccountForecastRow,
   type ForecastPresentation,
   type ProviderPresentationSection,
 } from '../lib/dashboardPresentation';
-import type { ForecastEnvelope, SourceName } from '../types/envelope';
+import type { Envelope, ForecastEnvelope, SourceName } from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
@@ -353,13 +357,101 @@ function useRangeBar(
   }, [wrapRef, trackRef, fc, nowPct]);
 }
 
+// #416 QA P0 — the per-account Codex forecast table.
+//
+// A forecast is a claim about ONE quota allowance. `presentationForecast`
+// resolved a single weekly window out of a per-account list, so the "All
+// accounts" modal published account A's cycle bounds beside a `$ / 1%` taken
+// from the MERGED weekly rows — a rate belonging to no account that exists, and
+// two daily budgets derived from it. Blending is not fixable by picking a
+// better representative, so the modal discloses instead: one row per account,
+// every value that account's OWN server-emitted projection, nothing summed or
+// averaged. Same construction as `CodexPerAccountCycleTable` (the precedent
+// this deliberately mirrors) and the per-account hero strip.
+function CodexPerAccountForecastTable({
+  rows,
+}: {
+  rows: CodexAccountForecastRow[];
+}) {
+  return (
+    <div data-testid="codex-forecast-per-account">
+      <p className="mcw-ms-sub" data-testid="codex-forecast-per-account-note">
+        Each account has its own quota cycle, so there is no single merged
+        projection, rate or daily budget. Every row below is that
+        account&rsquo;s own — pick an account chip for its full forecast.
+      </p>
+      <table className="m-histable mcw-table mcw-per-account-table">
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th className="num">Projected @ reset</th>
+            <th className="num">Current quota</th>
+            <th>Confidence</th>
+            <th>Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const verdict = resolveVerdict(row.verdict);
+            return (
+              <tr
+                key={row.accountKey}
+                data-testid="forecast-account-row"
+                data-account-key={row.accountKey}
+                className={row.unattributed ? 'is-unattributed' : undefined}
+              >
+                <td>{row.label}</td>
+                <td className={`num${row.projected == null ? ' m-unavailable' : ''}`}>
+                  {fmt.pct1(row.projected)}
+                </td>
+                <td className={`num${row.current == null ? ' m-unavailable' : ''}`}>
+                  {fmt.pct1(row.current)}
+                </td>
+                <td className={row.confidence == null ? 'm-unavailable' : undefined}>
+                  {row.confidence ?? '—'}
+                </td>
+                <td>
+                  {verdict ? (
+                    <span className={`fc-verdict-chip is-${verdict.cls}`}>
+                      <span className="fc-verdict-glyph" aria-hidden="true">
+                        {verdict.glyph}
+                      </span>
+                      {' '}{verdict.label}
+                    </span>
+                  ) : (
+                    <span className="m-unavailable">—</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// The gate is the scope chokepoint on a provider tab (decorated AND unfocused)
+// and plain decoration on the combined tab, where there is no Codex chip to
+// focus — identical to `ForecastPanel` and `SharedHero`.
+function codexPerAccountRows(
+  env: Envelope | null,
+  focusedAccountKey: string | null,
+): CodexAccountForecastRow[] | null {
+  if (focusedAccountKey != null) return null;
+  if (sourceAccounts(env?.sources?.codex ?? null) == null) return null;
+  return presentationCodexAccountForecasts(env);
+}
+
 function AllForecastSection({
   section,
+  perAccountRows,
 }: {
   section: ProviderPresentationSection<ForecastPresentation>;
+  perAccountRows: CodexAccountForecastRow[] | null;
 }) {
   const value = section.value;
-  const verdict = resolveVerdict(value?.verdict ?? null);
+  const verdict = perAccountRows != null ? null : resolveVerdict(value?.verdict ?? null);
   return (
     <section
       className="modal-forecast provider-composition-section"
@@ -370,11 +462,13 @@ function AllForecastSection({
       <div className="source-provider-head provider-composition-head">
         <SourceChip source={section.source} />
         <strong>{section.label} forecast</strong>
-        {section.status !== 'available' && (
+        {section.status !== 'available' && perAccountRows == null && (
           <span className="provider-section-status">{section.status}</span>
         )}
       </div>
-      {value == null ? (
+      {perAccountRows != null ? (
+        <CodexPerAccountForecastTable rows={perAccountRows} />
+      ) : value == null ? (
         <div className="provider-section-reason m-unavailable">{section.reason}</div>
       ) : (
         <>
@@ -437,8 +531,10 @@ function AllForecastSection({
 }
 
 function AllForecastModal() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot('all');
   const composition = presentationForecastComposition(env, 'all');
+  // The combined tab has no Codex account chip, so decoration alone gates it.
+  const perAccountRows = codexPerAccountRows(env, null);
   const headerExtras = (
     <ShareIcon
       panel="forecast"
@@ -451,7 +547,11 @@ function AllForecastModal() {
     <Modal title="Forecast — by provider" accentClass="accent-purple" headerExtras={headerExtras}>
       <div className="provider-composition provider-composition--modal" aria-label="Claude and Codex forecast reports">
         {composition.sections.map((section) => (
-          <AllForecastSection key={section.source} section={section} />
+          <AllForecastSection
+            key={section.source}
+            section={section}
+            perAccountRows={section.source === 'codex' ? perAccountRows : null}
+          />
         ))}
       </div>
     </Modal>
@@ -459,8 +559,16 @@ function AllForecastModal() {
 }
 
 function CanonicalForecastModal({ source }: { source: SourceName }) {
-  const env = useSnapshot();
+  // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
+  const env = useScopedSnapshot(source);
+  const scope = useAccountScope();
   const isClaude = source === 'claude';
+  // #416 QA P0 — "All accounts" on a decorated Codex provider. Resolved BEFORE
+  // any of the derivations below, all of which mix a single representative
+  // window with merged weekly rows.
+  const perAccountRows = isClaude
+    ? null
+    : codexPerAccountRows(env, scope.accountKey);
   const presented = presentationForecast(env, source);
   // #373: a separate model pool is listed but is not account-level standard
   // quota. The fallback needs the same exclusion as the primary `find`, or a
@@ -471,6 +579,18 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
     (row) => row.window_minutes === 10_080,
   ) ?? accountHistories[0];
   const nativeForecast = nativeHistory?.forecast;
+  // #416 QA P3-1 — the sibling read of the same already-reset window. The
+  // retained `forecast.rate_percent_per_hour` is RENDERED twice (under the
+  // projection and as the "Quota rate" row), so a dead-window account printed a
+  // real %/h for a window that no longer exists, right beside a `—` current
+  // quota. `nativeBudget100/90` already self-blank (`remaining_seconds` is 0),
+  // so the rate was the only leak. `env` is the SCOPED envelope, so under focus
+  // this reads the account's own child — the same subtree `nativeHistory` came
+  // from, which is what keeps the shared-root collision (P2-1) out of here.
+  const nativeLive = nativeHistory != null && codexLiveQuotaKeys(
+    env?.sources?.codex?.data?.quota,
+  ).has(nativeHistory.key);
+  const nativeRate = nativeLive ? nativeForecast?.rate_percent_per_hour ?? null : null;
   const nativeRemainingHours = nativeForecast?.remaining_seconds == null
     ? null
     : nativeForecast.remaining_seconds / 3600;
@@ -500,7 +620,7 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
         explain: {
           rates: {
             dollars_per_percent: nativeDollarsPerPercent,
-            week_average_pct_per_hour: nativeForecast?.rate_percent_per_hour ?? null,
+            week_average_pct_per_hour: nativeRate,
             recent_24h_pct_per_hour: null,
           },
           week: { elapsed_hours: nativeElapsedHours, remaining_hours: nativeRemainingHours },
@@ -546,6 +666,34 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
 
   const rates = explain?.rates;
   const week = explain?.week;
+
+  // Every derivation above mixes ONE representative window with the MERGED
+  // weekly rows, so under "All accounts" the whole canonical body is replaced
+  // rather than selectively blanked: `$ / 1%`, `cycle done`, `elapsed`,
+  // `remaining` and the two daily budgets were each a different account's fact
+  // or a rate belonging to none. Hooks above stay unconditional; only the
+  // rendered tree branches.
+  if (perAccountRows != null) {
+    return (
+      <Modal
+        title="Forecast — per account"
+        accentClass="accent-purple"
+        headerExtras={headerExtras}
+      >
+        <section
+          className="modal-forecast"
+          data-source={source}
+          data-per-account=""
+        >
+          <div className="m-chipstrip" id="mfc-chips">
+            <span className="m-pill accent-purple">All accounts</span>
+            <span className="m-pill accent-blue">Codex native quota</span>
+          </div>
+          <CodexPerAccountForecastTable rows={perAccountRows} />
+        </section>
+      </Modal>
+    );
+  }
 
   return (
     <Modal

@@ -29,7 +29,7 @@
 //
 // No ShareIcon in v1 — cache-report is not in SHARE_CAPABLE_PANELS
 // (spec §2.6).
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useSyncExternalStore } from 'react';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { dispatch, getState, subscribeStore } from '../store/store';
@@ -104,7 +104,7 @@ function CacheProviderSummary({
 // Codex publishes the same computed report shape from native inclusive-input
 // cache counters. The card and modal therefore share one canonical renderer.
 export function CacheReportPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const isMobile = useIsMobile();
   const collapseClass = isMobile ? ' cache-report-collapsed' : '';

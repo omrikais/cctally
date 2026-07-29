@@ -720,7 +720,22 @@ def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, A
         and observation.identity.logical_limit_key == matched[1]
         and observation.identity.observed_slot == matched[2]
         and observation.identity.window_minutes == matched[3]
-        and observation.resets_at == reset_at
+        # CANONICAL, never the raw reset (#416 §4.1). `quota_window_blocks
+        # .resets_at_utc` — which `matched[5]` is — became the tolerance-anchored
+        # anchor, so a raw comparison here is no longer the same axis: it keeps
+        # only the members that happen to spell their reset the way the anchor
+        # does, and `block.observations`, `percent_milestones`,
+        # `quota_freshness` and `forecast_quota` are then all recomputed from
+        # that truncated set — reintroducing the very fragmentation §4.1
+        # removes. It is also a 404 generator: this read is BOUNDED (35 days /
+        # 1,000 rows) while the anchor was resolved UNBOUNDED at ingest, so
+        # whenever the anchor-establishing observation falls outside the bounds
+        # — or was another account's, since the anchor group excludes the
+        # account deliberately — a raw filter keeps nothing at all and
+        # `build_blocks(()) == ()` raises `SourceResourceNotFound`. The line
+        # below is already anchor-vs-anchor (`QuotaBlock.resets_at` is the
+        # anchor), so both sides now agree.
+        and observation.canonical_resets_at == reset_at
     )
     block = next(
         (item for item in build_blocks(matching_observations) if item.resets_at == reset_at),
@@ -6386,6 +6401,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         connections, no sync/migration writes from the assembly; the multi-read
         assembly runs inside one transaction per DB. 400 malformed key/source;
         404 ``{code: "unknown_key", reason}`` for keys that don't resolve.
+
+        ``?account=<account_key|unattributed>`` (#416, Codex only) focuses the
+        cycle on one account: its own crossings, its own spend. ABSENT is the
+        shipped merged response and is byte-identical — the client sends the
+        qualifier only under account focus, exactly as `/api/source/` does. The
+        vendor-wide ``*`` sentinel is rejected here (unlike `/api/source/`,
+        where it labels an alert row): it names no cycle to render.
         """
         import re as _re
         import urllib.parse as _urlparse
@@ -6401,6 +6423,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self._send_milestones_json(400, {"error": "invalid source"})
             return
         key = _urlparse.unquote(raw_key)
+        raw_account = _urlparse.parse_qs(
+            _urlparse.urlsplit(self.path).query, keep_blank_values=True,
+        ).get("account")
+        account_key = None
+        if raw_account is not None:
+            if (
+                len(raw_account) != 1
+                or not _re.fullmatch(r"[0-9a-f]{32}|unattributed", raw_account[0])
+            ):
+                self._send_milestones_json(400, {"error": "invalid account"})
+                return
+            if source != "codex":
+                # Claude weeks are not account-partitioned on this route yet;
+                # accepting the qualifier silently would be a privacy lie.
+                self._send_milestones_json(400, {"error": "invalid account"})
+                return
+            account_key = raw_account[0]
         c = sys.modules["cctally"]
         try:
             if source == "claude":
@@ -6458,12 +6497,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # fall through to `cyc.reset > now_utc`, which marks every
                 # future-ending cycle current — so one cycle key described two
                 # different cycles depending on which route answered.
+                # #416 QA sweep: the live boundary must belong to the SAME
+                # account the enumeration below is scoped to, or the focused
+                # account's own current cycle is judged against a sibling's
+                # reset and never resolves as current.
                 identity = resolve_codex_cycle_detail_identity(
                     cache_conn, source_root_keys=roots, now_utc=now_utc,
+                    account_key=account_key,
                 )
                 result = c.build_codex_cycle_detail(
                     stats_conn, cache_conn, identity=identity, key=key,
-                    speed=speed, now_utc=now_utc,
+                    speed=speed, now_utc=now_utc, account_key=account_key,
                 )
                 stats_conn.commit()
                 cache_conn.commit()

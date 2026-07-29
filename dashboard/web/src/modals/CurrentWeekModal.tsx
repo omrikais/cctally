@@ -7,7 +7,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { Modal } from './Modal';
@@ -170,6 +170,11 @@ interface MilestoneNav {
 function useMilestoneNav(
   source: 'claude' | 'codex',
   index: WeekIndexEntry[],
+  // #416 — the account whose `cycle_index` produced `index`, or null for "All
+  // accounts". It rides the detail fetch as `?account=` and is part of the
+  // fetch key, so switching the chip re-fetches instead of re-showing the
+  // previous account's cycle.
+  accountKey: string | null = null,
 ): MilestoneNav {
   const [weekKey, setWeekKeyRaw] = useState<string | null>(null);
   const [blockSel, setBlockSel] = useState<string | number | null>(null);
@@ -211,15 +216,27 @@ function useMilestoneNav(
       wantDetail
     );
   const fetchKey = shouldFetch && selectedEntry
-    ? `${selectedEntry.key}|${selectedEntry.detail_stamp}`
+    ? `${accountKey ?? ''}|${selectedEntry.key}|${selectedEntry.detail_stamp}`
     : null;
+
+  // Switching the account chip replaces the whole cycle index, so a week key
+  // held from the previous account names a cycle that account never had. Drop
+  // the selection back to "current" rather than rendering a vanished-week
+  // state — or, worse, the other account's history.
+  useEffect(() => {
+    setWeekKeyRaw(null);
+    setBlockSel(null);
+    setWantDetail(false);
+    setPendingBlockStep(null);
+    setError(null);
+  }, [accountKey]);
 
   const doFetch = useCallback(() => {
     if (!selectedEntry) return;
     const seq = ++reqSeq.current;
     setLoading(true);
     setError(null);
-    fetchWeekDetail(source, selectedEntry)
+    fetchWeekDetail(source, selectedEntry, accountKey)
       .then((payload) => {
         if (seq !== reqSeq.current) return; // only the latest selection resolves
         setDetail(payload);
@@ -230,7 +247,7 @@ function useMilestoneNav(
         setError({ status: e?.status, code: e?.code });
         setLoading(false);
       });
-  }, [source, selectedEntry]);
+  }, [source, selectedEntry, accountKey]);
 
   useEffect(() => {
     if (fetchKey == null) {
@@ -474,6 +491,62 @@ function flattenClaudeWeekly(detail: WeekDetailPayload): { rows: WeeklyRow[]; co
   return { rows, count };
 }
 
+// #416 QA P0-B — the honest "All accounts" cycle state.
+//
+// The hero that opens this modal already blanks percent and reset under All
+// accounts precisely because independent quota allowances are never blended
+// (D6). The modal was nonetheless rendering ONE representative account's
+// ladder — pill, big number, $/1%, "N crossed" and every milestone row — with
+// no account named anywhere in the dialog. Blending the crossings instead would
+// violate D6 outright (a merged percentage ladder is not a quantity that
+// exists), so the honest and more useful state is the per-account strip in
+// table form: every value here is a server-emitted per-account field off the
+// same `accounts[]` cards the hero renders. Nothing is summed, averaged, or
+// re-derived in JavaScript.
+function CodexPerAccountCycleTable({
+  accounts,
+  ctx,
+}: {
+  accounts: NonNullable<CodexSourceData['accounts']>;
+  ctx: FmtCtx;
+}) {
+  return (
+    <div data-testid="codex-cycle-per-account">
+      <p className="mcw-ms-sub" data-testid="codex-cycle-per-account-note">
+        Each account has its own quota cycle, so there is no single merged
+        percentage ladder. Spend and tokens below are each account&rsquo;s own —
+        pick an account chip to open its milestones.
+      </p>
+      <table className="m-histable mcw-table mcw-per-account-table">
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th className="num">Used %</th>
+            <th>Resets ({ctx.offsetLabel})</th>
+            <th className="num">Spent</th>
+            <th className="num">Tokens</th>
+          </tr>
+        </thead>
+        <tbody>
+          {accounts.map((card) => (
+            <tr
+              key={card.accountKey}
+              data-account-key={card.accountKey}
+              className={card.unattributed ? 'is-unattributed' : undefined}
+            >
+              <td>{card.label}</td>
+              <td className="num">{fmt.pct1(card.weeklyPercent)}</td>
+              <td className="d">{fmt.datetimeShortZ(card.resetsAt, ctx)}</td>
+              <td className="num">{fmt.usd2(card.spendUsd)}</td>
+              <td className="num">{fmt.tokens(card.totalTokens)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function CodexCurrentCycleModal({
   env,
   ctx,
@@ -486,10 +559,24 @@ function CodexCurrentCycleModal({
   const codex = env?.sources?.codex?.data as CodexSourceData | undefined;
   const hero = codex?.hero;
   const cycle = hero?.cycle;
+  const accountKey = useAccountScope().accountKey;
+  // #416 QA P0-B — "All accounts" on a decorated Codex provider. `accounts` is
+  // emitted ONLY above one real account (R8), so a single-account install can
+  // never take this branch and its modal is byte-identical. `accountKey` is
+  // also null for the EMBEDDED All-providers variant, which carries the same
+  // defect and gets the same honest state.
+  const perAccountCycles = accountKey == null
+    && Array.isArray(codex?.accounts)
+    && codex!.accounts!.length > 0;
+  // #416 — under account focus `env` is already the scoped envelope, so this is
+  // that ACCOUNT's own cycle index (built from its own cluster representative).
+  // It is never interchangeable with the parent's or a sibling's: reusing the
+  // parent index here would render account A's milestone history on B's hero.
+  // An account with no cycle emits `()` — an honest empty history.
   const cycleIndex: WeekIndexEntry[] = Array.isArray(codex?.quota.cycle_index)
     ? codex!.quota.cycle_index!
     : [];
-  const nav = useMilestoneNav('codex', cycleIndex);
+  const nav = useMilestoneNav('codex', cycleIndex, accountKey);
   const {
     weekKey, setWeekKey, selectedEntry, detail, loading, error, vanished,
     blockSel, setBlockSel, requestCurrentDetail, wantDetail, pendingBlockStep,
@@ -662,7 +749,10 @@ function CodexCurrentCycleModal({
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cycleIndex, weekKey, selectedBlockIndex, blocks.length, blocksReady]);
-  useKeymap(embedded ? EMPTY_BINDINGS : bindings);
+  // The per-account state offers no cycle navigator, so it registers no
+  // cycle-step bindings either — an arrow press must not silently fetch the
+  // representative account's historic cycle behind a table that never shows it.
+  useKeymap(embedded || perAccountCycles ? EMPTY_BINDINGS : bindings);
 
   const showShare = weekKey == null;
   const headerExtras = showShare ? (
@@ -678,6 +768,25 @@ function CodexCurrentCycleModal({
     return (
       <CurrentWeekShell embedded={embedded} title="Cycle — per-percent milestones" accentClass="accent-orange" headerExtras={headerExtras}>
         <VanishedState onBack={() => setWeekKey(null)} />
+      </CurrentWeekShell>
+    );
+  }
+
+  if (perAccountCycles) {
+    return (
+      <CurrentWeekShell
+        embedded={embedded}
+        title="Current Cycle — per-account quota"
+        accentClass="accent-orange"
+        headerExtras={headerExtras}
+      >
+        <section className="modal-current-week" data-source="codex" data-per-account="">
+          <div className="m-chipstrip" id={singleId('mcw-badges')}>
+            <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>All accounts</span>
+            <span className="m-pill accent-orange">Codex · native 7-day quota</span>
+          </div>
+          <CodexPerAccountCycleTable accounts={codex!.accounts!} ctx={ctx} />
+        </section>
       </CurrentWeekShell>
     );
   }
@@ -1328,7 +1437,7 @@ function AllCurrentWeekModal({
 }
 
 export function CurrentWeekModal() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const source = useSyncExternalStore(
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,

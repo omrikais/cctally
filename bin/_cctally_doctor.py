@@ -24,6 +24,7 @@ Spec: docs/superpowers/specs/2026-05-30-extract-diagnostics-cmd-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import json
@@ -76,6 +77,53 @@ def _stats_ro_guarded():
         _cctally_core.DB_PATH,
         connect=lambda p: sqlite3.connect(f"file:{p}?mode=ro", uri=True),
     )
+
+
+@contextlib.contextmanager
+def _conversation_ro_guarded(*, timeout: float):
+    """Bounded read-only transcript handle participating in #415 recovery."""
+    path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+    if not path.exists():
+        yield None
+        return
+    marker = path.with_name(f"{path.name}.repairing")
+    pending = path.with_name(f"{path.name}.quarantine-pending.json")
+    recovery = path.with_name(f"{path.name}.recovery.json")
+    maintenance = pathlib.Path(
+        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    )
+    lock_fh = conn = None
+    try:
+        maintenance.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(maintenance, "a+")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        if marker.exists() or pending.exists() or recovery.exists():
+            yield None
+            return
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=max(0.0, timeout),
+        )
+        if marker.exists() or pending.exists() or recovery.exists():
+            conn.close()
+            conn = None
+            yield None
+            return
+        yield conn
+    finally:
+        if conn is not None:
+            conn.close()
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
 
 
 def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
@@ -533,7 +581,7 @@ def _doctor_gather_state_impl(
     diagnostic command must never mutate user state.
 
     `deep=True` (CLI cmd_doctor only) additionally runs `PRAGMA
-    quick_check(1)` on each DB (#279 S2 F5b); the dashboard/TUI callers
+    quick_check(1)` on each DB (#279 S2 F5b, #415); the dashboard/TUI callers
     stay `deep=False` — the rebuild loop calls the gather every rebuild
     and quick_check on a large cache.db costs seconds.
     """
@@ -867,15 +915,15 @@ def _doctor_gather_state_impl(
     try:
         if _cctally_core.CONVERSATIONS_DB_PATH.exists():
             # This gather also runs inside dashboard snapshot precompute. A
-            # transcript writer may hold an exclusive SQLite lock, so use a
-            # read-only zero-timeout probe: conversation health can degrade,
-            # but it must never delay core snapshot freshness (#320).
-            conv_uri = (
-                _cctally_core.CONVERSATIONS_DB_PATH.resolve().as_uri()
-                + "?mode=ro"
-            )
-            conn = sqlite3.connect(conv_uri, uri=True, timeout=0.0)
-            try:
+            # transcript writer or recovery may hold an exclusive lock, so use
+            # the recovery-aware read-only zero-timeout probe: conversation
+            # health can degrade, but it must never delay core snapshot
+            # freshness (#320, #415).
+            with _conversation_ro_guarded(timeout=0.0) as conn:
+                if conn is None:
+                    raise sqlite3.OperationalError(
+                        "conversation store maintenance in progress"
+                    )
                 try:
                     row = conn.execute("PRAGMA page_count").fetchone()
                     if row and row[0] is not None:
@@ -916,8 +964,6 @@ def _doctor_gather_state_impl(
                         conv_rollup_sync_in_progress = True
                 except Exception:
                     pass
-            finally:
-                conn.close()
         # Non-blocking flock probe: if a transcript writer/reingest holds the
         # conversations.db lock, the rollup may be mid-recompute → in progress. We
         # acquire LOCK_EX|LOCK_NB and immediately release; failure (held) is the
@@ -1063,11 +1109,15 @@ def _doctor_gather_state_impl(
 
     # ── Parse health (#279 S2 F5a) ───────────────────────────────────
     parse_health_claude = parse_health_codex = None
+    # #416 review B4: the durable record that a torn Codex `auth.json` halted
+    # ingest. Same cache_meta read, same degrade-to-None-on-anything contract.
+    codex_torn_deferred = None
     try:
         if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
-                for _key in ("parse_health_claude", "parse_health_codex"):
+                for _key in ("parse_health_claude", "parse_health_codex",
+                             "codex_torn_auth_deferred"):
                     try:
                         row = conn.execute(
                             "SELECT value FROM cache_meta WHERE key = ?",
@@ -1078,8 +1128,10 @@ def _doctor_gather_state_impl(
                             if isinstance(_parsed, dict):
                                 if _key == "parse_health_claude":
                                     parse_health_claude = _parsed
-                                else:
+                                elif _key == "parse_health_codex":
                                     parse_health_codex = _parsed
+                                else:
+                                    codex_torn_deferred = _parsed
                     except (sqlite3.OperationalError, ValueError):
                         pass
             finally:
@@ -1089,13 +1141,24 @@ def _doctor_gather_state_impl(
 
     # ── Integrity (deep only — #279 S2 F5b) ──────────────────────────
     stats_db_quick_check = cache_db_quick_check = None
+    conversations_db_quick_check = None
     if deep:
         for _label, _path in (("stats", _cctally_core.DB_PATH),
-                              ("cache", _cctally_core.CACHE_DB_PATH)):
+                              ("cache", _cctally_core.CACHE_DB_PATH),
+                              ("conversations",
+                               _cctally_core.CONVERSATIONS_DB_PATH)):
             _result = None
             try:
                 if (
-                    _path.exists()
+                    (
+                        _path.exists()
+                        or (
+                            _label == "conversations"
+                            and _path.with_name(
+                                f"{_path.name}.recovery.json"
+                            ).exists()
+                        )
+                    )
                     and (_label != "cache" or _cache_probe_allowed)
                 ):
                     # #386: the stats leg holds a read-write handle for the whole
@@ -1104,24 +1167,40 @@ def _doctor_gather_state_impl(
                     # protocol. The cache leg keeps its own opener.
                     if _label == "stats":
                         import _cctally_store as _store_mod
-                        _conn = _store_mod.stats_open_guarded(_path)
+                        _conn_ctx = contextlib.closing(
+                            _store_mod.stats_open_guarded(_path)
+                        )
+                    elif _label == "cache":
+                        _conn_ctx = contextlib.closing(
+                            sqlite3.connect(str(_path))
+                        )
                     else:
-                        _conn = sqlite3.connect(str(_path))
-                    try:
-                        _row = _conn.execute(
-                            "PRAGMA quick_check(1)").fetchone()
-                        _result = (str(_row[0])
-                                   if _row and _row[0] is not None else None)
-                    finally:
-                        _conn.close()
+                        _conn_ctx = _conversation_ro_guarded(timeout=2.0)
+                    with _conn_ctx as _conn:
+                        if _conn is not None:
+                            _row = _conn.execute(
+                                "PRAGMA quick_check(1)").fetchone()
+                            _result = (
+                                str(_row[0])
+                                if _row and _row[0] is not None else None
+                            )
+                        elif (
+                            _label == "conversations"
+                            and _path.with_name(
+                                f"{_path.name}.recovery.json"
+                            ).exists()
+                        ):
+                            _result = "recovery in progress"
             except sqlite3.DatabaseError as exc:
                 _result = f"open failed: {exc}"
             except Exception:
                 _result = None
             if _label == "stats":
                 stats_db_quick_check = _result
-            else:
+            elif _label == "cache":
                 cache_db_quick_check = _result
+            else:
+                conversations_db_quick_check = _result
 
     # ── Lock state (#279 S2 F5c) — read-only: never create files ─────
     locks_held: "dict | None" = None
@@ -1627,8 +1706,10 @@ def _doctor_gather_state_impl(
         # non-blocking lock-file probes (appended after the defaulted tail).
         parse_health_claude=parse_health_claude,
         parse_health_codex=parse_health_codex,
+        codex_torn_deferred=codex_torn_deferred,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
+        conversations_db_quick_check=conversations_db_quick_check,
         locks_held=locks_held,
         # #297: cache.db WAL size backstop (gathered outside the deep branch).
         cache_db_wal_bytes=cache_db_wal_bytes,

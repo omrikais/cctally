@@ -291,6 +291,12 @@ def test_quota_obs_replay_has_stable_identity(tmp_path, monkeypatch):
         "primary", "limit-primary", "native-primary", "Primary", 300,
         42.0, RESET, "pro", None, None, "gpt-5.3-codex",
         None,  # #341 trailing account_key (unattributed -> obs omits `account`)
+        # #416 §4.2 trailing canonical_resets_at_utc. Deliberately NOT journaled:
+        # the anchor is a property of the observation's POPULATION, not of the
+        # observation, so freezing it into the append-only record would both
+        # prevent a later ingest from correcting it and change the payload's
+        # content id, breaking the natural-key dedup that keeps replay idempotent.
+        None,
     )
 
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T12:00:00Z")
@@ -328,6 +334,12 @@ def test_quota_obs_upgrade_dedupes_legacy_command_time_identity(
         "primary", "limit-primary", "native-primary", "Primary", 300,
         42.0, RESET, "pro", None, None, "gpt-5.3-codex",
         None,  # #341 trailing account_key (unattributed -> obs omits `account`)
+        # #416 §4.2 trailing canonical_resets_at_utc. Deliberately NOT journaled:
+        # the anchor is a property of the observation's POPULATION, not of the
+        # observation, so freezing it into the append-only record would both
+        # prevent a later ingest from correcting it and change the payload's
+        # content id, breaking the natural-key dedup that keeps replay idempotent.
+        None,
     )
 
     # v1.80.1 used the later sync command clock as `at`, so the same retained

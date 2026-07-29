@@ -250,8 +250,28 @@ export const fmt = {
   // #264 S1 — whole-dollar money hero (the hero's "SPENT THIS WEEK" number
   // reads "$254", low-noise, while the $/1% sub keeps 2dp via usd2). Guards
   // null → "—" so a missing spend never renders "$NaN" or a bare "$".
+  //
+  // #416 QA P2-B — an amount that is NON-ZERO but rounds to zero dollars keeps
+  // cents. Per-account Codex spends are routinely sub-dollar, and whole-dollar
+  // rounding turned a real $0.23 into "$0" — the glyph for nothing — in the one
+  // hero slot that asserts a number while every neighbour honestly abstains
+  // with "—", 40px above the card that reads $0.23. Blanking it would hide real
+  // data; the value was never wrong, only its magnitude. Below a cent the
+  // honest form is the "<$0.01" convention rather than a rounded-up figure
+  // (D1: nothing inferred).
+  //
+  // A TRUE zero still reads "$0", and every amount that rounds to $1 or more is
+  // untouched — #264 S1's low-noise money hero is intact, and the separate
+  // $5-vs-$5.02 headline question is deliberately NOT addressed here.
   usd0(v: number | null | undefined): string {
-    return v == null ? '—' : `$${Math.round(+v)}`;
+    if (v == null) return '—';
+    const n = +v;
+    if (n !== 0 && Math.round(n) === 0) {
+      const sign = n < 0 ? '−' : '';
+      const abs = Math.abs(n);
+      return abs < 0.005 ? `${sign}<$0.01` : `${sign}$${abs.toFixed(2)}`;
+    }
+    return `$${Math.round(n)}`;
   },
   // "+$1.20" / "−$0.42" — signed USD with Unicode U+2212 minus on
   // negatives, matching the dashboard's typographic standard

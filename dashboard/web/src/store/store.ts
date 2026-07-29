@@ -49,6 +49,7 @@ import {
 } from './basketSlice';
 import { loadActiveSource, saveActiveSource } from './sourcePrefs';
 import { seedAccountFocus, saveAccountFocus, resolveAccountFocus, ALL_ACCOUNTS } from './accountFocus';
+import { scopeEnvelope } from './accountScope';
 import { resolveSourceView } from './sourceView';
 import { deriveVisiblePanelOrder, mapVisibleReorderToFull } from '../lib/visiblePanelOrder';
 import {
@@ -861,6 +862,32 @@ export function getRenderedRows(s: UIState = state): SessionRow[] {
   return sorted.slice(0, s.prefs.sessionsPerPage);
 }
 
+// #416 Task 15 — the store-side account-scope chokepoint. Every panel consumes
+// THIS envelope (via `useScopedSnapshot`) rather than `state.snapshot`, so the
+// account chip actually re-scopes the view instead of decorating the hero.
+//
+// IDENTITY-PRESERVING when the focus resolves to "All accounts", when the
+// source cannot scope (Claude ships no `account_scopes`), or when the provider
+// is undecorated — so an unfocused dashboard is byte-identical to today and no
+// existing consumer, test or golden moves. Under focus it is memoised per
+// (envelope, source, account) inside `accountScope`, which is what keeps
+// `useSyncExternalStore` from re-rendering forever and keeps downstream
+// `memo`/`useMemo` comparisons meaningful.
+// `source` defaults to the active source (what every panel wants). A MODAL
+// passes its own bound source instead (`openModalSource ?? activeSource`): a
+// source switch behind an open modal changes the board without re-binding the
+// modal, and scoping the wrong source there would hand the modal an unscoped
+// envelope while its chip still reads as focused.
+export function getScopedSnapshot(
+  s: UIState = state,
+  source: DashboardSelection = s.activeSource,
+): Envelope | null {
+  const stored = source === 'all'
+    ? ALL_ACCOUNTS
+    : s.accountFocus[source] ?? ALL_ACCOUNTS;
+  return scopeEnvelope(s.snapshot, source, stored);
+}
+
 // #294 S5 §6.3 — the source-aware parallel of getRenderedRows: the currently-
 // visible Sessions display-row list for Codex / All. Codex → the source-native
 // rows; All → the two providers' rows CONCATENATED and interleaved by the shared
@@ -885,7 +912,7 @@ export function getRenderedSourceRows(s: UIState = state): SessionDisplayRow[] {
       title: row.title,
     })));
   }
-  const view = resolveSourceView(s.snapshot, s.activeSource);
+  const view = resolveSourceView(getScopedSnapshot(s), s.activeSource);
   const rows = collectSourceSessionRows(view);
   const filtered = applySourceSessionFilter(rows, s.filterText);
   const override = s.sourceSessionsSort;

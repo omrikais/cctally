@@ -299,6 +299,7 @@ def resolve_codex_cycle_detail_identity(
     *,
     source_root_keys: Iterable[str],
     now_utc: dt.datetime,
+    account_key: str | None = None,
 ):
     """The live-cycle identity for a per-request Codex cycle-DETAIL read (#373).
 
@@ -313,6 +314,21 @@ def resolve_codex_cycle_detail_identity(
     passes every retained Codex root, so a just-closed cycle stays fetchable);
     the live boundary itself is resolved from the active roots' observations,
     exactly as the source build does.
+
+    ``account_key`` (#416 QA sweep) picks the LIVE boundary belonging to the
+    account the route is focused on. ``_resolve_codex_weekly_cycle`` returns one
+    boundary per account and this function used ``cycles[0]`` — the first
+    account by sorted key — unconditionally, while ``build_codex_cycle_detail``
+    was already given the account predicate. So a focused read enumerated
+    account B's cycles and judged them against account A's reset: no candidate
+    falls inside ``CODEX_CYCLE_JITTER_FLOOR_SECONDS`` of a foreign boundary, so
+    ``_select_live_physical_cycle`` returned ``None`` and B's own live cycle
+    lost both its ``is_current`` flag and the §7.4 no-clip guard — the exact
+    index/detail disagreement #373 closed, re-opened one account over.
+
+    An account with no live weekly cycle resolves to NO boundary rather than a
+    sibling's: an unarmed guard is today's honest degrade, a foreign boundary is
+    a wrong answer. ``None`` keeps the merged representative and is byte-stable.
 
     Degrades to a bare-roots identity — today's behaviour — whenever no live
     cycle resolves. The clip guard stays unarmed on that identity by design
@@ -348,7 +364,22 @@ def resolve_codex_cycle_detail_identity(
         return identity
     if not cycles:
         return identity
-    boundary = cycles[0]
+    if account_key is None:
+        boundary = cycles[0]
+    else:
+        boundary = next(
+            (
+                cyc for cyc in cycles
+                if (
+                    cyc.quota_identity.account_key
+                    if cyc.quota_identity is not None
+                    else _lib_accounts.UNATTRIBUTED
+                ) == account_key
+            ),
+            None,
+        )
+        if boundary is None:
+            return identity
     identity.resets_at = boundary.resets_at
     identity.quota_identity = boundary.quota_identity
     return identity
@@ -450,6 +481,7 @@ def _codex_weekly_periods(
     *,
     source_root_keys: Iterable[str],
     active_cycle: CodexCycleBoundary | None,
+    account_key: str | None = None,
 ) -> tuple[CodexWeeklyPeriod, ...]:
     """Read durable 10,080-minute boundaries and clip early re-anchors.
 
@@ -457,6 +489,24 @@ def _codex_weekly_periods(
     the prior seven-day deadline.  Sorting those nominal starts and ending the
     prior segment at the next start preserves the actual quota-cycle boundary
     without double-counting the overlapping nominal windows.
+
+    ``account_key`` (#416 Slice 3A review B1) scopes the read to ONE account.
+    ``quota_window_blocks`` is ``UNIQUE(source, source_root_key, account_key,
+    logical_limit_key, observed_slot, window_minutes, resets_at_utc)``, so two
+    accounts on one root genuinely produce two weekly rows; without the
+    predicate the jitter merge below pools their ``current_percent`` values and
+    ``max(...)`` hands the focused account the OTHER account's percentage —
+    the never-combine violation D6 forbids — while ``end_at = min(resets_at,
+    next_start)`` clips one account's week at the other's start. ``None`` keeps
+    the merged "All accounts" read, which is byte-stable and is what the parent
+    still uses.
+
+    The predicate is strict equality, deliberately NOT the one-directional
+    ``(account, unattributed)`` widening ``_codex_five_hour_rows`` uses: that
+    widening produces a LISTING whose members each keep their own percentage,
+    whereas the merge here ADOPTS a pooled percentage onto one account's row.
+    Unattributed weekly boundaries are already rendered by the ``unattributed``
+    child, which is a first-class scope after D1.
     """
     roots = tuple(sorted({
         root for root in source_root_keys if isinstance(root, str) and root
@@ -464,6 +514,10 @@ def _codex_weekly_periods(
     if not roots:
         return ()
     placeholders = ",".join("?" for _ in roots)
+    # `quota_window_blocks.account_key` is `NOT NULL DEFAULT 'unattributed'`,
+    # so the sentinel needs no NULL branch here (unlike the cache tables).
+    account_predicate = "" if account_key is None else "AND account_key = ? "
+    account_params: tuple = () if account_key is None else (account_key,)
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, limit_name, resets_at_utc, "
@@ -471,9 +525,10 @@ def _codex_weekly_periods(
             "FROM quota_window_blocks "
             "WHERE source='codex' AND window_minutes=10080 "
             f"AND source_root_key IN ({placeholders}) AND orphaned_at IS NULL "
+            f"{account_predicate}"
             "ORDER BY nominal_start_at_utc DESC, resets_at_utc DESC, source_root_key "
             "LIMIT ?",
-            (*roots, SOURCE_HISTORY_LIMIT),
+            (*roots, *account_params, SOURCE_HISTORY_LIMIT),
         ).fetchall()
     except sqlite3.Error:
         rows = ()
@@ -1294,6 +1349,8 @@ def _quota_wire(
     cycle: CodexCycleBoundary | None = None,
     now_utc: dt.datetime | None = None,
     display_tz_name: str | None = None,
+    account_key: str | None = None,
+    decorated: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Build current-cycle Codex 5-hour activity rows from durable windows.
 
@@ -1301,13 +1358,33 @@ def _quota_wire(
     tokens, and model splits come from root-qualified accounting inside each
     half-open 300-minute interval. Weekly quota summaries are deliberately not
     activity blocks and never enter this wire.
+
+    #416 spec §5.2 (review F9): blocks were filtered by `source_root_key` and
+    time ONLY, against a single `cycle` that is `cycles_all[0]` — the FIRST
+    account's. Two accounts sharing one physical root therefore saw each other's
+    5h blocks. `account_key` scopes both the durable block row and the
+    accounting inside it to the block identity's account; `None` keeps the
+    merged read, which is byte-stable. `decorated` (R8) serializes the block's
+    own account so the client can label it; below two REAL accounts no key is
+    added at all.
+
+    The account predicate here is STRICT and deliberately diverges from
+    `_codex_five_hour_rows`, which widens the same table (#416 closeout F2).
+    Both reads are selection reads, but the rule turns on the stamping
+    mechanism, not on the verb: `_codex_five_hour_rows` asks "is this block
+    inside the focused CYCLE" — a different physical-window group than the
+    weekly key it is scoped by, so a still-`unattributed` 5h block genuinely
+    belongs and must be admitted. This is a LISTING of the block rows
+    themselves, keyed by the very column it filters, so widening would render
+    one unattributed block twice, once under each real account.
     """
     if cycle is None or now_utc is None:
         return ()
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
-            "limit_name, resets_at_utc, nominal_start_at_utc, current_percent, orphaned_at "
+            "limit_name, resets_at_utc, nominal_start_at_utc, current_percent, orphaned_at, "
+            "account_key "
             "FROM quota_window_blocks WHERE source='codex' AND window_minutes=300 "
             "ORDER BY resets_at_utc DESC, source_root_key, logical_limit_key, observed_slot "
             "LIMIT ?",
@@ -1323,7 +1400,11 @@ def _quota_wire(
     for (
         root_key, logical_limit_key, observed_slot, window_minutes,
         _limit_name, resets_at_raw, nominal_start_raw, current_percent, orphaned_at,
+        block_account,
     ) in rows:
+        block_account = str(block_account or _lib_accounts.UNATTRIBUTED)
+        if account_key is not None and block_account != account_key:
+            continue
         if orphaned_at is not None or str(root_key) not in cycle.source_root_keys:
             continue
         try:
@@ -1337,7 +1418,14 @@ def _quota_wire(
         resets_at = resets_at.astimezone(UTC)
         if resets_at <= cycle.start_at or start_at >= cycle.resets_at:
             continue
-        physical_key = (str(root_key), start_at, resets_at)
+        # The account joins the physical dedup key only under decoration: two
+        # accounts sharing one physical 5h window are two windows (never-combine
+        # extends to accounts), but a <=1-real-account install must keep exactly
+        # today's key so its wire is byte-identical.
+        physical_key = (
+            (str(root_key), start_at, resets_at, block_account) if decorated
+            else (str(root_key), start_at, resets_at)
+        )
         if physical_key in seen_windows:
             continue
         seen_windows.add(physical_key)
@@ -1378,6 +1466,10 @@ def _quota_wire(
                 observed_slot, window_minutes, resets_at_raw,
             ),
             "source": "codex",
+            # R8: snake_case to match the sibling `quota.history[].account_key`
+            # rows in this same subtree (#341 Task 4), NOT the camelCase
+            # `accounts[].accountKey` hero-card surface.
+            **({"account_key": block_account} if decorated else {}),
             "label": c.format_display_dt(
                 start_at, display_tz, fmt="%H:%M %b %d", suffix=True,
             ),
@@ -1394,11 +1486,13 @@ def _quota_wire(
     return tuple(wired)
 
 
-def _budget_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
+def _budget_wire(
+    stats_conn: sqlite3.Connection, *, decorated: bool = False,
+) -> tuple[dict[str, object], ...]:
     try:
         rows = stats_conn.execute(
             "SELECT period_start_at, period, threshold, budget_usd, spent_usd, "
-            "consumption_pct FROM budget_milestones WHERE vendor='codex' "
+            "consumption_pct, account_key FROM budget_milestones WHERE vendor='codex' "
             "ORDER BY period_start_at DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
         ).fetchall()
@@ -1411,13 +1505,21 @@ def _budget_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...
         "budget_usd": budget_usd,
         "spent_usd": spent_usd,
         "consumption_pct": consumption_pct,
-    } for period_start_at, period, threshold, budget_usd, spent_usd, consumption_pct in rows)
+        # R8 (#416 §5.5): the per-account ladder needs the key to scope a child;
+        # below two REAL accounts nothing is added.
+        **({"account_key": str(account_key or _CODEX_VENDOR_WIDE_ACCOUNT)}
+           if decorated else {}),
+    } for period_start_at, period, threshold, budget_usd, spent_usd,
+        consumption_pct, account_key in rows)
 
 
-def _projected_budget_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
+def _projected_budget_wire(
+    stats_conn: sqlite3.Connection, *, decorated: bool = False,
+) -> tuple[dict[str, object], ...]:
     try:
         rows = stats_conn.execute(
-            "SELECT period, threshold, projected_value, denominator, crossed_at_utc, alerted_at "
+            "SELECT period, threshold, projected_value, denominator, crossed_at_utc, "
+            "alerted_at, account_key "
             "FROM projected_milestones WHERE metric='codex_budget_usd' "
             "ORDER BY crossed_at_utc DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
@@ -1431,7 +1533,10 @@ def _projected_budget_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, ob
         "denominator": denominator,
         "crossed_at": crossed_at,
         "alerted_at": alerted_at,
-    } for period, threshold, projected_value, denominator, crossed_at, alerted_at in rows)
+        **({"account_key": str(account_key or _CODEX_VENDOR_WIDE_ACCOUNT)}
+           if decorated else {}),
+    } for period, threshold, projected_value, denominator, crossed_at, alerted_at,
+        account_key in rows)
 
 
 def _configured_codex_budget_status(
@@ -1439,6 +1544,7 @@ def _configured_codex_budget_status(
     entries: Iterable[object],
     *,
     cost_events: tuple[tuple[dt.datetime, float], ...] | None = None,
+    account_key: str | None = None,
 ) -> dict[str, object] | None:
     """Compute the live configured Codex budget from the coordinated entries.
 
@@ -1446,10 +1552,23 @@ def _configured_codex_budget_status(
     This reuses the CLI's calendar-window and ``BudgetInputs``/status kernels
     while deliberately keeping the accounting read on the caller-owned cache
     snapshot.
+
+    ``account_key`` (#416 §5.5) scopes the status to ONE account: the target is
+    that account's own configured budget from ``budget.codex.accounts`` — never a
+    share of the vendor amount, which would be an invented number. An account
+    with no configured budget therefore has no budget status at all (``None``),
+    exactly as an unconfigured vendor does; the merged vendor status stays on the
+    parent. ``None`` keeps the merged behaviour and is byte-stable.
     """
     config = context.codex_budget
     if config is None:
         return None
+    amount_usd = config.get("amount_usd")
+    if account_key is not None:
+        per_account = config.get("accounts")
+        if not isinstance(per_account, Mapping) or account_key not in per_account:
+            return None
+        amount_usd = per_account[account_key]
     c = sys.modules["cctally"]
     period, start_at, end_at = _configured_codex_budget_window(context)
 
@@ -1462,7 +1581,7 @@ def _configured_codex_budget_status(
 
     recent_start = max(start_at, context.now_utc - dt.timedelta(hours=24))
     inputs = c.BudgetInputs(
-        target_usd=float(config["amount_usd"]),
+        target_usd=float(amount_usd),
         spent_usd=_sum_cost(start_at, context.now_utc),
         recent_24h_usd=_sum_cost(recent_start, context.now_utc),
         week_start_at=start_at,
@@ -1512,13 +1631,52 @@ def _configured_codex_budget_window(
     return period, start_at.astimezone(UTC), end_at.astimezone(UTC)
 
 
+def _codex_account_admits(scope_key: str | None, row_key: object) -> bool:
+    """Whether an account-scoped quota read admits ``row_key`` (#416 B2).
+
+    One-directional widening, identical to ``_codex_five_hour_rows``
+    (``bin/_cctally_milestone_history.py``): a REAL account admits its own rows
+    plus the ``unattributed`` sentinel, because
+    ``adopt_unidentified_observations`` resolves attribution PER physical-window
+    group — a decorated install can legitimately carry the weekly window under a
+    real account while its 5h windows are still unattributed, and strict
+    equality would then correlate nothing. The widening is one-directional on
+    purpose: an ``unattributed`` scope never picks up another account's
+    identified rows, so no REAL account's number ever reaches another's row.
+
+    ``scope_key is None`` is the merged read and admits everything.
+    """
+    if scope_key is None:
+        return True
+    key = str(row_key or _lib_accounts.UNATTRIBUTED)
+    if scope_key == _lib_accounts.UNATTRIBUTED:
+        return key == _lib_accounts.UNATTRIBUTED
+    return key in (scope_key, _lib_accounts.UNATTRIBUTED)
+
+
 def _quota_read_model(
     context: DashboardReadContext,
     observations: Iterable[object],
     *,
     accounting_entries: Iterable[object] = (),
+    account_key: str | None = None,
 ) -> dict[str, object]:
-    """Use S2's pure history/block/forecast kernels over cache evidence."""
+    """Use S2's pure history/block/forecast kernels over cache evidence.
+
+    ``account_key`` (#416 Slice 3A review B2/F4) scopes the two reads this
+    function reaches that the observation partition does NOT already cover: the
+    durable milestone breakdown (``codex_quota_breakdown``, whose accounting and
+    block-start reads filter by root and time only) and the 5h correlation load
+    below. ``None`` keeps the merged parent read, byte-stable.
+
+    The key passed on is POST-fold — it names a registry account or an
+    ``obs_partition`` bucket, and ``load_codex_quota_observations`` applies
+    ``adopt_unidentified_observations`` before returning — while
+    ``codex_quota_breakdown``'s block-start boundary reads the PRE-fold
+    ``quota_window_snapshots``. That read widens (#416 closeout F1); its
+    accounting read stays strict so the children keep partitioning the parent's
+    spend. Neither is elected here — the kernel settles both.
+    """
     quota_observations = tuple(observations)
     cost_entries = tuple(accounting_entries)
     histories = build_history(quota_observations)
@@ -1628,6 +1786,7 @@ def _quota_read_model(
                     speed=context.speed,
                     cache_conn=context.cache_conn,
                     stats_conn=context.stats_conn,
+                    account_key=account_key,
                 )
             except sqlite3.Error:
                 # Older or partially migrated stores retain the bounded
@@ -1636,6 +1795,9 @@ def _quota_read_model(
                 canonical_rows = ()
         if canonical_rows:
             try:
+                # #416 Slice 3A review F4: this load is bounded by root, slot
+                # and `limit_id` only, so under focus the crossing was annotated
+                # with whichever ACCOUNT's 5h observation happened to sort last.
                 correlated_five_hour = tuple(
                     observation
                     for observation in load_codex_quota_observations(
@@ -1646,6 +1808,8 @@ def _quota_read_model(
                     if observation.identity.window_minutes == 300
                     and observation.identity.observed_slot == identity.observed_slot
                     and observation.identity.limit_id == identity.limit_id
+                    and _codex_account_admits(
+                        account_key, observation.identity.account_key)
                 )
             except sqlite3.Error:
                 correlated_five_hour = ()
@@ -2038,12 +2202,30 @@ def refresh_codex_source_clock(
     return state if refreshed_state == state else refreshed_state
 
 
-def _alerts_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...]:
-    """Return only safe, source-owned Codex alert context in newest-first order."""
+def _alerts_wire(
+    stats_conn: sqlite3.Connection, *, decorated: bool = False,
+) -> tuple[dict[str, object], ...]:
+    """Return only safe, source-owned Codex alert context in newest-first order.
+
+    #416 spec §5.4 (review F14): the underlying tables all carry an account key —
+    including the vendor-wide ``*`` rows — but this wire neither selected nor
+    emitted it, so removing the `alerts-unfiltered-note` disclaimer badge without
+    this would silently show one account another's alerts. `account_key` is now
+    selected on all three legs and serialized under decoration (R8: below two
+    REAL accounts no key is added, so the envelope is byte-identical).
+
+    Vendor-wide ``*`` rows keep that literal key rather than being dropped or
+    reassigned: a vendor-wide budget crossing is not attributable to one account,
+    so it stays visible under focus and the client labels it as vendor-wide.
+    """
     rows: list[dict[str, object]] = []
+
+    def _account(value: object) -> dict[str, object]:
+        return {"account_key": str(value or _CODEX_VENDOR_WIDE_ACCOUNT)} if decorated else {}
+
     try:
-        for period, threshold, consumption_pct, crossed_at in stats_conn.execute(
-            "SELECT period, threshold, consumption_pct, crossed_at_utc "
+        for period, threshold, consumption_pct, crossed_at, account_key in stats_conn.execute(
+            "SELECT period, threshold, consumption_pct, crossed_at_utc, account_key "
             "FROM budget_milestones WHERE vendor='codex' AND alerted_at IS NOT NULL "
             "ORDER BY crossed_at_utc DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
@@ -2053,9 +2235,10 @@ def _alerts_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...
                 "source": "codex",
                 "axis": "codex_budget", "period": period, "threshold": threshold,
                 "value": consumption_pct, "created_at": crossed_at,
+                **_account(account_key),
             })
-        for period, threshold, projected_value, crossed_at in stats_conn.execute(
-            "SELECT period, threshold, projected_value, crossed_at_utc "
+        for period, threshold, projected_value, crossed_at, account_key in stats_conn.execute(
+            "SELECT period, threshold, projected_value, crossed_at_utc, account_key "
             "FROM projected_milestones WHERE metric='codex_budget_usd' AND alerted_at IS NOT NULL "
             "ORDER BY crossed_at_utc DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
@@ -2065,10 +2248,12 @@ def _alerts_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...
                 "source": "codex",
                 "axis": "projected", "period": period, "threshold": threshold,
                 "value": projected_value, "created_at": crossed_at,
+                **_account(account_key),
             })
-        for root_key, logical_key, observed_slot, window_minutes, resets_at, threshold, severity, created_at in stats_conn.execute(
+        for (root_key, logical_key, observed_slot, window_minutes, resets_at,
+             threshold, severity, created_at, account_key) in stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, "
-            "threshold, severity, created_at_utc FROM quota_threshold_events "
+            "threshold, severity, created_at_utc, account_key FROM quota_threshold_events "
             "WHERE source='codex' AND disposition='alerted' AND orphaned_at IS NULL "
             "ORDER BY created_at_utc DESC, source_root_key, logical_limit_key, observed_slot, threshold "
             "LIMIT ?",
@@ -2082,6 +2267,7 @@ def _alerts_wire(stats_conn: sqlite3.Connection) -> tuple[dict[str, object], ...
                 "source": "codex",
                 "axis": "quota", "threshold": threshold, "severity": severity,
                 "created_at": created_at,
+                **_account(account_key),
             })
     except sqlite3.Error:
         return ()
@@ -2276,12 +2462,18 @@ def _build_codex_native_weekly_view(
     now_utc: dt.datetime,
     display_tz_name: str | None,
     speed: str,
+    account_key: str | None = None,
 ) -> CodexWeeklyView:
-    """Aggregate Codex cost into observed native quota-cycle segments."""
+    """Aggregate Codex cost into observed native quota-cycle segments.
+
+    ``account_key`` scopes the durable boundary read to one account (#416
+    Slice 3A review B1); ``None`` is the merged parent read and is byte-stable.
+    """
     periods = _codex_weekly_periods(
         stats_conn,
         source_root_keys=source_root_keys,
         active_cycle=active_cycle,
+        account_key=account_key,
     )
     converted: list[CodexEntry] = []
     bucket_by_entry: dict[int, str] = {}
@@ -2416,6 +2608,11 @@ def _codex_accounts_wire(
         or _lib_accounts.UNATTRIBUTED in five_hour
     ):
         ordered_keys.append(_lib_accounts.UNATTRIBUTED)
+    # #416 §6: population-aware labels, so two Codex accounts that auto-label to
+    # one email do not render two identical chips. Collision-only (D5): a
+    # non-colliding label is untouched.
+    _codex_label_map = _cctally_account.display_label_map(
+        context.stats_conn, "codex")
 
     def _totals(rows: tuple[object, ...]) -> dict[str, object]:
         entries = _codex_entries_from_accounting(rows)
@@ -2457,7 +2654,7 @@ def _codex_accounts_wire(
             totals = _totals(rows)
         card: dict[str, object] = {
             "accountKey": key,
-            "label": _cctally_account.account_label(context.stats_conn, key),
+            "label": _codex_label_map.get(key) or _cctally_account.account_label(context.stats_conn, key),
             "plan": plan_by_key.get(key),
             "active": key in active_keys,
             "weeklyPercent": (
@@ -2484,6 +2681,270 @@ def _codex_accounts_wire(
                 "total_tokens": totals["totalTokens"],
             })
     return accounts_wire, hero_cycles_wire
+
+
+def _codex_partition_by_account(
+    entries: Iterable[object],
+) -> dict[str, tuple[object, ...]]:
+    """Partition already-loaded Codex accounting rows by their stamped account.
+
+    #416 spec §5.2/§5.3 (review F9/F10). The account axis is added by splitting
+    rows that are ALREADY in memory and re-running the SHIPPED builders per
+    partition — not by threading an account through `CodexEntry`,
+    `QualifiedCodexEntry`'s grouping keys, or the shared aggregator kernels. Two
+    consequences, both load-bearing:
+
+    * the merged parent is byte-identical BY CONSTRUCTION, because the parent's
+      code path is literally unchanged; and
+    * `_aggregate_codex_buckets` accumulates in encounter order and preserves
+      first-seen model order plus merged `model_breakdowns`, so ENCOUNTER ORDER
+      IS PRESERVED within each partition here. Sorting, or partitioning through
+      a set, would move a bucket's `models` order for free.
+
+    `NULL ≡ unattributed` — a row with no stamp lands in the reserved sentinel
+    bucket, which stays selectable because after D1 it holds the bulk of Codex
+    history.
+    """
+    buckets: dict[str, list[object]] = {}
+    for entry in entries:
+        key = str(
+            getattr(entry, "account_key", "") or _lib_accounts.UNATTRIBUTED)
+        buckets.setdefault(key, []).append(entry)
+    return {key: tuple(values) for key, values in buckets.items()}
+
+
+def _codex_account_scopes_wire(
+    context: DashboardReadContext,
+    *,
+    account_keys: Iterable[str],
+    quota_observations: Iterable[object],
+    cycle_by_account: Mapping[str, "CodexCycleBoundary"],
+    visible_accounting_entries: Iterable[object],
+    active_roots: Iterable[str],
+    accounting_end: dt.datetime,
+    metadata_incomplete: bool,
+    conversation_metadata: Mapping[tuple[str, str], Mapping[str, object]],
+    alerts: Iterable[Mapping[str, object]],
+    budget_milestones: Iterable[Mapping[str, object]],
+    projected_budget_milestones: Iterable[Mapping[str, object]],
+    budget_cost_events_by_account: Mapping[str, tuple[tuple[dt.datetime, float], ...]],
+    private_session_labels: dict[str, str],
+    hero_failure: bool = False,
+) -> dict[str, dict[str, object]]:
+    """The per-account CHILDREN of the merged Codex read model (spec §5.3).
+
+    Caller must gate on `provider_is_decorated(stats_conn, "codex")` — this
+    builds nothing for a <=1-real-account install, so the whole surface is ABSENT
+    rather than present-and-empty and the envelope stays byte-identical (R8).
+
+    Each child mirrors the parent's own key shape (`periods` / `sessions` /
+    `projects` / `cache_report` / `budget` / `quota` / `alerts`) so one client
+    selector can return a structurally identical object for "All accounts" (the
+    parent) and for a focused account (its child). Nothing is summed on the
+    client: §5.3 established that scalar summation cannot reconstruct `models` /
+    `model_breakdowns` and that weekly `used_pct` / `dollar_per_pct` are not
+    additive at all.
+
+    `is_empty` is the explicit empty state from §6 and acceptance criterion 2 —
+    an account with no evidence renders blank rather than the PREVIOUS account's
+    numbers, which is the literal reported symptom.
+
+    Every read a child reaches that is NOT already covered by the in-memory
+    partition is account-scoped explicitly (#416 Slice 3A review B1/B2/B3):
+    `_codex_weekly_periods`, `_quota_wire`, `codex_quota_breakdown` (its block
+    boundary AND its accounting), the 5h correlation load, and the cycle index.
+    A read that filters by root, time or slot but not by account is the defect
+    CLASS this section exists to close — `quota_window_blocks` and
+    `quota_window_snapshots` both carry two rows when two accounts share one
+    physical root.
+    """
+    visible = tuple(visible_accounting_entries)
+    observations = tuple(quota_observations)
+    partition = _codex_partition_by_account(visible)
+    obs_partition: dict[str, list[object]] = {}
+    for observation in observations:
+        obs_partition.setdefault(
+            observation.identity.account_key, []).append(observation)
+    alert_rows = tuple(alerts)
+    budget_rows = tuple(budget_milestones)
+    projected_rows = tuple(projected_budget_milestones)
+    roots = tuple(active_roots)
+
+    def _for_account(key: str) -> dict[str, object]:
+        rows = partition.get(key, ())
+        account_observations = tuple(obs_partition.get(key, ()))
+        entries = _codex_entries_from_accounting(rows)
+        cycle = cycle_by_account.get(key)
+        sessions_view = (
+            build_rooted_codex_session_view(
+                rows, now_utc=context.now_utc,
+                tz_name=context.display_tz_name, speed=context.speed,
+            )
+            if metadata_incomplete else build_codex_session_view(
+                entries, now_utc=context.now_utc,
+                tz_name=context.display_tz_name, speed=context.speed,
+            )
+        )
+        quota = _quota_read_model(
+            context, account_observations, accounting_entries=rows,
+            account_key=key,
+        )
+        # #416 Slice 3A review B3. The parent sets `quota.cycle_index` and the
+        # client reads `codex.quota.cycle_index`, so a child without the key
+        # forces the client into a fallback — and the tempting one (reuse the
+        # parent's) would render account A's milestone HISTORY on account B's
+        # hero. The index is derivable per account from what the child already
+        # has (its own `CodexCycleBoundary` plus `stats_conn`), so it is built
+        # genuinely rather than declared parent-only. No cycle => `()`, an
+        # honest empty state, never another account's ledger.
+        cycle_index: tuple = ()
+        if cycle is not None and not hero_failure:
+            try:
+                cycle_index = tuple(
+                    sys.modules["cctally"].build_codex_cycle_index(
+                        context.stats_conn, identity=cycle,
+                        now_utc=context.now_utc, account_key=key,
+                    )
+                )
+            except sqlite3.Error:
+                cycle_index = ()
+        quota = {
+            **quota,
+            "blocks": _quota_wire(
+                context.stats_conn, accounting_entries=rows, cycle=cycle,
+                now_utc=context.now_utc,
+                display_tz_name=context.display_tz_name,
+                account_key=key, decorated=True,
+            ),
+            "cycle_index": cycle_index,
+        }
+        return {
+            # An account is empty when it owns neither accounting rows nor quota
+            # evidence. Both axes matter: a brand-new account can carry a live
+            # quota window with no spend yet, and a retired one the reverse.
+            "is_empty": not rows and not account_observations,
+            "periods": {
+                "daily": _period_wire(build_codex_daily_view(
+                    entries, now_utc=context.now_utc,
+                    tz_name=context.display_tz_name, speed=context.speed,
+                )),
+                "monthly": _period_wire(build_codex_monthly_view(
+                    entries, now_utc=context.now_utc,
+                    tz_name=context.display_tz_name, speed=context.speed,
+                )),
+                "weekly": _period_wire(_build_codex_native_weekly_view(
+                    context.stats_conn, rows, source_root_keys=roots,
+                    active_cycle=cycle, now_utc=context.now_utc,
+                    display_tz_name=context.display_tz_name, speed=context.speed,
+                    account_key=key,
+                )),
+            },
+            "sessions": _session_wire(
+                sessions_view, metadata=conversation_metadata,
+                private_labels=private_session_labels,
+            ),
+            "projects": (
+                _partial_projects_wire(rows, conversation_metadata)
+                if metadata_incomplete else _projects_wire(
+                    context, account_observations, rows,
+                    accounting_end=accounting_end,
+                )
+            ),
+            "cache_report": _codex_cache_report_wire(
+                rows, metadata=conversation_metadata, now_utc=context.now_utc,
+                display_tz_name=context.display_tz_name, speed=context.speed,
+                anomaly_threshold_pp=context.cache_report_anomaly_threshold_pp,
+            ),
+            "budget": {
+                "status": _configured_codex_budget_status(
+                    context, rows,
+                    cost_events=budget_cost_events_by_account.get(key, ()),
+                    account_key=key,
+                ),
+                "milestones": tuple(_codex_account_scoped_rows(budget_rows, key)),
+                "projected": tuple(_codex_account_scoped_rows(projected_rows, key)),
+            },
+            "quota": quota,
+            "alerts": {
+                "rows": tuple(_codex_account_scoped_rows(alert_rows, key)),
+                "actual_thresholds": context.codex_quota_actual_thresholds,
+                "projected_thresholds": context.codex_quota_projected_thresholds,
+            },
+        }
+
+    # #416 Slice 3A review B4. The requested key set comes from the stats
+    # `accounts` REGISTRY (the hero cards) while the two partitions above key
+    # off the DATA (`codex_session_entries.account_key` and each observation's
+    # identity). Cache/stats drift — a stats rebuild that has not re-registered
+    # an account, or a key stamped by a newer binary — therefore left rows in a
+    # bucket with NO scope, so the union of the children was silently LESS than
+    # the parent with no warning. Residual data keys become scopes of their own:
+    # nothing is folded into `unattributed` (that would misattribute a KNOWN
+    # key, which D1 forbids) and nothing is dropped. Such a scope has no hero
+    # card, so it is simply not chip-selectable until the registry catches up —
+    # a safe degrade, never a silent loss.
+    #
+    # #416 closeout F2: the durable projection is the THIRD axis. Those two
+    # partitions cover only the rows this build loaded, and both loads are
+    # bounded (`DASHBOARD_QUOTA_RECENT_DAYS` / `DASHBOARD_QUOTA_OBSERVATION_-
+    # LIMIT`, and the visible accounting window) while `quota_window_blocks`
+    # retains its account stamp indefinitely. A key that survives only there —
+    # an older cycle, or a cache pruned behind a retained projection — was in no
+    # bucket at all, which is B4's own failure on the axis B4 missed.
+    ordered_keys = list(dict.fromkeys(str(key) for key in account_keys))
+    residual_keys = sorted(
+        (set(partition) | set(obs_partition) | _codex_block_account_keys(
+            context.stats_conn, roots)) - set(ordered_keys)
+    )
+    return {key: _for_account(key) for key in ordered_keys + residual_keys}
+
+
+def _codex_block_account_keys(
+    stats_conn: sqlite3.Connection, roots: Iterable[str],
+) -> set[str]:
+    """Every account stamped on a retained Codex block over ``roots`` (#416 F2).
+
+    Scoped to the child-visible cycle roots, so an unrelated root's account
+    cannot manufacture a scope. `quota_window_blocks.account_key` is NOT NULL
+    DEFAULT `unattributed`, and the `or UNATTRIBUTED` is belt-and-suspenders for
+    a store written before that default landed. A read failure degrades to the
+    two in-memory axes rather than failing the whole child build.
+    """
+    root_keys = tuple(dict.fromkeys(str(root) for root in roots))
+    if not root_keys:
+        return set()
+    placeholders = ",".join("?" for _ in root_keys)
+    try:
+        return {
+            str(row[0] or _lib_accounts.UNATTRIBUTED)
+            for row in stats_conn.execute(
+                "SELECT DISTINCT account_key FROM quota_window_blocks "
+                "WHERE source='codex' AND orphaned_at IS NULL "
+                f"AND source_root_key IN ({placeholders})",
+                root_keys,
+            )
+        }
+    except sqlite3.Error:
+        return set()
+
+
+def _codex_account_scoped_rows(
+    rows: Iterable[Mapping[str, object]], account_key: str,
+) -> list[Mapping[str, object]]:
+    """Rows this account owns, PLUS the vendor-wide ``*`` rows (spec §5.4).
+
+    A vendor-wide budget crossing is not attributable to one account, so hiding
+    it under focus would silently drop a real alert. It stays visible and keeps
+    its ``account_key == "*"`` so the client can label it as vendor-wide rather
+    than as this account's.
+    """
+    return [
+        row for row in rows
+        if row.get("account_key") in (account_key, _CODEX_VENDOR_WIDE_ACCOUNT)
+    ]
+
+
+_CODEX_VENDOR_WIDE_ACCOUNT = "*"
 
 
 def _claude_accounts_wire(
@@ -2527,6 +2988,8 @@ def _claude_accounts_wire(
         ).fetchone()
         return float(row[0]) if row is not None and row[0] is not None else 0.0
 
+    _claude_label_map = _cctally_account.display_label_map(stats_conn, "claude")
+
     # Include the unattributed bucket last iff it retained any snapshot.
     unattr_usage = _latest_usage(_lib_accounts.UNATTRIBUTED)
     unattr_cost = stats_conn.execute(
@@ -2545,7 +3008,7 @@ def _claude_accounts_wire(
         resets_at = usage[2] if usage is not None else None
         card: dict[str, object] = {
             "accountKey": key,
-            "label": _cctally_account.account_label(stats_conn, key),
+            "label": _claude_label_map.get(key) or _cctally_account.account_label(stats_conn, key),
             "plan": plan_by_key.get(key),
             "active": key in active_keys,
             "weeklyPercent": None if is_unattributed else weekly_pct,
@@ -2715,12 +3178,24 @@ def build_codex_source_state(
         quota_observations,
         accounting_entries=visible_accounting_entries,
     )
+    # R8 gate, resolved ONCE and threaded (#341 Task 4 / #416 §5.8). Every
+    # per-account decoration below — block/alert/budget `account_key`, the
+    # `accounts[]` cards, `hero.cycles[]`, and the `account_scopes` children —
+    # hangs off this single boolean, so a <=1-real-account install is provably
+    # byte-identical by construction rather than by golden observation.
+    try:
+        import _cctally_account
+        _codex_decorated = _cctally_account.provider_is_decorated(
+            context.stats_conn, "codex")
+    except Exception:
+        _codex_decorated = False
     quota_blocks = _quota_wire(
         context.stats_conn,
         accounting_entries=visible_accounting_entries,
         cycle=cycle,
         now_utc=context.now_utc,
         display_tz_name=context.display_tz_name,
+        decorated=_codex_decorated,
     )
     # Hero-modal historical-milestone navigation index (spec §1c, §3). Built
     # here on the non-idle codex source rebuild (idle ticks reuse the stored
@@ -2737,8 +3212,9 @@ def build_codex_source_state(
         except sqlite3.Error:
             cycle_index = ()
     quota = {**quota, "blocks": quota_blocks, "cycle_index": cycle_index}
-    budget_rows = _budget_wire(context.stats_conn)
-    projected_budget_rows = _projected_budget_wire(context.stats_conn)
+    budget_rows = _budget_wire(context.stats_conn, decorated=_codex_decorated)
+    projected_budget_rows = _projected_budget_wire(
+        context.stats_conn, decorated=_codex_decorated)
     budget_cost_events = _codex_budget_cost_events(context, budget_entries)
     configured_budget = _configured_codex_budget_status(
         context, budget_entries, cost_events=budget_cost_events,
@@ -2761,7 +3237,16 @@ def build_codex_source_state(
             accounting_end=accounting_end,
         )
     )
-    alerts = _alerts_wire(context.stats_conn)
+    alerts = _alerts_wire(context.stats_conn, decorated=_codex_decorated)
+    # Built here, BEFORE the children, so the parent's session wire is the first
+    # writer into `private_session_labels` and the children (strict subsets of
+    # the parent's rows) can only ever re-derive the same entries.
+    private_session_labels: dict[str, str] = {}
+    sessions_wire = _session_wire(
+        sessions,
+        metadata=conversation_metadata,
+        private_labels=private_session_labels,
+    )
     availability = (
         "partial" if metadata_incomplete or hero_failure
         else ("ok" if (entries or quota_blocks or budget_rows) else "empty")
@@ -2796,12 +3281,7 @@ def build_codex_source_state(
     # projection (client-side chip filter); the hero renders per-account cards.
     accounts_wire: list[dict[str, object]] = []
     hero_cycles_wire: list[dict[str, object]] = []
-    try:
-        import _cctally_account
-        _codex_decorated = _cctally_account.provider_is_decorated(
-            context.stats_conn, "codex")
-    except Exception:
-        _codex_decorated = False
+    account_scopes: dict[str, dict[str, object]] = {}
     if _codex_decorated:
         try:
             accounts_wire, hero_cycles_wire = _codex_accounts_wire(
@@ -2811,12 +3291,134 @@ def build_codex_source_state(
                 accounting_start=accounting_start,
                 accounting_end=accounting_end,
             )
+            # #416 §5.3: the per-account CHILDREN beside the merged parent. The
+            # scope set is exactly the card set, so every chip the client can
+            # focus resolves to a scope (an account with no evidence gets an
+            # explicit `is_empty` child, never a missing key the client would
+            # have to fall back from).
+            cycle_by_account: dict[str, CodexCycleBoundary] = {}
+            for cyc in cycles_all:
+                cycle_by_account.setdefault(
+                    (
+                        cyc.quota_identity.account_key
+                        if cyc.quota_identity is not None
+                        else _lib_accounts.UNATTRIBUTED
+                    ),
+                    cyc,
+                )
+            # Budget cost events are frozen per account over the CONFIGURED
+            # budget window, which can start before `range_start` — so they come
+            # from the full `accounting_entries`, not the visible slice.
+            budget_events_by_account = {
+                key: _codex_budget_cost_events(context, rows)
+                for key, rows in _codex_partition_by_account(
+                    accounting_entries).items()
+            } if context.codex_budget is not None else {}
+            account_scopes = _codex_account_scopes_wire(
+                context,
+                account_keys=[str(card["accountKey"]) for card in accounts_wire],
+                quota_observations=quota_observations,
+                cycle_by_account=cycle_by_account,
+                visible_accounting_entries=visible_accounting_entries,
+                active_roots=active_roots,
+                accounting_end=accounting_end,
+                metadata_incomplete=metadata_incomplete,
+                conversation_metadata=conversation_metadata,
+                alerts=alerts,
+                budget_milestones=budget_rows,
+                projected_budget_milestones=projected_budget_rows,
+                budget_cost_events_by_account=budget_events_by_account,
+                private_session_labels=private_session_labels,
+                hero_failure=hero_failure,
+            )
+            # #416 QA P1-A — the "All accounts" Blocks panel is the UNION of
+            # every account's 5-hour blocks. `_quota_wire` filters
+            # `str(root_key) not in cycle.source_root_keys` against a single
+            # `cycle` that is `cycles_all[0]`, so in the production shape (one
+            # Codex root per account) every SIBLING account's live block is
+            # dropped: the merged panel read "1 blocks · $0.86" while focusing
+            # the sibling revealed a second live block the merged view never
+            # showed. That is an UNDERCOUNT, not a misattribution — the strict
+            # account predicate `_quota_wire` applies under focus is correct and
+            # is untouched; the defect is on the separate CYCLE-ROOT axis.
+            #
+            # The merge is STRICTLY ADDITIVE over today's parent read: every
+            # child's rows are unioned in, and every row the representative-cycle
+            # read already produced is kept. Taking the children ALONE was the
+            # obvious construction (it mirrors P0-A's sum-of-the-cards, and it
+            # makes the merged list incapable of disagreeing with the chip the
+            # operator focuses next) but it LOSES rows: a child whose account has
+            # no live cycle passes `cycle=None` to `_quota_wire`, which returns
+            # `()` — so an account whose key survives only in
+            # `quota_window_blocks` (the third stamping axis; see
+            # `test_a_block_only_account_key_still_gets_a_scope`) vanished from
+            # the merged view that used to list it. Electing a sibling's cycle to
+            # bound it instead would be the very defect this fixes, so the parent
+            # keeps its own rows and gains the siblings'.
+            #
+            # Dedup is on `(key, account_key)`: the opaque block key is built
+            # from root/limit/slot/window/reset and deliberately excludes the
+            # account, so two accounts sharing one physical root are two rows
+            # with one key — never-combine extends to accounts.
+            #
+            # Each row keeps its own `current_percent` and its own `account_key`,
+            # so this is a LISTING of independent windows, never a blend (D6).
+            # Ordering mirrors `_quota_wire`'s own `resets_at DESC` with the
+            # opaque key as the deterministic tie-break.
+            by_identity: dict[tuple[str, str], dict[str, object]] = {}
+            for block in (
+                *(
+                    row
+                    for scope in account_scopes.values()
+                    for row in scope["quota"]["blocks"]
+                ),
+                *quota["blocks"],
+            ):
+                by_identity.setdefault(
+                    (str(block["key"]), str(block.get("account_key", ""))), block)
+            merged_blocks = tuple(sorted(
+                by_identity.values(),
+                key=lambda row: (
+                    str(row["resets_at"]),
+                    str(row["key"]),
+                    str(row.get("account_key", "")),
+                ),
+                reverse=True,
+            ))
+            quota = {**quota, "blocks": merged_blocks}
         except (sqlite3.Error, QualifiedMetadataUnavailable):
             # A per-account wire failure must never fail the whole source build;
             # degrade to the byte-stable undecorated shape.
             accounts_wire = []
             hero_cycles_wire = []
-    private_session_labels: dict[str, str] = {}
+            account_scopes = {}
+    # #416 QA P0-A — the "All accounts" headline is the MERGED spend and tokens
+    # (spec §6, decision D6). Everything above resolves the hero from ONE
+    # representative cycle (`cycles_all[0]` plus that cycle's own
+    # `source_root_keys`), which in the production shape — one Codex root per
+    # account — cannot see a sibling's spend at all: the headline then reads as
+    # a live total while being byte-identical to a single card sitting directly
+    # beneath it.
+    #
+    # Spend and tokens are the ONLY axes D6 lets "All accounts" merge; the
+    # percentage, reset, forecast and $/1% stay per-account and the client
+    # blanks them with a pointer to the cards. The merge is a SUM OF THE CARDS
+    # rather than a fresh query, so the headline can never disagree with the
+    # strip it sits above (an account without a live cycle contributes exactly
+    # what its own card shows, over the accounting range — the card's documented
+    # fallback). Gated on `_codex_decorated`, so a <=1-real-account install
+    # keeps the single-cycle hero byte-for-byte (R8); gated on `hero_failure`,
+    # so an unavailable hero stays unavailable rather than gaining totals the
+    # rest of the envelope says are absent.
+    if _codex_decorated and accounts_wire and not hero_failure:
+        cycle_cost_usd = stable_sum(
+            float(card["spendUsd"]) for card in accounts_wire)
+        hero_input = sum(int(card["inputTokens"]) for card in accounts_wire)
+        hero_cached = sum(int(card["cachedInputTokens"]) for card in accounts_wire)
+        hero_output = sum(int(card["outputTokens"]) for card in accounts_wire)
+        hero_reasoning = sum(
+            int(card["reasoningOutputTokens"]) for card in accounts_wire)
+        hero_total = sum(int(card["totalTokens"]) for card in accounts_wire)
     return SourceDashboardState(
         source="codex",
         availability=availability,
@@ -2883,16 +3485,17 @@ def build_codex_source_state(
                 **({"cycles": hero_cycles_wire} if _codex_decorated else {}),
             },
             **({"accounts": accounts_wire} if _codex_decorated else {}),
+            # #416 §5.3 — the per-account children. Present ONLY under
+            # decoration; the merged parent below is untouched by their
+            # existence, which is what makes acceptance criterion 7 true by
+            # construction rather than by careful re-derivation.
+            **({"account_scopes": account_scopes} if _codex_decorated else {}),
             "periods": {
                 "daily": _period_wire(daily),
                 "monthly": _period_wire(monthly),
                 "weekly": _period_wire(weekly),
             },
-            "sessions": _session_wire(
-                sessions,
-                metadata=conversation_metadata,
-                private_labels=private_session_labels,
-            ),
+            "sessions": sessions_wire,
             "quota": quota,
             "budget": {
                 "status": configured_budget,

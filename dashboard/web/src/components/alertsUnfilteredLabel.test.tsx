@@ -1,8 +1,14 @@
-// #341 Task 4 (Decision R4) — alerts are OUT of the account dimension this
-// epic's Task-4 slice: when an account focus is active, the Recent alerts panel
-// shows an "all accounts (unfiltered)" note (its rows are NEVER filtered by
-// account yet — per-account alert-wire decoration is a filed follow-up). The
-// note is absent with no focus, on All accounts, and on an undecorated source.
+// #341 Task 4 (Decision R4) → #416 Task 15. Alert rows now carry `account_key`
+// and the panel scopes to the focused account, so the "all accounts
+// (unfiltered)" note survives only where a focus genuinely cannot be applied:
+// an envelope with account cards but NO `account_scopes` (Claude today, and any
+// Codex envelope from a pre-#416 server). This file pins that degrade path; the
+// scoped path — note gone, `alerts-account-note` in its place, vendor-wide rows
+// labelled — is pinned in `panels/accountScopedPanels.test.tsx`.
+//
+// The fixture below deliberately has cards without scopes. Do NOT "fix" it by
+// adding `account_scopes`: that would silently retarget these assertions at a
+// path the code no longer takes.
 import { beforeEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { RecentAlertsPanel } from './RecentAlertsPanel';

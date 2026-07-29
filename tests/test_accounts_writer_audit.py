@@ -40,11 +40,20 @@ REAL_ACCOUNT_TABLES = frozenset({
     # account_key in its (source_root_key, account_key, …)-qualified UNIQUE.
     "quota_window_blocks", "quota_percent_milestones", "quota_threshold_events",
     "quota_alert_arming", "quota_projection_state",
+    # #416: the durable Codex attribution map. Its account_key is NULLABLE (NULL
+    # is the stably-absent sentinel DECISION) rather than
+    # ``NOT NULL DEFAULT 'unattributed'``, so it cannot rely on a schema DEFAULT
+    # even accidentally — but the audit's real value here is the same: a future
+    # writer that forgets to carry the decision's account through to the map
+    # would silently record every range as undecided-shaped.
+    "codex_file_accounts",
 })
 
 AUDITED_MODULES = (
     "_cctally_record.py", "_cctally_milestones.py", "_cctally_five_hour.py",
     "_cctally_weekrefs.py", "_cctally_quota.py",
+    # #416: the Codex ingest writes the attribution map.
+    "_cctally_cache.py",
 )
 
 # `INSERT [OR IGNORE|OR REPLACE|...] INTO <table> (` — the start of a

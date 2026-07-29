@@ -845,6 +845,18 @@ def _sync_failure_envelope(
             "action": "cctally db repair --db stats --yes",
         }
 
+    # conversations.db is intentionally outside core dashboard generations.
+    # Typed transcript ownership therefore degrades through the generic server
+    # contract: Doctor owns integrity diagnosis, and raw SQLite wording must
+    # never manufacture a cache.db repair action for this third store.
+    if attributed("conversations"):
+        return {
+            "kind": "server_sync",
+            "label": "⚠ server sync error",
+            "detail": "The server could not complete its background sync.",
+            "action": None,
+        }
+
     text = error.casefold()
     if (
         "stale maintenance marker" in text

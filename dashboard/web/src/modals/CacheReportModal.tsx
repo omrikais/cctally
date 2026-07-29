@@ -1,6 +1,6 @@
 // CacheReportModal — anomaly watchdog detail view.
 //
-// Subscribes to ``state.cache_report`` via ``useSnapshot()`` and
+// Subscribes to ``state.cache_report`` via ``useScopedSnapshot()`` and
 // renders six sections (spec §3.1):
 //
 //   1. Today's spotlight (CacheReportSpotlight).
@@ -21,7 +21,7 @@
 // Spec 2026-05-21 §3.
 import { useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { CacheReportSpotlight } from './CacheReportSpotlight';
@@ -147,7 +147,7 @@ function AllCacheReportSection({
 }
 
 function AllCacheReportModal() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot('all');
   const composition = presentationCacheReportComposition(env, 'all');
   return (
     <Modal title="Cache Report — by provider" accentClass="accent-teal">
@@ -161,7 +161,8 @@ function AllCacheReportModal() {
 }
 
 function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
-  const env = useSnapshot();
+  // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
+  const env = useScopedSnapshot(source);
   const display = useDisplayTz();
   const isClaude = source === 'claude';
   const nativeReport = env?.sources?.codex?.data?.cache_report ?? null;

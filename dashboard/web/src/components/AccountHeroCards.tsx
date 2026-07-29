@@ -1,12 +1,13 @@
 import { useSyncExternalStore } from 'react';
 import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
-import { humanizeAge } from '../lib/syncFreshness';
+import { humanizeDuration } from '../lib/syncFreshness';
 import {
   ALL_ACCOUNTS,
   resolveAccountFocus,
   sourceAccounts,
 } from '../store/accountFocus';
+import { useAccountScope } from '../hooks/useScopedSnapshot';
 import type { AccountCard, SourceEntry, SourceName } from '../types/envelope';
 
 // #341 Task 4 — the unified per-account hero cards (spec §5). Rendered under the
@@ -16,6 +17,17 @@ import type { AccountCard, SourceEntry, SourceName } from '../types/envelope';
 // weekly spend; the unattributed card renders DIMMED with totals only (no live
 // bars). Absent for a <=1-real-account source, so single-account layouts are
 // unchanged (R8).
+//
+// #416 QA — the strip ALSO renders on the ALL-PROVIDERS tab, for Codex. It used
+// to self-hide there ("account cards are provider-scoped"), which was right while
+// the strip was only a companion to the per-provider account CHIP — the chip is
+// provider-scoped and the combined tab has none. It is wrong now that the strip
+// is the DISCLOSURE that makes a blanked headline honest: the combined hero
+// blanks its Codex percent, countdown and quota row precisely because each
+// account owns an independent cycle (D6), and spec §6 names the per-account strip
+// as the thing those slots point at. Without it the combined tab would point at
+// nothing. It renders unfocused and provider-labelled there — Codex only, because
+// Codex is the only provider whose numbers this tab blanks.
 
 // Deterministic per-account color palette, assigned by registry order (spec §5).
 const ACCOUNT_COLORS = [
@@ -27,11 +39,15 @@ function resetCountdown(resetsAt: string | null, nowMs: number): string | null {
   const ms = Date.parse(resetsAt);
   if (Number.isNaN(ms)) return null;
   const secs = Math.max(0, Math.round((ms - nowMs) / 1000));
-  // At/after the reset boundary `secs` clamps to 0; `humanizeAge(0)` is "0s ago",
-  // so `resets in ${…}` would read the contradictory "resets in 0s ago" (#341
-  // ui-qa P3). Emit a non-contradictory string; the future path is untouched.
+  // At/after the reset boundary `secs` clamps to 0 (#341 ui-qa P3).
   if (secs === 0) return 'resets now';
-  return `resets in ${humanizeAge(secs)}`;
+  // #416 QA P2-A: this is a FUTURE interval, so it takes the direction-free
+  // duration. The boundary case above was special-cased in #341 while the
+  // ordinary future path kept calling `humanizeAge`, whose " ago" suffix is
+  // unconditional — so every card with a future reset read "resets in 2d 2h
+  // ago". The hero's own countdown (`fmt.ddhh`) reads correctly, so the two
+  // contradicted each other side by side.
+  return `resets in ${humanizeDuration(secs)}`;
 }
 
 function pctText(v: number | null): string {
@@ -93,19 +109,40 @@ function AccountHeroCard({ card, color, focused }: {
 
 export function AccountHeroCards() {
   const env = useSnapshot();
+  const scope = useAccountScope();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const focusSlot = useSyncExternalStore(
     subscribeStore,
     () => (activeSource === 'all' ? ALL_ACCOUNTS : getState().accountFocus[activeSource as SourceName]),
   );
-  if (activeSource === 'all') return null; // account cards are provider-scoped.
-  const source = activeSource as SourceName;
+  // #416 QA — the combined tab has no account chip and no provider context, so
+  // it reads the CODEX population and labels it. Every other tab is unchanged.
+  const combined = activeSource === 'all';
+  const source: SourceName = combined ? 'codex' : (activeSource as SourceName);
   const entry = (env?.sources?.[source] ?? null) as SourceEntry<unknown> | null;
   const accounts = sourceAccounts(entry);
   if (accounts == null) return null; // <=1 real account → no cards.
 
-  const focused = resolveAccountFocus(env, source, focusSlot ?? ALL_ACCOUNTS);
+  // A focus stored for the Codex TAB must never narrow the combined tab: there
+  // is no chip there to show or undo it, so a narrowed strip would silently
+  // reintroduce exactly the one-account-as-the-whole-picture defect this fixes.
+  const focused = combined
+    ? null
+    : resolveAccountFocus(env, source, focusSlot ?? ALL_ACCOUNTS);
   const visible = focused == null ? accounts : accounts.filter((a) => a.accountKey === focused);
+  // #416 §6 — the explicit empty state. An account with neither accounting rows
+  // nor quota evidence renders a NAMED "no activity" note with its bars and
+  // reset blank, rather than silently inheriting the previous account's numbers
+  // (the literal reported symptom) or painting a blank panel with no
+  // explanation. Only the provider that actually emits per-account children can
+  // know this, so it comes from the scope chokepoint, never from the card.
+  // Wording is deliberate: the server's `is_empty` means "owns neither
+  // accounting rows nor quota evidence in the loaded window", NOT "nothing in
+  // the current cycle" — an account can carry spend outside its cycle and still
+  // have no live cycle, and that case shows its spend with blank bars instead.
+  const emptyNote = scope.isEmpty && scope.card != null
+    ? `No Codex activity recorded for ${scope.card.label}.`
+    : null;
   // Color is assigned by registry (array) order, stable across focus changes.
   const colorOf = (key: string): string => {
     const idx = accounts.findIndex((a) => a.accountKey === key);
@@ -114,6 +151,14 @@ export function AccountHeroCards() {
 
   return (
     <div className="account-hero-cards" data-testid="account-hero-cards">
+      {/* On a provider tab the strip's owner is the tab itself; on the combined
+          tab it has to say so, since the operator may hold several accounts with
+          BOTH providers and only Codex ships a per-account strip today. */}
+      {combined && (
+        <p className="account-hero-caption" data-testid="account-hero-caption">
+          Codex accounts — each has its own quota cycle.
+        </p>
+      )}
       {visible.map((card) => (
         <AccountHeroCard
           key={card.accountKey}
@@ -122,6 +167,15 @@ export function AccountHeroCards() {
           focused={focused === card.accountKey}
         />
       ))}
+      {emptyNote != null && (
+        <p
+          className="account-hero-empty"
+          data-testid="account-hero-empty"
+          role="status"
+        >
+          {emptyNote}
+        </p>
+      )}
     </div>
   );
 }

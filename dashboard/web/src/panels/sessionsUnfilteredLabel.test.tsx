@@ -1,7 +1,14 @@
-// #341 Task 4 (Decision R4) — sessions are OUT of the account dimension this
-// epic: when an account focus is active, the Sessions panel shows an "all
-// accounts (unfiltered)" note (it is NEVER filtered by account). The note is
-// absent with no focus and on an undecorated source.
+// #341 Task 4 (Decision R4) → #416 Task 15. Sessions DO scope by account now,
+// so the "all accounts (unfiltered)" note survives only where a focus genuinely
+// cannot be applied: an envelope that ships account cards but NO
+// `account_scopes` (Claude today, and any Codex envelope from a server that
+// pre-dates #416). This file pins that degrade path; the scoped path — where
+// the note is gone and replaced by `sessions-account-note` — is pinned in
+// `accountScopedPanels.test.tsx`.
+//
+// The fixture below deliberately has cards without scopes, which is exactly the
+// unscopeable shape. Do NOT "fix" it by adding `account_scopes`: that would
+// silently turn these into assertions about a path the code no longer takes.
 import { beforeEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { SessionsPanel } from './SessionsPanel';

@@ -1,5 +1,5 @@
 import { Fragment, useState, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
@@ -280,7 +280,8 @@ function CanonicalTrendModal({
   source: DashboardSelection;
   embedded?: boolean;
 }) {
-  const env = useSnapshot();
+  // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
+  const env = useScopedSnapshot(source);
   const isClaude = source === 'claude';
   const presentation = presentationTrend(env, source);
   const rows: TrendChartDatum[] = isClaude
@@ -602,11 +603,11 @@ function CanonicalTrendModal({
 }
 
 export function TrendModal() {
-  const env = useSnapshot();
   const source = useSyncExternalStore(
     subscribeStore,
     () => getState().openModalSource ?? getState().activeSource,
   );
+  const env = useScopedSnapshot(source);
   if (source !== 'all') return <CanonicalTrendModal source={source} />;
   const presentation = presentationTrend(env, 'all');
   const headerExtras = (

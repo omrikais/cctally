@@ -38,6 +38,172 @@ def _integer_percent(value: float) -> int:
     return math.floor(value + 1e-9)
 
 
+# --------------------------------------------------------------------------
+# #416 spec §4.2 — tolerance-anchored reset canonicalization (decision D4).
+#
+# The Codex quota path never received the jitter canonicalization the Claude 5h
+# path has, so the RAW `resets_at` enters the window identity and one physical
+# window splits into many, each with its own peak and milestone ladder (spec
+# §1.4: one reset-minute observed split six ways).
+#
+# The tolerance is safe by construction: the next GENUINE reset of a 5h window
+# is five hours out and of a weekly window seven days out, so nothing within
+# 600s of an established anchor can be a different cycle.
+#
+# This kernel is pure and takes the established anchor set as an argument,
+# because resolution must happen at INGEST over the complete population (spec
+# §4.1 / review F7). A read-time anchor is deterministic only for a fixed input
+# population, and the dashboard reads at most 35 days / 1,000 rows with those
+# bounds applied in SQL — so omitting the earliest member of a jitter cluster
+# would silently move its anchor and make the dashboard and the CLI disagree
+# about window identity.
+# --------------------------------------------------------------------------
+
+CODEX_RESET_ANCHOR_TOLERANCE_SECONDS = 600
+
+
+def resolve_reset_anchor(
+    anchors: Iterable[dt.datetime], raw_reset: dt.datetime,
+    *, tolerance_seconds: int = CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
+) -> dt.datetime:
+    """Return the anchor ``raw_reset`` joins, or ``raw_reset`` itself when it
+    establishes a new one.
+
+    ``anchors`` are the anchors already established for this observation's
+    identity (the identity MINUS the reset and MINUS the account — see
+    ``_physical_window_key``, which excludes the account precisely so an
+    unidentified observation can be adopted by a same-window identified one).
+
+    First sight wins and an anchor NEVER moves: the returned value is always an
+    anchor already in ``anchors`` or the observation's own raw value, never a
+    recomputed centroid. Assignment picks the NEAREST anchor within tolerance,
+    breaking a tie on the earlier anchor, so for a given anchor set the answer
+    does not depend on the order the anchors were established in. (The anchor
+    SET can still depend on arrival order in the pathological case of a chain of
+    observations each within tolerance of its neighbour but not of the first;
+    real jitter is seconds wide, so a real cluster collapses to one anchor under
+    every order.)
+    """
+    _require_aware(raw_reset, "raw_reset")
+    if (isinstance(anchors, ResetAnchorIndex)
+            and anchors.tolerance_seconds == tolerance_seconds):
+        # O(1) via the bucketed index; the linear body below stays the
+        # reference semantics for a caller holding a plain sequence, and
+        # `ResetAnchorIndex.resolve` is pinned against it by an equivalence
+        # test over a randomized population.
+        return anchors.resolve(raw_reset)
+    return _resolve_reset_anchor_linear(
+        anchors, raw_reset, tolerance_seconds=tolerance_seconds)
+
+
+def _resolve_reset_anchor_linear(
+    anchors: Iterable[dt.datetime], raw_reset: dt.datetime,
+    *, tolerance_seconds: int,
+) -> dt.datetime:
+    best: dt.datetime | None = None
+    best_delta: float | None = None
+    for anchor in anchors:
+        _require_aware(anchor, "anchor")
+        delta = abs((raw_reset - anchor).total_seconds())
+        if delta > tolerance_seconds:
+            continue
+        if best is None or delta < best_delta or (
+            delta == best_delta and anchor < best
+        ):
+            best, best_delta = anchor, delta
+    return raw_reset if best is None else best
+
+
+class ResetAnchorIndex:
+    """An established-anchor set with O(1) ``resolve``.
+
+    Semantically identical to ``resolve_reset_anchor`` over the same anchors —
+    nearest within tolerance, ties broken on the earlier anchor, first sight
+    wins, the anchor never moves, and the pathological chain-of-neighbours
+    order-dependence that docstring documents is preserved exactly, because the
+    anchor SET is still whatever the caller established in whatever order.
+
+    Only the LOOKUP changes. The linear scan did a full ``datetime`` subtraction
+    against every established anchor, and a 5h group accumulates ~1,750 anchors
+    a year — so the scan is quadratic in the population. That is not a
+    background cost: cache migration 032 runs the resolver over the WHOLE
+    ``quota_window_snapshots`` table synchronously on the first DB open after
+    upgrade, and ``cache-sync --rebuild`` runs it over the whole walk, so the
+    quadratic term lands on the operator's first post-upgrade command as a
+    multi-minute hang.
+
+    Anchors are bucketed by ``floor(epoch / tolerance)``. Anything within
+    ``tolerance`` of a probe lies in the probe's own bucket or one on either
+    side, so three bucket lookups are EXHAUSTIVE — this is an exact index, not
+    an approximation, and no correctness argument depends on the bucket width
+    beyond that identity.
+    """
+
+    __slots__ = ("_tolerance", "_buckets", "_order")
+
+    def __init__(
+        self, anchors: Iterable[dt.datetime] = (),
+        *, tolerance_seconds: int = CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
+    ) -> None:
+        if not isinstance(tolerance_seconds, int) or isinstance(tolerance_seconds, bool):
+            raise ValueError("tolerance_seconds must be an int")
+        if tolerance_seconds <= 0:
+            raise ValueError("tolerance_seconds must be positive")
+        self._tolerance = tolerance_seconds
+        self._buckets: dict[int, list[dt.datetime]] = {}
+        self._order: list[dt.datetime] = []
+        for anchor in anchors:
+            self.add(anchor)
+
+    @property
+    def tolerance_seconds(self) -> int:
+        return self._tolerance
+
+    def _bucket(self, value: dt.datetime) -> int:
+        return int(value.timestamp() // self._tolerance)
+
+    def add(self, anchor: dt.datetime) -> bool:
+        """Establish ``anchor``. Returns False when it was already present."""
+        _require_aware(anchor, "anchor")
+        bucket = self._buckets.setdefault(self._bucket(anchor), [])
+        if anchor in bucket:
+            return False
+        bucket.append(anchor)
+        self._order.append(anchor)
+        return True
+
+    def resolve(self, raw_reset: dt.datetime) -> dt.datetime:
+        """The anchor ``raw_reset`` joins, or ``raw_reset`` when it establishes
+        a new one. Does NOT add it — the caller decides, exactly as with the
+        pure function."""
+        _require_aware(raw_reset, "raw_reset")
+        probe = self._bucket(raw_reset)
+        best: dt.datetime | None = None
+        best_delta: float | None = None
+        for offset in (-1, 0, 1):
+            for anchor in self._buckets.get(probe + offset, ()):
+                delta = abs((raw_reset - anchor).total_seconds())
+                if delta > self._tolerance:
+                    continue
+                if best is None or delta < best_delta or (
+                    delta == best_delta and anchor < best
+                ):
+                    best, best_delta = anchor, delta
+        return raw_reset if best is None else best
+
+    def __contains__(self, anchor: object) -> bool:
+        if not isinstance(anchor, dt.datetime):
+            return False
+        return anchor in self._buckets.get(self._bucket(anchor), ())
+
+    def __iter__(self):
+        """Established anchors in the order they were established."""
+        return iter(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+
 @dataclass(frozen=True)
 class QuotaWindowIdentity:
     """One root-qualified native quota window identity.
@@ -87,10 +253,25 @@ class QuotaObservation:
     plan_type: str | None = None
     individual_limit_json: str | None = None
     reached_type: str | None = None
+    # #416 spec §4.1/§4.2: the tolerance-anchored reset resolved at INGEST over
+    # the complete population and stored on the cache row. ``resets_at`` stays
+    # the RAW provider value, retained unchanged as evidence.
+    #
+    # Every reset-identity consumer reads THIS field, not ``resets_at``, and
+    # ``__post_init__`` fills it from ``resets_at`` when the caller has none —
+    # so a pre-migration row, an older binary's row, or any construction site
+    # that predates the column behaves exactly as it does today rather than
+    # failing. That default is what makes "route every consumer through the
+    # anchor" a safe blanket rule instead of a per-call-site judgement.
+    canonical_resets_at: dt.datetime | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.captured_at, "captured_at")
         _require_aware(self.resets_at, "resets_at")
+        if self.canonical_resets_at is None:
+            object.__setattr__(self, "canonical_resets_at", self.resets_at)
+        else:
+            _require_aware(self.canonical_resets_at, "canonical_resets_at")
         if not isinstance(self.used_percent, (int, float)) or isinstance(self.used_percent, bool):
             raise ValueError("used_percent must be a number")
         if not math.isfinite(self.used_percent) or not 0 <= self.used_percent <= 100:
@@ -221,10 +402,16 @@ def identity_sort_key(identity: QuotaWindowIdentity) -> tuple[str, str, str, str
 
 
 def physical_order_key(observation: QuotaObservation) -> tuple[dt.datetime, dt.datetime, str, int]:
-    """The frozen total order for physical rows within one identity."""
+    """The frozen total order for physical rows within one identity.
+
+    The reset component is the CANONICAL anchor (#416 §4.1), so two captures of
+    one physical window whose raw resets differ only by provider jitter tie here
+    and fall through to the deterministic physical position
+    (``source_path``, ``line_offset``) instead of being ordered by the jitter.
+    """
     return (
         observation.captured_at,
-        observation.resets_at,
+        observation.canonical_resets_at,
         observation.source_path,
         observation.line_offset,
     )
@@ -242,7 +429,10 @@ def logical_value_tuple(observation: QuotaObservation) -> tuple[object, ...]:
         identity.limit_id,
         identity.limit_name,
         observation.used_percent,
-        observation.resets_at,
+        # CANONICAL, not raw (#416 §4.1): the reset is part of the interpreted
+        # point's value, so raw jitter would make one unchanged reading look
+        # like a run of distinct interpreted points and defeat the dedup.
+        observation.canonical_resets_at,
         observation.plan_type,
         observation.individual_limit_json,
         observation.reached_type,
@@ -289,9 +479,13 @@ def _physical_window_key(observation: QuotaObservation) -> tuple[object, ...]:
     """The account-INDEPENDENT physical window key used by the continuity fold.
 
     Two observations share a physical window iff they agree on root, limit key,
-    slot, window minutes, and the exact (canonical UTC) reset boundary — the
-    account is deliberately EXCLUDED so unidentified observations can be adopted
-    by a same-window identified account (spec §2 window-account continuity).
+    slot, window minutes, and the reset boundary — the account is deliberately
+    EXCLUDED so unidentified observations can be adopted by a same-window
+    identified account (spec §2 window-account continuity).
+
+    The reset is the CANONICAL anchor (#416 §4.1). With the raw value, jitter
+    ALONE defeats continuity adoption: an unidentified observation a few seconds
+    off the identified one is a different physical window and is never adopted.
     """
     identity = observation.identity
     return (
@@ -300,7 +494,7 @@ def _physical_window_key(observation: QuotaObservation) -> tuple[object, ...]:
         identity.logical_limit_key,
         identity.observed_slot,
         identity.window_minutes,
-        observation.resets_at,
+        observation.canonical_resets_at,
     )
 
 
@@ -376,11 +570,18 @@ def select_baseline(
 
 
 def build_blocks(observations: Iterable[QuotaObservation]) -> tuple[QuotaBlock, ...]:
-    """Segment deduplicated interpreted history at each native reset boundary."""
+    """Segment deduplicated interpreted history at each native reset boundary.
+
+    Blocks are keyed on the CANONICAL anchor (#416 §4.1), so one physical window
+    is one block however many raw reset spellings its observations carry — and
+    ``QuotaBlock.resets_at``, which every renderer shows, is that same anchor.
+    """
     by_block: dict[tuple[QuotaWindowIdentity, dt.datetime], list[QuotaObservation]] = {}
     for history in build_history(observations):
         for observation in history.observations:
-            by_block.setdefault((history.identity, observation.resets_at), []).append(observation)
+            by_block.setdefault(
+                (history.identity, observation.canonical_resets_at), []
+            ).append(observation)
 
     blocks: list[QuotaBlock] = []
     for (identity, resets_at), points in sorted(
@@ -495,9 +696,13 @@ def forecast_quota(
     if baseline is None:
         return _null_forecast("future" if freshness.state == "future" else "unavailable")
 
+    # Same-cycle selection on the CANONICAL anchor (#416 §4.1). With the raw
+    # value, a jittered cycle's evidence splits and the forecast silently runs
+    # on a fraction of the samples it should have.
     points = tuple(
         observation for observation in history.observations
-        if observation.resets_at == baseline.resets_at and observation.captured_at <= as_of
+        if observation.canonical_resets_at == baseline.canonical_resets_at
+        and observation.captured_at <= as_of
     )
     points = tuple(sorted(points, key=physical_order_key))
     sample_count = 0
@@ -507,9 +712,13 @@ def forecast_quota(
         if elapsed_seconds > 0 and delta_percent > 0:
             sample_count += 1
 
-    remaining_seconds = max(0, int((baseline.resets_at - as_of).total_seconds()))
+    # The cycle geometry rides the same anchor, so the countdown, the elapsed
+    # fraction, and the reported reset all describe ONE window rather than
+    # whichever jittered spelling the baseline observation happened to carry.
+    anchor = baseline.canonical_resets_at
+    remaining_seconds = max(0, int((anchor - as_of).total_seconds()))
     native_window_seconds = baseline.identity.window_minutes * 60
-    cycle_start = baseline.resets_at - dt.timedelta(minutes=baseline.identity.window_minutes)
+    cycle_start = anchor - dt.timedelta(minutes=baseline.identity.window_minutes)
     cycle_elapsed_seconds = min(
         float(native_window_seconds),
         max(0.0, (as_of - cycle_start).total_seconds()),
@@ -544,7 +753,7 @@ def forecast_quota(
         current_percent=baseline.used_percent,
         rate_percent_per_hour=rate,
         projected_percent=projected,
-        resets_at=baseline.resets_at,
+        resets_at=anchor,
         remaining_seconds=remaining_seconds,
         sample_count=sample_count,
         sample_span_seconds=int(cycle_elapsed_seconds) if sample_count > 0 else 0,

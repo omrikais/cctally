@@ -169,6 +169,11 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("observed_model", "TEXT", 0),
             # account_key (#341): observe-and-stamp attribution, NULL ≡ unattributed.
             ("account_key", "TEXT", 0),
+            # canonical_resets_at_utc (#416 §4.2): the tolerance-anchored reset,
+            # resolved at ingest over the complete population. NULL ≡ "not yet
+            # resolved", and every reader falls back to the raw resets_at_utc,
+            # which is retained unchanged beside it as evidence.
+            ("canonical_resets_at_utc", "TEXT", 0),
         ]
         assert _columns(conn, "codex_conversation_events") == [
             ("id", "INTEGER", 0),

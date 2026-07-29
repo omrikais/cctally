@@ -102,3 +102,37 @@ def test_all_four_legs_ok_on_empty_state(D):
     for fn in (D._check_accounts_identity, D._check_accounts_registry,
                D._check_accounts_freshness, D._check_accounts_attribution):
         assert fn(s).severity == "ok"
+
+
+# -- Codex identity / torn-auth deferral (#416 fix-round review B4) ---------
+#
+# A persistently torn `<root>/auth.json` defers every growing rollout under that
+# root, so Codex spend and quota stop updating while `cache-sync` exits 0. Not
+# R8-gated: it names no account and adds no per-account column.
+
+def _codex(**state):
+    return types.SimpleNamespace(codex_torn_deferred=state or None)
+
+
+def test_codex_identity_ok_without_a_marker(D):
+    assert D._check_accounts_codex_identity(_codex()).severity == "ok"
+
+
+def test_codex_identity_ok_when_the_marker_says_zero(D):
+    assert D._check_accounts_codex_identity(
+        _codex(files=0, at="2026-07-28T00:00:00Z")).severity == "ok"
+
+
+def test_codex_identity_warns_while_ingest_is_deferred(D):
+    r = D._check_accounts_codex_identity(
+        _codex(files=3, at="2026-07-28T00:00:00Z"))
+    assert r.severity == "warn"
+    assert "3" in r.summary
+    assert r.remediation
+    assert r.details["files"] == 3
+
+
+def test_codex_identity_leg_is_registered(D):
+    ids = [cid for _key, _title, checks in D._CATEGORY_DEFINITIONS
+           for cid, _fn in checks]
+    assert "accounts.codex_identity" in ids

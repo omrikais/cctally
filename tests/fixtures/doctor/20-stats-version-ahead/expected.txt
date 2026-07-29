@@ -24,8 +24,8 @@ Database
   ✓ Integrity                quick_check ok
   ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1004) — no journal data available
       → Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`
-  ✓ Migrations               0/43 applied
-  ⚠ Pending migrations       43 pending
+  ✓ Migrations               0/45 applied
+  ⚠ Pending migrations       45 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -52,6 +52,7 @@ Data
   ✓ Conversation rollup      no data
 Accounts
   ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Codex account identity   no deferred Codex ingest
   ✓ Account registry         no accounts observed yet
   ✓ Account attribution freshness no attribution activity recorded
   ✓ Account attribution      usage attribution healthy
@@ -68,4 +69,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 46 OK · 6 WARN · 0 FAIL
+Summary: 47 OK · 6 WARN · 0 FAIL

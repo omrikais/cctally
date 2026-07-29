@@ -224,6 +224,7 @@ def test_doctor_writes_nothing_to_app_dir_on_fresh_home(tmp_path):
 
 import sqlite3  # noqa: E402
 import sys as _sys  # noqa: E402
+import fcntl  # noqa: E402
 from conftest import load_script, redirect_paths  # noqa: E402
 
 
@@ -253,9 +254,11 @@ def test_gather_deep_false_skips_quick_check(monkeypatch, tmp_path):
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
     state = ns["doctor_gather_state"](deep=False)
     assert state.stats_db_quick_check is None
     assert state.cache_db_quick_check is None
+    assert state.conversations_db_quick_check is None
 
 
 def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
@@ -265,9 +268,11 @@ def test_gather_deep_true_healthy_dbs_ok(monkeypatch, tmp_path):
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _valid_sqlite(_cctally_core.DB_PATH)
     _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
     state = ns["doctor_gather_state"](deep=True)
     assert state.stats_db_quick_check == "ok"
     assert state.cache_db_quick_check == "ok"
+    assert state.conversations_db_quick_check == "ok"
 
 
 def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
@@ -339,6 +344,80 @@ def test_gather_deep_true_corrupt_stats_reports_nonok(monkeypatch, tmp_path):
     state = ns["doctor_gather_state"](deep=True)
     assert state.stats_db_quick_check is not None
     assert state.stats_db_quick_check != "ok"
+
+
+def test_gather_deep_true_corrupt_conversations_reports_nonok(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _cctally_core.CONVERSATIONS_DB_PATH.write_bytes(
+        b"this is not a sqlite transcript database"
+    )
+
+    state = ns["doctor_gather_state"](deep=True)
+
+    assert state.conversations_db_quick_check is not None
+    assert state.conversations_db_quick_check != "ok"
+
+
+def test_gather_conversations_declines_during_recovery(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    _valid_sqlite(_cctally_core.CONVERSATIONS_DB_PATH)
+
+    maintenance = _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    maintenance.touch()
+    with maintenance.open("a+") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = ns["doctor_gather_state"](deep=True)
+
+    assert state.conversations_db_quick_check is None
+    assert state.conversations_db_page_count is None
+    assert state.conversations_db_freelist_count is None
+    assert state.conv_sessions_rollup_count is None
+    assert state.conv_messages_distinct_sessions is None
+
+
+def test_gather_reports_durable_conversation_recovery_as_incomplete(
+    monkeypatch, tmp_path,
+):
+    ns = load_script()
+    import _cctally_core
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _valid_cache_sqlite(_cctally_core.CACHE_DB_PATH)
+    recovery = _cctally_core.CONVERSATIONS_DB_PATH.with_name(
+        "conversations.db.recovery.json"
+    )
+    recovery.write_text(json.dumps({
+        "schemaVersion": 1,
+        "providers": ["claude", "codex"],
+        "phase": "quarantined",
+    }))
+
+    state = ns["doctor_gather_state"](deep=True)
+
+    assert state.conversations_db_quick_check == "recovery in progress"
+    import _lib_doctor
+    report = _lib_doctor.run_checks(state)
+    integrity = next(
+        check for category in report.categories
+        for check in category.checks
+        if check.id == "db.integrity"
+    )
+    assert integrity.severity == "warn"
+    assert "conversations.db" in integrity.summary
+    assert "cache-sync --rebuild" in integrity.remediation
 
 
 def test_gather_head_guard_survives_repo_root_raise(monkeypatch, tmp_path):

@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
+import { sourceAccounts } from '../store/accountFocus';
 import { PanelGrip } from '../components/PanelGrip';
 import { ShareIcon } from '../components/ShareIcon';
 import { ExpandButton } from '../components/ExpandButton';
@@ -16,13 +17,33 @@ import {
 } from '../lib/dashboardPresentation';
 import { SourceChip } from './sourcePanel';
 
+// #416 QA P0 — the shared blank. A forecast is a claim about ONE quota
+// allowance, and a decorated Codex provider has several; no summary statistic
+// over them is the quantity this slot holds (D6). The pointer reuses the hero's
+// `hero-per-account-value` italic-caption vocabulary so the blanked slots on
+// the hero and the panel read as one deliberate treatment rather than two
+// unrelated absences.
+export function ForecastPerAccountValue(): JSX.Element {
+  return (
+    <span
+      className="hero-per-account-value"
+      data-testid="forecast-per-account"
+      title="Each Codex account has its own quota cycle — independent forecasts are never blended."
+    >
+      per account
+    </span>
+  );
+}
+
 function ForecastProviderSummary({
   section,
+  perAccount,
 }: {
   section: ProviderPresentationSection<ForecastPresentation>;
+  perAccount: boolean;
 }) {
   const value = section.value;
-  const verdict = resolveVerdict(value?.verdict ?? null);
+  const verdict = perAccount ? null : resolveVerdict(value?.verdict ?? null);
   const verdictClass = verdict?.cls ?? 'good';
   return (
     <div
@@ -32,26 +53,34 @@ function ForecastProviderSummary({
     >
       <div className="source-provider-head">
         <SourceChip source={section.source} />
-        {section.status !== 'available' && (
+        {section.status !== 'available' && !perAccount && (
           <span className="provider-section-status">{section.status}</span>
         )}
       </div>
-      {value == null ? (
+      {value == null && !perAccount ? (
         <div className="provider-section-reason">{section.reason}</div>
       ) : (
         <>
           <div className="provider-summary-kpis">
             <div>
-              <span className="provider-summary-label">{value.primaryLabel}</span>
+              <span className="provider-summary-label">
+                {value?.primaryLabel ?? 'Projected @ reset'}
+              </span>
               <strong className={`provider-summary-value is-${verdictClass}`}>
-                {verdictClass === 'over' && value.projected != null
-                  ? '≥100%'
-                  : fmt.pct0(value.projected)}
+                {perAccount
+                  ? <ForecastPerAccountValue />
+                  : verdictClass === 'over' && value!.projected != null
+                    ? '≥100%'
+                    : fmt.pct0(value!.projected)}
               </strong>
             </div>
             <div>
-              <span className="provider-summary-label">{value.recentLabel}</span>
-              <strong className="provider-summary-value">{fmt.pct0(value.recent)}</strong>
+              <span className="provider-summary-label">
+                {perAccount ? 'Current quota' : value!.recentLabel}
+              </span>
+              <strong className="provider-summary-value">
+                {perAccount ? <ForecastPerAccountValue /> : fmt.pct0(value!.recent)}
+              </strong>
             </div>
           </div>
           {verdict && (
@@ -60,7 +89,9 @@ function ForecastProviderSummary({
               {' '}{verdict.label}
             </span>
           )}
-          {section.reason && <div className="provider-section-reason">{section.reason}</div>}
+          {section.reason && !perAccount && (
+            <div className="provider-section-reason">{section.reason}</div>
+          )}
         </>
       )}
     </div>
@@ -81,9 +112,17 @@ function ForecastProviderSummary({
 // summaries inside one shell. The adapter keeps the legacy top-level Claude
 // forecast from leaking into the Codex section.
 export function ForecastPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const scope = useAccountScope();
   const composition = presentationForecastComposition(env, activeSource);
+  // #416 QA P0. On the Codex tab the gate is the scope chokepoint's own answer
+  // (decorated AND unfocused), the same predicate the hero uses. On the
+  // combined tab there is no Codex chip to focus, so the gate is simply whether
+  // the provider ships `accounts[]` — matching `SharedHero`'s `all` branch.
+  const codexPerAccount = activeSource === 'all'
+    ? sourceAccounts(env?.sources?.codex ?? null) != null
+    : scope.scopesSupported && scope.accountKey == null;
   if (activeSource === 'all') {
     return (
       <section
@@ -116,14 +155,24 @@ export function ForecastPanel() {
         </div>
         <div className="panel-body source-all-sections provider-composition provider-composition--panel">
           {composition.sections.map((section) => (
-            <ForecastProviderSummary key={section.source} section={section} />
+            <ForecastProviderSummary
+              key={section.source}
+              section={section}
+              perAccount={section.source === 'codex' && codexPerAccount}
+            />
           ))}
         </div>
       </section>
     );
   }
   const fc = presentationForecast(env, activeSource);
-  const v = resolveVerdict(fc.verdict);
+  // #416 QA P0 — under "All accounts" the tile blanks: the verdict, the accent
+  // edge and the escalation tint all describe ONE account's allowance, and this
+  // tile sat ~40px under a hero that already reads `Forecast @ reset —
+  // per account`, contradicting it in a single glance. The expansion carries
+  // the per-account disclosure.
+  const perAccount = activeSource === 'codex' && codexPerAccount;
+  const v = perAccount ? null : resolveVerdict(fc.verdict);
   // `v.cls` is 'good' | 'warn' | 'over'. The accent edge escalates on any
   // non-OK verdict (cap/capped both set `warn: true`).
   const esc = v?.cls ?? 'good';
@@ -166,7 +215,9 @@ export function ForecastPanel() {
       <div className="panel-body fc-body">
         <div className="fc-hero">
           <div className="fc-eyebrow">{fc.primaryLabel}</div>
-          <div className={`fc-num is-${esc}`}>{projectedLabel}</div>
+          <div className={`fc-num is-${esc}${perAccount ? ' is-blank' : ''}`}>
+            {perAccount ? <ForecastPerAccountValue /> : projectedLabel}
+          </div>
           {v && (
             <span className={`fc-verdict-chip is-${esc}`}>
               <span className="fc-verdict-glyph" aria-hidden="true">{v.glyph}</span>
@@ -183,15 +234,21 @@ export function ForecastPanel() {
         <div className={`fc-pace is-${esc}`} role="presentation">
           <div
             className="fc-pace-fill"
-            style={{ width: `${Math.min(100, Math.max(0, fc.projected ?? 0))}%` }}
+            style={{ width: `${perAccount ? 0 : Math.min(100, Math.max(0, fc.projected ?? 0))}%` }}
           />
         </div>
         <div className="fc-budget-foot">
           <div className="fc-foot-line">
-            <span className="fc-foot-k">{fc.recentLabel}</span>
-            <span className="fc-foot-v">{fmt.pct0(fc.recent)}</span>
+            <span className="fc-foot-k">{perAccount ? 'Current quota' : fc.recentLabel}</span>
+            <span className="fc-foot-v">
+              {perAccount ? <ForecastPerAccountValue /> : fmt.pct0(fc.recent)}
+            </span>
           </div>
-          {fc.foot.map((line) => (
+          {/* `Confidence` describes one account's sample history, so it blanks
+              with the projection it qualifies. `Budget pace` is a SPEND axis —
+              the one thing D6 does let "All accounts" merge — and the server
+              already merges it, so it rides through unchanged. */}
+          {(perAccount ? fc.foot.filter((l) => l.label !== 'Confidence') : fc.foot).map((line) => (
             <div className="fc-foot-line" key={line.label}>
               <span className="fc-foot-k">{line.label}</span>
               <span className="fc-foot-v">{line.value}</span>

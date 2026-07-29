@@ -1,5 +1,5 @@
 import { useContext, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
@@ -63,7 +63,7 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
 // Codex = observed native reset-cycle summaries; All uses the same shared row
 // anatomy for both providers without treating independent reset axes as one.
 export function WeeklyPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const allRows = presentationPeriodRows(env, activeSource, 'weekly');
   const mode = useContext(BoardModeContext);

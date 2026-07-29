@@ -62,6 +62,7 @@ def test_doctor_state_has_required_fields():
         # #279 S2 F5: parse-health / deep quick_check / lock-state probes.
         "parse_health_claude", "parse_health_codex",
         "stats_db_quick_check", "cache_db_quick_check",
+        "conversations_db_quick_check",
         "locks_held",
         # #297: read-only cache.db WAL-size backstop.
         "cache_db_wal_bytes",
@@ -96,6 +97,9 @@ def test_doctor_state_has_required_fields():
         # #341 Task 3: multi-account health legs (accounts.identity/registry/
         # freshness/attribution) all read off this single gathered snapshot.
         "accounts_state",
+        # #416 review B4: durable record of a torn Codex auth.json halting
+        # ingest (accounts.codex_identity).
+        "codex_torn_deferred",
     }
     assert fields == expected, fields ^ expected
 
@@ -1582,7 +1586,8 @@ def test_parse_health_zero_counts_is_ok():
 
 def test_db_integrity_not_checked_is_ok():
     r = L._check_db_integrity(_state(stats_db_quick_check=None,
-                                     cache_db_quick_check=None))
+                                     cache_db_quick_check=None,
+                                     conversations_db_quick_check=None))
     assert r.severity == "ok"
     assert "not checked" in r.summary
 
@@ -1590,7 +1595,8 @@ def test_db_integrity_not_checked_is_ok():
 def test_db_integrity_stats_corrupt_is_fail_no_delete():
     r = L._check_db_integrity(_state(
         stats_db_quick_check="malformed database schema",
-        cache_db_quick_check="ok"))
+        cache_db_quick_check="database disk image is malformed",
+        conversations_db_quick_check="file is not a database"))
     assert r.severity == "fail"
     assert "backup" in r.remediation.lower() or "back up" in r.remediation.lower()
     assert "cctally db repair --db stats --yes" in r.remediation
@@ -1600,14 +1606,29 @@ def test_db_integrity_stats_corrupt_is_fail_no_delete():
 def test_db_integrity_cache_corrupt_stats_ok_is_warn():
     r = L._check_db_integrity(_state(
         stats_db_quick_check="ok",
-        cache_db_quick_check="database disk image is malformed"))
+        cache_db_quick_check="database disk image is malformed",
+        conversations_db_quick_check="ok"))
     assert r.severity == "warn"
     assert "cache-sync --rebuild" in r.remediation
 
 
+def test_db_integrity_conversations_corrupt_is_store_specific_warn():
+    r = L._check_db_integrity(_state(
+        stats_db_quick_check="ok",
+        cache_db_quick_check="ok",
+        conversations_db_quick_check="database disk image is malformed"))
+    assert r.severity == "warn"
+    assert "conversations.db" in r.summary
+    assert "cctally cache-sync --rebuild" in r.remediation
+    assert r.details["conversations_quick_check"] == (
+        "database disk image is malformed"
+    )
+
+
 def test_db_integrity_both_ok():
     r = L._check_db_integrity(_state(stats_db_quick_check="ok",
-                                     cache_db_quick_check="ok"))
+                                     cache_db_quick_check="ok",
+                                     conversations_db_quick_check="ok"))
     assert r.severity == "ok"
     assert "ok" in r.summary
 

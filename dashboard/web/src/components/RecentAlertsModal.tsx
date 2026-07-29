@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { Modal } from '../modals/Modal';
 import { getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { fmt } from '../lib/fmt';
 import {
   alertSeverity,
@@ -167,7 +167,8 @@ function CodexCostCell(): JSX.Element {
 }
 
 export function RecentAlertsModal(): JSX.Element {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
+  const scope = useAccountScope();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().openModalSource ?? getState().activeSource);
   const legacyAlerts = useSyncExternalStore(subscribeStore, () => getState().alerts);
   const hasBundle = env?.sources != null;
@@ -196,10 +197,15 @@ export function RecentAlertsModal(): JSX.Element {
   const codexThresholds = env?.sources?.codex?.data?.alerts.actual_thresholds?.length
     ? env.sources.codex.data.alerts.actual_thresholds
     : [90, 95];
+  // #416 QA sweep — see `RecentAlertsPanel`: `latest_percent` is the MAX across
+  // accounts, so under "All accounts" it is one account's number printed as the
+  // provider's. The gauge abstains rather than electing one.
   const usedPct = activeSource === 'claude'
     ? env?.header?.used_pct ?? null
     : activeSource === 'codex'
-      ? codexQuota?.latest_percent ?? null
+      ? (scope.scopesSupported && scope.accountKey == null
+        ? null
+        : codexQuota?.latest_percent ?? null)
       : null;
   const weeklyThresholds = activeSource === 'claude'
     ? claudeThresholds

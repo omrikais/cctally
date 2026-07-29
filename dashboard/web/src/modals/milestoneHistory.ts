@@ -46,14 +46,32 @@ export function stepWeek(
   return index[next].is_current ? null : index[next].key;
 }
 
+/**
+ * Fetch one cycle's milestone detail.
+ *
+ * `accountKey` (#416) is the `?account=` route qualifier. It MUST be the
+ * account whose `cycle_index` produced `entry.key` — a correctness requirement,
+ * not a filter, because a key minted from one account's index is not guaranteed
+ * to resolve against the merged enumeration. Pass `null` iff "All accounts" is
+ * selected; the server then answers with the shipped merged body. A mismatched
+ * or omitted-under-focus qualifier is a 404 `unknown cycle`, never a
+ * wrong-account body; `*`, blank, uppercase or malformed values are a 400, and
+ * the qualifier is rejected outright on `claude`.
+ *
+ * The cache key carries the account for the same reason: two accounts can hold
+ * distinct cycles and must never share a payload.
+ */
 export async function fetchWeekDetail(
   source: 'claude' | 'codex',
   entry: WeekIndexEntry,
+  accountKey: string | null = null,
 ): Promise<WeekDetailPayload> {
-  const ck = `${source}|${entry.key}|${entry.detail_stamp}`;
+  const account = source === 'codex' ? accountKey : null;
+  const ck = `${source}|${account ?? ''}|${entry.key}|${entry.detail_stamp}`;
   const hit = cache.get(ck);
   if (hit) return hit;
-  const res = await fetch(`/api/milestones/${source}/week/${encodeURIComponent(entry.key)}`);
+  const qs = account == null ? '' : `?account=${encodeURIComponent(account)}`;
+  const res = await fetch(`/api/milestones/${source}/week/${encodeURIComponent(entry.key)}${qs}`);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw Object.assign(new Error('week fetch failed'), {

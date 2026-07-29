@@ -22,10 +22,11 @@ run. Use `cache-sync` when you want to:
   pricing-dict edits where you want a clean re-derivation (note:
   pricing edits don't actually require a rebuild — cost is computed at
   query time, not stored).
-- Recover a corrupt `cache.db` without moving or unlinking SQLite files by
-  hand. Positively classified corruption is preserved for forensics, the whole
-  main/WAL/SHM family is quarantined after live readers drain, and the requested
-  source scope is re-ingested.
+- Recover a corrupt `cache.db` or `conversations.db` without moving or
+  unlinking SQLite files by hand. Positively confirmed corruption is preserved
+  for forensics, the complete main/WAL/SHM family is quarantined after live
+  readers drain, and the requested source scope is re-ingested. The default
+  `--source all` recovery rebuilds both transcript providers.
 - Prune cache rows left behind by session directories that were removed from disk (for example a deleted git worktree), without paying for a full rebuild — see `--prune-orphans` below.
 - Limit work to one source (Claude or Codex) when the other half is large.
 
@@ -33,7 +34,7 @@ run. Use `cache-sync` when you want to:
 
 | Flag | Description |
 | --- | --- |
-| `--rebuild` | Drop all cached entries and re-ingest from scratch. Waits up to 30s for each provider lock; each transcript-provider phase has a 30-minute no-progress ceiling and exits non-zero if incomplete (see Notes). |
+| `--rebuild` | Drop all cached entries and re-ingest from scratch. It first checks an existing transcript store and safely recovers confirmed corruption. Waits up to 30s for each provider lock; each transcript-provider phase has a 30-minute no-progress ceiling and exits non-zero if incomplete (see Notes). |
 | `--prune-orphans` | Remove cache rows for source files no longer on disk, without a full rebuild (Claude cache only). |
 | `--prune-conversations` | Prune conversation transcripts older than `conversation.retention_days` (default 90) right now, without a full rebuild. Reports the rows removed per provider. See `--prune-conversations` below. |
 | `--source {claude,codex,all}` | Which ingest half to sync/rebuild. Default `all`. |
@@ -97,14 +98,15 @@ cctally cache-sync --source claude
   (for example while a dashboard is actively syncing), instead of silently
   doing nothing and reporting success. Re-run it once the other process
   releases the lock. `--prune-orphans` behaves the same way for the cache lock.
-- Corrupt-file recovery is classifier-gated: lock contention, permissions,
-  disk-full errors, and SQL mistakes are never destructive recovery signals.
-  Recovery writes a forensics bundle with the precise trigger origin, then
-  quarantines the complete SQLite family only after the maintenance lock and
+- Corrupt-file recovery is classifier-gated for both derived stores: lock
+  contention, permissions, disk-full errors, and SQL mistakes are never
+  destructive recovery signals. Recovery writes a forensics bundle with the
+  precise trigger origin, then quarantines the complete SQLite family only
+  after the store maintenance lock, every relevant provider lock, and the
   open-handle drain checks pass **and** `integrity_check` confirms corruption.
   An `ok`, unavailable, or unwritable probe preserves the family and propagates
-  the original failure. Confirmed recovery recreates the cache and retries the
-  requested provider plan once. If
+  the original failure. Confirmed recovery recreates the affected store and
+  retries the requested provider plan once. If
   corruption occurs in the Codex leg of `--source all`, Claude is re-ingested
   again on the replacement family; a failed or contended provider walk remains
   non-zero.
@@ -115,8 +117,22 @@ cctally cache-sync --source claude
   If a repair is killed at any phase, the next opener or
   `cache-sync --rebuild` resumes from the surviving corrupt/quarantined/fresh
   state without manual marker deletion.
+- `conversations.db.repairing` uses the same process-start-qualified ownership,
+  while `conversations.db.recovery.json` durably records every transcript
+  provider that must be rebuilt after whole-family quarantine. A killed
+  recovery reclaims stale ownership and finishes the recorded provider set on
+  the next `cache-sync --rebuild`, even when that retry names only one source;
+  the recovery record clears only after all pending provider markers clear.
+  Public transcript readers, bounded title decoration, and Doctor decline the
+  store while that record exists, so an empty or one-provider intermediate
+  rebuild is never published as healthy.
+- Transcript integrity probes use a same-volume copy-on-write clone of the
+  locked main/WAL family, bounded to five seconds per member. They never fall
+  back to a full byte copy; when the filesystem lacks clone/reflink support,
+  recovery fails closed with the live family untouched. Stale private probe
+  directories from a killed owner are removed under the same exclusion locks.
 - Whole-family quarantine publishes
-  `cache.db.quarantine-pending.json` before its first rename. The next
+  `<store>.quarantine-pending.json` before its first rename. The next
   maintenance-exclusive opener completes the same incident after a killed
   owner or move failure; it does not create a fresh DB until every snapshotted
   main/WAL/SHM member is accounted for in quarantine.

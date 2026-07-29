@@ -1,15 +1,15 @@
 import { useSyncExternalStore } from 'react';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { fmt } from '../lib/fmt';
 import {
   alertDisplay,
   selectSourceAlertRows,
 } from '../lib/alertIdentity';
-import type { SourceAlertRow, SourceName } from '../types/envelope';
+import { VENDOR_WIDE_ACCOUNT, type SourceAlertRow } from '../types/envelope';
 import { resolveSourceView } from '../store/sourceView';
-import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
+import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
 import { PanelGrip } from './PanelGrip';
@@ -28,7 +28,7 @@ import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 // the legacy `state.alerts` (wrapped as Claude rows) so older servers and unit
 // tests keep working; Claude-mode rendering is value-identical either way.
 export function RecentAlertsPanel(): JSX.Element {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const legacyAlerts = useSyncExternalStore(subscribeStore, () => getState().alerts);
   const collapsed = useSyncExternalStore(
@@ -38,20 +38,19 @@ export function RecentAlertsPanel(): JSX.Element {
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
 
-  // #341 Task 4 (Decision R4) — the alerts panel currently shows ALL accounts'
-  // rows (per-account alert-wire decoration is a filed follow-up, not this
-  // slice). So when a source is decorated AND an account focus is active, we
-  // LABEL the panel "all accounts (unfiltered)" — the same honesty affordance
-  // the Sessions grid got — rather than silently showing every account's alerts
-  // next to a focused radiogroup. Absent with no focus, on All, and undecorated.
-  const accountFocusSlot = useSyncExternalStore(
-    subscribeStore,
-    () => (activeSource === 'all'
-      ? ALL_ACCOUNTS
-      : getState().accountFocus[activeSource as SourceName]),
-  );
-  const accountFocused = activeSource !== 'all'
-    && resolveAccountFocus(env ?? null, activeSource, accountFocusSlot ?? ALL_ACCOUNTS) != null;
+  // #416 Task 15 — alert rows now carry `account_key` and the panel reads the
+  // FOCUSED account's own rows through the scope chokepoint, so #341's
+  // "all accounts (unfiltered)" disclaimer is retired for Codex. Claude keeps
+  // it: it ships `accounts[]` but no `account_scopes`, so its chip really is
+  // unfiltered and dropping the badge there would be a false claim.
+  //
+  // Vendor-wide rows (`account_key === '*'`) arrive INSIDE the focused child by
+  // design: a vendor-wide budget crossing is not attributable to one account,
+  // so it stays visible and is LABELLED vendor-wide rather than hidden or
+  // silently credited to the focused account.
+  const scope = useAccountScope();
+  const accountScoped = scope.accountKey != null;
+  const accountUnfiltered = scope.requestedKey != null && !scope.scopesSupported;
   const claudeLegacyRows: SourceAlertRow[] = legacyAlerts.map((a) => ({
     ...a,
     source: 'claude' as const,
@@ -81,10 +80,20 @@ export function RecentAlertsPanel(): JSX.Element {
   const codexThresholds = env?.sources?.codex?.data?.alerts.actual_thresholds?.length
     ? env.sources.codex.data.alerts.actual_thresholds
     : [90, 95];
+  // #416 QA sweep — `quota.summary.latest_percent` is `max(...)` across every
+  // account's active window, and this gauge prints it as a big unlabelled "%".
+  // A max is still ONE account's number presented as the provider's, which is
+  // the same class as the forecast defect reached through an aggregate rather
+  // than an index — and the thresholds it is measured against fire per account.
+  // Under "All accounts" the gauge abstains (the canonical anatomy already
+  // renders an em dash with the fill at zero); focus a chip and the account's
+  // own percentage returns.
   const usedPct = activeSource === 'claude'
     ? env?.header?.used_pct ?? null
     : activeSource === 'codex'
-      ? codexQuota?.latest_percent ?? null
+      ? (scope.scopesSupported && scope.accountKey == null
+        ? null
+        : codexQuota?.latest_percent ?? null)
       : null;
   const gaugeThresholds = activeSource === 'claude'
     ? claudeThresholds
@@ -128,11 +137,20 @@ export function RecentAlertsPanel(): JSX.Element {
           <h2>
             Recent alerts <span className="sub">(last 10)</span>
           </h2>
-          {accountFocused && (
+          {accountScoped && (
+            <span
+              className="alerts-account-note"
+              data-testid="alerts-account-note"
+              title={`Showing only ${scope.card?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
+            >
+              {scope.card?.label ?? 'focused account'} only
+            </span>
+          )}
+          {accountUnfiltered && (
             <span
               className="alerts-unfiltered-note"
               data-testid="alerts-unfiltered-note"
-              title="Alerts are not filtered by account this release (showing all accounts)."
+              title="Claude alerts are not filtered by account (showing all accounts)."
             >
               all accounts (unfiltered)
             </span>
@@ -189,6 +207,16 @@ export function RecentAlertsPanel(): JSX.Element {
                   {activeSource === 'all' && (
                     <span className={`source-chip source-chip--${d.source}`}>
                       {d.sourceLabel}
+                    </span>
+                  )}
+                  {accountScoped
+                    && (row as { account_key?: string }).account_key === VENDOR_WIDE_ACCOUNT && (
+                    <span
+                      className="alert-vendor-wide"
+                      data-testid="alert-vendor-wide"
+                      title="A vendor-wide crossing — not attributable to one account."
+                    >
+                      vendor-wide
                     </span>
                   )}
                   <span className="alert-when">

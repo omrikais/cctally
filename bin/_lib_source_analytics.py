@@ -66,6 +66,19 @@ class QualifiedCodexEntry:
     # source-analytics renderers never expose either raw identity.
     session_id: str = ""
     source_path: str = ""
+    # #416 spec §5.2 (review F9): the ingest-stamped account, carried so the
+    # dashboard can partition ALREADY-LOADED rows by account instead of running
+    # a second query shape per account.
+    #
+    # CARRIED, never grouped. It is a trailing defaulted field and it is
+    # deliberately absent from `project_key`, from the `(root, project)` project
+    # grouping, from the `(source_root_key, source_path)` session grouping, and
+    # from every aggregator key — the merged parent stays byte-identical BY
+    # CONSTRUCTION rather than by careful re-derivation. Adding it to a grouping
+    # key would silently split every merged bucket a file that switches accounts
+    # contributes to. The default is the reserved `unattributed` sentinel, so
+    # every existing constructor (and the whole CLI path) is unchanged.
+    account_key: str = "unattributed"
 
 
 def emitted_project_label(entry: QualifiedCodexEntry) -> str:

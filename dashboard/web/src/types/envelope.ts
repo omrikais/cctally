@@ -923,6 +923,12 @@ export interface CodexQuotaHistoryRow {
   source: 'codex';
   /** Present only on windows outside account-level standard quota (#373). */
   model_scoped?: true;
+  /**
+   * #416 — the owning account, snake_case to match its `quota.blocks` sibling.
+   * Emitted only under decoration (>1 REAL account), so consumers must treat it
+   * as omitted-when-not-applicable rather than assuming it is present.
+   */
+  account_key?: string;
   label: string;
   observed_slot: number;
   window_minutes: number | null;
@@ -933,6 +939,12 @@ export interface CodexQuotaHistoryRow {
   forecast: CodexQuotaForecast;
 }
 
+// A quota milestone row arrives from TWO producers. The canonical durable
+// projection carries the six token/percent fields below; the observation-derived
+// FALLBACK row carries only `key`/`source`/`block_key`/`quota_key`/
+// `window_minutes`/`resets_at`/`percent`/`captured_at`/`cumulative_usd`/
+// `marginal_usd`. Every one of the six is therefore optional — never assume
+// `total_tokens` or `five_hour_percent` exists.
 export interface CodexQuotaMilestoneRow {
   key: string;
   source: 'codex';
@@ -957,6 +969,8 @@ export interface CodexQuotaMilestoneRow {
 export interface CodexQuotaBlockRow {
   key: string;
   source: 'codex';
+  /** #416 — the owning account; decoration-only, so treat as optional. */
+  account_key?: string;
   label: string;
   window_minutes: number;
   start_at: string;
@@ -1014,6 +1028,8 @@ export interface CodexBudgetMilestoneRow {
   budget_usd: number;
   spent_usd: number;
   consumption_pct: number;
+  /** #416 — owning account, or the vendor-wide `*` sentinel. Decoration-only. */
+  account_key?: string;
 }
 
 export interface CodexProjectedBudgetRow {
@@ -1023,6 +1039,8 @@ export interface CodexProjectedBudgetRow {
   denominator: number;
   crossed_at: string | null;
   alerted_at: string | null;
+  /** #416 — owning account, or the vendor-wide `*` sentinel. Decoration-only. */
+  account_key?: string;
 }
 
 export interface CodexBudgetDomain {
@@ -1174,6 +1192,13 @@ export interface CodexProjectsDomain {
 // Codex source-owned alert rows (_alerts_wire) — a discriminated union on
 // `axis`. The heterogeneous toast-pipeline `SourceAlertRow` union that spans
 // Claude+Codex lands in Stage 2 (§6.7); these are the Codex `data.alerts.rows`.
+// #416 — every Codex alert row gains `account_key` UNDER DECORATION only, and
+// the reserved `*` value means VENDOR-WIDE (a crossing not attributable to one
+// account). A vendor-wide row stays visible under account focus and must be
+// LABELLED as vendor-wide — never hidden, never attributed to the focused
+// account. Undecorated installs omit the field entirely.
+export const VENDOR_WIDE_ACCOUNT = '*';
+
 export interface CodexBudgetAlertRow {
   key: string;
   source: 'codex';
@@ -1182,6 +1207,7 @@ export interface CodexBudgetAlertRow {
   threshold: number;
   value: number;
   created_at: string;
+  account_key?: string;
 }
 export interface CodexProjectedAlertRow {
   key: string;
@@ -1191,6 +1217,7 @@ export interface CodexProjectedAlertRow {
   threshold: number;
   value: number;
   created_at: string;
+  account_key?: string;
 }
 export interface CodexQuotaAlertRow {
   key: string;
@@ -1199,11 +1226,41 @@ export interface CodexQuotaAlertRow {
   threshold: number;
   severity: string;
   created_at: string;
+  account_key?: string;
 }
 export type CodexAlertRow =
   | CodexBudgetAlertRow
   | CodexProjectedAlertRow
   | CodexQuotaAlertRow;
+
+export interface CodexAlertsDomain {
+  rows: CodexAlertRow[];
+  actual_thresholds?: number[];
+  projected_thresholds?: number[];
+}
+
+// #416 §5.3 — ONE per-account child of the merged Codex read model. It mirrors
+// the parent's own key shape exactly, so the client selector can hand back a
+// structurally identical object for "All accounts" (the parent) and for a
+// focused account (its child) without reconstructing anything.
+//
+// snake_case throughout, including `is_empty` — unlike the camelCase
+// `accounts[]` cards and the mixed `hero.cycles[]`. That mix is deliberate and
+// matches the shipped #341 surfaces; do not "normalise" it.
+//
+// `is_empty` is the explicit empty state: an account with neither accounting
+// rows nor quota evidence. It renders blank, NEVER the previous account's
+// numbers — the literal symptom this epic exists to fix.
+export interface CodexAccountScope {
+  is_empty: boolean;
+  periods: CodexPeriodsDomain;
+  sessions: CodexSessionsDomain;
+  projects: CodexProjectsDomain;
+  cache_report?: CacheReportEnvelope | null;
+  budget: CodexBudgetDomain;
+  quota: CodexQuotaDomain;
+  alerts: CodexAlertsDomain;
+}
 
 export interface CodexSourceData {
   hero: CodexHero;
@@ -1212,15 +1269,23 @@ export interface CodexSourceData {
   quota: CodexQuotaDomain;
   budget: CodexBudgetDomain;
   projects: CodexProjectsDomain;
-  alerts: {
-    rows: CodexAlertRow[];
-    actual_thresholds?: number[];
-    projected_thresholds?: number[];
-  };
+  alerts: CodexAlertsDomain;
   cache_report?: CacheReportEnvelope | null;
   // #341 Task 4 — conditional (R8): one card per account (real + the
   // unattributed bucket when non-empty). Absent for a <=1-real-account source.
   accounts?: AccountCard[];
+  // #416 §5.3 — the per-account CHILDREN, `{account_key: child}`. Present ONLY
+  // under decoration (>1 REAL account): at <=1 real account the key is ABSENT,
+  // not empty, so consumers must branch on PRESENCE.
+  //
+  // Two asymmetries the client must respect:
+  //   * The map may hold keys with NO `accounts[]` card — data-only residuals
+  //     from registry drift. They are NOT chip-selectable: iterate `accounts[]`
+  //     for chips, this map for lookup.
+  //   * Every `accounts[]` card key DOES resolve to a scope (an evidence-less
+  //     account gets `is_empty: true`, never a missing key), so a missing child
+  //     is drift — and must never fall back to the parent.
+  account_scopes?: Record<string, CodexAccountScope>;
 }
 
 // ---- Claude provider projection (_tui_project_claude_source_data) -----

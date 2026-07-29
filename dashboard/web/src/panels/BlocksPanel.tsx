@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
@@ -26,11 +26,13 @@ function Row({
   maxCost,
   isFirstMount,
   showSource,
+  accountLabel,
 }: {
   r: BlockPresentationRow;
   maxCost: number;
   isFirstMount: boolean;
   showSource: boolean;
+  accountLabel: string | null;
 }) {
   const fillPct = maxCost > 0 ? (r.value / maxCost) * 100 : 0;
   const open = () => openBlockDetail(r);
@@ -39,7 +41,11 @@ function Row({
       className="blocks-row"
       role="button"
       tabIndex={0}
-      aria-label={`Open detail for block starting ${r.label}`}
+      aria-label={
+        accountLabel == null
+          ? `Open detail for block starting ${r.label}`
+          : `Open detail for ${accountLabel} block starting ${r.label}`
+      }
       onClick={open}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -52,6 +58,19 @@ function Row({
         <span className="label">
           {showSource && (
             <span className={`source-chip source-chip--${r.source}`}>{r.source === 'claude' ? 'Claude' : 'Codex'}</span>
+          )}
+          {/* #416 QA P1-A — the merged list now carries every account's
+              windows, so two otherwise identical rows can belong to different
+              accounts. Under focus (or below two real accounts) there is
+              exactly one owner and no chip is rendered. */}
+          {accountLabel != null && (
+            <span
+              className="blocks-account-chip"
+              data-testid="block-account-chip"
+              title={`5-hour window owned by ${accountLabel}`}
+            >
+              {accountLabel}
+            </span>
           )}
           {r.anchor === 'heuristic' && (
             <span className="anchor-marker" aria-label="approximate start">~</span>
@@ -86,7 +105,7 @@ function Row({
 // #294 S5 — source-aware wrapper. Both providers render real 5h activity
 // blocks; Codex boundaries come from its durable native 300-minute windows.
 export function BlocksPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const collapsed = useSyncExternalStore(
     subscribeStore,
@@ -106,6 +125,19 @@ export function BlocksPanel() {
   const codexHasFiveHourWindow = codex?.quota.histories.some(
     (row) => row.window_minutes === 300 && !row.model_scoped,
   ) ?? false;
+  // #416 QA P1-A — key -> label for the merged Codex rows. Built only when the
+  // provider is decorated AND no chip is focused; a focused view has exactly
+  // one owner and an undecorated envelope ships no `accounts[]` at all, so both
+  // keep today's unlabelled rows (R8).
+  const scope = useAccountScope();
+  const codexAccountLabels = scope.scopesSupported && scope.accountKey == null
+    ? new Map((codex?.accounts ?? []).map((card) => [card.accountKey, card.label]))
+    : null;
+  const accountLabelFor = (row: BlockPresentationRow): string | null => (
+    row.source === 'codex' && row.accountKey != null && codexAccountLabels != null
+      ? codexAccountLabels.get(row.accountKey) ?? null
+      : null
+  );
   const blocksScope = activeSource === 'codex'
     ? `${codexHasFiveHourWindow ? '5h' : 'optional 5h'} · current cycle`
     : activeSource === 'all'
@@ -211,6 +243,7 @@ export function BlocksPanel() {
               maxCost={maxCost}
               isFirstMount={!seenStarts.current.has(r.start_at)}
               showSource={activeSource === 'all'}
+              accountLabel={accountLabelFor(r)}
             />
           ))
         )}

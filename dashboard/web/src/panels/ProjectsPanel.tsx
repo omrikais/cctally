@@ -11,7 +11,7 @@
 // is zero so attribution is undefined; mirrors the kernel's null
 // emission.
 import { useSyncExternalStore, type CSSProperties, type MouseEvent } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
@@ -30,7 +30,7 @@ const TOP_N = 5;
 // Codex = native qualified-attribution table; All = provider sections
 // (identical labels across providers stay distinct rows — different keys).
 export function ProjectsPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const projectedRows = presentationProjects(env, activeSource);
   const rows = projectedRows ?? [];

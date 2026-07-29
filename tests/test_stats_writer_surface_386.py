@@ -129,6 +129,7 @@ FROZEN_WRITE_SITES = {
         "journal_effective_events": 4,
         "journal_protocol_violations": 2,
         "quota_alert_arming": 2,
+        "quota_threshold_events": 1,
         "weekly_credit_floors": 1,
     },
     "_cctally_milestones.py": {
@@ -142,7 +143,7 @@ FROZEN_WRITE_SITES = {
         "quota_alert_arming": 2,
         "quota_percent_milestones": 2,
         "quota_projection_state": 1,
-        "quota_threshold_events": 2,
+        "quota_threshold_events": 3,
         "quota_window_blocks": 2,
     },
     "_cctally_record.py": {

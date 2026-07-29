@@ -436,9 +436,28 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   line-height: 0.9;
   color: var(--text);
 }
+/* #416 QA P3-C — the deliberate "All accounts" blank. Same glyph, dimmed, so
+   it reads as an intentional absence rather than an unfinished load. */
+.hu-num.is-blank { color: var(--text-dim); }
 .hu-num--sm { font-size: var(--fs-kpi); color: var(--accent-cyan); }
 .hu-reset { flex-basis: 100%; font-size: var(--fs-meta); color: var(--text-dim); }
 .hu-reset span { color: var(--text); font-weight: 600; }
+/* #416 D6 — "All accounts" merges only spend and tokens. Under All accounts
+   the headline percent + reset are deliberately blank and this points at the
+   per-account cards; independent quota percentages are never blended into one
+   number. */
+.hu-reset--per-account span { font-style: italic; font-weight: 600; }
+/* #416 QA P2-D — the same pointer in the OTHER deliberately-blank slots
+   (`Forecast @ reset`, `$/1% vs last week`, `$/1% used`), which previously
+   rendered a bare em-dash and read as missing data. Dimmed + italic so it
+   recedes into a caption inside slots whose base style is a bright value —
+   the reset slot's own span stays bright because its surrounding label is
+   already dim. */
+.hero-per-account-value {
+  font-style: italic;
+  font-weight: 600;
+  color: var(--text-dim);
+}
 
 /* spent zone — SPENT THIS WEEK whole-$ hero + $/1% sub. */
 .hero-spent { display: flex; flex-direction: column; justify-content: center; }
@@ -1218,6 +1237,10 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 /* OK is calm — the hero number stays neutral; only WARN/OVER tint it. */
 .fc-num.is-warn { color: var(--accent-amber); }
 .fc-num.is-over { color: var(--accent-red); }
+/* #416 QA P0 — the deliberate "All accounts" blank. A KPI-weight `per account`
+   caption would read as a value; drop it to the hero-blank size so the slot is
+   legibly EMPTY rather than quietly asserting something. */
+.fc-num.is-blank { font-size: var(--fs-body); font-weight: 600; }
 
 .fc-verdict-chip {
   display: inline-flex; align-items: center; gap: 4px;
@@ -1378,16 +1401,45 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-size: var(--fs-body); color: var(--text-dim); white-space: nowrap;
 }
 
-/* #341 Task 4 (Decision R4) — sessions + recent-alerts are labeled unfiltered
-   (never filtered) when an account focus is active, since conversations are out
-   of the account dimension this release and per-account alert-wire decoration is
-   a follow-up. A muted, non-interactive caption chip. */
+/* #341 Task 4 (Decision R4) → #416 Task 15. The "unfiltered" caption survives
+   only where a focus genuinely CANNOT be applied — Claude, which ships account
+   cards but no per-account children. Codex now scopes for real and gets the
+   `*-account-note` variant instead, which NAMES the account whose rows are on
+   screen. Both are muted, non-interactive caption chips; the scoped one takes
+   the account accent so "filtered" reads differently from "caveat". */
 .sessions-unfiltered-note,
-.alerts-unfiltered-note {
+.alerts-unfiltered-note,
+.sessions-account-note,
+.alerts-account-note {
   display: inline-flex; align-items: center;
   font-size: var(--fs-caption, var(--fs-body)); color: var(--text-dim);
   white-space: nowrap; padding: 1px 8px; border-radius: var(--radius-pill);
   border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+}
+.sessions-account-note,
+.alerts-account-note {
+  color: var(--text);
+  border-color: var(--accent-blue);
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+}
+
+/* #416 §5.4 — a vendor-wide crossing stays visible under account focus and is
+   labelled as such. It is deliberately NOT a severity chip: the severity glyph
+   beside it already carries the 3-tier vocabulary, and this only says the row
+   is not attributable to the focused account. */
+.alert-vendor-wide {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xs);
+  padding: 0 5px;
+  white-space: nowrap;
 }
 
 /* S3 (#264) — Session (title) + Cache columns. The Session cell is ALWAYS
@@ -3282,6 +3334,16 @@ mark.current {
 .blocks-row .label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text); font-weight: 600; }
 .blocks-row .label > .source-chip { flex: none; }
 .blocks-row .label .anchor-marker { color: var(--text-dim); margin-right: 2px; font-weight: 400; }
+/* #416 QA P1-A — owning-account chip on a merged Codex row. Quieter than the
+   provider chip beside it (that names WHICH board you are on; this qualifies
+   one row), and it never truncates the timestamp it precedes. */
+.blocks-row .label .blocks-account-chip {
+  flex: none; max-width: 12ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft); background: var(--panel-bg-2);
+  color: var(--text-dim); font-size: var(--fs-eyebrow); font-weight: 600;
+}
 .blocks-row .cost { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .blocks-row .gauge-track {
@@ -6933,6 +6995,30 @@ mark.current {
 .account-hero-card-spend { font-family: var(--font-mono); font-weight: 700; color: var(--text); }
 .account-hero-card-reset,
 .account-hero-card-note { font-size: 11px; color: var(--text-dim); }
+
+/* #416 QA — the combined tab renders this strip for CODEX, so it names its
+   provider there (a provider tab is its own label). Same caption treatment as
+   `.account-hero-empty` below and full-width so it heads the wrapping row;
+   upright rather than italic because it labels the row instead of commenting on
+   it. Applied only on the combined tab, so the Codex tab's strip is unmoved. */
+.account-hero-caption {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+}
+
+/* #416 §6 — the explicit empty state. Its own full-width line under the focused
+   card, so the blank bars above are EXPLAINED rather than read as a broken
+   render. Muted, non-interactive; `role="status"` carries it to assistive tech
+   since the visible signal is otherwise only an absence. */
+.account-hero-empty {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+  font-style: italic;
+}
 
 /* Active-source status chip (§6.8) — distinct from the global SyncChip. Reuses
    the existing chip severity vocabulary rather than inventing new primitives. */

@@ -28,7 +28,7 @@ import { ProjectsDrillPanel } from './ProjectsDrillPanel';
 import { ShareIcon } from '../components/ShareIcon';
 import { SortableHeader } from '../components/SortableHeader';
 import { KeyHintFooter } from '../components/KeyHintFooter';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
@@ -65,7 +65,8 @@ type WindowPill = 1 | 4 | 8 | 12;
 const WINDOW_PILLS: readonly WindowPill[] = [1, 4, 8, 12];
 
 function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
-  const env = useSnapshot();
+  // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
+  const env = useScopedSnapshot(source);
   const isClaude = source === 'claude';
   const sourceRows = useMemo(
     () => (isClaude ? null : presentationProjects(env, source)),

@@ -1,5 +1,5 @@
 import { useCallback, useState, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useIsMobile } from '../hooks/useIsMobile';
 import {
@@ -25,8 +25,8 @@ import { collectSourceSessionRows, type SessionDisplayRow } from '../lib/sourceR
 import { costClass } from '../lib/cost';
 import { transcriptsEnabled } from '../lib/transcripts';
 import { SourceChip, DegradedChip } from './sourcePanel';
-import type { DashboardSelection, SourceName } from '../types/envelope';
-import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
+import type { DashboardSelection } from '../types/envelope';
+import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { openShareModal } from '../store/shareSlice';
 import { legacyClaudeConversationRef } from '../types/conversation';
 
@@ -47,7 +47,7 @@ export function SourceSessionsGrid() {
     subscribeStore,
     () => getState().activeSource,
   ) as DashboardSelection;
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // Re-render on the slices that feed getRenderedSourceRows so the painted rows
@@ -62,17 +62,17 @@ export function SourceSessionsGrid() {
   const searchText = useSyncExternalStore(subscribeStore, () => getState().searchText);
   const collapsed = useSyncExternalStore(subscribeStore, () => getState().prefs.sessionsCollapsed);
 
-  // #341 Task 4 (Decision R4) — sessions are OUT of the account dimension this
-  // epic: they are labeled unfiltered when an account focus is active, never
-  // filtered. Compute whether the active source has a focus so the label shows.
-  const accountFocusSlot = useSyncExternalStore(
-    subscribeStore,
-    () => (activeSource === 'all'
-      ? ALL_ACCOUNTS
-      : getState().accountFocus[activeSource as SourceName]),
-  );
-  const accountFocused = activeSource !== 'all'
-    && resolveAccountFocus(env, activeSource, accountFocusSlot ?? ALL_ACCOUNTS) != null;
+  // #416 Task 15 — sessions now genuinely re-scope: the grid reads the FOCUSED
+  // account's own rows through the scope chokepoint (`useScopedSnapshot`), so
+  // #341's `sessions-unfiltered-note` disclaimer is retired for Codex and
+  // replaced by a label naming the account whose rows are painted.
+  //
+  // Claude keeps the disclaimer. It ships `accounts[]` (the chip row) but no
+  // `account_scopes`, so a Claude focus really is unfiltered — dropping the
+  // badge there would turn an honest caveat into a false claim.
+  const scope = useAccountScope();
+  const accountScoped = scope.accountKey != null;
+  const accountUnfiltered = scope.requestedKey != null && !scope.scopesSupported;
 
   const isMobile = useIsMobile();
   const isAll = activeSource === 'all';
@@ -200,11 +200,20 @@ export function SourceSessionsGrid() {
             </span>
           )}
           {gate.mode === 'degraded' && <DegradedChip gate={gate} />}
-          {accountFocused && (
+          {accountScoped && (
+            <span
+              className="sessions-account-note"
+              data-testid="sessions-account-note"
+              title={`Showing only ${scope.card?.label ?? 'this account'}'s sessions.`}
+            >
+              {scope.card?.label ?? 'focused account'} only
+            </span>
+          )}
+          {accountUnfiltered && (
             <span
               className="sessions-unfiltered-note"
               data-testid="sessions-unfiltered-note"
-              title="Sessions are not filtered by account this release (conversations are account-agnostic)."
+              title="Claude sessions are not filtered by account (conversations are account-agnostic)."
             >
               all accounts (unfiltered)
             </span>

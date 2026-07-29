@@ -207,6 +207,7 @@
                 {
                     "details": {
                         "cache_quick_check": null,
+                        "conversations_quick_check": null,
                         "stats_quick_check": "ok"
                     },
                     "id": "db.integrity",
@@ -218,7 +219,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 30,
+                            "registry_size": 32,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -269,7 +270,9 @@
                                     "027_codex_fork_preamble_rebuild",
                                     "028_split_conversation_store",
                                     "029_backfill_claude_account",
-                                    "030_session_entries_cache_creation_split"
+                                    "030_session_entries_cache_creation_split",
+                                    "031_codex_file_account_map",
+                                    "032_codex_canonical_reset_anchor"
                                 ],
                                 "skipped": []
                             },
@@ -297,7 +300,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/43 applied",
+                    "summary": "0/45 applied",
                     "title": "Migrations"
                 },
                 {
@@ -474,13 +477,21 @@
                             [
                                 "cache.db",
                                 "030_session_entries_cache_creation_split"
+                            ],
+                            [
+                                "cache.db",
+                                "031_codex_file_account_map"
+                            ],
+                            [
+                                "cache.db",
+                                "032_codex_canonical_reset_anchor"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "43 pending",
+                    "summary": "45 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -744,6 +755,16 @@
                 },
                 {
                     "details": {
+                        "at": null,
+                        "files": 0
+                    },
+                    "id": "accounts.codex_identity",
+                    "severity": "ok",
+                    "summary": "no deferred Codex ingest",
+                    "title": "Codex account identity"
+                },
+                {
+                    "details": {
                         "by_provider": {},
                         "missing_provider": 0,
                         "real_account_count": 0
@@ -880,7 +901,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 46,
+            "ok": 47,
             "warn": 6
         },
         "severity": "warn"

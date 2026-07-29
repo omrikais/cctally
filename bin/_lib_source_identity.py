@@ -25,6 +25,30 @@ def source_root_key(canonical_root: str) -> str:
     return digest.hexdigest()[:32]
 
 
+def codex_file_key(root_key: str, canonical_physical_path: str) -> str:
+    """Return the durable identity of one Codex rollout file (#416 spec §3.2).
+
+    Keyed on ``(source_root_key, canonical physical path)`` — deliberately NOT
+    on the configured walk spelling, because Codex discovery deduplicates on the
+    canonical physical path but persists the FIRST configured candidate
+    spelling, so reordering ``$CODEX_HOME`` roots or respelling a symlink makes
+    the same physical file miss a path-keyed map.
+
+    Scoping by ``root_key`` is what makes a root requalification safe for free:
+    the same physical file reached under a different provider root is a
+    different identity, so it carries no prior attribution decision and takes a
+    fresh one. Non-reversible and fixed-width like ``source_root_key``, so the
+    durable key never embeds an operator path.
+    """
+    root = _required_string(root_key, "root_key")
+    path = _required_string(canonical_physical_path, "canonical_physical_path")
+    digest = hashlib.sha256(
+        b"cctally-codex-file-v1\0" + root.encode("utf-8")
+        + b"\0" + path.encode("utf-8")
+    )
+    return digest.hexdigest()[:32]
+
+
 def canonical_identity(
     source: str,
     resource_kind: str,

@@ -754,6 +754,7 @@ def _corruption_trigger_record(
 def write_corruption_forensics(
     db_path,
     *,
+    probe_db_path: "pathlib.Path | None" = None,
     db_label: str = "stats",
     trigger_origin: "str | None" = None,
     trigger_exception: "BaseException | None" = None,
@@ -769,13 +770,21 @@ def write_corruption_forensics(
     heal/rebuild callers. Cache recovery opts into the typed result: only a
     persisted bundle plus either a non-``ok`` integrity row or a positively
     classified corruption failure during the probe confirms destructive
-    quarantine. Probe/write unavailability is always unconfirmed.
+    quarantine. ``probe_db_path`` lets a caller run integrity against an
+    isolated family snapshot while the bundle still identifies the live
+    ``db_path``. Probe/write unavailability is always unconfirmed. Confirmed
+    bundles are atomically replaced and fsynced before this function returns.
     """
     if (trigger_origin is None) != (trigger_exception is None):
         raise ValueError(
             "trigger_origin and trigger_exception must be supplied together"
         )
     db_path = pathlib.Path(db_path)
+    probe_db_path = (
+        pathlib.Path(probe_db_path)
+        if probe_db_path is not None
+        else db_path
+    )
     ts = _db_backup_timestamp()
     try:
         _cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -808,7 +817,7 @@ def write_corruption_forensics(
         except OSError:
             bundle["family"][p.name] = None
     try:
-        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        c = sqlite3.connect(f"file:{probe_db_path}?mode=ro", uri=True)
         try:
             c.execute("PRAGMA busy_timeout=2000")
             bundle["integrityCheck"] = [
@@ -860,11 +869,7 @@ def write_corruption_forensics(
     except Exception as exc:
         bundle["holders"] = [f"error: {exc}"]
     try:
-        out.write_text(json.dumps(bundle, indent=2, sort_keys=True))
-        try:
-            os.chmod(out, 0o600)
-        except OSError:
-            pass
+        _atomic_write_private_json(out, bundle)
     except OSError:
         result = CorruptionForensicsResult(
             path=None,
@@ -3328,6 +3333,43 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             last_seen_utc        TEXT NOT NULL
         );
 
+        -- #416 spec §3.2/§3.3: the durable Codex attribution map. Two tables,
+        -- one concept. `codex_file_incarnations` is the per-file incarnation
+        -- counter (bumped when a truncation resets the file to offset zero, so
+        -- reused offsets can never be covered by the previous incarnation's
+        -- intervals); `codex_file_accounts` holds the decisions themselves, one
+        -- row per (identity, incarnation, byte range).
+        --
+        -- `account_key` is NULLABLE on purpose: NULL is the stably-absent
+        -- SENTINEL DECISION (no auth / api-key mode), matching the
+        -- `NULL ≡ unattributed` cache-read rule used by every other family. The
+        -- literal string "unattributed" is never stored. A torn auth read
+        -- records NO ROW AT ALL — "undecided" and "decided: no account" are
+        -- distinct states and readers must not collapse them.
+        --
+        -- Both live in the UNCONDITIONAL executescript, BEFORE the FTS5
+        -- `legacy_present` early-return below, because they are plain tables
+        -- with no FTS-shape dependency and the ingest path needs them on every
+        -- open (the `_apply_cache_schema_legacy_early_return_before_new_table`
+        -- class). Cache migration 031 exists only to bump the registry head so
+        -- an existing install re-runs this schema apply.
+        CREATE TABLE IF NOT EXISTS codex_file_incarnations (
+            file_identity  TEXT    NOT NULL PRIMARY KEY,
+            incarnation    INTEGER NOT NULL,
+            updated_at_utc TEXT
+        );
+        CREATE TABLE IF NOT EXISTS codex_file_accounts (
+            file_identity  TEXT    NOT NULL,
+            incarnation    INTEGER NOT NULL,
+            from_offset    INTEGER NOT NULL,
+            root_scope     TEXT    NOT NULL,
+            account_key    TEXT,
+            decided_at_utc TEXT    NOT NULL,
+            PRIMARY KEY (file_identity, incarnation, from_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_file_accounts_root
+            ON codex_file_accounts(root_scope);
+
         CREATE TABLE IF NOT EXISTS codex_conversation_threads (
             conversation_key     TEXT NOT NULL PRIMARY KEY,
             source_root_key      TEXT NOT NULL,
@@ -3641,6 +3683,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # backfills it from the still-present legacy event corpus before dropping
     # that corpus.
     add_column_if_missing(conn, "quota_window_snapshots", "observed_model", "TEXT")
+    # #416 spec §4.1/§4.2: the tolerance-anchored canonical reset, resolved at
+    # INGEST over the complete population and stored beside the raw value (which
+    # is retained unchanged as evidence). NULL means "not yet resolved" and every
+    # reader falls back to the raw reset, i.e. exactly today's behaviour — so an
+    # old binary reading a new cache, or a row written before migration 032's
+    # backfill, degrades rather than breaking. Migration 032 arms the one-time
+    # backfill over existing history.
+    add_column_if_missing(
+        conn, "quota_window_snapshots", "canonical_resets_at_utc", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -3795,6 +3846,11 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS quota_window_snapshots;
         DROP TABLE IF EXISTS codex_conversation_threads;
         DROP TABLE IF EXISTS codex_source_roots;
+        -- #416: the Codex attribution map is a cache.db accounting concern; it
+        -- rides in via _apply_cache_schema above and is dropped here with the
+        -- rest of the accounting families so conversations.db stays transcripts-only.
+        DROP TABLE IF EXISTS codex_file_accounts;
+        DROP TABLE IF EXISTS codex_file_incarnations;
 
         CREATE TABLE IF NOT EXISTS conversation_source_files (
             path             TEXT PRIMARY KEY,
@@ -5850,6 +5906,116 @@ def _030_session_entries_cache_creation_split(conn: sqlite3.Connection) -> None:
         "SET size_bytes = CASE WHEN size_bytes > 0 THEN -1 ELSE size_bytes END, "
         "    last_byte_offset = 0"
     )
+    conn.commit()
+
+
+@cache_migration("031_codex_file_account_map")
+def _031_codex_file_account_map(conn: sqlite3.Connection) -> None:
+    """#416 spec §3.2/§3.3: land the durable Codex attribution map on an
+    existing install.
+
+    The two tables (``codex_file_incarnations``, ``codex_file_accounts``) are
+    created by ``_apply_cache_schema`` in its UNCONDITIONAL executescript — the
+    repo's table-addition rule, and specifically BEFORE the FTS5
+    ``legacy_present`` early-return so a legacy-shape cache still receives them.
+    This migration exists because that schema apply is VERSION-GATED: a
+    steady-state open compares ``PRAGMA user_version`` against
+    ``len(_CACHE_MIGRATIONS)`` and skips the whole DDL pass when they match
+    (``_cctally_store.schema_current``). Registering here bumps the head, so an
+    already-current install re-runs the schema apply and gains the tables. Same
+    mechanism migration 029 relies on, stated there in the same words.
+
+    There is deliberately NO BACKFILL (spec D1: history that was never durably
+    stamped becomes ``unattributed``; nothing is inferred — heuristic backfill
+    cannot distinguish two accounts that share an email). The map starts empty
+    and fills forward from ingest decisions plus journal replay.
+
+    The idempotent DDL below is a defensive re-assert, not the primary creation
+    path: it keeps the handler self-contained if ``_apply_cache_schema``'s
+    ordering ever drifts, and it is what the per-migration golden exercises
+    (the golden's ``pre.sqlite`` is a genuine 030-head install that predates
+    both tables). Re-running is a no-op. NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS codex_file_incarnations (
+            file_identity  TEXT    NOT NULL PRIMARY KEY,
+            incarnation    INTEGER NOT NULL,
+            updated_at_utc TEXT
+        );
+        CREATE TABLE IF NOT EXISTS codex_file_accounts (
+            file_identity  TEXT    NOT NULL,
+            incarnation    INTEGER NOT NULL,
+            from_offset    INTEGER NOT NULL,
+            root_scope     TEXT    NOT NULL,
+            account_key    TEXT,
+            decided_at_utc TEXT    NOT NULL,
+            PRIMARY KEY (file_identity, incarnation, from_offset)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_file_accounts_root
+            ON codex_file_accounts(root_scope);
+        """
+    )
+    conn.commit()
+
+
+@cache_migration("032_codex_canonical_reset_anchor")
+def _032_codex_canonical_reset_anchor(conn: sqlite3.Connection) -> None:
+    """#416 spec §4.1/§4.2: backfill the tolerance-anchored canonical reset onto
+    existing Codex quota history.
+
+    ``canonical_resets_at_utc`` itself is a plain column addition, so it lands
+    through ``add_column_if_missing`` in ``_apply_cache_schema`` (the idempotent
+    guard pattern — no marker, no version). This migration exists for the
+    BACKFILL, which is a data-shape change and therefore does go through the
+    framework, and it bumps the registry head so a steady-state install re-runs
+    the version-gated schema apply and actually gains the column (the same
+    mechanism 029 and 031 rely on).
+
+    Ordering is ``(source_path, line_offset)`` — the order the rollout walk
+    itself visits bytes in — so the anchors this backfill establishes are the
+    same ones a later ``cache-sync --rebuild`` re-derives, rather than a
+    different-but-also-deterministic set.
+
+    Idempotent by construction: only rows whose anchor is still NULL are
+    considered, and rows already carrying an anchor SEED the resolver, so a
+    re-run cannot move an established anchor.
+    """
+    import _cctally_cache as cache_mod
+
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if "canonical_resets_at_utc" not in cols:
+        # An older schema apply did not reach the column add (a legacy-shape
+        # cache whose FTS early-return fires first). Nothing to backfill; the
+        # readers' raw-reset fallback keeps behaviour identical.
+        return
+    resolver = cache_mod.CodexResetAnchorResolver(conn)
+    updates: list[tuple[str, int]] = []
+    for row in conn.execute(
+        "SELECT id, source_root_key, observed_slot, logical_limit_key, "
+        "       window_minutes, resets_at_utc "
+        "  FROM quota_window_snapshots "
+        " WHERE source = 'codex' AND canonical_resets_at_utc IS NULL "
+        "   AND source_root_key IS NOT NULL AND observed_slot IS NOT NULL "
+        " ORDER BY source_path, line_offset, id"
+    ).fetchall():
+        anchor = resolver.resolve(
+            source_root_key=row[1], observed_slot=row[2],
+            logical_limit_key=row[3], window_minutes=row[4],
+            resets_at_utc=row[5],
+        )
+        if anchor is not None:
+            updates.append((anchor, int(row[0])))
+    if updates:
+        conn.executemany(
+            "UPDATE quota_window_snapshots SET canonical_resets_at_utc = ? "
+            "WHERE id = ?",
+            updates,
+        )
     conn.commit()
 
 

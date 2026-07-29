@@ -30,14 +30,29 @@ ALLOWLIST = {
 }
 
 
+WIRE_SHAPE_ALLOWLIST = {
+    "_fixture_builders.py":
+        "shared synthetic Claude JSONL emitter consumed by ingest tests",
+    "build-bench-fixtures.py":
+        "synthetic Claude JSONL benchmark input",
+    "build-codex-parity-fixtures.py":
+        "synthetic Claude reference transcript beside Codex parity data",
+    "build-e2e-fixtures.py":
+        "synthetic Claude conversation JSONL for end-to-end fixtures",
+    "build-migrations-fixtures.py":
+        "synthetic Claude JSONL used to seed migration fixtures",
+    "build-statusline-fixtures.py":
+        "synthetic Claude JSONL used by statusline fixtures",
+}
+
+
 def _is_wire_shape_emitter(name: str) -> bool:
-    """Fixture builders emit the Anthropic WIRE shape — the `usage` object of a
-    synthetic JSONL line, which is INPUT to `_classify_cost_entry`, not a
-    cost-feeding dict. Routing those through `claude_usage_dict` would be
-    actively wrong: the builder emits normalized flat keys, while a fixture may
-    need to emit the nested `cache_creation` sub-dict the ingest chokepoint
-    parses. Structurally out of scope, guarded for non-vacuity below."""
-    return name.startswith("build-") or name == "_fixture_builders.py"
+    """Return whether one proven file emits Anthropic wire-format `usage`.
+
+    These objects are input to `_classify_cost_entry`, not cost-feeding dicts.
+    Routing them through `claude_usage_dict` would change the wire shape.
+    """
+    return name in WIRE_SHAPE_ALLOWLIST
 
 
 # Display-only SELECT projections: they read `cache_create_tokens` to RENDER
@@ -161,10 +176,20 @@ def _literal_usage_dicts():
     return hits
 
 
+def _unexpected_literal_usage_dicts(hits=None):
+    """Return cost-like dict sites that have no exact justified exemption."""
+    if hits is None:
+        hits = _literal_usage_dicts()
+    return [
+        (name, line)
+        for name, line in hits
+        if not any(name == allowed for allowed, _ in ALLOWLIST)
+        and not _is_wire_shape_emitter(name)
+    ]
+
+
 def test_no_hand_rolled_usage_dicts_outside_the_builder():
-    unexpected = [(n, ln) for n, ln in _literal_usage_dicts()
-                  if not any(n == a for a, _ in ALLOWLIST)
-                  and not _is_wire_shape_emitter(n)]
+    unexpected = _unexpected_literal_usage_dicts()
     assert unexpected == [], (
         "these sites build a usage dict by hand and will silently under-price; "
         f"route them through claude_usage_dict: {unexpected}")
@@ -178,12 +203,31 @@ def test_allowlist_is_non_vacuous():
     assert stale == set(), f"stale allowlist entries: {stale}"
 
 
+def _stale_wire_shape_allowlist_entries(live=None):
+    if live is None:
+        live = {name for name, _ in _literal_usage_dicts()}
+    return set(WIRE_SHAPE_ALLOWLIST) - set(live)
+
+
 def test_wire_shape_carve_out_is_non_vacuous():
-    """The structural carve-out must still describe real sites; if fixture
-    builders stop emitting wire-shape usage objects, delete the carve-out
-    rather than letting it stand as a blanket suppression."""
-    live = {n for n, _ in _literal_usage_dicts() if _is_wire_shape_emitter(n)}
-    assert live, "no wire-shape emitter matched — remove _is_wire_shape_emitter"
+    """Every explicit wire-shape exemption must still match a real site."""
+    stale = _stale_wire_shape_allowlist_entries()
+    assert stale == set(), f"stale wire-shape allowlist entries: {stale}"
+    assert all(reason.strip() for reason in WIRE_SHAPE_ALLOWLIST.values())
+
+
+def test_wire_shape_carve_out_rejects_an_unlisted_builder():
+    """A new builder's cost-like dict reaches the scanner's offender list."""
+    hit = ("build-unlisted-wire-shape.py", 41)
+    assert _unexpected_literal_usage_dicts([hit]) == [hit]
+
+
+def test_wire_shape_carve_out_reports_each_stale_entry():
+    """Removing one live emitter makes that exact allowlist entry stale."""
+    live = set(WIRE_SHAPE_ALLOWLIST)
+    removed = "build-bench-fixtures.py"
+    live.remove(removed)
+    assert _stale_wire_shape_allowlist_entries(live) == {removed}
 
 
 def _select_offenders():

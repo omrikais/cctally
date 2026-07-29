@@ -41,7 +41,7 @@ import sqlite3
 import sys
 from collections.abc import Mapping
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from _cctally_core import open_db, parse_iso_datetime
@@ -1317,7 +1317,7 @@ def _share_account_display_label(source: str, account: "str | None",
         conn = c._load_sibling("_cctally_core").open_db()
         try:
             reg = _cctally_account.load_accounts(conn, source)
-            label = _cctally_account.account_label(conn, account)
+            label = _cctally_account.display_account_label(conn, account)
         finally:
             conn.close()
     except Exception:
@@ -1710,9 +1710,50 @@ def _share_digest_input(*, panel: str, template_id: str, source: str,
     }
 
 
+_CODEX_ACCOUNT_SCOPED_DOMAINS = (
+    "periods", "sessions", "projects", "cache_report", "budget", "quota",
+    "alerts",
+)
+
+
+def _share_scope_codex_state(state, account: "str | None"):
+    """Restrict a Codex source state to ONE account's child (#416 §5.6, F16).
+
+    The share handler has always parsed `account` and stamped it on the digest,
+    the response and the history metadata — but never passed it to the snapshot
+    builder, so a focused user exported an ALL-ACCOUNT body LABELLED with the
+    focused account. That is a disclosure defect, not a missing feature, and it
+    is worse than an unlabelled export because the label asserts a scope the
+    body does not have.
+
+    Substitutes the per-account children the source already publishes, so the
+    share reads exactly what the focused dashboard reads — one read model, not a
+    second re-derivation that could drift from it.
+
+    FAILS CLOSED. A decorated source that does not know this account raises
+    rather than falling back to the merged body: falling back is precisely the
+    leak. An UNDECORATED source (<=1 real account) publishes no children and
+    needs none — its merged body IS that account's body.
+    """
+    if account is None:
+        return state
+    data = state.data if isinstance(state.data, Mapping) else {}
+    scopes = data.get("account_scopes")
+    if not isinstance(scopes, Mapping):
+        return state
+    scope = scopes.get(account)
+    if not isinstance(scope, Mapping):
+        raise ValueError("source capability unavailable")
+    scoped = {
+        key: scope[key] for key in _CODEX_ACCOUNT_SCOPED_DOMAINS if key in scope
+    }
+    return replace(state, data=MappingProxyType({**dict(data), **scoped}))
+
+
 def _share_build_source_snapshots(*, ls, template, template_id: str,
                                   panel: str, options: dict, source: str,
-                                  source_explicit: bool, data_snap):
+                                  source_explicit: bool, data_snap,
+                                  account: "str | None" = None):
     """Branch by provider before invoking any provider-specific builder."""
     claude_snapshot = None
     claude_state = None
@@ -1744,8 +1785,11 @@ def _share_build_source_snapshots(*, ls, template, template_id: str,
     codex_snapshot = None
     codex_state = None
     if source in ("codex", "all"):
-        codex_state = _share_codex_state_for_period(
-            data_snap, panel=panel, options=options,
+        codex_state = _share_scope_codex_state(
+            _share_codex_state_for_period(
+                data_snap, panel=panel, options=options,
+            ),
+            account,
         )
         codex_snapshot = _build_codex_source_share_snapshot(
             ls,
@@ -1964,6 +2008,9 @@ def _handle_share_render_post_impl(handler) -> None:
             source=source,
             source_explicit=source_explicit,
             data_snap=data_snap,
+            # #416 §5.6: the captured account has always reached the digest and
+            # the response label; it must reach the BODY too.
+            account=account,
         )
     except _SharePeriodError as exc:
         handler._respond_json(400, exc.payload)
@@ -2153,6 +2200,11 @@ def _handle_share_compose_post_impl(handler) -> None:
                 {"source": snap_recipe["source"]}
                 if "source" in snap_recipe else {}
             )
+            # #416 §5.6: a section that captured an account must be BODY-scoped
+            # to it, exactly as the render path is. Absent (every section the
+            # shipped composer posts today) → account-agnostic and byte-stable;
+            # malformed → the same fail-closed rejection as `source`.
+            section_account = _share_account_selection(snap_recipe)
         except ValueError:
             handler._respond_json(400, {
                 "code": "source_capability_unavailable",
@@ -2204,6 +2256,7 @@ def _handle_share_compose_post_impl(handler) -> None:
                 source=source,
                 source_explicit=source_explicit,
                 data_snap=data_snap,
+                account=section_account,
             )
         except _SharePeriodError as exc:
             handler._respond_json(400, {

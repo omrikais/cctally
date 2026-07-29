@@ -204,7 +204,9 @@ def _alert_label_prefix(axis: str, account_key: "str | None") -> str:
         try:
             if _cctally_account.real_account_count(conn, vendor) <= 1:
                 return ""
-            return f"[{_cctally_account.account_label(conn, account_key)}] "
+            # #416 §6: population-aware, so two accounts that auto-label to
+            # one email do not print the same alert prefix.
+            return f"[{_cctally_account.display_account_label(conn, account_key)}] "
         finally:
             conn.close()
     except Exception:

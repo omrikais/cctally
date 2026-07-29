@@ -1,5 +1,5 @@
 import { useContext, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { PanelGrip } from '../components/PanelGrip';
 import { PanelSkeleton } from '../components/PanelSkeleton';
 import { ShareIcon } from '../components/ShareIcon';
@@ -62,7 +62,7 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
 // #294 S5 — source-aware wrapper. Claude = calendar-month tile (unchanged);
 // Codex = native calendar-month period table; All = provider sections.
 export function MonthlyPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const allRows = presentationPeriodRows(env, activeSource, 'monthly');
   const mode = useContext(BoardModeContext);

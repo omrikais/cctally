@@ -67,6 +67,12 @@ _EVT_CLASSIFICATIONS = {
         "historical project budgets are not journaled; stale latches retire"),
     "quota_alert_arming": KindClassification(
         "retained", "Codex quota lifecycle state is outside claude-usage"),
+    # #416 spec §7.2: terminal Codex quota alert evidence. `retained`, exactly
+    # like its `quota_alert_arming` sibling — it is provider state OUTSIDE the
+    # claude-usage family, replayed by its own fold applier rather than
+    # re-derived into the claude-usage scratch index.
+    "quota_threshold_event": KindClassification(
+        "retained", "Codex terminal quota alert evidence is outside claude-usage"),
 }
 
 _OP_CLASSIFICATIONS = {
@@ -81,6 +87,12 @@ _OP_CLASSIFICATIONS = {
         "legacy Claude ownership normalizes unstamped journal history"),
     "sync_week": KindClassification(
         "retained_input", "operator cost-sync request is re-executed in scratch"),
+    # #416: the durable Codex file/range attribution decision. `retained` (not
+    # `retained_input`) mirrors the `quota_alert_arming` precedent above — it is
+    # provider state OUTSIDE the claude-usage family, replayed by the Codex cache
+    # leg rather than into the claude-usage scratch index.
+    "codex_file_account": KindClassification(
+        "retained", "Codex file attribution decision is outside claude-usage"),
 }
 
 

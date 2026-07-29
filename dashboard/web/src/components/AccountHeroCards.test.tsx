@@ -3,6 +3,7 @@ import { render, screen, cleanup } from '@testing-library/react';
 import { AccountHeroCards } from './AccountHeroCards';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
+import { fmt } from '../lib/fmt';
 import type { AccountCard, Envelope } from '../types/envelope';
 
 const A = 'a'.repeat(32);
@@ -104,8 +105,18 @@ describe('AccountHeroCards — reset countdown copy (ui-qa P3)', () => {
     });
   });
 
-  it('leaves the future reset countdown unchanged ("resets in …")', () => {
-    const future = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(); // 2h ahead
+  // #416 QA P2-A. The guard above anchored only the PREFIX (`/^resets in /`),
+  // which passes for "resets in 2d 2h ago" — and that is exactly what every
+  // future reset rendered, because `humanizeAge` appends " ago"
+  // unconditionally and only the `secs === 0` case was special-cased. The
+  // assertion is now on the whole string.
+  it.each([
+    [2 * 60 * 60, 'resets in 2h'],
+    [(2 * 24 + 2) * 60 * 60, 'resets in 2d 2h'],
+    [45, 'resets in 45s'],
+    [90 * 60, 'resets in 1h 30m'],
+  ])('renders a future countdown as a duration, never an age (+%is)', (secs, expected) => {
+    const future = new Date(Date.now() + secs * 1000).toISOString();
     updateSnapshot(decoratedEnv([
       card({ accountKey: A, label: 'alice', weeklyPercent: 40, spendUsd: 1, resetsAt: future }),
       card({ accountKey: B, label: 'bob', weeklyPercent: 55, spendUsd: 2, resetsAt: future }),
@@ -115,8 +126,39 @@ describe('AccountHeroCards — reset countdown copy (ui-qa P3)', () => {
     const resets = [...container.querySelectorAll('.account-hero-card-reset')];
     expect(resets.length).toBe(2);
     resets.forEach((el) => {
-      expect(el.textContent).toMatch(/^resets in /);
+      expect(el.textContent).toBe(expected);
+      expect(el.textContent).not.toMatch(/ago/);
       expect(el.textContent).not.toBe('resets now');
     });
+  });
+});
+
+// #416 QA P2-B — `SPENT THIS WEEK` under a focused account with a sub-dollar
+// spend. The reported symptom was `$0` sitting directly above a card reading
+// `$0.23`, in the one hero slot that asserts a number while every neighbour
+// honestly abstains with `—`. The value is NOT a real zero: it is the card's
+// own range total, correctly selected and then rounded to whole dollars by
+// `fmt.usd0`. Blanking it would hide real data; the fix is that a non-zero
+// spend never renders as the glyph for "nothing".
+describe('fmt.usd0 — a real sub-dollar spend never reads as nothing', () => {
+  it('keeps cents when whole dollars would round a real spend to $0', () => {
+    expect(fmt.usd0(0.23)).toBe('$0.23');
+    expect(fmt.usd0(0.4)).toBe('$0.40');
+    // Below a cent, the honest form is the convention, not a rounded-up figure.
+    expect(fmt.usd0(0.004)).toBe('<$0.01');
+    expect(fmt.usd0(-0.23)).toBe('−$0.23');
+  });
+
+  it('leaves the whole-dollar hero and a true zero untouched', () => {
+    // #264 S1's low-noise money hero is the point of `usd0`; only the band that
+    // rounds to zero changes, so nothing that reaches $1 moves (P3-B, the $5 vs
+    // $5.02 headline, is deliberately NOT addressed here).
+    expect(fmt.usd0(254)).toBe('$254');
+    expect(fmt.usd0(5.02)).toBe('$5');
+    expect(fmt.usd0(1)).toBe('$1');
+    expect(fmt.usd0(0.999)).toBe('$1');
+    expect(fmt.usd0(0.5)).toBe('$1');
+    expect(fmt.usd0(0)).toBe('$0');
+    expect(fmt.usd0(null)).toBe('—');
   });
 });

@@ -203,6 +203,16 @@ automatically. See [setup](setup.md#codex-quota-lifecycle-hooks) for the
 trust-review boundary, multi-root behavior, and recovery of malformed hook
 configuration.
 
+## Multiple Codex accounts
+
+Every quota window, block, milestone and alert is recorded against the account whose rollout produced it, so two accounts sharing one `$CODEX_HOME` keep separate weekly percentages, separate reset boundaries and separate milestone ladders. The account is decided once, when a rollout's bytes are first read, and journaled — a `cctally cache-sync --rebuild` replays those decisions instead of re-deriving them from whoever happens to be signed in at rebuild time. History recorded before that mechanism existed stays in the `unattributed` bucket rather than being guessed at.
+
+On the command line, `--account <ref>` scopes `history`, `statusline`, `forecast`, `blocks` and `breakdown` to one account; see [account](account.md#account-refs) for how a ref is resolved. Without the flag the output is byte-identical to a single-account install.
+
+In the dashboard the same axis is the account chip row under the hero (`a` cycles through it). Selecting an account switches the quota blocks, the milestone history and the hero's percentage, reset and spend to that account; opening a past cycle from the hero fetches that account's own cycle, so a cycle key minted from one account's history never resolves against another's. An account with no recorded evidence shows an explicit empty state instead of the previously selected account's numbers. Under "All accounts" the hero merges only spend and tokens — with more than one live cycle the headline percentage and reset are blank and each account's own values appear on its card, because independent quota allowances are never summed or averaged. All of this appears only when more than one real Codex account is known; a single-account install renders exactly as before. See [account](account.md#the-dashboard-account-selector) for the full selector behaviour.
+
+Windows that run on a separate model allowance, such as GPT-5.3-Codex-Spark, keep their own pool and are never filed as account-level weekly quota, whichever account they belong to.
+
 ## Limitations and recovery
 
 - Codex quota freshness is local rollout evidence, not a provider-live usage

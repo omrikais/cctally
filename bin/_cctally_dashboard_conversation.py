@@ -442,22 +442,31 @@ def _parse_search_kind_impl(handler, q, valid=_CONV_SEARCH_KINDS):
     return kind
 
 def _run_conversation_query_impl(handler, kernel_call, log_label):
-    """Open cache.db, run ``kernel_call(conn)``, close — with the uniform
-    500 envelopes the three conversation routes share (#151).
+    """Open conversations.db, run ``kernel_call(conn)``, close.
 
-    Collapses the triplicated open-cache → try/except/finally → 500
+    Collapses the triplicated open-store → try/except/finally → 500
     scaffold to one site. Returns ``(ok, body)``: ``ok=False`` means a 500
     has ALREADY been sent and the caller must just ``return``; ``ok=True``
     carries the kernel result (which may itself be ``None`` — the reader's
     404 sentinel — so the explicit flag, not ``body is None``, signals
-    failure). An ``open_conversations_db`` failure is a ``cache unavailable:`` 500;
-    a kernel exception is logged as ``<log_label> failed: %r`` and returned
-    as a ``{type}: {msg}`` 500 — byte-identical to the inlined handlers.
+    failure). An ``open_conversations_db`` failure is logged in full but
+    returned through one privacy-safe transcript-store envelope. A kernel
+    exception is logged as ``<log_label> failed: %r`` and returned as a
+    ``{type}: {msg}`` 500.
     """
     try:
         conn = sys.modules["_cctally_dashboard"].open_conversations_db()
     except (sqlite3.DatabaseError, OSError) as exc:
-        handler._respond_json(500, {"error": f"cache unavailable: {exc}"})
+        handler.log_error("%s transcript store open failed: %r", log_label, exc)
+        handler._respond_json(
+            500,
+            {
+                "error": (
+                    "transcript store unavailable; "
+                    "run cctally doctor for details"
+                )
+            },
+        )
         return False, None
     try:
         body = kernel_call(conn)

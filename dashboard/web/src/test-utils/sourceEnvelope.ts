@@ -12,8 +12,11 @@
 // one field (mirrors the `{...base, ...over}` convention used by the session /
 // basket fixture builders).
 import type {
+  AccountCard,
   AllSourceData,
   ClaudeSourceData,
+  CodexAccountScope,
+  CodexQuotaForecast,
   CodexSourceData,
   SourceEntry,
   SourcesMap,
@@ -315,6 +318,503 @@ export function makeCodexSourceData(): CodexSourceData {
       ],
     },
   } satisfies CodexSourceData;
+}
+
+// ---- #416: the DECORATED (>1 real account) Codex shape ----------------
+//
+// The three conditional surfaces that appear together under decoration (R8):
+// camelCase `accounts[]` cards, mixed-case `hero.cycles[]`, and the fully
+// snake_case `account_scopes` children. `ACCOUNT_A` has real evidence,
+// `ACCOUNT_B` has different evidence, and `ACCOUNT_EMPTY` is the reported
+// symptom — a registered account with nothing in this cycle.
+export const ACCOUNT_A = 'a'.repeat(32);
+export const ACCOUNT_B = 'b'.repeat(32);
+export const ACCOUNT_EMPTY = 'e'.repeat(32);
+
+function accountCard(over: Partial<AccountCard> & { accountKey: string }): AccountCard {
+  return {
+    accountKey: over.accountKey,
+    label: over.label ?? over.accountKey.slice(0, 4),
+    plan: over.plan ?? 'pro',
+    active: over.active ?? false,
+    weeklyPercent: over.weeklyPercent ?? null,
+    fiveHourPercent: over.fiveHourPercent ?? null,
+    resetsAt: over.resetsAt ?? null,
+    spendUsd: over.spendUsd ?? 0,
+    inputTokens: over.inputTokens ?? 0,
+    cachedInputTokens: over.cachedInputTokens ?? 0,
+    outputTokens: over.outputTokens ?? 0,
+    reasoningOutputTokens: over.reasoningOutputTokens ?? 0,
+    totalTokens: over.totalTokens ?? 0,
+    ...(over.unattributed ? { unattributed: true as const } : {}),
+  };
+}
+
+function accountScope(over: {
+  marker: string;
+  is_empty?: boolean;
+  cost?: number;
+  alerts?: CodexAccountScope['alerts']['rows'];
+}): CodexAccountScope {
+  const cost = over.cost ?? 1;
+  const period = {
+    rows: over.is_empty ? [] : [{
+      label: `${over.marker}-04-24`,
+      cost_usd: cost,
+      input_tokens: 10,
+      cached_input_tokens: 2,
+      output_tokens: 4,
+      reasoning_output_tokens: 1,
+      total_tokens: 17,
+      models: ['gpt-5'],
+    }],
+    total_cost_usd: over.is_empty ? 0 : cost,
+    total_tokens: over.is_empty ? 0 : 17,
+    display_tz: 'UTC',
+  };
+  return {
+    is_empty: over.is_empty ?? false,
+    periods: { daily: period, monthly: period, weekly: period },
+    sessions: {
+      rows: over.is_empty ? [] : [{
+        key: `session:${over.marker}`,
+        source: 'codex' as const,
+        label: `Session ${over.marker}`,
+        last_activity: '2026-04-24T12:30:00Z',
+        cost_usd: cost,
+        input_tokens: 10,
+        cached_input_tokens: 2,
+        output_tokens: 4,
+        reasoning_output_tokens: 1,
+        total_tokens: 17,
+        models: ['gpt-5'],
+      }],
+      total_sessions: over.is_empty ? 0 : 1,
+      total_cost_usd: over.is_empty ? 0 : cost,
+      total_tokens: over.is_empty ? 0 : 17,
+    },
+    projects: {
+      rows: over.is_empty ? [] : [{
+        key: `project:${over.marker}`,
+        source: 'codex' as const,
+        label: `proj-${over.marker}`,
+        session_count: 1,
+        first_seen: '2026-04-20T00:00:00Z',
+        last_seen: '2026-04-24T12:30:00Z',
+        cost_usd: cost,
+        input_tokens: 10,
+        cached_input_tokens: 2,
+        output_tokens: 4,
+        reasoning_output_tokens: 1,
+        total_tokens: 17,
+      }],
+      total_cost_usd: over.is_empty ? 0 : cost,
+      total_tokens: over.is_empty ? 0 : 17,
+    },
+    cache_report: null,
+    budget: { status: null, milestones: [], projected: [] },
+    quota: {
+      summary: {
+        window_count: over.is_empty ? 0 : 1,
+        active_window_count: over.is_empty ? 0 : 1,
+        latest_percent: over.is_empty ? null : 30,
+        freshness: over.is_empty ? 'unavailable' : 'fresh',
+        active: [],
+      },
+      histories: [],
+      milestones: [],
+      blocks: [],
+      cycle_index: over.is_empty ? [] : [{
+        key: `cycle:${over.marker}`,
+        start_at_utc: '2026-04-23T00:00:00Z',
+        end_at_utc: '2026-04-30T00:00:00Z',
+        resets_at_utc: '2026-04-30T00:00:00Z',
+        label: `${over.marker} cycle`,
+        is_current: true,
+        milestone_count: 1,
+        block_count: 1,
+        detail_stamp: `${over.marker}-stamp`,
+      }],
+    },
+    alerts: { rows: over.alerts ?? [], actual_thresholds: [90], projected_thresholds: [90] },
+  };
+}
+
+// The parent's per-account weekly quota rows. Under decoration the server
+// stamps `account_key` on every `quota.histories` row, so the merged subtree
+// carries ONE weekly history PER ACCOUNT — which is exactly why picking
+// `histories.find(w => w.window_minutes === 10080)` publishes whichever account
+// happens to sort first as "the" forecast (#416 QA P0).
+function accountWeeklyHistory(
+  accountKey: string,
+  over: {
+    percent: number;
+    projected: number;
+    confidence: CodexQuotaForecast['confidence'];
+    marker: string;
+  },
+): CodexSourceData['quota']['histories'][number] {
+  return {
+    key: `quota:codex-weekly-${over.marker}`,
+    source: 'codex',
+    account_key: accountKey,
+    label: '7-day limit',
+    observed_slot: 0,
+    window_minutes: 10080,
+    current_percent: over.percent,
+    captured_at: '2026-04-24T13:00:00Z',
+    freshness: 'fresh',
+    stale_after_seconds: 3600,
+    forecast: {
+      status: 'ok',
+      current_percent: over.percent,
+      rate_percent_per_hour: 1.5,
+      projected_percent: over.projected,
+      resets_at: '2026-04-30T00:00:00Z',
+      remaining_seconds: 216000,
+      sample_count: 10,
+      sample_span_seconds: 86400,
+      confidence: over.confidence,
+    },
+  } as CodexSourceData['quota']['histories'][number];
+}
+
+// #416 QA P2-1: the children are mirrored HERE rather than left to an opt-in
+// second call. A decorated provider builds both halves from the SAME
+// observations — `_quota_read_model` over the merged set for the parent, over
+// each account's partition for its child — so a parent weekly row stamped
+// `account_key: A` always implies A's child holds that row. The split builder
+// let a test construct the opposite (a stamped parent over empty children),
+// which is not a wire shape, and any selector that consults a child then reads
+// as broken against a fixture rather than against the server.
+export function makeDecoratedCodexSourceData(): CodexSourceData {
+  return withAccountScopedQuotaHistories(makeDecoratedCodexParentOnly());
+}
+
+function makeDecoratedCodexParentOnly(): CodexSourceData {
+  const base = makeCodexSourceData();
+  // The representative account's weekly window is the one `hero.quota.active`
+  // joins against, so it keeps its shipped key and simply gains the stamp. It
+  // projects OVER the cap; the sibling is comfortably OK — the two verdicts the
+  // reported defect showed as one.
+  const siblingWeekly = accountWeeklyHistory(ACCOUNT_B, {
+    percent: 12, projected: 31, confidence: 'low', marker: 'b',
+  });
+  // #416 QA P1 — the sibling's window is LIVE, so the server lists it in
+  // `quota.summary.active` exactly like the representative account's. The
+  // builder used to stamp a second weekly HISTORY without its matching active
+  // row, which no wire ever emits: `_quota_read_model` appends an active row for
+  // every non-model-scoped history whose `baseline.resets_at > now`. A gate that
+  // reads that server-side liveness decision would have blanked a live window
+  // against the old fixture, so the fidelity gap had to close first.
+  const summary = {
+    ...base.quota.summary,
+    window_count: base.quota.summary.window_count + 1,
+    active_window_count: base.quota.summary.active_window_count + 1,
+    active: [
+      ...base.quota.summary.active,
+      {
+        key: siblingWeekly.key,
+        current_percent: 12.0,
+        captured_at: '2026-04-24T13:00:00Z',
+        resets_at: '2026-04-29T00:00:00Z',
+        freshness: 'fresh' as const,
+        stale_after_seconds: 3600,
+      },
+    ],
+  };
+  return {
+    ...base,
+    quota: {
+      ...base.quota,
+      summary,
+      histories: [
+        ...base.quota.histories.map((row) => ({
+          ...row,
+          account_key: ACCOUNT_A,
+          ...(row.window_minutes === 10080
+            ? {
+              forecast: {
+                ...row.forecast,
+                projected_percent: 104,
+                confidence: 'high' as const,
+              },
+            }
+            : {}),
+        })),
+        siblingWeekly,
+      ],
+    },
+    hero: {
+      ...base.hero,
+      // `hero.quota` is BUILT FROM `quota.summary`: the source builder passes
+      // `quota["summary"]` straight into the hero, so the two agree at the
+      // point of construction. They are not guaranteed equal in a DELIVERED
+      // envelope — a captured production snapshot carried older `captured_at`
+      // values in `hero.quota.active[]` than in `quota.summary.active[]` for
+      // two rows, meaning the hero it shipped came from an earlier generation.
+      // Keeping them in step here is still what a coherent single-generation
+      // wire looks like, which is what a fixture should model.
+      quota: summary,
+      cycles: [
+        {
+          accountKey: ACCOUNT_A,
+          window_minutes: 10080,
+          start_at: '2026-04-23T00:00:00Z',
+          resets_at: '2026-04-30T00:00:00Z',
+          used_percent: 61,
+          cost_usd: 8.0,
+          total_tokens: 400000,
+        },
+        {
+          accountKey: ACCOUNT_B,
+          window_minutes: 10080,
+          start_at: '2026-04-22T00:00:00Z',
+          resets_at: '2026-04-29T00:00:00Z',
+          used_percent: 12,
+          cost_usd: 4.3,
+          total_tokens: 152000,
+        },
+      ],
+    },
+    accounts: [
+      accountCard({
+        accountKey: ACCOUNT_A, label: 'work@example.com', weeklyPercent: 61,
+        spendUsd: 8.0, inputTokens: 320000, totalTokens: 400000,
+      }),
+      accountCard({
+        accountKey: ACCOUNT_B, label: 'personal@example.com', weeklyPercent: 12,
+        spendUsd: 4.3, inputTokens: 120000, totalTokens: 152000,
+      }),
+      accountCard({ accountKey: ACCOUNT_EMPTY, label: 'quiet@example.com' }),
+    ],
+    account_scopes: {
+      [ACCOUNT_A]: accountScope({
+        marker: 'A',
+        cost: 8.0,
+        alerts: [
+          {
+            key: 'alert:codex-quota-a', source: 'codex', axis: 'quota',
+            threshold: 90, severity: 'warn', created_at: '2026-04-24T09:00:00Z',
+            account_key: ACCOUNT_A,
+          },
+          // A vendor-wide crossing: visible under focus, LABELLED vendor-wide,
+          // never attributed to the focused account.
+          {
+            key: 'alert:codex-budget-90', source: 'codex', axis: 'codex_budget',
+            period: 'calendar-month', threshold: 90, value: 90.5,
+            created_at: '2026-04-20T00:00:00Z', account_key: '*',
+          },
+        ],
+      }),
+      [ACCOUNT_B]: accountScope({ marker: 'B', cost: 4.3 }),
+      [ACCOUNT_EMPTY]: accountScope({ marker: 'E', is_empty: true }),
+    },
+  } satisfies CodexSourceData;
+}
+
+// The child scopes mirror the parent's shape, so each account's own weekly
+// history lives in its own subtree — that is what a FOCUSED read renders.
+// `makeDecoratedCodexSourceData` applies it, so the two halves can never
+// disagree about which account owns which projection; it is exported because a
+// transform that rewrites the PARENT (`withExpiredWeekly`,
+// `withStaleButLiveWeekly`) must re-derive the children afterwards. Idempotent —
+// every call rebuilds the children from the parent.
+//
+// Assumes each account's window carries a DISTINCT key, which is what the
+// key-join below needs to attribute an active row. Two accounts sharing one
+// `$CODEX_HOME` root collide on that key; `withSharedRootWeeklyWindows` writes
+// those children out directly instead.
+export function withAccountScopedQuotaHistories(
+  data: CodexSourceData,
+): CodexSourceData {
+  const byAccount = new Map(
+    (data.quota.histories ?? [])
+      .filter((row) => row.account_key != null && row.window_minutes === 10080)
+      .map((row) => [row.account_key as string, row] as const),
+  );
+  const scopes = { ...(data.account_scopes ?? {}) };
+  const activeByKey = new Map(
+    (data.quota.summary.active ?? []).map((row) => [row.key, row] as const),
+  );
+  for (const [key, scope] of Object.entries(scopes)) {
+    const own = byAccount.get(key);
+    // A child's `quota.summary.active` is built from the CHILD's observations,
+    // so it holds exactly this account's live windows — the same rows the parent
+    // lists, narrowed. Mirroring it here keeps the scoped fixture honest about
+    // which of its windows is still running (#416 QA P1).
+    const ownActive = own == null ? undefined : activeByKey.get(own.key);
+    // The other three summary fields are DERIVED from the same active rows by
+    // `_quota_read_model`, so they move together or the child contradicts
+    // itself: `latest_percent` is a MAX over the active rows (`None` when there
+    // are none), and `freshness` is `fresh` when every active row is fresh,
+    // `unavailable` when there are no active rows at all, `stale` otherwise.
+    // Leaving `accountScope()`'s `30` / `fresh` in place while zeroing
+    // `active_window_count` produced a child that reported a latest percent and
+    // fresh quota with no active window — a shape no wire emits, and one
+    // `focusedHero` would have carried straight onto the hero.
+    scopes[key] = {
+      ...scope,
+      quota: {
+        ...scope.quota,
+        histories: own == null ? [] : [own],
+        summary: {
+          ...scope.quota.summary,
+          active_window_count: ownActive == null ? 0 : 1,
+          latest_percent: ownActive?.current_percent ?? null,
+          freshness: ownActive == null
+            ? 'unavailable'
+            : ownActive.freshness === 'fresh' ? 'fresh' : 'stale',
+          active: ownActive == null ? [] : [ownActive],
+        },
+      },
+    };
+  }
+  return { ...data, account_scopes: scopes };
+}
+
+// ---- #416 QA P2-1: two accounts sharing ONE `$CODEX_HOME` root ---------
+//
+// The quota row key is `dashboard_resource_key("quota", "codex",
+// source_root_key, logical_limit_key, observed_slot, window_minutes)` and
+// carries NO account; `_codex_logical_limit_key` carries none either (its
+// `limitId` is the same literal for every account of one provider). Under a
+// single root, two accounts' weekly windows are therefore TWO history rows with
+// ONE key — `build_history` partitions by the full `QuotaWindowIdentity`
+// (account included) while `dashboard_resource_key` does not, and
+// `adopt_unidentified_observations` states the rule outright: "two identified
+// accounts sharing an identical physical window key stay separate windows".
+// `_codex_account_scopes_wire`'s own docstring names this the shape the
+// per-account reads exist for ("`quota_window_blocks` and
+// `quota_window_snapshots` both carry two rows when two accounts share one
+// physical root"), so it is designed for, not hypothetical.
+//
+// `ACCOUNT_A`'s window is LIVE; `ACCOUNT_B`'s reset nine days ago. The parent's
+// `quota.summary.active` consequently lists that ONE key ONCE, contributed by
+// A — which is precisely why a key-only liveness lookup taken from the PARENT
+// revives B.
+//
+// The children are written out here rather than mirrored through
+// `withAccountScopedQuotaHistories`: that helper attributes an active row to a
+// child BY KEY, and under a shared root the key no longer identifies the
+// account. The server has no such problem — each child comes from
+// `_quota_read_model` over that ACCOUNT's own observations — so constructing
+// them directly is the faithful emulation.
+export const SHARED_ROOT_WEEKLY_KEY = 'quota:codex-weekly';
+
+export function withSharedRootWeeklyWindows(data: CodexSourceData): CodexSourceData {
+  const weeklyOf = (accountKey: string) => (data.quota.histories ?? []).find(
+    (row) => row.account_key === accountKey && row.window_minutes === 10080,
+  )!;
+  const liveWeekly = {
+    ...weeklyOf(ACCOUNT_A),
+    key: SHARED_ROOT_WEEKLY_KEY,
+    current_percent: 78.2,
+    captured_at: '2026-04-24T13:00:00Z',
+    freshness: 'fresh' as const,
+    forecast: {
+      ...weeklyOf(ACCOUNT_A).forecast,
+      status: 'ok' as const,
+      current_percent: 78.2,
+      projected_percent: 91.0,
+      resets_at: '2026-04-30T00:00:00Z',
+      confidence: 'high' as const,
+    },
+  };
+  // Captured 2026-04-13 with a `resets_at` of 2026-04-19 — already past at
+  // capture time, and nine days dead by the fixture clock (2026-04-24T13:07Z).
+  const deadWeekly = {
+    ...weeklyOf(ACCOUNT_B),
+    key: SHARED_ROOT_WEEKLY_KEY,
+    current_percent: 41.0,
+    captured_at: '2026-04-13T09:00:00Z',
+    freshness: 'stale' as const,
+    forecast: {
+      ...weeklyOf(ACCOUNT_B).forecast,
+      status: 'stale' as const,
+      current_percent: 41.0,
+      projected_percent: null,
+      resets_at: '2026-04-19T00:00:00Z',
+      remaining_seconds: 0,
+      confidence: 'medium' as const,
+    },
+  };
+  const liveActive = {
+    key: SHARED_ROOT_WEEKLY_KEY,
+    current_percent: 78.2,
+    captured_at: '2026-04-24T13:00:00Z',
+    resets_at: '2026-04-30T00:00:00Z',
+    freshness: 'fresh' as const,
+    stale_after_seconds: 3600,
+  };
+  const others = (data.quota.histories ?? []).filter(
+    (row) => row.window_minutes !== 10080,
+  );
+  // The parent's active list: every non-weekly window it already had, plus the
+  // shared weekly key exactly ONCE. A's row contributed it; B's is absent.
+  const active = [
+    ...data.quota.summary.active.filter(
+      (row) => !(data.quota.histories ?? []).some(
+        (h) => h.key === row.key && h.window_minutes === 10080,
+      ),
+    ),
+    liveActive,
+  ];
+  const summary = {
+    ...data.quota.summary,
+    window_count: others.length + 2,
+    active_window_count: active.length,
+    latest_percent: Math.max(...active.map((row) => row.current_percent)),
+    freshness: 'fresh' as const,
+    active,
+  };
+  const scopes = { ...(data.account_scopes ?? {}) };
+  const childQuota = (
+    histories: CodexSourceData['quota']['histories'],
+    ownActive: typeof liveActive | null,
+  ) => ({
+    summary: {
+      window_count: histories.length,
+      active_window_count: ownActive == null ? 0 : 1,
+      latest_percent: ownActive?.current_percent ?? null,
+      freshness: (ownActive == null ? 'unavailable' : 'fresh') as 'unavailable' | 'fresh',
+      active: ownActive == null ? [] : [ownActive],
+    },
+    histories,
+    milestones: [],
+    blocks: [],
+    cycle_index: [],
+  });
+  scopes[ACCOUNT_A] = {
+    ...scopes[ACCOUNT_A],
+    quota: childQuota([liveWeekly], liveActive),
+  } as CodexAccountScope;
+  scopes[ACCOUNT_B] = {
+    ...scopes[ACCOUNT_B],
+    quota: childQuota([deadWeekly], null),
+  } as CodexAccountScope;
+  scopes[ACCOUNT_EMPTY] = {
+    ...scopes[ACCOUNT_EMPTY],
+    quota: childQuota([], null),
+  } as CodexAccountScope;
+  return {
+    ...data,
+    quota: { ...data.quota, summary, histories: [...others, liveWeekly, deadWeekly] },
+    hero: {
+      ...data.hero,
+      quota: summary,
+      // B has no live cycle, exactly as `hero_cycles_wire` emits it.
+      cycles: (data.hero.cycles ?? []).filter((c) => c.accountKey !== ACCOUNT_B),
+    },
+    accounts: (data.accounts ?? []).map((card) => (
+      card.accountKey === ACCOUNT_A
+        ? { ...card, weeklyPercent: 78.2 }
+        : card.accountKey === ACCOUNT_B
+          ? { ...card, weeklyPercent: null, resetsAt: null }
+          : card
+    )),
+    account_scopes: scopes,
+  } as CodexSourceData;
 }
 
 export function makeCodexSourceEntry(

@@ -184,6 +184,25 @@ def test_bounded_reader_returns_empty_when_the_store_is_missing(
     assert not path.exists()
 
 
+def test_bounded_reader_declines_while_recovery_marker_exists(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_titles_on_disk(ns, rollup=[("s-1", "Fix the flaky test")])
+    cache_mod = ns["_load_sibling"]("_cctally_cache")
+    path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    marker = path.with_name("conversations.db.repairing")
+    marker.write_text("test recovery owner")
+
+    assert cache_mod.read_session_titles_bounded(["s-1"]) == {}
+
+    marker.unlink()
+    assert cache_mod.read_session_titles_bounded(["s-1"]) == {
+        "s-1": "Fix the flaky test"
+    }
+
+
 def test_bounded_reader_does_not_block_on_an_exclusively_locked_store(
     tmp_path, monkeypatch,
 ):

@@ -623,14 +623,16 @@ def test_forensics_write_failure_overrides_confirmed_probe(
     path.write_bytes(b"not a sqlite database")
     before_inode = path.stat().st_ino
     before_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-    real_write_text = pathlib.Path.write_text
+    real_publish = db_mod._atomic_write_private_json
 
-    def fail_forensics_write(self, *args, **kwargs):
-        if "corruption-forensics" in self.name:
+    def fail_forensics_write(output, payload):
+        if "corruption-forensics" in pathlib.Path(output).name:
             raise OSError("injected forensics write failure")
-        return real_write_text(self, *args, **kwargs)
+        return real_publish(output, payload)
 
-    monkeypatch.setattr(pathlib.Path, "write_text", fail_forensics_write)
+    monkeypatch.setattr(
+        db_mod, "_atomic_write_private_json", fail_forensics_write,
+    )
     assert cache_mod._recover_corrupt_cache(
         sqlite3.DatabaseError("file is not a database"),
         origin="test.forensics_write_failure",

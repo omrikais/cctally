@@ -49,6 +49,12 @@ NOW_UTC = dt.datetime(2026, 5, 19, 12, 0, 0, tzinfo=dt.timezone.utc)
 # Fixed `last_ingested_at` so session_files inserts are byte-stable.
 _FIXED_LAST_INGESTED_AT = "2026-05-19T11:50:00Z"
 
+# These fixtures exercise aggregation values and index presence, not SQLite
+# plan selection informed by sampled row distributions.  Keep planner stats
+# absent deliberately: ANALYZE would add SQLite-version-sensitive derived
+# tables without improving the product contract under test.
+PLANNER_STATS_POLICY = "absent"
+
 
 def _iso(d: dt.datetime) -> str:
     return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -214,6 +220,22 @@ def _seed_weekly_snapshot(
     )
 
 
+def _finalize_fixture(conn: sqlite3.Connection) -> None:
+    """Commit and enforce the declared planner-stat policy before close."""
+    conn.commit()
+    try:
+        stat_tables = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name LIKE 'sqlite_stat%' ORDER BY name"
+        ).fetchall()
+        if PLANNER_STATS_POLICY == "absent" and stat_tables:
+            raise RuntimeError(
+                f"projects fixtures must omit planner stats, found: {stat_tables}"
+            )
+    finally:
+        conn.close()
+
+
 # --- Scenario builders ----------------------------------------------------
 
 def build_multi_week(path: pathlib.Path) -> None:
@@ -275,8 +297,7 @@ def build_multi_week(path: pathlib.Path) -> None:
             weekly_percent=40.0 + (w_idx - 4) * 4.0,  # 40, 44, ..., 68
         )
 
-    conn.commit()
-    conn.close()
+    _finalize_fixture(conn)
 
 
 def build_single_week(path: pathlib.Path) -> None:
@@ -309,8 +330,7 @@ def build_single_week(path: pathlib.Path) -> None:
 
     _seed_weekly_snapshot(conn, week_start=cw_start, weekly_percent=22.0)
 
-    conn.commit()
-    conn.close()
+    _finalize_fixture(conn)
 
 
 def build_edge_cases(path: pathlib.Path) -> None:
@@ -354,8 +374,7 @@ def build_edge_cases(path: pathlib.Path) -> None:
     # Deliberately NO weekly_usage_snapshots → attributed_pct = None
     # everywhere.
 
-    conn.commit()
-    conn.close()
+    _finalize_fixture(conn)
 
 
 def main() -> int:

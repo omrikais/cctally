@@ -28,6 +28,10 @@ jobs:
         python-version: ['3.11', '3.12', '3.13']
     env:
       CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2, release auto-capped via the runner (#292)
+      # Hosted Actions cannot read the separate private agentmem repository.
+      # The self-hosted macOS lane owns that integration gate; this matrix
+      # declares the boundary so its skips are explicit rather than accidental.
+      CCTALLY_AGENTMEM_TEST_POLICY: "hosted-private-unavailable"
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:

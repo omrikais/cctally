@@ -658,13 +658,25 @@ def _select_physical_cycles(cycles: list, *, preferred_identity=None,
 
 def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
                        preferred_identity=None, current_boundary=None,
-                       now_utc=None) -> list:
-    """Unbounded reset-defined 7-day cycles, one selected identity per boundary."""
+                       now_utc=None, account_key=None) -> list:
+    """Unbounded reset-defined 7-day cycles, one selected identity per boundary.
+
+    ``account_key`` (#416 Slice 3A review B3) scopes the enumeration to one
+    account. ``_CodexCycle.identity_parts`` is ``(root, limit, slot, window)``
+    and deliberately excludes the account, so without the predicate two accounts
+    on one root are jitter-clustered TOGETHER and one account's cycle index
+    lists the other's boundaries — the milestone-history equivalent of B1.
+    ``None`` keeps the merged read, which is byte-stable and is what the
+    cycle-DETAIL route and every existing caller still use.
+    """
     roots = tuple(sorted({r for r in root_keys if isinstance(r, str) and r}))
     if not roots:
         return []
     placeholders = ",".join("?" for _ in roots)
     orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
+    # `quota_window_blocks.account_key` is NOT NULL DEFAULT 'unattributed'.
+    account_clause = "" if account_key is None else "AND account_key=? "
+    account_params = () if account_key is None else (account_key,)
     rows = stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
         "       window_minutes, limit_id, limit_name, account_key, "
@@ -672,9 +684,10 @@ def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
         "FROM quota_window_blocks "
         "WHERE source='codex' AND window_minutes=10080 "
         f"{orphan_clause}"
+        f"{account_clause}"
         f"AND source_root_key IN ({placeholders}) "
         "ORDER BY unixepoch(resets_at_utc) DESC",
-        (*roots,),
+        (*account_params, *roots),
     ).fetchall()
 
     cycles: list = []
@@ -867,16 +880,21 @@ def _codex_cycle_label(cyc, tz) -> str:
     )
 
 
-def build_codex_cycle_index(stats_conn, *, identity, now_utc) -> list:
+def build_codex_cycle_index(stats_conn, *, identity, now_utc,
+                            account_key=None) -> list:
     """Newest-first Codex cycle index over the durable projection (spec §1c,
     §3). Enumerates the hero root's reset-defined ledger with no depth cap;
-    one selected full native identity per physical reset."""
+    one selected full native identity per physical reset.
+
+    ``account_key`` (#416 Slice 3A review B3) builds the index for ONE account,
+    so a focused hero renders its own milestone history instead of the first
+    account's. ``None`` is the merged parent index and is byte-stable."""
     now = now_utc.astimezone(UTC) if now_utc.tzinfo else now_utc.replace(tzinfo=UTC)
     tz = _resolve_display_tz()
     cycles = _load_codex_cycles(
         stats_conn, getattr(identity, "source_root_keys", ()),
         preferred_identity=getattr(identity, "quota_identity", None),
-        current_boundary=identity, now_utc=now,
+        current_boundary=identity, now_utc=now, account_key=account_key,
     )
     return [_codex_cycle_entry(stats_conn, c, tz) for c in cycles]
 
@@ -905,16 +923,26 @@ def _shape_codex_milestone(row, *, key_parts, block_key) -> dict:
     }
 
 
-def _codex_breakdown_rows(ident, reset, speed, cache_conn, stats_conn):
+def _codex_breakdown_rows(ident, reset, speed, cache_conn, stats_conn,
+                          account_key=None):
     try:
+        # #416 closeout F3: the flavour is NOT this route's to pick. Every key
+        # that reaches here comes from the POST-fold durable projection, so the
+        # pre-fold BOUNDARY read widens — but `codex_quota_breakdown` now
+        # decides that per read, because the two reads behind it have opposite
+        # correctness requirements and the single flag conflated them. The
+        # accounting read stays strict, so a crossing whose spend is
+        # unattributed renders $0.00 rather than adopting another scope's rows.
         return codex_quota_breakdown(
             ident, reset, speed=speed, cache_conn=cache_conn, stats_conn=stats_conn,
+            account_key=account_key,
         )
     except sqlite3.Error:
         return None
 
 
-def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn):
+def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn,
+                              account_key=None):
     """Union ``codex_quota_breakdown`` milestone rows across every cluster
     member (each jittered sibling reset via the existing per-reset path).
 
@@ -922,6 +950,19 @@ def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn)
     full ledger is the union — shaped and ordered by ``(captured_at, percent)``.
     Returns ``None`` if any member's projection is incoherent (mirrors the
     single-reset signal so the caller can surface ``projection_incoherent``).
+
+    ``account_key`` (#416) is the ROUTE's focus, deliberately not
+    ``member.account_key``. The milestone read keeps using the member's own
+    stamp — those rows were written under that exact identity — but the two
+    CACHE reads are scoped to the account whose view this is. The two differ for
+    the 5h leg: ``_codex_five_hour_rows`` admits a still-``unattributed`` block
+    into a real account's cycle (the #373 per-window-group rule). SELECTION is
+    therefore the cycle's scope, and so is the block-start boundary — but COST
+    is not widened to match (#416 closeout F3): an unattributed block selected
+    into a real account's cycle renders its crossings at ``$0.00``, because
+    costing it under the cycle's account would file those dollars twice, in the
+    focused scope and in the ``unattributed`` one. ``None`` keeps the merged
+    read.
     """
     shaped: list = []
     for member in cluster.cluster_members:
@@ -932,7 +973,8 @@ def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn)
             limit_id=member.limit_id, limit_name=member.limit_name,
         )
         breakdown = _codex_breakdown_rows(
-            ident, member.reset, speed, cache_conn, stats_conn
+            ident, member.reset, speed, cache_conn, stats_conn,
+            account_key=account_key,
         )
         if breakdown is None:
             return None  # projection-incoherent signal to the caller
@@ -955,12 +997,14 @@ def _union_cluster_milestones(cluster, block_key, speed, cache_conn, stats_conn)
     )
 
 
-def _codex_cycle_blocks(stats_conn, cache_conn, cyc, speed) -> "list | None":
+def _codex_cycle_blocks(stats_conn, cache_conn, cyc, speed,
+                        account_key=None) -> "list | None":
     out: list = []
     for block in _codex_five_hour_clusters(stats_conn, cyc):
         block_key = block.block_key
         milestones = _union_cluster_milestones(
-            block, block_key, speed, cache_conn, stats_conn
+            block, block_key, speed, cache_conn, stats_conn,
+            account_key=account_key,
         )
         if milestones is None:
             return None  # projection-incoherent signal to the caller
@@ -987,13 +1031,24 @@ def _now_guard(cyc):
 
 
 def build_codex_cycle_detail(
-    stats_conn, cache_conn, *, identity, key, speed, now_utc
+    stats_conn, cache_conn, *, identity, key, speed, now_utc, account_key=None
 ):
     """Complete payload for one Codex cycle (spec §1c). On success returns a
     dict mirroring the Claude detail shape (segments = a single Codex segment,
     dividers = []). On failure returns ``(None, reason)`` where reason ∈
     {pruned, rebuild_pending, projection_incoherent, unknown} — Task 4 maps it
     into the 404 body.
+
+    ``account_key`` (#416) focuses the whole route on ONE account. It scopes the
+    cycle ENUMERATION and the milestone LADDER together, which has to be one
+    parameter rather than two: ``build_codex_cycle_index`` already takes it
+    (Slice 3A review B3) and builds each key from THAT account's cluster
+    representative, while ``_canonicalize_codex_cluster`` takes ``max(reset)``
+    across the cluster — so a merged enumeration resolves a jitter-separated
+    sibling's reset and the focused account's own index key 404s.
+
+    ``None`` is the merged route every shipped caller uses and is byte-stable by
+    construction: nothing below it changes shape.
     """
     now = now_utc.astimezone(UTC) if now_utc.tzinfo else now_utc.replace(tzinfo=UTC)
     tz = _resolve_display_tz()
@@ -1001,7 +1056,7 @@ def build_codex_cycle_detail(
         cycles = _load_codex_cycles(
             stats_conn, getattr(identity, "source_root_keys", ()),
             preferred_identity=getattr(identity, "quota_identity", None),
-            current_boundary=identity, now_utc=now,
+            current_boundary=identity, now_utc=now, account_key=account_key,
         )
     except sqlite3.Error:
         return (None, "projection_incoherent")
@@ -1014,7 +1069,7 @@ def build_codex_cycle_detail(
                 stats_conn, getattr(identity, "source_root_keys", ()),
                 include_orphaned=True,
                 preferred_identity=getattr(identity, "quota_identity", None),
-                current_boundary=identity, now_utc=now,
+                current_boundary=identity, now_utc=now, account_key=account_key,
             )
         except sqlite3.Error:
             return (None, "projection_incoherent")
@@ -1023,11 +1078,13 @@ def build_codex_cycle_detail(
         return (None, "unknown")
 
     milestones = _union_cluster_milestones(
-        match, match.block_key, speed, cache_conn, stats_conn
+        match, match.block_key, speed, cache_conn, stats_conn,
+        account_key=account_key,
     )
     if milestones is None:
         return (None, "projection_incoherent")
-    blocks = _codex_cycle_blocks(stats_conn, cache_conn, match, speed)
+    blocks = _codex_cycle_blocks(
+        stats_conn, cache_conn, match, speed, account_key=account_key)
     if blocks is None:
         return (None, "projection_incoherent")
 

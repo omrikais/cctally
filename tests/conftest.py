@@ -6,6 +6,7 @@ internals without running the CLI.
 """
 import os
 import pathlib
+import shutil
 import sys
 import types
 
@@ -18,6 +19,47 @@ import pytest
 # per-test fake HOME, not the cctally-dev layout. setdefault so an explicit
 # env value (a test that WANTS to exercise auto-detect) still wins.
 os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+
+
+_AGENTMEM_TEST_POLICIES = {
+    "optional-local",
+    "required",
+    "hosted-private-unavailable",
+}
+
+
+def _agentmem_policy_error(
+    policy: str, agentmem_path: str | None, github_actions: bool
+) -> str | None:
+    """Return the verification-lane dependency error, if any."""
+    if policy not in _AGENTMEM_TEST_POLICIES:
+        return (
+            f"unsupported CCTALLY_AGENTMEM_TEST_POLICY={policy!r}; "
+            f"expected one of {sorted(_AGENTMEM_TEST_POLICIES)}"
+        )
+    if policy == "required" and agentmem_path is None:
+        return (
+            "this verification lane requires pinned agentmem, but it is not "
+            "on PATH; run bin/cctally-agentmem-dependency provision"
+        )
+    if policy == "hosted-private-unavailable" and not github_actions:
+        return (
+            "hosted-private-unavailable is reserved for GitHub Actions lanes "
+            "that cannot read the separate private agentmem repository"
+        )
+    return None
+
+
+def pytest_sessionstart(session) -> None:
+    """Fail before collection when an enforced lane lacks agentmem."""
+    policy = os.environ.get("CCTALLY_AGENTMEM_TEST_POLICY", "optional-local")
+    error = _agentmem_policy_error(
+        policy,
+        shutil.which("agentmem"),
+        os.environ.get("GITHUB_ACTIONS") == "true",
+    )
+    if error:
+        raise pytest.UsageError(error)
 
 
 def _script_path() -> pathlib.Path:

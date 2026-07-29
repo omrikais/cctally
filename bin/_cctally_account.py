@@ -106,6 +106,103 @@ def account_label(conn, account_key: str) -> str:
     return account_key[:8]
 
 
+def _base_label_for_row(row: dict) -> str:
+    """The undecorated label: manual label, else email, else key prefix.
+
+    `cctally account label` sits at the top of the `user > switcher > auto`
+    precedence, so a manual label is the BASE the collision pass decorates — it
+    is never overridden by the email.
+    """
+    if row.get("label"):
+        return str(row["label"])
+    if row.get("email"):
+        return str(row["email"])
+    return str(row.get("account_key") or "")[:8] or "-"
+
+
+def display_label_map_from_rows(rows: "list[dict]") -> "dict[str, str]":
+    """Collision-only display labels for one provider's population (#416 §6).
+
+    Collision handling CANNOT live in `account_label` / `account_label_from_row`:
+    both are scalar — one row, no population and no plan context — so neither can
+    know that its label is shared. This map sees the whole provider population,
+    which is the only place the question is answerable.
+
+    Decision D5: auto-disambiguate ONLY on collision. A label nobody else shares
+    comes back untouched, so a single-account install and every existing golden
+    are unaffected. Two Codex accounts really do auto-label as one email (the
+    `pro` and one `team` account share it; `account_key` correctly differs
+    because it derives from `chatgpt_account_id + email`), and that is the case
+    this exists for.
+
+    The discriminator is the PLAN where the plan separates the tied accounts, and
+    a key prefix where it does not — a group of two `team` accounts on one email
+    is exactly the case D1 says no heuristic can separate, so the fallback is the
+    one thing that IS unique. Disambiguation is per sub-group, not
+    all-or-nothing: the `pro` account in such a group still gets the readable
+    plan discriminator while its two `team` siblings get prefixes.
+
+    Collision detection is CASE-INSENSITIVE because `resolve_account_ref`
+    resolves labels and emails case-insensitively — two labels differing only in
+    case are one ambiguous ref, so they are one collision here too.
+
+    The result is injective by construction: `account_key` prefixes are the
+    terminal discriminator and keys are distinct.
+    """
+    by_base: "dict[str, list[dict]]" = {}
+    for row in rows:
+        key = str(row.get("account_key") or "")
+        if not key or key in (_lib_accounts.UNATTRIBUTED, _lib_accounts.VENDOR_WIDE):
+            continue
+        by_base.setdefault(_base_label_for_row(row).lower(), []).append(row)
+
+    labels: "dict[str, str]" = {}
+    for group in by_base.values():
+        if len(group) == 1:
+            row = group[0]
+            labels[str(row["account_key"])] = _base_label_for_row(row)
+            continue
+        by_plan: "dict[str, list[dict]]" = {}
+        for row in group:
+            plan = str(row.get("plan_type") or "").strip()
+            by_plan.setdefault(plan.lower(), []).append(row)
+        for plan_group in by_plan.values():
+            for row in plan_group:
+                base = _base_label_for_row(row)
+                plan = str(row.get("plan_type") or "").strip()
+                key = str(row["account_key"])
+                discriminator = (
+                    plan if plan and len(plan_group) == 1 else key[:8]
+                )
+                labels[key] = f"{base} ({discriminator})"
+    return labels
+
+
+def display_label_map(conn, provider: str) -> "dict[str, str]":
+    """`display_label_map_from_rows` over one provider's registry."""
+    return display_label_map_from_rows(load_accounts(conn, provider))
+
+
+def display_account_label(conn, account_key: str) -> str:
+    """The population-aware label for ONE key — the scalar entry point every
+    consumer (alert prefix, share label, `--account` JSON, dashboard card) uses.
+
+    Returns exactly what `display_label_map` would for the same key, so the
+    surfaces cannot disagree about what an account is called. Sentinels and keys
+    the registry does not know degrade to the scalar `account_label`, never to a
+    guess.
+    """
+    if account_key in (_lib_accounts.UNATTRIBUTED, _lib_accounts.VENDOR_WIDE):
+        return account_label(conn, account_key)
+    row = conn.execute(
+        "SELECT provider FROM accounts WHERE account_key = ?", (account_key,)
+    ).fetchone()
+    if row is None or not row[0]:
+        return account_label(conn, account_key)
+    return display_label_map(conn, str(row[0])).get(
+        account_key, account_label(conn, account_key))
+
+
 def resolve_account_filter(args, provider: str = "claude", *,
                            needs_cache: bool = False) -> "tuple[str | None, int | None]":
     """Resolve the ``--account <ref>`` render filter (#341, spec §3) to an
@@ -133,10 +230,7 @@ def resolve_account_filter(args, provider: str = "claude", *,
             key = _lib_accounts.resolve_account_ref(conn, ref, provider)
         except _lib_accounts.AccountRefError as exc:
             eprint(f"account: --account {ref!r} is ambiguous or unknown")
-            if exc.candidates:
-                eprint("candidates:")
-                for cand in exc.candidates:
-                    eprint(f"  {cand}")
+            print_ref_candidates(conn, exc.candidates)
             return (None, 2)
     finally:
         conn.close()
@@ -161,7 +255,7 @@ def account_json_fields(account_key: "str | None") -> dict:
         return {}
     conn = _cctally_core.open_db()
     try:
-        label = account_label(conn, account_key)
+        label = display_account_label(conn, account_key)
     finally:
         conn.close()
     return {"accountKey": account_key, "accountLabel": label}
@@ -267,10 +361,19 @@ def _cmd_account_list(args: argparse.Namespace) -> int:
     headers = ["PROVIDER", "LABEL", "EMAIL", "PLAN", "FIRST SEEN",
                "LAST SEEN", "ACTIVE"]
     rows = []
+    # #416 §6: the rendered label is population-aware, so two accounts that
+    # auto-label to one email no longer print identically in the list they are
+    # meant to be distinguished by. Built per provider, since a Claude account
+    # sharing a Codex account's email is not a collision (they never appear in
+    # one list).
+    display: "dict[str, str]" = {}
+    for prov in sorted({str(a["provider"]) for a in accounts if a["provider"]}):
+        display.update(display_label_map_from_rows(
+            [a for a in accounts if a["provider"] == prov]))
     for a in accounts:
         rows.append([
             a["provider"] or "-",
-            account_label_from_row(a),
+            display.get(a["account_key"]) or account_label_from_row(a),
             _dash(a["email"]),
             _dash(a["plan_type"]),
             _date_only(a["first_seen_utc"]),
@@ -290,16 +393,40 @@ def account_label_from_row(a: dict) -> str:
     return (a["account_key"] or "")[:8] or "-"
 
 
+def print_ref_candidates(conn, candidates) -> None:
+    """Print an ambiguity candidate list a user can actually act on (#416 §6).
+
+    Each line carries the population-aware DISPLAY label plus a key PREFIX.
+    Both are needed: `resolve_account_ref` accepts only STORED labels, emails and
+    key prefixes (`bin/_lib_accounts.py`), so a generated collision label such as
+    `omrikais@me.com (pro)` is NOT a resolvable ref — printing it alone would
+    hand the user a string that cannot be typed back. The prefix is the
+    resolvable half; the label is the half that says which account it is.
+
+    Best-effort: an unreadable registry falls back to the bare keys, which is
+    exactly today's output.
+    """
+    if not candidates:
+        return
+    eprint("candidates:")
+    try:
+        labels = {
+            key: display_account_label(conn, key) for key in candidates
+        }
+    except sqlite3.Error:
+        labels = {}
+    for cand in candidates:
+        label = labels.get(cand)
+        eprint(f"  {cand[:8]}  {label}" if label else f"  {cand}")
+
+
 def _resolve_ref_or_exit(conn, ref: str) -> "str | None":
     """Resolve a ref, printing candidates + returning None on error (exit 2)."""
     try:
         return _lib_accounts.resolve_account_ref(conn, ref)
     except _lib_accounts.AccountRefError as exc:
         eprint(f"account: ref {ref!r} is ambiguous or unknown")
-        if exc.candidates:
-            eprint("candidates:")
-            for cand in exc.candidates:
-                eprint(f"  {cand}")
+        print_ref_candidates(conn, exc.candidates)
         return None
 
 
@@ -319,6 +446,10 @@ def _cmd_account_show(args: argparse.Namespace) -> int:
              if row is not None else None)
         snap_count = _count_scoped(conn, "weekly_usage_snapshots", key)
         milestone_count = _count_scoped(conn, "percent_milestones", key)
+        # Resolved while the connection is still open — the map is
+        # population-aware and therefore needs the registry, unlike the scalar
+        # `account_label_from_row` it replaces.
+        display = display_account_label(conn, key) if a is not None else None
     finally:
         conn.close()
     active = resolve_active_account_keys()
@@ -342,7 +473,9 @@ def _cmd_account_show(args: argparse.Namespace) -> int:
         print(json.dumps(_cctally().stamp_schema_version(payload)))
         return 0
 
-    label = (account_label_from_row(a) if a else
+    # #416 §6: population-aware, so `account show` names the account exactly the
+    # way `account list`, the chip, the alert prefix and the share label do.
+    label = (display or
              ("Unattributed" if key == _lib_accounts.UNATTRIBUTED else key[:8]))
     lines = [
         f"Account:    {label}",

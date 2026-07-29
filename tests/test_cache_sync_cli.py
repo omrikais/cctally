@@ -81,7 +81,9 @@ def test_transcript_open_failure_preserves_successful_core_sync(env, capsys):
         raise sqlite3.OperationalError("database is locked")
 
     import sqlite3
-    monkeypatch.setattr(ns["_cctally_cache"], "open_conversations_db", unavailable)
+    monkeypatch.setattr(
+        ns["_cctally_cache"], "open_conversations_db", unavailable,
+    )
     args = argparse.Namespace(
         source="claude", rebuild=False, prune_orphans=False,
         prune_conversations=False,
@@ -102,18 +104,20 @@ def test_transcript_open_failure_makes_explicit_rebuild_nonzero(env, capsys):
         raise sqlite3.OperationalError("database is locked")
 
     import sqlite3
-    monkeypatch.setattr(ns["_cctally_cache"], "open_conversations_db", unavailable)
+    monkeypatch.setattr(
+        ns["_cctally_cache"],
+        "_open_conversations_db_for_recovery",
+        unavailable,
+    )
     args = argparse.Namespace(
         source="claude", rebuild=True, prune_orphans=False,
         prune_conversations=False,
     )
     assert ns["cmd_cache_sync"](args) == 1
     stderr = capsys.readouterr().err
-    assert "provider=claude store=conversations.db phase=open" in stderr
+    assert "store=conversations.db phase=recovery" in stderr
     assert "core accounting/quota sync is complete" in stderr
-    assert (
-        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
-    )
+    assert "Re-run `cctally cache-sync --rebuild`." in stderr
 
 
 def test_transcript_lock_contention_names_phase_and_retry(env, monkeypatch, capsys):
@@ -139,10 +143,9 @@ def test_transcript_lock_contention_names_phase_and_retry(env, monkeypatch, caps
         fcntl.flock(holder, fcntl.LOCK_UN)
         holder.close()
     stderr = capsys.readouterr().err
-    assert "provider=claude store=conversations.db phase=lock" in stderr
-    assert (
-        "Re-run `cctally cache-sync --source claude --rebuild`." in stderr
-    )
+    assert "store=conversations.db phase=recovery" in stderr
+    assert "provider locks" in stderr
+    assert "Re-run `cctally cache-sync --rebuild`." in stderr
 
 
 def test_transcript_file_failure_names_phase_and_retry(

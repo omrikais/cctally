@@ -1118,6 +1118,54 @@ def make_account_label(
     return make_op(at=at, src="account-label", payload=payload)
 
 
+def make_codex_file_account(
+    at: str,
+    *,
+    root_scope: str,
+    file_identity: str,
+    incarnation: int,
+    from_offset: int,
+    account_key: "str | None" = None,
+) -> dict:
+    """Build a ``codex_file_account`` op — the DURABLE attribution decision for
+    one byte range of one rollout incarnation (#416 spec §3.3).
+
+    Why this exists: the Codex account is otherwise re-derived from the live
+    ``auth.json`` on every ingest cycle, so a ``cache-sync --rebuild`` (which
+    re-reads every rollout from offset 0, cache.db being fully re-derivable by
+    design) re-stamps the entire history with whoever is logged in at that
+    moment. A decision that is journaled ONCE and thereafter only replayed is
+    immune to that.
+
+    The identity is ``(root_scope, file_identity, incarnation, from_offset)``,
+    never ``(source_path, offset)`` (spec §3.2): discovery persists the first
+    configured candidate spelling, so reordering ``$CODEX_HOME`` roots or
+    respelling a symlink makes the same physical file miss a path-keyed map; and
+    a truncation or root requalification resets the file to offset zero, so a
+    permanent ``(path, offset)`` interval would overlap newly reused offsets and
+    stamp a replacement file with the previous account. A truncation or
+    requalification opens a NEW ``incarnation`` whose intervals can never
+    overlap the old one.
+
+    Sentinel encoding follows the two-shaped stamp rule
+    (``docs/accounts-gotchas.md``): this is an **op**, so a real account rides
+    ``payload.account_key`` and a stably-absent identity (no auth / api-key mode)
+    is an explicit sentinel decision that OMITS the field. Never write the
+    literal ``"unattributed"``. A **torn** read appends NOTHING at all — it is
+    not a decision (spec §3.6).
+    """
+    payload = {
+        "kind": "codex_file_account",
+        "root_scope": root_scope,
+        "file_identity": file_identity,
+        "incarnation": incarnation,
+        "from_offset": from_offset,
+    }
+    if account_key is not None:
+        payload["account_key"] = account_key
+    return make_op(at=at, src="codex-file-account", payload=payload)
+
+
 # --------------------------------------------------------------------------
 # segment naming + canonical order
 # --------------------------------------------------------------------------

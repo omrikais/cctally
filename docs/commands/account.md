@@ -55,6 +55,18 @@ cctally config set budget.codex.accounts '{"<ref-or-key>": 30}'    # Codex
 
 Vendor-wide budgets (`budget.weekly_usd`, `budget.codex.amount_usd`) keep today's semantics and count **all** accounts including unattributed spend; unattributed spend can never trip a per-account budget alert.
 
+## The dashboard account selector
+
+When a provider has more than one real account, the dashboard shows a row of account chips under the hero and the `a` key cycles through them (All accounts → each account → back to All). The selection is per source and is remembered across reloads; an account that disappears from the envelope falls back to All without losing the stored choice, so it re-engages if the account comes back.
+
+**Codex — the selection re-scopes the whole view.** Picking an account switches the daily, monthly and weekly period tables, Sessions, Projects, the trend chart, cache diagnostics, the forecast, budget, quota blocks, alerts and the milestone history to that account alone — including each panel's expanded view, so clicking a panel open never widens it back to every account. Its weekly percentage, reset, spend and tokens are its own, and opening a past cycle from the hero shows that account's own cycle rather than the merged one. Nothing is added together in the browser: each account's figures are computed server-side, because model breakdowns cannot be reassembled from totals and quota percentages are not additive.
+
+An account with no recorded usage renders an explicit "no Codex activity recorded" note with its percentage and reset left blank, rather than continuing to show whichever account you were looking at before. An account that has spend but no live cycle keeps its spend and leaves only the percentage and reset blank. The reserved `unattributed` bucket stays selectable and shows totals only — it holds Codex history recorded before per-file attribution existed, which is deliberately never guessed at. Alerts that belong to the whole vendor rather than to one account, such as a vendor-wide budget crossing, stay visible under a focused account and are labelled `vendor-wide`.
+
+Under **All accounts** the hero headline is the merged spend and token total across every account, including the unattributed bucket — the same figures the cards below it add up to. The headline percentage, reset, `$/1%`, forecast and week range are deliberately blank instead, because independent quota allowances are never blended into a single number and no single account's cycle window describes the whole; each blank carries a `per account` pointer to the cards, where each account's own percentage, reset and spend appear. Opening the cycle modal from that hero shows the same per-account table rather than any one account's milestone ladder — pick an account chip first to see a ladder. A single-account install is unchanged throughout.
+
+**Claude — the chip is a hero decoration only.** Claude usage is stamped per account and reported per account by `--account` on the CLI, but the dashboard does not yet split its panels by account. Sessions and Recent alerts therefore keep an explicit `all accounts (unfiltered)` caption while a Claude account is selected, so the panel never implies a filter it is not applying.
+
 ## Alerts
 
 Alert notification text gains a `[<label>]` prefix only when the vendor has more than one real account. The `alerts.log` file carries the account key as its trailing (8th) tab-delimited field on every line (`*` for vendor-wide rows).

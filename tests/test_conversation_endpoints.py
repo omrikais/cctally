@@ -682,16 +682,16 @@ def test_kernel_exception_returns_clean_500(tmp_path, monkeypatch):
         srv.shutdown()
 
 
-def test_cache_open_failure_returns_500(tmp_path, monkeypatch):
-    """A failure at ``open_cache_db()`` itself (BEFORE the query) must surface
-    as a clean HTTP 500 with ``{"error": "cache unavailable: ..."}`` on all
-    three conversation routes. Distinct from ``test_kernel_exception_…``: this
-    fires at connection time, not mid-query, exercising the FIRST try/except of
-    the shared scaffold. Characterizes the open-failure branch the #151
-    scaffold-collapse must preserve byte-for-byte (without the
-    ``except (DatabaseError, OSError)`` the OSError propagates out of
-    ``do_GET`` and the client sees a reset, not a 500 — so this is
-    non-vacuous)."""
+def test_conversation_store_open_failure_is_private_and_truthful(
+    tmp_path, monkeypatch, capsys,
+):
+    """A transcript-store open failure must stay a clean, privacy-safe 500.
+
+    Every JSON conversation route shares the same open/query/close scaffold.
+    The response names the transcript store generically, points diagnosis to
+    ``doctor``, and never misattributes the failure to cache.db or reflects the
+    raw exception. Detailed diagnostics remain in the server log.
+    """
     ns = load_script()
     srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
     try:
@@ -699,23 +699,50 @@ def test_cache_open_failure_returns_500(tmp_path, monkeypatch):
         import _cctally_dashboard as _dash
 
         def _boom():
-            raise OSError("disk gone")
+            raise OSError(
+                "unable to open /private/secret/conversations.db; "
+                "SQL: SELECT content FROM conversation_messages"
+            )
 
         # Patch the binding the handler resolves at request time
         # (LOAD_GLOBAL in _cctally_dashboard's namespace). Seeding already
-        # happened in _boot via ns["open_cache_db"], so this only affects
+        # happened in _boot, so this only affects
         # the live request path.
         monkeypatch.setattr(_dash, "open_conversations_db", _boom)
-        for route in ("/api/conversations",
-                      "/api/conversation/s1",
-                      "/api/conversation/search?q=token"):
+        routes = (
+            "/api/conversations",
+            "/api/conversations?source=claude",
+            "/api/conversations/facets",
+            "/api/conversations/facets?source=claude",
+            "/api/conversation/s1",
+            "/api/conversation/search?q=token",
+            "/api/conversation/search?source=claude&q=token",
+            "/api/conversation/s1/find?q=token",
+            "/api/conversation/s1/outline",
+            "/api/conversation/s1/prompts",
+            "/api/conversation/s1/payload?tool_use_id=t1&which=result",
+            "/api/conversation/s1/export",
+            "/api/conversation/s1/anon-map",
+            "/api/conversation/s1/media?tool_use_id=t1&index=0",
+        )
+        for route in routes:
             status, body = _get(port, route)
             assert status == 500, (route, status, body)
             payload = json.loads(body)
-            assert payload.get("error", "").startswith("cache unavailable:"), \
-                (route, payload)
+            assert payload == {
+                "error": "transcript store unavailable; "
+                "run cctally doctor for details"
+            }, (route, payload)
+            body_text = body.decode("utf-8")
+            assert "cache" not in body_text.casefold(), (route, body)
+            assert "/private/secret" not in body_text, (route, body)
+            assert "SELECT content" not in body_text, (route, body)
     finally:
         srv.shutdown()
+        srv.server_close()
+    server_log = capsys.readouterr().err
+    assert "/private/secret/conversations.db" in server_log
+    assert "SELECT content FROM conversation_messages" in server_log
 
 
 def test_api_data_transcripts_enabled_is_host_aware(tmp_path, monkeypatch):

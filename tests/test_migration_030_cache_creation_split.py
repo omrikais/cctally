@@ -101,6 +101,73 @@ def test_replay_is_idempotent(conn):
         "SELECT cache_create_1h_tokens, COUNT(*) FROM session_entries").fetchone() == (700, 1)
 
 
+def test_physical_conflict_updates_only_split_and_mutation_stamps(conn):
+    """#418: the replay-only physical-key handler enriches a retained row.
+
+    Every other incoming mutable value deliberately differs.  The physical
+    identity and first account stamp are sticky, while timestamp/model/token/
+    usage/speed/raw-cost values remain byte-for-byte those of the stored row.
+    """
+    from _cctally_cache import SESSION_ENTRY_UPSERT_SQL_REWALK as SQL
+
+    stored = (
+        "/physical.jsonl", 17, "2026-07-25T00:00:00+00:00", "stored-model",
+        None, None, 10, 20, 1000, 5, '{"stored":true}', "standard", 1.25,
+        None, None, 3, "2026-07-25T00:00:00+00:00", "account-first",
+    )
+    incoming = (
+        "/physical.jsonl", 17, "2026-07-24T00:00:00+00:00", "incoming-model",
+        None, None, 90, 80, 1000, 70, '{"incoming":true}', "fast", 9.75,
+        700, 300, 9, "2026-07-24T00:00:00+00:00", "account-later",
+    )
+    _insert(conn, SQL, stored)
+    before = conn.execute(
+        "SELECT source_path, line_offset, timestamp_utc, model, msg_id, req_id, "
+        "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+        "usage_extra_json, speed, cost_usd_raw, cache_create_1h_tokens, "
+        "cache_create_5m_tokens, mutation_seq, mutation_min_ts, account_key "
+        "FROM session_entries"
+    ).fetchone()
+
+    _insert(conn, SQL, incoming)
+    after = conn.execute(
+        "SELECT source_path, line_offset, timestamp_utc, model, msg_id, req_id, "
+        "input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, "
+        "usage_extra_json, speed, cost_usd_raw, cache_create_1h_tokens, "
+        "cache_create_5m_tokens, mutation_seq, mutation_min_ts, account_key "
+        "FROM session_entries"
+    ).fetchone()
+
+    expected = list(before)
+    expected[13:17] = [
+        700,
+        300,
+        9,
+        "2026-07-24T00:00:00+00:00",
+    ]
+    assert after == tuple(expected)
+    assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("stored_h,stored_m", [
+    (None, 300),
+    (700, None),
+    (700, 300),
+])
+def test_physical_conflict_requires_the_whole_stored_split_absent(
+        conn, stored_h, stored_m):
+    """A partial or complete retained split is not replay-overwritten."""
+    from _cctally_cache import SESSION_ENTRY_UPSERT_SQL_REWALK as SQL
+
+    stored = list(_row("/physical.jsonl", 17, None, None, None))
+    stored[13:15] = [stored_h, stored_m]
+    incoming = list(_row("/physical.jsonl", 17, None, None, 600))
+    _insert(conn, SQL, tuple(stored))
+    before = conn.execute("SELECT * FROM session_entries").fetchone()
+    _insert(conn, SQL, tuple(incoming))
+    assert conn.execute("SELECT * FROM session_entries").fetchone() == before
+
+
 # ---------------------------------------------------------------------------
 # Per-migration goldens for cache migration 030_session_entries_cache_creation_split
 # (#195). The two split columns are added by `_apply_cache_schema`

@@ -74,3 +74,53 @@ def test_sync_failure_is_null_when_sync_is_healthy(ns):
     )
 
     assert envelope["sync_failure"] is None
+
+
+def test_typed_conversations_corruption_never_becomes_cache_recovery(ns):
+    """Typed transcript ownership wins over corruption-shaped raw text."""
+    import _cctally_tui as tui
+
+    now = dt.datetime(2026, 7, 24, 8, 0, tzinfo=dt.timezone.utc)
+    raw_error = (
+        "conversation-title: database disk image is malformed at "
+        "/private/secret/conversations.db"
+    )
+    snap = dataclasses.replace(
+        ns["_empty_dashboard_snapshot"](),
+        generated_at=now,
+        last_sync_error=raw_error,
+        sync_failures=(
+            tui.SyncFailureAttribution(
+                leg="conversation-title",
+                database="conversations",
+                corruption=True,
+            ),
+        ),
+    )
+
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+
+    assert envelope["sync_failure"] == {
+        "kind": "server_sync",
+        "label": "⚠ server sync error",
+        "detail": "The server could not complete its background sync.",
+        "action": None,
+    }
+    assert "/private/secret" not in str(envelope["sync_failure"])
+
+
+def test_tui_attribution_preserves_conversations_ownership(ns):
+    import _cctally_tui as tui
+
+    class NoStatsProbe:
+        def execute(self, _sql):
+            raise AssertionError("transcript attribution queried stats.db")
+
+    database, corruption = tui._tui_attribute_corruption(
+        NoStatsProbe(),
+        RuntimeError("database disk image is malformed"),
+        database="conversations",
+    )
+
+    assert database == "conversations"
+    assert corruption is True

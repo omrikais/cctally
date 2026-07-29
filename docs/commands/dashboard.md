@@ -209,10 +209,12 @@ In the single-provider variants, `ArrowUp`/`ArrowDown` step to the newer/older c
 A compact per-provider navigation index rides the live SSE envelope (`current_week.week_index` for Claude, `sources.codex.data.quota.cycle_index` for Codex), built only on non-idle snapshot rebuilds. The complete payload for one selected cycle—its single opaque milestone segment and exact overlapping five-hour block list—is fetched on demand from:
 
 ```
-GET /api/milestones/<source>/week/<key>
+GET /api/milestones/<source>/week/<key>[?account=<account_key>]
 ```
 
 `<source>` ∈ `claude | codex`. For both providers, `<key>` is an opaque server-issued `milestone_cycle:*` key obtained from the envelope index; never hand-construct it or expose provider identity fields. The response is snake_case JSON with `Cache-Control: no-cache`; the client reuses it client-side keyed by `(source, key, detail_stamp)`. A malformed key or source returns `400`; a key that no longer resolves returns `404` with a machine-readable `{ code: "unknown_key", reason }` body (`reason` ∈ `pruned | rebuild_pending | projection_incoherent | unknown`).
+
+Under Codex account focus, pass the selected account as `?account=<account_key>` (a 32-hex key or the literal `unattributed`) — the same qualifier `/api/source/` already takes. It must be the account whose `cycle_index` produced `<key>`: the index is built per account, so a key from one account's index is not guaranteed to resolve against the merged enumeration, and the focused response carries that account's own crossings and its own spend rather than every account's on the same Codex home. Omitting the qualifier is the merged "All accounts" response and is unchanged. The vendor-wide `*` sentinel is rejected (it names no cycle), as is the qualifier on `claude` (Claude weeks are not account-partitioned on this route).
 
 ## Manual verification (post-v2)
 
@@ -349,10 +351,20 @@ combined transcript body.
 
 ## Conversation viewer endpoints (Plan 2)
 
-The three `/api/conversation*` routes serve **raw transcript prose** read from
-the local `cache.db`. Because that prose is far more sensitive than the
+The `/api/conversation*` routes serve **raw transcript prose** read from the
+local `conversations.db`. Because that prose is far more sensitive than the
 aggregate usage numbers the rest of `/api/*` exposes, those routes sit behind a
 fail-closed privacy gate that is independent of the general LAN bind.
+
+If the transcript store cannot be opened, its shared JSON routes return HTTP
+500 with only `transcript store unavailable; run cctally doctor for details`.
+The server log retains the underlying exception for local diagnosis, but the
+response and dashboard never expose raw SQLite text, SQL, or filesystem paths.
+This failure is not attributed to `cache.db`: accounting, quota, and session
+panels plus `/api/stream` remain available, while transcript-derived titles
+degrade to a dash. Run `cctally doctor` for the store-specific diagnosis; when
+Doctor confirms corruption, the supported recovery is
+`cctally cache-sync --rebuild`.
 
 **Loopback-default gate.** By default the conversation routes are served **only
 over loopback** — even when the dashboard itself is LAN-bound (`--host 0.0.0.0`

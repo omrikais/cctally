@@ -137,7 +137,8 @@ _WSA = "2026-01-01T00:00:00+00:00"
 _WEA = "2026-01-07T23:59:59+00:00"
 
 
-def _seed_stats(conn, *, with_open_block=False, with_arming=False):
+def _seed_stats(conn, *, with_open_block=False, with_arming=False,
+                with_terminal=False):
     """Seed one realistic row per journal-covered stats table, with valid FK
     links (percent milestone -> snapshot/cost/reset; 5h milestone -> snapshot/
     block-by-window-key). All journal_id left NULL (pre-cutover)."""
@@ -242,6 +243,21 @@ def _seed_stats(conn, *, with_open_block=False, with_arming=False):
            "activated_at_utc) VALUES (?,?,?,?,?,?,?)",
            ("codex", "root-arm", "5h", "primary", 300, "fp-arm-1",
             "2026-01-04T10:30:00+00:00"))
+    if with_terminal:
+        # A quota_threshold_events row — TERMINAL alert evidence (#416 §7.2).
+        # `disposition`, `alerted_at` and `created_at_utc` must survive
+        # cutover -> rebuild VERBATIM, or the rebuild forgets the alert already
+        # fired and the next reconcile is free to fire it again. Distinct root
+        # key (`root-term`) so no seeded observation / reconcile re-derives it.
+        ex("INSERT INTO quota_threshold_events (source, source_root_key, "
+           "logical_limit_key, observed_slot, window_minutes, resets_at_utc, "
+           "threshold, qualifying_kind, qualifying_percent, projected_percent, "
+           "severity, created_at_utc, disposition, alerted_at, suppressed_at, "
+           "account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           ("codex", "root-term", "5h", "primary", 300,
+            "2026-01-04T14:00:00+00:00", 90, "actual", 92.5, None, "warn",
+            "2026-01-04T11:15:00+00:00", "alerted", "2026-01-04T11:15:00+00:00",
+            None, "unattributed"))
     if with_open_block:
         ex("INSERT INTO five_hour_blocks (five_hour_window_key, "
            "five_hour_resets_at, block_start_at, first_observed_at_utc, "
@@ -294,12 +310,13 @@ def _seed_quota(core):
 
 
 def _build_legacy_install(ns, *, with_open_block=False, with_quota=False,
-                          with_arming=False):
+                          with_arming=False, with_terminal=False):
     """Build a legacy-head-13 stats.db (no journal, journal_id NULL, uv=13)."""
     core = _core()
     conn = core.open_db()  # fresh -> empty cutover to epoch (no bootstrap)
     try:
-        _seed_stats(conn, with_open_block=with_open_block, with_arming=with_arming)
+        _seed_stats(conn, with_open_block=with_open_block,
+                    with_arming=with_arming, with_terminal=with_terminal)
         for t in _JOURNAL_TABLES:
             conn.execute(f"UPDATE {t} SET journal_id = NULL")
         conn.execute("DROP TABLE IF EXISTS stats_open_fixups")
@@ -825,5 +842,166 @@ def test_db_recover_stats_is_retired(ns, capsys):
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == \
             core.STATS_INDEX_EPOCH
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# #416 Task 10 — terminal quota alert evidence must survive a rebuild
+#
+# `quota_threshold_events` is in NEITHER `_HARVEST_SPECS` (eight families,
+# none of them this one) nor — before #416 — `_CUTOVER_SPECS`, and
+# `rematerialize_quota_projection_for_rebuild` runs with
+# `alert_eligible_roots=frozenset()`, so a rebuild could not recreate an
+# `alerted` row at all. Every rebuild silently discarded the evidence that an
+# alert had already fired — which is exactly what would let it fire again.
+# ==========================================================================
+
+def _terminal_row(conn, root="root-term"):
+    return conn.execute(
+        "SELECT disposition, alerted_at, suppressed_at, created_at_utc, "
+        "       severity, qualifying_kind, qualifying_percent, threshold "
+        "  FROM quota_threshold_events WHERE source_root_key = ?", (root,),
+    ).fetchone()
+
+
+def test_terminal_quota_events_survive_rebuild_verbatim(ns, tmp_path):
+    _build_legacy_install(ns, with_terminal=True)
+    core, jr = _core(), _jr()
+    live = core.open_db()  # cutover exports the terminal row as a qte: evt
+    try:
+        before = _terminal_row(live)
+        assert before is not None, "cutover dropped the terminal event"
+        assert before[0] == "alerted"
+    finally:
+        live.close()
+
+    target = tmp_path / "rb.db"
+    jr.rebuild_stats_index(target_path=str(target))
+    rb = core.open_db(_target_path=str(target))
+    try:
+        after = _terminal_row(rb)
+        assert after is not None, "rebuild lost the terminal alert evidence"
+        assert after == before, (
+            f"rebuild did not preserve the terminal event verbatim: "
+            f"{after!r} != {before!r}")
+        assert after[1] == "2026-01-04T11:15:00+00:00", (
+            "alerted_at was re-stamped at rebuild time instead of replayed")
+    finally:
+        rb.close()
+
+
+def test_rebuild_fires_no_alerts_for_a_replayed_terminal_event(ns, tmp_path):
+    """Acceptance criterion 8's second half. Replaying terminal evidence must
+    RECORD that an alert fired, never dispatch one."""
+    _build_legacy_install(ns, with_terminal=True)
+    core, jr = _core(), _jr()
+    core.open_db().close()
+
+    dispatched = []
+    import _cctally_journal as journal
+    saved = getattr(journal, "ALERT_DISPATCHER", None)
+    journal.ALERT_DISPATCHER = lambda *a, **k: dispatched.append((a, k))
+    try:
+        target = tmp_path / "rb.db"
+        jr.rebuild_stats_index(target_path=str(target))
+    finally:
+        if saved is None:
+            delattr(journal, "ALERT_DISPATCHER")
+        else:
+            journal.ALERT_DISPATCHER = saved
+    assert dispatched == [], f"rebuild dispatched {len(dispatched)} alert(s)"
+
+    rb = core.open_db(_target_path=str(target))
+    try:
+        assert _terminal_row(rb) is not None
+    finally:
+        rb.close()
+
+
+def test_the_terminal_event_kind_is_registered_in_both_registries(ns):
+    jr = _jr()
+    assert "quota_threshold_event" in jr._EVT_SPECS
+    assert any(spec.table == "quota_threshold_events"
+               for spec in jr._CUTOVER_SPECS), (
+        "quota_threshold_events has no _CutoverSpec, so a legacy install's "
+        "terminal alert evidence is dropped at cutover")
+
+
+def test_the_terminal_fold_applier_converges_rather_than_duplicating(ns):
+    """The table has no `journal_id` column, so idempotence cannot ride an
+    `INSERT OR IGNORE` on the journal id — it has to be the natural-key
+    upsert, exactly like `quota_alert_arming`."""
+    _build_legacy_install(ns, with_terminal=True)
+    core, jr = _core(), _jr()
+    conn = core.open_db()
+    try:
+        evt = {
+            "id": "qte:x", "kind": "quota_threshold_event",
+            "at": "2026-01-04T11:15:00+00:00",
+            "payload": {
+                "source": "codex", "source_root_key": "root-term",
+                "account_key": "unattributed", "logical_limit_key": "5h",
+                "observed_slot": "primary", "window_minutes": 300,
+                "resets_at_utc": "2026-01-04T14:00:00+00:00", "threshold": 90,
+                "qualifying_kind": "actual", "qualifying_percent": 92.5,
+                "projected_percent": None, "severity": "warn",
+                "created_at_utc": "2026-01-04T11:15:00+00:00",
+                "disposition": "alerted",
+                "alerted_at": "2026-01-04T11:15:00+00:00",
+                "suppressed_at": None,
+            },
+        }
+        jr._apply_quota_threshold_event(conn, evt)
+        jr._apply_quota_threshold_event(conn, evt)
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM quota_threshold_events "
+            "WHERE source_root_key='root-term'").fetchone()[0] == 1
+        assert _terminal_row(conn)[0] == "alerted"
+    finally:
+        conn.close()
+
+
+def test_the_fold_applier_restores_an_alerted_row_over_a_rederived_suppression(ns):
+    """Ordering safety. The rebuild's re-materialization can legitimately
+    re-derive the same crossing as a fresh `suppressed_backfill` row. Whichever
+    of the two runs second, the JOURNALED terminal fact is what stands — so the
+    applier upserts rather than `INSERT OR IGNORE`-ing."""
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    conn = core.open_db()
+    try:
+        conn.execute(
+            "INSERT INTO quota_threshold_events (source, source_root_key, "
+            "logical_limit_key, observed_slot, window_minutes, resets_at_utc, "
+            "threshold, qualifying_kind, qualifying_percent, projected_percent, "
+            "severity, created_at_utc, disposition, alerted_at, suppressed_at, "
+            "account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("codex", "root-x", "5h", "primary", 300,
+             "2026-01-04T14:00:00+00:00", 90, "actual", 92.5, None, "warn",
+             "2026-02-01T00:00:00+00:00", "suppressed_backfill", None,
+             "2026-02-01T00:00:00+00:00", "unattributed"))
+        jr._apply_quota_threshold_event(conn, {
+            "id": "qte:y", "kind": "quota_threshold_event",
+            "at": "2026-01-04T11:15:00+00:00",
+            "payload": {
+                "source": "codex", "source_root_key": "root-x",
+                "account_key": "unattributed", "logical_limit_key": "5h",
+                "observed_slot": "primary", "window_minutes": 300,
+                "resets_at_utc": "2026-01-04T14:00:00+00:00", "threshold": 90,
+                "qualifying_kind": "actual", "qualifying_percent": 92.5,
+                "projected_percent": None, "severity": "warn",
+                "created_at_utc": "2026-01-04T11:15:00+00:00",
+                "disposition": "alerted",
+                "alerted_at": "2026-01-04T11:15:00+00:00",
+                "suppressed_at": None,
+            },
+        })
+        conn.commit()
+        row = _terminal_row(conn, "root-x")
+        assert row[0] == "alerted"
+        assert row[1] == "2026-01-04T11:15:00+00:00"
+        assert row[2] is None
     finally:
         conn.close()

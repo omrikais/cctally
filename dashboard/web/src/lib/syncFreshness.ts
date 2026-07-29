@@ -18,23 +18,33 @@ function safeAge(ageS: number): number {
   return Number.isFinite(ageS) && ageS > 0 ? Math.floor(ageS) : 0;
 }
 
-export function humanizeAge(ageS: number): string {
-  const s = safeAge(ageS);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+// The DURATION tiers, with no direction attached (#416 QA P2-A). `humanizeAge`
+// is this plus " ago"; a FUTURE interval — a countdown to a reset — is this
+// plus nothing. Splitting them is the fix for "resets in 4d 10h ago": the
+// caller was appending its own "resets in" prefix to a string that already
+// carried a past-tense suffix, and only the `secs === 0` case had been
+// special-cased, so every card with a future reset contradicted itself.
+export function humanizeDuration(seconds: number): string {
+  const s = safeAge(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
   if (s < 86400) {
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
-    return m === 0 ? `${h}h ago` : `${h}h ${m}m ago`;
+    return m === 0 ? `${h}h` : `${h}h ${m}m`;
   }
-  // Days tier (#259): raw ">24h" ages read poorly as "27h 9m ago" — the
-  // reported freshness surfaces idle for a full day-plus. Drop to "1d 3h ago"
-  // (minutes elided at this magnitude). Coarser than the hour tier by design.
-  // The fresh/aging/stale buckets cap at 30min, so this text-only tier never
+  // Days tier (#259): raw ">24h" ages read poorly as "27h 9m" — the reported
+  // freshness surfaces idle for a full day-plus. Drop to "1d 3h" (minutes
+  // elided at this magnitude). Coarser than the hour tier by design. The
+  // fresh/aging/stale buckets cap at 30min, so this text-only tier never
   // affects syncFreshness() bucketing.
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
-  return h === 0 ? `${d}d ago` : `${d}d ${h}h ago`;
+  return h === 0 ? `${d}d` : `${d}d ${h}h`;
+}
+
+export function humanizeAge(ageS: number): string {
+  return `${humanizeDuration(ageS)} ago`;
 }
 
 export function syncFreshness(ageS: number): SyncFreshness {

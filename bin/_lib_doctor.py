@@ -184,6 +184,11 @@ class DoctorState:
     # absent (pre-first-sync) or cache unreadable — check degrades OK.
     parse_health_claude: Optional[dict] = None
     parse_health_codex: Optional[dict] = None
+    # #416 review B4: `{"files": N, "at": iso}` written by a whole-tree Codex
+    # sync that deferred files because a `<root>/auth.json` read torn, deleted
+    # by the next whole-tree sync that defers none. None = key absent (the
+    # normal state) or cache unreadable — the check degrades OK.
+    codex_torn_deferred: Optional[dict] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -191,6 +196,7 @@ class DoctorState:
     # "open failed: ..." | None = not run.
     stats_db_quick_check: Optional[str] = None
     cache_db_quick_check: Optional[str] = None
+    conversations_db_quick_check: Optional[str] = None
     # #279 S2 (F5c): non-blocking flock probes on the two sync lock files
     # (name -> True held / False free / None unreadable). Probe never
     # creates files (doctor read-only contract). None = probe errored.
@@ -1899,7 +1905,9 @@ def _check_data_parse_health(s: DoctorState) -> CheckResult:
 
 def _check_db_integrity(s: DoctorState) -> CheckResult:
     details = {"stats_quick_check": s.stats_db_quick_check,
-               "cache_quick_check": s.cache_db_quick_check}
+               "cache_quick_check": s.cache_db_quick_check,
+               "conversations_quick_check":
+                   s.conversations_db_quick_check}
     if s.stats_db_quick_check is not None and s.stats_db_quick_check != "ok":
         return CheckResult(
             id="db.integrity", title="Integrity", severity="fail",
@@ -1920,7 +1928,27 @@ def _check_db_integrity(s: DoctorState) -> CheckResult:
                          "`cctally cache-sync --rebuild`."),
             details=details,
         )
-    if s.stats_db_quick_check is None and s.cache_db_quick_check is None:
+    if (
+        s.conversations_db_quick_check is not None
+        and s.conversations_db_quick_check != "ok"
+    ):
+        return CheckResult(
+            id="db.integrity", title="Integrity", severity="warn",
+            summary=(
+                "conversations.db quick_check: "
+                f"{s.conversations_db_quick_check}"
+            ),
+            remediation=(
+                "conversations.db is re-derivable — run "
+                "`cctally cache-sync --rebuild`."
+            ),
+            details=details,
+        )
+    if (
+        s.stats_db_quick_check is None
+        and s.cache_db_quick_check is None
+        and s.conversations_db_quick_check is None
+    ):
         return CheckResult(
             id="db.integrity", title="Integrity", severity="ok",
             summary="not checked (fast gather — run `cctally doctor`)",
@@ -2505,6 +2533,42 @@ def _check_accounts_freshness(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_accounts_codex_identity(s: DoctorState) -> CheckResult:
+    """WARN while a torn `<codex root>/auth.json` is deferring Codex ingest.
+
+    The defer is correct — spec §3.6's stable-read protocol never guesses an
+    account — but since #416 a growing ALREADY-DECIDED rollout also consults
+    `auth.json`, so a persistently torn file (truncated, half-written, replaced
+    by a directory) halts every rollout under that root, not just the
+    never-decided ones. `cache-sync` still exits 0, so this leg is the only
+    standing signal that Codex spend and quota have stopped moving.
+
+    Not R8-gated: it names no account and adds no per-account column, so it
+    reports at any account count (docs/accounts-gotchas.md).
+    """
+    st = s.codex_torn_deferred or {}
+    try:
+        files = int(st.get("files") or 0)
+    except (TypeError, ValueError):
+        files = 0
+    details = {"files": files, "at": st.get("at")}
+    if files > 0:
+        return CheckResult(
+            id="accounts.codex_identity", title="Codex account identity",
+            severity="warn",
+            summary=(f"{files} Codex rollout(s) deferred — auth.json read torn; "
+                     "no usage attributed from them"),
+            remediation=("Check the Codex auth.json (re-run `codex login` if it is "
+                         "truncated), then `cctally cache-sync --source codex`"),
+            details=details,
+        )
+    return CheckResult(
+        id="accounts.codex_identity", title="Codex account identity",
+        severity="ok", summary="no deferred Codex ingest",
+        remediation=None, details=details,
+    )
+
+
 def _check_accounts_attribution(s: DoctorState) -> CheckResult:
     """WARN when Claude usage is flowing but landing in `unattributed` despite a
     resolved active account (the stamping pipeline is broken), or while the
@@ -2599,6 +2663,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     )),
     ("accounts", "Accounts", (
         ("accounts.identity", "_check_accounts_identity"),
+        ("accounts.codex_identity", "_check_accounts_codex_identity"),
         ("accounts.registry", "_check_accounts_registry"),
         ("accounts.freshness", "_check_accounts_freshness"),
         ("accounts.attribution", "_check_accounts_attribution"),

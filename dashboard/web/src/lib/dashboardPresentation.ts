@@ -5,6 +5,7 @@ import type {
   CacheReportDailyRow,
   CodexPeriodBucket,
   CodexQuotaBlockRow,
+  CodexQuotaDomain,
   CodexSourceData,
   DailyPanelRow,
   DashboardSelection,
@@ -512,6 +513,50 @@ export interface ForecastPresentation {
   verdict: 'ok' | 'cap' | 'capped' | null;
 }
 
+// #416 QA P1 — the ONE liveness question every Codex forecast read must ask
+// before it publishes a "current quota".
+//
+// A retained history row keeps a window's last observed percentage and its
+// forecast as EVIDENCE, long after the window itself has reset — the reported
+// case had a weekly window captured 2026-07-13 whose `resets_at` was already
+// 2026-07-19, nine days dead by the snapshot's clock, still carrying
+// `current_percent: 41` and `confidence: 'medium'`.
+//
+// The server already answers the question and publishes the answer:
+// `_quota_read_model` appends a `quota.summary.active[]` row, keyed identically
+// to the history row, only when `baseline.resets_at > now`. That set is exactly
+// this predicate, per WINDOW. Reading it keeps the decision in the one place
+// that owns it — build time — instead of re-deriving cycle validity on the
+// client from a view #350 documented as lossy for precisely that purpose.
+//
+// PASS THE RIGHT SUBTREE (#416 QA P2-1). The active row's key is
+// `dashboard_resource_key("quota", "codex", source_root_key, logical_limit_key,
+// observed_slot, window_minutes)` and carries NO account — nor does
+// `logical_limit_key`, whose `limitId` is one literal for the whole provider. So
+// two accounts sharing one `$CODEX_HOME` root — the shape
+// `adopt_unidentified_observations` and `_codex_account_scopes_wire` are both
+// written for — produce two history rows under ONE key, and the merged parent
+// lists that key once, contributed by whichever account is live. A liveness
+// lookup for ONE account must therefore come from THAT account's
+// `account_scopes` child, whose `quota` is built by `_quota_read_model` over
+// that account's own observations. The parent's set answers only the
+// provider-wide question "is any window with this key live", which is not the
+// question a per-account row is asking.
+//
+// NOT `forecast.status === 'ok'`: that is derived from freshness and sample
+// count alone (`forecast_quota`), so it says nothing about whether the window is
+// still running, and gating on it would blank a LIVE window whose forecast is
+// merely stale or low-confidence — a worse defect than the one this fixes.
+//
+// NOT `accounts[].weeklyPercent`: that is the per-ACCOUNT cycle decision, and it
+// is additionally forced to null for the unattributed bucket (dimmed, totals
+// only) whose window may still be live.
+export function codexLiveQuotaKeys(
+  quota: CodexQuotaDomain | null | undefined,
+): Set<string> {
+  return new Set((quota?.summary.active ?? []).map((row) => row.key));
+}
+
 export function presentationForecast(env: Envelope | null, selection: SourceName): ForecastPresentation {
   if (selection === 'claude') {
     const fc = env?.forecast ?? env?.sources?.claude?.data?.hero.forecast ?? null;
@@ -536,19 +581,108 @@ export function presentationForecast(env: Envelope | null, selection: SourceName
   const weekly = accountHistories.find((row) => row.window_minutes === 10_080)
     ?? accountHistories[0];
   const forecast = weekly?.forecast;
-  const projected = forecast?.status === 'ok' ? forecast.projected_percent : null;
+  // #416 QA P1: an already-reset window is not a current quota. `status` is a
+  // forecast-QUALITY axis, so it gates the projection independently.
+  //
+  // `codex` here is ALREADY the right subtree for the shared-root collision:
+  // under focus `composeScopedData` replaces `quota` wholesale with the
+  // account's child, so the histories and the active set come from the SAME
+  // child; unfocused-and-decorated, this branch is not the surface that
+  // publishes a per-account number (`presentationCodexAccountForecasts` is);
+  // undecorated, the parent has exactly one account.
+  const live = weekly != null && codexLiveQuotaKeys(codex?.quota).has(weekly.key);
+  const projected = live && forecast?.status === 'ok' ? forecast.projected_percent : null;
   const budget = codex?.budget.status;
   return {
     projected,
-    recent: forecast?.current_percent ?? null,
+    recent: live ? forecast?.current_percent ?? null : null,
     primaryLabel: 'Projected @ reset',
     recentLabel: weekly?.label ?? 'Current quota',
     foot: [
-      { label: 'Confidence', value: forecast?.confidence ?? 'unavailable' },
+      { label: 'Confidence', value: (live && forecast?.confidence) || 'unavailable' },
       { label: 'Budget pace', value: budget?.pace.daily_usd == null ? '—' : `$${budget.pace.daily_usd.toFixed(2)}/day` },
     ],
     verdict: projected == null ? null : projected >= 100 ? 'capped' : projected >= 90 ? 'cap' : 'ok',
   };
+}
+
+// #416 QA P0 — the per-account Codex forecast disclosure.
+//
+// `presentationForecast` resolves ONE weekly window, and under decoration
+// `quota.histories` carries one weekly row PER ACCOUNT. Every "All accounts"
+// forecast surface therefore published whichever account sorted first as the
+// provider's forecast, unlabelled, while a sibling could be sixty points away
+// and carry the opposite verdict.
+//
+// D6 forbids blending independent allowances and no summary statistic over them
+// (a max, a mean, "the most urgent") is the quantity a forecast slot claims to
+// hold — so the surfaces blank. Where a disclosure beats a blank, this selector
+// supplies it: one row per `accounts[]` card, each carrying that account's OWN
+// server-emitted projection. Nothing is summed, averaged or re-derived here,
+// exactly as `CodexPerAccountCycleTable` and the per-account hero strip
+// established.
+//
+// Returns `null` when the provider is UNDECORATED (`accounts[]` absent), which
+// is the byte-stable single-account shape — callers branch on presence.
+export interface CodexAccountForecastRow {
+  accountKey: string;
+  label: string;
+  unattributed: boolean;
+  projected: number | null;
+  current: number | null;
+  confidence: string | null;
+  status: string | null;
+  verdict: 'ok' | 'cap' | 'capped' | null;
+}
+
+export function presentationCodexAccountForecasts(
+  env: Envelope | null,
+): CodexAccountForecastRow[] | null {
+  const codex = (env?.sources?.codex?.data ?? null) as CodexSourceData | null;
+  const cards = codex?.accounts;
+  if (cards == null || cards.length === 0) return null;
+  // #373: a window outside account-level standard quota is never the account's
+  // forecast — the same exclusion every other forecast read applies.
+  const histories = (codex?.quota.histories ?? []).filter((row) => !row.model_scoped);
+  // #416 QA P1: the same server-side liveness decision the focused panel reads.
+  // Without it this table published a nine-day-dead window's `41.0% / medium`
+  // under CURRENT QUOTA while the sibling per-account Current Cycle table, the
+  // account card, the hero and the alerts gauge all rendered `—` for the same
+  // account, from the same envelope.
+  //
+  // #416 QA P2-1: taken from the CARD'S OWN child, never the merged parent. The
+  // window key excludes the account, so two accounts under one `$CODEX_HOME`
+  // root collide on it and the parent's set would let the live sibling revive
+  // the dead account — the original defect, unfixed, on the exact shape
+  // `_codex_account_scopes_wire` exists to serve. A missing child degrades to
+  // the empty set (blank), matching `accountScope.ts`'s law that a focused read
+  // NEVER falls back to the parent; `accounts[]` and `account_scopes` ship
+  // together under one `_codex_decorated` gate, and every card key is passed to
+  // `_codex_account_scopes_wire`, so a missing child is drift, not a shape.
+  const scopes = codex?.account_scopes;
+  return cards.map((card) => {
+    const own = histories.filter((row) => row.account_key === card.accountKey);
+    const weekly = own.find((row) => row.window_minutes === 10_080) ?? own[0];
+    const forecast = weekly?.forecast;
+    const live = weekly != null
+      && codexLiveQuotaKeys(scopes?.[card.accountKey]?.quota).has(weekly.key);
+    const projected = live && forecast?.status === 'ok' ? forecast.projected_percent : null;
+    return {
+      accountKey: card.accountKey,
+      label: card.label,
+      unattributed: card.unattributed === true,
+      projected,
+      current: live ? forecast?.current_percent ?? weekly?.current_percent ?? null : null,
+      confidence: live ? forecast?.confidence ?? null : null,
+      // #416 QA P3-1: `status` is a forecast-QUALITY axis, so on a dead window
+      // it describes a projection for a cycle that no longer exists. Nothing
+      // renders it today, but it is on the exported row contract.
+      status: live ? forecast?.status ?? null : null,
+      verdict: projected == null
+        ? null
+        : projected >= 100 ? 'capped' : projected >= 90 ? 'cap' : 'ok',
+    };
+  });
 }
 
 export function presentationForecastComposition(
@@ -653,12 +787,19 @@ export interface BlockPresentationRow extends BlocksPanelRow {
   source: SourceName;
   value: number;
   valueLabel: string;
+  // Present only on a decorated Codex row (#416); `null` everywhere else.
+  accountKey?: string | null;
 }
 
 function codexBlock(row: CodexQuotaBlockRow): BlockPresentationRow {
   return {
     key: row.key,
     source: 'codex',
+    // #416 QA P1-A — the merged list is now the union of every account's
+    // windows, so a row must be able to name its owner. Omitted below two real
+    // accounts (the server does not stamp it), which is what keeps the
+    // single-account panel unlabelled.
+    accountKey: row.account_key ?? null,
     start_at: row.start_at,
     end_at: row.end_at,
     anchor: 'recorded',

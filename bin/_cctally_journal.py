@@ -532,7 +532,7 @@ def journal_high_water() -> tuple[str, int] | None:
 #
 #   1. HW snapshot (leaf lock, µs).                         journal_high_water()
 #   2. read+decode cursor -> HW, counting malformed.        _read_range()
-#   3. cache leg (Codex quota) BEFORE the stats txn.        QUOTA_APPLIER seam
+#   3. cache leg (Codex quota + attribution) before stats.  CACHE_APPLIER seam
 #   4. ONE `BEGIN IMMEDIATE`:
 #        a. replay journal evt lines (apply-only, NO alerts).  _apply_evt()
 #        b. per-record sequential PIPELINE over obs/op.        PIPELINE hooks
@@ -548,14 +548,19 @@ def journal_high_water() -> tuple[str, int] | None:
 #                    milestones, resets/credits, cost snapshots, budgets); the
 #                    built-in `_pipeline_op_weekly_credit_floor` op fold ships
 #                    here (spec §5.3 "fold op").
-#   QUOTA_APPLIER    the Codex quota cache leg (Task 7; wired to `_quota_applier`
-#                    below). Contract: (decoded) -> stop_index | None. `decoded`
-#                    is the ordered list of (record, segment, offset); a non-None
-#                    int is a prefix-stop boundary (busy global or Codex cache
-#                    writer flock at a quota line): the cycle processes
-#                    decoded[:stop] and
-#                    advances the cursor to decoded[stop]'s offset (spec §5.2
-#                    step 3). Always-on: a Claude-only batch scans + returns None.
+#   CACHE_APPLIER    the composite Codex cache leg (Task 7; #416 widened it from
+#                    quota-only to quota + `codex_file_account` attribution ops,
+#                    wired to `_cache_applier` below; `QUOTA_APPLIER` remains as
+#                    its back-compat alias). Contract: (decoded) -> stop_index |
+#                    None. `decoded` is the ordered list of (record, segment,
+#                    offset); a non-None int is a prefix-stop boundary (busy
+#                    global or Codex cache writer flock, or an incomplete cache
+#                    write): the cycle processes decoded[:stop] and advances the
+#                    cursor to decoded[stop]'s offset (spec §5.2 step 3). ONE
+#                    applier, ONE `BEGIN IMMEDIATE`, ONE stop across BOTH
+#                    families — see the #416 review-F1 note at `_cache_applier`
+#                    for why a second independent applier is unsafe here.
+#                    Always-on: a Claude-only batch scans + returns None.
 #   codex_apply      per-cycle `(ctx) -> None` closure (Task 7, a `run_stats_
 #                    ingest` arg, not a module global) run in step 4b'' on
 #                    ctx.conn — the seam every Codex on-demand stats.db writer
@@ -944,36 +949,63 @@ def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
     )
 
 
-def _read_segment_lines(seg_path, lo: int, hi: int) -> list[tuple[str, int, bytes]]:
-    """`(basename, absolute-offset, raw-line-without-newline)` for every
-    complete line in `[lo, hi)`. `hi` is a line boundary (a HW snapshot size or
-    an immutable prior segment's full size), so no partial trailing line
-    appears."""
+_SEGMENT_READ_CHUNK = 256 * 1024
+
+
+def _iter_segment_lines(seg_path, lo: int, hi: int):
+    """Stream `(basename, absolute-offset, raw-line-without-newline)` for every
+    complete line in `[lo, hi)`, holding at most one chunk plus one partial line
+    in memory. `hi` is a line boundary (a HW snapshot size or an immutable prior
+    segment's full size), so no partial trailing line appears."""
+    name = seg_path.name
     with open(seg_path, "rb") as fh:
         fh.seek(lo)
-        data = fh.read(hi - lo)
-    out = []
-    start = 0
-    while True:
-        nl = data.find(b"\n", start)
-        if nl == -1:
-            break
-        out.append((seg_path.name, lo + start, data[start:nl]))
-        start = nl + 1
-    return out
+        pos = lo
+        buf = b""
+        buf_at = lo
+        while pos < hi:
+            data = fh.read(min(_SEGMENT_READ_CHUNK, hi - pos))
+            if not data:
+                break
+            pos += len(data)
+            buf = buf + data if buf else data
+            start = 0
+            while True:
+                nl = buf.find(b"\n", start)
+                if nl == -1:
+                    break
+                yield (name, buf_at + start, buf[start:nl])
+                start = nl + 1
+            if start:
+                buf = buf[start:]
+                buf_at += start
 
 
-def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
-    """Read `cursor -> HW` across segments in canonical order (spec §5.2.2).
+def _read_segment_lines(seg_path, lo: int, hi: int) -> list[tuple[str, int, bytes]]:
+    """Materialized form of :func:`_iter_segment_lines` (see it for the
+    contract). Callers that walk a whole range at once should prefer
+    :func:`iter_range`; this list form is retained for the ingest cycle, which
+    needs the batch as an indexable sequence."""
+    return list(_iter_segment_lines(seg_path, lo, hi))
+
+
+def iter_range(cursor, hw):
+    """Stream `cursor -> HW` across segments in canonical order (spec §5.2.2).
 
     Prior segments (before HW's) are immutable and read to their full size;
     HW's segment is read only up to the snapshot size, so appends past HW
     belong to the next cycle.
+
+    Streaming, not list-building: a caller that only needs to fold each record
+    into a table (the Codex attribution rehydration) must not put a transient
+    the size of the whole journal on the hot path. `_read_range` remains the
+    materialized form for the ingest cycle, which genuinely needs the batch as
+    an indexable sequence (prefix-stop indices address into it).
     """
     hw_seg, hw_size = hw
     segments = list_segments()
     if hw_seg not in segments:
-        return []
+        return
     hw_idx = segments.index(hw_seg)
     if cursor is None:
         start_idx, start_off = 0, 0
@@ -983,7 +1015,6 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
             start_idx, start_off = segments.index(cur_seg), cur_off
         else:
             start_idx, start_off = 0, 0
-    lines: list[tuple[str, int, bytes]] = []
     for idx in range(start_idx, hw_idx + 1):
         seg = segments[idx]
         seg_path = _cctally_core.JOURNAL_DIR / seg
@@ -991,8 +1022,12 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
         hi = hw_size if idx == hw_idx else os.path.getsize(seg_path)
         if lo >= hi:
             continue
-        lines.extend(_read_segment_lines(seg_path, lo, hi))
-    return lines
+        yield from _iter_segment_lines(seg_path, lo, hi)
+
+
+def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
+    """Materialized `cursor -> HW` (see :func:`iter_range`)."""
+    return list(iter_range(cursor, hw))
 
 
 def journal_prefix_hash(high_water) -> "str | None":
@@ -1053,13 +1088,22 @@ def _capture_protocol_prefix_evidence(record, prior_high_water, evidence) -> Non
 
 _QUOTA_OBS_KIND = "quota_window_snapshot"
 
-_QUOTA_SNAPSHOT_INSERT = (
+_QUOTA_SNAPSHOT_INSERT_LEGACY = (
     "INSERT OR IGNORE INTO quota_window_snapshots "
     "(source, source_root_key, source_path, line_offset, captured_at_utc, "
     " observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
     " used_percent, resets_at_utc, plan_type, individual_limit_json, "
     " reached_type, observed_model, account_key) "
     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+_QUOTA_SNAPSHOT_INSERT = (
+    "INSERT OR IGNORE INTO quota_window_snapshots "
+    "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+    " observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
+    " used_percent, resets_at_utc, plan_type, individual_limit_json, "
+    " reached_type, observed_model, account_key, canonical_resets_at_utc) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 _QUOTA_SNAPSHOT_COLS = (
@@ -1070,15 +1114,23 @@ _QUOTA_SNAPSHOT_COLS = (
 )
 
 
-def _quota_snapshot_values(rec: dict) -> tuple:
+def _quota_snapshot_values(rec: dict, anchor: "str | None" = None) -> tuple:
     """Build the INSERT values tuple for one Codex quota obs. account_key (#341)
     rides the obs TOP-LEVEL ``account`` field (obs stamp shape), not the payload,
     so an unstamped/sentinel obs re-materializes cache.db with NULL account_key
     (``NULL ≡ unattributed`` on the read path). first-stamp-wins via the
     ``INSERT OR IGNORE`` natural key — account_key is a stamped attribute, never
-    part of the identity."""
+    part of the identity.
+
+    ``anchor`` is the #416 §4.2 canonical reset. It is NOT journaled: it is a
+    property of the observation's POPULATION, not of the observation, so it is
+    re-resolved by whichever writer materializes the row. NULL leaves every
+    reader on the raw-reset fallback, i.e. exactly today's behaviour."""
     p = rec.get("payload") or {}
-    return tuple(p.get(col) for col in _QUOTA_SNAPSHOT_COLS) + (rec.get("account"),)
+    return (
+        tuple(p.get(col) for col in _QUOTA_SNAPSHOT_COLS)
+        + (rec.get("account"), anchor)
+    )
 
 
 def _is_codex_quota_obs(rec: dict) -> bool:
@@ -1089,25 +1141,537 @@ def _is_codex_quota_obs(rec: dict) -> bool:
     )
 
 
-def _quota_applier(decoded) -> int | None:
-    """Cache leg (spec §5.2 step 3): materialize this batch's Codex quota obs
-    into cache.db `quota_window_snapshots`, under the NON-BLOCKING global cache
-    writer lock followed by `cache.db.codex.lock`. Contract (journal seam):
-    `(decoded) -> stop | None`, `decoded = [(record, segment, offset), ...]` in
-    canonical order.
+# --------------------------------------------------------------------------
+# #416: the second family this leg carries — the durable Codex attribution
+# decision (`codex_file_account` op, spec §3.3). It shares the leg rather than
+# getting its own applier because `run_stats_ingest` invokes exactly ONE applier
+# and truncates the batch afterwards, while an applier commits everything it
+# handled BEFORE returning a stop index. Two independent prefix-stopping
+# appliers could therefore commit past each other's stop, exposing suffix
+# effects beyond the retained prefix and violating the scalar-cursor rule
+# (docs/journal-gotchas.md; #416 review F1).
+# --------------------------------------------------------------------------
 
-    - No Codex quota obs in the batch → return None (no flock taken).
+_FILE_ACCOUNT_OP_KIND = "codex_file_account"
+# Byte prefilter for the streamed replay: the canonical encoder is
+# `json.dumps(..., ensure_ascii=False)`, which never escapes an ASCII token, so
+# every genuine op carries the kind verbatim.
+_FILE_ACCOUNT_KIND_MARKER = f'"{_FILE_ACCOUNT_OP_KIND}"'.encode("ascii")
+
+# FIRST-WINS at a contended primary key (Slice 1 closeout review C1). Spec §3.3
+# — "a mid-file account change appends a second range-qualified op; the first is
+# never rewritten" — and §3.5 — "a genuine correction is expressed as an explicit
+# new range decision, not by mutating history". Ops apply in journal order, so
+# `DO NOTHING` retains the FIRST decision at that key.
+#
+# This reverses the fix-round's last-op-wins. The #374 concern that motivated it
+# (a fold applier is an inserter, not a convergence operator) does not apply
+# here, because the path that must converge — `cache-sync --rebuild` — runs
+# `rehydrate_codex_file_accounts(authoritative=True)`, which DELETEs the table
+# before replaying. After an authoritative clear, `DO NOTHING` is first-WINS on
+# an empty table, not a no-op, so clear-then-replay still repairs a drifted row
+# (pinned by `test_authoritative_replay_still_repairs_a_drifted_row`).
+#
+# Last-op-wins was actively wrong on the one path where duplicates are
+# reachable: a failed rehydration lets the walk re-decide from the live
+# `auth.json` and mint a second op at the same key (plan candidate 10). Under
+# last-op-wins the documented remedy would then CEMENT that newer
+# live-auth-derived value rather than restore the original — the inverse of
+# acceptance criterion 4. The disagreement is REPORTED (see
+# `_apply_file_account_records`) rather than applied silently.
+#
+# `OR IGNORE` is deliberate, exactly as on `_QUOTA_SNAPSHOT_UPSERT`: SQLite
+# gives the named upsert clause precedence for the conflict it names, so the
+# first-wins policy is unaffected, while a record violating some OTHER
+# constraint is dropped instead of raising — an `IntegrityError` here would
+# prefix-stop `_cache_applier`, and the scalar cursor could never advance past
+# that record, wedging the whole journal ingest cycle for every provider.
+_FILE_ACCOUNT_INSERT = (
+    "INSERT OR IGNORE INTO codex_file_accounts "
+    "(file_identity, incarnation, from_offset, root_scope, account_key, "
+    " decided_at_utc) "
+    "VALUES (?,?,?,?,?,?) "
+    "ON CONFLICT(file_identity, incarnation, from_offset) DO NOTHING"
+)
+
+# The incarnation high-water rides the same replay. MAX-set, never an increment,
+# so replaying the same op converges instead of drifting.
+#
+# `OR IGNORE` for the same reason its sibling carries it (closeout review C2):
+# an `IntegrityError` raised HERE prefix-stops `_cache_applier` just as surely,
+# and the scalar cursor then never advances past the record. The named upsert
+# clause still takes precedence for the primary-key conflict, so the MAX-set
+# convergence is unaffected. `_apply_file_account_records` additionally refuses
+# to reach this statement for a record the map insert dropped, so the two guards
+# are belt-and-suspenders over disjoint failure modes: this one covers any
+# constraint the incarnation table might gain that the map table lacks.
+_FILE_INCARNATION_INSERT = (
+    "INSERT OR IGNORE INTO codex_file_incarnations "
+    "(file_identity, incarnation, updated_at_utc) "
+    "VALUES (?,?,?) "
+    "ON CONFLICT(file_identity) DO UPDATE SET "
+    "  incarnation = MAX(codex_file_incarnations.incarnation, excluded.incarnation), "
+    "  updated_at_utc = excluded.updated_at_utc"
+)
+
+
+def _is_codex_file_account_op(rec: dict) -> bool:
+    return (
+        rec.get("t") == "op"
+        and (rec.get("payload") or {}).get("kind") == _FILE_ACCOUNT_OP_KIND
+    )
+
+
+def _file_account_values(rec: dict) -> tuple:
+    """INSERT values for one attribution decision.
+
+    ``account_key`` is read with ``.get`` because the stably-absent sentinel
+    OMITS the field (two-shaped stamp), and the absence must materialize as SQL
+    NULL — the literal string is never stored.
+    """
+    p = rec.get("payload") or {}
+    return (
+        p.get("file_identity"), p.get("incarnation"), p.get("from_offset"),
+        p.get("root_scope"), p.get("account_key"), rec.get("at"),
+    )
+
+
+def _apply_file_account_records(cache, records) -> "tuple[int, int]":
+    """Materialize the given ``codex_file_account`` ops into an OPEN cache.db
+    transaction; return ``(restored, conflicts)`` — how many rows were ABSENT
+    before and actually landed (a genuine restore) and how many CONTRADICTED a
+    different account already recorded at the same primary key (and were
+    therefore declined, first-wins). Never opens or commits a transaction itself
+    — every call site owns the flocks and the single ``BEGIN IMMEDIATE`` so the
+    two families stay atomic.
+
+    ``restored`` deliberately excludes a no-op replay of a row that is already
+    present and already says the same thing. The rehydration re-reads the ops
+    its OWN previous sync appended (the cursor is snapshotted before the walk,
+    which is exactly what recovers a failed write), so counting those would
+    make every second sync claim to have rehydrated something — and that claim
+    is printed on stderr, where several golden harnesses read it.
+
+    The ``prior is None`` probe is NOT sufficient on its own to call a record
+    restored (closeout review C3): ``_FILE_ACCOUNT_INSERT`` carries ``OR
+    IGNORE``, so a record violating some OTHER constraint is silently dropped
+    and nothing was restored at all. ``total_changes`` after the statement is
+    the only honest witness. A dropped record must also NOT raise the
+    incarnation high-water — an inflated counter is the DANGEROUS direction,
+    because ranges resolve at exactly the walk's current incarnation, so the
+    range list comes back empty, ``covered`` is False, and a plain sync falls
+    straight through to the live ``auth.json``.
+
+    Both counts are returned rather than printed here because this is called
+    once per record by the streamed rehydration; the caller collapses a run
+    into one line AFTER its commit (closeout review C5) — a rollback must not
+    leave the operator told about a decline that never happened."""
+    restored = conflicts = 0
+    for rec in records:
+        values = _file_account_values(rec)
+        prior = cache.execute(
+            "SELECT account_key FROM codex_file_accounts "
+            "WHERE file_identity = ? AND incarnation = ? AND from_offset = ?",
+            values[:3],
+        ).fetchone()
+        before = cache.total_changes
+        cache.execute(_FILE_ACCOUNT_INSERT, values)
+        landed = cache.total_changes > before
+        if prior is None:
+            if not landed:
+                # Dropped by a constraint the map table carries and the
+                # incarnation table does not (`root_scope`, `decided_at_utc`).
+                # Nothing was restored and nothing may be advanced.
+                continue
+            restored += 1
+        elif prior[0] != values[4]:
+            conflicts += 1
+        cache.execute(_FILE_INCARNATION_INSERT, (values[0], values[1], values[5]))
+    return restored, conflicts
+
+
+def _report_file_account_conflicts(conflicts: int) -> None:
+    """One stderr line for a run of replayed decisions that contradicted a
+    different account already recorded at the same
+    ``(file_identity, incarnation, from_offset)`` and were therefore DECLINED
+    (first-wins, spec §3.3). Two ops at one primary key means one of them was
+    minted without seeing the other, which is a real (if rare) condition with a
+    real remedy, so it is reported rather than applied silently — the #374 rule.
+
+    Every call site must invoke this AFTER its commit (closeout review C5): a
+    rolled-back transaction applied nothing, so reporting from inside it would
+    tell the operator about a decline that did not happen."""
+    if conflicts > 0:
+        print(
+            f"[ingest] codex attribution replay declined {conflicts} "
+            "contradicting decision(s); the first journalled decision for each "
+            "byte range is retained; run "
+            "`cctally cache-sync --source codex --rebuild` if the "
+            "attribution still looks wrong",
+            file=sys.stderr,
+        )
+
+
+# --------------------------------------------------------------------------
+# #416 spec §3.5 (review F5): which record is AUTHORITATIVE.
+#
+# "The journal always wins" is the wrong authority. Journaled quota obs are
+# deduplicated on a natural key that EXCLUDES the account
+# (`_codex_quota_natural_key`) and later records for that key are discarded by
+# `append_record`, so the retained observation is FIRST-STAMP-WINS and may
+# preserve the known late-ingest guess — bytes written under one login but
+# ingested after a switch (spec §1.7). An unconditional upsert from it would
+# overwrite a corrected file-range decision.
+#
+# Precedence: the durable file/range DECISION is authoritative; the observation
+# stamp is used only where no range decision covers those bytes. Where the two
+# disagree the row keeps the decision and the disagreement is REPORTED rather
+# than silently applied — a genuine correction is expressed as an explicit new
+# range decision, never by mutating history.
+# --------------------------------------------------------------------------
+
+# Converging form, used ONLY for a row whose bytes a decision covers. Repeating
+# a deterministic DO UPDATE is idempotent, which is what preserves crash-replay;
+# an uncovered obs keeps the first-write-wins INSERT OR IGNORE above.
+#
+# `INSERT OR IGNORE` is RETAINED here, not replaced by a plain `INSERT`. SQLite
+# gives the upsert clause precedence for the conflict it names, so the targeted
+# `DO UPDATE` still fires and convergence is unaffected — while every OTHER
+# constraint on `quota_window_snapshots` (four CHECKs and several NOT NULLs)
+# keeps the silent-drop tolerance the uncovered path has. Without it a violating
+# record raises `IntegrityError`, `_cache_applier` catches it as `sqlite3.Error`
+# and prefix-stops, and the scalar cursor can never advance past that record —
+# so ONE permanently-violating row would wedge the whole journal ingest cycle
+# forever, for every provider, not just Codex.
+_QUOTA_SNAPSHOT_UPSERT_CLAUSE = (
+    " ON CONFLICT(source, source_path, line_offset, logical_limit_key) "
+    "DO UPDATE SET account_key = excluded.account_key"
+)
+
+_QUOTA_SNAPSHOT_UPSERT = _QUOTA_SNAPSHOT_INSERT + _QUOTA_SNAPSHOT_UPSERT_CLAUSE
+_QUOTA_SNAPSHOT_UPSERT_LEGACY = (
+    _QUOTA_SNAPSHOT_INSERT_LEGACY + _QUOTA_SNAPSHOT_UPSERT_CLAUSE
+)
+
+
+class _CodexAttributionOracle:
+    """Resolve ``(root_scope, source_path, line_offset)`` to the authoritative
+    decision, memoised per file for one transaction.
+
+    The map is keyed on the durable file identity, not on the path, so the path
+    is canonicalized through the SAME helper the ingest used
+    (``_cctally_cache._canonical_codex_path``) to reach it. When that lookup
+    cannot be made — the sibling is unavailable, or the map holds MORE THAN ONE
+    incarnation for the file — the oracle DECLINES. Declining matters most for
+    the multi-incarnation case: a truncation reuses offsets from zero, so an
+    observation's byte offset no longer identifies which incarnation it belongs
+    to, and guessing would attribute pre-truncation bytes to the replacement
+    file's account. Declining falls back to the observation stamp, which is
+    exactly the documented "no range decision covers those bytes" branch.
+    """
+
+    def __init__(self, cache):
+        self._cache = cache
+        self._cache_by_path: dict = {}
+        self._canonicalize = None
+        self._available = None
+
+    def _ensure_loaded(self) -> bool:
+        if self._available is not None:
+            return self._available
+        try:
+            probe = self._cache.execute(
+                "SELECT 1 FROM codex_file_accounts LIMIT 1").fetchone()
+        except sqlite3.Error:
+            self._available = False
+            return False
+        if probe is None:
+            self._available = False
+            return False
+        try:
+            import _cctally_cache as _cc
+            from _lib_source_identity import codex_file_key
+        except Exception:  # pragma: no cover — sibling unavailable
+            self._available = False
+            return False
+        self._canonicalize = (_cc._canonical_codex_path, codex_file_key)
+        self._available = True
+        return True
+
+    def _ranges_for(self, root_scope, source_path):
+        key = (root_scope, source_path)
+        if key in self._cache_by_path:
+            return self._cache_by_path[key]
+        ranges: list = []
+        canonical, file_key = self._canonicalize
+        try:
+            identity = file_key(root_scope, str(canonical(pathlib.Path(source_path))))
+        except Exception:
+            self._cache_by_path[key] = ranges
+            return ranges
+        rows = self._cache.execute(
+            "SELECT DISTINCT incarnation FROM codex_file_accounts "
+            "WHERE file_identity = ?", (identity,)).fetchall()
+        if len(rows) == 1:
+            ranges = [
+                (int(r[0]), r[1]) for r in self._cache.execute(
+                    "SELECT from_offset, account_key FROM codex_file_accounts "
+                    "WHERE file_identity = ? AND incarnation = ? "
+                    "ORDER BY from_offset ASC", (identity, int(rows[0][0])))
+            ]
+        self._cache_by_path[key] = ranges
+        return ranges
+
+    def resolve(self, rec) -> "tuple[bool, str | None]":
+        """``(covered, account_key)`` for one quota obs."""
+        if not self._ensure_loaded():
+            return False, None
+        payload = rec.get("payload") or {}
+        root_scope = payload.get("source_root_key")
+        source_path = payload.get("source_path")
+        offset = payload.get("line_offset")
+        if not root_scope or not source_path or offset is None:
+            return False, None
+        covered, account_key = False, None
+        for from_offset, decided in self._ranges_for(root_scope, source_path):
+            if from_offset > offset:
+                break
+            covered, account_key = True, decided
+        return covered, account_key
+
+
+def _cache_has_anchor_column(cache) -> bool:
+    """Whether this cache.db carries ``quota_window_snapshots.canonical_resets_at_utc``.
+
+    Probed rather than assumed. This leg opens cache.db RAW (no dispatcher, no
+    schema apply), so it can meet a cache that has not yet gained the column. A
+    column-count mismatch would raise ``sqlite3.OperationalError``, which
+    ``_cache_applier`` catches as a write failure and turns into a PREFIX-STOP —
+    and the scalar cursor could then never advance past that record, wedging the
+    journal ingest cycle for every provider. Same reasoning as the ``OR IGNORE``
+    on ``_FILE_ACCOUNT_INSERT``; the walk's own writer needs no such guard
+    because it only ever runs on a dispatcher-opened connection.
+    """
+    try:
+        return "canonical_resets_at_utc" in {
+            str(row[1]) for row in cache.execute(
+                "PRAGMA table_info(quota_window_snapshots)")
+        }
+    except sqlite3.Error:  # pragma: no cover — unreadable schema
+        return False
+
+
+def _codex_anchor_resolver(cache):
+    """A ``CodexResetAnchorResolver`` over this connection, or ``None`` when the
+    sibling is unavailable. Degrading to ``None`` leaves the anchor column NULL,
+    which every reader treats as "use the raw reset" — today's behaviour."""
+    try:
+        import _cctally_cache as _cc
+    except Exception:  # pragma: no cover — sibling unavailable
+        return None
+    try:
+        return _cc.CodexResetAnchorResolver(cache)
+    except Exception:  # pragma: no cover — older sibling without the resolver
+        return None
+
+
+def _resolve_obs_anchor(resolver, rec: dict) -> "str | None":
+    if resolver is None:
+        return None
+    p = rec.get("payload") or {}
+    root = p.get("source_root_key")
+    slot = p.get("observed_slot")
+    key = p.get("logical_limit_key")
+    if not isinstance(root, str) or not isinstance(slot, str) or not isinstance(key, str):
+        return None
+    try:
+        return resolver.resolve(
+            source_root_key=root, observed_slot=slot, logical_limit_key=key,
+            window_minutes=p.get("window_minutes"),
+            resets_at_utc=p.get("resets_at_utc"),
+        )
+    except Exception:  # pragma: no cover — never fail an ingest over a label
+        return None
+
+
+def _apply_quota_records(cache, records) -> None:
+    """Materialize Codex quota obs into an OPEN cache.db transaction, applying
+    the §3.5 precedence rule. Callers must apply the batch's file-account
+    decisions FIRST, so a decision arriving in the same batch already governs
+    the observations it covers."""
+    oracle = _CodexAttributionOracle(cache)
+    # One line per FILE PER BATCH, not per record. A mid-file account switch
+    # legitimately produces a run of observations whose first-stamp-wins account
+    # disagrees with the range decision now governing those bytes, and an
+    # unthrottled warning would emit one line per row for the whole run. The set
+    # is deliberately local, so a file whose conflicting run SPANS several
+    # ingest batches reports once per batch — a per-cycle or per-process set
+    # would have to outlive the transaction that may roll back, and repeating a
+    # standing condition a handful of times is the cheaper error. The condition
+    # is worth reporting at all because a genuine correction is expressed as an
+    # explicit new range decision, never by mutating history.
+    reported_conflicts: set = set()
+    # #416 spec §4.2: this leg is a genuine INGEST into cache.db (it materializes
+    # observations whose source rollout may have evaporated), so it must resolve
+    # the canonical anchor too. Without it, a journal-replayed row lands with a
+    # NULL anchor, a later walk's `INSERT OR IGNORE` cannot correct it, and that
+    # window stays fragmented forever.
+    has_anchor = _cache_has_anchor_column(cache)
+    anchors = _codex_anchor_resolver(cache) if has_anchor else None
+    insert_sql = _QUOTA_SNAPSHOT_INSERT if has_anchor else _QUOTA_SNAPSHOT_INSERT_LEGACY
+    upsert_sql = _QUOTA_SNAPSHOT_UPSERT if has_anchor else _QUOTA_SNAPSHOT_UPSERT_LEGACY
+    for rec in records:
+        covered, decided = oracle.resolve(rec)
+        anchor = _resolve_obs_anchor(anchors, rec)
+        row_values = _quota_snapshot_values(rec, anchor)
+        if not has_anchor:
+            row_values = row_values[:-1]
+        if not covered:
+            cache.execute(insert_sql, row_values)
+            continue
+        observed = rec.get("account")
+        payload = rec.get("payload") or {}
+        conflict_key = (payload.get("source_root_key"), payload.get("source_path"))
+        if (observed is not None and observed != decided
+                and conflict_key not in reported_conflicts):
+            reported_conflicts.add(conflict_key)
+            print(
+                "[ingest] codex attribution conflict: "
+                f"{payload.get('source_path')}@{payload.get('line_offset')} "
+                f"observation stamped {observed} but the durable decision says "
+                f"{decided if decided is not None else 'unattributed'}; "
+                "keeping the decision",
+                file=sys.stderr,
+            )
+        values = list(row_values)
+        values[16] = decided
+        cache.execute(upsert_sql, tuple(values))
+
+
+def rehydrate_codex_file_accounts(
+    cache_conn, *, authoritative: bool = False, since=None,
+) -> "tuple[int, tuple[str, int] | None, int]":
+    """Replay journaled ``codex_file_account`` ops into an open cache.db
+    connection; return ``(applied_count, high_water, declined_conflicts)``
+    (#416 spec §3.4).
+
+    The conflict count is RETURNED rather than reported here (closeout review
+    C5). This function runs inside the caller's transaction, and that caller
+    rolls back on failure — reporting from in here would tell the operator about
+    a decline that was undone. The two ``_apply_file_account_records`` call
+    sites in the appliers already report post-commit; this one now matches.
+
+    ``since`` is the ``(segment, offset)`` journal cursor the caller last
+    replayed, or ``None`` for "from the beginning". The returned high-water is
+    what the caller must persist so the NEXT call replays only the delta — the
+    two together are what make this affordable on the hot path AND what recovers
+    a decision that was journaled but never materialized (spec §3.6: "a crash
+    after append but before the cache-map commit is recovered by replaying
+    pending journal state under the same locked operation BEFORE ``auth.json``
+    is consulted on retry"). A one-shot "already rehydrated" marker cannot do
+    that: the failing sync's own op lands AFTER the marker was written, so the
+    retry would never replay it and would re-decide from a possibly-changed
+    identity instead.
+
+    ``authoritative`` ignores ``since`` — a clear-then-replay is only correct
+    from the beginning of the journal.
+
+    The caller owns the flocks, the transaction and the commit — this function
+    only executes the idempotent upserts, so it can run inside
+    ``sync_codex_cache``'s already-locked phases without violating the
+    lock-order law.
+
+    Why an explicit phase exists at all: the ordinary journal-to-cache replay
+    runs only inside ``rebuild_stats_index``, whereas ``cache-sync`` clears (on
+    ``--rebuild``) and begins the rollout walk with NO applier in front of it. A
+    recreated cache.db (corruption recovery, a manual ``rm cache.db``) therefore
+    starts with an empty map, and the walk would fall straight back to the live
+    ``auth.json`` for every file — which is the defect (review F2). Note this is
+    NOT rebuild-only: every production Codex call site syncs with
+    ``rebuild=False``, and the corruption auto-heal recreates the cache.db family
+    and then re-runs the ORDINARY sync, so a rebuild-only wiring leaves the
+    defect reachable by a shorter road.
+
+    ``authoritative=True`` makes the replay a CONVERGENCE operator rather than an
+    inserter: it clears ``codex_file_accounts`` first, so a row that has drifted
+    away from the journal is corrected instead of being silently preserved by the
+    ``DO NOTHING`` conflict clause (the #374 fold-applier defect class — see
+    ``docs/journal-gotchas.md``). This is lossless because the ingest's
+    fail-closed append journals the decision BEFORE any accounting DML or map
+    write for that file, so every map row has a journal op behind it, and the
+    journal is append-only with no segment pruning. It is the documented remedy
+    (``cache-sync --rebuild``), so it must actually be able to repair.
+
+    ``codex_file_incarnations`` is deliberately NOT cleared even under
+    ``authoritative``, and the reason is NOT that a clear would be conservative.
+    The op is journaled BEFORE the batch that persists the incarnation, so every
+    committed incarnation is ``<=`` the highest incarnation any op carries — a
+    re-derivation from ops can therefore never LOWER the counter, only raise it
+    above what any committed batch used. And too high is the DANGEROUS
+    direction, not the safe one: ranges are resolved at exactly the walk's
+    current incarnation, so an inflated counter loads an EMPTY range list,
+    ``covered`` is False, and a plain sync falls straight through to the live
+    ``auth.json`` branch and re-decides — the original defect. Since the MAX-set
+    upsert already converges the counter, a clear has no upside and that
+    downside.
+    """
+    hw = journal_high_water()
+    if hw is None:
+        if authoritative:
+            # No journal at all: an authoritative pass still says "the journal
+            # is the truth", and the truth is that there are no decisions.
+            cache_conn.execute("DELETE FROM codex_file_accounts")
+        return 0, None, 0
+    if authoritative:
+        cache_conn.execute("DELETE FROM codex_file_accounts")
+        since = None
+    applied = 0
+    conflicts = 0
+    # Streamed, never materialized: this runs on the FIRST ordinary sync of
+    # every cache.db (hook-tick, the dashboard, the corruption auto-heal's
+    # re-sync) while both cache flocks are held, so a whole-journal transient
+    # here is a multi-second global cache-writer stall — itself a
+    # `database is locked` trigger. The cheap byte prefilter skips the JSON
+    # decode for every non-decision line; the canonical encoder is
+    # `json.dumps(..., ensure_ascii=False)`, which never escapes an ASCII kind
+    # token, so a genuine op always carries this substring verbatim. A false
+    # positive is harmless — it is decoded and rejected by the real predicate.
+    for _seg, _off, raw in iter_range(since, hw):
+        if _FILE_ACCOUNT_KIND_MARKER not in raw:
+            continue
+        rec = _lib_journal.decode_line(raw)
+        if rec is not None and _is_codex_file_account_op(rec):
+            _restored, _conflicts = _apply_file_account_records(cache_conn, (rec,))
+            applied += _restored
+            conflicts += _conflicts
+    return applied, hw, conflicts
+
+
+def _cache_applier(decoded) -> int | None:
+    """Composite cache leg (spec §5.2 step 3 + #416 spec §3.4): materialize this
+    batch's Codex quota obs into `quota_window_snapshots` AND its
+    `codex_file_account` ops into the attribution map, under the NON-BLOCKING
+    global cache writer lock followed by `cache.db.codex.lock`, in ONE
+    `BEGIN IMMEDIATE`. Contract (journal seam): `(decoded) -> stop | None`,
+    `decoded = [(record, segment, offset), ...]` in canonical order.
+
+    - Neither family present in the batch → return None (no flock taken).
     - Busy global/provider flock, OR a cache write it cannot complete → PREFIX-STOP:
-      return the index of the FIRST codex quota obs, so the cycle processes only
-      `decoded[:stop]` and advances the cursor to `decoded[stop]`'s offset,
-      retrying the remainder next cycle (the scalar cursor never advances past an
-      unmaterialized obs — spec §5.2 step 3).
-    - Flock acquired + all obs upserted → return None (full consumption).
+      return the EARLIEST index across BOTH families having committed NEITHER, so
+      the cycle processes only `decoded[:stop]` and advances the cursor to
+      `decoded[stop]`'s offset, retrying the remainder next cycle (the scalar
+      cursor never advances past an unmaterialized record — spec §5.2 step 3).
+    - Flock acquired + everything upserted → return None (full consumption).
     """
     quota_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
                  if _is_codex_quota_obs(rec)]
-    if not quota_idx:
+    file_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
+                if _is_codex_file_account_op(rec)]
+    if not quota_idx and not file_idx:
         return None
+    # All-or-nothing across the two families: one stop, the earliest of either.
+    stop_idx = min(quota_idx[0] if quota_idx else file_idx[0],
+                   file_idx[0] if file_idx else quota_idx[0])
     from _lib_cache_writer_lock import (
         acquire_cache_writer_flocks,
         release_cache_writer_flocks,
@@ -1120,31 +1684,36 @@ def _quota_applier(decoded) -> int | None:
             _cctally_core.CACHE_LOCK_CODEX_PATH,
         )
     except OSError:
-        return quota_idx[0]
+        return stop_idx
     if held is None:
-        return quota_idx[0]
+        return stop_idx
     try:
         try:
             cache = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH), timeout=15.0)
         except sqlite3.Error as exc:  # pragma: no cover — cache.db unopenable
-            print(f"[ingest] quota cache leg connect failed: {exc}", file=sys.stderr)
-            return quota_idx[0]
+            print(f"[ingest] cache leg connect failed: {exc}", file=sys.stderr)
+            return stop_idx
         try:
             cache.execute("PRAGMA busy_timeout=15000")
             cache.execute("BEGIN IMMEDIATE")
-            for i in quota_idx:
-                cache.execute(_QUOTA_SNAPSHOT_INSERT,
-                              _quota_snapshot_values(decoded[i][0]))
+            # Decisions FIRST: §3.5 makes the file/range decision authoritative
+            # over the observation stamp, so a decision arriving in this batch
+            # must already govern the observations it covers.
+            _, _file_conflicts = _apply_file_account_records(
+                cache, [decoded[i][0] for i in file_idx])
+            _apply_quota_records(cache, [decoded[i][0] for i in quota_idx])
             cache.commit()
+            _report_file_account_conflicts(_file_conflicts)
         except sqlite3.Error as exc:
             try:
                 cache.rollback()
             except sqlite3.Error:
                 pass
             # Could not materialize -> prefix-stop so the cursor holds and the
-            # next cycle retries (the obs stay durable in the journal regardless).
-            print(f"[ingest] quota cache leg write failed: {exc}", file=sys.stderr)
-            return quota_idx[0]
+            # next cycle retries (the records stay durable in the journal
+            # regardless). NEITHER family is committed.
+            print(f"[ingest] cache leg write failed: {exc}", file=sys.stderr)
+            return stop_idx
         finally:
             cache.close()
         return None
@@ -1152,10 +1721,14 @@ def _quota_applier(decoded) -> int | None:
         release_cache_writer_flocks(held)
 
 
+# Back-compat alias: the leg was Codex-quota-only until #416 widened it.
+_quota_applier = _cache_applier
+
 # Wire the seam (declared None near the top as the contract stub). Always-on:
-# a Claude-only cycle's scan finds no Codex quota obs and returns None before
-# any flock/DB touch, so the cost is one list comprehension over the batch.
-QUOTA_APPLIER = _quota_applier
+# a Claude-only cycle's scan finds neither family and returns None before any
+# flock/DB touch, so the cost is two list comprehensions over the batch.
+CACHE_APPLIER = _cache_applier
+QUOTA_APPLIER = _cache_applier
 
 
 # --------------------------------------------------------------------------
@@ -1468,11 +2041,21 @@ _EVT_KIND_PROVIDER = {
     "projected": "claude",
     "project_budget": "claude",
     "quota_alert_arming": "codex",
+    "quota_threshold_event": "codex",
 }
 
 # Op kinds that are accounts-machinery (recognised, never classified as legacy).
+# `codex_file_account` (#416 spec §3.3) joins them: it is the durable Codex
+# attribution DECISION, and its sentinel form deliberately OMITS `account_key`
+# — exactly the shape the legacy classifier keys on — so registration here is
+# what keeps `_normalize_legacy_account_stamp` from ever retro-stamping it.
+# Registering a kind here also feeds `_cctally_rederive.plan_claude_usage`'s
+# `op_kinds` set, so the kind MUST additionally carry a
+# `_lib_rederive._OP_CLASSIFICATIONS` entry or the re-derive planner raises
+# `RederiveConflict` on every run.
 _ACCOUNTS_MACHINERY_KINDS = frozenset(
-    ("account_observe", "account_label", "accounts_cutover"))
+    ("account_observe", "account_label", "accounts_cutover",
+     "codex_file_account"))
 
 # Legacy-classifier exhaustiveness guard (#341, review finding P2-1). EVERY evt
 # kind in `_EVT_SPECS` and every harvest kind in `_HARVEST_SPECS` must carry a
@@ -1769,6 +2352,75 @@ def _apply_quota_alert_arming(conn, evt):
     return None
 
 
+def _apply_quota_threshold_event(conn, evt):
+    """Fold a `quota_threshold_event` evt (#416 spec §7.2, review F13).
+
+    `quota_threshold_events` is TERMINAL alert evidence: each row records that a
+    threshold was crossed and either alerted or was suppressed as backfill, with
+    the exact moment it happened. It is in NEITHER `_HARVEST_SPECS` (eight
+    families, none of them this one) nor — before #416 — `_CUTOVER_SPECS`, and
+    `rematerialize_quota_projection_for_rebuild` runs with
+    `alert_eligible_roots=frozenset()`, so a rebuild could not recreate an
+    `alerted` row at all. Every rebuild silently discarded the evidence that an
+    alert had already fired, which is what would let it fire again.
+
+    Convergence is a natural-key UPSERT, exactly like `_apply_quota_alert_arming`
+    — the table has no `journal_id` column, so idempotence cannot ride an
+    `INSERT OR IGNORE` on the journal id. The upsert restores `disposition`,
+    `alerted_at` and `suppressed_at` VERBATIM, which matters because the rebuild's
+    re-materialization pass can legitimately re-derive the same crossing as a
+    fresh `suppressed_backfill` row: whichever of the two runs second, the
+    journaled terminal fact is what stands.
+
+    `orphaned_at` is deliberately NOT journaled and NOT touched here. It marks a
+    window whose evidence has since vanished, and `_orphan_unseen` re-derives it
+    from the current projection on every pass — replaying a stale value would
+    fight that.
+    """
+    p = evt.get("payload") or {}
+    account_key = p.get("account_key") or _lib_accounts.UNATTRIBUTED
+    disposition = p.get("disposition")
+    alerted_at = p.get("alerted_at")
+    suppressed_at = p.get("suppressed_at")
+    # The table's CHECK pairs disposition with exactly one timestamp. Normalize
+    # rather than trust the payload, so a malformed record cannot raise here and
+    # prefix-stop the whole fold.
+    if disposition == "alerted":
+        suppressed_at = None
+        alerted_at = alerted_at or p.get("created_at_utc")
+    elif disposition == "suppressed_backfill":
+        alerted_at = None
+        suppressed_at = suppressed_at or p.get("created_at_utc")
+    else:
+        return None
+    conn.execute(
+        "INSERT OR IGNORE INTO quota_threshold_events "
+        "(source, source_root_key, logical_limit_key, observed_slot, "
+        " window_minutes, resets_at_utc, threshold, qualifying_kind, "
+        " qualifying_percent, projected_percent, severity, created_at_utc, "
+        " disposition, alerted_at, suppressed_at, account_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(source, source_root_key, account_key, logical_limit_key, "
+        "            observed_slot, window_minutes, resets_at_utc, threshold) "
+        "DO UPDATE SET "
+        "  qualifying_kind=excluded.qualifying_kind, "
+        "  qualifying_percent=excluded.qualifying_percent, "
+        "  projected_percent=excluded.projected_percent, "
+        "  severity=excluded.severity, "
+        "  created_at_utc=excluded.created_at_utc, "
+        "  disposition=excluded.disposition, "
+        "  alerted_at=excluded.alerted_at, "
+        "  suppressed_at=excluded.suppressed_at",
+        (p.get("source"), p.get("source_root_key"), p.get("logical_limit_key"),
+         p.get("observed_slot"), p.get("window_minutes"), p.get("resets_at_utc"),
+         p.get("threshold"), p.get("qualifying_kind"),
+         p.get("qualifying_percent"), p.get("projected_percent"),
+         p.get("severity"), p.get("created_at_utc"), disposition,
+         alerted_at, suppressed_at, account_key),
+    )
+    return None
+
+
 def _apply_block_close(conn, evt):
     """Fold one authoritative frozen-block fact.
 
@@ -1957,6 +2609,14 @@ _EVT_SPECS = {
     # upsert applier. order is arbitrary among evts (no cross-family FK).
     "quota_alert_arming": _EvtSpec(
         None, order=45, applier=_apply_quota_alert_arming),
+    # Terminal quota alert evidence (#416 spec §7.2). Order 44 — BEFORE
+    # `quota_alert_arming` (45) and before the quota projection
+    # re-materialization, so the journaled terminal fact is already in place
+    # when the rebuild's re-derivation runs. Both directions are safe anyway:
+    # this applier converges by natural-key upsert and the re-derivation's own
+    # insert is `INSERT OR IGNORE`, so neither can clobber the other's row.
+    "quota_threshold_event": _EvtSpec(
+        None, order=44, applier=_apply_quota_threshold_event),
 }
 for _hs in _HARVEST_SPECS:
     if _hs.children:
@@ -3972,16 +4632,25 @@ def _publish_rebuilt_stats_index(
 
 
 def _rebuild_quota_cache_leg(records) -> None:
-    """Re-materialize cache.db `quota_window_snapshots` from the journal's Codex
-    quota obs (spec §5.4). The journal obs are the DURABLE source (§1 latent
-    data-loss hole — the rollout JSONL evaporates); this INSERT OR IGNOREs them
-    on the natural key, mirroring `_quota_applier`. Runs BEFORE any stats
-    transaction, under the global cache writer lock followed by the
-    `cache.db.codex.lock` provider flock (lock-order law). Best-effort: a
-    missing/busy cache.db is a clean skip (the obs stay durable in the journal;
-    the stats quota projection pass then degrades cleanly)."""
+    """Re-materialize cache.db `quota_window_snapshots` AND the #416 Codex
+    attribution map from the journal (spec §5.4 + #416 spec §3.4).
+
+    The journal records are the DURABLE source (§1 latent data-loss hole — the
+    rollout JSONL evaporates); this INSERT-OR-IGNOREs the quota obs on their
+    natural key and the attribution decisions on theirs, mirroring
+    `_cache_applier` family for family. The map half is not optional: without it
+    a rebuild would leave the map empty and the following rollout walk would
+    have nothing to replay, sending every file back to the live `auth.json` —
+    the exact defect this mechanism exists to prevent.
+
+    Runs BEFORE any stats transaction, under the global cache writer lock
+    followed by the `cache.db.codex.lock` provider flock (lock-order law).
+    Best-effort: a missing/busy cache.db is a clean skip (the records stay
+    durable in the journal; the stats quota projection pass then degrades
+    cleanly)."""
     quota_obs = [r for r in records if _is_codex_quota_obs(r)]
-    if not quota_obs:
+    file_accounts = [r for r in records if _is_codex_file_account_op(r)]
+    if not quota_obs and not file_accounts:
         return
     cache_path = _cctally_core.CACHE_DB_PATH
     if not cache_path.exists():
@@ -4013,10 +4682,11 @@ def _rebuild_quota_cache_leg(records) -> None:
         try:
             cache.execute("PRAGMA busy_timeout=15000")
             cache.execute("BEGIN IMMEDIATE")
-            for r in quota_obs:
-                cache.execute(_QUOTA_SNAPSHOT_INSERT,
-                              _quota_snapshot_values(r))
+            # Decisions FIRST — same §3.5 precedence ordering as `_cache_applier`.
+            _, _file_conflicts = _apply_file_account_records(cache, file_accounts)
+            _apply_quota_records(cache, quota_obs)
             cache.commit()
+            _report_file_account_conflicts(_file_conflicts)
         except sqlite3.Error as exc:
             try:
                 cache.rollback()
@@ -4387,6 +5057,23 @@ _CUTOVER_SPECS = (
                                  "logical_limit_key", "observed_slot",
                                  "window_minutes", "rule_fingerprint",
                                  "activated_at_utc")),
+    _CutoverSpec("quota_threshold_events", "quota_threshold_event", "evt",
+                 "created_at_utc", stamp=False, natural_key_prefix="qte",
+                 natural_key_id=("source", "source_root_key", "account_key",
+                                 "logical_limit_key", "observed_slot",
+                                 "window_minutes", "resets_at_utc",
+                                 "threshold")),
+    # quota_threshold_events (#416 spec §7.2, review F13) — TERMINAL alert
+    # evidence, modelled exactly on the quota_alert_arming precedent above: no
+    # `journal_id` column -> NOT stamped, and the fold applier converges by
+    # natural key. The `qte:` id mirrors the table's own UNIQUE key so one
+    # crossing is one event forever, and it MUST match the live emitter in
+    # `_cctally_quota._codex_leg._emit_terminal_event`.
+    #
+    # This spec covers a legacy install that has not yet cut over. An install
+    # already past the cutover carries no history here — which is exactly why
+    # the live emitter exists: without it, only pre-cutover rows would ever be
+    # replayable, and every row written since would still be lost on a rebuild.
 )
 
 def _export_stats_table(conn, spec) -> list:
@@ -4420,7 +5107,7 @@ def _export_stats_table(conn, spec) -> list:
             payload[payload_key] = [
                 {k: cr[k] for k in cr.keys() if k not in ("id", "block_id")}
                 for cr in child_rows]
-        if spec.kind == "quota_alert_arming":
+        if spec.kind in ("quota_alert_arming", "quota_threshold_event"):
             payload["journal_identity_version"] = 2
         if spec.natural_key_id:
             # §5.3 "state" family: the evt id is the state-instance form (matching

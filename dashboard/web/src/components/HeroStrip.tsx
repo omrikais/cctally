@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { fmt, type FmtCtx } from '../lib/fmt';
@@ -10,6 +10,8 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
 import { warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
+import { useAccountScope } from '../hooks/useScopedSnapshot';
+import { sourceAccounts } from '../store/accountFocus';
 import { AccountHeroCards } from './AccountHeroCards';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import type { AllSourceData, CodexSourceData, Envelope, FreshnessEnvelope } from '../types/envelope';
@@ -27,7 +29,7 @@ export const CODEX_STALE_CYCLE_NOTE =
   + 'until Codex reports again.';
 
 export function HeroStrip() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const h = env?.header;
   const cw = env?.current_week ?? null;
@@ -105,6 +107,7 @@ function SharedHero({
 }) {
   const h = env?.header;
   const cw = env?.current_week ?? null;
+  const scope = useAccountScope();
   if (source === 'claude') {
     return (
       <CanonicalHero
@@ -189,25 +192,42 @@ function SharedHero({
     : cycleStartLabel ?? cycleEndLabel;
 
   if (source === 'codex') {
+    // #416 D6 — "All accounts" merges only SPEND and TOKENS. Independent quota
+    // percentages and resets are never summed, averaged or stood in for by one
+    // account's window: under All accounts the headline percent, reset, $/1%,
+    // forecast and week label go blank and the per-account cards below carry
+    // each account's own numbers. Focus a chip and the account's own values
+    // return. Gated on decoration, so a single-account install is unchanged.
+    //
+    // The gate is DECORATION, not "more than one live cycle" (#416 QA P1-C).
+    // The headline spend merges every account unconditionally, so letting a
+    // lone surviving cycle's percentage through would publish a blended $/1%
+    // by construction — merged spend over one account's percent — and would
+    // silently change what the headline means as cycles expire.
+    const perAccount = scope.scopesSupported && scope.accountKey == null;
     return (
       <CanonicalHero
-        weekLabel={weekLabel}
-        usedPct={usedPct}
-        fiveHourPct={fiveHour?.current.current_percent}
-        resetInSec={resetSeconds}
+        // #416 QA P1-C: `hero.cycle` is the REPRESENTATIVE account's window.
+        // Printing it on the line that blanks the percentage *because each
+        // account has its own cycle* contradicts itself in one glance.
+        weekLabel={perAccount ? null : weekLabel}
+        usedPct={perAccount ? null : usedPct}
+        fiveHourPct={perAccount ? null : fiveHour?.current.current_percent}
+        resetInSec={perAccount ? null : resetSeconds}
         spentUsd={spentUsd}
-        dollarPerPct={dollarPerPct}
-        forecastPct={forecastPct}
-        vsLastWeekDelta={vsLastWeekDelta}
-        freshness={codexFreshness}
+        dollarPerPct={perAccount ? null : dollarPerPct}
+        forecastPct={perAccount ? null : forecastPct}
+        vsLastWeekDelta={perAccount ? null : vsLastWeekDelta}
+        freshness={perAccount ? null : codexFreshness}
         ctx={ctx}
-        verdict={codexVerdict}
+        verdict={perAccount ? null : codexVerdict}
         heroLabel={codexHeroLabel}
-        showFiveHour={fiveHour != null}
-        unavailableReason={codexUnavailable
+        showFiveHour={!perAccount && fiveHour != null}
+        unavailableReason={!perAccount && codexUnavailable
           ? warning?.message ?? 'Cycle accounting unavailable'
           : null}
-        spentNote={codexCycleStale ? CODEX_STALE_CYCLE_NOTE : null}
+        spentNote={!perAccount && codexCycleStale ? CODEX_STALE_CYCLE_NOTE : null}
+        perAccountNote={perAccount ? 'per account' : null}
       />
     );
   }
@@ -218,6 +238,34 @@ function SharedHero({
   const allWarning = warningForDomain(allEntry?.warnings, 'hero');
   const allWarningDetail = allWarning?.message
     ?? 'Combined totals are unavailable while a provider is degraded.';
+  // #416 QA — the COMBINED tab carries the same defect the Codex tab just shed,
+  // one surface further out. `weekly` is joined off the PARENT hero, whose
+  // `cycle` is `cycles_all[0]` — one representative account's window — so with
+  // several Codex accounts this tab published one of them, unlabelled, as the
+  // Codex 7-day percent, the countdown and the `Codex quota` row.
+  //
+  // D6 forbids blending independent allowances, and no summary statistic over
+  // them (a max, a mean, "the most urgent") is the quantity the slot claims to
+  // hold. So the three slots blank and the per-account strip — which now renders
+  // on this tab too — carries each account's own percent, 5h, reset and spend
+  // directly beneath them. Nothing is lost by the blanks: the strip is strictly
+  // more information than the one number it replaces.
+  //
+  // Spend and tokens are untouched. They are the only axes D6 lets All merge,
+  // the merge already happens server-side (a sum of the same cards), and
+  // COMBINED SPEND is this tab's headline — blanking it would be the opposite
+  // failure. Gated on Codex decoration, so a <=1-real-account install is
+  // byte-identical (R8).
+  const codexPerAccount = sourceAccounts(codexEntry) != null;
+  const codexPerAccountValue = codexPerAccount ? (
+    <span
+      className="hero-per-account-value"
+      data-testid="hero-per-account-value"
+      title="Each Codex account has its own quota cycle — independent percentages are never blended."
+    >
+      per account
+    </span>
+  ) : null;
 
   return (
     <>
@@ -227,10 +275,28 @@ function SharedHero({
           <div className="hu-num">{fmt.pct1(h?.used_pct)}</div>
         </div>
         <div className="hu-block">
-          <div className="hu-label">CODEX 7-DAY</div>
-          <div className="hu-num hu-num--sm">{fmt.pct0(weekly?.current.current_percent)}</div>
+          <div className="hu-label">
+            CODEX 7-DAY
+            {codexPerAccount ? <span className="hu-week"> · per account</span> : null}
+          </div>
+          <div className="hu-num hu-num--sm">
+            {codexPerAccount ? '—' : fmt.pct0(weekly?.current.current_percent)}
+          </div>
         </div>
-        <div className="hu-reset">resets in <span>{fmt.ddhh(resetSeconds)}</span></div>
+        {codexPerAccount ? (
+          // This countdown has always been the CODEX reset (Claude's own reset
+          // is not shown on this tab), so the replacement names Codex — dropping
+          // the provider would read as though Claude's reset were per-account too.
+          <div
+            className="hu-reset hu-reset--per-account"
+            data-testid="hero-per-account-note"
+            title="Each Codex account has its own quota cycle — independent resets are never blended."
+          >
+            Codex usage + reset <span>per account</span>
+          </div>
+        ) : (
+          <div className="hu-reset">resets in <span>{fmt.ddhh(resetSeconds)}</span></div>
+        )}
       </div>
 
       <div className="hero-zone hero-spent" data-testid="shared-hero-spent">
@@ -259,7 +325,9 @@ function SharedHero({
         </div>
         <div className="sup-row">
           <span className="sup-l">Codex quota</span>
-          <span className="sup-v">{fmt.pct1(weekly?.current.current_percent)}</span>
+          <span className="sup-v">
+            {codexPerAccountValue ?? fmt.pct1(weekly?.current.current_percent)}
+          </span>
         </div>
         <div className="sup-row">
           <span className="sup-l">Providers</span>
@@ -288,6 +356,7 @@ function CanonicalHero({
   showFiveHour,
   unavailableReason = null,
   spentNote = null,
+  perAccountNote = null,
 }: {
   weekLabel: string | null | undefined;
   usedPct: number | null | undefined;
@@ -307,7 +376,26 @@ function CanonicalHero({
   // quota evidence is stale. Distinct from `unavailableReason`, which explains
   // an ABSENT hero; when both apply the unavailable reason wins.
   spentNote?: string | null;
+  // #416 D6 — set when the headline percentage/reset are deliberately BLANK
+  // because each account owns an independent quota cycle. Replaces the reset
+  // countdown AND every other deliberately-blank slot with a pointer to the
+  // per-account cards; it is never a failure state.
+  perAccountNote?: string | null;
 }) {
+  // #416 QA P2-D — a bare em-dash reads as missing data, not as a deliberate
+  // blank. The reset slot already carried the caption; `Forecast @ reset`,
+  // `$/1% vs last week` and `$/1% used` did not, so the QA gate's honest read
+  // was that those three looked broken. One shared pointer, one vocabulary
+  // (the italic `per account` span the reset slot already uses).
+  const perAccountValue = perAccountNote == null ? null : (
+    <span
+      className="hero-per-account-value"
+      data-testid="hero-per-account-value"
+      title="Each account has its own quota cycle — independent percentages are never blended."
+    >
+      {perAccountNote}
+    </span>
+  );
   return (
     <>
       <div className="hero-zone hero-usage">
@@ -316,7 +404,17 @@ function CanonicalHero({
             WEEK USAGE
             {weekLabel ? <span className="hu-week"> · {weekLabel}</span> : null}
           </div>
-          <div className="hu-num">{fmt.pct1(usedPct)}</div>
+          {/* #416 QA P3-C — a bare em-dash at KPI weight in full-brightness
+              text colour reads as a loading skeleton, not as a deliberate
+              blank. Every other slot on this hero carries the dimmed
+              `per account` caption; this one carries the glyph alone, so it
+              takes `--text-dim` to match. Only the deliberate blank is dimmed:
+              a real percentage is untouched. */}
+          <div
+            className={`hu-num${perAccountNote != null && usedPct == null ? ' is-blank' : ''}`}
+          >
+            {fmt.pct1(usedPct)}
+          </div>
         </div>
         {showFiveHour && (
           <div className="hu-block" data-testid="hero-five-hour">
@@ -324,9 +422,19 @@ function CanonicalHero({
             <div className="hu-num hu-num--sm">{fmt.pct0(fiveHourPct)}</div>
           </div>
         )}
-        <div className="hu-reset">
-          resets in <span>{fmt.ddhh(resetInSec)}</span>
-        </div>
+        {perAccountNote == null ? (
+          <div className="hu-reset">
+            resets in <span>{fmt.ddhh(resetInSec)}</span>
+          </div>
+        ) : (
+          <div
+            className="hu-reset hu-reset--per-account"
+            data-testid="hero-per-account-note"
+            title="Each account has its own quota cycle — independent percentages are never blended."
+          >
+            usage + reset <span>{perAccountNote}</span>
+          </div>
+        )}
       </div>
 
       <div
@@ -345,7 +453,9 @@ function CanonicalHero({
         <div className="hs-label">SPENT THIS WEEK</div>
         <div className="hs-big">{fmt.usd0(spentUsd)}</div>
         <div className="hs-sub">
-          <span>{fmt.usd2(dollarPerPct)}</span> / 1% used
+          {perAccountValue == null
+            ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>
+            : <>$ / 1% used {perAccountValue}</>}
         </div>
       </div>
 
@@ -353,7 +463,7 @@ function CanonicalHero({
         <div className="sup-row">
           <span className="sup-l">Forecast @ reset</span>
           <span className={`sup-v${verdict ? ` is-${verdict.cls}` : ''}`}>
-            {fmt.pct0(forecastPct)}
+            {perAccountValue ?? fmt.pct0(forecastPct)}
           </span>
         </div>
         {(() => {
@@ -362,7 +472,7 @@ function CanonicalHero({
             return (
               <div className="sup-row" data-metric="vs-last-week">
                 <span className="sup-l">$/1% vs last week</span>
-                <span className="sup-v">—</span>
+                <span className="sup-v">{perAccountValue ?? '—'}</span>
               </div>
             );
           }

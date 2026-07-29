@@ -641,6 +641,125 @@ def _codex_logical_limit_key(
     return _codex_canonical_json(payload)
 
 
+# --------------------------------------------------------------------------
+# #416 spec §4.3 (review F8): `window_minutes` snapping.
+#
+# The provider occasionally reports a weekly window as `10081` rather than
+# `10080`. `window_minutes` is a member of the logical limit key AND a column of
+# its own, and both feed `QuotaWindowIdentity`, so one minute of jitter mints a
+# second identity for one physical window — the second fragmentation axis behind
+# spec §1.4 (392 live weekly blocks across 126 distinct reset-minutes, plus a
+# stray `window_minutes = 10081`).
+#
+# Snapping is safe ONLY as a member-preserving replace. Rebuilding the key from
+# limit/root/slot/minutes would drop `modelPool`, and
+# `is_model_scoped_codex_quota` treats that member as an axis INDEPENDENT of the
+# Spark `limit_name` — so a rebuild would file a Spark window under account
+# weekly quota, which #373 forbids outright. Every other member (including one
+# a future version adds) therefore survives verbatim.
+#
+# ±1 minute only. The next genuine boundary is 300 or 10080, so a wider
+# tolerance buys nothing and a `10200` window is a different window, not jitter.
+# --------------------------------------------------------------------------
+
+CODEX_NATIVE_WINDOW_MINUTES: tuple[int, ...] = (300, 10080)
+CODEX_WINDOW_MINUTES_SNAP_TOLERANCE = 1
+
+
+def snap_codex_window_minutes(window_minutes: object) -> object:
+    """Snap a jittered Codex window length onto its native value.
+
+    Scalar half of the transform, used for the `window_minutes` COLUMN. Anything
+    that is not a plain positive int, or that is not within
+    ``CODEX_WINDOW_MINUTES_SNAP_TOLERANCE`` of a native length, is returned
+    unchanged — the caller must be able to apply this unconditionally.
+    """
+    if not isinstance(window_minutes, int) or isinstance(window_minutes, bool):
+        return window_minutes
+    for native in CODEX_NATIVE_WINDOW_MINUTES:
+        if abs(window_minutes - native) <= CODEX_WINDOW_MINUTES_SNAP_TOLERANCE:
+            return native
+    return window_minutes
+
+
+def codex_snap_equivalent_limit_keys(logical_limit_key: str) -> tuple[str, ...]:
+    """Every RAW logical limit key that ``snap_window_minutes`` maps onto the
+    same canonical key as ``logical_limit_key``.
+
+    The reset-anchor group (spec §4.2) must be the CANONICAL identity, but rows
+    are STORED under their raw key, so a group lookup has to enumerate the raw
+    spellings rather than snap in SQL. The set is bounded at three — the native
+    length plus/minus the tolerance — and contains the input itself, so a
+    non-snappable key resolves to a one-element tuple.
+    """
+    snapped = snap_window_minutes(logical_limit_key)
+    try:
+        payload = json.loads(snapped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return (logical_limit_key,)
+    if not isinstance(payload, dict):
+        return (logical_limit_key,)
+    native = payload.get("windowMinutes")
+    if native not in CODEX_NATIVE_WINDOW_MINUTES:
+        return (logical_limit_key,)
+    tol = CODEX_WINDOW_MINUTES_SNAP_TOLERANCE
+    out: list[str] = []
+    for minutes in range(native - tol, native + tol + 1):
+        payload["windowMinutes"] = minutes
+        out.append(_codex_canonical_json(payload))
+    return tuple(out)
+
+
+def codex_snap_equivalent_window_minutes(window_minutes: object) -> tuple[object, ...]:
+    """The scalar sibling of ``codex_snap_equivalent_limit_keys``: every RAW
+    ``window_minutes`` value that ``snap_codex_window_minutes`` maps onto the
+    same native length as ``window_minutes``.
+
+    An identity carries the length in BOTH the logical limit key and a column of
+    its own, so a lookup that enumerates only the equivalent keys still misses a
+    stored row on the column predicate. Same bound (three values), same
+    self-inclusion for a non-snappable input.
+    """
+    native = snap_codex_window_minutes(window_minutes)
+    if native not in CODEX_NATIVE_WINDOW_MINUTES:
+        return (window_minutes,)
+    tol = CODEX_WINDOW_MINUTES_SNAP_TOLERANCE
+    return tuple(range(native - tol, native + tol + 1))
+
+
+def snap_window_minutes(logical_limit_key: str) -> str:
+    """Replace ONLY the ``windowMinutes`` member of a serialized logical limit
+    key, preserving every other member verbatim.
+
+    Re-serialized through ``_codex_canonical_json`` so the byte form is exactly
+    what a natively-minted key produces: the key is a natural-key member on both
+    the journal (``_codex_quota_natural_key``) and the cache
+    (``UNIQUE(source, source_path, line_offset, logical_limit_key)``), so a
+    near-miss serialization would mint a second window rather than merge one.
+
+    Fails OPEN on shape: a key this cannot parse, or one whose ``windowMinutes``
+    is not a plain int, is returned exactly as it arrived rather than rebuilt
+    from guessed members.
+    """
+    if not isinstance(logical_limit_key, str):
+        return logical_limit_key
+    try:
+        payload = json.loads(logical_limit_key)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return logical_limit_key
+    if not isinstance(payload, dict):
+        return logical_limit_key
+    minutes = payload.get("windowMinutes")
+    snapped = snap_codex_window_minutes(minutes)
+    if snapped == minutes and type(snapped) is type(minutes):
+        return logical_limit_key
+    payload["windowMinutes"] = snapped
+    try:
+        return _codex_canonical_json(payload)
+    except (TypeError, ValueError):  # pragma: no cover — non-serializable member
+        return logical_limit_key
+
+
 def _codex_quota_observations(
     obj: dict[str, Any], payload: dict[str, Any], path_str: str, line_offset: int,
     source_root_key: str | None, model: str | None,

@@ -21,6 +21,7 @@ import _cctally_core
 import _lib_accounts
 from _cctally_core import _command_as_of, eprint
 from _lib_quota import (
+    CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
     QuotaBlock,
     QuotaForecast,
     QuotaFreshness,
@@ -43,7 +44,13 @@ from _lib_quota import (
     source_path_key,
 )
 from _lib_json_envelope import stamp_schema_version
-from _lib_jsonl import _codex_logical_limit_key
+from _lib_jsonl import (
+    _codex_logical_limit_key,
+    codex_snap_equivalent_limit_keys,
+    codex_snap_equivalent_window_minutes,
+    snap_codex_window_minutes,
+    snap_window_minutes,
+)
 from _lib_codex_pools import (
     codex_history_is_model_scoped,
     codex_model_scoped_quota_pool,
@@ -298,6 +305,17 @@ def load_codex_quota_observations(
         account_expr = (
             "account_key" if has_account else "NULL AS account_key"
         )
+        # canonical_resets_at_utc (#416 §4.2): resolved at ingest over the
+        # complete population. A cache that has not yet gained the column (or a
+        # row the 032 backfill has not reached) reads NULL, and
+        # `QuotaObservation` then falls back to the raw reset — exactly today's
+        # behaviour, never a failure.
+        has_anchor = has_columns(
+            "quota_window_snapshots", {"canonical_resets_at_utc"})
+        anchor_expr = (
+            "canonical_resets_at_utc" if has_anchor
+            else "NULL AS canonical_resets_at_utc"
+        )
         entry_lookup = (
             "(SELECT entries.model FROM codex_session_entries AS entries "
             "WHERE entries.source_path=quota_window_snapshots.source_path "
@@ -323,10 +341,11 @@ def load_codex_quota_observations(
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,
                    limit_name, window_minutes, used_percent, resets_at_utc,
                    plan_type, individual_limit_json, reached_type,
-                   {model_expr}, {account_expr}
+                   {model_expr}, {account_expr}, {anchor_expr}
               FROM quota_window_snapshots
              WHERE source='codex' AND source_root_key IS NOT NULL
-        """.format(model_expr=model_expr, account_expr=account_expr)
+        """.format(model_expr=model_expr, account_expr=account_expr,
+                   anchor_expr=anchor_expr)
         params: list[object] = []
         if requested is not None:
             if not requested:
@@ -374,11 +393,28 @@ def load_codex_quota_observations(
             if any(row[name] is None or not str(row[name]).strip() for name in required_text):
                 continue
             try:
-                logical_limit_key = str(row["logical_limit_key"])
+                # #416 spec §4.3: snap a jittered `window_minutes` (the stray
+                # `10081`) onto its native length, in BOTH the column and the
+                # key member — an identity carries both, so snapping one alone
+                # would still leave two identities for one physical window.
+                #
+                # This runs on the READ path deliberately. It is a PURE PER-ROW
+                # function with no population dependence, so §4.1's argument
+                # against read-time canonicalization (a bounded read picks a
+                # different first member of a jitter cluster, so the dashboard
+                # and CLI disagree) does not apply to it. Snapping at ingest
+                # instead would change the journal quota natural key AND the
+                # cache UNIQUE key, so `--rebuild` would re-append every
+                # already-journalled observation under a new key and materialize
+                # BOTH forms — reintroducing the fragmentation being removed.
+                window_minutes = snap_codex_window_minutes(
+                    int(row["window_minutes"]))
+                logical_limit_key = snap_window_minutes(
+                    str(row["logical_limit_key"]))
                 if codex_model_scoped_quota_pool(row["observed_model"]) is not None:
                     logical_limit_key = _codex_logical_limit_key(
                         str(row["source_root_key"]), row["limit_id"],
-                        str(row["observed_slot"]), int(row["window_minutes"]),
+                        str(row["observed_slot"]), window_minutes,
                         str(row["observed_model"]),
                     )
                 raw_account = row["account_key"]
@@ -392,7 +428,7 @@ def load_codex_quota_observations(
                     account_key=account_key,
                     logical_limit_key=logical_limit_key,
                     observed_slot=str(row["observed_slot"]),
-                    window_minutes=int(row["window_minutes"]),
+                    window_minutes=window_minutes,
                     limit_id=row["limit_id"],
                     limit_name=row["limit_name"],
                 )
@@ -406,6 +442,11 @@ def load_codex_quota_observations(
                     plan_type=row["plan_type"],
                     individual_limit_json=row["individual_limit_json"],
                     reached_type=row["reached_type"],
+                    canonical_resets_at=(
+                        None if row["canonical_resets_at_utc"] in (None, "")
+                        else _parse_utc(str(row["canonical_resets_at_utc"]),
+                                        "canonical_resets_at_utc")
+                    ),
                 )
             except (TypeError, ValueError, OverflowError):
                 # Physical retention is intentionally more permissive than the
@@ -696,8 +737,22 @@ def _insert_quota_terminal_event(
     *, identity: QuotaWindowIdentity, resets_at: dt.datetime,
     threshold: int, kind: str, qualifying_percent: float | None,
     projected_percent: float | None, disposition: str, now_iso: str,
+    journal_emit=None,
 ) -> bool:
-    """Claim one durable threshold lifecycle row; unique-key races converge."""
+    """Claim one durable threshold lifecycle row; unique-key races converge.
+
+    #416 spec §7.2 (review F13): a claimed row is TERMINAL alert evidence and
+    must survive a stats.db rebuild, so a genuine claim is journaled through
+    ``journal_emit``. Without it a rebuild could not recreate an ``alerted`` row
+    at all — `rematerialize_quota_projection_for_rebuild` runs with no
+    alert-eligible roots — and the crossing would be free to fire again.
+
+    ``journal_emit`` is set only on the LIVE ingest-cycle path and is ``None``
+    for the rebuild re-materialization, which must never append. It fires only
+    when ``rowcount == 1``, i.e. on a genuinely NEW claim: re-emitting on a
+    converged race would append a duplicate record for a fact already journaled.
+    Same shape as ``_activate_quota_rule``'s arming emitter.
+    """
     alerted_at = now_iso if disposition == "alerted" else None
     suppressed_at = now_iso if disposition == "suppressed_backfill" else None
     cur = conn.execute(
@@ -715,7 +770,27 @@ def _insert_quota_terminal_event(
             alerted_at, suppressed_at, identity.account_key,
         ),
     )
-    return cur.rowcount == 1
+    claimed = cur.rowcount == 1
+    if claimed and journal_emit is not None:
+        journal_emit({
+            "source": identity.source,
+            "source_root_key": identity.source_root_key,
+            "account_key": identity.account_key,
+            "logical_limit_key": identity.logical_limit_key,
+            "observed_slot": identity.observed_slot,
+            "window_minutes": identity.window_minutes,
+            "resets_at_utc": _utc_iso(resets_at),
+            "threshold": threshold,
+            "qualifying_kind": kind,
+            "qualifying_percent": qualifying_percent,
+            "projected_percent": projected_percent,
+            "severity": _cctally().severity_for(threshold),
+            "created_at_utc": now_iso,
+            "disposition": disposition,
+            "alerted_at": alerted_at,
+            "suppressed_at": suppressed_at,
+        })
+    return claimed
 
 
 def _block_observations_at_or_before(
@@ -754,6 +829,7 @@ def _evaluate_quota_alerts(
     conn: sqlite3.Connection,
     *, observations: tuple[QuotaObservation, ...], alert_eligible_roots: set[str],
     now: dt.datetime, now_iso: str, journal_emit=None, journal_disarm=None,
+    journal_terminal=None,
 ) -> list[dict]:
     """Arm or claim quota alerts within the caller's stats transaction.
 
@@ -848,6 +924,7 @@ def _evaluate_quota_alerts(
                             projected_percent if decision.kind == "projected" else None
                         ),
                         disposition="suppressed_backfill", now_iso=now_iso,
+                        journal_emit=journal_terminal,
                     )
                 continue
             later = tuple(point for point in present if point.captured_at > activated_at)
@@ -858,7 +935,10 @@ def _evaluate_quota_alerts(
             baseline = select_baseline(history.observations, now)
             if (
                 freshness.state != "stale" and baseline is not None
-                and baseline.resets_at == block.resets_at
+                # CANONICAL on both sides (#416 §4.1): `block.resets_at` is
+                # now the anchor, so comparing it to the baseline's RAW reset
+                # would never match for a jittered window.
+                and baseline.canonical_resets_at == block.resets_at
                 and baseline.captured_at > activated_at
             ):
                 projected_percent = _quota_projection_for_block(history, block, now)
@@ -875,6 +955,7 @@ def _evaluate_quota_alerts(
                     threshold=decision.threshold, kind=decision.kind,
                     qualifying_percent=qualifying, projected_percent=projected,
                     disposition="alerted", now_iso=now_iso,
+                    journal_emit=journal_terminal,
                 ):
                     queued.append(_quota_alert_payload(
                         identity=identity, resets_at=block.resets_at,
@@ -885,10 +966,89 @@ def _evaluate_quota_alerts(
     return queued
 
 
+def _reanchor_terminal_events_sql(key_slots: int, minute_slots: int) -> str:
+    # `UPDATE OR IGNORE`, not a plain UPDATE: if this identity already carries an
+    # anchored row at the same threshold, moving the jittered twin onto it would
+    # violate the UNIQUE key. OR IGNORE SKIPS that move (it does not delete the
+    # twin), which is the right trade: the anchored row survives with its
+    # evidence intact and is the one every future evaluation keys against, so
+    # the re-fire is prevented either way — while deleting historical alert
+    # evidence to tidy the display would be irreversible and is not this pass's
+    # mandate. A plain UPDATE would raise and abort the whole projection
+    # transaction.
+    keys = ",".join(f":key{i}" for i in range(key_slots))
+    minutes = ",".join(f":min{i}" for i in range(minute_slots))
+    return (
+        "UPDATE OR IGNORE quota_threshold_events "
+        "   SET resets_at_utc = :anchor, "
+        "       logical_limit_key = :limit_key, "
+        "       window_minutes = :minutes "
+        " WHERE source = :source AND source_root_key = :root "
+        "   AND account_key = :account "
+        f"   AND logical_limit_key IN ({keys}) "
+        f"   AND observed_slot = :slot AND window_minutes IN ({minutes}) "
+        "   AND (resets_at_utc <> :anchor OR logical_limit_key <> :limit_key "
+        "        OR window_minutes <> :minutes) "
+        "   AND abs(unixepoch(resets_at_utc) - unixepoch(:anchor)) <= :tolerance"
+    )
+
+
+def _reanchor_terminal_events(conn: sqlite3.Connection, block) -> None:
+    """Move terminal alert evidence for one window onto its canonical identity.
+
+    #416 spec §4.1 made `QuotaBlock.resets_at` the tolerance-anchored reset, but
+    `quota_threshold_events.resets_at_utc` is part of that table's UNIQUE key and
+    existing rows were written under whichever RAW spelling the block carried at
+    the time. Without this, the very next reconcile after the canonicalization
+    ships would look up an already-alerted threshold under the anchor, find
+    nothing, claim it again, and DISPATCH A DUPLICATE ALERT for a crossing the
+    user was already told about. The window would also appear twice in the
+    dashboard's alert list.
+
+    The reset is not the only axis §4.3 moved. `window_minutes` is snapped too,
+    and it lives in BOTH the logical limit key and a column of its own — so a
+    terminal row written before the snap under the stray `10081` spelling is not
+    reachable by an identity match on the snapped value at all. Matching only the
+    snapped spelling would leave exactly the rows the canonicalization merged
+    stranded under their old identity, which is the same duplicate-alert hazard
+    one axis over. The match therefore enumerates the RAW spellings that snap
+    onto this identity (`codex_snap_equivalent_limit_keys` /
+    `codex_snap_equivalent_window_minutes`) and the UPDATE re-keys them, not just
+    re-anchors them.
+
+    Runs inside the caller's transaction, on both the live leg and the rebuild
+    re-materialization (they share this body), and is idempotent: a row already
+    on the canonical identity is excluded by the three-way `<>` guard.
+
+    Bounded on both axes by the tolerances that produced the canonical identity —
+    600s on the reset, ±1 minute on the length — so it can only ever collapse
+    rows the canonicalization itself merged. Two genuinely different cycles are
+    five hours or seven days apart, and a `10200` window is a different window,
+    not jitter.
+    """
+    identity = block.identity
+    keys = codex_snap_equivalent_limit_keys(identity.logical_limit_key)
+    minutes = codex_snap_equivalent_window_minutes(identity.window_minutes)
+    params: dict[str, object] = {
+        "anchor": _utc_iso(block.resets_at),
+        "source": identity.source,
+        "root": identity.source_root_key,
+        "account": identity.account_key,
+        "limit_key": identity.logical_limit_key,
+        "slot": identity.observed_slot,
+        "minutes": identity.window_minutes,
+        "tolerance": CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
+    }
+    params.update({f"key{i}": value for i, value in enumerate(keys)})
+    params.update({f"min{i}": value for i, value in enumerate(minutes)})
+    conn.execute(
+        _reanchor_terminal_events_sql(len(keys), len(minutes)), params)
+
+
 def _apply_quota_projection_rows(
     conn, *, observations, active_roots, now, now_iso,
     sink, alert_eligible_roots, journal_emit=None, journal_disarm=None,
-    holder=None,
+    journal_terminal=None, holder=None,
 ):
     """Transaction-neutral quota projection apply (spec §5.3 "projection").
 
@@ -908,6 +1068,7 @@ def _apply_quota_projection_rows(
     generation = secrets.token_hex(16)
     blocks = build_blocks(observations)
     for block in blocks:
+        _reanchor_terminal_events(conn, block)
         conn.execute(_BLOCK_UPSERT, _block_params(block, generation))
         for milestone in percent_milestones(block):
             conn.execute(
@@ -921,7 +1082,7 @@ def _apply_quota_projection_rows(
         conn, observations=observations,
         alert_eligible_roots=alert_eligible_roots & active_roots,
         now=now, now_iso=now_iso, journal_emit=journal_emit,
-        journal_disarm=journal_disarm,
+        journal_disarm=journal_disarm, journal_terminal=journal_terminal,
     )
     # The completion stamp is intentionally the final DML in the stats
     # transaction.  A pre-commit failure rolls all projection updates back;
@@ -1103,6 +1264,7 @@ def reconcile_codex_quota_projection(
 
     def _apply_projection(
         conn, sink, *, journal_emit=None, journal_disarm=None,
+        journal_terminal=None,
     ):
         # No configured roots and no existing interpreted history means there is
         # no stats work.  This preserves the existing empty-Codex fast path.
@@ -1113,6 +1275,7 @@ def reconcile_codex_quota_projection(
             now=now, now_iso=now_iso, sink=sink,
             alert_eligible_roots=alert_eligible_roots,
             journal_emit=journal_emit, journal_disarm=journal_disarm,
+            journal_terminal=journal_terminal,
             holder=holder,
         )
 
@@ -1172,11 +1335,30 @@ def reconcile_codex_quota_projection(
             ))
             ctx.events_emitted += 1
 
+        def _emit_terminal_event(payload):
+            # #416 spec §7.2: journal one TERMINAL threshold fact. The `qte:` id
+            # mirrors the table's UNIQUE key, so one crossing is one event
+            # forever and a replay converges instead of duplicating. This order
+            # MUST match the cutover export's `natural_key_id`.
+            eid = _jl.evt_id(
+                "qte", payload["source"], payload["source_root_key"],
+                payload["account_key"], payload["logical_limit_key"],
+                payload["observed_slot"], payload["window_minutes"],
+                payload["resets_at_utc"], payload["threshold"],
+            )
+            _jr.append_record(_jl.make_evt(
+                kind="quota_threshold_event", id=eid,
+                at=payload["created_at_utc"],
+                payload={**payload, "journal_identity_version": 2},
+            ))
+            ctx.events_emitted += 1
+
         _apply_projection(
             ctx.conn,
             ctx.pending_alerts,
             journal_emit=_emit_arming,
             journal_disarm=_emit_disarm,
+            journal_terminal=_emit_terminal_event,
         )
         # `_before_stats_commit` fires INSIDE the cycle txn, before COMMIT — a
         # raise rolls the whole cycle back, so the projection updates undo
@@ -1227,9 +1409,63 @@ def _load_active_milestones(
             stats.close()
 
 
+def _codex_cache_account_predicate(
+    account_key: str | None, *, admit_unattributed: bool = False,
+) -> tuple[str, tuple]:
+    """SQL fragment scoping a CACHE table to one account (#416 B2).
+
+    The cache columns are nullable ``TEXT``, so ``NULL ≡ unattributed`` — the
+    established cache-read rule (``load_cached_rooted_codex_accounting_entries``
+    uses the identical pair). ``None`` yields an empty fragment, i.e. today's
+    merged read.
+
+    ``admit_unattributed`` selects the ONE-DIRECTIONAL WIDENING flavour — the
+    SQL twin of ``_codex_account_admits``: a REAL account admits its own rows
+    PLUS the unattributed sentinel, while an ``unattributed`` scope still admits
+    only unattributed, so no REAL account's rows ever reach another's read.
+
+    Which flavour a read wants is decided by the STAMPING MECHANISM behind its
+    scope key, never by taste, and it is settled per read INSIDE this module —
+    no caller elects it (#416 closeout F1/F3). The rule, in full:
+
+    * **Widen** iff a row genuinely belonging to the focused account can still
+      carry the ``unattributed`` sentinel IN THE TABLE BEING FILTERED — i.e. the
+      scope key and the rows were stamped by DIFFERENT mechanisms, or by the
+      same mechanism over a different population/window-group.
+    * **Strict** iff the scope key was derived from the very column being
+      filtered, over the same population: the read is then a partition of the
+      rows the key came from, and the children must sum to the parent.
+    * Corollary: **selection/boundary reads widen; cost- and percentage-
+      adoption reads stay strict.** A boundary read answers "where did this
+      block open" — widening it is not attribution. A cost read answers "whose
+      dollars are these" — widening it IS attribution, which D1 forbids, and it
+      puts one row in two scopes.
+
+    Three stamping mechanisms exist and must never be conflated: the
+    quota-observation fold (``adopt_unidentified_observations``, per physical-
+    window group, landing post-fold in ``quota_window_blocks`` /
+    ``quota_percent_milestones`` and NEVER written back to
+    ``quota_window_snapshots``); per-file-range attribution
+    (``codex_file_accounts`` -> ``codex_session_entries.account_key``,
+    ``stably_absent`` -> NULL); and the stats ``accounts`` registry.
+    """
+    if account_key is None:
+        return "", ()
+    if account_key == _lib_accounts.UNATTRIBUTED:
+        return "AND (account_key IS NULL OR account_key = ?)", (
+            _lib_accounts.UNATTRIBUTED,)
+    if admit_unattributed:
+        return (
+            "AND (account_key = ? OR account_key IS NULL OR account_key = ?)",
+            (account_key, _lib_accounts.UNATTRIBUTED),
+        )
+    return "AND account_key = ?", (account_key,)
+
+
 def _first_block_physical_tuple(
     identity: QuotaWindowIdentity, resets_at: dt.datetime,
     *, cache_conn: sqlite3.Connection | None = None,
+    account_key: str | None = None,
 ) -> tuple[dt.datetime, str, int] | None:
     """Read the first physical tuple for one exact projected block.
 
@@ -1237,6 +1473,31 @@ def _first_block_physical_tuple(
     for the root in Python just to discover this boundary.  Keep the same
     physical ordering while letting SQLite filter the exact identity/reset.
     ``unixepoch`` deliberately accepts retained ``Z`` and ``+00:00`` spellings.
+
+    ``account_key`` (#416 Slice 3A review B2) scopes the boundary to one
+    account: two accounts sharing one root and one canonical reset otherwise
+    hand the focused account the OTHER account's earlier start, so its first
+    milestone segment absorbs spend from before its own block opened.
+    ``NULL ≡ unattributed`` on this cache column; ``None`` keeps the merged
+    read, which is byte-stable.
+
+    A non-``None`` scope ALWAYS takes the widening flavour here, unconditionally
+    and with no caller say in it (#416 closeout F1). Every scope key that can
+    reach this read is stamped by a different mechanism than
+    ``quota_window_snapshots.account_key``: the durable projection and the
+    in-memory observation partition are both POST-fold
+    (``load_codex_quota_observations`` runs ``adopt_unidentified_observations``
+    before returning), while these snapshot rows are the PRE-fold raw cache the
+    fold never writes back to. And this is a BOUNDARY read — "where did the
+    block open" — so widening it attributes nothing.
+
+    Getting it wrong here is maximally destructive: ``codex_quota_breakdown``
+    returns ``()`` outright when this read finds no row, so a post-fold key read
+    strictly against pre-fold snapshots does not shrink the ladder, it DELETES
+    it, while the cycle INDEX (reading the post-fold
+    ``quota_percent_milestones``) still counts the crossings — the #373
+    root-cause-3 symptom exactly. The widening stays one-directional, so an
+    ``unattributed`` scope never adopts a REAL account's boundary.
     """
     owns_conn = cache_conn is None
     if cache_conn is None:
@@ -1247,6 +1508,8 @@ def _first_block_physical_tuple(
     else:
         cache = cache_conn
     try:
+        account_predicate, account_params = _codex_cache_account_predicate(
+            account_key, admit_unattributed=True)
         row = cache.execute(
             """SELECT captured_at_utc, source_path, line_offset
                  FROM quota_window_snapshots
@@ -1254,13 +1517,14 @@ def _first_block_physical_tuple(
                   AND logical_limit_key=? AND observed_slot=?
                   AND window_minutes=?
                   AND unixepoch(resets_at_utc)=unixepoch(?)
+                  """ + account_predicate + """
                 ORDER BY unixepoch(captured_at_utc), unixepoch(resets_at_utc),
                          source_path, line_offset
                 LIMIT 1""",
             (
                 identity.source_root_key, identity.logical_limit_key,
                 identity.observed_slot, identity.window_minutes,
-                _utc_iso(resets_at),
+                _utc_iso(resets_at), *account_params,
             ),
         ).fetchone()
     finally:
@@ -1279,6 +1543,7 @@ def codex_quota_breakdown(
     resets_at: str | dt.datetime,
     *, speed: str = "auto", cache_conn: sqlite3.Connection | None = None,
     stats_conn: sqlite3.Connection | None = None,
+    account_key: str | None = None,
 ) -> tuple[CodexQuotaBreakdownRow, ...]:
     """Correlate durable milestone boundaries with live-priced cache accounting.
 
@@ -1286,6 +1551,32 @@ def codex_quota_breakdown(
     same-timestamp records stay deterministic.  Pricing is deliberately read
     now rather than materialized in stats.db, keeping a pricing refresh
     immediately effective for historical quota breakdowns.
+
+    ``account_key`` (#416 Slice 3A review B2) scopes BOTH cache reads below —
+    the block-start boundary and the accounting rows — to one account. The
+    milestone read is already account-scoped through ``identity.account_key``,
+    so without this the durable ladder mixed one account's crossings with every
+    account's spend on that root. ``None`` is today's merged read and is
+    byte-stable, which is what every CLI caller keeps.
+
+    The two reads take DIFFERENT flavours, and neither is a caller's choice
+    (#416 closeout F1/F3) — the single flag they used to share conflated two
+    reads with opposite correctness requirements:
+
+    * the boundary (``_first_block_physical_tuple``, pre-fold
+      ``quota_window_snapshots``) always WIDENS. It is a selection read whose
+      scope key comes from another mechanism entirely, and strict equality
+      there blanks the whole ladder rather than trimming it.
+    * the accounting read below (``codex_session_entries``) always stays
+      STRICT. It is a COST read: widening it would file one unattributed row
+      under a real account AND under the ``unattributed`` scope, which is
+      inference D1 forbids and double-counting the children-sum-to-parent
+      invariant forbids. A crossing whose spend is unattributed therefore
+      renders an honest ``$0.00``; the dollars stay visible in the
+      ``unattributed`` scope, which owns them.
+
+    The full rule, and the three stamping mechanisms it turns on, are in
+    ``_codex_cache_account_predicate``.
     """
     reset = _parse_utc(resets_at, "resets_at") if isinstance(resets_at, str) else resets_at
     if reset.tzinfo is None or reset.utcoffset() is None:
@@ -1302,7 +1593,8 @@ def codex_quota_breakdown(
             return ()
     else:
         cache = cache_conn
-    start = _first_block_physical_tuple(identity, reset, cache_conn=cache)
+    start = _first_block_physical_tuple(
+        identity, reset, cache_conn=cache, account_key=account_key)
     if start is None:
         if owns_cache:
             cache.close()
@@ -1321,17 +1613,22 @@ def codex_quota_breakdown(
     ).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     try:
         entries = []
+        # Cost read: strict, always. See the docstring above.
+        entry_predicate, entry_params = _codex_cache_account_predicate(
+            account_key)
         for row in cache.execute(
             """SELECT timestamp_utc, source_path, line_offset, model,
                       input_tokens, cached_input_tokens, output_tokens,
                       reasoning_output_tokens, total_tokens
                  FROM codex_session_entries
                 WHERE source_root_key=?
-                  AND timestamp_utc>=? AND timestamp_utc<=?""",
+                  AND timestamp_utc>=? AND timestamp_utc<=?
+                  """ + entry_predicate,
             (
                 identity.source_root_key,
                 query_start,
                 query_end,
+                *entry_params,
             ),
         ):
             try:
@@ -2016,7 +2313,8 @@ def cmd_codex_percent_breakdown(args) -> int:
                     ).state == "fresh"
                 )
                 for block in build_blocks(history.physical_observations)
-                if block.resets_at == baseline.resets_at
+                # CANONICAL on both sides (#416 §4.1) — see above.
+                if block.resets_at == baseline.canonical_resets_at
             )
         if len(matching) != 1:
             raise QuotaCLIError(

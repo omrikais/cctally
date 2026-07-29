@@ -4928,6 +4928,354 @@ def build_per_migration_030_session_entries_cache_creation_split(
     _build_post(pre, post)
 
 
+_CACHE_031_TABLES = ("codex_file_incarnations", "codex_file_accounts")
+
+# The cache-migration chain a pre-032 install carries, shared by the 032
+# golden builder. Kept module-level because 032's `pre.sqlite` must sit at
+# the 031 head, one entry further along than every earlier builder's chain.
+_PRIOR_CHAIN_THROUGH_031 = tuple(
+    f"{n:03d}_{s}" for n, s in [
+        (1, "dedup_highest_wins"),
+        (2, "conversation_messages_backfill"),
+        (3, "conversation_reingest_tool_ids"),
+        (4, "conversation_reingest_subagent_kind"),
+        (5, "conversation_reingest_meta"),
+        (6, "conversation_reingest_source_tool_use_id"),
+        (7, "conversation_reingest_enrichment"),
+        (8, "session_entries_speed_backfill"),
+        (9, "conversation_media_reingest"),
+        (10, "conversation_search_split"),
+        (11, "conversation_promote_command_args"),
+        (12, "create_conversation_ai_titles"),
+        (13, "create_conversation_sessions"),
+        (14, "conversation_queued_prompt_reingest"),
+        (15, "conversation_sessions_filter_columns"),
+        (16, "drop_search_aux"),
+        (17, "arm_nested_agent_reingest"),
+        (18, "create_conversation_title_fts"),
+        (19, "create_conversation_file_touches"),
+        (20, "session_entries_physical_unique"),
+        (21, "index_conversation_messages_cwd"),
+        (22, "index_conversation_messages_model"),
+        (23, "conversation_sessions_enrichment_columns"),
+        (24, "codex_fused_ingest_rebuild"),
+        (25, "codex_conversation_normalization"),
+        (26, "codex_conversation_key_backfill"),
+        (27, "codex_fork_preamble_rebuild"),
+        (28, "split_conversation_store"),
+        (29, "backfill_claude_account"),
+        (30, "session_entries_cache_creation_split"),
+        (31, "codex_file_account_map"),
+    ]
+)
+
+
+def build_per_migration_031_codex_file_account_map(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration ``031_codex_file_account_map``
+    (#416 spec §3.2/§3.3).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — a genuine existing install at the 030 head: the full
+        production cache schema with ``schema_migrations`` carrying cache
+        001-030, then the two #416 tables DROPPED, which is exactly the shape a
+        pre-#416 install has on disk (its ``user_version`` already matched the
+        registry head, so ``_apply_cache_schema`` was being skipped entirely on
+        every steady-state open — that version gate is the whole reason this
+        migration exists).
+      * ``post.sqlite`` — after running the production 031 handler: both tables
+        exist and are EMPTY. There is deliberately no backfill (spec D1:
+        history that was never durably stamped becomes ``unattributed``;
+        nothing is inferred). The dispatcher central-stamps the 031 marker
+        (#140).
+
+    Every value is fixed (no machine state) so a regen is byte-idempotent
+    (#197). Loaded by
+    ``tests/test_cache_migration_031_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    _PRIOR_CHAIN = tuple(
+        f"{n:03d}_{s}" for n, s in [
+            (1, "dedup_highest_wins"),
+            (2, "conversation_messages_backfill"),
+            (3, "conversation_reingest_tool_ids"),
+            (4, "conversation_reingest_subagent_kind"),
+            (5, "conversation_reingest_meta"),
+            (6, "conversation_reingest_source_tool_use_id"),
+            (7, "conversation_reingest_enrichment"),
+            (8, "session_entries_speed_backfill"),
+            (9, "conversation_media_reingest"),
+            (10, "conversation_search_split"),
+            (11, "conversation_promote_command_args"),
+            (12, "create_conversation_ai_titles"),
+            (13, "create_conversation_sessions"),
+            (14, "conversation_queued_prompt_reingest"),
+            (15, "conversation_sessions_filter_columns"),
+            (16, "drop_search_aux"),
+            (17, "arm_nested_agent_reingest"),
+            (18, "create_conversation_title_fts"),
+            (19, "create_conversation_file_touches"),
+            (20, "session_entries_physical_unique"),
+            (21, "index_conversation_messages_cwd"),
+            (22, "index_conversation_messages_model"),
+            (23, "conversation_sessions_enrichment_columns"),
+            (24, "codex_fused_ingest_rebuild"),
+            (25, "codex_conversation_normalization"),
+            (26, "codex_conversation_key_backfill"),
+            (27, "codex_fork_preamble_rebuild"),
+            (28, "split_conversation_store"),
+            (29, "backfill_claude_account"),
+            (30, "session_entries_cache_creation_split"),
+        ]
+    )
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-15T12:00:00Z"),
+                )
+            # Reproduce the real pre-#416 on-disk shape: an install already at
+            # the 030 head never re-ran _apply_cache_schema, so it does not
+            # carry the attribution map.
+            for table in _CACHE_031_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        handler = None
+        for m in db._CACHE_MIGRATIONS:
+            if m.name == "031_codex_file_account_map":
+                handler = m.handler
+                break
+        if handler is None:
+            raise SystemExit("031_codex_file_account_map not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("031_codex_file_account_map", "2026-07-15T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+_CACHE_032_QUOTA_ROWS = (
+    # (source_path, line_offset, resets_at_utc, window_minutes)
+    # One jitter CLUSTER (three spellings of one physical weekly reset, plus the
+    # stray 10081 length) and one genuinely later week, so the golden exercises
+    # both the join and the establish branch. Byte offsets are the walk order
+    # the backfill reproduces.
+    ("/roots/rk/sessions/a.jsonl", 10, "2026-08-01T19:19:03Z", 10080),
+    ("/roots/rk/sessions/a.jsonl", 20, "2026-08-01T19:19:06Z", 10080),
+    ("/roots/rk/sessions/a.jsonl", 30, "2026-08-01T19:19:04Z", 10081),
+    ("/roots/rk/sessions/b.jsonl", 10, "2026-08-08T19:19:00Z", 10080),
+)
+
+
+def build_per_migration_032_codex_canonical_reset_anchor(scenario_dir: Path) -> None:
+    """Per-migration goldens for cache migration
+    ``032_codex_canonical_reset_anchor`` (#416 spec §4.1/§4.2).
+
+    Emits two cache.db files:
+      * ``pre.sqlite``  — an install at the 031 head carrying four Codex quota
+        observations and NO ``canonical_resets_at_utc`` column, which is exactly
+        the pre-#416-slice-2 on-disk shape (the version gate meant
+        ``_apply_cache_schema`` was skipped entirely on a steady-state open, so
+        the column add never ran).
+      * ``post.sqlite`` — after running the production 032 handler: the column
+        exists and every row carries its cluster's anchor. Three rows form one
+        jitter cluster (including the stray ``10081`` weekly length, which shares
+        the cluster) and collapse onto ``…19:19:03Z``; the genuinely later week
+        anchors itself.
+
+    Every value is fixed (no machine state) so a regen is byte-idempotent
+    (#197). Loaded by
+    ``tests/test_cache_migration_032_per_migration_goldens.py``.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        jsonl = sys.modules["_lib_jsonl"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN_THROUGH_031:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-15T12:00:00Z"),
+                )
+            for source_path, offset, resets, minutes in _CACHE_032_QUOTA_ROWS:
+                conn.execute(
+                    "INSERT INTO quota_window_snapshots "
+                    "(source, source_root_key, source_path, line_offset, "
+                    " captured_at_utc, observed_slot, logical_limit_key, "
+                    " limit_id, limit_name, window_minutes, used_percent, "
+                    " resets_at_utc, plan_type, individual_limit_json, "
+                    " reached_type, observed_model, account_key) "
+                    "VALUES ('codex','rk',?,?, '2026-07-28T00:00:00Z',"
+                    " 'primary',?, 'codex', NULL, ?, 10.0, ?, NULL, NULL,"
+                    " NULL, NULL, NULL)",
+                    (source_path, offset,
+                     jsonl._codex_logical_limit_key(
+                         "rk", "codex", "primary", minutes, None),
+                     minutes, resets),
+                )
+            # Reproduce the real pre-slice-2 on-disk shape: an install already at
+            # the 031 head never re-ran _apply_cache_schema, so it does not carry
+            # the anchor column. SQLite has no DROP COLUMN before 3.35 and the
+            # table has a UNIQUE index, so rebuild it explicitly.
+            conn.executescript(
+                """
+                CREATE TABLE quota_window_snapshots_pre032 (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source                TEXT NOT NULL
+                        CHECK(source IN ('claude','codex')),
+                    source_root_key       TEXT,
+                    source_path           TEXT NOT NULL,
+                    line_offset           INTEGER NOT NULL,
+                    captured_at_utc       TEXT NOT NULL,
+                    observed_slot         TEXT,
+                    logical_limit_key     TEXT NOT NULL,
+                    limit_id              TEXT,
+                    limit_name            TEXT,
+                    window_minutes        INTEGER NOT NULL
+                        CHECK(window_minutes > 0),
+                    used_percent          REAL NOT NULL
+                        CHECK(used_percent >= 0 AND used_percent <= 100),
+                    resets_at_utc         TEXT NOT NULL,
+                    plan_type             TEXT,
+                    individual_limit_json TEXT,
+                    reached_type          TEXT,
+                    observed_model        TEXT,
+                    UNIQUE(source, source_path, line_offset, logical_limit_key),
+                    CHECK(source != 'codex' OR source_root_key IS NOT NULL)
+                );
+                INSERT INTO quota_window_snapshots_pre032
+                  SELECT id, source, source_root_key, source_path, line_offset,
+                         captured_at_utc, observed_slot, logical_limit_key,
+                         limit_id, limit_name, window_minutes, used_percent,
+                         resets_at_utc, plan_type, individual_limit_json,
+                         reached_type, observed_model
+                    FROM quota_window_snapshots;
+                DROP TABLE quota_window_snapshots;
+                ALTER TABLE quota_window_snapshots_pre032
+                  RENAME TO quota_window_snapshots;
+                CREATE INDEX IF NOT EXISTS idx_quota_window_source_root
+                    ON quota_window_snapshots(source_root_key);
+                CREATE INDEX IF NOT EXISTS idx_quota_window_captured_at
+                    ON quota_window_snapshots(captured_at_utc);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # The column add lives in _apply_cache_schema (the idempotent-guard
+            # pattern for a plain column); 032 owns only the backfill. The
+            # dispatcher runs the schema apply first, so the golden does too.
+            db._apply_cache_schema(conn)
+            handler = None
+            for m in db._CACHE_MIGRATIONS:
+                if m.name == "032_codex_canonical_reset_anchor":
+                    handler = m.handler
+                    break
+            if handler is None:
+                raise SystemExit("032_codex_canonical_reset_anchor not registered")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("032_codex_canonical_reset_anchor", "2026-07-15T12:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -5546,6 +5894,12 @@ def main() -> int:
     build_per_migration_030_session_entries_cache_creation_split(
         FIXTURES_ROOT / "per-migration"
         / "030_session_entries_cache_creation_split"
+    )
+    build_per_migration_031_codex_file_account_map(
+        FIXTURES_ROOT / "per-migration" / "031_codex_file_account_map"
+    )
+    build_per_migration_032_codex_canonical_reset_anchor(
+        FIXTURES_ROOT / "per-migration" / "032_codex_canonical_reset_anchor"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

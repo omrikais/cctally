@@ -49,8 +49,11 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version-file: dashboard/web/.nvmrc
-          cache: npm
-          cache-dependency-path: dashboard/web/package-lock.json
+          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
+          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
+          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
+          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
+          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
 
       - name: Install dashboard deps (vitest for share-v2 smoke)
         working-directory: dashboard/web
@@ -73,6 +76,10 @@ jobs:
           # already pin this — test-macos was the lone unpinned suite lane.
           # Etc/UTC, not UTC (repo gotcha).
           TZ: "Etc/UTC"
+          # This self-hosted lane is the CI authority for cctally's private
+          # agentmem integration. tests/conftest.py fails before collection if
+          # the pinned dependency is absent.
+          CCTALLY_AGENTMEM_TEST_POLICY: "required"
           # Cap the OUTER parallel-harness fan-out below the Mac Studio's core
           # count. cctally-test-all keeps CCTALLY_TEST_JOBS as the outer pool
           # budget; the derived inner cap (min(4,outer)=4 here) is pinned lower
@@ -80,6 +87,12 @@ jobs:
           # no longer fans out to full nproc (#292). pytest still runs solo.
           CCTALLY_TEST_JOBS: "4"
           CCTALLY_INNER_JOBS: "2"
+          # pytest runs SOLO after the shell pool, so it gets the whole box.
+          # cctally-test-all only auto-sizes pytest to the core count when
+          # CCTALLY_TEST_JOBS is unset; pinning the outer budget above collapsed
+          # PYTEST to 4 as a side effect. State it explicitly (runner is a
+          # 10-core M1 Max: 8 performance + 2 efficiency).
+          CCTALLY_PYTEST_JOBS: "10"
         run: |
           set -e
           python3 --version
@@ -91,7 +104,16 @@ jobs:
           # too (rich + pytest then importable).
           python3 -m venv .venv
           source .venv/bin/activate
-          python3 -m pip install --upgrade pip pytest pytest-timeout rich
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 bin/cctally-agentmem-dependency provision
+          python3 bin/cctally-agentmem-dependency check
+          # pytest-xdist is REQUIRED for parallelism, not optional garnish:
+          # bin/cctally-test-all gates `-n "$PYTEST"` on `import xdist` and
+          # silently falls back to SERIAL pytest when it is absent. Omitting it
+          # here (the `test-pr` lane below always had it) is what made this
+          # lane's pytest phase run single-process for 914s. Keep in sync with
+          # tests/requirements-dev.txt.
+          python3 -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
           bin/cctally-test-all
 
   dashboard-build-stability:
@@ -108,8 +130,11 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version-file: dashboard/web/.nvmrc
-          cache: npm
-          cache-dependency-path: dashboard/web/package-lock.json
+          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
+          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
+          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
+          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
+          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
 
       - name: Install dashboard deps
         working-directory: dashboard/web
@@ -150,8 +175,11 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version-file: dashboard/web/.nvmrc
-          cache: npm
-          cache-dependency-path: dashboard/web/package-lock.json
+          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
+          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
+          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
+          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
+          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
 
       - name: Install dashboard deps
         working-directory: dashboard/web
@@ -213,6 +241,10 @@ jobs:
       cancel-in-progress: true
     env:
       CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2 (release auto-capped via the runner) — no explicit CCTALLY_INNER_JOBS needed (#292)
+      # The hosted token cannot read the separate private agentmem repository.
+      # Declare that boundary explicitly so missing-dependency skips cannot be
+      # mistaken for self-hosted integration coverage.
+      CCTALLY_AGENTMEM_TEST_POLICY: "hosted-private-unavailable"
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
     steps:

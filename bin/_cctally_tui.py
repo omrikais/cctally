@@ -1061,14 +1061,18 @@ def _tui_attribute_corruption(
     """Classify corruption against the actual database at the catch site.
 
     Mixed stats/cache builders can surface the same SQLite message from either
-    family.  Only after a corruption-shaped exception do we run the expensive
+    family. Only after a corruption-shaped exception do we run the expensive
     stats ``quick_check``: a failed/non-ok result positively attributes stats;
-    an intact stats family leaves the failure attributed to cache.  No path or
-    exception-text parsing is used for database identity.
+    an intact stats family leaves the failure attributed to cache. Explicit
+    third-store ownership, including ``conversations``, is preserved without a
+    stats probe. No path or exception-text parsing is used for database
+    identity.
     """
 
     corruption = bool(_cctally()._is_sqlite_corruption_error(exc))
     attributed = database
+    if database == "conversations":
+        return database, corruption
     if corruption and database == "stats_or_cache":
         try:
             rows = conn.execute("PRAGMA quick_check").fetchall()

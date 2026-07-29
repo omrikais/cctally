@@ -1079,7 +1079,13 @@ def test_codex_cycle_detail_unions_member_milestones(ns, monkeypatch):
     base = _dt("2026-03-08T00:00:00+00:00")
     r0, r1 = base, base + dt.timedelta(seconds=3)
 
-    def fake_breakdown(ident, reset, *, speed, cache_conn, stats_conn):
+    def fake_breakdown(ident, reset, *, speed, cache_conn, stats_conn,
+                       account_key=None):
+        # #416: the merged route must keep reaching the breakdown unscoped —
+        # asserting it here makes this double a byte-stability guard too, not
+        # merely a signature mirror.
+        assert account_key is None
+
         def mk(pct, cap):
             return types.SimpleNamespace(
                 percent=pct, captured_at=_dt(cap), cost_usd=0.0,

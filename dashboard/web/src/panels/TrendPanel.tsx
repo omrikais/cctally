@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { Sparkline } from '../components/Sparkline';
 import { SortableHeader } from '../components/SortableHeader';
 import { PanelGrip } from '../components/PanelGrip';
@@ -132,7 +132,7 @@ function TrendSection({
 // a pair of source-owned charts/tables, never a chronology formed by sorting
 // independent reset axes together.
 export function TrendPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const presentation = presentationTrend(env, activeSource);
   const trendOverride = useSyncExternalStore(

@@ -1,5 +1,5 @@
 import { Fragment, useSyncExternalStore } from 'react';
-import { useSnapshot } from '../hooks/useSnapshot';
+import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useIsDesktopBento } from '../hooks/useIsDesktopBento';
 import { PanelGrip } from '../components/PanelGrip';
@@ -96,7 +96,7 @@ function Cell({
 // unchanged; Codex renders the native calendar-day period table; All renders
 // provider-labeled sections.
 export function DailyPanel() {
-  const env = useSnapshot();
+  const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const isMobile = useIsMobile();
   const isDesktopBento = useIsDesktopBento();
