@@ -486,6 +486,74 @@ def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation
         stats.close()
 
 
+def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
+    tmp_path, monkeypatch,
+):
+    """A busy cache may advance after the builder pins its coherent snapshot.
+
+    Rejecting that completed snapshot starves the dashboard whenever active
+    Claude/Codex sessions keep appending faster than a source build finishes.
+    Stats movement remains covered by the preceding fail-closed regression.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    tui_module = ns["_cctally_tui"]
+    now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
+    try:
+        prior = tui_module._tui_build_source_bundle(
+            stats_conn=stats,
+            now_utc=now,
+            display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+        )
+        from _lib_snapshot_cache import SnapshotSignature
+
+        signatures = iter((
+            SnapshotSignature(
+                max_entry_id=1,
+                max_wus_id=0,
+                max_wcs_id=0,
+                reset_sig=(0, 0),
+                max_codex_id=1,
+                generation=0,
+                entry_mutation_seq=1,
+                codex_physical_mutation_seq=1,
+            ),
+            SnapshotSignature(
+                max_entry_id=2,
+                max_wus_id=0,
+                max_wcs_id=0,
+                reset_sig=(0, 0),
+                max_codex_id=2,
+                generation=0,
+                entry_mutation_seq=2,
+                codex_physical_mutation_seq=2,
+            ),
+        ))
+        monkeypatch.setitem(
+            ns, "compute_signature", lambda *args, **kwargs: next(signatures),
+        )
+
+        rebuilt = tui_module._tui_build_source_bundle(
+            stats_conn=stats,
+            now_utc=now + ns["dt"].timedelta(minutes=1),
+            display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+            prior_bundle=prior,
+        )
+
+        assert rebuilt is not prior
+        assert rebuilt.sources["claude"].data_version.startswith("claude:1:1:")
+        assert rebuilt.sources["codex"].data_version.startswith("codex:1:1:")
+    finally:
+        stats.close()
+
+
 def test_real_dispatch_keeps_the_unchanged_provider_object_across_owned_changes(
     tmp_path, monkeypatch,
 ):

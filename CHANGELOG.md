@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.87.2] - 2026-07-30
+
+### Fixed
+- The dashboard no longer freezes provider data while Claude or Codex sessions are continuously active. A completed read now publishes the coherent cache snapshot it actually built even when newer session bytes arrive before the build finishes, so Codex quota percentages and Recent Sessions keep advancing instead of remaining pinned to an older generation. Stats-side changes during a build still fail closed to the prior complete bundle.
+
 ## [1.87.1] - 2026-07-30
 
 ### Fixed

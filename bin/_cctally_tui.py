@@ -2808,21 +2808,33 @@ def _tui_build_source_bundle(
             source_order=("claude", "codex", "all"),
             sources={"claude": claude, "codex": codex, "all": combined},
         )
-        # End our snapshots before re-reading the cheap signatures.  Seeing a
-        # different physical state means the build may have mixed independent
-        # database generations; retain only the prior complete bundle.
+        # End the pinned cache snapshot before re-reading the cheap signatures.
+        # New cache commits after BEGIN do not make this bundle incoherent: all
+        # cache-backed reads above saw the same frozen generation, and its
+        # data_version names that generation. Reject only stats-side movement,
+        # whose statement-scoped autocommit reads may have mixed generations.
+        # Rejecting ordinary cache advancement starves publication whenever
+        # active Claude/Codex sessions append faster than this build completes.
         if cache_read_tx:
             cache_conn.rollback()
             cache_read_tx = False
         post_stats_digest = codex_stats_digest(stats_conn)
+        post_accounts_digest = accounts_identity_digest(stats_conn)
         post_signature = c.compute_signature(
             cache_conn,
             stats_conn,
             generation=c.current_generation(),
             codex_stats_digest=post_stats_digest,
-            accounts_digest=accounts_identity_digest(stats_conn),
+            accounts_digest=post_accounts_digest,
         )
-        if post_signature != signature:
+        stats_generation_moved = (
+            post_signature.max_wus_id != signature.max_wus_id
+            or post_signature.max_wcs_id != signature.max_wcs_id
+            or post_signature.reset_sig != signature.reset_sig
+            or post_stats_digest != stats_digest
+            or post_accounts_digest != accounts_digest
+        )
+        if stats_generation_moved:
             if prior_bundle is not None:
                 return prior_bundle
             raise RuntimeError("source read generation moved during build")
