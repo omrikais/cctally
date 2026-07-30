@@ -105,7 +105,7 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
     json.dumps(envelope)
 
 
-def test_codex_labels_are_injected_per_request_into_direct_and_all_rows():
+def test_codex_labels_are_injected_per_request_into_parent_and_account_rows():
     """One frozen source bundle serves clients with different transcript gates.
 
     Codex labels are transcript-derived content: they stay in a server-private
@@ -125,11 +125,19 @@ def test_codex_labels_are_injected_per_request_into_direct_and_all_rows():
         source="codex", availability="ok", freshness="fresh",
         warnings=(), data_version="codex-v1", last_success_at=now,
         capabilities={},
-        data={"sessions": {"rows": ({"key": key, "source": "codex"},)}},
+        data={
+            "sessions": {"rows": ({"key": key, "source": "codex"},)},
+            "account_scopes": {
+                "account-a": {
+                    "sessions": {
+                        "rows": ({"key": key, "source": "codex"},),
+                    },
+                },
+            },
+        },
     )
-    # RED seam: the production dataclass does not expose this server-private
-    # field yet, but a dynamic attribute lets the test exercise the desired
-    # request-local overlay without publishing the label in ``data``.
+    # The server-private map stays outside the published data tree and is read
+    # only by the request-local overlay.
     object.__setattr__(codex, "private_session_labels", {key: label})
     snap = ns["_empty_dashboard_snapshot"]()
     snap.source_bundle = SourceDashboardBundle(
@@ -154,9 +162,13 @@ def test_codex_labels_are_injected_per_request_into_direct_and_all_rows():
 
     def codex_rows(env):
         sources = env["sources"]
+        direct = sources["codex"]["data"]
+        nested = sources["all"]["data"]["providers"]["codex"]
         return (
-            sources["codex"]["data"]["sessions"]["rows"],
-            sources["all"]["data"]["providers"]["codex"]["sessions"]["rows"],
+            direct["sessions"]["rows"],
+            direct["account_scopes"]["account-a"]["sessions"]["rows"],
+            nested["sessions"]["rows"],
+            nested["account_scopes"]["account-a"]["sessions"]["rows"],
         )
 
     for env in (open_first, open_again):

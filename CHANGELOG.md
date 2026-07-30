@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.87.1] - 2026-07-30
+
+### Fixed
+- Codex session names now remain visible in Recent Sessions when an individual account is selected, whenever transcript visibility is enabled. Selecting an account no longer replaces every session name with an em dash; disabling transcript visibility still hides names in both the all-accounts and focused-account views.
+
 ## [1.87.0] - 2026-07-30
 
 ### Fixed

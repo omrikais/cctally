@@ -295,20 +295,30 @@ def test_transcript_timeout_tracks_no_progress_not_total_wall_time(
     """A healthy large phase may outlive the bound while still advancing."""
     ns, _tmp_path, _fixture_monkeypatch = env
     cache_mod = ns["_cctally_cache"]
+    step_seconds = 0.04
+    phase_timeout_seconds = step_seconds * 25
+    startup_delay_seconds = step_seconds * 5
+    progress_steps = 30
     monkeypatch.setattr(
         cache_mod,
         "_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS",
-        0.12,
+        phase_timeout_seconds,
     )
 
     class FakeConnection:
         def close(self) -> None:
             pass
 
+    def delayed_open():
+        # Exercise worker-startup scheduling latency without letting it consume
+        # the deliberately proportional no-progress budget.
+        time.sleep(startup_delay_seconds)
+        return FakeConnection()
+
     def advancing(_conn, *, progress, **_kwargs):
-        stats = cache_mod.IngestStats(files_total=3)
-        for completed in range(1, 4):
-            time.sleep(0.08)
+        stats = cache_mod.IngestStats(files_total=progress_steps)
+        for completed in range(1, progress_steps + 1):
+            time.sleep(step_seconds)
             stats.files_processed = completed
             progress("ingest", stats)
         return stats
@@ -316,7 +326,7 @@ def test_transcript_timeout_tracks_no_progress_not_total_wall_time(
     monkeypatch.setattr(
         cache_mod,
         "_open_conversations_db_for_recovery",
-        lambda: FakeConnection(),
+        delayed_open,
     )
     monkeypatch.setattr(cache_mod, "sync_claude_conversations", advancing)
 
@@ -326,11 +336,11 @@ def test_transcript_timeout_tracks_no_progress_not_total_wall_time(
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed > 0.12
+    assert elapsed > phase_timeout_seconds
     assert outcome.timed_out is False
     assert outcome.error is None
     assert outcome.stats is not None
-    assert outcome.stats.files_processed == 3
+    assert outcome.stats.files_processed == progress_steps
 
 
 def test_rebuild_recovers_post_open_corruption_and_retries_once(

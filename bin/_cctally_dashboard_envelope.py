@@ -1787,11 +1787,39 @@ def _overlay_claude_source_session_titles(
 
 
 def _codex_source_session_rows(envelope: dict) -> list:
-    """Return direct-Codex and All-tab Codex session row lists."""
+    """Return every request-local Codex session row list.
+
+    Besides the merged parent used by ``All accounts``, decorated Codex data
+    carries one ``account_scopes[*].sessions`` child per account. The client
+    swaps that child into view when an account chip is focused, so the private
+    label overlay must cover it under the same per-request transcript gate.
+    """
     sources = envelope.get("sources")
     if not isinstance(sources, Mapping):
         return []
     out = []
+
+    def append_rows(data) -> None:
+        if not isinstance(data, Mapping):
+            return
+        sessions = data.get("sessions")
+        if isinstance(sessions, Mapping):
+            rows = sessions.get("rows")
+            if isinstance(rows, list):
+                out.append(rows)
+        account_scopes = data.get("account_scopes")
+        if not isinstance(account_scopes, Mapping):
+            return
+        for child in account_scopes.values():
+            if not isinstance(child, Mapping):
+                continue
+            sessions = child.get("sessions")
+            if not isinstance(sessions, Mapping):
+                continue
+            rows = sessions.get("rows")
+            if isinstance(rows, list):
+                out.append(rows)
+
     candidates = [(sources.get("codex") or {}).get("data")]
     all_data = (sources.get("all") or {}).get("data")
     if isinstance(all_data, Mapping):
@@ -1799,14 +1827,7 @@ def _codex_source_session_rows(envelope: dict) -> list:
         if isinstance(providers, Mapping):
             candidates.append(providers.get("codex"))
     for data in candidates:
-        if not isinstance(data, Mapping):
-            continue
-        sessions = data.get("sessions")
-        if not isinstance(sessions, Mapping):
-            continue
-        rows = sessions.get("rows")
-        if isinstance(rows, list):
-            out.append(rows)
+        append_rows(data)
     return out
 
 
@@ -1818,8 +1839,9 @@ def _overlay_codex_source_session_labels(
     ``state_5.sqlite.threads.title`` is derived from transcript prompt content.
     The frozen source state therefore retains it only in a server-private key
     map, outside the published ``data`` tree. Closed requests return before
-    consulting that map; open requests match labels to direct and All rows by
-    their opaque resource keys. A missed call fails closed.
+    consulting that map; open requests match labels to merged-parent,
+    account-scoped, and All rows by their opaque resource keys. A missed call
+    fails closed.
     """
     if not transcripts_visible:
         return
