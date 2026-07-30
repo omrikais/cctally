@@ -240,6 +240,7 @@ def load_codex_quota_observations(
     active_at: dt.datetime | None = None,
     max_rows: int | None = None,
     physical_signatures: dict[str, str] | None = None,
+    canonical_resets_between: "tuple[dt.datetime, dt.datetime] | None" = None,
 ) -> tuple[QuotaObservation, ...]:
     """Load only valid root-qualified S1 physical quota rows.
 
@@ -258,6 +259,14 @@ def load_codex_quota_observations(
     supplied, exact S2 signatures are accumulated from the same cursor before
     presentation bounds are applied, so coherence validation does not require
     a second unbounded observation load.
+
+    ``canonical_resets_between`` is an INCLUSIVE ``(low, high)`` bound on the
+    window's CANONICAL reset, applied in SQL.  Unlike ``captured_at_or_after``
+    it is a window-IDENTITY bound, so it never fractures a window group: every
+    observation of one physical window shares one canonical anchor, and the
+    continuity fold below therefore still sees each retained window whole.  That
+    is what lets the ingest-side spend-adoption pass bound itself to the windows
+    one sync touched instead of materializing all history every hook tick.
     """
     for name, value in (
         ("captured_at_or_after", captured_at_or_after), ("active_at", active_at),
@@ -269,6 +278,19 @@ def load_codex_quota_observations(
                 captured_at_or_after = value.astimezone(UTC)
             else:
                 active_at = value.astimezone(UTC)
+    if canonical_resets_between is not None:
+        if len(canonical_resets_between) != 2:
+            raise ValueError(
+                "canonical_resets_between must be a (low, high) pair")
+        bounds = []
+        for value in canonical_resets_between:
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(
+                    "canonical_resets_between must be timezone-aware")
+            bounds.append(value.astimezone(UTC))
+        if bounds[0] > bounds[1]:
+            raise ValueError("canonical_resets_between must be ordered")
+        canonical_resets_between = (bounds[0], bounds[1])
     if max_rows is not None:
         if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows <= 0:
             raise ValueError("max_rows must be a positive integer or None")
@@ -352,6 +374,23 @@ def load_codex_quota_observations(
                 return ()
             sql += " AND source_root_key IN (" + ",".join("?" for _ in requested) + ")"
             params.extend(sorted(requested))
+        if canonical_resets_between is not None:
+            # COALESCE, not the bare column: a pre-032 row (or one the backfill
+            # never reached) carries NULL there and the reader falls back to the
+            # raw reset, so the bound has to fall back with it or the row would
+            # silently drop out of its own window.
+            reset_expr = (
+                "COALESCE(canonical_resets_at_utc, resets_at_utc)"
+                if has_anchor else "resets_at_utc"
+            )
+            sql += (
+                f" AND unixepoch({reset_expr}) >= unixepoch(?)"
+                f" AND unixepoch({reset_expr}) <= unixepoch(?)"
+            )
+            params.extend((
+                _utc_iso(canonical_resets_between[0]),
+                _utc_iso(canonical_resets_between[1]),
+            ))
         # When exact signatures are requested this first cursor must cover the
         # complete root history.  Otherwise apply dashboard presentation bounds
         # in SQL so only the capped evidence crosses the SQLite/Python boundary.
@@ -494,6 +533,7 @@ def load_codex_quota_observations(
                     captured_at_or_after=captured_at_or_after,
                     active_at=active_at,
                     max_rows=max_rows,
+                    canonical_resets_between=canonical_resets_between,
                 )
         if max_rows is not None and len(result) > max_rows:
             result = sorted(
@@ -1464,13 +1504,30 @@ def _codex_cache_account_predicate(
       dollars are these" — widening it IS attribution, which D1 forbids, and it
       puts one row in two scopes.
 
-    Three stamping mechanisms exist and must never be conflated: the
+    FOUR stamping mechanisms exist and must never be conflated: the
     quota-observation fold (``adopt_unidentified_observations``, per physical-
     window group, landing post-fold in ``quota_window_blocks`` /
     ``quota_percent_milestones`` and NEVER written back to
     ``quota_window_snapshots``); per-file-range attribution
     (``codex_file_accounts`` -> ``codex_session_entries.account_key``,
-    ``stably_absent`` -> NULL); and the stats ``accounts`` registry.
+    ``stably_absent`` -> NULL); WINDOW-SCOPED SPEND ADOPTION (the 2026-07-30
+    spec — ``_lib_codex_account_adoption`` +
+    ``_cctally_cache.apply_codex_window_spend_adoption``, which stamps that same
+    ``codex_session_entries.account_key`` column at ingest from the window's
+    single identified account); and the stats ``accounts`` registry.
+
+    So ``codex_session_entries.account_key`` now carries window-derived
+    attribution IN ADDITION to per-file decisions, and that is precisely what
+    keeps the cost read strict rather than forcing it to widen. The rule above
+    genuinely pointed both ways for that read: the scope key comes from the
+    observation fold while the rows came from per-file attribution — DIFFERENT
+    mechanisms, which reads as "widen" — yet widening a cost read is attribution
+    D1 forbids and puts one row in two scopes. The resolution is to make the ROW
+    carry the window's answer durably, so scope key and row now agree by
+    construction and the strict flavour is correct rather than merely safe. A
+    row the adoption pass declined to stamp (zero or ambiguous identified
+    accounts, an overlap whose windows disagree) is genuinely nobody's and
+    stays in the ``unattributed`` scope, which is the honest answer.
     """
     if account_key is None:
         return "", ()
@@ -1598,7 +1655,19 @@ def codex_quota_breakdown(
       renders an honest ``$0.00``; the dollars stay visible in the
       ``unattributed`` scope, which owns them.
 
-    The full rule, and the three stamping mechanisms it turns on, are in
+    That honest ``$0.00`` used to fire for spend that was NOT nobody's. The
+    crossing carries the window's account (the observation fold put it there)
+    while the rows behind it carried none, because per-file attribution had no
+    decision covering those bytes. ``codex_session_entries.account_key`` now also
+    carries WINDOW-DERIVED attribution — stamped durably at ingest by
+    ``apply_codex_window_spend_adoption`` under the same window key and the same
+    single-identified-account guard the fold uses — so the ladder and the
+    dollars agree by construction. The read stays strict on top of it precisely
+    BECAUSE the inference is now durable: doing it here instead would re-file one
+    row under two scopes on every read, while doing it once at ingest moves the
+    row out of ``unattributed`` and into exactly one owner.
+
+    The full rule, and the four stamping mechanisms it turns on, are in
     ``_codex_cache_account_predicate``.
     """
     reset = _parse_utc(resets_at, "resets_at") if isinstance(resets_at, str) else resets_at

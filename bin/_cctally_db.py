@@ -6085,6 +6085,56 @@ def _033_codex_reset_anchor_component_closure(
     conn.commit()
 
 
+@cache_migration("034_codex_window_spend_adoption")
+def _034_codex_window_spend_adoption(conn: sqlite3.Connection) -> None:
+    """One-time window-scoped spend adoption over existing Codex history.
+
+    Spec:
+    ``docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md``.
+
+    Ingest stamps every window forward from here, but rollout bytes that were
+    already walked keep whatever per-file attribution decided for them — and for
+    history predating the durable attribution map that is nothing at all (#416
+    spec D1). A cycle's milestone ladder then renders ``$0.00`` for a crossing
+    whose spend is real, because the crossing came from the folded observation
+    axis and the dollars from the per-file axis. This handler runs the SAME pass
+    ingest now runs, unbounded, so existing history converges in one pass.
+
+    The whole decision lives in ``_lib_codex_account_adoption`` and the read/write
+    in ``_cctally_cache.apply_codex_window_spend_adoption``; re-implementing the
+    rule here would let the migration and ingest drift.
+
+    Idempotent by construction: only rows whose ``account_key`` is ``NULL`` or
+    empty are candidates, so a re-run over its own output writes nothing. NO
+    self-stamp — the dispatcher central-stamps on a clean return (#140).
+
+    Takes the Codex provider flock like handlers 024-027: this writes a
+    Codex-derived table, so a mid-walk ``sync_codex_cache`` must not interleave.
+    On contention it DEFERS (``MigrationGateNotMet``) before touching any data —
+    the safe side, and free here because that same sync runs the identical pass
+    at its own end anyway.
+
+    ``BEGIN IMMEDIATE`` before the read, like handler 024: the pass reads the
+    folded window evidence and then writes back a plan derived from it, so it
+    must hold the write lock for the whole read-then-write rather than upgrade
+    part way through it.
+    """
+    import _cctally_cache as cache_mod
+
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="034 window spend adoption")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cache_mod.apply_codex_window_spend_adoption(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")

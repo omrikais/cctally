@@ -5392,6 +5392,171 @@ def build_per_migration_033_codex_reset_anchor_component_closure(
     _build_post(pre, post)
 
 
+_CACHE_034_ROOT = "rk"
+_CACHE_034_AMBIGUOUS_ROOT = "rk2"
+_CACHE_034_ACCOUNT_A = "a" * 32
+_CACHE_034_ACCOUNT_B = "b" * 32
+# The live-store cycle the defect was reproduced against, transposed onto the
+# fixture's synthetic root. Nominal start is 2026-07-29T04:35:06Z.
+_CACHE_034_RESET = "2026-08-05T04:35:06Z"
+_CACHE_034_ENTRIES = (
+    # (source_path, offset, timestamp, account_key, expectation)
+    ("/roots/rk/sessions/a.jsonl", 10, "2026-07-29T05:29:52.095000+00:00",
+     None, _CACHE_034_ROOT),
+    ("/roots/rk/sessions/a.jsonl", 20, "2026-08-01T00:00:00+00:00",
+     "", _CACHE_034_ROOT),
+    # Before the nominal window opened — no window covers it.
+    ("/roots/rk/sessions/a.jsonl", 30, "2026-07-28T00:00:00+00:00",
+     None, _CACHE_034_ROOT),
+    # Already identified: never re-stamped, even though it sits in range.
+    ("/roots/rk/sessions/a.jsonl", 40, "2026-07-30T00:00:00+00:00",
+     _CACHE_034_ACCOUNT_B, _CACHE_034_ROOT),
+    # A second root whose window names TWO accounts: ambiguity is never guessed.
+    ("/roots/rk2/sessions/c.jsonl", 10, "2026-07-30T00:00:00+00:00",
+     None, _CACHE_034_AMBIGUOUS_ROOT),
+)
+
+
+def build_per_migration_034_codex_window_spend_adoption(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the window-scoped spend adoption repair.
+
+    ``pre.sqlite`` is a 033-head install whose weekly window names exactly one
+    account while the accounting rows inside it carry no attribution at all —
+    the shape the live store was in when the milestone ladder rendered ``$0.00``.
+    ``post.sqlite`` is that database after the production handler: the two
+    unattributed in-range rows carry the window's account, the out-of-range row
+    and the ambiguous root's row are untouched, and the already-identified row
+    keeps its own account.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+    migration = "034_codex_window_spend_adoption"
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _snapshot(conn, *, root, key, source_path, offset, captured,
+                  account_key):
+        conn.execute(
+            "INSERT INTO quota_window_snapshots "
+            "(source, source_root_key, source_path, line_offset, "
+            " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
+            " limit_name, window_minutes, used_percent, resets_at_utc, "
+            " plan_type, individual_limit_json, reached_type, observed_model, "
+            " account_key, canonical_resets_at_utc) "
+            "VALUES ('codex',?,?,?,?,'primary',?,'codex','7-day limit',10080,"
+            " 1.0,?,NULL,NULL,NULL,NULL,?,?)",
+            (root, source_path, offset, captured, key, _CACHE_034_RESET,
+             account_key, _CACHE_034_RESET),
+        )
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        jsonl = sys.modules["_lib_jsonl"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_031,
+                         "032_codex_canonical_reset_anchor",
+                         "033_codex_reset_anchor_component_closure"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-30T12:00:00Z"),
+                )
+            _snapshot(
+                conn, root=_CACHE_034_ROOT,
+                key=jsonl._codex_logical_limit_key(
+                    _CACHE_034_ROOT, "codex", "primary", 10080, None),
+                source_path="/roots/rk/sessions/a.jsonl", offset=1,
+                captured="2026-07-29T04:35:29.396000Z",
+                account_key=_CACHE_034_ACCOUNT_A,
+            )
+            ambiguous_key = jsonl._codex_logical_limit_key(
+                _CACHE_034_AMBIGUOUS_ROOT, "codex", "primary", 10080, None)
+            for offset, account in ((1, _CACHE_034_ACCOUNT_A),
+                                    (2, _CACHE_034_ACCOUNT_B)):
+                _snapshot(
+                    conn, root=_CACHE_034_AMBIGUOUS_ROOT, key=ambiguous_key,
+                    source_path="/roots/rk2/sessions/c.jsonl", offset=offset,
+                    captured="2026-07-29T04:35:29.396000Z",
+                    account_key=account,
+                )
+            for source_path, offset, stamp, account, root in _CACHE_034_ENTRIES:
+                conn.execute(
+                    "INSERT INTO codex_session_entries "
+                    "(source_path, line_offset, timestamp_utc, session_id, "
+                    " model, input_tokens, cached_input_tokens, output_tokens, "
+                    " reasoning_output_tokens, total_tokens, source_root_key, "
+                    " conversation_key, account_key) "
+                    "VALUES (?,?,?,'session','gpt-5',1000,0,0,0,1000,?,NULL,?)",
+                    (source_path, offset, stamp, root, account),
+                )
+            conn.execute("PRAGMA user_version=33")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler = next(
+                (item.handler for item in db._CACHE_MIGRATIONS
+                 if item.name == migration),
+                None,
+            )
+            if handler is None:
+                raise SystemExit(f"{migration} not registered")
+            handler(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, "2026-07-30T12:00:00Z"),
+            )
+            conn.execute("PRAGMA user_version=34")
+            conn.commit()
+        finally:
+            conn.close()
+        # The handler takes the Codex provider flock (handlers 024-027 do too),
+        # which creates a sibling lock file next to the golden. Same cleanup the
+        # 024 builder does.
+        lock = Path(str(dst) + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -6020,6 +6185,9 @@ def main() -> int:
     build_per_migration_033_codex_reset_anchor_component_closure(
         FIXTURES_ROOT / "per-migration"
         / "033_codex_reset_anchor_component_closure"
+    )
+    build_per_migration_034_codex_window_spend_adoption(
+        FIXTURES_ROOT / "per-migration" / "034_codex_window_spend_adoption"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

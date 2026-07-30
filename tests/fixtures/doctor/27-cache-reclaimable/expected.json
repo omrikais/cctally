@@ -171,12 +171,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 33,
+                        "registry_size": 34,
                         "user_version": 0
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 0 / 33 known",
+                    "summary": "version 0 / 34 known",
                     "title": "cache.db"
                 },
                 {
@@ -194,7 +194,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 33,
+                            "registry_size": 34,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -248,7 +248,8 @@
                                     "030_session_entries_cache_creation_split",
                                     "031_codex_file_account_map",
                                     "032_codex_canonical_reset_anchor",
-                                    "033_codex_reset_anchor_component_closure"
+                                    "033_codex_reset_anchor_component_closure",
+                                    "034_codex_window_spend_adoption"
                                 ],
                                 "skipped": []
                             },
@@ -276,7 +277,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/46 applied",
+                    "summary": "0/47 applied",
                     "title": "Migrations"
                 },
                 {
@@ -465,13 +466,17 @@
                             [
                                 "cache.db",
                                 "033_codex_reset_anchor_component_closure"
+                            ],
+                            [
+                                "cache.db",
+                                "034_codex_window_spend_adoption"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "46 pending",
+                    "summary": "47 pending",
                     "title": "Pending migrations"
                 },
                 {

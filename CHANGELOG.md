@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.87.0] - 2026-07-30
+
+### Fixed
+- A Codex cycle's per-percent milestone ladder no longer reports `$0.00` for a crossing whose spend is real. cctally already recognised which account a quota window belongs to even when individual samples arrived unlabelled, but the dollars behind those percentages were attributed separately, per rollout file — and for usage recorded before cctally began keeping durable per-file attribution there was no decision to apply, so that spend belonged to nobody. The crossing was confidently the account's while its cost read as zero, the cycle hero under-reported spend by the same amount, and roughly a seventh of one Pro account's weekly Codex spend sat in the `unattributed` bucket instead of on its own card. Codex spend recorded inside an account-level weekly window is now attributed to that window's account whenever the window names exactly one, so the ladder, the cycle hero, the per-account cards, the Codex budget and the CLI all agree. Nothing is guessed: spend that no window can name is left alone, so is spend claimed by two windows naming different accounts, and separate model pools such as GPT-5.3-Codex-Spark are never treated as account quota. Existing history is repaired once on upgrade, and no usage is ever counted twice.
+
 ## [1.86.0] - 2026-07-30
 
 ### Fixed

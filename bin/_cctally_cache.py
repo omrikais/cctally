@@ -192,6 +192,11 @@ _iter_message_rows = _lib_conversation.iter_message_rows
 # so it loads at module-load time alongside _lib_conversation.
 _lib_codex_conversation = _load_lib("_lib_codex_conversation")
 
+# Window-scoped spend adoption's decision kernel (2026-07-30 spec). Pure
+# stdlib leaf, same shape as `_lib_codex_pools`, so it loads here rather than
+# through a bare import that would depend on ``bin/`` being on ``sys.path``.
+_lib_codex_account_adoption = _load_lib("_lib_codex_account_adoption")
+
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
 # shared no-op singleton), so the sync_cache seam wraps below cost nothing on
@@ -4812,6 +4817,22 @@ def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> N
     )
 
 
+def _extend_codex_touched_span(
+    spans: "dict[str, tuple[dt.datetime, dt.datetime]]",
+    source_root_key: object,
+    moment: "dt.datetime | None",
+) -> None:
+    """Widen one root's touched instant span in place."""
+    if not source_root_key or moment is None:
+        return
+    key = str(source_root_key)
+    current = spans.get(key)
+    if current is None:
+        spans[key] = (moment, moment)
+    else:
+        spans[key] = (min(current[0], moment), max(current[1], moment))
+
+
 def sync_codex_cache(
     conn: sqlite3.Connection,
     *,
@@ -4836,6 +4857,13 @@ def sync_codex_cache(
     """
     stats = CodexIngestStats()
     project_after_unlock = False
+    # Per-root instant span this sync wrote — accounting-row timestamps AND
+    # canonical window resets. It bounds the end-of-sync spend-adoption pass to
+    # the windows this sync could have changed; an unchanged tree leaves it empty
+    # and the pass does no SQL at all. A rebuild deliberately passes ``None``
+    # instead (full re-derivation restores the unattributed state, so the repair
+    # has to re-run over everything).
+    adoption_spans: "dict[str, tuple[dt.datetime, dt.datetime]]" = {}
     # #313 P1 review (F4/F1): when the CACHE certificate is current we cannot
     # yet decide whether to skip the reconcile — reconcile's own short-circuit
     # ALSO requires the stats-side quota_projection_state signatures to match
@@ -5646,6 +5674,23 @@ def sync_codex_cache(
                 continue
             anchor_resolver.mark_file_committed()
 
+            if not rebuild:
+                # Accounting timestamps share one producer spelling, so the
+                # lexicographic extremes ARE the chronological ones and only two
+                # rows need parsing. Quota anchors are few per file, so they are
+                # parsed individually.
+                if accounting_rows:
+                    for _extreme in (
+                        min(_r[2] for _r in accounting_rows),
+                        max(_r[2] for _r in accounting_rows),
+                    ):
+                        _extend_codex_touched_span(
+                            adoption_spans, discovered.source_root_key,
+                            _parse_anchor_iso(_extreme))
+                for _qrow in quota_rows:
+                    _extend_codex_touched_span(
+                        adoption_spans, _qrow[1], _parse_anchor_iso(_qrow[17]))
+
             # Private test seam (§5.1 post-preflight late-shrink race): fires
             # after each file's successful commit, so a race test can shrink a
             # not-yet-written target and assert the earlier commit stands.
@@ -5698,6 +5743,31 @@ def sync_codex_cache(
                 conn.execute("DELETE FROM cache_meta WHERE key = ?",
                              ("codex_torn_auth_deferred",))
             conn.commit()
+        # Window-scoped spend adoption (spec
+        # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
+        # Runs AFTER the walk committed and while both cache writer flocks are
+        # still held, so the observation evidence and the accounting rows it
+        # stamps are the same committed generation. Cache-only — no stats.db read
+        # — so the lock-order law is untouched. A failure here is never fatal:
+        # the stamp is fully re-derivable, so the next sync (or the migration)
+        # repeats it.
+        try:
+            adopted = apply_codex_window_spend_adoption(
+                conn, touched=None if rebuild else adoption_spans)
+            conn.commit()
+            # Terse, and silent on zero: a rebuild re-derives every row and so
+            # legitimately re-stamps the same population each time, which would
+            # otherwise read as a recurring anomaly rather than convergence.
+            if adopted:
+                eprint(f"[cache-sync] attributed {adopted} Codex row(s) "
+                       "from quota windows")
+        except sqlite3.DatabaseError as exc:
+            conn.rollback()
+            if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                # Classified family corruption belongs to the shared recovery
+                # boundary, never to a best-effort local except.
+                raise
+            eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
         # Codex creates/extends cache.db sidecars independently of Claude's
         # sync path. Harden them while both cache flocks are still held and
         # after all Codex writes, before the optional checkpoint can rotate a
@@ -5792,6 +5862,188 @@ def sync_codex_cache(
         from _cctally_quota import reconcile_codex_quota_projection
         reconcile_codex_quota_projection()
     return stats
+
+
+_CODEX_ACCOUNT_WEEK = dt.timedelta(
+    minutes=_lib_codex_account_adoption.ACCOUNT_WEEKLY_WINDOW_MINUTES)
+
+
+def apply_codex_window_spend_adoption(
+    conn: sqlite3.Connection,
+    *,
+    touched: "dict[str, tuple[dt.datetime, dt.datetime]] | None" = None,
+) -> int:
+    """Stamp window-derived attribution onto unattributed Codex spend.
+
+    The I/O half of ``_lib_codex_account_adoption``: read the folded window
+    evidence and the candidate rows, hand both to the pure kernel, write back the
+    plan it returns.  Cache-only by construction — the window's identified
+    accounts come from ``load_codex_quota_observations`` (which already runs
+    ``adopt_unidentified_observations``) and the nominal range is derived from
+    the canonical reset, so no stats.db read is involved and the lock-order law
+    is untouched.  The caller owns the transaction and the commit.
+
+    ``touched`` maps ``source_root_key`` to the ``(low, high)`` instant span this
+    sync wrote — the timestamps of the accounting rows AND the canonical resets
+    of the quota rows.  ``None`` runs the pass over all history (``cache-sync
+    --rebuild`` and the one-time migration); an EMPTY map is a no-op that issues
+    NO SQL AT ALL, which is what keeps a quiescent hook tick free.
+
+    A bounded pass must reach the SAME verdict the unbounded one would, because
+    the stamp is one-way (``NULL`` -> key, never back) and an incremental sync
+    followed by a later rebuild would otherwise disagree.  That needs the loaded
+    window set to be a SUPERSET of the windows that can claim any candidate the
+    scan offers, so the two bounds are derived together: windows are loaded for
+    resets in ``[low - 7d, high + 7d]``, and candidates are clamped to
+    ``[low - 7d, high]``.  Every window claiming an instant ``t`` in that
+    candidate span has its reset in ``(t, t + 7d]``, which the window bound
+    contains — so no window can claim a scanned row unseen.  The candidate span
+    still covers everything this sync could have changed: the rows it wrote lie
+    in ``[low, high]``, and a window whose reset it wrote lies in ``[low, high]``
+    too, so that window's whole nominal range lies in ``[low - 7d, high)``.
+
+    Idempotent and re-runnable: ``codex_session_entries`` is fully re-derived on
+    every rebuild, so the pass must re-stamp afterwards, and re-running over an
+    already-stamped cache writes nothing because an identified row is never a
+    candidate.  Returns the number of rows actually stamped.
+    """
+    roots: "set[str] | None" = None
+    reset_bounds: "tuple[dt.datetime, dt.datetime] | None" = None
+    candidate_bounds: "tuple[dt.datetime, dt.datetime] | None" = None
+    if touched is not None:
+        spans = {
+            str(root): span for root, span in touched.items()
+            if root and span is not None
+        }
+        # Before any SQL: an unchanged tree must cost this pass nothing.
+        if not spans:
+            return 0
+        roots = set(spans)
+        low = min(span[0] for span in spans.values())
+        high = max(span[1] for span in spans.values())
+        reset_bounds = (low - _CODEX_ACCOUNT_WEEK, high + _CODEX_ACCOUNT_WEEK)
+        candidate_bounds = (low - _CODEX_ACCOUNT_WEEK, high)
+
+    from _cctally_quota import load_codex_quota_observations
+
+    # `_load_lib`, not a bare import: this module is loadable in isolation, where
+    # `bin/` may not be on `sys.path` (see the module docstring).
+    _lib_accounts = _load_lib("_lib_accounts")
+    is_model_scoped_codex_quota = _load_lib(
+        "_lib_codex_pools").is_model_scoped_codex_quota
+    adopt = _lib_codex_account_adoption
+    try:
+        columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(codex_session_entries)")
+        }
+    except sqlite3.DatabaseError:
+        return 0
+    if not {"account_key", "source_root_key", "timestamp_utc"} <= columns:
+        return 0
+
+    try:
+        observations = load_codex_quota_observations(
+            source_root_keys=roots, cache_conn=conn,
+            canonical_resets_between=reset_bounds,
+        )
+    except sqlite3.DatabaseError:
+        return 0
+
+    # Group on the SAME key the observation fold groups on
+    # (`_lib_quota._physical_window_key`) — the account is deliberately excluded
+    # from it, which is precisely what makes a window able to name an account for
+    # rows that carry none.
+    buckets: "dict[tuple, dict]" = {}
+    for observation in observations:
+        identity = observation.identity
+        bucket = buckets.get(key := _lib_quota._physical_window_key(observation))
+        if bucket is None:
+            bucket = buckets[key] = {
+                "root": identity.source_root_key,
+                "minutes": identity.window_minutes,
+                "reset": observation.canonical_resets_at,
+                "accounts": set(),
+                "model_scoped": False,
+            }
+        if identity.account_key != _lib_accounts.UNATTRIBUTED:
+            bucket["accounts"].add(identity.account_key)
+        # `limit_name` is compare=False on the identity, so the label can differ
+        # across one group's observations; ANY Spark evidence demotes the whole
+        # window out of account weekly quota (#373). That direction only ever
+        # withholds a stamp, never invents one.
+        if is_model_scoped_codex_quota(
+                identity.logical_limit_key, identity.limit_name):
+            bucket["model_scoped"] = True
+
+    windows: "list[object]" = []
+    root_ranges: "dict[str, list[tuple[dt.datetime, dt.datetime]]]" = {}
+    for bucket in buckets.values():
+        window = adopt.SpendAdoptionWindow(
+            source_root_key=bucket["root"],
+            window_minutes=bucket["minutes"],
+            canonical_resets_at=bucket["reset"],
+            identified_accounts=frozenset(bucket["accounts"]),
+            model_scoped=bucket["model_scoped"],
+        )
+        if not window.in_scope:
+            continue
+        windows.append(window)
+        root_ranges.setdefault(window.source_root_key, []).append(
+            (window.nominal_start_at, window.canonical_resets_at))
+    if not windows:
+        return 0
+
+    # SQL bounds the scan to a coarse per-root union of the candidate windows,
+    # clamped to the span the loaded window set provably covers (see the
+    # docstring); exact half-open containment stays in the kernel. `unixepoch`
+    # deliberately accepts both retained spellings (`Z` and `+00:00`) — the
+    # accounting rows are written with the offset form, the quota rows with `Z`.
+    # Both comparisons are INCLUSIVE on the truncated second: `unixepoch` drops
+    # any sub-second fraction, so an exclusive upper bound would discard rows in
+    # the reset's final second if a canonical anchor ever carried one. Admitting
+    # that second here is free — the kernel re-tests containment exactly.
+    candidates = []
+    for root, spans_for_root in root_ranges.items():
+        window_low = min(span[0] for span in spans_for_root)
+        window_high = max(span[1] for span in spans_for_root)
+        if candidate_bounds is not None:
+            window_low = max(window_low, candidate_bounds[0])
+            window_high = min(window_high, candidate_bounds[1])
+            if window_low > window_high:
+                continue
+        for row in conn.execute(
+            "SELECT id, timestamp_utc FROM codex_session_entries "
+            " WHERE source_root_key = ? "
+            "   AND (account_key IS NULL OR account_key = '' "
+            "        OR account_key = ?) "
+            "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
+            "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
+            (root, _lib_accounts.UNATTRIBUTED,
+             _codex_anchor_iso(window_low), _codex_anchor_iso(window_high)),
+        ):
+            timestamp = _parse_anchor_iso(row[1])
+            if timestamp is None:
+                continue
+            candidates.append(adopt.SpendAdoptionCandidate(
+                entry_id=int(row[0]), source_root_key=root,
+                timestamp=timestamp, account_key=None,
+            ))
+    if not candidates:
+        return 0
+
+    plan = adopt.build_spend_adoption_plan(windows, candidates)
+    if not plan:
+        return 0
+    before = conn.total_changes
+    conn.executemany(
+        "UPDATE codex_session_entries SET account_key = ? "
+        " WHERE id = ? AND (account_key IS NULL OR account_key = '' "
+        "                   OR account_key = ?)",
+        [(stamp.account_key, stamp.entry_id, _lib_accounts.UNATTRIBUTED)
+         for stamp in plan],
+    )
+    return conn.total_changes - before
 
 
 def iter_codex_entries(

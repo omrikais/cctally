@@ -11,7 +11,7 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1004) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
-  ⚠ Pending migrations       46 pending
+  ⚠ Pending migrations       47 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data

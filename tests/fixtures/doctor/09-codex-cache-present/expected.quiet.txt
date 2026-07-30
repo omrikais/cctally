@@ -14,7 +14,7 @@ Hooks
       → Run `cctally setup`, then review the handler in Codex /hooks.
 Auth
 Database
-  ⚠ Pending migrations       46 pending
+  ⚠ Pending migrations       47 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data
