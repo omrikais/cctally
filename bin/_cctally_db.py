@@ -5997,7 +5997,7 @@ def _032_codex_canonical_reset_anchor(conn: sqlite3.Connection) -> None:
     updates: list[tuple[str, int]] = []
     for row in conn.execute(
         "SELECT id, source_root_key, observed_slot, logical_limit_key, "
-        "       window_minutes, resets_at_utc "
+        "       window_minutes, resets_at_utc, source_path, line_offset "
         "  FROM quota_window_snapshots "
         " WHERE source = 'codex' AND canonical_resets_at_utc IS NULL "
         "   AND source_root_key IS NOT NULL AND observed_slot IS NOT NULL "
@@ -6007,9 +6007,75 @@ def _032_codex_canonical_reset_anchor(conn: sqlite3.Connection) -> None:
             source_root_key=row[1], observed_slot=row[2],
             logical_limit_key=row[3], window_minutes=row[4],
             resets_at_utc=row[5],
+            source_path=row[6], line_offset=row[7],
         )
         if anchor is not None:
             updates.append((anchor, int(row[0])))
+    if updates:
+        conn.executemany(
+            "UPDATE quota_window_snapshots SET canonical_resets_at_utc = ? "
+            "WHERE id = ?",
+            updates,
+        )
+    conn.commit()
+
+
+@cache_migration("033_codex_reset_anchor_component_closure")
+def _033_codex_reset_anchor_component_closure(
+    conn: sqlite3.Connection,
+) -> None:
+    """#425: converge migration-032 chain-of-neighbours splits.
+
+    Migration 032 compared each raw reset only with established anchors. Real
+    production history contains tolerance-connected chains whose endpoints are
+    more than 600 seconds apart, leaving one physical window under multiple
+    anchors. Rebuild the component closure over the complete population while
+    retaining the deterministic first observation as the winning anchor.
+
+    Raw ``resets_at_utc`` evidence is never rewritten. Re-running computes the
+    same full-population mapping and therefore changes no rows.
+    """
+    import _cctally_cache as cache_mod
+    import _lib_quota
+
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if "canonical_resets_at_utc" not in cols:
+        return
+
+    groups: dict[tuple, _lib_quota.ResetAnchorComponents] = {}
+    evidence: list[
+        tuple[int, dt.datetime, _lib_quota.ResetAnchorComponents, str | None]
+    ] = []
+    for row in conn.execute(
+        "SELECT id, source_root_key, observed_slot, logical_limit_key, "
+        "       window_minutes, resets_at_utc, canonical_resets_at_utc, "
+        "       source_path, line_offset "
+        "  FROM quota_window_snapshots "
+        " WHERE source = 'codex' "
+        "   AND source_root_key IS NOT NULL AND observed_slot IS NOT NULL "
+        " ORDER BY source_path, line_offset, id"
+    ).fetchall():
+        raw = cache_mod._parse_anchor_iso(row[5])
+        if raw is None:
+            continue
+        group = cache_mod.CodexResetAnchorResolver.group_key(
+            row[1], row[2], row[3], row[4])
+        components = groups.setdefault(
+            group, _lib_quota.ResetAnchorComponents())
+        components.add(
+            raw,
+            order_key=(str(row[7]), int(row[8]), int(row[0])),
+        )
+        evidence.append((int(row[0]), raw, components, row[6]))
+
+    updates: list[tuple[str, int]] = []
+    for row_id, raw, components, stored in evidence:
+        canonical = cache_mod._codex_anchor_iso(components.canonical(raw))
+        if canonical != stored:
+            updates.append((canonical, row_id))
     if updates:
         conn.executemany(
             "UPDATE quota_window_snapshots SET canonical_resets_at_utc = ? "

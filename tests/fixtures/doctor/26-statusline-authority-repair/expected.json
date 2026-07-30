@@ -192,7 +192,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 32,
+                            "registry_size": 33,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -245,7 +245,8 @@
                                     "029_backfill_claude_account",
                                     "030_session_entries_cache_creation_split",
                                     "031_codex_file_account_map",
-                                    "032_codex_canonical_reset_anchor"
+                                    "032_codex_canonical_reset_anchor",
+                                    "033_codex_reset_anchor_component_closure"
                                 ],
                                 "skipped": []
                             },
@@ -273,7 +274,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/45 applied",
+                    "summary": "0/46 applied",
                     "title": "Migrations"
                 },
                 {
@@ -458,13 +459,17 @@
                             [
                                 "cache.db",
                                 "032_codex_canonical_reset_anchor"
+                            ],
+                            [
+                                "cache.db",
+                                "033_codex_reset_anchor_component_closure"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "45 pending",
+                    "summary": "46 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -767,6 +772,15 @@
                     "severity": "ok",
                     "summary": "usage attribution healthy",
                     "title": "Account attribution"
+                },
+                {
+                    "details": {
+                        "null_anchor_rows": 0
+                    },
+                    "id": "accounts.codex_reset_anchors",
+                    "severity": "ok",
+                    "summary": "Codex reset anchors complete",
+                    "title": "Codex reset anchors"
                 }
             ],
             "id": "accounts",
@@ -875,7 +889,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 47,
+            "ok": 48,
             "warn": 6
         },
         "severity": "warn"

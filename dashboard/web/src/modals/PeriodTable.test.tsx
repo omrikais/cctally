@@ -30,6 +30,25 @@ afterEach(() => {
 });
 
 describe('PeriodTable keyboard row selection (SH-3, key-based)', () => {
+  it('discloses every account behind a pooled weekly row', () => {
+    render(
+      <PeriodTable
+        rows={[periodRow({
+          account_labels: ['work@example.com', 'personal@example.com'],
+        })]}
+        variant="weekly"
+        accentClass="accent-cyan"
+        selectedKey={null}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(
+      Array.from(document.querySelectorAll('.period-account-chip')).map(
+        (chip) => chip.textContent,
+      ),
+    ).toEqual(['work@example.com', 'personal@example.com']);
+  });
+
   it('rows are focusable and Enter/Space selects by key like a click', () => {
     const onSelect = vi.fn();
     const { container } = render(
@@ -75,6 +94,38 @@ describe('PeriodTable header (WM-1)', () => {
 });
 
 describe('PeriodTable provider model labels', () => {
+  it('keeps same-family releases separate and exact-model colored', () => {
+    render(
+      <PeriodTable
+        rows={[periodRow({
+          models: [
+            {
+              model: 'claude-opus-4-8', display: 'opus-4-8', chip: 'opus',
+              cost_usd: 7, cost_pct: 70,
+            },
+            {
+              model: 'claude-opus-5', display: 'opus-5', chip: 'opus',
+              cost_usd: 3, cost_pct: 30,
+            },
+          ],
+        })]}
+        variant="weekly"
+        accentClass="accent-cyan"
+        selectedKey={null}
+        onSelect={vi.fn()}
+      />,
+    );
+    const chips = Array.from(
+      document.querySelectorAll('.models-chips .chip'),
+    ) as HTMLElement[];
+    expect(chips.map((chip) => chip.textContent)).toEqual([
+      'opus-4-8',
+      'opus-5',
+    ]);
+    expect(chips[0].style.backgroundColor)
+      .not.toBe(chips[1].style.backgroundColor);
+  });
+
   it('keeps distinct Codex model identities instead of collapsing them to other', () => {
     const codexRows = [periodRow({
       models: [

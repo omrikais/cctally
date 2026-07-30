@@ -71,7 +71,7 @@ function ForecastProviderSummary({
                   ? <ForecastPerAccountValue />
                   : verdictClass === 'over' && value!.projected != null
                     ? '≥100%'
-                    : fmt.pct0(value!.projected)}
+                    : fmt.pct1(value!.projected)}
               </strong>
             </div>
             <div>
@@ -79,7 +79,7 @@ function ForecastProviderSummary({
                 {perAccount ? 'Current quota' : value!.recentLabel}
               </span>
               <strong className="provider-summary-value">
-                {perAccount ? <ForecastPerAccountValue /> : fmt.pct0(value!.recent)}
+                {perAccount ? <ForecastPerAccountValue /> : fmt.pct1(value!.recent)}
               </strong>
             </div>
           </div>
@@ -182,7 +182,7 @@ export function ForecastPanel() {
   // presenting 100% as a suspiciously exact repeated estimate.
   const projectedLabel = esc === 'over' && fc.projected != null
     ? '≥100%'
-    : fmt.pct0(fc.projected);
+    : fmt.pct1(fc.projected);
   return (
     <section
       className={`panel accent-purple fc-tile fc-esc-${esc}${hasEdge ? ' fc-accent-edge' : ''}`}
@@ -241,7 +241,7 @@ export function ForecastPanel() {
           <div className="fc-foot-line">
             <span className="fc-foot-k">{perAccount ? 'Current quota' : fc.recentLabel}</span>
             <span className="fc-foot-v">
-              {perAccount ? <ForecastPerAccountValue /> : fmt.pct0(fc.recent)}
+              {perAccount ? <ForecastPerAccountValue /> : fmt.pct1(fc.recent)}
             </span>
           </div>
           {/* `Confidence` describes one account's sample history, so it blanks

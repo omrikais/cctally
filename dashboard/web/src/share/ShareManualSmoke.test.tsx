@@ -472,7 +472,8 @@ describe('share-v2 manual smoke harness', () => {
     fireEvent.click(screen.getByRole('button', { name: /refresh from current data/i }));
     await waitFor(() => {
       const refreshed = getState().basket.items.find((it) => it.panel === 'forecast');
-      expect(refreshed?.data_digest_at_add).toMatch(/^sha256:forecast-/);
+      expect(refreshed?.data_digest_at_add).toMatch(/^sha256:forecast-\d+$/);
+      expect('sha256:forecast-4 stale').not.toMatch(/^sha256:forecast-\d+$/);
     });
 
     await clickExport(/^download$/i);

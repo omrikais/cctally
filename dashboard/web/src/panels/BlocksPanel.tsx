@@ -8,6 +8,7 @@ import { ModelLegend } from '../components/ModelLegend';
 import { fmt } from '../lib/fmt';
 import { modelChipStyle } from '../lib/model';
 import { dispatch, getState, subscribeStore } from '../store/store';
+import { sourceAccounts } from '../store/accountFocus';
 import { resolveSourceView } from '../store/sourceView';
 import { openShareModal } from '../store/shareSlice';
 import { presentationBlocks, presentationProviders, type BlockPresentationRow } from '../lib/dashboardPresentation';
@@ -130,7 +131,10 @@ export function BlocksPanel() {
   // one owner and an undecorated envelope ships no `accounts[]` at all, so both
   // keep today's unlabelled rows (R8).
   const scope = useAccountScope();
-  const codexAccountLabels = scope.scopesSupported && scope.accountKey == null
+  const showCodexAccountLabels = activeSource === 'all'
+    ? sourceAccounts(codexEntry) != null
+    : scope.scopesSupported && scope.accountKey == null;
+  const codexAccountLabels = showCodexAccountLabels
     ? new Map((codex?.accounts ?? []).map((card) => [card.accountKey, card.label]))
     : null;
   const accountLabelFor = (row: BlockPresentationRow): string | null => (

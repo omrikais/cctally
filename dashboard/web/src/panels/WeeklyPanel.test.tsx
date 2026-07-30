@@ -71,6 +71,23 @@ afterEach(() => {
 });
 
 describe('<WeeklyPanel /> (#264 S2)', () => {
+  it('discloses every account behind a pooled Codex weekly row', () => {
+    const env = baseEnvelope();
+    env.weekly!.rows = [
+      periodRow({
+        label: '04-20',
+        account_labels: ['work@example.com', 'personal@example.com'],
+      }),
+    ];
+    updateSnapshot(env);
+    render(<WeeklyPanel />);
+    expect(
+      Array.from(document.querySelectorAll('.period-account-chip')).map(
+        (chip) => chip.textContent,
+      ),
+    ).toEqual(['work@example.com', 'personal@example.com']);
+  });
+
   it('renders the cyan panel card with the bar-chart icon and model-split subtitle', () => {
     render(<WeeklyPanel />);
     const section = document.getElementById('panel-weekly');

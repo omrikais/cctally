@@ -11,6 +11,7 @@ import { fmt } from '../lib/fmt';
 import { applyTableSort } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import type { TrendChartDatum } from '../store/selectors';
+import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import {
@@ -111,7 +112,10 @@ function TrendSection({
             <tbody id={composed ? `trend-rows-${section.source}` : 'trend-rows'}>
               {tableData.map((w) => (
                 <tr key={`${section.source}:${w.label}`} className={w.is_current ? 'current' : undefined}>
-                  <td>{w.label}</td>
+                  <td>
+                    <PeriodAccountChips labels={w.account_labels} />
+                    {w.label}
+                  </td>
                   <td className="num">{fmt.pct0(w.used_pct)}</td>
                   <td className={'num' + (w.is_current ? '' : ' dollar')}>
                     {fmt.usd2(w.dollar_per_pct)}

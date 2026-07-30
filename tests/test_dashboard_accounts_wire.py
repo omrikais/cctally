@@ -155,6 +155,14 @@ def test_decorated_source_emits_per_account_cards_and_cycles(tmp_path, monkeypat
         source_module, "load_codex_quota_observations", lambda **_k: observations)
     monkeypatch.setattr(
         _cctally_account, "resolve_active_account_keys", lambda: {_ACCT_A})
+    cycle_index_calls = []
+
+    def _cycle_index(_conn, *, identity, now_utc, account_key=None):
+        cycle_index_calls.append(account_key)
+        return ({"key": f"cycle:{account_key or 'merged'}"},)
+
+    monkeypatch.setattr(
+        sys.modules["cctally"], "build_codex_cycle_index", _cycle_index)
     try:
         state = source_module.build_codex_source_state(
             DashboardReadContext(
@@ -187,6 +195,16 @@ def test_decorated_source_emits_per_account_cards_and_cycles(tmp_path, monkeypat
         unattr = by_key.get("unattributed")
         assert unattr is not None and unattr["unattributed"] is True
         assert unattr["weeklyPercent"] is None
+        # A decorated parent has no single cycle history. The parent index
+        # would belong to whichever account supplied the representative cycle,
+        # so only the account-scoped children may build one.
+        assert state.data["quota"]["cycle_index"] == ()
+        assert None not in cycle_index_calls
+        assert set(cycle_index_calls) == {_ACCT_A, _ACCT_B}
+        assert state.data["account_scopes"][_ACCT_A]["quota"]["cycle_index"] == (
+            {"key": f"cycle:{_ACCT_A}"},)
+        assert state.data["account_scopes"][_ACCT_B]["quota"]["cycle_index"] == (
+            {"key": f"cycle:{_ACCT_B}"},)
     finally:
         cache.close()
         stats.close()

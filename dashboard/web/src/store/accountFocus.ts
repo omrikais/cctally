@@ -26,6 +26,15 @@ export const ACCOUNT_STORAGE_PREFIX = 'cctally:dashboard:account:';
 // reserved sentinels are 'unattributed' / '*', so 'all' can never collide.
 export const ALL_ACCOUNTS = 'all';
 
+// Long account labels have to remain recognisable in narrow panel headers.
+// Preserve both the distinguishing prefix and suffix instead of exposing only
+// the first few characters through CSS ellipsis. The full label remains in the
+// element's accessible name and title.
+export function shortAccountLabel(label: string): string {
+  if (label.length <= 24) return label;
+  return `${label.slice(0, 12)}…${label.slice(-8)}`;
+}
+
 function storageKey(source: SourceName): string {
   return `${ACCOUNT_STORAGE_PREFIX}${source}`;
 }

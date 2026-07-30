@@ -277,11 +277,10 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 31 after #416 appended 031_codex_file_account_map
-        # (30 after #195's 030_session_entries_cache_creation_split); the
+        # Head is 33 after #425's reset-anchor component repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 
@@ -312,11 +311,10 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 31 after #416 appended 031_codex_file_account_map
-        # (30 after #195's 030_session_entries_cache_creation_split); the
+        # Head is 33 after #425's reset-anchor component repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 
@@ -348,11 +346,10 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
             conn, legacy_claude_messages=False
         )
         assert _marker(conn) == 1
-        # Head is 31 after #416 appended 031_codex_file_account_map
-        # (30 after #195's 030_session_entries_cache_creation_split); the
+        # Head is 33 after #425's reset-anchor component repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 

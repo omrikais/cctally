@@ -25,8 +25,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/45 applied
-  ⚠ Pending migrations       45 pending
+  ✓ Migrations               0/46 applied
+  ⚠ Pending migrations       46 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -58,6 +58,7 @@ Accounts
   ✓ Account registry         no accounts observed yet
   ✓ Account attribution freshness no attribution activity recorded
   ✓ Account attribution      usage attribution healthy
+  ✓ Codex reset anchors      Codex reset anchors complete
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -71,4 +72,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 45 OK · 7 WARN · 1 FAIL
+Summary: 46 OK · 7 WARN · 1 FAIL

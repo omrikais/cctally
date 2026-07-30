@@ -115,21 +115,27 @@ export function AccountHeroCards() {
     subscribeStore,
     () => (activeSource === 'all' ? ALL_ACCOUNTS : getState().accountFocus[activeSource as SourceName]),
   );
-  // #416 QA — the combined tab has no account chip and no provider context, so
-  // it reads the CODEX population and labels it. Every other tab is unchanged.
+  // The combined tab has no account chip and no provider context, so it shows
+  // every decorated physical provider unfocused and labels each group.
   const combined = activeSource === 'all';
-  const source: SourceName = combined ? 'codex' : (activeSource as SourceName);
-  const entry = (env?.sources?.[source] ?? null) as SourceEntry<unknown> | null;
-  const accounts = sourceAccounts(entry);
-  if (accounts == null) return null; // <=1 real account → no cards.
+  const sources: SourceName[] = combined
+    ? ['claude', 'codex']
+    : [activeSource as SourceName];
+  const groups = sources.flatMap((source) => {
+    const entry = (env?.sources?.[source] ?? null) as SourceEntry<unknown> | null;
+    const accounts = sourceAccounts(entry);
+    return accounts == null ? [] : [{ source, accounts }];
+  });
+  if (groups.length === 0) return null; // <=1 real account everywhere → no cards.
 
   // A focus stored for the Codex TAB must never narrow the combined tab: there
   // is no chip there to show or undo it, so a narrowed strip would silently
   // reintroduce exactly the one-account-as-the-whole-picture defect this fixes.
+  const providerGroup = groups[0];
+  const source = providerGroup.source;
   const focused = combined
     ? null
     : resolveAccountFocus(env, source, focusSlot ?? ALL_ACCOUNTS);
-  const visible = focused == null ? accounts : accounts.filter((a) => a.accountKey === focused);
   // #416 §6 — the explicit empty state. An account with neither accounting rows
   // nor quota evidence renders a NAMED "no activity" note with its bars and
   // reset blank, rather than silently inheriting the previous account's numbers
@@ -140,33 +146,38 @@ export function AccountHeroCards() {
   // accounting rows nor quota evidence in the loaded window", NOT "nothing in
   // the current cycle" — an account can carry spend outside its cycle and still
   // have no live cycle, and that case shows its spend with blank bars instead.
-  const emptyNote = scope.isEmpty && scope.card != null
-    ? `No Codex activity recorded for ${scope.card.label}.`
+  const emptyNote = !combined && scope.isEmpty && scope.card != null
+    ? `No ${source === 'codex' ? 'Codex' : 'Claude'} activity recorded for ${scope.card.label}.`
     : null;
-  // Color is assigned by registry (array) order, stable across focus changes.
-  const colorOf = (key: string): string => {
-    const idx = accounts.findIndex((a) => a.accountKey === key);
-    return ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length];
-  };
 
   return (
     <div className="account-hero-cards" data-testid="account-hero-cards">
-      {/* On a provider tab the strip's owner is the tab itself; on the combined
-          tab it has to say so, since the operator may hold several accounts with
-          BOTH providers and only Codex ships a per-account strip today. */}
-      {combined && (
-        <p className="account-hero-caption" data-testid="account-hero-caption">
-          Codex accounts — each has its own quota cycle.
-        </p>
-      )}
-      {visible.map((card) => (
-        <AccountHeroCard
-          key={card.accountKey}
-          card={card}
-          color={colorOf(card.accountKey)}
-          focused={focused === card.accountKey}
-        />
-      ))}
+      {groups.map((group) => {
+        const groupFocused = combined ? null : focused;
+        const visible = groupFocused == null
+          ? group.accounts
+          : group.accounts.filter((card) => card.accountKey === groupFocused);
+        return (
+          <div className="account-hero-provider-group" data-source={group.source} key={group.source}>
+            {combined && (
+              <p className="account-hero-caption" data-testid="account-hero-caption">
+                {group.source === 'claude' ? 'Claude' : 'Codex'} accounts — each has its own quota cycle.
+              </p>
+            )}
+            {visible.map((card) => {
+              const idx = group.accounts.findIndex((item) => item.accountKey === card.accountKey);
+              return (
+                <AccountHeroCard
+                  key={card.accountKey}
+                  card={card}
+                  color={ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length]}
+                  focused={groupFocused === card.accountKey}
+                />
+              );
+            })}
+          </div>
+        );
+      })}
       {emptyNote != null && (
         <p
           className="account-hero-empty"

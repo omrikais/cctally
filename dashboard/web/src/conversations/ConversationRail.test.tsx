@@ -182,8 +182,12 @@ describe('ConversationRail', () => {
   it('renders a model chip from row.models', () => {
     browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8'] })];
     render(<ConversationRail />);
-    const chip = document.querySelector('.conv-rail-row-model .chip.opus');
+    const chip = document.querySelector(
+      '.conv-rail-row-model .chip.opus',
+    ) as HTMLElement;
     expect(chip).toBeTruthy();
+    expect(chip.textContent).toBe('opus-4-8');
+    expect(chip.style.backgroundColor).not.toBe('');
   });
 
   it('renders no model chip when row.models is empty', () => {
@@ -1013,11 +1017,11 @@ describe('rail two-line meta regroup (#304 S3 §2)', () => {
     expect(chip.getAttribute('aria-label')).toBe('internal-experimental-model-v2-preview');
   });
 
-  it('a known-family chip carries no title/aria-label (the text IS the name)', () => {
+  it('a known-model chip carries its release label without a redundant title', () => {
     browseRows = [summary({ session_id: 's1', models: ['claude-opus-4-8'] })];
     render(<ConversationRail />);
     const chip = document.querySelector('.conv-rail-row-model .chip.opus')!;
-    expect(chip.textContent).toBe('opus');
+    expect(chip.textContent).toBe('opus-4-8');
     expect(chip.getAttribute('title')).toBeNull();
     expect(chip.getAttribute('aria-label')).toBeNull();
   });

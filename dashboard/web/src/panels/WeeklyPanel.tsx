@@ -16,6 +16,7 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
+import { PeriodAccountChips } from '../components/PeriodAccountChips';
 
 // #264 S2 / #265 — the Weekly summary TILE (restored from the S8 collapse).
 // #293 S3 — below 900px (stack mode) the card previews the newest
@@ -36,6 +37,7 @@ function Row({ r, isFirstMount, reduced }: { r: PeriodRow; isFirstMount: boolean
     <div className="period">
       <div className="meta">
         <span className="label">
+          <PeriodAccountChips labels={r.account_labels} />
           {r.label}
           {r.is_current && <span className="pill-current">Now</span>}
         </span>

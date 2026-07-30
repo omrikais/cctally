@@ -16,23 +16,26 @@ on:
       - '**/*.md'
 
 jobs:
-  # test-linux (hosted ubuntu) was disabled to save GH Actions minutes —
-  # the self-hosted macOS runner covers push-to-main validation. Trade-off:
-  # PRs no longer have a CI gating signal (test-macos / dashboard-build-
-  # stability are push-only for fork-PR safety). Re-enable if PR gating
-  # becomes load-bearing again.
+  # test-linux (hosted ubuntu) was disabled to save GH Actions minutes.
+  # The self-hosted macOS runner covers push-to-main plus trusted private
+  # same-repository PRs; public-mirror/fork PRs use the hosted `test-pr`
+  # sandbox below. `dashboard-build-stability` and `e2e-reader` stay push-only.
 
   test-macos:
-    # Self-hosted runners must NOT execute fork-PR code on the maintainer's
-    # machine (a public-mirror exposure once the repo goes public — fork
-    # contributors could run arbitrary build/test scripts on the host).
-    # Push to main is the maintainer's own commits, so it's safe to run
-    # there. Loosen later (e.g. allow same-repo PRs) only with deliberate
-    # vetting.
-    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    # Self-hosted runners must NEVER execute fork-PR code on the maintainer's
+    # machine. Private same-repository PRs are maintainer-owned branches, so
+    # they use this authority instead of the two-worker hosted lane that took
+    # ~30 minutes for the same suite. The exact head-repository equality is the
+    # safety boundary; public-mirror/fork PRs stay on `test-pr` below.
+    if: >-
+      github.repository == 'omrikais/cctally-dev' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, macOS, cctally]
-    # Real headroom over observed wall-clock (the full suite runs in ~3 min) so
-    # a hung test can't wedge this job for GitHub's default 6h (#279 S7 W4).
+    # Real headroom over observed wall-clock (the full suite stays under
+    # ~10 min) so a hung test can't wedge this job for GitHub's default 6h
+    # (#279 S7 W4).
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -219,19 +222,15 @@ jobs:
           retention-days: 7
 
   test-pr:
-    # PR signal lane (#281 S2 / #280 R2): same-repo PRs get checks
-    # everywhere; fork PRs additionally run on the public mirror
-    # (omrikais/cctally) where GH-hosted sandboxing makes fork code safe
-    # (read-only token, no secrets) and minutes are free. Fork PRs to the
-    # PRIVATE repo never run (and outsiders can't fork a private repo
-    # anyway). The self-hosted jobs above stay push-only — never loosen
-    # those. This lane is a SIGNAL, not merge enforcement: no
-    # branch-protection required checks (they'd reject the direct-push
-    # merge-back flow and strand md-only PRs on path-filtered checks).
+    # Hosted PR signal lane (#281 S2 / #280 R2): public-mirror PRs (including
+    # forks) run in GitHub's sandbox with a read-only token and no secrets.
+    # Private same-repository PRs use the faster self-hosted macOS authority
+    # above; private fork PRs never run. This lane is a SIGNAL, not merge
+    # enforcement: no branch-protection required checks (they'd reject the
+    # direct-push merge-back flow and strand md-only PRs on path filters).
     if: >-
       github.event_name == 'pull_request' &&
-      (github.event.pull_request.head.repo.full_name == github.repository ||
-       github.repository == 'omrikais/cctally')
+      github.repository == 'omrikais/cctally'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -240,7 +239,12 @@ jobs:
       group: test-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
-      CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2 (release auto-capped via the runner) — no explicit CCTALLY_INNER_JOBS needed (#292)
+      # Keep the nested shell-harness pool narrow on the hosted runner without
+      # collapsing the later, solo pytest phase to two xdist workers. With the
+      # combined CCTALLY_TEST_JOBS=2 knob, two consecutive PR runs spent
+      # 1112–1131s in pytest alone; an outer-only override leaves pytest at the
+      # runner's detected core count while the derived inner cap stays 2.
+      CCTALLY_OUTER_JOBS: "2"
       # The hosted token cannot read the separate private agentmem repository.
       # Declare that boundary explicitly so missing-dependency skips cannot be
       # mistaken for self-hosted integration coverage.
@@ -291,7 +295,10 @@ jobs:
         working-directory: dashboard/web
         run: npm ci
       - name: Run cctally test suite
-        run: bin/cctally-test-all
+        # This phase has its own bound so a genuinely wedged harness is named
+        # and terminated before consuming the whole 60-minute job timeout,
+        # which also covers the later Vitest and Playwright phases.
+        run: timeout --kill-after=30s 30m bin/cctally-test-all
       - name: Run frontend unit tests (full vitest estate)
         working-directory: dashboard/web
         run: npx vitest run

@@ -89,7 +89,11 @@ export function AccountChipRow() {
     }
     if (prevKeyRef.current !== activeKey) {
       prevKeyRef.current = activeKey;
-      setAnnounce(`${activeLabel} account selected`);
+      setAnnounce(
+        activeKey === ALL_ACCOUNTS
+          ? 'All accounts selected'
+          : `${activeLabel} account selected`,
+      );
     }
   }, [activeKey, activeLabel]);
 

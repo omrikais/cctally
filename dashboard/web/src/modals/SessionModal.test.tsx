@@ -93,6 +93,8 @@ describe('SessionModal single-model collapse (SE-2)', () => {
     const caption = document.getElementById('msess-model-caption')!;
     expect(caption.textContent).toContain('claude-opus-4');
     expect(caption.textContent).toContain('$1.00');
+    expect((caption.querySelector('.sw') as HTMLElement).style.backgroundColor)
+      .not.toBe('');
   });
 
   it('drops the Models strip and renders ModelCostBars for a multi-model session (#260)', async () => {
@@ -129,6 +131,8 @@ describe('SessionModal single-model collapse (SE-2)', () => {
     // Top model bar = 100%, second = ~17% (2.1/12.3), relative to the TOP model.
     const bars = document.querySelectorAll('.drill-bar');
     expect((bars[0] as HTMLElement).style.getPropertyValue('--w')).toBe('100%');
+    expect((bars[0] as HTMLElement).style.getPropertyValue('--model-color'))
+      .not.toBe('');
   });
 });
 

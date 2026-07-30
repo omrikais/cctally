@@ -1345,6 +1345,30 @@ def test_run_checks_returns_all_categories():
     }
 
 
+def test_accounts_codex_reset_anchors_warns_on_null_rows():
+    state = _state(accounts_state={
+        "claude_identity_status": "stably_absent",
+        "claude_email": None,
+        "real_account_count": 0,
+        "by_provider": {},
+        "missing_provider": 0,
+        "freshest_last_seen_age_s": None,
+        "recent_attributed": 0,
+        "recent_unattributed": 0,
+        "codex_null_reset_anchors": 2,
+    })
+    checks = {
+        check.id: check
+        for category in L.run_checks(state).categories
+        for check in category.checks
+    }
+
+    result = checks["accounts.codex_reset_anchors"]
+    assert result.severity == "warn"
+    assert result.details == {"null_anchor_rows": 2}
+    assert result.remediation == "Run `cctally cache-sync --source codex --rebuild`"
+
+
 def test_run_checks_all_ok_overall_ok():
     rep = L.run_checks(_state())
     assert rep.overall_severity == "ok"

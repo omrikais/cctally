@@ -72,13 +72,12 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     expect(usage.textContent).toContain('2d 7h');
   });
 
-  it('spent zone: whole-dollar hero from current_week.spent_usd (→ $14) + $/1% sub', () => {
+  it('spent zone: accurate hero from current_week.spent_usd (→ $14.20) + $/1% sub', () => {
     const { container } = render(<HeroStrip />);
     const spent = container.querySelector('.hero-spent') as HTMLElement;
     expect(spent).not.toBeNull();
     expect(spent.textContent).toContain('SPENT THIS WEEK');
-    // usd0(14.2) → "$14" (whole dollars; NOT "$14.20").
-    expect((container.querySelector('.hs-big') as HTMLElement).textContent).toBe('$14');
+    expect((container.querySelector('.hs-big') as HTMLElement).textContent).toBe('$14.20');
     // $/1% sub keeps 2dp.
     expect(spent.textContent).toContain('$23.40');
     expect(spent.textContent).toContain('/ 1% used');

@@ -78,11 +78,11 @@ def resolve_reset_anchor(
     anchor already in ``anchors`` or the observation's own raw value, never a
     recomputed centroid. Assignment picks the NEAREST anchor within tolerance,
     breaking a tie on the earlier anchor, so for a given anchor set the answer
-    does not depend on the order the anchors were established in. (The anchor
-    SET can still depend on arrival order in the pathological case of a chain of
-    observations each within tolerance of its neighbour but not of the first;
-    real jitter is seconds wide, so a real cluster collapses to one anchor under
-    every order.)
+    does not depend on the order the anchors were established in. The anchor
+    SET can still depend on arrival order in the chain-of-neighbours case. This
+    is retained as migration 032's reference rule; production ingest uses
+    :class:`ResetAnchorComponents` after #425 real-data evidence proved those
+    chains occur.
     """
     _require_aware(raw_reset, "raw_reset")
     if (isinstance(anchors, ResetAnchorIndex)
@@ -121,7 +121,9 @@ class ResetAnchorIndex:
     nearest within tolerance, ties broken on the earlier anchor, first sight
     wins, the anchor never moves, and the pathological chain-of-neighbours
     order-dependence that docstring documents is preserved exactly, because the
-    anchor SET is still whatever the caller established in whatever order.
+    anchor SET is still whatever the caller established in whatever order. This
+    class remains the exact migration-032 oracle; current ingest uses
+    ``ResetAnchorComponents``.
 
     Only the LOOKUP changes. The linear scan did a full ``datetime`` subtraction
     against every established anchor, and a 5h group accumulates ~1,750 anchors
@@ -202,6 +204,156 @@ class ResetAnchorIndex:
 
     def __len__(self) -> int:
         return len(self._order)
+
+
+class ResetAnchorComponents:
+    """Tolerance-connected raw-reset components with first-sight anchors.
+
+    ``ResetAnchorIndex`` intentionally preserves the original migration-032
+    rule: compare a raw reset only with already-established anchors. Real data
+    proved that rule can split a chain whose adjacent members are all within
+    tolerance. This index retains every distinct raw reset as evidence and
+    unions adjacent members transitively. The member with the smallest stable
+    physical ``order_key`` remains the completed component's canonical anchor,
+    independent of filesystem traversal or journal batch arrival. Callers that
+    omit an order key retain insertion-order behavior for compatibility.
+
+    ``add`` returns both the winning anchor and any formerly independent
+    component anchors retired by the union. Writers use the retired set to
+    converge rows materialized before a later bridge observation arrived.
+    """
+
+    __slots__ = (
+        "_tolerance", "_buckets", "_parent", "_rank",
+        "_anchor", "_first_order", "_member_order", "_next_order",
+    )
+
+    def __init__(
+        self, raws: Iterable[dt.datetime] = (),
+        *, tolerance_seconds: int = CODEX_RESET_ANCHOR_TOLERANCE_SECONDS,
+    ) -> None:
+        if not isinstance(tolerance_seconds, int) or isinstance(
+                tolerance_seconds, bool):
+            raise ValueError("tolerance_seconds must be an int")
+        if tolerance_seconds <= 0:
+            raise ValueError("tolerance_seconds must be positive")
+        self._tolerance = tolerance_seconds
+        self._buckets: dict[int, list[dt.datetime]] = {}
+        self._parent: dict[dt.datetime, dt.datetime] = {}
+        self._rank: dict[dt.datetime, int] = {}
+        self._anchor: dict[dt.datetime, dt.datetime] = {}
+        self._first_order: dict[
+            dt.datetime, tuple[str, int, int]
+        ] = {}
+        self._member_order: dict[
+            dt.datetime, tuple[str, int, int]
+        ] = {}
+        self._next_order = 0
+        for raw in raws:
+            self.add(raw)
+
+    @property
+    def tolerance_seconds(self) -> int:
+        return self._tolerance
+
+    def _bucket(self, value: dt.datetime) -> int:
+        return int(value.timestamp() // self._tolerance)
+
+    def _find(self, value: dt.datetime) -> dt.datetime:
+        parent = self._parent[value]
+        if parent != value:
+            self._parent[value] = self._find(parent)
+        return self._parent[value]
+
+    def _union(
+        self, left: dt.datetime, right: dt.datetime,
+    ) -> dt.datetime:
+        left_root = self._find(left)
+        right_root = self._find(right)
+        if left_root == right_root:
+            return left_root
+        if self._rank[left_root] < self._rank[right_root]:
+            left_root, right_root = right_root, left_root
+        self._parent[right_root] = left_root
+        if self._rank[left_root] == self._rank[right_root]:
+            self._rank[left_root] += 1
+        if self._first_order[right_root] < self._first_order[left_root]:
+            self._anchor[left_root] = self._anchor[right_root]
+            self._first_order[left_root] = self._first_order[right_root]
+        del self._anchor[right_root]
+        del self._first_order[right_root]
+        return left_root
+
+    def add(
+        self, raw_reset: dt.datetime,
+        *, order_key: "tuple[str, int, int] | None" = None,
+    ) -> tuple[dt.datetime, tuple[dt.datetime, ...]]:
+        """Add one raw reset and return ``(anchor, retired_anchors)``."""
+        _require_aware(raw_reset, "raw_reset")
+        if order_key is None:
+            order_key = ("", self._next_order, 0)
+        if (
+            not isinstance(order_key, tuple) or len(order_key) != 3
+            or not isinstance(order_key[0], str)
+            or not isinstance(order_key[1], int)
+            or isinstance(order_key[1], bool)
+            or not isinstance(order_key[2], int)
+            or isinstance(order_key[2], bool)
+        ):
+            raise ValueError(
+                "order_key must be a (source_path, line_offset, row_id) tuple")
+        self._next_order += 1
+        if raw_reset in self._parent:
+            root = self._find(raw_reset)
+            previous = self._anchor[root]
+            if order_key < self._member_order[raw_reset]:
+                self._member_order[raw_reset] = order_key
+                if order_key < self._first_order[root]:
+                    self._first_order[root] = order_key
+                    self._anchor[root] = raw_reset
+            winner = self._anchor[root]
+            retired = (previous,) if previous != winner else ()
+            return winner, retired
+
+        probe = self._bucket(raw_reset)
+        neighbours: list[dt.datetime] = []
+        for bucket_id in (probe - 1, probe, probe + 1):
+            for candidate in self._buckets.get(bucket_id, ()):
+                if abs((raw_reset - candidate).total_seconds()) <= self._tolerance:
+                    neighbours.append(candidate)
+
+        self._parent[raw_reset] = raw_reset
+        self._rank[raw_reset] = 0
+        self._anchor[raw_reset] = raw_reset
+        self._first_order[raw_reset] = order_key
+        self._member_order[raw_reset] = order_key
+        self._buckets.setdefault(probe, []).append(raw_reset)
+
+        prior_anchors = {raw_reset}
+        prior_anchors.update(
+            self._anchor[self._find(candidate)] for candidate in neighbours)
+        root = raw_reset
+        for candidate in neighbours:
+            root = self._union(root, candidate)
+        winner = self._anchor[self._find(root)]
+        return winner, tuple(sorted(prior_anchors - {winner}))
+
+    def canonical(self, raw_reset: dt.datetime) -> dt.datetime:
+        """Return the completed component's first-sight anchor."""
+        _require_aware(raw_reset, "raw_reset")
+        return self._anchor[self._find(raw_reset)]
+
+    def __contains__(self, anchor: object) -> bool:
+        if not isinstance(anchor, dt.datetime):
+            return False
+        return anchor in self._buckets.get(self._bucket(anchor), ())
+
+    def __iter__(self):
+        """Distinct raw-reset evidence in insertion order."""
+        return iter(self._parent)
+
+    def __len__(self) -> int:
+        return len(self._parent)
 
 
 @dataclass(frozen=True)
@@ -313,6 +465,7 @@ class QuotaBlock:
     last_observed_at: dt.datetime
     first_percent: float
     current_percent: float
+    physical_observations: tuple[QuotaObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -577,7 +730,14 @@ def build_blocks(observations: Iterable[QuotaObservation]) -> tuple[QuotaBlock, 
     ``QuotaBlock.resets_at``, which every renderer shows, is that same anchor.
     """
     by_block: dict[tuple[QuotaWindowIdentity, dt.datetime], list[QuotaObservation]] = {}
+    physical_by_block: dict[
+        tuple[QuotaWindowIdentity, dt.datetime], list[QuotaObservation]
+    ] = {}
     for history in build_history(observations):
+        for observation in history.physical_observations:
+            physical_by_block.setdefault(
+                (history.identity, observation.canonical_resets_at), []
+            ).append(observation)
         for observation in history.observations:
             by_block.setdefault(
                 (history.identity, observation.canonical_resets_at), []
@@ -599,6 +759,10 @@ def build_blocks(observations: Iterable[QuotaObservation]) -> tuple[QuotaBlock, 
             last_observed_at=last.captured_at,
             first_percent=first.used_percent,
             current_percent=last.used_percent,
+            physical_observations=tuple(sorted(
+                physical_by_block[(identity, resets_at)],
+                key=physical_order_key,
+            )),
         ))
     return tuple(blocks)
 

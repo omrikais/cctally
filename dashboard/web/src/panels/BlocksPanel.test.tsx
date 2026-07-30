@@ -4,6 +4,10 @@ import { BlocksPanel } from './BlocksPanel';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import type { BlocksPanelRow, Envelope } from '../types/envelope';
 import fixture from '../../__tests__/fixtures/envelope.json';
+import {
+  ACCOUNT_A,
+  makeDecoratedCodexSourceData,
+} from '../test-utils/sourceEnvelope';
 
 beforeEach(() => {
   localStorage.clear();
@@ -122,6 +126,27 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
 
     expect(container.querySelector('.source-chip--claude')).toHaveTextContent('Claude');
     expect(container.querySelector('.source-chip--codex')).toHaveTextContent('Codex');
+  });
+
+  it('All names the Codex account in both the chip and accessible row name', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    const codex = makeDecoratedCodexSourceData();
+    codex.quota.blocks = [{
+      ...codex.quota.blocks[0],
+      account_key: ACCOUNT_A,
+    }];
+    env.sources!.codex.data = codex;
+    env.sources!.all.data!.providers.codex = codex;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    render(<BlocksPanel />);
+
+    expect(screen.getByTestId('block-account-chip'))
+      .toHaveTextContent('work@example.com');
+    expect(screen.getByRole('button', {
+      name: 'Open detail for work@example.com block starting 13:00 Apr 24 UTC',
+    })).toBeInTheDocument();
   });
 
   it('All keeps a Claude block when the optional Codex five-hour window is absent', () => {

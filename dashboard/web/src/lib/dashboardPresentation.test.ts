@@ -127,6 +127,34 @@ describe('provider-neutral dashboard presentation adapters', () => {
     });
   });
 
+  it('maps every pooled Codex weekly owner key to its account label', () => {
+    const env = cloneFixture();
+    const codex = env.sources!.codex.data!;
+    codex.accounts = [
+      {
+        accountKey: 'a'.repeat(32), label: 'work@example.com', plan: 'pro',
+        active: true, weeklyPercent: 40, fiveHourPercent: null,
+        resetsAt: '2026-04-30T00:00:00Z', spendUsd: 8,
+        inputTokens: 1, cachedInputTokens: 0, outputTokens: 0,
+        reasoningOutputTokens: 0, totalTokens: 1,
+      },
+      {
+        accountKey: 'b'.repeat(32), label: 'personal@example.com', plan: 'pro',
+        active: true, weeklyPercent: 97, fiveHourPercent: null,
+        resetsAt: '2026-04-30T00:00:00Z', spendUsd: 12.1,
+        inputTokens: 1, cachedInputTokens: 0, outputTokens: 0,
+        reasoningOutputTokens: 0, totalTokens: 1,
+      },
+    ];
+    const row = codex.periods.weekly.rows[0] as CodexPeriodBucket & {
+      account_keys?: string[];
+    };
+    row.account_keys = ['a'.repeat(32), 'b'.repeat(32)];
+
+    expect(presentationPeriodRows(env, 'codex', 'weekly')[0].account_labels)
+      .toEqual(['work@example.com', 'personal@example.com']);
+  });
+
   it('labels stale native Forecast evidence as degraded with its provider reason', () => {
     const env = cloneFixture();
     const weekly = env.sources!.codex.data!.quota.histories.find(

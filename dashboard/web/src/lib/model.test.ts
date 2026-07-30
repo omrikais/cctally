@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { modelChipClass, modelChipSummary } from './model';
+import { modelChipClass, modelChipStyle, modelChipSummary } from './model';
 
 describe('modelChipClass', () => {
   it('maps each known family to its own class', () => {
@@ -20,31 +20,99 @@ describe('modelChipClass', () => {
   });
 });
 
+describe('modelChipStyle', () => {
+  it('gives Opus 4.8 and Opus 5 exact-model colors despite one family class', () => {
+    expect(modelChipClass('claude-opus-4-8')).toBe('opus');
+    expect(modelChipClass('claude-opus-5')).toBe('opus');
+    expect(modelChipStyle('claude-opus-4-8'))
+      .not.toEqual(modelChipStyle('claude-opus-5'));
+  });
+});
+
 describe('modelChipSummary', () => {
   it('empty models → no chips', () => {
     expect(modelChipSummary([])).toEqual({ chips: [], extra: 0 });
   });
-  it('a known model → a chip labelled by its family name', () => {
+  it('a known model → a chip labelled by its logical release', () => {
     expect(modelChipSummary(['claude-opus-4-8']))
-      .toEqual({ chips: [{ cls: 'opus', label: 'opus', full: 'opus' }], extra: 0 });
+      .toEqual({
+        chips: [{
+          cls: 'opus', label: 'opus-4-8', full: 'opus-4-8',
+          model: 'claude-opus-4-8',
+        }],
+        extra: 0,
+      });
   });
   it('a fable model → a fable chip (not sonnet)', () => {
     expect(modelChipSummary(['claude-fable-5']))
-      .toEqual({ chips: [{ cls: 'fable', label: 'fable', full: 'fable' }], extra: 0 });
+      .toEqual({
+        chips: [{
+          cls: 'fable', label: 'fable-5', full: 'fable-5',
+          model: 'claude-fable-5',
+        }],
+        extra: 0,
+      });
   });
   it('an unrecognized model → an `other` chip labelled by its abbreviation', () => {
     expect(modelChipSummary(['gpt-5']))
-      .toEqual({ chips: [{ cls: 'other', label: 'gpt-5', full: 'gpt-5' }], extra: 0 });
+      .toEqual({
+        chips: [{
+          cls: 'other', label: 'gpt-5', full: 'gpt-5', model: 'gpt-5',
+        }],
+        extra: 0,
+      });
     expect(modelChipSummary(['<synthetic>']))
-      .toEqual({ chips: [{ cls: 'other', label: '<synthetic>', full: '<synthetic>' }], extra: 0 });
+      .toEqual({
+        chips: [{
+          cls: 'other', label: '<synthetic>', full: '<synthetic>',
+          model: '<synthetic>',
+        }],
+        extra: 0,
+      });
   });
-  it('dedupes models that share a chip class', () => {
-    expect(modelChipSummary(['claude-opus-4-8', 'claude-opus-4-7']))
-      .toEqual({ chips: [{ cls: 'opus', label: 'opus', full: 'opus' }], extra: 0 });
+  it('dedupes aliases of one logical release', () => {
+    expect(modelChipSummary([
+      'claude-opus-4-8-20260701',
+      'claude-opus-4-8[1m]',
+    ])).toEqual({
+      chips: [{
+        cls: 'opus', label: 'opus-4-8', full: 'opus-4-8',
+        model: 'claude-opus-4-8-20260701',
+      }],
+      extra: 0,
+    });
   });
-  it('caps at 2 distinct classes and reports the overflow, preserving order', () => {
+  it('keeps distinct same-family releases as separate chips', () => {
+    expect(modelChipSummary(['claude-opus-4-8', 'claude-opus-5']))
+      .toEqual({
+        chips: [
+          {
+            cls: 'opus', label: 'opus-4-8', full: 'opus-4-8',
+            model: 'claude-opus-4-8',
+          },
+          {
+            cls: 'opus', label: 'opus-5', full: 'opus-5',
+            model: 'claude-opus-5',
+          },
+        ],
+        extra: 0,
+      });
+  });
+  it('caps at 2 logical models and reports the overflow, preserving order', () => {
     expect(modelChipSummary(['claude-haiku-4-5', 'claude-opus-4-8', 'claude-sonnet-4-6']))
-      .toEqual({ chips: [{ cls: 'haiku', label: 'haiku', full: 'haiku' }, { cls: 'opus', label: 'opus', full: 'opus' }], extra: 1 });
+      .toEqual({
+        chips: [
+          {
+            cls: 'haiku', label: 'haiku-4-5', full: 'haiku-4-5',
+            model: 'claude-haiku-4-5',
+          },
+          {
+            cls: 'opus', label: 'opus-4-8', full: 'opus-4-8',
+            model: 'claude-opus-4-8',
+          },
+        ],
+        extra: 1,
+      });
   });
   // #304 S3 (Codex F4) — the rigid two-line rail stats line must not grow with
   // arbitrary model-id length. An `other` chip's DISPLAY label is bounded to
@@ -61,9 +129,9 @@ describe('modelChipSummary', () => {
     expect(s.chips[0].label.length).toBe(13); // 12 + ellipsis
   });
 
-  it('leaves short other labels and known-family labels unbounded/unchanged', () => {
+  it('leaves short model labels unbounded/unchanged', () => {
     const s = modelChipSummary(['gpt-5', 'claude-opus-4-8'], 2);
-    expect(s.chips.map((c) => c.label)).toEqual(['gpt-5', 'opus']);
-    expect(s.chips.map((c) => c.full)).toEqual(['gpt-5', 'opus']);
+    expect(s.chips.map((c) => c.label)).toEqual(['gpt-5', 'opus-4-8']);
+    expect(s.chips.map((c) => c.full)).toEqual(['gpt-5', 'opus-4-8']);
   });
 });

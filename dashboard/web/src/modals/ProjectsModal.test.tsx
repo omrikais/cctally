@@ -332,6 +332,13 @@ describe('<ProjectsModal />', () => {
     ).map((el) => el.textContent);
     expect(rawBarChips).not.toContain('claude-sonnet-4-5');
     expect(rawBarChips).not.toContain('claude-opus-4-7');
+    const recentModelChips = Array.from(
+      document.querySelectorAll('.drill-session-row .chip'),
+    ) as HTMLElement[];
+    expect(recentModelChips.length).toBeGreaterThan(0);
+    expect(recentModelChips.every(
+      (chip) => chip.style.backgroundColor !== '',
+    )).toBe(true);
   });
 
   it('renders the "Showing N weeks" notice when actual < requested', () => {

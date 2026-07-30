@@ -82,6 +82,11 @@ def test_explicit_role_overrides():
     assert (kv["outer"], kv["inner"], kv["pytest"]) == ("9", "3", "6")
 
 
+def test_outer_only_override_keeps_full_machine_for_solo_pytest():
+    kv = _kv(_plan({"CCTALLY_OUTER_JOBS": "2"}, fake_ncpu="4").stdout)
+    assert (kv["outer"], kv["inner"], kv["pytest"]) == ("2", "2", "4")
+
+
 def test_inner_override_independent_of_outer_default():
     kv = _kv(_plan({"CCTALLY_INNER_JOBS": "2"}, fake_ncpu="16").stdout)
     assert kv["outer"] == "7" and kv["inner"] == "2"

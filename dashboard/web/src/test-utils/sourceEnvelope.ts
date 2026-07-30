@@ -918,6 +918,37 @@ export function makeClaudeSourceData(): ClaudeSourceData {
   } satisfies ClaudeSourceData;
 }
 
+export const CLAUDE_ACCOUNT_MAIN = 'c'.repeat(32);
+export const CLAUDE_ACCOUNT_ALT = 'd'.repeat(32);
+
+export function makeDecoratedClaudeSourceData(): ClaudeSourceData {
+  const base = makeClaudeSourceData();
+  return {
+    ...base,
+    accounts: [
+      accountCard({
+        accountKey: CLAUDE_ACCOUNT_MAIN,
+        label: 'claude-main',
+        plan: 'max',
+        active: true,
+        weeklyPercent: 64,
+        fiveHourPercent: 37,
+        resetsAt: '2026-04-30T00:00:00Z',
+        spendUsd: 88.2,
+      }),
+      accountCard({
+        accountKey: CLAUDE_ACCOUNT_ALT,
+        label: 'claude-alt',
+        plan: 'pro',
+        weeklyPercent: 22,
+        fiveHourPercent: 8,
+        resetsAt: '2026-04-30T00:00:00Z',
+        spendUsd: 19.4,
+      }),
+    ],
+  } satisfies ClaudeSourceData;
+}
+
 export function makeClaudeSourceEntry(
   overrides?: Partial<SourceEntry<ClaudeSourceData>>,
 ): SourceEntry<ClaudeSourceData> {

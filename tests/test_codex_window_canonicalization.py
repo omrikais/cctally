@@ -265,16 +265,21 @@ def _seed_anchored(
     conn, resolver, *, resets_at: str, window_minutes: int = 10080,
     observed_slot: str = "primary", account_key: str | None = None,
     model: str | None = None,
+    source_path: str = "/roots/rk/sessions/rollout.jsonl",
+    line_offset: int | None = None,
 ) -> str:
     """Insert one observation through the resolver, exactly as ingest does."""
-    _NEXT_OFFSET[0] += 1
-    line_offset = _NEXT_OFFSET[0]
+    if line_offset is None:
+        _NEXT_OFFSET[0] += 1
+        line_offset = _NEXT_OFFSET[0]
     key = _key(window_minutes, model=model)
     anchor = resolver.resolve(
         source_root_key=ROOT, observed_slot=observed_slot,
         logical_limit_key=key, window_minutes=window_minutes,
         resets_at_utc=resets_at,
+        source_path=source_path, line_offset=line_offset,
     )
+    resolver.apply_pending_merges()
     conn.execute(
         "INSERT INTO quota_window_snapshots "
         "(source, source_root_key, source_path, line_offset, captured_at_utc, "
@@ -283,11 +288,12 @@ def _seed_anchored(
         " individual_limit_json, reached_type, observed_model, account_key, "
         " canonical_resets_at_utc) "
         "VALUES ('codex',?,?,?,?,?,?,'codex',NULL,?,10.0,?,NULL,NULL,NULL,?,?,?)",
-        (ROOT, "/roots/rk/sessions/rollout.jsonl", line_offset,
+        (ROOT, source_path, line_offset,
          "2026-07-28T00:00:00Z", observed_slot, key, window_minutes,
          resets_at, model, account_key, anchor),
     )
     conn.commit()
+    resolver.mark_file_committed()
     return anchor
 
 
@@ -321,8 +327,14 @@ def test_the_tolerance_boundary_is_inclusive_at_600s(cache_conn):
     base = _seed_anchored(cache_conn, r, resets_at="2026-08-01T19:00:00Z")
     at_600 = _seed_anchored(cache_conn, r, resets_at="2026-08-01T19:10:00Z")
     assert at_600 == base
-    at_601 = _seed_anchored(cache_conn, r, resets_at="2026-08-01T19:10:01Z")
-    assert at_601 == "2026-08-01T19:10:01Z"
+    other = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T20:00:00Z",
+        observed_slot="secondary")
+    at_601 = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T20:10:01Z",
+        observed_slot="secondary")
+    assert other == "2026-08-01T20:00:00Z"
+    assert at_601 == "2026-08-01T20:10:01Z"
 
 
 def test_the_anchor_never_moves_when_an_earlier_reset_arrives_later(cache_conn):
@@ -333,6 +345,58 @@ def test_the_anchor_never_moves_when_an_earlier_reset_arrives_later(cache_conn):
     later = _seed_anchored(cache_conn, r, resets_at="2026-08-01T19:19:01Z")
     assert later == first == "2026-08-01T19:19:06Z"
     assert _anchors(cache_conn) == {"2026-08-01T19:19:06Z"}
+
+
+def test_a_chain_of_neighbours_closes_onto_the_first_anchor(cache_conn):
+    """Issue #425 production evidence: two observations can each sit within
+    600s of a bridge while remaining more than 600s apart from each other.
+    The complete tolerance-connected component is one physical window, and its
+    first observation remains the anchor."""
+    r = _resolver(cache_conn)
+    first = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:00:00Z")
+    second = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:20:00Z")
+    assert second != first, "precondition: the endpoints begin split"
+
+    bridge = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:10:00Z")
+
+    assert bridge == first
+    assert _anchors(cache_conn) == {first}, (
+        "the bridge did not converge the previously established endpoint")
+
+
+def test_component_winner_uses_stable_physical_order_not_arrival(cache_conn):
+    """Direct ingest, DB migration and journal replay must choose the same
+    winner even when records reach the resolver in different orders."""
+    r = _resolver(cache_conn)
+    later_path = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:20:00Z",
+        source_path="/roots/rk/sessions/z.jsonl", line_offset=20)
+    earlier_path = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:00:00Z",
+        source_path="/roots/rk/sessions/a.jsonl", line_offset=10)
+    assert later_path != earlier_path
+
+    bridge = _seed_anchored(
+        cache_conn, r, resets_at="2026-08-01T19:10:00Z",
+        source_path="/roots/rk/sessions/m.jsonl", line_offset=30)
+
+    assert bridge == earlier_path
+    assert _anchors(cache_conn) == {earlier_path}
+
+
+def test_anchor_index_retains_its_collection_protocol():
+    index = _lq().ResetAnchorIndex((
+        dt.datetime(2026, 8, 1, 19, 0, tzinfo=UTC),
+        dt.datetime(2026, 8, 8, 19, 0, tzinfo=UTC),
+    ))
+    assert len(index) == 2
+    assert list(index) == [
+        dt.datetime(2026, 8, 1, 19, 0, tzinfo=UTC),
+        dt.datetime(2026, 8, 8, 19, 0, tzinfo=UTC),
+    ]
 
 
 def test_a_later_sync_joins_the_anchor_a_previous_sync_established(cache_conn):
@@ -418,6 +482,16 @@ def _run_032(conn) -> None:
     raise AssertionError("032_codex_canonical_reset_anchor not registered")
 
 
+def _run_033(conn) -> None:
+    import _cctally_db
+    for m in _cctally_db._CACHE_MIGRATIONS:
+        if m.name == "033_codex_reset_anchor_component_closure":
+            m.handler(conn)
+            return
+    raise AssertionError(
+        "033_codex_reset_anchor_component_closure not registered")
+
+
 def test_migration_032_backfills_existing_history(cache_conn):
     for reset in ("2026-08-01T19:19:03Z", "2026-08-01T19:19:04Z",
                   "2026-08-01T19:19:06Z", "2026-08-08T19:19:00Z"):
@@ -477,6 +551,51 @@ def test_migration_032_is_deterministic_over_a_shuffled_insert_order(cache_conn,
         assert _anchors(other) == reverse_insert == {"2026-08-01T19:19:03Z"}
     finally:
         other.close()
+
+
+def test_migration_033_repairs_a_split_chain_without_rewriting_raw_evidence(
+        cache_conn):
+    observations = (
+        (
+            "2026-08-01T19:20:00Z",
+            "/roots/rk/sessions/z.jsonl",
+            20,
+        ),
+        (
+            "2026-08-01T19:00:00Z",
+            "/roots/rk/sessions/a.jsonl",
+            10,
+        ),
+        (
+            "2026-08-01T19:10:00Z",
+            "/roots/rk/sessions/m.jsonl",
+            30,
+        ),
+    )
+    for reset, source_path, line_offset in observations:
+        _seed_obs(
+            cache_conn, resets_at=reset, source_path=source_path,
+            line_offset=line_offset)
+    cache_conn.executemany(
+        "UPDATE quota_window_snapshots "
+        "SET canonical_resets_at_utc = ? WHERE resets_at_utc = ?",
+        (
+            ("2026-08-01T19:20:00Z", observations[0][0]),
+            ("2026-08-01T19:00:00Z", observations[1][0]),
+            ("2026-08-01T19:00:00Z", observations[2][0]),
+        ),
+    )
+    cache_conn.commit()
+    assert len(_anchors(cache_conn)) == 2, (
+        "precondition: the fixture reproduces migration 032's production split")
+
+    _run_033(cache_conn)
+
+    assert _anchors(cache_conn) == {"2026-08-01T19:00:00Z"}
+    assert [row[0] for row in cache_conn.execute(
+        "SELECT resets_at_utc FROM quota_window_snapshots "
+        "ORDER BY id"
+    )] == [item[0] for item in observations]
 
 
 # --------------------------------------------------------------------------
@@ -740,6 +859,78 @@ def test_re_anchoring_never_merges_two_genuine_cycles(stats_ns):
             conn, _block(dt.datetime(2026, 8, 1, 19, 19, 3, tzinfo=UTC)))
         conn.commit()
         assert _terminal(conn)[0][0] == "2026-07-25T19:19:03+00:00"
+    finally:
+        conn.close()
+
+
+def test_re_anchoring_reaches_a_transitive_component_endpoint(stats_ns):
+    """#425: a raw reset can be more than 600s from the winning anchor while
+    remaining connected through retained observations. Terminal evidence at
+    that endpoint still belongs to this exact block."""
+    conn = _stats_conn(stats_ns)
+    try:
+        endpoint = dt.datetime(2026, 8, 1, 19, 20, tzinfo=UTC)
+        anchor = dt.datetime(2026, 8, 1, 19, 0, tzinfo=UTC)
+        bridge = dt.datetime(2026, 8, 1, 19, 10, tzinfo=UTC)
+        _insert_terminal(
+            conn, resets_at_utc=endpoint.isoformat())
+        observations = tuple(
+            _lq().QuotaObservation(
+                identity=_identity(),
+                captured_at=NOW + dt.timedelta(minutes=index),
+                used_percent=90.0 + index,
+                resets_at=raw,
+                canonical_resets_at=anchor,
+                source_path="/roots/rk/sessions/rollout.jsonl",
+                line_offset=index,
+            )
+            for index, raw in enumerate((anchor, endpoint, bridge), start=1)
+        )
+        block = _lq().QuotaBlock(
+            identity=_identity(), resets_at=anchor,
+            nominal_start_at=anchor - dt.timedelta(minutes=10080),
+            observations=observations,
+            first_observed_at=observations[0].captured_at,
+            last_observed_at=observations[-1].captured_at,
+            first_percent=90.0, current_percent=93.0,
+        )
+
+        _quota()._reanchor_terminal_events(conn, block)
+        conn.commit()
+
+        assert _terminal(conn)[0][0] == anchor.isoformat()
+    finally:
+        conn.close()
+
+
+def test_reanchoring_uses_physical_members_hidden_by_interpreted_dedup(stats_ns):
+    """Equal logical readings are deduplicated for presentation, but every raw
+    reset remains terminal-event membership evidence."""
+    conn = _stats_conn(stats_ns)
+    try:
+        anchor = dt.datetime(2026, 8, 1, 19, 0, tzinfo=UTC)
+        endpoint = dt.datetime(2026, 8, 1, 19, 20, tzinfo=UTC)
+        bridge = dt.datetime(2026, 8, 1, 19, 10, tzinfo=UTC)
+        _insert_terminal(conn, resets_at_utc=endpoint.isoformat())
+        physical = tuple(
+            _lq().QuotaObservation(
+                identity=_identity(),
+                captured_at=NOW + dt.timedelta(minutes=index),
+                used_percent=92.5,
+                resets_at=raw,
+                canonical_resets_at=anchor,
+                source_path="/roots/rk/sessions/rollout.jsonl",
+                line_offset=index,
+            )
+            for index, raw in enumerate((anchor, endpoint, bridge), start=1)
+        )
+        block = _lq().build_blocks(physical)[0]
+        assert len(block.observations) == 1, "precondition: values deduplicate"
+
+        _quota()._reanchor_terminal_events(conn, block)
+        conn.commit()
+
+        assert _terminal(conn)[0][0] == anchor.isoformat()
     finally:
         conn.close()
 

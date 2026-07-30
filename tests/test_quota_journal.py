@@ -75,7 +75,8 @@ def _journal_lines(jr, jl):
 def _codex_quota_obs(jl, *, source_root_key, source_path, line_offset,
                      captured_at_utc, used_percent=10.0,
                      logical_limit_key="limit-primary", observed_slot="primary",
-                     window_minutes=300, at="2026-07-15T12:00:00Z"):
+                     window_minutes=300, at="2026-07-15T12:00:00Z",
+                     resets_at_utc=RESET):
     return jl.make_obs(at=at, src="codex-quota", provider="codex", payload={
         "kind": "quota_window_snapshot",
         "source": "codex", "source_root_key": source_root_key,
@@ -83,7 +84,7 @@ def _codex_quota_obs(jl, *, source_root_key, source_path, line_offset,
         "captured_at_utc": captured_at_utc, "observed_slot": observed_slot,
         "logical_limit_key": logical_limit_key, "limit_id": "native-primary",
         "limit_name": "Primary", "window_minutes": window_minutes,
-        "used_percent": used_percent, "resets_at_utc": RESET,
+        "used_percent": used_percent, "resets_at_utc": resets_at_utc,
         "plan_type": "pro", "individual_limit_json": None, "reached_type": None,
         "observed_model": "gpt-5.3-codex",
     })
@@ -163,6 +164,40 @@ def test_quota_applier_materializes_obs_into_cache(tmp_path, monkeypatch):
 
     # cursor advanced past the fully-consumed obs
     assert jr.run_stats_ingest(mode="authoritative").consumed == 0
+
+
+def test_quota_applier_converges_cross_batch_records_by_physical_order(
+        tmp_path, monkeypatch):
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    conn = ns["open_cache_db"]()
+    try:
+        records = (
+            _codex_quota_obs(
+                jl, source_root_key="root-a",
+                source_path="/codex/root-a/z.jsonl", line_offset=20,
+                captured_at_utc=_iso(10), resets_at_utc=_iso(19, 20)),
+            _codex_quota_obs(
+                jl, source_root_key="root-a",
+                source_path="/codex/root-a/a.jsonl", line_offset=10,
+                captured_at_utc=_iso(10, 1), resets_at_utc=_iso(19, 0)),
+            _codex_quota_obs(
+                jl, source_root_key="root-a",
+                source_path="/codex/root-a/m.jsonl", line_offset=30,
+                captured_at_utc=_iso(10, 2), resets_at_utc=_iso(19, 10)),
+        )
+        for record in records:
+            conn.execute("BEGIN IMMEDIATE")
+            jr._apply_quota_records(conn, [record])
+            conn.commit()
+
+        anchors = {
+            row[0] for row in conn.execute(
+                "SELECT canonical_resets_at_utc "
+                "FROM quota_window_snapshots WHERE source='codex'")
+        }
+        assert anchors == {"2026-07-15T19:00:00Z"}
+    finally:
+        conn.close()
 
 
 def test_quota_applier_prefix_stops_on_busy_codex_flock(tmp_path, monkeypatch):

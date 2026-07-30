@@ -19,6 +19,7 @@ import { modelChipClass, modelChipStyle } from '../lib/model';
 import { HighlightText } from '../lib/highlightText';
 import { rovingAction } from '../lib/sessionsRovingKeyboard';
 import { resolveSourceView } from '../store/sourceView';
+import { shortAccountLabel } from '../store/accountFocus';
 import { gateSessions } from '../lib/sourceGating';
 import { sourceSessionsColumns } from '../lib/sourceSessionsColumns';
 import { collectSourceSessionRows, type SessionDisplayRow } from '../lib/sourceRows';
@@ -206,7 +207,7 @@ export function SourceSessionsGrid() {
               data-testid="sessions-account-note"
               title={`Showing only ${scope.card?.label ?? 'this account'}'s sessions.`}
             >
-              {scope.card?.label ?? 'focused account'} only
+              {shortAccountLabel(scope.card?.label ?? 'focused account')} only
             </span>
           )}
           {accountUnfiltered && (

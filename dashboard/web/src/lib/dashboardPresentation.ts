@@ -194,11 +194,21 @@ function codexModelRows(
     });
 }
 
-function codexPeriodRow(row: CodexPeriodBucket, index: number): PeriodRow {
+function codexPeriodRow(
+  row: CodexPeriodBucket,
+  index: number,
+  accountLabels: ReadonlyMap<string, string>,
+): PeriodRow {
   const breakdownModels = codexModelRows(row.cost_usd, row.model_breakdowns, true);
   const models = breakdownModels.length > 0
     ? breakdownModels
     : sourceModels(row.cost_usd, 'codex');
+  const ownerLabels = [...new Set(
+    (row.account_keys ?? []).flatMap((key) => {
+      const label = accountLabels.get(key);
+      return label == null ? [] : [label];
+    }),
+  )];
   return {
     source: 'codex',
     label: row.label,
@@ -222,6 +232,7 @@ function codexPeriodRow(row: CodexPeriodBucket, index: number): PeriodRow {
       reasoning_output_tokens: row.reasoning_output_tokens,
       total_tokens: row.total_tokens,
     },
+    ...(ownerLabels.length > 0 ? { account_labels: ownerLabels } : {}),
   };
 }
 
@@ -265,13 +276,16 @@ export function presentationPeriodRows(
   period: 'weekly' | 'monthly',
 ): PeriodRow[] {
   const providers = presentationProviders(env, selection);
+  const codexAccountLabels = new Map(
+    (providers.codex?.accounts ?? []).map((card) => [card.accountKey, card.label]),
+  );
   const legacy = (selection === 'claude'
     ? env?.[period]?.rows ?? []
     : providers.claude?.periods?.[period]?.rows ?? [])
     .map((row) => ({ ...row, source: 'claude' as const }));
   const codex = [...(providers.codex?.periods?.[period]?.rows ?? [])]
     .sort((a, b) => b.label.localeCompare(a.label))
-    .map(codexPeriodRow)
+    .map((row, index) => codexPeriodRow(row, index, codexAccountLabels))
     .map((row, index, allRows) => ({
       ...row,
       delta_cost_pct: allRows[index + 1]?.cost_usd
@@ -447,6 +461,7 @@ function periodRowsToTrend(rows: PeriodRow[], source: SourceName): TrendRow[] {
       : null,
     is_current: row.is_current,
     cost_usd: row.cost_usd,
+    ...(row.account_labels ? { account_labels: row.account_labels } : {}),
   }));
 }
 

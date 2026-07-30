@@ -31,22 +31,29 @@ import {
   ACCOUNT_EMPTY,
   makeDecoratedCodexSourceData,
   makeSourceEnvelope,
+  withSharedRootWeeklyWindows,
 } from '../test-utils/sourceEnvelope';
 import type { CodexSourceData, Envelope } from '../types/envelope';
 
-function decoratedEnv(): Envelope {
+function decoratedEnv(
+  data: CodexSourceData = makeDecoratedCodexSourceData(),
+): Envelope {
   const slice = makeSourceEnvelope() as unknown as {
     sources: { codex: { data: CodexSourceData } };
   };
-  slice.sources.codex.data = makeDecoratedCodexSourceData();
+  slice.sources.codex.data = data;
   return slice as unknown as Envelope;
 }
 
 // Open `kind` the way the panel's ExpandButton does: bind the modal source at
 // open time, with the Codex account chip already focused.
-function openScoped(kind: string, account: string | null): void {
+function openScoped(
+  kind: string,
+  account: string | null,
+  data: CodexSourceData = makeDecoratedCodexSourceData(),
+): void {
   act(() => {
-    updateSnapshot(decoratedEnv());
+    updateSnapshot(decoratedEnv(data));
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     if (account != null) {
       dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account });
@@ -185,5 +192,46 @@ describe('The All-accounts cycle modal is per-account, never one account ladder'
     expect(container.querySelector('[data-testid="codex-cycle-per-account"]'))
       .toBeNull();
     expect(container.textContent).toContain('crossed');
+  });
+
+  it('derives a live totals-only row from that account own active window', () => {
+    const data = makeDecoratedCodexSourceData();
+    data.accounts = data.accounts!.map((card) => (
+      card.accountKey === ACCOUNT_B
+        ? {
+          ...card,
+          label: 'Unattributed',
+          unattributed: true,
+          weeklyPercent: null,
+          resetsAt: null,
+        }
+        : card
+    ));
+
+    openScoped('current-week', null, data);
+    const { container } = render(<CurrentWeekModal />);
+    const row = container.querySelector(`[data-account-key="${ACCOUNT_B}"]`);
+    expect(row).not.toBeNull();
+    const cells = [...row!.querySelectorAll('td')];
+    expect(cells[1].textContent).toBe('12.0%');
+    expect(cells[2].textContent).toContain('Apr 29');
+    expect(cells[2].textContent).not.toBe('—');
+  });
+
+  it('abstains when a focused retained weekly history is no longer live', () => {
+    const data = withSharedRootWeeklyWindows(makeDecoratedCodexSourceData());
+
+    openScoped('current-week', ACCOUNT_B, data);
+    const { container } = render(<CurrentWeekModal />);
+
+    expect(container.querySelector('#mcw-week-pill')?.textContent)
+      .toContain('Native 7-day cycle unavailable');
+    expect(container.querySelector('#mcw-bignum')?.textContent).toBe('—');
+    const miniRows = [...container.querySelectorAll('#mcw-mini .s')];
+    expect(miniRows.find((row) => row.textContent?.includes('$ / 1%'))?.textContent)
+      .toContain('—');
+    expect(miniRows.find((row) => row.textContent?.includes('reset'))?.textContent)
+      .toContain('—');
+    expect(container.textContent).not.toContain('41.0%');
   });
 });

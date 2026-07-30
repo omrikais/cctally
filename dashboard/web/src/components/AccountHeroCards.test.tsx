@@ -135,11 +135,9 @@ describe('AccountHeroCards — reset countdown copy (ui-qa P3)', () => {
 
 // #416 QA P2-B — `SPENT THIS WEEK` under a focused account with a sub-dollar
 // spend. The reported symptom was `$0` sitting directly above a card reading
-// `$0.23`, in the one hero slot that asserts a number while every neighbour
-// honestly abstains with `—`. The value is NOT a real zero: it is the card's
-// own range total, correctly selected and then rounded to whole dollars by
-// `fmt.usd0`. Blanking it would hide real data; the fix is that a non-zero
-// spend never renders as the glyph for "nothing".
+// `$0.23`. The value is NOT a real zero: it is the card's own range total.
+// Blanking it would hide real data; the shared formatter now preserves every
+// known fractional dollar amount at both hero call sites.
 describe('fmt.usd0 — a real sub-dollar spend never reads as nothing', () => {
   it('keeps cents when whole dollars would round a real spend to $0', () => {
     expect(fmt.usd0(0.23)).toBe('$0.23');
@@ -149,15 +147,14 @@ describe('fmt.usd0 — a real sub-dollar spend never reads as nothing', () => {
     expect(fmt.usd0(-0.23)).toBe('−$0.23');
   });
 
-  it('leaves the whole-dollar hero and a true zero untouched', () => {
-    // #264 S1's low-noise money hero is the point of `usd0`; only the band that
-    // rounds to zero changes, so nothing that reaches $1 moves (P3-B, the $5 vs
-    // $5.02 headline, is deliberately NOT addressed here).
+  it('keeps exact dollars compact and preserves known fractional dollars', () => {
     expect(fmt.usd0(254)).toBe('$254');
-    expect(fmt.usd0(5.02)).toBe('$5');
+    expect(fmt.usd0(254.27)).toBe('$254.27');
+    expect(fmt.usd0(254.6)).toBe('$254.60');
+    expect(fmt.usd0(5.02)).toBe('$5.02');
     expect(fmt.usd0(1)).toBe('$1');
-    expect(fmt.usd0(0.999)).toBe('$1');
-    expect(fmt.usd0(0.5)).toBe('$1');
+    expect(fmt.usd0(0.999)).toBe('$1.00');
+    expect(fmt.usd0(0.5)).toBe('$0.50');
     expect(fmt.usd0(0)).toBe('$0');
     expect(fmt.usd0(null)).toBe('—');
   });

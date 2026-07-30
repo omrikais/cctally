@@ -1489,6 +1489,8 @@ def _resolve_obs_anchor(resolver, rec: dict) -> "str | None":
             source_root_key=root, observed_slot=slot, logical_limit_key=key,
             window_minutes=p.get("window_minutes"),
             resets_at_utc=p.get("resets_at_utc"),
+            source_path=p.get("source_path"),
+            line_offset=p.get("line_offset"),
         )
     except Exception:  # pragma: no cover — never fail an ingest over a label
         return None
@@ -1523,6 +1525,9 @@ def _apply_quota_records(cache, records) -> None:
     for rec in records:
         covered, decided = oracle.resolve(rec)
         anchor = _resolve_obs_anchor(anchors, rec)
+        if anchors is not None:
+            anchors.apply_pending_merges()
+            anchors.mark_file_committed()
         row_values = _quota_snapshot_values(rec, anchor)
         if not has_anchor:
             row_values = row_values[:-1]

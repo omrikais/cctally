@@ -7,6 +7,7 @@ import {
   resolveAccountFocus,
   saveAccountFocus,
   seedAccountFocus,
+  shortAccountLabel,
   sourceAccounts,
   sourceIsDecorated,
 } from './accountFocus';
@@ -48,6 +49,14 @@ function envWith(accounts: AccountCard[] | null): Envelope {
 }
 
 beforeEach(() => localStorage.clear());
+
+describe('shortAccountLabel', () => {
+  it('preserves short labels and both ends of long labels', () => {
+    expect(shortAccountLabel('work')).toBe('work');
+    expect(shortAccountLabel('client-acme-consulting-longname'))
+      .toBe('client-acme-…longname');
+  });
+});
 
 describe('accountFocus persistence (cctally:dashboard:account:<source>)', () => {
   it('defaults to All when absent, round-trips a stored key', () => {

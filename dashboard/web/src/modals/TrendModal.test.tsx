@@ -118,8 +118,27 @@ describe('<TrendModal /> median label states its basis (TR-2)', () => {
     const { container } = renderTrend(history10());
     const med = container.querySelector('.mtr-medlabel') as SVGTextElement;
     expect(med).not.toBeNull();
-    expect(med.textContent).toMatch(/^10-wk median \$/);
+    expect(med.textContent).toBe('10-wk median $1.45');
+    expect('10-wk median $1.45 stale').not.toBe('10-wk median $1.45');
     expect(med.textContent).not.toMatch(/^median \$/);
+  });
+});
+
+describe('<TrendModal /> pooled-account disclosure (#424)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+  });
+
+  it('carries both owners into the modal history table', () => {
+    const rows = historyFixture();
+    rows[0].account_labels = ['work@example.com', 'personal@example.com'];
+    renderTrend(rows);
+    expect(
+      Array.from(document.querySelectorAll('.period-account-chip')).map(
+        (chip) => chip.textContent,
+      ),
+    ).toEqual(['work@example.com', 'personal@example.com']);
   });
 });
 
@@ -271,6 +290,7 @@ describe('<TrendModal /> sortable Cost column (TREND-COLS · decisions 6/7)', ()
     expect(curRow).not.toBeNull();
     // Chrono-keyed: the current row still reads "Now …", NOT "W−2 …" (which is
     // what the sorted map index would mislabel it as).
-    expect(curRow?.querySelector('.wlab')?.textContent ?? '').toMatch(/^Now/);
+    expect(curRow?.querySelector('.wlab')?.textContent ?? '').toBe('Now · Now');
+    expect('Now · Now (stale)').not.toBe('Now · Now');
   });
 });

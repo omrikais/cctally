@@ -9,6 +9,7 @@ import {
 } from '../lib/alertIdentity';
 import { VENDOR_WIDE_ACCOUNT, type SourceAlertRow } from '../types/envelope';
 import { resolveSourceView } from '../store/sourceView';
+import { shortAccountLabel } from '../store/accountFocus';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { cardRegionClick } from '../lib/cardRegion';
 import { PANEL_REGISTRY } from '../lib/panelRegistry';
@@ -143,7 +144,7 @@ export function RecentAlertsPanel(): JSX.Element {
               data-testid="alerts-account-note"
               title={`Showing only ${scope.card?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
             >
-              {scope.card?.label ?? 'focused account'} only
+              {shortAccountLabel(scope.card?.label ?? 'focused account')} only
             </span>
           )}
           {accountUnfiltered && (

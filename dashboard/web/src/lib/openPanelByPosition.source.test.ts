@@ -3,6 +3,10 @@ import { openPanelByPosition } from './openPanelByPosition';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import type { Envelope } from '../types/envelope';
+import {
+  ACCOUNT_B,
+  makeDecoratedCodexSourceData,
+} from '../test-utils/sourceEnvelope';
 
 beforeEach(() => {
   localStorage.clear();
@@ -40,6 +44,45 @@ describe('openPanelByPosition — source-bound non-Claude interactions', () => {
     openPanelByPosition(1);
     expect(getState().openModal).toBeNull();
     expect(getState().openSourceDetail).toMatchObject({ source: 'codex', resource: 'session' });
+  });
+
+  it('Codex: position 1 opens the first session visible under account focus', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data = makeDecoratedCodexSourceData();
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_B });
+
+    openPanelByPosition(1);
+
+    expect(getState().openSourceDetail).toMatchObject({
+      source: 'codex',
+      resource: 'session',
+      key: 'session:B',
+    });
+  });
+
+  it('Codex: position 8 opens the active block visible under account focus', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    const codex = makeDecoratedCodexSourceData();
+    codex.account_scopes![ACCOUNT_B].quota.blocks = [{
+      ...codex.quota.blocks[0],
+      key: 'block:B',
+      account_key: ACCOUNT_B,
+      is_active: true,
+    }];
+    env.sources!.codex.data = codex;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_B });
+
+    openPanelByPosition(8);
+
+    expect(getState().openSourceDetail).toMatchObject({
+      source: 'codex',
+      resource: 'block',
+      key: 'block:B',
+    });
   });
 
   it('Codex: position 10 (Recent alerts) opens — canonical numbering is source-stable', () => {

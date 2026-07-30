@@ -17,6 +17,13 @@ function periodRow(over: Partial<PeriodRow> = {}): PeriodRow {
   };
 }
 
+function hexToCssRgb(hex: string): string {
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(hex.slice(offset, offset + 2), 16),
+  );
+  return `rgb(${channels.join(', ')})`;
+}
+
 describe('PeriodDetailCard', () => {
   it('renders per-model cost bars via ModelCostBars (.drill-bar-row rows)', () => {
     render(<PeriodDetailCard row={periodRow()} variant="weekly" accentClass="accent-cyan" />);
@@ -30,6 +37,33 @@ describe('PeriodDetailCard', () => {
     expect(screen.queryByText('claude-opus-4-8')).toBeNull();
     // The former thin .model-stack bar is gone (swapped for ModelCostBars).
     expect(document.querySelector('.model-stack')).toBeNull();
+  });
+
+  it('uses each model color for both the chip and its cost bar', () => {
+    render(<PeriodDetailCard row={periodRow({
+      models: [
+        {
+          model: 'claude-opus-4-8', display: 'opus-4-8', chip: 'opus',
+          cost_usd: 10, cost_pct: 66.7,
+        },
+        {
+          model: 'claude-opus-5', display: 'opus-5', chip: 'opus',
+          cost_usd: 5, cost_pct: 33.3,
+        },
+      ],
+    })} variant="monthly" accentClass="accent-pink" />);
+
+    const rows = Array.from(
+      document.querySelectorAll('.drill-bar-row'),
+    ) as HTMLElement[];
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      const chip = row.querySelector('.chip') as HTMLElement;
+      const bar = row.querySelector('.drill-bar') as HTMLElement;
+      expect(chip.style.backgroundColor).not.toBe('');
+      expect(hexToCssRgb(bar.style.getPropertyValue('--model-color')))
+        .toBe(chip.style.backgroundColor);
+    }
   });
 
   it('renders the weekly-only Used % / $/1% stats for the weekly variant', () => {

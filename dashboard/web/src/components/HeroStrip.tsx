@@ -109,28 +109,49 @@ function SharedHero({
   const cw = env?.current_week ?? null;
   const scope = useAccountScope();
   if (source === 'claude') {
+    const claudeEntry = resolveSourceView(env, 'claude').entry;
+    const accounts = sourceAccounts(claudeEntry);
+    const focusedCard = scope.requestedKey == null
+      ? null
+      : accounts?.find((card) => card.accountKey === scope.requestedKey) ?? null;
+    const perAccount = accounts != null && focusedCard == null;
+    const focusedResetInSec = focusedCard?.resetsAt == null
+      ? null
+      : Math.max(0, (Date.parse(focusedCard.resetsAt) - Date.now()) / 1000);
+    const mergedSpendUsd = accounts?.reduce((sum, card) => sum + card.spendUsd, 0) ?? null;
     return (
       <CanonicalHero
-        weekLabel={h?.week_label}
-        usedPct={h?.used_pct}
-        fiveHourPct={h?.five_hour_pct}
-        resetInSec={cw?.reset_in_sec}
-        spentUsd={cw?.spent_usd}
-        dollarPerPct={h?.dollar_per_pct}
-        forecastPct={h?.forecast_pct}
-        vsLastWeekDelta={h?.vs_last_week_delta}
-        freshness={cw?.freshness ?? null}
+        weekLabel={accounts == null ? h?.week_label : null}
+        usedPct={focusedCard?.weeklyPercent ?? (perAccount ? null : h?.used_pct)}
+        fiveHourPct={focusedCard?.fiveHourPercent ?? (perAccount ? null : h?.five_hour_pct)}
+        resetInSec={focusedCard != null ? focusedResetInSec : perAccount ? null : cw?.reset_in_sec}
+        spentUsd={focusedCard?.spendUsd ?? (perAccount ? mergedSpendUsd : cw?.spent_usd)}
+        // The account wire does not emit this metric. Do not manufacture it
+        // from rounded card values: the canonical merged value is a different
+        // accounting scope and cannot be borrowed while focused.
+        dollarPerPct={accounts == null ? h?.dollar_per_pct : null}
+        forecastPct={accounts == null ? h?.forecast_pct : null}
+        vsLastWeekDelta={accounts == null ? h?.vs_last_week_delta : null}
+        freshness={accounts == null ? cw?.freshness ?? null : null}
         ctx={ctx}
-        verdict={verdict}
+        verdict={accounts == null ? verdict : null}
         heroLabel={heroLabel}
-        showFiveHour
+        showFiveHour={!perAccount && (focusedCard?.fiveHourPercent != null || accounts == null)}
+        perAccountNote={perAccount ? 'per account' : null}
       />
     );
   }
   const codexEntry = resolveSourceView(env, 'codex').entry;
   const codex = codexEntry?.data as CodexSourceData | undefined;
   const cycle = codex?.hero.cycle;
-  const windows = codex?.hero && codex.quota ? joinCodexQuotaLabels(codex.hero, codex.quota) : [];
+  const codexDecorated = sourceAccounts(codexEntry) != null;
+  const suppressAccountBlindQuota = (
+    source === 'codex' && scope.scopesSupported && scope.accountKey == null
+  ) || (source === 'all' && codexDecorated);
+  const quota = suppressAccountBlindQuota
+    ? null
+    : scope.accountKey != null ? scope.scope?.quota ?? null : codex?.quota ?? null;
+  const windows = codex?.hero && quota ? joinCodexQuotaLabels(codex.hero, quota) : [];
   const weekly = [...windows].sort((a, b) => {
     const aMatchesCycle = a.current.resets_at === cycle?.resets_at;
     const bMatchesCycle = b.current.resets_at === cycle?.resets_at;
@@ -150,7 +171,7 @@ function SharedHero({
   // are real, and `Forecast @ reset` already pauses through `forecast.status`.
   const codexCycleStale = codex?.hero?.cycle_freshness === 'stale';
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
-  const quotaForecast = codex?.quota.histories.find((row) => row.key === weekly?.key)?.forecast;
+  const quotaForecast = quota?.histories.find((row) => row.key === weekly?.key)?.forecast;
   const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
   const capturedMs = weekly ? Date.parse(weekly.current.captured_at) : Number.NaN;
   const ageSeconds = Number.isFinite(capturedMs)
@@ -256,7 +277,9 @@ function SharedHero({
   // COMBINED SPEND is this tab's headline — blanking it would be the opposite
   // failure. Gated on Codex decoration, so a <=1-real-account install is
   // byte-identical (R8).
-  const codexPerAccount = sourceAccounts(codexEntry) != null;
+  const codexPerAccount = codexDecorated;
+  const claudeEntry = resolveSourceView(env, 'claude').entry;
+  const claudePerAccount = sourceAccounts(claudeEntry) != null;
   const codexPerAccountValue = codexPerAccount ? (
     <span
       className="hero-per-account-value"
@@ -271,8 +294,11 @@ function SharedHero({
     <>
       <div className="hero-zone hero-usage" data-testid="shared-hero-usage">
         <div className="hu-block">
-          <div className="hu-label">CLAUDE 7-DAY</div>
-          <div className="hu-num">{fmt.pct1(h?.used_pct)}</div>
+          <div className="hu-label">
+            CLAUDE 7-DAY
+            {claudePerAccount ? <span className="hu-week"> · per account</span> : null}
+          </div>
+          <div className="hu-num">{claudePerAccount ? '—' : fmt.pct1(h?.used_pct)}</div>
         </div>
         <div className="hu-block">
           <div className="hu-label">
@@ -321,7 +347,19 @@ function SharedHero({
       <div className="hero-zone hero-support" data-testid="shared-hero-support">
         <div className="sup-row">
           <span className="sup-l">Claude quota</span>
-          <span className="sup-v">{fmt.pct1(h?.used_pct)}</span>
+          <span className="sup-v">
+            {claudePerAccount
+              ? (
+                <span
+                  className="hero-per-account-value"
+                  data-testid="hero-per-account-value"
+                  title="Each Claude account has its own quota cycle — independent percentages are never blended."
+                >
+                  per account
+                </span>
+              )
+              : fmt.pct1(h?.used_pct)}
+          </span>
         </div>
         <div className="sup-row">
           <span className="sup-l">Codex quota</span>

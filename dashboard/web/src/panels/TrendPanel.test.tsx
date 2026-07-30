@@ -151,6 +151,36 @@ function trendLeakEnv(): Envelope {
 }
 
 describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () => {
+  it('discloses every account behind the pooled Codex trend row', () => {
+    const env = trendLeakEnv();
+    const codex = env.sources!.codex.data!;
+    codex.accounts = [
+      {
+        accountKey: 'a'.repeat(32), label: 'work@example.com', plan: 'pro',
+        active: true, weeklyPercent: 40, fiveHourPercent: null,
+        resetsAt: null, spendUsd: 8, inputTokens: 1, cachedInputTokens: 0,
+        outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1,
+      },
+      {
+        accountKey: 'b'.repeat(32), label: 'personal@example.com', plan: 'pro',
+        active: true, weeklyPercent: 97, fiveHourPercent: null,
+        resetsAt: null, spendUsd: 12.1, inputTokens: 1, cachedInputTokens: 0,
+        outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1,
+      },
+    ];
+    (codex.periods.weekly.rows[0] as typeof codex.periods.weekly.rows[number] & {
+      account_keys?: string[];
+    }).account_keys = ['a'.repeat(32), 'b'.repeat(32)];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<TrendPanel />);
+    expect(
+      Array.from(document.querySelectorAll('.period-account-chip')).map(
+        (chip) => chip.textContent,
+      ),
+    ).toEqual(['work@example.com', 'personal@example.com']);
+  });
+
   it('Codex mode renders the shared trend visualization with Codex weekly cost', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });

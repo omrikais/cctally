@@ -7,7 +7,7 @@ import { CacheRebuildsSection } from './CacheRebuildsSection';
 import { ShareIcon } from '../components/ShareIcon';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { revalToken } from '../lib/revalToken';
-import { modelChipClass } from '../lib/model';
+import { modelChipClass, modelChipStyle } from '../lib/model';
 import { abbreviateModel } from '../lib/modelName';
 import { ModelCostBars } from './ModelCostBars';
 import { isSingleModel } from '../lib/sessionModel';
@@ -342,7 +342,11 @@ export function SessionDetailContent({
 
       {oneModel ? (
         <div className="msess-model-caption" id="msess-model-caption">
-          <span className={'sw ' + modelChipClass(soleModelName)} aria-hidden="true" />
+          <span
+            className={'sw ' + modelChipClass(soleModelName)}
+            style={modelChipStyle(soleModelName)}
+            aria-hidden="true"
+          />
           <span className="k">Model</span>
           <span className="name">{soleModelName}</span>
           <span className="dot" aria-hidden="true">·</span>

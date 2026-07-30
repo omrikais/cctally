@@ -109,22 +109,17 @@ def test_codex_file_account_op_ids_separate_distinct_decisions(ns):
     assert len({a["id"], b["id"], sentinel["id"]}) == 3
 
 
-def test_codex_file_account_kind_is_registered_machinery(ns):
-    """The kind must be registered as accounts machinery so it is never
-    classified as legacy data and retro-stamped by
-    ``_normalize_legacy_account_stamp`` (spec section 3.3)."""
-    jr, _J, _rd = _siblings()
-    assert "codex_file_account" in jr._ACCOUNTS_MACHINERY_KINDS
+def test_accounts_machinery_registry_drives_rederive_classification(ns):
+    """The machinery registry is consumed by the rederive-family audit.
 
-
-def test_codex_file_account_kind_has_a_rederive_classification(ns):
-    """The protocol audit: ``_cctally_rederive.plan_claude_usage`` feeds
-    ``_ACCOUNTS_MACHINERY_KINDS`` into ``validate_family_registry`` and raises
-    ``RederiveConflict`` on any unclassified op kind. Registering the kind in one
-    table but not the other therefore bricks the re-derive planner — this test
-    is exactly what catches that (it fails when the kind is machinery-registered
-    but absent from ``_lib_rederive._OP_CLASSIFICATIONS``)."""
+    Removing ``codex_file_account`` from either registry must make this fail:
+    the former makes the exact machinery membership assertion fail, while the
+    latter makes the audit report the registered op as unclassified. This is
+    the non-vacuous protocol guard; an unknown op's legacy-classifier result is
+    intentionally additive-tolerant and therefore cannot prove registration.
+    """
     jr, _J, rd = _siblings()
+    assert "codex_file_account" in jr._ACCOUNTS_MACHINERY_KINDS
     report = rd.validate_family_registry(
         evt_kinds=set(jr._EVT_SPECS),
         op_kinds=(
@@ -135,26 +130,6 @@ def test_codex_file_account_kind_has_a_rederive_classification(ns):
     )
     assert report.unclassified_op_kinds == ()
     assert "codex_file_account" in report.op
-
-
-def test_codex_file_account_op_is_never_legacy_classified(ns):
-    """Neither shape of the op may be classified as legacy Codex data: the
-    sentinel form omits ``account_key`` entirely, which is precisely the shape
-    the legacy classifier keys on."""
-    jr, J, _rd = _siblings()
-    sentinel = J.make_codex_file_account(
-        at="2026-07-28T00:00:00Z", root_scope="rk1", file_identity="fid1",
-        incarnation=1, from_offset=0, account_key=None,
-    )
-    stamped = J.make_codex_file_account(
-        at="2026-07-28T00:00:00Z", root_scope="rk1", file_identity="fid1",
-        incarnation=1, from_offset=0, account_key="a" * 32,
-    )
-    assert jr.classify_legacy_provider(sentinel) is None
-    assert jr.classify_legacy_provider(stamped) is None
-    # And normalisation must leave the sentinel's omission intact.
-    jr._normalize_legacy_account_stamp(sentinel, "cutover-claude")
-    assert "account_key" not in sentinel["payload"]
 
 
 # --------------------------------------------------------------------------
@@ -701,6 +676,58 @@ def test_cache_applier_materializes_both_families(ns):
         conn.close()
 
 
+def test_same_batch_decision_governs_the_quota_row(ns, tmp_path):
+    """Swapping the two family appliers must make this fail.
+
+    The observation deliberately appears first in journal order and carries
+    account B. The same batch's range decision carries account A and targets
+    the observation's real durable file identity. Cross-family disposition
+    order, not record order or the observation stamp, must decide the row.
+    """
+    import _cctally_cache as cc
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    from _lib_source_identity import codex_file_key
+
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("{}\n")
+    ns["open_cache_db"]().close()
+    identity = codex_file_key(
+        "root-a", str(cc._canonical_codex_path(rollout)))
+    decision = jl.make_codex_file_account(
+        at="2026-07-28T10:00:01Z", root_scope="root-a",
+        file_identity=identity, incarnation=1, from_offset=0,
+        account_key=KEY_A,
+    )
+    observation = _quota_obs(
+        jl, root="root-a", path=str(rollout), offset=10, account=KEY_B)
+
+    assert jr._cache_applier([
+        (observation, "seg", 0),
+        (decision, "seg", 100),
+    ]) is None
+    assert _quota_account_in_cache(ns, rollout, 10) == KEY_A
+
+
+def test_cache_applier_persists_a_non_null_reset_anchor(ns):
+    """Replacing `_resolve_obs_anchor(...)` with `None` must make this fail."""
+    import _cctally_journal as jr
+    import _lib_journal as jl
+
+    ns["open_cache_db"]().close()
+    observation = _quota_obs(jl)
+    assert jr._cache_applier([(observation, "seg", 0)]) is None
+
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute(
+            "SELECT canonical_resets_at_utc FROM quota_window_snapshots "
+            "WHERE source='codex'"
+        ).fetchone() == ("2026-07-28T15:00:00Z",)
+    finally:
+        conn.close()
+
+
 def test_cache_applier_is_all_or_nothing_across_families(ns):
     """Spec section 3.4: the leg commits BOTH families or neither, and returns
     the EARLIEST stop across them.
@@ -826,6 +853,54 @@ def test_rebuild_rehydrates_the_map_from_the_journal(ns, monkeypatch, tmp_path):
         assert {r[0] for r in cache.execute(
             "SELECT DISTINCT account_key FROM codex_session_entries")} == {key_a}
         assert _map_rows(cache), "the map must be rehydrated, not left empty"
+    finally:
+        cache.close()
+
+
+def test_rehydration_failure_defers_the_walk_without_minting_a_decision(
+        ns, monkeypatch, tmp_path):
+    """A failed replay cannot fall through to live `auth.json` attribution."""
+    provider_root, _rollout = _codex_root(tmp_path)
+    (provider_root / "auth.json").write_text(
+        _auth_json("acct-alpha", "alpha@example.com"))
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+    import _cctally_journal as jr
+
+    def fail_rehydration(*_args, **_kwargs):
+        raise sqlite3.OperationalError("forced rehydration failure")
+
+    monkeypatch.setattr(
+        jr, "rehydrate_codex_file_accounts", fail_rehydration)
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](cache)
+        assert stats.files_processed == 0
+        assert stats.deferred_reason == "attribution_rehydration"
+        assert _map_rows(cache) == []
+        assert _journal_ops(ns, "codex_file_account") == []
+    finally:
+        cache.close()
+
+
+def test_walk_persists_a_non_null_reset_anchor(ns, monkeypatch, tmp_path):
+    """Replacing the walk's resolver call with `None` must make this fail."""
+    provider_root, _rollout = _codex_root(tmp_path)
+    (provider_root / "auth.json").write_text(
+        _auth_json("acct-alpha", "alpha@example.com"))
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](cache)
+        assert stats.files_processed == 1
+        count, null_count = cache.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN canonical_resets_at_utc IS NULL THEN 1 ELSE 0 END) "
+            "FROM quota_window_snapshots WHERE source='codex'"
+        ).fetchone()
+        assert count > 0, "fixture must exercise the quota writer"
+        assert null_count == 0
     finally:
         cache.close()
 
@@ -994,9 +1069,8 @@ def test_attribution_disagreement_is_reported_not_silent(ns, tmp_path, capfd):
     assert "attribution conflict" in err, err
 
 
-def test_obs_stamp_is_used_where_no_decision_covers_the_bytes(ns, tmp_path):
-    """The observation stamp remains the fallback for undecided bytes — the
-    precedence rule narrows it, it does not remove it."""
+def test_guardrail_obs_stamp_is_used_for_bytes_no_decision_covers(ns, tmp_path):
+    """Guard-rail: precedence narrows the stamp fallback but does not remove it."""
     import _lib_journal as jl
     import _cctally_journal as jr
     rollout = tmp_path / "rollout.jsonl"
@@ -1576,6 +1650,63 @@ def test_attribution_conflict_warning_is_one_line_per_file(ns, tmp_path, capfd):
     ])
     err = capfd.readouterr().err
     assert err.count("attribution conflict") == 1, err
+
+
+def test_cache_rehydration_cursor_catches_up_after_stats_cursor_advances(
+        ns):
+    """The two cursors materialize different stores and may advance separately.
+
+    The stats-driven applier first consumes the decision and advances the stats
+    cursor. The cache-specific cursor remains absent until the pre-walk replay
+    independently consumes the same durable op; that catch-up must not move the
+    already-advanced stats cursor.
+    """
+    import _cctally_journal as jr
+    import _lib_journal as jl
+
+    cache = ns["open_cache_db"]()
+    cache.close()
+    jr.append_record(_file_account_op(jl))
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.ran
+
+    stats_conn = ns["open_db"]()
+    try:
+        stats_cursor_before = stats_conn.execute(
+            "SELECT applied_segment, applied_offset FROM journal_cursor "
+            "WHERE id=1"
+        ).fetchone()
+    finally:
+        stats_conn.close()
+    assert tuple(stats_cursor_before) == jr.journal_high_water()
+
+    cache = ns["open_cache_db"]()
+    try:
+        assert _map_rows(cache) == [
+            ("fid-1", 1, 0, "root-a", KEY_A)
+        ], "precondition: stats ingest materialized the decision"
+        _wipe_map(cache)
+        assert _map_rows(cache) == []
+        assert _cache_meta_value(
+            cache, "codex_attribution_rehydrated_hw") is None
+        ns["sync_codex_cache"](cache)
+        cache_cursor = _cache_meta_value(
+            cache, "codex_attribution_rehydrated_hw")
+        assert cache_cursor is not None
+        assert _map_rows(cache) == [
+            ("fid-1", 1, 0, "root-a", KEY_A)
+        ]
+    finally:
+        cache.close()
+
+    stats_conn = ns["open_db"]()
+    try:
+        assert stats_conn.execute(
+            "SELECT applied_segment, applied_offset FROM journal_cursor "
+            "WHERE id=1"
+        ).fetchone() == stats_cursor_before
+    finally:
+        stats_conn.close()
 
 
 # --------------------------------------------------------------------------

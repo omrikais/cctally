@@ -1,4 +1,9 @@
 import { abbreviateModel } from './modelName';
+import {
+  createModelColorAllocator,
+  logicalModelKey,
+  type ModelColorStyle,
+} from './modelColor';
 
 // #244 — model families that get a dedicated chip colour. `fable` joins the
 // original three (Fable is a current first-class model, e.g. claude-fable-5),
@@ -18,44 +23,38 @@ export function modelChipClass(m: string | null | undefined): ModelChipClass {
   return 'other';
 }
 
-/** Deterministic exact-model color for ids outside Claude's named families. */
-export function modelChipStyle(m: string | null | undefined): { backgroundColor: string; color: string } | undefined {
-  if (!m || modelChipClass(m) !== 'other') return undefined;
-  // FNV-1a gives stable, well-spread hues without assigning provider meaning.
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < m.length; i += 1) {
-    hash ^= m.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  const hue = (hash >>> 0) % 360;
-  return {
-    backgroundColor: `hsl(${hue} 58% 38%)`,
-    color: `hsl(${hue} 85% 92%)`,
-  };
+const dashboardModelColors = createModelColorAllocator();
+
+/** Session-stable exact-model color shared by every dashboard surface. */
+export function modelChipStyle(
+  model: string | null | undefined,
+): ModelColorStyle | undefined {
+  return dashboardModelColors.styleFor(model);
 }
 
-// #304 S3 (Codex F4) — the deterministic bound on an `other` chip's DISPLAY
+// #304 S3 (Codex F4) — the deterministic bound on a model chip's DISPLAY
 // label. The rail's two-line stats line is rigid (no shrink valve), so an
 // arbitrarily long internal/future model id must not be allowed to grow the
-// line and push $cost/msgs off the rail. Known-family labels are short and
-// unaffected; the bound only clamps the `other` bucket's abbreviation.
+// line and push $cost/msgs off the rail.
 export const OTHER_CHIP_LABEL_MAX = 12;
 
-// One rail chip: the colour class (`cls`) plus the SHORT label rendered as the
-// chip's text. For a known family the label is the family name (the compact,
-// rigid pill the #243 rail layout depends on — "opus"/"sonnet"/"haiku"/
-// "fable"). An `other` chip keeps its OWN identity via an abbreviation of the
-// real model id (e.g. "gpt-5") rather than the meaningless literal word
-// "other" — and that abbreviation is now deterministically BOUNDED for display
-// (Codex F4), with the untruncated form carried on `full` for the chip's title
-// and accessible name.
+// One rail chip: the fallback family colour class (`cls`) plus the logical
+// release label rendered as text. Every model keeps its own identity via an
+// abbreviation of the real model id (for example "opus-4-8" or "gpt-5")
+// rather than a family-only label or the meaningless literal word "other".
+// The abbreviation is deterministically BOUNDED for display (Codex F4), with
+// the untruncated form carried on `full` for the chip's title and accessible
+// name.
 export interface ModelChip {
   cls: ModelChipClass;
   label: string;
   // #304 S3 (Codex F4) — the untruncated label for the chip's title/accessible
-  // name. Equals `label` for known families and short `other` ids; differs only
-  // when an `other` abbreviation exceeded OTHER_CHIP_LABEL_MAX and was clamped.
+  // name. Equals `label` for short ids and differs when the abbreviation
+  // exceeded OTHER_CHIP_LABEL_MAX and was clamped.
   full: string;
+  // Canonical input carried through so every consumer resolves the same
+  // logical-model color instead of falling back to the family class.
+  model: string;
 }
 
 export interface ModelChipSummary {
@@ -63,27 +62,26 @@ export interface ModelChipSummary {
   extra: number;
 }
 
-// Dedupe a session's model strings to unique chip-classes (preserving the
-// array's order — `models` is the backend's main-session-first sorted-distinct
-// list, NOT a recency/frequency ranking), capped at `cap` with the remainder as
-// `extra`. The label of an `other` chip comes from the FIRST model that mapped
-// to it (rare edge: two distinct unrecognized ids collapse to one chip — fine
-// for the rail, which shows the single primary model; the reader header lists
-// every model in full via abbreviateModel).
+// Dedupe a session's model strings to logical releases (preserving the array's
+// order — `models` is the backend's main-session-first sorted-distinct list,
+// NOT a recency/frequency ranking), capped at `cap` with the remainder as
+// `extra`. Dated/capacity aliases collapse, while Opus 4.8 and Opus 5 remain
+// separate even though both retain the `opus` family class as a CSS fallback.
 export function modelChipSummary(models: string[], cap = 2): ModelChipSummary {
-  const seen = new Set<ModelChipClass>();
+  const seen = new Set<string>();
   const chips: ModelChip[] = [];
-  for (const m of models) {
-    const cls = modelChipClass(m);
-    if (seen.has(cls)) continue;
-    seen.add(cls);
-    // #304 S3 (Codex F4) — `full` is the untruncated label; `label` is the
-    // display text, bounded for `other` ids that exceed OTHER_CHIP_LABEL_MAX.
-    const full = cls === 'other' ? abbreviateModel(m) : cls;
-    const label = cls === 'other' && full.length > OTHER_CHIP_LABEL_MAX
+  for (const model of models) {
+    const key = logicalModelKey(model);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const cls = modelChipClass(model);
+    // #304 S3 (Codex F4) — `full` is the untruncated logical-release label;
+    // `label` is bounded so any future provider id stays inside the rigid rail.
+    const full = abbreviateModel(model).replace(/\[[^\]]+\]$/, '');
+    const label = full.length > OTHER_CHIP_LABEL_MAX
       ? `${full.slice(0, OTHER_CHIP_LABEL_MAX)}…`
       : full;
-    chips.push({ cls, label, full });
+    chips.push({ cls, label, full, model });
   }
   return { chips: chips.slice(0, cap), extra: Math.max(0, chips.length - cap) };
 }

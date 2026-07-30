@@ -123,6 +123,7 @@ export interface TrendChartDatum {
   is_current: boolean;
   spark_height?: number;
   cost_usd?: number | null;   // S3 (#264): weekly cost, for the modal Cost column
+  account_labels?: string[];
 }
 
 export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
@@ -141,6 +142,7 @@ export function buildTrendSparkData(env: Envelope | null): TrendChartDatum[] {
     is_current: w.is_current,
     spark_height: trend.spark_heights?.[i],
     cost_usd: w.cost_usd ?? null,
+    ...(w.account_labels ? { account_labels: w.account_labels } : {}),
   }));
 }
 
@@ -154,6 +156,7 @@ export function buildTrendHistoryData(env: Envelope | null): TrendChartDatum[] {
     delta: w.delta,
     is_current: w.is_current,
     cost_usd: w.cost_usd ?? null,
+    ...(w.account_labels ? { account_labels: w.account_labels } : {}),
   }));
 }
 

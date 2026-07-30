@@ -305,6 +305,62 @@ def test_gather_reads_cache_page_and_freelist_counts(monkeypatch, tmp_path):
     assert state.cache_db_freelist_count == expected_freelist_count
 
 
+def test_gather_counts_only_null_codex_reset_anchors(monkeypatch, tmp_path):
+    ns = load_script()
+    import _cctally_core
+    import _cctally_db
+
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    _valid_sqlite(_cctally_core.DB_PATH)
+    _cctally_core.CACHE_DB_PATH.with_name(
+        "cache.db.maintenance.lock").touch()
+    conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
+    _cctally_db._apply_cache_schema(conn)
+    base = (
+        "codex", "root", "/rollout.jsonl", 1, "2026-07-29T00:00:00Z",
+        "primary", '{"limitId":"codex"}', "codex", None, 10080, 10.0,
+        "2026-08-01T00:00:00Z", None, None, None, None, None,
+    )
+    conn.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        " observed_slot, logical_limit_key, limit_id, limit_name, "
+        " window_minutes, used_percent, resets_at_utc, plan_type, "
+        " individual_limit_json, reached_type, observed_model, account_key, "
+        " canonical_resets_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (*base, None),
+    )
+    conn.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        " observed_slot, logical_limit_key, limit_id, limit_name, "
+        " window_minutes, used_percent, resets_at_utc, plan_type, "
+        " individual_limit_json, reached_type, observed_model, account_key, "
+        " canonical_resets_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (*base[:3], 2, *base[4:], "2026-08-01T00:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        " observed_slot, logical_limit_key, limit_id, limit_name, "
+        " window_minutes, used_percent, resets_at_utc, plan_type, "
+        " individual_limit_json, reached_type, observed_model, account_key, "
+        " canonical_resets_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "claude", None, "/claude.jsonl", 3, "2026-07-29T00:00:00Z",
+            "primary", '{"limitId":"claude"}', "claude", None, 10080, 20.0,
+            "2026-08-01T00:00:00Z", None, None, None, None, None, None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    state = ns["doctor_gather_state"](deep=False)
+
+    assert state.accounts_state["codex_null_reset_anchors"] == 1
+
+
 def test_gather_reads_conversation_page_and_freelist_counts(monkeypatch, tmp_path):
     ns = load_script()
     import _cctally_core

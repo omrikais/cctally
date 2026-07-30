@@ -702,6 +702,7 @@ def maybe_record_milestone(
 
         # Threshold crossed — sync cost before recording so the milestone
         # captures up-to-date cumulative cost, not a stale snapshot.
+        cost_synced = True
         try:
             if retained_selection is None:
                 retained_selection = _cctally().WeekSelection(
@@ -740,7 +741,13 @@ def maybe_record_milestone(
                 retained_selection=retained_selection,
             )
         except Exception as exc:
-            eprint(f"[milestone] cost sync failed, using latest available: {exc}")
+            # The snapshot read below would now return a row from an EARLIER
+            # crossing, so recording here stamps that older cumulative onto
+            # this threshold — a write-once row with a $0.00 marginal and a
+            # fabricated $/1%. Fall through only far enough to reach the
+            # skip guard on the snapshot branch.
+            cost_synced = False
+            eprint(f"[milestone] cost sync failed: {exc}")
 
         week_start = dt.date.fromisoformat(week_start_date)
         week_end = dt.date.fromisoformat(week_end_date)
@@ -762,17 +769,36 @@ def maybe_record_milestone(
             effective_ref = adjusted[0]
 
         if _week_ref_has_reset_event(conn, effective_ref):
-            live_cost = _compute_cost_for_weekref(
-                effective_ref,
-                account_key=account_key,
-                as_of=as_of,
-            )
+            import _cctally_cache  # fail-closed attribution guard (#341)
+            try:
+                live_cost = _compute_cost_for_weekref(
+                    effective_ref,
+                    account_key=account_key,
+                    as_of=as_of,
+                )
+            except _cctally_cache.AccountAttributionUnavailable as exc:
+                # Same contract the budget ladder already holds (#341 Task 4):
+                # an account-scoped read that fell into the fail-closed guard
+                # SKIPS this tick and fires on the next healthy one. Never
+                # re-raised — on the passed-conn (ingest) path a bare raise
+                # would abort the whole cycle over a transient lock.
+                eprint("[milestone] account attribution unavailable, "
+                       f"skipping this crossing: {exc}")
+                return
             if live_cost is None:
                 eprint("[milestone] could not compute effective-range cost, skipping")
                 return
             cumulative_cost = live_cost
             cost_snapshot_id = 0  # no snapshot row to anchor against
         else:
+            if not cost_synced:
+                # The latest snapshot predates this crossing. Milestones are
+                # write-once, so a stale cumulative here is permanent; skip
+                # instead. The next observation still sees current_floor >
+                # max_existing and records the crossing with a real cost.
+                eprint("[milestone] skipping this crossing — its cost would "
+                       "come from a snapshot taken before the crossing")
+                return
             # Account-scoped read (#341 P2-1): the cost snapshot was just
             # materialized under `account_key`, so scope the read to it — the
             # merged (account-blind) read would return another account's row on

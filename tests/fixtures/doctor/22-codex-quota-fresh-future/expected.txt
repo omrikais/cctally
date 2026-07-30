@@ -20,11 +20,11 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 0 / 32 known
+  ✓ cache.db                 version 0 / 33 known
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/45 applied
-  ⚠ Pending migrations       45 pending
+  ✓ Migrations               0/46 applied
+  ⚠ Pending migrations       46 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -56,6 +56,7 @@ Accounts
   ✓ Account registry         no accounts observed yet
   ✓ Account attribution freshness no attribution activity recorded
   ✓ Account attribution      usage attribution healthy
+  ✓ Codex reset anchors      Codex reset anchors complete
 Pricing
   ✓ Coverage                 all observed models priced
 Safety
@@ -69,4 +70,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 48 OK · 5 WARN · 0 FAIL
+Summary: 49 OK · 5 WARN · 0 FAIL

@@ -4,7 +4,7 @@ Turns the former "per-migration goldens are lazy-adopted; not retroactively
 backfilled" policy into an ENFORCED invariant, now that W3 has backfilled the
 last 7 gaps:
 
-  1. Registry counts are pinned (13 stats / 31 cache) with the test-injection
+  1. Registry counts are pinned (13 stats / 33 cache) with the test-injection
      env var (``CCTALLY_MIGRATION_TEST_MODE``) asserted ABSENT — when it is
      armed, ``bin/_cctally_db`` registers one REAL extra entry in each registry
      that has no golden, so the guard must run against the clean 13/27 shape.
@@ -44,7 +44,7 @@ PER_MIGRATION_ROOT = (
 # Pinned registry sizes. Bump the matching one when a migration ships (see
 # module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 32
+EXPECTED_CACHE_COUNT = 33
 EXPECTED_CONVERSATIONS_COUNT = 1
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
@@ -101,6 +101,7 @@ MANIFEST = {
     "030_session_entries_cache_creation_split": "test_migration_030_cache_creation_split",
     "031_codex_file_account_map": "test_cache_migration_031_per_migration_goldens",
     "032_codex_canonical_reset_anchor": "test_cache_migration_032_per_migration_goldens",
+    "033_codex_reset_anchor_component_closure": "test_cache_migration_033_per_migration_goldens",
     # ── conversations registry (DB journal redesign spec §7.2) ──
     "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
 }

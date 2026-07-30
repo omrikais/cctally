@@ -6,6 +6,9 @@ import { historyColumns } from '../lib/historyColumns';
 import { decorateHistoryRows } from './historyData';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import type { ModelCostRow, PeriodRow } from '../types/envelope';
+import { PeriodAccountChips } from '../components/PeriodAccountChips';
+import { modelChipStyle } from '../lib/model';
+import { logicalModelKey } from '../lib/modelColor';
 
 interface Props {
   rows: PeriodRow[];
@@ -31,19 +34,20 @@ interface ModelChip {
   key: string;
   cls: string;
   label: string;
+  model: string;
 }
 
-// Known Claude families remain deduped (`opus-4-7` + `opus-4-6` → one Opus
-// chip). Provider models in the neutral `other` class retain their own model
-// identity, otherwise every Codex split collapses into a useless "other".
+// Collapse build/capacity aliases of one logical release, but preserve
+// same-family releases such as Opus 4.8 and Opus 5 as separate colored chips.
 function uniqueModelChips(models: ModelCostRow[]): ModelChip[] {
   const seen = new Set<string>();
   const chips: ModelChip[] = [];
   for (const m of models) {
-    const key = m.chip === 'other' ? `other:${m.model}` : m.chip;
+    const key = logicalModelKey(m.model);
+    if (!key) continue;
     if (!seen.has(key)) {
       seen.add(key);
-      chips.push({ key, cls: m.chip, label: m.chip === 'other' ? m.display : m.chip });
+      chips.push({ key, cls: m.chip, label: m.display, model: m.model });
     }
   }
   return chips;
@@ -56,7 +60,13 @@ function ModelsCell({ models }: { models: ModelCostRow[] }) {
   return (
     <span className="models-chips">
       {top.map((chip) => (
-        <span key={chip.key} className={`chip ${chip.cls}`}>{chip.label}</span>
+        <span
+          key={chip.key}
+          className={`chip ${chip.cls}`}
+          style={modelChipStyle(chip.model)}
+        >
+          {chip.label}
+        </span>
       ))}
       {extra > 0 && <span className="models-chips-more">…+{extra}</span>}
     </span>
@@ -116,7 +126,10 @@ export function PeriodTable({
                 }
               }}
             >
-              <td>{r.label}{isSelected ? ' ▶' : ''}</td>
+              <td>
+                <PeriodAccountChips labels={r.account_labels} />
+                {r.label}{isSelected ? ' ▶' : ''}
+              </td>
               {showSource && (
                 <td>
                   <span className={`source-chip source-chip--${r.source ?? 'all'}`}>

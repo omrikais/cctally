@@ -29,10 +29,11 @@ describe('roundIsoToTenMinutes (5h-block reset-jitter display normalization)', (
   });
 });
 
-describe('fmt.usd0 (#264 S1 — whole-dollar hero)', () => {
-  it('rounds to whole dollars with a leading $', () => {
-    expect(fmt.usd0(254.27)).toBe('$254');
-    expect(fmt.usd0(254.6)).toBe('$255');
+describe('fmt.usd0 (#423 item 25 — accurate adaptive money hero)', () => {
+  it('keeps known cents while leaving exact dollars compact', () => {
+    expect(fmt.usd0(254.27)).toBe('$254.27');
+    expect(fmt.usd0(254.6)).toBe('$254.60');
+    expect(fmt.usd0(254)).toBe('$254');
     expect(fmt.usd0(0)).toBe('$0');
   });
   it('renders an em-dash for null/undefined (never NaN or a bare $)', () => {

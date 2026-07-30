@@ -387,6 +387,9 @@ class CodexBucketUsage:
     period_end_at: dt.datetime | None = None
     used_pct: float | None = None
     dollar_per_pct: float | None = None
+    # #424: owning accounts for a pooled native weekly period. Empty for
+    # calendar buckets, focused account children, and undecorated providers.
+    account_keys: tuple[str, ...] = ()
 
 
 @dataclass

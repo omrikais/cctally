@@ -162,6 +162,7 @@ class CodexWeeklyPeriod:
     end_at: dt.datetime
     source_root_keys: tuple[str, ...]
     used_percent: float | None = None
+    account_keys: tuple[str, ...] = ()
 
 
 def _codex_history_row_is_model_scoped(row: object) -> bool:
@@ -506,8 +507,9 @@ def _codex_weekly_periods(
     ``max(...)`` hands the focused account the OTHER account's percentage —
     the never-combine violation D6 forbids — while ``end_at = min(resets_at,
     next_start)`` clips one account's week at the other's start. ``None`` keeps
-    the merged "All accounts" read, which is byte-stable and is what the parent
-    still uses.
+    the merged "All accounts" read used by the parent. Every merged boundary
+    retains the account-key set that contributed its percentage; the parent
+    publishes that set only under the existing multi-account decoration gate.
 
     The predicate is strict equality, deliberately NOT the one-directional
     ``(account, unattributed)`` widening ``_codex_five_hour_rows`` uses: that
@@ -528,8 +530,8 @@ def _codex_weekly_periods(
     account_params: tuple = () if account_key is None else (account_key,)
     try:
         rows = stats_conn.execute(
-            "SELECT source_root_key, logical_limit_key, limit_name, resets_at_utc, "
-            "nominal_start_at_utc, current_percent "
+            "SELECT source_root_key, account_key, logical_limit_key, limit_name, "
+            "resets_at_utc, nominal_start_at_utc, current_percent "
             "FROM quota_window_blocks "
             "WHERE source='codex' AND window_minutes=10080 "
             f"AND source_root_key IN ({placeholders}) AND orphaned_at IS NULL "
@@ -547,10 +549,10 @@ def _codex_weekly_periods(
     # live boundary together with its own durable row, so the flag is OR-ed on
     # merge rather than taken from either side.
     raw_boundaries: list[
-        tuple[dt.datetime, dt.datetime, set[str], list[float], bool]
+        tuple[dt.datetime, dt.datetime, set[str], list[float], set[str], bool]
     ] = []
 
-    for (root_key, logical_limit_key, limit_name, resets_at_raw,
+    for (root_key, row_account_key, logical_limit_key, limit_name, resets_at_raw,
          start_at_raw, current_percent) in rows:
         if is_model_scoped_codex_quota(logical_limit_key, limit_name):
             continue
@@ -568,7 +570,14 @@ def _codex_weekly_periods(
         used_values = []
         if isinstance(current_percent, (int, float)) and not isinstance(current_percent, bool):
             used_values.append(float(current_percent))
-        raw_boundaries.append((start_at, resets_at, {str(root_key)}, used_values, False))
+        raw_boundaries.append((
+            start_at,
+            resets_at,
+            {str(root_key)},
+            used_values,
+            {str(row_account_key or _lib_accounts.UNATTRIBUTED)},
+            False,
+        ))
 
     # `active_cycle is None` is the case §7.4 calls out explicitly: no boundary
     # is live, so nothing is exempt and every period clips exactly as before.
@@ -578,13 +587,18 @@ def _codex_weekly_periods(
             active_cycle.resets_at.astimezone(UTC),
             set(active_cycle.source_root_keys),
             [active_cycle.used_percent] if active_cycle.used_percent is not None else [],
+            {
+                active_cycle.quota_identity.account_key
+                if active_cycle.quota_identity is not None
+                else _lib_accounts.UNATTRIBUTED
+            },
             True,
         ))
 
     ordered: list[
-        tuple[dt.datetime, dt.datetime, set[str], list[float], bool]
+        tuple[dt.datetime, dt.datetime, set[str], list[float], set[str], bool]
     ] = []
-    for start_at, resets_at, period_roots, used_values, is_live in sorted(
+    for start_at, resets_at, period_roots, used_values, period_accounts, is_live in sorted(
         raw_boundaries, key=lambda item: (item[0], item[1]),
     ):
         if (
@@ -592,19 +606,26 @@ def _codex_weekly_periods(
             and (start_at - ordered[-1][0]).total_seconds()
             < _FIVE_HOUR_JITTER_FLOOR_SECONDS
         ):
-            first_start, latest_reset, existing_roots, existing_used, existing_live = ordered[-1]
+            (
+                first_start, latest_reset, existing_roots, existing_used,
+                existing_accounts, existing_live,
+            ) = ordered[-1]
             existing_roots.update(period_roots)
             existing_used.extend(used_values)
+            existing_accounts.update(period_accounts)
             ordered[-1] = (
                 first_start, max(latest_reset, resets_at), existing_roots, existing_used,
-                existing_live or is_live,
+                existing_accounts, existing_live or is_live,
             )
         else:
             ordered.append((
-                start_at, resets_at, set(period_roots), list(used_values), is_live,
+                start_at, resets_at, set(period_roots), list(used_values),
+                set(period_accounts), is_live,
             ))
     periods: list[CodexWeeklyPeriod] = []
-    for index, (start_at, resets_at, period_roots, used_values, is_live) in enumerate(ordered):
+    for index, (
+        start_at, resets_at, period_roots, used_values, period_accounts, is_live,
+    ) in enumerate(ordered):
         next_start = ordered[index + 1][0] if index + 1 < len(ordered) else None
         # The live cycle always ends at its own reset (#373 §7.4).
         if is_live:
@@ -617,6 +638,7 @@ def _codex_weekly_periods(
             end_at=end_at,
             source_root_keys=tuple(sorted(period_roots)),
             used_percent=max(used_values) if used_values else None,
+            account_keys=tuple(sorted(period_accounts)),
         ))
     return tuple(periods)
 
@@ -929,6 +951,9 @@ def _bucket_wire(bucket: Any) -> dict[str, object]:
         value = getattr(bucket, name, None)
         if value is not None:
             result[name] = value
+    account_keys = getattr(bucket, "account_keys", ())
+    if account_keys:
+        result["account_keys"] = tuple(account_keys)
     return result
 
 
@@ -2474,11 +2499,13 @@ def _build_codex_native_weekly_view(
     display_tz_name: str | None,
     speed: str,
     account_key: str | None = None,
+    include_account_keys: bool = False,
 ) -> CodexWeeklyView:
     """Aggregate Codex cost into observed native quota-cycle segments.
 
     ``account_key`` scopes the durable boundary read to one account (#416
-    Slice 3A review B1); ``None`` is the merged parent read and is byte-stable.
+    Slice 3A review B1); ``None`` is the merged parent read. The additive
+    ownership axis is emitted only when ``include_account_keys`` is true.
     """
     periods = _codex_weekly_periods(
         stats_conn,
@@ -2531,6 +2558,10 @@ def _build_codex_native_weekly_view(
                 if periods_by_bucket[row.bucket].used_percent is not None
                 and periods_by_bucket[row.bucket].used_percent > 0
                 else None
+            ),
+            account_keys=(
+                periods_by_bucket[row.bucket].account_keys
+                if include_account_keys else ()
             ),
         )
         for row in rows
@@ -2802,14 +2833,11 @@ def _codex_account_scopes_wire(
             context, account_observations, accounting_entries=rows,
             account_key=key,
         )
-        # #416 Slice 3A review B3. The parent sets `quota.cycle_index` and the
-        # client reads `codex.quota.cycle_index`, so a child without the key
-        # forces the client into a fallback — and the tempting one (reuse the
-        # parent's) would render account A's milestone HISTORY on account B's
-        # hero. The index is derivable per account from what the child already
-        # has (its own `CodexCycleBoundary` plus `stats_conn`), so it is built
-        # genuinely rather than declared parent-only. No cycle => `()`, an
-        # honest empty state, never another account's ledger.
+        # Each decorated child owns the only honest cycle index for that
+        # account. Reusing a merged parent index here would render account A's
+        # milestone HISTORY on account B's hero. The index is derivable from
+        # the child's own `CodexCycleBoundary` plus `stats_conn`; no cycle =>
+        # `()`, an honest empty state, never another account's ledger.
         cycle_index: tuple = ()
         if cycle is not None and not hero_failure:
             try:
@@ -3166,6 +3194,15 @@ def build_codex_source_state(
     monthly = build_codex_monthly_view(
         entries, now_utc=context.now_utc, tz_name=context.display_tz_name, speed=context.speed,
     )
+    # R8 gate, resolved once before the parent weekly projection so that only
+    # a decorated merged row gains the additive account axis. Focused children
+    # and <=1-real-account providers remain byte-identical.
+    try:
+        import _cctally_account
+        _codex_decorated = _cctally_account.provider_is_decorated(
+            context.stats_conn, "codex")
+    except Exception:
+        _codex_decorated = False
     weekly = _build_codex_native_weekly_view(
         context.stats_conn,
         visible_accounting_entries,
@@ -3174,6 +3211,7 @@ def build_codex_source_state(
         now_utc=context.now_utc,
         display_tz_name=context.display_tz_name,
         speed=context.speed,
+        include_account_keys=_codex_decorated,
     )
     sessions = (
         build_rooted_codex_session_view(
@@ -3196,12 +3234,6 @@ def build_codex_source_state(
     # `accounts[]` cards, `hero.cycles[]`, and the `account_scopes` children —
     # hangs off this single boolean, so a <=1-real-account install is provably
     # byte-identical by construction rather than by golden observation.
-    try:
-        import _cctally_account
-        _codex_decorated = _cctally_account.provider_is_decorated(
-            context.stats_conn, "codex")
-    except Exception:
-        _codex_decorated = False
     quota_blocks = _quota_wire(
         context.stats_conn,
         accounting_entries=visible_accounting_entries,
@@ -3210,12 +3242,13 @@ def build_codex_source_state(
         display_tz_name=context.display_tz_name,
         decorated=_codex_decorated,
     )
-    # Hero-modal historical-milestone navigation index (spec §1c, §3). Built
-    # here on the non-idle codex source rebuild (idle ticks reuse the stored
-    # bundle) over the durable projection — a pure serializer never touches it.
-    # Guarded: an index failure must never fail the codex source build.
+    # Hero-modal historical-milestone navigation index (spec §1c, §3). A
+    # decorated parent has no single cycle history: its representative
+    # `cycle` belongs to one account, while every child builds its own index
+    # above. Preserve the parent index only for the byte-stable undecorated
+    # shape. Guarded: an index failure must never fail the codex source build.
     cycle_index: tuple = ()
-    if cycle is not None and not hero_failure:
+    if not _codex_decorated and cycle is not None and not hero_failure:
         try:
             cycle_index = tuple(
                 sys.modules["cctally"].build_codex_cycle_index(

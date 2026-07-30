@@ -129,7 +129,7 @@ describe('All providers — a decorated Codex provider is never one account', ()
     renderAll(makeDecoratedCodexSourceData());
     const spent = screen.getByTestId('shared-hero-spent');
     // claude 8.4 + codex 12.3 (itself the sum of the cards) = 20.7.
-    expect(spent.textContent).toContain('$21');
+    expect(spent.textContent).toContain('$20.70');
     expect(spent.textContent).toContain('total tokens');
   });
 

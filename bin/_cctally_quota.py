@@ -966,7 +966,9 @@ def _evaluate_quota_alerts(
     return queued
 
 
-def _reanchor_terminal_events_sql(key_slots: int, minute_slots: int) -> str:
+def _reanchor_terminal_events_sql(
+    key_slots: int, minute_slots: int, reset_slots: int,
+) -> str:
     # `UPDATE OR IGNORE`, not a plain UPDATE: if this identity already carries an
     # anchored row at the same threshold, moving the jittered twin onto it would
     # violate the UNIQUE key. OR IGNORE SKIPS that move (it does not delete the
@@ -978,6 +980,11 @@ def _reanchor_terminal_events_sql(key_slots: int, minute_slots: int) -> str:
     # transaction.
     keys = ",".join(f":key{i}" for i in range(key_slots))
     minutes = ",".join(f":min{i}" for i in range(minute_slots))
+    member_epochs = ",".join(f":reset{i}" for i in range(reset_slots))
+    member_clause = (
+        f" OR unixepoch(resets_at_utc) IN ({member_epochs})"
+        if member_epochs else ""
+    )
     return (
         "UPDATE OR IGNORE quota_threshold_events "
         "   SET resets_at_utc = :anchor, "
@@ -989,7 +996,9 @@ def _reanchor_terminal_events_sql(key_slots: int, minute_slots: int) -> str:
         f"   AND observed_slot = :slot AND window_minutes IN ({minutes}) "
         "   AND (resets_at_utc <> :anchor OR logical_limit_key <> :limit_key "
         "        OR window_minutes <> :minutes) "
-        "   AND abs(unixepoch(resets_at_utc) - unixepoch(:anchor)) <= :tolerance"
+        "   AND ("
+        "       abs(unixepoch(resets_at_utc) - unixepoch(:anchor)) <= :tolerance"
+        f"{member_clause})"
     )
 
 
@@ -1020,15 +1029,24 @@ def _reanchor_terminal_events(conn: sqlite3.Connection, block) -> None:
     re-materialization (they share this body), and is idempotent: a row already
     on the canonical identity is excluded by the three-way `<>` guard.
 
-    Bounded on both axes by the tolerances that produced the canonical identity —
-    600s on the reset, ±1 minute on the length — so it can only ever collapse
-    rows the canonicalization itself merged. Two genuinely different cycles are
-    five hours or seven days apart, and a `10200` window is a different window,
-    not jitter.
+    The reset match accepts either the original 600-second anchor neighbourhood
+    or an exact raw reset retained by this block. The latter is required by
+    #425's transitive component closure: an endpoint can be farther than 600s
+    from the first-sight anchor while still joining it through retained bridge
+    observations. Exact membership keeps the widened reach evidence-bound; a
+    genuinely different cycle is never inferred from distance alone. The length
+    axis remains bounded by its ±1 minute snap.
     """
     identity = block.identity
     keys = codex_snap_equivalent_limit_keys(identity.logical_limit_key)
     minutes = codex_snap_equivalent_window_minutes(identity.window_minutes)
+    membership_evidence = (
+        block.physical_observations or block.observations
+    )
+    reset_epochs = sorted({
+        int(observation.resets_at.timestamp())
+        for observation in membership_evidence
+    })
     params: dict[str, object] = {
         "anchor": _utc_iso(block.resets_at),
         "source": identity.source,
@@ -1041,8 +1059,13 @@ def _reanchor_terminal_events(conn: sqlite3.Connection, block) -> None:
     }
     params.update({f"key{i}": value for i, value in enumerate(keys)})
     params.update({f"min{i}": value for i, value in enumerate(minutes)})
+    params.update({
+        f"reset{i}": value for i, value in enumerate(reset_epochs)})
     conn.execute(
-        _reanchor_terminal_events_sql(len(keys), len(minutes)), params)
+        _reanchor_terminal_events_sql(
+            len(keys), len(minutes), len(reset_epochs)),
+        params,
+    )
 
 
 def _apply_quota_projection_rows(

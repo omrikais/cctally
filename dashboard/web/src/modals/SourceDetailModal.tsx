@@ -5,7 +5,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
-import { modelChipClass } from '../lib/model';
+import { modelChipClass, modelChipStyle } from '../lib/model';
 import { ModelCostBars } from './ModelCostBars';
 import { ProjectDetailContent } from './ProjectsDrillPanel';
 import { SessionDetailContent } from './SessionModal';
@@ -295,7 +295,11 @@ function CodexModelCollection({
       renderItem={(row) => (
         <>
           <span className="sd-collection-primary">
-            <span className={`sw ${modelChipClass(row.modelName!)}`} aria-hidden="true" />
+            <span
+              className={`sw ${modelChipClass(row.modelName!)}`}
+              style={modelChipStyle(row.modelName!)}
+              aria-hidden="true"
+            />
             {row.modelName}
           </span>
           <span>{fmt.usd2(row.cost ?? null)}</span>
@@ -353,7 +357,11 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
 
       {singleModel ? (
         <div className="msess-model-caption">
-          <span className={`sw ${modelChipClass(modelRows[0].model)}`} aria-hidden="true" />
+          <span
+            className={`sw ${modelChipClass(modelRows[0].model)}`}
+            style={modelChipStyle(modelRows[0].model)}
+            aria-hidden="true"
+          />
           <span className="k">Model</span><span className="name">{modelRows[0].model}</span>
           <span className="dot" aria-hidden="true">·</span><span className="v">{fmt.usd2(modelRows[0].cost_usd)}</span>
         </div>

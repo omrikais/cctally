@@ -5,7 +5,13 @@ import { SourceStatusChip } from './SourceStatusChip';
 import { resolveSourceView } from '../store/sourceView';
 import { gateSessions } from '../lib/sourceGating';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
-import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
+import {
+  ACCOUNT_B,
+  makeAllSourceEntry,
+  makeDecoratedCodexSourceData,
+  makeSourceEnvelope,
+  withSharedRootWeeklyWindows,
+} from '../test-utils/sourceEnvelope';
 import type { Envelope } from '../types/envelope';
 
 beforeEach(() => {
@@ -82,6 +88,46 @@ describe('HeroStrip — Codex tiles (§6.1)', () => {
   beforeEach(() => {
     updateSnapshot(envWith());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+  });
+
+  it('does not evaluate an account-blind parent forecast under decorated All', () => {
+    const slice = makeSourceEnvelope();
+    const data = withSharedRootWeeklyWindows(makeDecoratedCodexSourceData());
+    for (const row of data.quota.histories.filter(
+      (history) => history.window_minutes === 10_080,
+    )) {
+      Object.defineProperty(row, 'forecast', {
+        get() {
+          throw new Error(
+            `account-blind parent forecast read for ${row.account_key ?? ACCOUNT_B}`,
+          );
+        },
+      });
+    }
+    const codex = { ...slice.sources.codex, data };
+    updateSnapshot({
+      header: {
+        used_pct: 17.4,
+        week_label: 'wk',
+        five_hour_pct: null,
+        dollar_per_pct: 1.2,
+        forecast_pct: 60,
+        forecast_verdict: 'ok',
+        vs_last_week_delta: null,
+      },
+      current_week: null,
+      ...slice,
+      sources: {
+        ...slice.sources,
+        codex,
+        all: makeAllSourceEntry(slice.sources.claude, codex),
+      },
+    } as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    expect(() => render(<HeroStrip />)).not.toThrow();
+    expect(screen.getAllByTestId('hero-per-account-value').length)
+      .toBeGreaterThan(0);
   });
 
   it('uses Claude\'s exact hero structure and metric slots with Codex cycle data', () => {
@@ -292,7 +338,7 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     render(<HeroStrip />);
     const combined = screen.getByTestId('shared-hero-spent');
     // claude 8.4 + codex 12.3 = 20.7
-    expect(combined).toHaveTextContent('$21');
+    expect(combined).toHaveTextContent('$20.70');
     expect(combined).not.toHaveTextContent('unavailable');
   });
 

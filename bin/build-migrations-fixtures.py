@@ -5276,6 +5276,122 @@ def build_per_migration_032_codex_canonical_reset_anchor(scenario_dir: Path) -> 
     _build_post(pre, post)
 
 
+_CACHE_033_QUOTA_ROWS = (
+    # One tolerance-connected chain. Migration 032's established-anchor lookup
+    # left the 19:20 endpoint split even though the 19:10 bridge is within 600s
+    # of both endpoints.
+    (
+        "/roots/rk/sessions/a.jsonl", 10, "2026-08-01T19:00:00Z",
+        "2026-08-01T19:00:00Z",
+    ),
+    (
+        "/roots/rk/sessions/a.jsonl", 20, "2026-08-01T19:20:00Z",
+        "2026-08-01T19:20:00Z",
+    ),
+    (
+        "/roots/rk/sessions/a.jsonl", 30, "2026-08-01T19:10:00Z",
+        "2026-08-01T19:00:00Z",
+    ),
+)
+
+
+def build_per_migration_033_codex_reset_anchor_component_closure(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the #425 chain-closure repair."""
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+    migration = "033_codex_reset_anchor_component_closure"
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        jsonl = sys.modules["_lib_jsonl"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_031,
+                         "032_codex_canonical_reset_anchor"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-29T12:00:00Z"),
+                )
+            key = jsonl._codex_logical_limit_key(
+                "rk", "codex", "primary", 10080, None)
+            for source_path, offset, raw, canonical in _CACHE_033_QUOTA_ROWS:
+                conn.execute(
+                    "INSERT INTO quota_window_snapshots "
+                    "(source, source_root_key, source_path, line_offset, "
+                    " captured_at_utc, observed_slot, logical_limit_key, "
+                    " limit_id, limit_name, window_minutes, used_percent, "
+                    " resets_at_utc, plan_type, individual_limit_json, "
+                    " reached_type, observed_model, account_key, "
+                    " canonical_resets_at_utc) "
+                    "VALUES ('codex','rk',?,?, '2026-07-29T00:00:00Z', "
+                    "'primary',?, 'codex', NULL, 10080, 10.0, ?, NULL, NULL, "
+                    "NULL, NULL, NULL, ?)",
+                    (source_path, offset, key, raw, canonical),
+                )
+            conn.execute("PRAGMA user_version=32")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler = next(
+                (item.handler for item in db._CACHE_MIGRATIONS
+                 if item.name == migration),
+                None,
+            )
+            if handler is None:
+                raise SystemExit(f"{migration} not registered")
+            handler(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, "2026-07-29T12:00:00Z"),
+            )
+            conn.execute("PRAGMA user_version=33")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -5900,6 +6016,10 @@ def main() -> int:
     )
     build_per_migration_032_codex_canonical_reset_anchor(
         FIXTURES_ROOT / "per-migration" / "032_codex_canonical_reset_anchor"
+    )
+    build_per_migration_033_codex_reset_anchor_component_closure(
+        FIXTURES_ROOT / "per-migration"
+        / "033_codex_reset_anchor_component_closure"
     )
     build_per_migration_008_recompute_weekly_cost_snapshots_dedup_fix(
         FIXTURES_ROOT / "per-migration"

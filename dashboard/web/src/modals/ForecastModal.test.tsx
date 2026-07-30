@@ -148,6 +148,12 @@ describe('<ForecastModal /> range bar (FC-2)', () => {
     expect(container.textContent).toContain('110%');
   });
 
+  it('keeps one decimal for projected and current/recent percentages', () => {
+    const { container } = renderForecast({ usedPct: 11, forecast: fcFixture() });
+    expect(container.querySelector('#mfc-wa-pct')?.textContent).toBe('19.8%');
+    expect(container.querySelector('#mfc-r24-pct')?.textContent).toBe('30.6%');
+  });
+
   it('omits the now-marker when the current used % is unknown', () => {
     const { container } = renderForecast({ usedPct: null, forecast: fcFixture() });
     expect(container.querySelector('.mfc-now')).toBeNull();

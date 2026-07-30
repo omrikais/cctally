@@ -7,6 +7,7 @@ import { fmt } from '../lib/fmt';
 import { applyTableSort, type SortOverride } from '../lib/tableSort';
 import { TREND_COLUMNS, type TrendTableRow } from '../lib/trendColumns';
 import { buildTrendHistoryData, type TrendChartDatum } from '../store/selectors';
+import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { presentationTrend } from '../lib/dashboardPresentation';
@@ -574,6 +575,7 @@ function CanonicalTrendModal({
                   className={r.is_current ? 'cur' : undefined}
                 >
                   <td>
+                    <PeriodAccountChips labels={r.account_labels} />
                     <span className="wlab">{wlab}</span>
                   </td>
                   <td className="num c-cost">{fmt.usd2(r.cost_usd)}</td>

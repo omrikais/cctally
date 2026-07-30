@@ -1426,6 +1426,35 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   display: inline-block;
 }
 
+/* #423 item 17 — phone headers previously squeezed a long focused-account chip
+   to 6–9 visible characters. Keep the full identity available on touch by
+   wrapping it onto a compact second line instead of relying on hover-only
+   title text. The floor prevents flex from reducing the chip to a sliver. */
+@media (max-width: 640px) {
+  #panel-alerts > .panel-header {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  #panel-alerts > .panel-header > div:first-child {
+    flex: 1 1 100%;
+  }
+  #panel-alerts > .panel-header > .panel-header-actions {
+    margin-left: auto;
+  }
+  #panel-sessions > .panel-header > .panel-title-wrap,
+  #panel-alerts > .panel-header > div:first-child {
+    flex-wrap: wrap;
+  }
+  .sessions-account-note,
+  .alerts-account-note {
+    flex: 0 1 auto;
+    min-width: min(16ch, calc(100% - 28px));
+    max-width: calc(100% - 28px);
+    margin-left: 28px;
+    white-space: nowrap;
+  }
+}
+
 /* #416 §5.4 — a vendor-wide crossing stays visible under account focus and is
    labelled as such. It is deliberately NOT a severity chip: the severity glyph
    beside it already carries the 3-tier vocabulary, and this only says the row
@@ -3338,6 +3367,20 @@ mark.current {
    provider chip beside it (that names WHICH board you are on; this qualifies
    one row), and it never truncates the timestamp it precedes. */
 .blocks-row .label .blocks-account-chip {
+  flex: none; max-width: 12ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft); background: var(--panel-bg-2);
+  color: var(--text-dim); font-size: var(--fs-eyebrow); font-weight: 600;
+}
+
+/* #424 — pooled native-week owners. Match the merged 5-hour row's quiet
+   account qualifier while allowing two colliding owners to wrap safely. */
+.period-account-chips {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  max-width: 100%; margin-inline-end: 6px; vertical-align: middle;
+}
+.period-account-chip {
   flex: none; max-width: 12ch; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
   padding: 1px 6px; border-radius: var(--radius-pill);
@@ -6090,7 +6133,7 @@ mark.current {
 }
 .drill-bar::after {
   content: ""; position: absolute; inset: 0 auto 0 0;
-  width: var(--w, 0%); background: var(--accent-magenta);
+  width: var(--w, 0%); background: var(--model-color, var(--accent-magenta));
   border-radius: 2px; /* lint-allow: border-radius data-viz */
 }
 .drill-bar-row .cost { text-align: right; }
@@ -6925,6 +6968,7 @@ mark.current {
   gap: var(--space-3);
   margin-top: var(--space-3);
 }
+.account-hero-provider-group { display: contents; }
 .account-hero-card {
   flex: 1 1 220px;
   min-width: 200px;

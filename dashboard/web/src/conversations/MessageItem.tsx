@@ -6,7 +6,7 @@ import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
 import { BookmarkButton } from './BookmarkButton';
 import { isSystemMarker } from './systemMarkers';
-import { modelChipClass } from '../lib/model';
+import { modelChipClass, modelChipStyle } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { costIntensity } from '../lib/cost';
 import { useFmtCtx, useMarkersEnabled, useMaxTurnCost } from './TranscriptContext';
@@ -216,7 +216,14 @@ function MessageItemImpl(
           <span className="conv-item-label">Assistant</span>
           {/* #175 F3: render the model through the shared .chip system (matching
               the rest of the dashboard). No chip — and no em dash — when null. */}
-          {item.model && <span className={`chip ${modelChipClass(item.model)}`}>{item.model}</span>}
+          {item.model && (
+            <span
+              className={`chip ${modelChipClass(item.model)}`}
+              style={modelChipStyle(item.model)}
+            >
+              {item.model}
+            </span>
+          )}
           {/* cache-failure-markers spec §3 — amber "cache rebuilt" chip next to
               the model chip. Gated on markersEnabled && the flag; the ⚡ glyph is
               aria-hidden so the chip text + aria-label/title carry the meaning. */}

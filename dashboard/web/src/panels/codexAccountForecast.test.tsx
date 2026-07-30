@@ -86,11 +86,11 @@ describe('Forecast panel — "All accounts" never publishes one account', () => 
   it('does not print the representative account projection or verdict', () => {
     const { container } = renderPanel(decorated());
     const panel = container.querySelector('#panel-forecast') as HTMLElement;
-    // A projects OVER the cap (104%), B is at 31% / OK. Either number alone is
+    // A projects OVER the cap (104%), B is at 31.0% / OK. Either number alone is
     // a claim about the provider that only one account supports.
     expect(panel.textContent).not.toContain('≥100%');
     expect(panel.textContent).not.toContain('OVER');
-    expect(panel.textContent).not.toContain('31%');
+    expect(panel.textContent).not.toContain('31.0%');
     expect(panel.querySelector('.fc-accent-edge')).toBeNull();
     expect(panel.className).not.toContain('fc-esc-over');
   });
@@ -110,7 +110,7 @@ describe('Forecast panel — "All accounts" never publishes one account', () => 
   it('restores that account\'s own forecast under focus', () => {
     const { container } = renderPanel(decorated(), ACCOUNT_B);
     const panel = container.querySelector('#panel-forecast') as HTMLElement;
-    expect(panel.textContent).toContain('31%');
+    expect(panel.textContent).toContain('31.0%');
     expect(panel.textContent).not.toContain('per account');
   });
 });
@@ -281,8 +281,8 @@ describe('An expired Codex quota window is not a current quota', () => {
       ACCOUNT_B,
     );
     const foot = container.querySelector('.fc-budget-foot') as HTMLElement;
-    // Observed RED: `7-day limit12%ConfidencemediumBudget pace—`.
-    expect(foot.textContent).not.toContain('12%');
+    // Observed RED: `7-day limit12.0%ConfidencemediumBudget pace—`.
+    expect(foot.textContent).not.toContain('12.0%');
     expect(foot.textContent).not.toContain('medium');
     expect(foot.textContent).toContain('—');
     expect(foot.textContent).toContain('unavailable');
@@ -302,7 +302,7 @@ describe('An expired Codex quota window is not a current quota', () => {
     cleanup();
     const panel = renderPanel(data, ACCOUNT_B);
     const foot = panel.container.querySelector('.fc-budget-foot') as HTMLElement;
-    expect(foot.textContent).toContain('12%');
+    expect(foot.textContent).toContain('12.0%');
     expect(foot.textContent).toContain('low');
   });
 
@@ -425,12 +425,12 @@ describe('Two Codex accounts under ONE root collide on the quota key', () => {
     // so the collision cannot reach it. Pinned rather than assumed.
     const { container } = renderPanel(sharedRoot(), ACCOUNT_B);
     const foot = container.querySelector('.fc-budget-foot') as HTMLElement;
-    expect(foot.textContent).not.toContain('41%');
+    expect(foot.textContent).not.toContain('41.0%');
     expect(foot.textContent).toContain('unavailable');
     cleanup();
     const livePanel = renderPanel(sharedRoot(), ACCOUNT_A);
     const liveFoot = livePanel.container.querySelector('.fc-budget-foot') as HTMLElement;
-    expect(liveFoot.textContent).toContain('78%');
+    expect(liveFoot.textContent).toContain('78.2%');
     expect(liveFoot.textContent).toContain('high');
   });
 
@@ -496,7 +496,7 @@ describe('An undecorated Codex provider is untouched (R8)', () => {
   it('keeps the single-account projection, verdict and rates', () => {
     const { container } = renderPanel(makeCodexSourceData());
     const panel = container.querySelector('#panel-forecast') as HTMLElement;
-    expect(panel.textContent).toContain('80%');
+    expect(panel.textContent).toContain('80.0%');
     expect(panel.textContent).not.toContain('per account');
     expect(container.querySelector('[data-testid="forecast-per-account"]')).toBeNull();
   });
@@ -517,7 +517,7 @@ describe('An undecorated Codex provider is untouched (R8)', () => {
     const { container } = renderPanel(makeCodexSourceData());
     const foot = container.querySelector('.fc-budget-foot') as HTMLElement;
     expect(foot.textContent).toContain('Weekly limit');
-    expect(foot.textContent).toContain('61%');
+    expect(foot.textContent).toContain('61.0%');
     expect(foot.textContent).toContain('medium');
   });
 });

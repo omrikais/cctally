@@ -381,6 +381,10 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(detail).toHaveTextContent('Jul 21 03:37 PDT');
     expect(detail.textContent).not.toMatch(/T\d{2}:\d{2}:\d{2}\.\d{6}Z/);
     expect(within(detail).getAllByTestId('codex-project-model-row')).toHaveLength(6);
+    const firstModelSwatch = detail.querySelector(
+      '[data-testid="codex-project-model-row"] .sw',
+    ) as HTMLElement;
+    expect(firstModelSwatch.style.backgroundColor).not.toBe('');
     expect(within(detail).getAllByTestId('codex-project-session-row')).toHaveLength(6);
     expect(within(detail).getByRole('button', { name: 'Show all 14 models' })).toHaveTextContent('+8 more');
     expect(within(detail).getByRole('button', { name: 'Show all 18 sessions' })).toHaveTextContent('+12 more');

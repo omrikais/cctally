@@ -314,7 +314,9 @@ def test_transcript_timeout_tracks_no_progress_not_total_wall_time(
         return stats
 
     monkeypatch.setattr(
-        cache_mod, "open_conversations_db", lambda: FakeConnection()
+        cache_mod,
+        "_open_conversations_db_for_recovery",
+        lambda: FakeConnection(),
     )
     monkeypatch.setattr(cache_mod, "sync_claude_conversations", advancing)
 

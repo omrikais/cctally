@@ -1,4 +1,4 @@
-import { dispatch, getState } from '../store/store';
+import { dispatch, getScopedSnapshot, getState } from '../store/store';
 import { resolveSourceView } from '../store/sourceView';
 import { collectSourceSessionRows } from './sourceRows';
 import { presentationBlocks } from './dashboardPresentation';
@@ -15,23 +15,25 @@ export function openPanelByPosition(position: number): void {
   // good data shown) keeps working.
   const s = getState();
   if (s.snapshot == null) return;
+  const env = getScopedSnapshot(s);
+  if (env == null) return;
   // #294 S5 §6.11 — digits address VISIBLE positions only, so a source-hidden
   // panel is unreachable by digit.
   const order = deriveVisiblePanelOrder(
     s.prefs.panelOrder,
-    resolveSourceView(s.snapshot, s.activeSource),
+    resolveSourceView(env, s.activeSource),
   );
   const idx = position - 1;
   if (idx < 0 || idx >= order.length) return;
   const id = order[idx];
   if (s.activeSource !== 'claude' && id === 'sessions') {
-    const row = collectSourceSessionRows(resolveSourceView(s.snapshot, s.activeSource))[0];
+    const row = collectSourceSessionRows(resolveSourceView(env, s.activeSource))[0];
     if (row) dispatch({ type: 'OPEN_SOURCE_DETAIL', source: row.source, resource: 'session', key: row.key });
     return;
   }
   if (s.activeSource !== 'claude' && id === 'blocks') {
-    const row = presentationBlocks(s.snapshot, s.activeSource).find((item) => item.is_active)
-      ?? presentationBlocks(s.snapshot, s.activeSource)[0];
+    const blocks = presentationBlocks(env, s.activeSource);
+    const row = blocks.find((item) => item.is_active) ?? blocks[0];
     if (row?.source === 'claude') {
       dispatch({ type: 'OPEN_MODAL', kind: 'block', blockStartAt: row.start_at });
     } else if (row) {

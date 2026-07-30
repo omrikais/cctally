@@ -17,13 +17,13 @@ describe('<ForecastPanel />', () => {
   });
 
   // #248 §4 — the panel is now a calm tile. The hero is the projected % at
-  // reset (fixture week_avg_projection_pct=68.5 → 69%); the verdict glyph is
+  // reset (fixture week_avg_projection_pct=68.5 → 68.5%); the verdict glyph is
   // data-driven (fixture verdict="ok" → ✓ / is-good, no accent edge).
   it('shows the projected % at reset as the hero number', () => {
     render(<ForecastPanel />);
     const num = document.querySelector('#panel-forecast .fc-num');
     expect(num).not.toBeNull();
-    expect(num?.textContent).toContain('69%');
+    expect(num?.textContent).toContain('68.5%');
   });
 
   it('renders the data-driven OK verdict chip (✓ / is-good, calm)', () => {
@@ -45,7 +45,7 @@ describe('<ForecastPanel />', () => {
     render(<ForecastPanel />);
     const foot = document.querySelector('#panel-forecast .fc-budget-foot');
     expect(foot).not.toBeNull();
-    expect(foot?.textContent).toContain('72%');     // recent_24h_projection_pct
+    expect(foot?.textContent).toContain('72.0%');   // recent_24h_projection_pct
     expect(foot?.textContent).toContain('$24.50');  // budget_100_per_day_usd
     expect(foot?.textContent).toContain('$21.00');  // budget_90_per_day_usd
   });

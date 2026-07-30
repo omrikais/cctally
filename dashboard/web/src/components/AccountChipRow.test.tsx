@@ -109,4 +109,18 @@ describe('AccountChipRow — live-region announce (ui-qa P3)', () => {
     act(() => cycleActiveAccount()); // alice → bob
     expect(live).toHaveTextContent(/bob account selected/i);
   });
+
+  it('announces the merged choice without duplicating "account"', () => {
+    updateSnapshot(decoratedEnv([card(A, 'alice', 40), card(B, 'bob', 55)]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<AccountChipRow />);
+    const live = screen.getByTestId('account-chip-live');
+
+    act(() => cycleActiveAccount()); // All → alice
+    act(() => cycleActiveAccount()); // alice → bob
+    act(() => cycleActiveAccount()); // bob → All
+
+    expect(live).toHaveTextContent('All accounts selected');
+    expect(live).not.toHaveTextContent('All accounts account selected');
+  });
 });

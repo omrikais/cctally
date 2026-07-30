@@ -18,11 +18,11 @@ import {
 } from '../test-utils/sourceEnvelope';
 import type { Envelope, ForecastEnvelope, Verdict } from '../types/envelope';
 
-function forecast(verdict: Verdict, wkAvg = 88): ForecastEnvelope {
+function forecast(verdict: Verdict, wkAvg = 88, recent = 92): ForecastEnvelope {
   return {
     verdict,
     week_avg_projection_pct: wkAvg,
-    recent_24h_projection_pct: 92,
+    recent_24h_projection_pct: recent,
     budget_100_per_day_usd: 4.2,
     budget_90_per_day_usd: 3.1,
     confidence: 'high',
@@ -31,7 +31,7 @@ function forecast(verdict: Verdict, wkAvg = 88): ForecastEnvelope {
   };
 }
 
-function env(verdict: Verdict, wkAvg = 88): Envelope {
+function env(verdict: Verdict, wkAvg = 88, recent = 92): Envelope {
   return {
     envelope_version: 2,
     generated_at: '2026-06-30T10:00:00Z',
@@ -41,7 +41,7 @@ function env(verdict: Verdict, wkAvg = 88): Envelope {
       dollar_per_pct: 23.4, forecast_pct: 31, forecast_verdict: verdict,
       vs_last_week_delta: null,
     },
-    current_week: null, forecast: forecast(verdict, wkAvg), trend: null,
+    current_week: null, forecast: forecast(verdict, wkAvg, recent), trend: null,
     weekly: { rows: [] }, monthly: { rows: [] }, blocks: { rows: [] },
     daily: { rows: [], quantile_thresholds: [], peak: null },
     sessions: { total: 0, sort_key: 'started_desc', rows: [] },
@@ -52,9 +52,9 @@ function env(verdict: Verdict, wkAvg = 88): Envelope {
   };
 }
 
-function renderFor(verdict: Verdict, wkAvg = 88) {
+function renderFor(verdict: Verdict, wkAvg = 88, recent = 92) {
   _resetForTests();
-  updateSnapshot(env(verdict, wkAvg));
+  updateSnapshot(env(verdict, wkAvg, recent));
   return render(<ForecastPanel />);
 }
 
@@ -68,7 +68,13 @@ describe('#248 Task 5 — Forecast calm tile', () => {
     const { container } = renderFor('ok', 88);
     const num = container.querySelector('.fc-num');
     expect(num).not.toBeNull();
-    expect(num?.textContent).toContain('88%');
+    expect(num?.textContent).toContain('88.0%');
+  });
+
+  it('keeps one decimal for the projection and current/recent percentages', () => {
+    const { container } = renderFor('ok', 19.5, 27.5);
+    expect(container.querySelector('.fc-num')?.textContent).toBe('19.5%');
+    expect(container.querySelector('.fc-budget-foot')?.textContent).toContain('27.5%');
   });
 
   // C2 NON-VACUITY: the OK verdict must render the ✓ glyph, NOT ⚠. This is the
@@ -131,7 +137,7 @@ describe('#248 Task 5 — Forecast calm tile', () => {
     expect(foot).not.toBeNull();
     expect(foot?.textContent).toContain('$4.20');  // budget_100_per_day_usd
     expect(foot?.textContent).toContain('$3.10');  // budget_90_per_day_usd
-    expect(foot?.textContent).toContain('92%');     // recent_24h_projection_pct
+    expect(foot?.textContent).toContain('92.0%');   // recent_24h_projection_pct
   });
 
   it('drops the old hardcoded warn-banner / warn-triangle', () => {
@@ -179,10 +185,10 @@ describe('ForecastPanel source seam — no Claude leak under Codex (#294 S5)', (
     const claude = container.querySelector('[data-provider-section="claude"]');
     const codex = container.querySelector('[data-provider-section="codex"]');
     expect(claude?.textContent).toContain('Claude');
-    expect(claude?.textContent).toContain('88%');
+    expect(claude?.textContent).toContain('88.0%');
     expect(claude?.textContent).toContain('OK');
     expect(codex?.textContent).toContain('Codex');
-    expect(codex?.textContent).toContain('80%');
+    expect(codex?.textContent).toContain('80.0%');
     expect(container.querySelector('[data-provider-section="all"]')).toBeNull();
   });
 
@@ -190,6 +196,6 @@ describe('ForecastPanel source seam — no Claude leak under Codex (#294 S5)', (
     updateSnapshot(forecastLeakEnv());
     const { container } = render(<ForecastPanel />);
     expect(container.querySelector('[data-panel-kind="forecast"]')).not.toBeNull();
-    expect(container.querySelector('.fc-num')?.textContent).toContain('88%');
+    expect(container.querySelector('.fc-num')?.textContent).toContain('88.0%');
   });
 });

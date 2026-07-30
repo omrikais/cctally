@@ -15,6 +15,7 @@ export interface HistoryTableRow {
   dollar_per_pct: number | null;
   delta_cost_pct: number | null;
   models: ModelCostRow[];
+  account_labels?: string[];
 }
 
 export type HistoryVariant = 'week' | 'month';

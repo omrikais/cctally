@@ -506,6 +506,9 @@ export interface TrendRow {
   // row. The Trend modal's new Cost column reads it; the `?` tolerates older
   // envelopes that predate the field.
   cost_usd?: number | null;
+  // Client-resolved labels for every account contributing to a pooled Codex
+  // native weekly row. Omitted for Claude, focused, and undecorated rows.
+  account_labels?: string[];
 }
 
 export interface SessionsEnvelope {
@@ -698,6 +701,7 @@ export interface PeriodRow {
   week_end_at?: string;                // weekly only
   cache_hit_pct?: number | null;       // v2.3 — populated by daily variant only for v1
   codex_tokens?: CodexNativeTokens;
+  account_labels?: string[];
 }
 
 export interface WeeklyEnvelope {
@@ -1128,6 +1132,8 @@ export interface CodexPeriodBucket {
   end_at?: string;
   used_pct?: number | null;
   dollar_per_pct?: number | null;
+  // #424: additive, decoration-gated ownership axis for pooled weekly rows.
+  account_keys?: string[];
 }
 
 export interface CodexPeriodView {

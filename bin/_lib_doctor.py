@@ -2607,6 +2607,33 @@ def _check_accounts_attribution(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_accounts_codex_reset_anchors(s: DoctorState) -> CheckResult:
+    """Surface Codex quota rows that landed after migration 032 with no anchor."""
+    st = s.accounts_state or {}
+    try:
+        null_rows = int(st.get("codex_null_reset_anchors") or 0)
+    except (TypeError, ValueError):
+        null_rows = 0
+    details = {"null_anchor_rows": null_rows}
+    if null_rows > 0:
+        return CheckResult(
+            id="accounts.codex_reset_anchors",
+            title="Codex reset anchors",
+            severity="warn",
+            summary=f"{null_rows} Codex quota observation(s) lack a canonical reset anchor",
+            remediation="Run `cctally cache-sync --source codex --rebuild`",
+            details=details,
+        )
+    return CheckResult(
+        id="accounts.codex_reset_anchors",
+        title="Codex reset anchors",
+        severity="ok",
+        summary="Codex reset anchors complete",
+        remediation=None,
+        details=details,
+    )
+
+
 _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
     ("install", "Install", (
         ("install.mode", "_check_install_dev_mode"),
@@ -2667,6 +2694,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("accounts.registry", "_check_accounts_registry"),
         ("accounts.freshness", "_check_accounts_freshness"),
         ("accounts.attribution", "_check_accounts_attribution"),
+        ("accounts.codex_reset_anchors", "_check_accounts_codex_reset_anchors"),
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),

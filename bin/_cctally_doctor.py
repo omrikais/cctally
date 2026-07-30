@@ -995,6 +995,7 @@ def _doctor_gather_state_impl(
     codex_last_entry_at = None
     codex_project_metadata_health = None
     codex_project_metadata_error = None
+    codex_null_reset_anchors = 0
     try:
         if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
@@ -1008,6 +1009,18 @@ def _doctor_gather_state_impl(
                         codex_last_entry_at = parse_iso_datetime(
                             row[1], "codex_session_entries.timestamp_utc",
                         ).astimezone(dt.timezone.utc)
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM quota_window_snapshots "
+                        "WHERE source = 'codex' "
+                        "AND canonical_resets_at_utc IS NULL"
+                    ).fetchone()
+                    if row and row[0] is not None:
+                        codex_null_reset_anchors = int(row[0])
+                except sqlite3.OperationalError:
+                    # Pre-anchor cache shapes have no column to inspect. Their
+                    # pending migration is reported by the DB checks instead.
+                    pass
                 # Keep the health probe on the existing read-only cache
                 # connection.  A failed probe is health evidence, not an
                 # empty corpus: the kernel renders it as a distinct FAIL.
@@ -1645,6 +1658,8 @@ def _doctor_gather_state_impl(
     cctally_version = (
         cctally_version_tuple[0] if cctally_version_tuple else "unknown"
     )
+    accounts_state = _gather_accounts_state(now_utc)
+    accounts_state["codex_null_reset_anchors"] = codex_null_reset_anchors
 
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,
@@ -1742,7 +1757,7 @@ def _doctor_gather_state_impl(
         journal_heal_incidents=journal_heal_incidents,
         journal_writer_guard=journal_writer_guard,
         # Multi-account attribution legs (#341).
-        accounts_state=_gather_accounts_state(now_utc),
+        accounts_state=accounts_state,
         cache_repair_marker=cache_repair_marker,
         backup_sync_state=backup_sync_state,
     )

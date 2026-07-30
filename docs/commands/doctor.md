@@ -37,7 +37,7 @@ usable as a healthcheck without false-positive noise:
 
 ## Check inventory
 
-Nine categories. Each check has a stable `id` (used as the
+Ten categories. Each check has a stable `id` (used as the
 JSON key), a one-line summary, and a remediation hint shown when
 severity != `OK`.
 
@@ -139,6 +139,15 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
 - `data.parse_health` — WARN when the rolling ingest parse-health record (per vendor, kept in `cache_meta`) shows a malformed or drift-skipped JSONL line within the trailing 7 days — a signal that a Claude Code / Codex session-format change may be silently affecting your numbers; the summary carries the counts and the dominant skip reason. OK otherwise: absent record (pre-first-sync), all-zero counters, or a *stale* anomaly older than 7 days (surfaced as historical counts in the details so a one-off bad line doesn't nag forever). Remediation points at checking for a cctally update / filing an issue; `cctally cache-sync --rebuild` re-baselines the counters.
 - `data.conversation_sessions_rollup` — WARN when the conversation-viewer browse-rail rollup (`conversation_sessions`) has drifted from its source — its row count differs from `COUNT(DISTINCT session_id)` over `conversation_messages` — **and only in a quiescent transcript store**. OK when the counts match, when either is unavailable (the table is absent on a pre-rollup store, or `conversations.db` cannot be read), or while a transcript sync/reingest/backfill is in progress. The in-progress signal is a non-blocking `conversations.db.lock` flock probe plus pending transcript `cache_meta` flags, so a transient mid-sync mismatch never WARNs. Informational only; the next conversation sync re-derives the rollup (`cctally cache-sync --rebuild` forces it). Read-only — the SQLite probe uses zero timeout and the lock probe never blocks.
 
+### Accounts
+
+- `accounts.identity` — WARN when the active Claude account identity cannot be read stably; cctally defers rather than guessing.
+- `accounts.codex_identity` — WARN while a torn Codex `auth.json` is deferring Codex rollout ingest. The remedy checks or refreshes the login, then retries `cctally cache-sync --source codex`.
+- `accounts.registry` — WARN when account registry rows are missing a provider; otherwise reports the real-account count by provider.
+- `accounts.freshness` — informational account-attribution recency. It remains OK when no account has yet been observed.
+- `accounts.attribution` — WARN when recent Claude usage is landing in `unattributed` despite a resolved active account, or while identity evidence is torn.
+- `accounts.codex_reset_anchors` — WARN when any retained Codex quota observation lacks its canonical reset anchor. Raw-reset fallback keeps reads functional, but the row will not be healed by the already-completed migration; run `cctally cache-sync --source codex --rebuild`.
+
 ### Pricing
 - `pricing.coverage` — WARN when your **recent (trailing 30-day)** session data contains a model cctally cannot price exactly: a Claude model that resolves to `$0` (`unpriced` — silent undercount) or a Codex model approximated via the `gpt-5` fallback (`fallback`). `details` lists each offending model ID + entry count + token volume; remediation points at [`pricing-check`](pricing-check.md) and the embedded pricing tables. OK when every observed model is priced, or when the cache is absent (no usage to assess). Read-only — the scan never creates the data dir on a fresh HOME. This is the offline counterpart to [`pricing-check`](pricing-check.md)'s coverage leg (which scans *all* history, not just the last 30 days), and it rolls into the dashboard health chip/modal for free.
 
@@ -149,6 +158,10 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
 - `safety.update_state` — FAIL on malformed JSON; WARN when absent or missing fields.
 - `safety.update_suppress` — FAIL on malformed JSON.
 - `safety.update_available` — WARN when latest > current.
+
+### Telemetry
+
+- `telemetry.state` — reports whether the anonymous install-count beat is enabled and why. It is informational and never creates an install id.
 
 ## JSON schema
 

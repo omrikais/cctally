@@ -8,7 +8,7 @@ import { railSectionLabel } from './railDateBucket';
 import { ConversationFiltersPopover } from './ConversationFiltersPopover';
 import { pickBannerLabel } from './pickBannerLabel';
 import { allOneProject, visibleBadges } from './railDiscovery';
-import { modelChipSummary } from '../lib/model';
+import { modelChipStyle, modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { mergeConversationRows, mergeSearchHits } from './conversationComposition';
 import {
@@ -592,8 +592,9 @@ function BrowseRow({ row, ctx, active, pickAnchor, hideProject }: {
           <span className="conv-rail-row-model">
             {models.chips.map((c) => (
               <span
-                key={c.cls}
+                key={c.model}
                 className={`chip ${c.cls}`}
+                style={modelChipStyle(c.model)}
                 title={c.full !== c.label ? c.full : undefined}
                 aria-label={c.full !== c.label ? c.full : undefined}
               >{c.label}</span>

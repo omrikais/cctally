@@ -152,13 +152,11 @@ def _decorate(stats):
 # Task 11 — the in-memory partition, parent + children.
 # --------------------------------------------------------------------------
 
-# `quota` is deliberately NOT here: decoration legitimately ADDS `account_key`
-# to each history row (R8 gates the key on >1 REAL account), so a byte-identity
-# assertion would be false. It is the subtree these rounds changed most, so
-# skipping it outright left the biggest blind spot — `test_the_merged_quota_-
-# subtree_only_gains_account_keys` below covers it with the precise claim
-# instead: keys ADDED, none removed, ZERO values changed.
-_PARENT_SUBTREES = ("periods", "sessions", "projects", "cache_report")
+# `quota` and `periods` are deliberately NOT here: decoration legitimately
+# ADDS ownership keys to their merged rows, so byte identity would be false.
+# Dedicated tests below make the precise claim for each: keys ADDED, none
+# removed, ZERO pre-existing values changed.
+_PARENT_SUBTREES = ("sessions", "projects", "cache_report")
 
 
 def _flatten(value, prefix=""):
@@ -209,11 +207,8 @@ def test_the_merged_quota_subtree_only_gains_account_keys(codex_env):
     assert changed == []
 
 
-def test_the_merged_parent_is_byte_identical_when_accounts_appear(codex_env):
-    """Acceptance criterion 7. The SAME cache, built once with one account and
-    once with two, must produce the same merged aggregates — proved by tracing
-    what COULD move (the whole aggregate subtree), not by observing that some
-    golden happened not to churn."""
+def test_the_merged_parent_only_gains_declared_ownership_keys(codex_env):
+    """Decoration preserves every aggregate and adds only ownership axes."""
     _ns, cache, stats, source_module, _root = codex_env
     before = _build(source_module, cache, stats, version="merged-v1")
     _decorate(stats)
@@ -225,6 +220,19 @@ def test_the_merged_parent_is_byte_identical_when_accounts_appear(codex_env):
         assert json.dumps(after.data[subtree], sort_keys=True, default=str) == \
             json.dumps(before.data[subtree], sort_keys=True, default=str), (
                 f"the merged `{subtree}` moved when a second account appeared")
+
+    before_flat = _flatten(before.data["periods"])
+    after_flat = _flatten(after.data["periods"])
+    added = sorted(set(after_flat) - set(before_flat))
+    removed = sorted(set(before_flat) - set(after_flat))
+    changed = sorted(
+        key for key in set(before_flat) & set(after_flat)
+        if before_flat[key] != after_flat[key]
+    )
+    assert added == [".weekly.rows[0].account_keys[0]"]
+    assert after_flat[added[0]] == _ACCT_A
+    assert removed == []
+    assert changed == []
 
 
 def test_an_undecorated_source_emits_no_account_scopes(codex_env):
@@ -697,10 +705,10 @@ def test_a_child_weekly_period_carries_only_its_own_accounts_percentage(
                 "$/1% divides A's spend by another account's percentage")
 
 
-def test_the_merged_weekly_period_read_is_unchanged_without_a_scope(codex_env):
-    """R8 guard-rail: `account_key=None` is the merged "All accounts" read and
-    must stay byte-stable — the parent's own weekly view depends on it."""
-    _ns, _cache, stats, source_module, root = codex_env
+def test_the_merged_weekly_period_discloses_every_account_in_a_jitter_blend(
+        codex_env):
+    """#424: a pooled percentage must carry every account that contributed."""
+    _ns, cache, stats, source_module, root = codex_env
     a_reset = NOW + dt.timedelta(days=2)
     a_start = a_reset - dt.timedelta(minutes=_WEEK_MINUTES)
     _seed_weekly_block(stats, root=root, account_key=_ACCT_A,
@@ -715,6 +723,28 @@ def test_the_merged_weekly_period_read_is_unchanged_without_a_scope(codex_env):
     assert len(periods) == 1
     assert periods[0].used_percent == 97.0
     assert periods[0].start_at == a_start
+    assert periods[0].account_keys == (_ACCT_A, _ACCT_B)
+
+    undecorated = _build(
+        source_module, cache, stats, version="undecorated-v1").data
+    assert undecorated["periods"]["weekly"]["rows"]
+    assert all(
+        "account_keys" not in row
+        for row in undecorated["periods"]["weekly"]["rows"]
+    ), "R8: a <=1-real-account provider must keep the old wire shape"
+
+    _decorate(stats)
+    parent = _build(source_module, cache, stats, version="v1").data
+    parent_rows = parent["periods"]["weekly"]["rows"]
+    assert parent_rows, "precondition: the parent owns weekly spend"
+    assert parent_rows[0]["account_keys"] == (_ACCT_A, _ACCT_B)
+    assert parent_rows[0]["used_pct"] == 97.0
+
+    # Focused children already carry one account's percentage and must not
+    # redundantly label themselves with the pooled-parent account axis.
+    child_rows = parent["account_scopes"][_ACCT_A]["periods"]["weekly"]["rows"]
+    assert child_rows
+    assert all("account_keys" not in row for row in child_rows)
 
 
 # -- B2/F4: the 5h correlation and the milestone ladder --------------------

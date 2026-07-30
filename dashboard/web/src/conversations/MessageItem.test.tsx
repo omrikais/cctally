@@ -271,6 +271,7 @@ describe('MessageItem', () => {
     const chip = container.querySelector('.conv-item-head .chip');
     expect(chip?.textContent).toBe('claude-opus-4-8');
     expect(chip?.classList.contains('opus')).toBe(true);
+    expect((chip as HTMLElement).style.backgroundColor).not.toBe('');
     expect(container.querySelector('.conv-item-model')).toBeNull();
   });
 

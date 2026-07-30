@@ -65,6 +65,8 @@ SCENARIOS = {
     # a data dir resolved inside an unexcluded file-level sync root.
     "28-stats-mismatch-with-journal": "stats_mismatch_with_journal",
     "29-backup-sync-included":        "backup_sync_included",
+    # #421: post-migration Codex quota row missing its ingest-time anchor.
+    "30-codex-null-reset-anchor":      "codex_null_reset_anchor",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -249,6 +251,11 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-cache \\
+                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
+        """)
+    if slug == "codex_null_reset_anchor":
+        return _scenario_body("all_ok") + textwrap.dedent("""\
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-null-anchor \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
         """)
     if slug in {
@@ -593,6 +600,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
     p.add_argument("--emit-codex-cache", action="store_true")
+    p.add_argument("--emit-codex-null-anchor", action="store_true")
     p.add_argument("--emit-pricing-cache", action="store_true")
     p.add_argument("--emit-empty-codex-project-metadata", action="store_true")
     p.add_argument("--emit-codex-doctor-case", choices=[
@@ -608,6 +616,9 @@ def main():
         return
     if args.emit_codex_cache and args.path:
         _emit_codex_cache(pathlib.Path(args.path))
+        return
+    if args.emit_codex_null_anchor and args.path:
+        _emit_codex_null_anchor(pathlib.Path(args.path))
         return
     if args.emit_pricing_cache and args.path:
         _emit_pricing_cache(pathlib.Path(args.path))
@@ -779,6 +790,59 @@ def _emit_codex_cache(db_path: pathlib.Path) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _emit_codex_null_anchor(db_path: pathlib.Path) -> None:
+    """Seed one fresh Codex quota observation with a NULL canonical anchor."""
+    import datetime as dt
+    import os
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        _ensure_empty_codex_project_metadata_schema(conn)
+        conn.execute("""
+            CREATE TABLE quota_window_snapshots (
+                source TEXT NOT NULL, source_root_key TEXT,
+                source_path TEXT NOT NULL, line_offset INTEGER NOT NULL,
+                captured_at_utc TEXT NOT NULL, observed_slot TEXT,
+                logical_limit_key TEXT NOT NULL, limit_id TEXT, limit_name TEXT,
+                window_minutes INTEGER NOT NULL, used_percent REAL NOT NULL,
+                resets_at_utc TEXT NOT NULL, plan_type TEXT,
+                individual_limit_json TEXT, reached_type TEXT,
+                observed_model TEXT, account_key TEXT,
+                canonical_resets_at_utc TEXT,
+                UNIQUE(source, source_path, line_offset, logical_limit_key)
+            )
+        """)
+        as_of = dt.datetime.fromisoformat(
+            os.environ.get(
+                "CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00"
+            )
+        ).astimezone(dt.timezone.utc)
+        captured = (as_of - dt.timedelta(seconds=20)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        conn.execute(
+            "INSERT INTO quota_window_snapshots "
+            "(source, source_root_key, source_path, line_offset, "
+            " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
+            " limit_name, window_minutes, used_percent, resets_at_utc, "
+            " plan_type, individual_limit_json, reached_type, observed_model, "
+            " account_key, canonical_resets_at_utc) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "codex", "fixture-root", "/fixture/codex-null-anchor.jsonl", 1,
+                captured, "primary", "fixture-weekly", "fixture-weekly",
+                "Fixture weekly", 10080, 12.0, "2026-05-18T14:00:00Z",
+                None, None, None, "gpt-5", None, None,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _emit_codex_doctor_case(

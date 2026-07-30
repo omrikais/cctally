@@ -60,6 +60,13 @@ instant. Zero or ambiguous matches exit `2` with candidates. These commands
 use cctally-native usage errors: malformed selectors and timestamps also exit
 `2`.
 
+`history` and `statusline` preserve OpenAI's raw `resetsAt` evidence. `blocks`,
+`breakdown`, and the `--reset-at` selector use the canonical reset anchor that
+cctally establishes when ingesting the complete observation population. When
+provider jitter made the raw value join a nearby anchor, copying `resetsAt`
+from `history` into `--reset-at` will not select the block; use the `resetAt`
+shown by `blocks` (or its JSON output) instead.
+
 For `history` and `blocks`, `--since` is inclusive and `--until` is exclusive.
 A date-only bound is interpreted in `display.tz`; an ISO datetime must include
 an offset and carries its own timezone. `statusline` and `forecast` accept
@@ -112,10 +119,10 @@ cctally codex quota forecast --as-of 2026-07-15T12:00:00+03:00 --json
 ### `blocks`
 
 Shows provider-native reset blocks. A block is keyed by the complete quota
-identity plus its observed reset instant; `nominalStartAt` is reset minus the
+identity plus its canonical reset anchor; `nominalStartAt` is reset minus the
 actual `windowMinutes`. The first and last observed times may cover only part
-of that interval. A reset change starts a new block; this is not the Claude
-five-hour blocks command.
+of that interval. A reset outside the anchor tolerance starts a new block; this
+is not the Claude five-hour blocks command.
 
 ```bash
 cctally codex quota blocks --since 2026-07-15

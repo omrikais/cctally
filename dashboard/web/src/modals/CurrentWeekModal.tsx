@@ -18,6 +18,7 @@ import { dispatch, getState, subscribeStore, topmostStoreFocusLayer } from '../s
 import type { Binding } from '../store/keymap';
 import { openShareModal } from '../store/shareSlice';
 import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
+import { codexLiveQuotaKeys } from '../lib/dashboardPresentation';
 import { warningForDomain } from '../lib/sourceGating';
 import { SourceChip } from '../panels/sourcePanel';
 import { fetchWeekDetail, stepWeek } from './milestoneHistory';
@@ -500,14 +501,19 @@ function flattenClaudeWeekly(detail: WeekDetailPayload): { rows: WeeklyRow[]; co
 // no account named anywhere in the dialog. Blending the crossings instead would
 // violate D6 outright (a merged percentage ladder is not a quantity that
 // exists), so the honest and more useful state is the per-account strip in
-// table form: every value here is a server-emitted per-account field off the
-// same `accounts[]` cards the hero renders. Nothing is summed, averaged, or
-// re-derived in JavaScript.
+// table form. Spend and tokens come from the same `accounts[]` cards the hero
+// renders; percentage and reset come from that card's own
+// `account_scopes` child, intersected with its `quota.summary.active[]`.
+// `accounts[].weeklyPercent` is deliberately null for a totals-only
+// unattributed card even when its retained weekly window is live, so the card
+// field cannot serve as liveness. Nothing is summed or averaged.
 function CodexPerAccountCycleTable({
   accounts,
+  codex,
   ctx,
 }: {
   accounts: NonNullable<CodexSourceData['accounts']>;
+  codex: CodexSourceData;
   ctx: FmtCtx;
 }) {
   return (
@@ -528,19 +534,31 @@ function CodexPerAccountCycleTable({
           </tr>
         </thead>
         <tbody>
-          {accounts.map((card) => (
-            <tr
-              key={card.accountKey}
-              data-account-key={card.accountKey}
-              className={card.unattributed ? 'is-unattributed' : undefined}
-            >
-              <td>{card.label}</td>
-              <td className="num">{fmt.pct1(card.weeklyPercent)}</td>
-              <td className="d">{fmt.datetimeShortZ(card.resetsAt, ctx)}</td>
-              <td className="num">{fmt.usd2(card.spendUsd)}</td>
-              <td className="num">{fmt.tokens(card.totalTokens)}</td>
-            </tr>
-          ))}
+          {accounts.map((card) => {
+            const quota = codex.account_scopes?.[card.accountKey]?.quota;
+            const liveKeys = codexLiveQuotaKeys(quota);
+            const liveWeekly = quota?.histories.find(
+              (row) => row.window_minutes === 10_080
+                && !row.model_scoped
+                && liveKeys.has(row.key),
+            );
+            const activeWeekly = quota?.summary.active.find(
+              (row) => row.key === liveWeekly?.key,
+            );
+            return (
+              <tr
+                key={card.accountKey}
+                data-account-key={card.accountKey}
+                className={card.unattributed ? 'is-unattributed' : undefined}
+              >
+                <td>{card.label}</td>
+                <td className="num">{fmt.pct1(activeWeekly?.current_percent)}</td>
+                <td className="d">{fmt.datetimeShortZ(activeWeekly?.resets_at, ctx)}</td>
+                <td className="num">{fmt.usd2(card.spendUsd)}</td>
+                <td className="num">{fmt.tokens(card.totalTokens)}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -589,22 +607,19 @@ function CodexCurrentCycleModal({
     // #373: a window outside account-level standard quota (a separate model
     // pool) stays listed in the envelope but is not this account's week.
     .filter((row) => !row.model_scoped) ?? [];
-  const activeWeeklyKeys = new Set(
-    hero?.quota.active
-      .filter((row) => row.resets_at === cycle?.resets_at)
-      .map((row) => row.key) ?? [],
-  );
+  const activeWeeklyKeys = codexLiveQuotaKeys(codex?.quota);
   const history = [...weeklyHistories]
+    .filter((row) => activeWeeklyKeys.has(row.key))
     .sort((a, b) => {
-      const aActive = activeWeeklyKeys.has(a.key) || a.forecast.resets_at === cycle?.resets_at;
-      const bActive = activeWeeklyKeys.has(b.key) || b.forecast.resets_at === cycle?.resets_at;
-      if (aActive !== bActive) return aActive ? -1 : 1;
       return (b.current_percent ?? -1) - (a.current_percent ?? -1)
         || (b.captured_at ?? '').localeCompare(a.captured_at ?? '');
     })[0];
+  const activeHistory = codex?.quota.summary.active.find(
+    (row) => row.key === history?.key,
+  );
   const envCurrentPercent = history?.current_percent
-    ?? hero?.quota.active.find((row) => row.key === history?.key)?.current_percent
-    ?? 0;
+    ?? activeHistory?.current_percent
+    ?? null;
   const cycleStart = cycle?.start_at ? Date.parse(cycle.start_at) : Number.NaN;
   const cycleEnd = cycle?.resets_at ? Date.parse(cycle.resets_at) : Number.NaN;
   const allMilestones = codex?.quota.milestones ?? [];
@@ -669,7 +684,9 @@ function CodexCurrentCycleModal({
   const spent = useDetail
     ? (weeklyMilestones.length ? weeklyMilestones[weeklyMilestones.length - 1].cumulative_usd ?? null : null)
     : hero?.cost_usd ?? null;
-  const dpp = spent != null && currentPercent > 0 ? spent / currentPercent : null;
+  const dpp = spent != null && currentPercent != null && currentPercent > 0
+    ? spent / currentPercent
+    : null;
   const weeklyTicks = dedupeTicks(
     weeklyMilestones.map((r) => ({ ...r, percent: r.percent })),
   );
@@ -785,7 +802,7 @@ function CodexCurrentCycleModal({
             <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>All accounts</span>
             <span className="m-pill accent-orange">Codex · native 7-day quota</span>
           </div>
-          <CodexPerAccountCycleTable accounts={codex!.accounts!} ctx={ctx} />
+          <CodexPerAccountCycleTable accounts={codex!.accounts!} codex={codex!} ctx={ctx} />
         </section>
       </CurrentWeekShell>
     );

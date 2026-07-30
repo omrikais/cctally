@@ -231,7 +231,7 @@ def test_025_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 
@@ -258,7 +258,7 @@ def test_025_defers_without_mutation_while_codex_lock_is_held(tmp_path, monkeypa
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 
@@ -286,7 +286,7 @@ def test_025_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(tmp
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 32
+        assert _version(conn) == 33
     finally:
         conn.close()
 

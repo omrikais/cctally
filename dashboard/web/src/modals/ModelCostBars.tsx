@@ -16,12 +16,12 @@
 // raw id, matching its prior behavior; PeriodDetailCard passes the
 // server's chip-friendly `display` (e.g. "opus-4-5") so a dated canonical
 // id like "claude-opus-4-5-20251101" doesn't overflow the 110px chip
-// column and stays consistent with the table's short family key. The chip
-// COLOR always derives from `modelChipClass(model)` (drill parity + the
-// #244 six-surface classifier convention), independent of `label`.
+// column and stays consistent with the table's short display name. The chip
+// and bar COLOR always derive from `modelChipStyle(model)`, with
+// `modelChipClass(model)` retained as the CSS fallback, independent of `label`.
 import type { CSSProperties } from 'react';
 import { fmt } from '../lib/fmt';
-import { modelChipClass } from '../lib/model';
+import { modelChipClass, modelChipStyle } from '../lib/model';
 import { costClass } from '../lib/cost';
 
 export interface ModelCostBarRow {
@@ -37,10 +37,19 @@ export function ModelCostBars({ rows }: { rows: ModelCostBarRow[] }) {
     <>
       {rows.map((m) => {
         const widthPct = (m.cost_usd / denom) * 100;
-        const style = { '--w': `${widthPct}%` } as CSSProperties;
+        const modelStyle = modelChipStyle(m.model);
+        const style = {
+          '--w': `${widthPct}%`,
+          '--model-color': modelStyle?.backgroundColor,
+        } as CSSProperties;
         return (
           <div className="drill-bar-row" key={m.model}>
-            <span className={`chip ${modelChipClass(m.model)}`}>{m.label ?? m.model}</span>
+            <span
+              className={`chip ${modelChipClass(m.model)}`}
+              style={modelStyle}
+            >
+              {m.label ?? m.model}
+            </span>
             <div className="drill-bar" style={style} />
             <span className={`cost ${costClass(m.cost_usd)}`}>{fmt.usd2(m.cost_usd)}</span>
           </div>

@@ -1054,7 +1054,11 @@ class CodexResetAnchorResolver:
 
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
-        self._groups: "dict[tuple[str, str, str, object], _lib_quota.ResetAnchorIndex]" = {}
+        self._groups: "dict[tuple[str, str, str, object], _lib_quota.ResetAnchorComponents]" = {}
+        self._pending_merges: list[
+            tuple[tuple[str, str, str, object], str, dt.datetime,
+                  tuple[dt.datetime, ...]]
+        ] = []
         self._seed_failed = False
 
     @staticmethod
@@ -1068,34 +1072,31 @@ class CodexResetAnchorResolver:
             _lib_jsonl.snap_codex_window_minutes(window_minutes),
         )
 
-    def _anchors_for(
+    def _components_for(
         self, group, logical_limit_key: str,
-    ) -> "_lib_quota.ResetAnchorIndex":
-        """The group's established anchors, as an O(1)-lookup index.
+    ) -> "_lib_quota.ResetAnchorComponents":
+        """The group's raw-reset components, ordered by deterministic ingest.
 
-        A bucketed index rather than a list because this seed is UNBOUNDED — it
-        is every distinct anchor the group ever carried — and the resolver is
-        driven over the whole table by cache migration 032 and over the whole
-        walk by `cache-sync --rebuild`. A linear scan per observation makes both
-        quadratic in the group's anchor count (~1,750 a year for a 5h window).
+        Raw values, not only stored anchors, are required to recover transitive
+        chain membership. Ordering by rollout byte identity preserves the
+        original first-sight winner while making a rebuild reproducible.
         """
-        anchors = self._groups.get(group)
-        if anchors is not None:
-            return anchors
-        anchors = _lib_quota.ResetAnchorIndex()
+        components = self._groups.get(group)
+        if components is not None:
+            return components
+        components = _lib_quota.ResetAnchorComponents()
         if not self._seed_failed:
             candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
                 str(logical_limit_key))
             placeholders = ",".join("?" for _ in candidates)
             try:
                 rows = self._conn.execute(
-                    "SELECT DISTINCT canonical_resets_at_utc "
+                    "SELECT source_path, line_offset, id, resets_at_utc "
                     "FROM quota_window_snapshots "
                     "WHERE source = 'codex' AND source_root_key = ? "
                     "  AND observed_slot = ? "
                     f"  AND logical_limit_key IN ({placeholders}) "
-                    "  AND canonical_resets_at_utc IS NOT NULL "
-                    "ORDER BY canonical_resets_at_utc",
+                    "ORDER BY source_path, line_offset, id",
                     (group[0], group[1], *candidates),
                 ).fetchall()
             except sqlite3.DatabaseError:
@@ -1105,15 +1106,66 @@ class CodexResetAnchorResolver:
                 self._seed_failed = True
                 rows = []
             for row in rows:
-                parsed = _parse_anchor_iso(row[0])
+                parsed = _parse_anchor_iso(row[3])
                 if parsed is not None:
-                    anchors.add(parsed)
-        self._groups[group] = anchors
-        return anchors
+                    components.add(
+                        parsed,
+                        order_key=(
+                            str(row[0]), int(row[1]), int(row[2])),
+                    )
+        self._groups[group] = components
+        return components
+
+    def _merge_stored_anchors(
+        self, group, logical_limit_key: str, winner: dt.datetime,
+        retired: tuple[dt.datetime, ...],
+    ) -> None:
+        if not retired:
+            return
+        self._pending_merges.append(
+            (group, str(logical_limit_key), winner, retired))
+
+    def apply_pending_merges(self) -> None:
+        """Apply queued component merges inside the caller's transaction.
+
+        Resolution happens while the direct walk is still buffering a file.
+        Deferring DML until `_write_codex_file_batch` keeps retired-anchor
+        updates atomic with that file's rows and cursor; its one rollback/retry
+        can safely reapply the unchanged queue.
+        """
+        for group, logical_limit_key, winner, retired in self._pending_merges:
+            candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
+                logical_limit_key)
+            key_placeholders = ",".join("?" for _ in candidates)
+            retired_text = tuple(
+                _codex_anchor_iso(value) for value in retired)
+            retired_placeholders = ",".join("?" for _ in retired_text)
+            self._conn.execute(
+                "UPDATE quota_window_snapshots "
+                "SET canonical_resets_at_utc = ? "
+                "WHERE source = 'codex' AND source_root_key = ? "
+                "  AND observed_slot = ? "
+                f"  AND logical_limit_key IN ({key_placeholders}) "
+                f"  AND canonical_resets_at_utc IN ({retired_placeholders})",
+                (
+                    _codex_anchor_iso(winner), group[0], group[1],
+                    *candidates, *retired_text,
+                ),
+            )
+
+    def mark_file_committed(self) -> None:
+        self._pending_merges.clear()
+
+    def discard_uncommitted_file(self) -> None:
+        """Forget buffered evidence after its file did not commit."""
+        self._groups.clear()
+        self._pending_merges.clear()
 
     def resolve(
         self, *, source_root_key: str, observed_slot: str,
         logical_limit_key: str, window_minutes: object, resets_at_utc: object,
+        source_path: "str | None" = None,
+        line_offset: "int | None" = None,
     ) -> "str | None":
         """The canonical anchor for one observation, as stored TEXT.
 
@@ -1126,16 +1178,42 @@ class CodexResetAnchorResolver:
             return None
         group = self.group_key(
             source_root_key, observed_slot, logical_limit_key, window_minutes)
-        anchors = self._anchors_for(group, logical_limit_key)
-        chosen = _lib_quota.resolve_reset_anchor(anchors, raw)
-        if chosen == raw:
-            anchors.add(raw)
+        components = self._components_for(group, logical_limit_key)
+        order_key = None
+        if (
+            isinstance(source_path, str)
+            and isinstance(line_offset, int)
+            and not isinstance(line_offset, bool)
+        ):
+            order_key = (source_path, line_offset, -1)
+        chosen, retired = components.add(raw, order_key=order_key)
+        self._merge_stored_anchors(
+            group, logical_limit_key, chosen, retired)
         # ALWAYS re-serialized through the canonical UTC form, established or
         # joined alike: two spellings of one instant ("…Z" vs "…+00:00") must
         # never mint two anchors for one cluster, and a row seeded by anything
         # other than the walk (a migration backfill, a hand-written fixture) can
         # spell it either way.
         return _codex_anchor_iso(chosen)
+
+    def normalize_quota_rows(self, quota_rows: list[tuple[Any, ...]]) -> None:
+        """Converge buffered direct-walk rows after a later bridge observation.
+
+        The journal applier inserts one row immediately after resolution, so a
+        component merge can update earlier rows in SQLite. The direct rollout
+        walk buffers a whole file before its first DML; this final pass applies
+        the same union result to those not-yet-inserted tuples.
+        """
+        for index, row in enumerate(quota_rows):
+            raw = _parse_anchor_iso(row[11])
+            if raw is None:
+                continue
+            group = self.group_key(row[1], row[5], row[6], row[9])
+            components = self._groups.get(group)
+            if components is None:
+                continue
+            quota_rows[index] = row[:-1] + (
+                _codex_anchor_iso(components.canonical(raw)),)
 
 
 def _codex_anchor_iso(value: dt.datetime) -> str:
@@ -1272,7 +1350,9 @@ def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
     discovered: list[CodexDiscoveredFile] = []
     seen: set[pathlib.Path] = set()
     for root in _codex_provider_roots():
-        for candidate in root.walk_root.glob("**/*.jsonl"):
+        for candidate in sorted(
+            root.walk_root.glob("**/*.jsonl"), key=lambda path: str(path)
+        ):
             if not candidate.is_file():
                 continue
             physical_path = _canonical_codex_path(candidate)
@@ -1905,6 +1985,7 @@ def _write_codex_file_batch(
     file_identity: "str | None" = None,
     incarnation: "int | None" = None,
     file_account_decision: "tuple[int, str | None] | None" = None,
+    anchor_resolver: "CodexResetAnchorResolver | None" = None,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
 
@@ -1960,6 +2041,8 @@ def _write_codex_file_batch(
         )
         rows_changed = conn.total_changes - before
     if quota_rows:
+        if anchor_resolver is not None:
+            anchor_resolver.apply_pending_merges()
         conn.executemany(
             """INSERT OR IGNORE INTO quota_window_snapshots
                (source, source_root_key, source_path, line_offset,
@@ -2027,7 +2110,7 @@ def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]
     """
     seen: set[pathlib.Path] = set()
     for root in roots:
-        for jp in root.glob("**/*.jsonl"):
+        for jp in sorted(root.glob("**/*.jsonl"), key=lambda path: str(path)):
             # Dedup on the RESOLVED path, not the raw spelling. A symlinked
             # $CODEX_HOME root or an alias entry (`.../.codex`,
             # `.../sub/../.codex`) can glob the same physical file under
@@ -4845,10 +4928,13 @@ def sync_codex_cache(
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
         # #416 spec §3.4: rehydrate the attribution map from the journal BEFORE
-        # the walk. The ordinary journal-to-cache replay lives inside
-        # `rebuild_stats_index`; this path clears (on --rebuild) and walks on its
-        # own with no applier in front of it, so a cache.db whose map cannot
-        # answer would send every file back to the live auth.json.
+        # the walk. This cursor is intentionally distinct from the stats ingest
+        # cursor that drives `_cache_applier`: a recreated/rebuilt cache.db may
+        # have an empty map while stats is already at journal high-water, and
+        # invoking stats ingest here would either reverse the total lock order
+        # (inside the cache flocks) or leave an append-before-lock race (outside
+        # them). The private cache-map cursor is therefore the only safe witness
+        # that every durable decision visible to this locked walk was replayed.
         #
         # Deliberately NOT rebuild-only. Every production Codex call site syncs
         # with rebuild=False, and the corruption auto-heal recreates the cache.db
@@ -4921,9 +5007,11 @@ def sync_codex_cache(
             _jr._report_file_account_conflicts(_declined)
         except Exception as exc:
             conn.rollback()
+            stats.deferred_reason = "attribution_rehydration"
             eprint(
                 "[cache-sync] could not rehydrate Codex attribution "
-                f"decisions: {exc}; undecided history stays unattributed")
+                f"decisions: {exc}; deferring the Codex walk")
+            return stats
 
         # Pure read (glob + is_file only); safe to run before the SELECT and
         # the per-file loop, where no cache.db write lock may be held. Targeted
@@ -5186,9 +5274,14 @@ def sync_codex_cache(
                 # The guard is the whole safety argument: `delta_append` means
                 # `start_offset` is this file's ingest watermark, and the second
                 # condition means the new range starts strictly beyond every
-                # decided range. So auth.json can only ever mint a range for
-                # bytes NOBODY has attributed yet; it can never re-decide bytes
-                # a decision already covers, which is the original defect.
+                # decided range. Today the term is algebraically redundant:
+                # every non-delta branch sets `start_offset = 0`, while every
+                # decided range starts at a non-negative offset, so the strict
+                # comparison alone implies a delta append. Keep the explicit
+                # term as belt-and-suspenders: it pins the semantic permission
+                # to consult auth.json if a future branch changes the offsets.
+                # Auth can therefore mint a range only for bytes NOBODY has
+                # attributed yet; it never re-decides covered bytes.
                 if delta_append and start_offset > account_ranges[-1][0]:
                     root_account = _live_root_account()
                     if root_account.status == "torn":
@@ -5345,6 +5438,8 @@ def sync_codex_cache(
                                     logical_limit_key=quota.logical_limit_key,
                                     window_minutes=quota.window_minutes,
                                     resets_at_utc=quota.resets_at_utc,
+                                    source_path=quota.source_path,
+                                    line_offset=quota.line_offset,
                                 ),
                             ))
                         if (thread := emission.thread) is not None and (
@@ -5394,6 +5489,7 @@ def sync_codex_cache(
                         stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
+                anchor_resolver.discard_uncommitted_file()
                 if targeted:
                     stats.files_failed += 1  # §5.1 I/O decline → call dirty
                 continue
@@ -5468,6 +5564,7 @@ def sync_codex_cache(
                         f"[codex-cache] attribution decision journal append "
                         f"failed for {jp}: {exc}; deferring the file")
                     stats.files_failed += 1
+                    anchor_resolver.discard_uncommitted_file()
                     continue
 
             # Task 7 Item 1: journal the Codex quota observations BEFORE the cache
@@ -5477,6 +5574,7 @@ def sync_codex_cache(
             # (idempotent at the QUOTA_APPLIER natural key) rather than losing the
             # observation. Appended once here, not inside the retry loop, so a DB
             # retry never double-journals.
+            anchor_resolver.normalize_quota_rows(quota_rows)
             _append_codex_quota_obs(quota_rows)
 
             # Every derived row above was buffered before the first DML. A
@@ -5514,6 +5612,7 @@ def sync_codex_cache(
                         file_identity=file_identity,
                         incarnation=incarnation,
                         file_account_decision=pending_decision,
+                        anchor_resolver=anchor_resolver,
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -5543,7 +5642,9 @@ def sync_codex_cache(
                 # walk count.  Targeted mode already depended on this signal;
                 # explicit rebuild now uses it to reject partial success too.
                 stats.files_failed += 1
+                anchor_resolver.discard_uncommitted_file()
                 continue
+            anchor_resolver.mark_file_committed()
 
             # Private test seam (§5.1 post-preflight late-shrink race): fires
             # after each file's successful commit, so a race test can shrink a
