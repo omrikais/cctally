@@ -255,7 +255,11 @@ def _maybe_prune_conversation_retention(
     skipped (retention disabled, throttled within 24h, or a lock contended).
 
     Concurrency (F7): a dedicated non-blocking MAINTENANCE flock serializes prune
-    attempts across processes (a second dashboard skips cleanly). Under it, the
+    attempts across processes (a second dashboard skips cleanly). It is claimed
+    EXCLUSIVE and then downgraded to SHARED for the pass proper, so a long prune
+    cannot starve the fail-closed panel readers that sample it
+    ``LOCK_SH | LOCK_NB``; a rival ``LOCK_EX | LOCK_NB`` claim still fails
+    against the held SHARED, so the serialization is unchanged. Under it, the
     two provider flocks are taken in a FIXED order (Claude then Codex),
     non-blocking, so a rebuild/reingest mid-flight makes the prune skip this
     cycle rather than race between candidate selection and deletion. The prune of
@@ -297,6 +301,26 @@ def _maybe_prune_conversation_retention(
                     fcntl.flock(codex_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except (BlockingIOError, OSError):
                     return None  # a Codex sync is mid-flight; retry next cycle
+                # Downgrade the maintenance flock to SHARED for the pass proper.
+                # The EXCLUSIVE acquire above is what wins the race; holding it
+                # exclusive for the whole pass additionally locked out the
+                # fail-CLOSED panel readers, which take this flock
+                # `LOCK_SH | LOCK_NB` and blank their column on any contention
+                # (`read_session_titles_bounded` -> every Claude session title in
+                # the Recent Sessions card, for the minutes a large prune runs).
+                # A prune is a writer, not a family replacement: concurrent
+                # writes are already excluded by the two provider flocks, and
+                # the replacement paths readers guard against take this flock
+                # EXCLUSIVE, which a held SHARED still blocks. Rival prunes and
+                # `db vacuum` claim `LOCK_EX | LOCK_NB`, which also still fails.
+                # MUST stay after both provider flocks: a flock conversion is
+                # not atomic, so a rival can slip into the downgrade window —
+                # the provider flocks it then fails to claim are what make that
+                # harmless.
+                try:
+                    fcntl.flock(maint_fh, fcntl.LOCK_SH)
+                except OSError:
+                    pass  # keep the exclusive hold; correctness is unchanged
                 cutoff = now_utc - dt.timedelta(days=int(retention_days))
                 conn.execute("BEGIN IMMEDIATE")
                 try:

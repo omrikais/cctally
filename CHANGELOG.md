@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.88.1] - 2026-07-31
+
+### Fixed
+- Session names no longer disappear from the Recent Sessions card while cctally is pruning old transcripts. The prune held the transcript store's maintenance lock exclusively for its entire pass, and the Sessions card's name lookup is deliberately built to give up instantly rather than wait on that lock, so every Claude session rendered a blank name until the prune finished — minutes on a large store, and for most installs on the v1.88.0 upgrade in particular, whose one-off transcript re-read is followed by an unthrottled sweep. The prune still claims the lock exclusively, which is what keeps it serialized against a second prune or a `cctally db vacuum`, but now holds it shared for the pass itself so read-only lookups are no longer locked out. What gets pruned, and when, is unchanged.
+
+### Security
+- Update the build-time `postcss` dependency to 8.5.25, clearing a path-traversal advisory (GHSA-r28c-9q8g-f849) in its source-map auto-loading. It is a development dependency used only when building the dashboard bundle from source, so it is absent from npm, Homebrew, and every other install, and the shipped dashboard is byte-for-byte unchanged.
+
 ## [1.88.0] - 2026-07-31
 
 ### Fixed

@@ -480,6 +480,81 @@ def test_orchestrator_skips_when_maintenance_flock_contended(tmp_path, monkeypat
         held.close()
 
 
+class _MaintenanceFlockProbingConnection:
+    """Proxy that samples the maintenance flock from separate fds mid-pass.
+
+    ``commit()`` fires once per pruned group, deep inside the pass with every
+    flock the orchestrator took still held — so these samples describe exactly
+    what a concurrent process sees while a prune is running.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.shared = []
+        self.exclusive = []
+
+    def _sample(self, mode):
+        import fcntl
+        import _cctally_core
+        fh = open(_cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, "r")
+        try:
+            fcntl.flock(fh, mode | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return False
+        else:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            return True
+        finally:
+            fh.close()
+
+    def commit(self):
+        import fcntl
+        self.shared.append(self._sample(fcntl.LOCK_SH))
+        self.exclusive.append(self._sample(fcntl.LOCK_EX))
+        return self._conn.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_prune_pass_does_not_starve_shared_maintenance_readers(
+    tmp_path, monkeypatch
+):
+    """A running prune must stay invisible to the dashboard Sessions card.
+
+    ``read_session_titles_bounded`` is a fail-CLOSED panel reader: it takes the
+    conversations maintenance flock ``LOCK_SH | LOCK_NB`` and returns ``{}`` on
+    any contention, so every Claude session title blanks for as long as anything
+    holds that flock EXCLUSIVE. The prune used to hold it exclusive for its whole
+    pass — deletes plus the post-commit ``_reclaim_incremental_vacuum`` tail —
+    which on a large store is minutes, not milliseconds.
+
+    The prune is a WRITER, not a family replacement, and the flock's job here is
+    only to serialize prune-vs-prune and prune-vs-vacuum. So it claims the flock
+    exclusively (that claim is what wins the race) and then holds it SHARED,
+    which readers tolerate and any rival ``LOCK_EX | LOCK_NB`` claim still does
+    not.
+    """
+    ns, conn, retention = _env(tmp_path, monkeypatch)
+    for session_id in ("old1", "old2", "old3"):
+        _seed_msg(conn, session_id, OLD)
+    conn.commit()
+    probed = _MaintenanceFlockProbingConnection(conn)
+
+    stats = retention._maybe_prune_conversation_retention(
+        probed, now_utc=NOW, retention_days=180, force=True
+    )
+
+    assert stats is not None and stats.claude_sessions == 3
+    # Non-vacuous: the samples were actually taken, mid-pass, more than once.
+    assert len(probed.shared) >= 3
+    # THE regression: a shared reader is never locked out while a prune runs.
+    assert all(probed.shared), probed.shared
+    # ...and the mutual exclusion the flock exists for is unchanged: a rival
+    # prune / `db vacuum` still cannot claim it.
+    assert not any(probed.exclusive), probed.exclusive
+
+
 def test_rebuild_replay_triggers_force_prune_but_noop_sync_does_not(tmp_path, monkeypatch):
     """F9 wiring: a from-zero replay (rebuild) invokes the UNTHROTTLED prune
     (force=True); a plain no-op sync does not prune at all."""

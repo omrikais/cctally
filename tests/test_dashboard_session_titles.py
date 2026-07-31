@@ -238,6 +238,47 @@ def test_bounded_reader_does_not_block_on_an_exclusively_locked_store(
         "s-1": "Fix the flaky test"}
 
 
+def test_bounded_reader_tolerates_a_prune_but_not_a_replacement(
+    tmp_path, monkeypatch,
+):
+    """The reader-side half of the maintenance-flock contract.
+
+    The transcript retention prune holds this flock SHARED for its pass (it is a
+    writer, not a family replacement), and a prune of a large store runs for
+    minutes — so a reader that declined a SHARED hold would blank every session
+    title for that whole window. The paths readers genuinely must not race —
+    quarantine / recovery family replacement — take the flock EXCLUSIVE, and
+    that is what still turns the reader away.
+
+    Sibling coverage on the writer side lives in
+    ``tests/test_conversation_retention.py``; each half fails independently if
+    the other end of the contract moves.
+    """
+    import fcntl
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _seed_titles_on_disk(ns, rollup=[("s-1", "Fix the flaky test")])
+    cache_mod = ns["_load_sibling"]("_cctally_cache")
+    lock_path = ns["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH
+
+    held = open(lock_path, "w")
+    try:
+        fcntl.flock(held, fcntl.LOCK_SH)          # a prune is running
+        assert cache_mod.read_session_titles_bounded(["s-1"]) == {
+            "s-1": "Fix the flaky test"
+        }
+        fcntl.flock(held, fcntl.LOCK_EX)          # a replacement is running
+        assert cache_mod.read_session_titles_bounded(["s-1"]) == {}
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+
+    # Non-vacuous: the same call succeeds again once nothing holds the flock.
+    assert cache_mod.read_session_titles_bounded(["s-1"]) == {
+        "s-1": "Fix the flaky test"
+    }
+
+
 # ------------------------------------------------------------ regression ----
 
 def test_dashboard_sessions_build_attaches_titles(tmp_path, monkeypatch):
