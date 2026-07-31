@@ -76,14 +76,16 @@ def test_codex_foreground_tick_syncs_all_roots_but_alerts_only_due_root(
     monkeypatch.setitem(
         ns,
         "sync_codex_cache",
-        lambda conn, *, lock_timeout: calls.append(("sync", lock_timeout))
+        lambda conn, *, lock_timeout, **_budget: calls.append(("sync", lock_timeout))
         or SimpleNamespace(lock_contended=False),
     )
     monkeypatch.setitem(
         ns,
         "reconcile_codex_quota_projection",
-        lambda *, source_root_keys, alert_eligible_root_keys, now=None: calls.append(
-            ("reconcile", tuple(source_root_keys), tuple(alert_eligible_root_keys))
+        lambda *, source_root_keys, alert_eligible_root_keys, now=None,
+        full_pass="inline": calls.append(
+            ("reconcile", tuple(source_root_keys),
+             tuple(alert_eligible_root_keys), full_pass)
         ) or SimpleNamespace(
             blocks_upserted=0, milestones_upserted=0,
             blocks_orphaned=0, milestones_orphaned=0, alerts_dispatched=0,
@@ -101,6 +103,9 @@ def test_codex_foreground_tick_syncs_all_roots_but_alerts_only_due_root(
     reconcile = next(call for call in calls if call[0] == "reconcile")
     assert reconcile[1] == tuple(sorted((first_key, second_key)))
     assert reconcile[2] == (first_key,)
+    assert reconcile[3] == "defer", (
+        "the hook must hand EVERY whole-history quota pass to a detached "
+        "worker rather than run one on the blocking path")
     assert [call[0] for call in calls].count("budget") == 1
     assert (marker_dir / f"{first_key}.last-success").is_file()
     assert (marker_dir / f"{second_key}.last-success").is_file()
@@ -123,7 +128,7 @@ def test_codex_tick_cache_contention_is_silent_and_touches_no_marker(
     monkeypatch.setitem(
         ns,
         "sync_codex_cache",
-        lambda conn, *, lock_timeout: calls.append("sync")
+        lambda conn, *, lock_timeout, **_budget: calls.append("sync")
         or SimpleNamespace(lock_contended=True),
     )
     monkeypatch.setitem(
@@ -146,6 +151,302 @@ def test_codex_tick_cache_contention_is_silent_and_touches_no_marker(
     assert captured.out == captured.err == ""
 
 
+def test_codex_tick_hands_a_declined_byte_zero_replay_to_a_drain_worker(
+    runtime, monkeypatch, capsys,
+):
+    """A budgeted tick cannot run the replay, and on a hook-only install
+    nothing else ever will — no dashboard, no `codex quota`, no `cache-sync`.
+    Before the hand-off, every tick from cache migration 035 onwards returned at
+    the decline and Codex ingest froze permanently while the lifecycle line, the
+    ingest-backlog leg and the dashboard envelope all reported a drained store.
+    """
+    ns, _first, _second = runtime
+    calls: list[str] = []
+    spawned: list[str] = []
+
+    class Cache:
+        def close(self):
+            calls.append("cache-close")
+
+    import _cctally_cache as cache_mod
+    import _cctally_update
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, *, lock_timeout, **_budget: calls.append("sync")
+        or SimpleNamespace(
+            lock_contended=False, deferred_reason="replay_pending",
+            backlog_files=0),
+    )
+    monkeypatch.setitem(
+        ns, "reconcile_codex_quota_projection",
+        lambda **kwargs: calls.append("reconcile") or SimpleNamespace(
+            blocks_upserted=0, milestones_upserted=0, alerts_dispatched=0),
+    )
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone",
+        lambda saved, **kwargs: calls.append("budget") or 0,
+    )
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    assert spawned == [cache_mod.CODEX_REPLAY_DRAIN_COMMAND], (
+        "the tick declined the replay and handed the drain to nobody — the "
+        "install is frozen and every surface reports fine")
+    line = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    assert "sync=deferred" in line
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_codex_tick_records_what_the_blanket_except_swallowed(
+    runtime, monkeypatch, capsys,
+):
+    """A `result=error` tick with nothing else recorded is undiagnosable.
+
+    This already cost a debugging round: a changed keyword signature raised
+    TypeError inside the hook's blanket except and presented as a silent error
+    tick indistinguishable from a database failure. Class and message only — no
+    traceback, and stdout/stderr stay contractually silent.
+    """
+    ns, _first, _second = runtime
+
+    class Cache:
+        def close(self):
+            pass
+
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+
+    def _boom(conn, **kwargs):
+        raise TypeError("sync_codex_cache() got an unexpected keyword 'nope'")
+
+    monkeypatch.setitem(ns, "sync_codex_cache", _boom)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    assert "result=error" in log
+    assert "error=TypeError: sync_codex_cache() got an unexpected keyword" in log
+    assert "Traceback" not in log
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_the_lifecycle_line_keeps_its_fixed_columns_parseable(runtime):
+    """`error` is appended LAST and collapsed to one line, so a multi-line
+    message cannot split the record or shift a fixed column."""
+    import _cctally_record
+
+    line = _cctally_record._codex_lifecycle_log_line(
+        source_root_key="rk", event="Stop", sync="error", result="error",
+        blocks=0, milestones=0, alert_eligible_roots=1, quota_alerts=0,
+        budget_alerts=0, dur_ms=7, error="ValueError: one\ntwo\n  three")
+    assert line.count("\n") == 0
+    assert " result=error error=ValueError: one two three" in line
+    assert line.index("dur_ms=") < line.index("error=")
+
+    # Absent by default: the ordinary success line is byte-unchanged.
+    plain = _cctally_record._codex_lifecycle_log_line(
+        source_root_key="rk", event="Stop", sync="ok", result="success",
+        blocks=0, milestones=0, alert_eligible_roots=1, quota_alerts=0,
+        budget_alerts=0, dur_ms=7)
+    assert plain.endswith("result=success")
+
+
+def test_a_free_text_error_cannot_override_a_fixed_column(runtime):
+    """Last position does not protect the fixed columns — it endangers them.
+
+    The line's only real reader is a LAST-WINS dict comprehension over
+    whitespace tokens (`_parse_codex_lifecycle_log`), so a `k=v` substring
+    inside an exception message beats the real field, and being last on the
+    line is exactly what makes it win.
+    """
+    import _cctally_core
+    import _cctally_doctor
+    import _cctally_record
+
+    ns, _first, _second = runtime
+    line = _cctally_record._codex_lifecycle_log_line(
+        source_root_key="rk", event="Stop", sync="error", result="error",
+        blocks=0, milestones=0, alert_eligible_roots=1, quota_alerts=0,
+        budget_alerts=0, dur_ms=7,
+        error="ValueError: expected result=success provider=claude dur_ms=0")
+    assert "expected" in line, "the message was discarded rather than defused"
+
+    log = _cctally_core.HOOK_TICK_LOG_PATH
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(line + "\n", encoding="utf-8")
+    records = _cctally_doctor._codex_lifecycle_activity_24h(
+        root_keys={"rk"}, now_utc=dt.datetime.now(dt.timezone.utc))
+
+    assert "rk" in records, (
+        "an exception message overrode the record's own `provider` field, so "
+        "the errored tick vanished from doctor's Codex lifecycle view entirely")
+    assert records["rk"]["error_count_24h"] == 1, (
+        "an exception message overrode the record's own `result` field, so an "
+        "errored tick is counted as a success")
+    assert records["rk"]["success_count_24h"] == 0
+
+
+def test_the_error_field_never_carries_a_filesystem_path(runtime):
+    """The docstring promises "only the bounded event label, opaque source root
+    key, aggregate counts and duration" — and the whole `OSError` family breaks
+    that promise through `str(exc)`, which embeds `filename`. A single
+    `PermissionError` on a rollout puts a username AND a conversation UUID into
+    a durable log. A traceback was already rejected for carrying paths; this
+    carries the same thing without one.
+    """
+    import _cctally_record
+
+    exc = PermissionError(
+        13, "Permission denied",
+        "/Users/someone/.codex/sessions/2026/07/31/"
+        "rollout-2026-07-31T09-00-00-0199aa11-bb22-cc33-dd44-ee55ff667788.jsonl")
+    line = _cctally_record._codex_lifecycle_log_line(
+        source_root_key="rk", event="Stop", sync="error", result="error",
+        blocks=0, milestones=0, alert_eligible_roots=1, quota_alerts=0,
+        budget_alerts=0, dur_ms=7,
+        error=_cctally_record._hook_log_error_detail(exc))
+
+    assert "someone" not in line
+    assert "0199aa11" not in line
+    assert "/Users/" not in line
+    assert ".jsonl" not in line
+    assert "PermissionError" in line, "the class must survive; it is the whole "\
+        "reason the field exists"
+    assert "Permission denied" in line
+
+
+def test_a_conversation_id_is_redacted_outside_absolute_path_form(runtime):
+    """The path rule alone does not make the promise true.
+
+    It matches only an ABSOLUTE or `~`-relative root, because the negative
+    lookbehind that keeps `Input/output error` intact also refuses every
+    separator in a RELATIVE path — each one has a word character in front of it.
+    The `OSError` narrowing hides that for the one family whose `filename` it
+    drops, but these callers are blanket `except` blocks: any OTHER type quoting
+    a rollout relatively, and a bare conversation key in one of our own
+    `ValueError(f"… {key}")` messages, walked straight into the durable log.
+    Widening the path rule to reach them is the same edit that starts eating
+    prose, so the identifier gets its own rule: a canonical UUID cannot occur in
+    prose.
+    """
+    import _cctally_record
+
+    relative = _cctally_record._hook_log_error_detail(
+        RuntimeError(
+            "torn rollout .codex/sessions/2026/07/31/"
+            "rollout-2026-07-31T09-00-00-0199aa11-bb22-cc33-dd44-ee55ff667788"
+            ".jsonl"))
+    assert "0199aa11" not in relative, (
+        "a relative rollout path on a non-OSError type carried the "
+        "conversation id into the log")
+
+    bare = _cctally_record._hook_log_error_detail(
+        ValueError("unknown conversation 0199aa11-bb22-cc33-dd44-ee55ff667788"))
+    assert "0199aa11" not in bare, (
+        "a bare conversation key carried the conversation id into the log")
+    assert "unknown conversation" in bare, (
+        "the diagnostic half was scrubbed along with the identifier")
+
+
+def test_a_pathless_error_is_left_readable(runtime):
+    """Defusing must not gut the diagnostic — the field exists because a bare
+    `result=error` already cost a debugging round."""
+    import _cctally_record
+
+    detail = _cctally_record._hook_log_error_detail(
+        TypeError("sync_codex_cache() got an unexpected keyword 'nope'"))
+    assert detail == (
+        "TypeError: sync_codex_cache() got an unexpected keyword 'nope'")
+    # `I/O` is not a path, and scrubbing must not treat it as one.
+    assert _cctally_record._hook_log_error_detail(
+        OSError(5, "Input/output error")) == "OSError: [Errno 5] Input/output error"
+
+
+def test_codex_tick_defers_a_pending_stats_epoch_rebuild(
+    runtime, monkeypatch, capsys,
+):
+    """The one unbounded operation `defer` and the ingest budget cannot reach.
+
+    An index-epoch bump makes the first `open_db()` after an upgrade replay the
+    whole journal, and that happens before any of the hook's own bounding gets
+    a say. Measured on a real 211K-observation / 1,859-rollout store the first
+    post-bump tick cost 82.05s wall, 76.45s of it the rebuild — against Codex's
+    30-second kill, after which nothing is committed and the next tick repeats
+    it. The tick must hand the rebuild off and do nothing else.
+    """
+    ns, _first, _second = runtime
+    calls: list[str] = []
+    spawned: list[str] = []
+
+    import _cctally_quota as quota_mod
+    import _cctally_update
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+    monkeypatch.setitem(
+        ns, "open_cache_db", lambda: calls.append("open-cache") or None)
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, **kwargs: calls.append("sync") or SimpleNamespace(
+            lock_contended=False),
+    )
+    import _cctally_record
+    monkeypatch.setattr(
+        _cctally_record, "_stats_epoch_rebuild_pending", lambda: True)
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    assert calls == [], (
+        "the tick opened the cache and ran the sync behind a pending epoch "
+        "rebuild, so `open_db()` was about to replay the whole journal inline")
+    assert spawned == [quota_mod.CODEX_QUOTA_VERIFY_COMMAND]
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    assert "sync=deferred" in log and "result=noop" in log
+    marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+    assert not any(marker_dir.glob("*.last-success")), (
+        "a deferred tick must not consume the lifecycle throttle — the next "
+        "Codex turn has to re-check whether the rebuild landed")
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_the_epoch_probe_only_fires_on_a_readable_wrong_epoch_index(
+    runtime, monkeypatch, tmp_path,
+):
+    """A missing index is a fresh install (cheap to build, and skipping it
+    would leave the hook with nothing to do forever); an unreadable one belongs
+    to the corruption auto-heal; a legacy one takes the migration route."""
+    import sqlite3
+    import _cctally_core
+    import _cctally_record
+
+    path = ns_path = tmp_path / "epoch-probe.db"
+    monkeypatch.setattr(_cctally_core, "DB_PATH", ns_path)
+    assert _cctally_record._stats_epoch_rebuild_pending() is False
+
+    def _stamp(version: int) -> None:
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _stamp(_cctally_core.STATS_INDEX_EPOCH)
+    assert _cctally_record._stats_epoch_rebuild_pending() is False
+    _stamp(_cctally_core.LEGACY_STATS_HEAD)
+    assert _cctally_record._stats_epoch_rebuild_pending() is False
+    _stamp(_cctally_core.STATS_INDEX_EPOCH - 1)
+    assert _cctally_record._stats_epoch_rebuild_pending() is True
+    path.write_bytes(b"not a database at all")
+    assert _cctally_record._stats_epoch_rebuild_pending() is False
+
+
 def test_codex_tick_excludes_a_contended_root_from_alerts_but_not_reporting(
     runtime, monkeypatch,
 ):
@@ -165,13 +466,15 @@ def test_codex_tick_excludes_a_contended_root_from_alerts_but_not_reporting(
     monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
     monkeypatch.setitem(
         ns, "sync_codex_cache",
-        lambda conn, *, lock_timeout: calls.append(("sync", lock_timeout))
+        lambda conn, *, lock_timeout, **_budget: calls.append(("sync", lock_timeout))
         or SimpleNamespace(lock_contended=False),
     )
     monkeypatch.setitem(
         ns, "reconcile_codex_quota_projection",
-        lambda *, source_root_keys, alert_eligible_root_keys, now=None: calls.append(
-            ("reconcile", tuple(source_root_keys), tuple(alert_eligible_root_keys))
+        lambda *, source_root_keys, alert_eligible_root_keys, now=None,
+        full_pass="inline": calls.append(
+            ("reconcile", tuple(source_root_keys),
+             tuple(alert_eligible_root_keys), full_pass)
         ) or SimpleNamespace(
             blocks_upserted=0, milestones_upserted=0,
             blocks_orphaned=0, milestones_orphaned=0, alerts_dispatched=0,
@@ -205,7 +508,7 @@ def test_codex_tick_failure_leaves_every_due_marker_unmodified(runtime, monkeypa
     monkeypatch.setitem(
         ns,
         "sync_codex_cache",
-        lambda conn, *, lock_timeout: SimpleNamespace(lock_contended=False),
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(lock_contended=False),
     )
 
     def fail_projection(**_kwargs):
@@ -232,7 +535,7 @@ def test_codex_tick_budget_evaluation_failure_leaves_markers_unmodified(
     monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
     monkeypatch.setitem(
         ns, "sync_codex_cache",
-        lambda conn, *, lock_timeout: SimpleNamespace(lock_contended=False),
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(lock_contended=False),
     )
     monkeypatch.setitem(
         ns, "reconcile_codex_quota_projection",
@@ -283,7 +586,7 @@ def test_codex_lifecycle_logs_alert_counts_separately_from_eligibility(
     monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
     monkeypatch.setitem(
         ns, "sync_codex_cache",
-        lambda conn, *, lock_timeout: SimpleNamespace(lock_contended=False),
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(lock_contended=False),
     )
     monkeypatch.setitem(
         ns, "reconcile_codex_quota_projection",

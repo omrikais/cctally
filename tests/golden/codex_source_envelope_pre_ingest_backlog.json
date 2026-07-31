@@ -1,0 +1,345 @@
+{
+  "availability": "partial",
+  "capabilities": {
+    "alerts": [
+      "supported",
+      "provider-native"
+    ],
+    "budget": [
+      "supported",
+      "calendar-period"
+    ],
+    "daily": [
+      "supported",
+      "calendar-day"
+    ],
+    "forensics": [
+      "supported",
+      "inclusive-input-token-reuse"
+    ],
+    "hero": [
+      "unavailable",
+      "missing-or-conflicting-native-cycle"
+    ],
+    "monthly": [
+      "supported",
+      "calendar-month"
+    ],
+    "projects": [
+      "supported",
+      "qualified-attribution"
+    ],
+    "quota": [
+      "derived",
+      "native-windows"
+    ],
+    "sessions": [
+      "supported",
+      "inclusive-input-tokens"
+    ],
+    "weekly": [
+      "derived",
+      "native-reset-cycles"
+    ]
+  },
+  "data": {
+    "alerts": {
+      "actual_thresholds": [],
+      "projected_thresholds": [],
+      "rows": []
+    },
+    "budget": {
+      "milestones": [],
+      "projected": [],
+      "status": null
+    },
+    "cache_report": {
+      "anomaly_threshold_pp": 15,
+      "anomaly_window_days": 14,
+      "by_model": [
+        {
+          "cache_hit_percent": 25.0,
+          "key": "gpt-synthetic-codex",
+          "net_usd": 0.0003375
+        }
+      ],
+      "by_project": [
+        {
+          "cache_hit_percent": 25.0,
+          "key": "project-red",
+          "net_usd": 0.0003375
+        }
+      ],
+      "days": [
+        {
+          "anomaly_reasons": [],
+          "anomaly_triggered": false,
+          "cache_creation_tokens": 0,
+          "cache_hit_percent": 25.0,
+          "cache_read_tokens": 300,
+          "date": "2026-07-14",
+          "input_tokens": 900,
+          "net_usd": 0.0003375,
+          "output_tokens": 400,
+          "saved_usd": 0.0003375,
+          "wasted_usd": 0.0
+        }
+      ],
+      "fourteen_day_counterfactual_usd": 0.0003375,
+      "fourteen_day_efficiency_ratio": 1.0,
+      "is_empty": false,
+      "seven_day_anomaly_count": 0,
+      "seven_day_net_usd": 0.0003375,
+      "today": {
+        "anomaly_reasons": [],
+        "anomaly_triggered": false,
+        "baseline_daily_row_count": 1,
+        "baseline_median_percent": null,
+        "cache_hit_percent": 0.0,
+        "date": "2026-07-20",
+        "delta_pp": null,
+        "net_usd": 0.0,
+        "saved_usd": 0.0,
+        "wasted_usd": 0.0
+      },
+      "window_days": 14
+    },
+    "hero": {
+      "alerts": {
+        "count": 0
+      },
+      "budget": null,
+      "cached_input_tokens": null,
+      "cost_usd": null,
+      "cycle": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "quota": {
+        "active": [
+          {
+            "captured_at": "2026-07-14T12:02:00+00:00",
+            "current_percent": 42.0,
+            "freshness": "stale",
+            "key": "quota:<salted>",
+            "resets_at": "2026-07-21T12:00:00+00:00",
+            "stale_after_seconds": 3600
+          }
+        ],
+        "active_window_count": 1,
+        "freshness": "stale",
+        "latest_percent": 42.0,
+        "window_count": 2
+      },
+      "reasoning_output_tokens": null,
+      "total_tokens": null
+    },
+    "periods": {
+      "daily": {
+        "display_tz": "UTC",
+        "rows": [
+          {
+            "cached_input_tokens": 300,
+            "cost_usd": 0.0051625,
+            "input_tokens": 1200,
+            "label": "2026-07-14",
+            "model_breakdowns": [
+              {
+                "cachedInputTokens": 300,
+                "cost": 0.0051625,
+                "inputTokens": 1200,
+                "isFallback": true,
+                "modelName": "gpt-synthetic-codex",
+                "outputTokens": 400,
+                "reasoningOutputTokens": 100,
+                "totalTokens": 1600
+              }
+            ],
+            "models": [
+              "gpt-synthetic-codex"
+            ],
+            "output_tokens": 400,
+            "reasoning_output_tokens": 100,
+            "total_tokens": 1600
+          }
+        ],
+        "total_cost_usd": 0.0051625,
+        "total_tokens": 1600
+      },
+      "monthly": {
+        "display_tz": "UTC",
+        "rows": [
+          {
+            "cached_input_tokens": 300,
+            "cost_usd": 0.0051625,
+            "input_tokens": 1200,
+            "label": "2026-07",
+            "model_breakdowns": [
+              {
+                "cachedInputTokens": 300,
+                "cost": 0.0051625,
+                "inputTokens": 1200,
+                "isFallback": true,
+                "modelName": "gpt-synthetic-codex",
+                "outputTokens": 400,
+                "reasoningOutputTokens": 100,
+                "totalTokens": 1600
+              }
+            ],
+            "models": [
+              "gpt-synthetic-codex"
+            ],
+            "output_tokens": 400,
+            "reasoning_output_tokens": 100,
+            "total_tokens": 1600
+          }
+        ],
+        "total_cost_usd": 0.0051625,
+        "total_tokens": 1600
+      },
+      "weekly": {
+        "display_tz": "UTC",
+        "rows": [],
+        "total_cost_usd": 0.0,
+        "total_tokens": 0
+      }
+    },
+    "projects": {
+      "rows": [
+        {
+          "cached_input_tokens": 300,
+          "cost_usd": 0.0051625,
+          "first_seen": "2026-07-14T12:02:00+00:00",
+          "input_tokens": 1200,
+          "key": "project:<salted>",
+          "label": "project-red",
+          "last_seen": "2026-07-14T12:02:00+00:00",
+          "output_tokens": 400,
+          "reasoning_output_tokens": 100,
+          "session_count": 1,
+          "source": "codex",
+          "total_tokens": 1600
+        }
+      ],
+      "total_cost_usd": 0.0051625,
+      "total_tokens": 1600
+    },
+    "quota": {
+      "blocks": [],
+      "cycle_index": [],
+      "histories": [
+        {
+          "captured_at": "2026-07-14T12:02:00+00:00",
+          "current_percent": 42.0,
+          "forecast": {
+            "confidence": null,
+            "current_percent": 42.0,
+            "projected_percent": null,
+            "rate_percent_per_hour": null,
+            "remaining_seconds": 129600,
+            "resets_at": "2026-07-21T12:00:00+00:00",
+            "sample_count": 0,
+            "sample_span_seconds": 0,
+            "status": "stale"
+          },
+          "freshness": "stale",
+          "key": "quota:<salted>",
+          "label": "Synthetic limit",
+          "observed_slot": "secondary",
+          "source": "codex",
+          "stale_after_seconds": 3600,
+          "window_minutes": 10020
+        },
+        {
+          "captured_at": "2026-07-14T12:02:00+00:00",
+          "current_percent": 12.5,
+          "forecast": {
+            "confidence": null,
+            "current_percent": 12.5,
+            "projected_percent": null,
+            "rate_percent_per_hour": null,
+            "remaining_seconds": 0,
+            "resets_at": "2026-07-14T17:00:00+00:00",
+            "sample_count": 0,
+            "sample_span_seconds": 0,
+            "status": "stale"
+          },
+          "freshness": "stale",
+          "key": "quota:<salted>",
+          "label": "Synthetic limit",
+          "observed_slot": "primary",
+          "source": "codex",
+          "stale_after_seconds": 1980,
+          "window_minutes": 330
+        }
+      ],
+      "milestones": [],
+      "summary": {
+        "active": [
+          {
+            "captured_at": "2026-07-14T12:02:00+00:00",
+            "current_percent": 42.0,
+            "freshness": "stale",
+            "key": "quota:<salted>",
+            "resets_at": "2026-07-21T12:00:00+00:00",
+            "stale_after_seconds": 3600
+          }
+        ],
+        "active_window_count": 1,
+        "freshness": "stale",
+        "latest_percent": 42.0,
+        "window_count": 2
+      }
+    },
+    "sessions": {
+      "rows": [
+        {
+          "cached_input_tokens": 300,
+          "cost_usd": 0.0051625,
+          "duration_min": 0,
+          "input_tokens": 1200,
+          "key": "session:<salted>",
+          "last_activity": "2026-07-14T12:02:00+00:00",
+          "model_breakdowns": [
+            {
+              "cachedInputTokens": 300,
+              "cost": 0.0051625,
+              "inputTokens": 1200,
+              "isFallback": true,
+              "modelName": "gpt-synthetic-codex",
+              "outputTokens": 400,
+              "reasoningOutputTokens": 100,
+              "totalTokens": 1600
+            }
+          ],
+          "models": [
+            "gpt-synthetic-codex"
+          ],
+          "output_tokens": 400,
+          "project": "project-red",
+          "project_key": "project:<salted>",
+          "reasoning_output_tokens": 100,
+          "source": "codex",
+          "started_at": "2026-07-14T12:02:00+00:00",
+          "total_tokens": 1600
+        }
+      ],
+      "total_cost_usd": 0.0051625,
+      "total_sessions": 1,
+      "total_tokens": 1600
+    }
+  },
+  "domain_freshness": {
+    "hero": "fresh",
+    "quota": "stale",
+    "sessions": "fresh"
+  },
+  "freshness": "fresh",
+  "source": "codex",
+  "warnings": [
+    [
+      "codex_cycle_unavailable",
+      "Codex native reset cycle is unavailable.",
+      "hero"
+    ]
+  ]
+}

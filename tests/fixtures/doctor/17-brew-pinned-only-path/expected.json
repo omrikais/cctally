@@ -209,11 +209,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 35,
+                            "registry_size": 41,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1004,
+                            "epoch": 1006,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -265,7 +265,13 @@
                                     "032_codex_canonical_reset_anchor",
                                     "033_codex_reset_anchor_component_closure",
                                     "034_codex_window_spend_adoption",
-                                    "035_codex_thread_source_inference_replay"
+                                    "035_codex_thread_source_inference_replay",
+                                    "036_codex_quota_window_identity_index",
+                                    "037_codex_quota_change_ledger",
+                                    "038_codex_session_files_ingest_complete",
+                                    "039_codex_quota_observed_model_backfill",
+                                    "040_codex_quota_physical_group_index",
+                                    "041_codex_quota_unresolved_model_index"
                                 ],
                                 "skipped": []
                             },
@@ -293,7 +299,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/48 applied",
+                    "summary": "0/54 applied",
                     "title": "Migrations"
                 },
                 {
@@ -490,13 +496,37 @@
                             [
                                 "cache.db",
                                 "035_codex_thread_source_inference_replay"
+                            ],
+                            [
+                                "cache.db",
+                                "036_codex_quota_window_identity_index"
+                            ],
+                            [
+                                "cache.db",
+                                "037_codex_quota_change_ledger"
+                            ],
+                            [
+                                "cache.db",
+                                "038_codex_session_files_ingest_complete"
+                            ],
+                            [
+                                "cache.db",
+                                "039_codex_quota_observed_model_backfill"
+                            ],
+                            [
+                                "cache.db",
+                                "040_codex_quota_physical_group_index"
+                            ],
+                            [
+                                "cache.db",
+                                "041_codex_quota_unresolved_model_index"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "48 pending",
+                    "summary": "54 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -690,6 +720,8 @@
                 {
                     "details": {
                         "blocked_at": null,
+                        "deferred_at": null,
+                        "deferred_since": null,
                         "files_deferred_torn": null,
                         "files_failed": null,
                         "pending": false
@@ -698,6 +730,18 @@
                     "severity": "ok",
                     "summary": "none pending",
                     "title": "Codex transcript replay"
+                },
+                {
+                    "details": {
+                        "age_s": null,
+                        "bytes": 0,
+                        "files": 0,
+                        "since": null
+                    },
+                    "id": "data.codex_ingest_backlog",
+                    "severity": "ok",
+                    "summary": "no Codex ingest backlog",
+                    "title": "Codex ingest backlog"
                 },
                 {
                     "details": {
@@ -713,6 +757,18 @@
                     "severity": "ok",
                     "summary": "not applicable",
                     "title": "Codex quota"
+                },
+                {
+                    "details": {
+                        "error_count_24h": 0,
+                        "last_success_at": null,
+                        "spawn_failure_count_24h": 0,
+                        "success_count_24h": 0
+                    },
+                    "id": "data.codex_quota_verification",
+                    "severity": "ok",
+                    "summary": "no hand-off in the last 24h",
+                    "title": "Codex quota verification"
                 },
                 {
                     "details": {
@@ -927,7 +983,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 49,
+            "ok": 51,
             "warn": 6
         },
         "severity": "warn"

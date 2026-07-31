@@ -6,6 +6,8 @@ import { CodexIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { LoadFull } from './LoadFull';
 import { parseCodexEnvelope, codexMeta, responseIsLong } from './codexEnvelope';
+import { useFmtCtx } from './TranscriptContext';
+import { fmt } from '../lib/fmt';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -28,6 +30,7 @@ export function CodexCard({ call }: { call: Call }) {
   const [fullInput, setFullInput] = useState<Record<string, unknown> | null>(null);
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [responseExpanded, setResponseExpanded] = useState(false);
+  const fmtCtx = useFmtCtx();
 
   const input = fullInput ?? call.input ?? null;
   const meta = codexMeta(input);
@@ -40,11 +43,36 @@ export function CodexCard({ call }: { call: Call }) {
   const parsed = parseCodexEnvelope(responseRaw);
   const isError = parsed.kind === 'error' || !!result?.is_error;
 
-  const statusText = result == null
-    ? ''
-    : isError
-      ? (parsed.kind === 'error' && parsed.status ? `✗ ${parsed.status}` : '✗ error')
-      : '✓ ok';
+  // Backgrounded MCP call (spec §5). RECOVERED is `background_completed_at`
+  // being set — never `background_status === 'completed'`. The status is
+  // whatever the notification claimed, and an unrecovered call can claim
+  // "completed" (a completion carrying no <result>; an ambiguity whose
+  // candidates are all completed) while `result` is still the "still running
+  // after 120s" placeholder. Keying off the status would print '✓ ok' directly
+  // above that placeholder — the false success this card exists to avoid.
+  const backgroundDone = call.background_completed_at ?? null;
+  const backgroundPending = !!call.background_status && backgroundDone == null;
+  const doneAt = backgroundDone ? fmt.timeHHmm(backgroundDone, fmtCtx, { noSuffix: true }) : null;
+
+  // `isError` precedes `result == null` only because the two cannot both hold:
+  // a null result forces `responseRaw === ''`, which parses as kind 'raw' with
+  // no `is_error` to read, and `fullResultText` is reachable only through
+  // LoadFull, which the null-result branch never renders. Reordering the null
+  // check earlier is safe; moving `isError` after `backgroundPending` is NOT —
+  // that relabels a genuinely failed background call as still in flight.
+  const statusText = isError
+    ? (parsed.kind === 'error' && parsed.status ? `✗ ${parsed.status}` : '✗ error')
+    : backgroundPending
+      ? '⋯ running in background'
+      : result == null
+        ? ''
+        : '✓ ok';
+  // The pending label is a RIGID summary child; at 152px it drove
+  // .conv-chip-name and .conv-chip-preview to 0px on a 390px viewport. Ship a
+  // second, shorter wording and let the @media rule pick one (see
+  // .conv-status-wide/-narrow in index.css). Null for every other status —
+  // they are already short, and duplicating them would only add a dead node.
+  const statusShort = !isError && backgroundPending ? '⋯ running' : null;
 
   // The "agent run" status bar only earns its space when it has at least one
   // field. A bare codex-reply carries just prompt + threadId, which would leave
@@ -53,7 +81,11 @@ export function CodexCard({ call }: { call: Call }) {
   const hasBarMeta = !!(meta.model || meta.effort || meta.sandbox || meta.approval || meta.cwdBase);
 
   return (
-    <details className={`conv-chip conv-codex${isError ? ' conv-codex--error' : ''}`}>
+    <details className={
+      'conv-chip conv-codex'
+      + (isError ? ' conv-codex--error' : '')
+      + (!isError && backgroundPending ? ' conv-codex--pending' : '')
+    }>
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         <CodexIcon />
@@ -61,7 +93,25 @@ export function CodexCard({ call }: { call: Call }) {
         {meta.threadId
           ? <span className="conv-codex-thread">↩ thread …{meta.threadId.slice(-4)}</span>
           : meta.model && <span className="conv-codex-model">{meta.model}</span>}
-        {statusText && <span className={`conv-codex-summary-status${isError ? ' conv-codex-summary-status--err' : ''}`}>{statusText}</span>}
+        {statusText && (
+          <span className={
+            'conv-codex-summary-status'
+            + (isError ? ' conv-codex-summary-status--err' : '')
+            + (!isError && backgroundPending ? ' conv-codex-summary-status--pending' : '')
+          } title={statusShort ? statusText : undefined}>
+            {statusShort ? (
+              <>
+                <span className="conv-status-wide">{statusText}</span>
+                <span className="conv-status-narrow">{statusShort}</span>
+              </>
+            ) : statusText}
+          </span>
+        )}
+        {doneAt && (
+          <span className="conv-codex-bg-done" title={backgroundDone ?? undefined}>
+            ran in background, completed {doneAt}
+          </span>
+        )}
         {preview && <span className="conv-chip-preview">{preview}</span>}
       </summary>
 
@@ -154,16 +204,24 @@ export function CodexCard({ call }: { call: Call }) {
     }
     // kind === 'ok'
     const content = parsed.content;
-    const clamped = responseIsLong(content) && !responseExpanded;
+    // The control's render condition is the response being LONG, not the clamp
+    // state: gating on `clamped` unmounted the only control that could collapse
+    // again the moment it expanded, stranding the reader in the expanded view.
+    // The handler is a toggle, matching the prompt toggle above.
+    const isLong = responseIsLong(content);
+    const clamped = isLong && !responseExpanded;
     return (
       <>
         <div className="conv-codex-reslabel">↩ response <CopyButton text={content} /></div>
         <div className={'conv-codex-md' + (clamped ? ' conv-codex-md--clamp' : '')}>
           <Markdown components={CODEX_MD}>{content}</Markdown>
         </div>
-        {clamped && (
+        {isLong && (
           <div className="conv-codex-more">
-            <button type="button" onClick={() => setResponseExpanded(true)}>Show full response ↓</button>
+            <button type="button" aria-expanded={responseExpanded}
+                    onClick={() => setResponseExpanded((v) => !v)}>
+              {responseExpanded ? 'Collapse response ↑' : 'Show full response ↓'}
+            </button>
           </div>
         )}
         {resultLoadFull}

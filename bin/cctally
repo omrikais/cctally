@@ -1053,6 +1053,7 @@ sync_claude_conversations = _cctally_cache.sync_claude_conversations
 sync_codex_conversations = _cctally_cache.sync_codex_conversations
 _reset_orphan_warning_throttle = _cctally_cache._reset_orphan_warning_throttle
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
+cmd_codex_replay_drain_internal = _cctally_cache.cmd_codex_replay_drain_internal
 
 
 # Record-usage / hook-tick hot-path subsystem — the runtime path that
@@ -1452,6 +1453,7 @@ cmd_codex_session = _cctally_codex.cmd_codex_session
 # adapter while retaining the existing Codex accounting commands unchanged.
 _cctally_quota = _load_sibling("_cctally_quota")
 reconcile_codex_quota_projection = _cctally_quota.reconcile_codex_quota_projection
+cmd_codex_quota_verify_internal = _cctally_quota.cmd_codex_quota_verify_internal
 cmd_codex_quota_history = _cctally_quota.cmd_codex_quota_history
 cmd_codex_quota_statusline = _cctally_quota.cmd_codex_quota_statusline
 cmd_codex_quota_forecast = _cctally_quota.cmd_codex_quota_forecast
@@ -3457,9 +3459,10 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # (it runs before the wrapper sets CCTALLY_DATA_DIR, so APP_DIR is
         # still cctally-dev at this point). Same rationale class as doctor.
         return
-    if command in ("_update-check", "_telemetry-beat"):
-        # Both hidden workers are detached and have already done their one job
-        # in their own command handler; neither must re-enter this hook.
+    if command in ("_update-check", "_telemetry-beat", "_codex-quota-verify",
+                   "_codex-replay-drain"):
+        # All four hidden workers are detached and have already done their one job
+        # in their own command handler; none must re-enter this hook.
         # Without the guard the ``_update-check`` worker would fall through to
         # the telemetry gate below and (throttle-bounded) spawn a
         # ``_telemetry-beat`` — a worker spawning another worker. And

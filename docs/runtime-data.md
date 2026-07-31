@@ -26,7 +26,7 @@ All persistent state lives under `~/.local/share/cctally/` (a dev checkout uses 
 
 ## `stats.db` schema
 
-A **disposable index** materialized from the append-only journal (`~/.local/share/cctally/journal/`), which is the durable truth since the DB journal redesign (§7.1). `stats.db` is stamped at a single `STATS_INDEX_EPOCH` (1004) rather than versioned by migrations; its 13-migration legacy registry is **frozen** (only used to bring a pre-cutover install to the export baseline). A version mismatch — newer or older binary — self-heals by **rebuild from the journal** (`cctally db rebuild --db stats`); `DowngradeDetected`-bricking no longer applies to `stats.db`, and `db recover --db stats` is retired. Corruption self-heals the same way (forensics → quarantine → rebuild, no human step). A schema change bumps the epoch, never adds a stats migration.
+A **disposable index** materialized from the append-only journal (`~/.local/share/cctally/journal/`), which is the durable truth since the DB journal redesign (§7.1). `stats.db` is stamped at a single `STATS_INDEX_EPOCH` (1006) rather than versioned by migrations; its 13-migration legacy registry is **frozen** (only used to bring a pre-cutover install to the export baseline). A version mismatch — newer or older binary — self-heals by **rebuild from the journal** (`cctally db rebuild --db stats`); `DowngradeDetected`-bricking no longer applies to `stats.db`, and `db recover --db stats` is retired. Corruption self-heals the same way (forensics → quarantine → rebuild, no human step). A schema change bumps the epoch, never adds a stats migration.
 
 The live schema includes the snapshot tables below plus the 5-hour, reset/credit, budget, account, journal-index, and framework-ledger tables added since.
 

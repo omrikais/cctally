@@ -14,6 +14,7 @@ carries it across.
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 import shutil
@@ -41,9 +42,13 @@ def D():
     return _lib_doctor
 
 
-def _s(pending=None, blocked=None):
+NOW = dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def _s(pending=None, blocked=None, deferred=None, now=NOW):
     return types.SimpleNamespace(
-        codex_replay_pending=pending, codex_replay_blocked=blocked)
+        codex_replay_pending=pending, codex_replay_blocked=blocked,
+        codex_replay_deferred=deferred, now_utc=now)
 
 
 # ── the pure check ───────────────────────────────────────────────────────────
@@ -86,6 +91,66 @@ def test_a_malformed_blocked_record_degrades_ok(D):
     for bad in ({}, {"at": None}, {"at": ""}, {"at": 7}):
         assert D._check_data_codex_replay(
             _s(pending=True, blocked=bad)).severity == "ok", bad
+
+
+def test_a_merely_pending_marker_no_longer_promises_the_next_sync_clears_it(D):
+    """A budgeted tick — the Codex hook — DECLINES the replay rather than
+    running it, so on a hook-only install "the next Codex sync" is precisely
+    the caller that does not clear it. Saying otherwise sends the one user who
+    is frozen away reassured."""
+    summary = D._check_data_codex_replay(_s(pending=True)).summary
+    assert "unbudgeted" in summary
+    assert summary != "pending (clears on the next Codex sync)"
+
+
+def test_a_recent_budgeted_deferral_is_reported_but_stays_ok(D):
+    """The hook hands the drain to a detached worker on every decline, so a
+    fresh deferral is the mechanism self-healing, not a fault."""
+    r = D._check_data_codex_replay(_s(pending=True, deferred={
+        "since": "2026-07-31T11:45:00Z", "at": "2026-07-31T11:59:00Z",
+    }))
+    assert r.severity == "ok"
+    assert "deferred it at 2026-07-31T11:59:00Z" in r.summary
+    assert r.details["deferred_since"] == "2026-07-31T11:45:00Z"
+
+
+def test_a_deferral_older_than_an_hour_warns(D):
+    """The blocker's visible half. Nothing else can report it: the decline
+    returns before the walk, so `files_failed` and `files_deferred_torn` are
+    both zero, no `blocked` record is ever written, and `codex.ingest_backlog`
+    reads a drained store."""
+    r = D._check_data_codex_replay(_s(pending=True, deferred={
+        "since": "2026-07-31T09:00:00Z", "at": "2026-07-31T11:59:00Z",
+    }))
+    assert r.severity == "warn"
+    assert "2026-07-31T09:00:00Z" in r.summary
+    assert "frozen" in r.summary
+    assert r.remediation and "cache-sync --source codex" in r.remediation
+
+
+def test_a_stalled_walk_still_outranks_a_deferral(D):
+    """`blocked` names a concrete root cause (a torn auth.json); the deferral
+    only says nobody unbudgeted has run yet. Report the actionable one."""
+    r = D._check_data_codex_replay(_s(
+        pending=True,
+        blocked={"at": "2026-07-31T00:00:00Z", "files_deferred_torn": 1},
+        deferred={"since": "2026-07-31T09:00:00Z", "at": "2026-07-31T11:00:00Z"},
+    ))
+    assert r.severity == "warn"
+    assert "stalled since 2026-07-31T00:00:00Z" in r.summary
+
+
+def test_a_deferral_without_the_marker_stays_ok(D):
+    """The marker is the gate here too — a leftover record is not a stall."""
+    assert D._check_data_codex_replay(_s(deferred={
+        "since": "2026-07-01T00:00:00Z", "at": "2026-07-01T00:00:00Z",
+    })).severity == "ok"
+
+
+def test_a_malformed_deferred_record_degrades_ok(D):
+    for bad in ({}, {"since": None}, {"since": ""}, {"since": "not-a-time"}):
+        assert D._check_data_codex_replay(
+            _s(pending=True, deferred=bad)).severity == "ok", bad
 
 
 def test_the_leg_is_registered(D):

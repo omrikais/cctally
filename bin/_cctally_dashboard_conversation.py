@@ -1090,16 +1090,35 @@ def _handle_get_conversation_payload_impl(handler, path: str) -> None:
         handler._respond_json(400, {"error": "bad request"})
         return
     cq = handler._conversation_query()
-    ok, loc = handler._run_conversation_query(
-        lambda conn: cq.locate_tool_payload(
-            conn, session_id, tool_use_id, which),
-        "/api/conversation/payload")
-    if not ok:
-        return
+    mode = which
+    if which == "result":
+        # A backgrounded-MCP result lives in an attachment record, not in the
+        # placeholder tool_result a public which='result' lookup finds first.
+        # Resolve the internal carrier here; the response the client receives
+        # still carries which:"result", so the client contract is unchanged and
+        # `background_result` is never an accepted input value.
+        ok, resolved = handler._run_conversation_query(
+            lambda conn: cq.locate_result_payload(conn, session_id, tool_use_id),
+            "/api/conversation/payload")
+        if not ok:
+            return
+        mode, loc = resolved
+        if mode == "background_gone":
+            # A KNOWN background placeholder whose notification row is gone or
+            # unresolvable — 410, distinct from the 404 an unknown id returns.
+            handler._respond_json(410, {"error": "source no longer available"})
+            return
+    else:
+        ok, loc = handler._run_conversation_query(
+            lambda conn: cq.locate_tool_payload(
+                conn, session_id, tool_use_id, which),
+            "/api/conversation/payload")
+        if not ok:
+            return
     if loc is None:
         handler._respond_json(404, {"error": "not found"})
         return
-    payload = cq.read_full_payload(loc[0], loc[1], tool_use_id, which)
+    payload = cq.read_located_payload(loc, tool_use_id, mode)
     if payload is None:
         handler._respond_json(410, {"error": "source no longer available"})
         return

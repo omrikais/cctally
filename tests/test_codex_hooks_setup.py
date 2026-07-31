@@ -604,3 +604,43 @@ def test_setup_install_and_uninstall_support_a_pure_codex_home(
     assert removed["codex_hooks"]["installed_count"] == 0
     assert json.loads((home / "hooks.json").read_text()) == {}
     assert not (home.parent / ".claude" / "settings.json").exists()
+
+
+def test_worker_log_lines_are_not_counted_as_hook_fires(tmp_path, monkeypatch):
+    """`hook-tick.log` is no longer only hook fires (public #5).
+
+    The three detached Codex workers write their outcomes there — the log is
+    the only place they can, since all their streams are `/dev/null` — and
+    those lines are `provider=codex op=… result=…` with no `event=` at all. The
+    scan counted every timestamped line as a fire and filed them under
+    `by_event["unknown"]`, which is meant to report a hook payload whose
+    `hook_event_name` cctally could not read. Both `cctally setup --status` and
+    doctor's `hooks.recent_activity` read those numbers.
+    """
+    import datetime as _dt
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+
+    stamp = _dt.datetime.now(_dt.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+    log = _cctally_core.HOOK_TICK_LOG_PATH
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("\n".join([
+        f"{stamp} event=Stop           session=abc ingested=0 malformed=0 "
+        f"skipped=0 oauth=ok(7d=1%) dur_ms=12",
+        f"{stamp} provider=codex source_root_key=rk event=Stop sync=ok "
+        f"blocks=1 milestones=0 alert_eligible_roots=1 quota_alerts=0 "
+        f"budget_alerts=0 backlog=0 dur_ms=3 result=success",
+        f"{stamp} provider=codex op=quota-verify result=success blocks=608",
+        f"{stamp} provider=codex op=quota-verify-spawn result=spawned",
+        f"{stamp} provider=codex op=replay-drain result=success files=2",
+    ]) + "\n", encoding="utf-8")
+
+    counts = ns["_setup_recent_log_stats"]()
+
+    assert counts["fires"] == 2, (
+        f"the three detached-worker lines were counted as hook fires: {counts}")
+    assert counts["by_event"] == {"Stop": 2}
+    assert "unknown" not in counts["by_event"]

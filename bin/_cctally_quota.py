@@ -9,13 +9,13 @@ stats generation from the physical cache.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 import secrets
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 import _cctally_core
 import _lib_accounts
@@ -56,11 +56,63 @@ from _lib_codex_pools import (
     codex_model_scoped_quota_pool,
     is_model_scoped_codex_quota,
 )
+import _lib_quota_alert_axes as _axes
+import _lib_quota_ledger as _ledger
 
 
 UTC = dt.timezone.utc
 _DASHBOARD_PROJECTION_CERTIFICATE_KEY = "codex_quota_projection_certificate"
-_CODEX_QUOTA_INTERPRETATION_VERSION = 2
+# 2 -> 3 (public #5): the root physical signature is now COMPOSED from per-group
+# digests instead of digested over a whole root's observation tuples. The
+# semantics are unchanged — still an exact-equality function of the physical
+# evidence — but the VALUE is not, so every certificate written under the old
+# scheme has to be rejected rather than compared. The version also invalidates
+# the ledger mechanism itself: a classification change alters interpreted keys
+# with no row mutation to observe, so a bump queues one complete pass.
+_CODEX_QUOTA_INTERPRETATION_VERSION = 3
+
+#: Above this many dirty loading units, a bounded pass stops being a saving: it
+#: is one indexed query per unit (times the snap closure) against a single
+#: unbounded scan, and the sweep's ``IN`` list stops fitting comfortably in
+#: SQLite's variable budget. A burst that wide is a rebuild or a first ingest,
+#: which is exactly what the full path is for.
+_MAX_INCREMENTAL_UNITS = 128
+
+#: Loading-unit keys per SQL ``IN`` chunk in the scoped sweep.
+_SWEEP_KEY_CHUNK = 400
+
+#: How long a projection may go without a whole-history verification pass
+#: (spec §2). The scoped sweep structurally cannot see two classes — a block
+#: whose physical group is absent from the cache entirely, and a milestone on a
+#: historic root no longer active — so without a deadline they are repairable
+#: only by an interpretation bump, a rebuild or a burst overflow, none of which
+#: happen on a normal install. One full pass per day against the roughly four
+#: seconds this design removes from every turn. EVERY full pass stamps the
+#: deadline, whatever triggered it, so it is satisfied by whichever caller
+#: reaches it first — a dashboard tick or a `codex quota` invocation pays the
+#: cost off the hook path entirely — except on a hook-only install, where no
+#: such caller exists. There the deadline would land on the blocking hook path
+#: as the one unbounded operation this design otherwise removes, so the hook
+#: passes ``full_pass="defer"`` and the pass is handed to the detached
+#: ``_codex-quota-verify`` worker instead (see ``_defer_codex_quota_verification``).
+CODEX_QUOTA_FULL_VERIFICATION_INTERVAL_SECONDS = 86400
+
+#: The hidden self-subcommand that performs a deferred verification pass.
+CODEX_QUOTA_VERIFY_COMMAND = "_codex-quota-verify"
+
+#: Marker whose mtime throttles worker spawns. In ``APP_DIR`` rather than
+#: cache.db because the decision is made with no cache write transaction open,
+#: and because a spawn is process state, not projection state.
+CODEX_QUOTA_VERIFY_MARKER_NAME = "codex-quota-verify.last-attempt"
+
+#: Minimum spacing between deferred-verification spawns. Stamped on ATTEMPT,
+#: not on success: ``last_full_pass_at`` moves only when a pass COMPLETES, so
+#: every tick between the spawn and the worker's commit still reads as due, and
+#: a success-stamped throttle would put one worker per hook tick on the box.
+#: Comfortably longer than a measured full pass (~4s locally, ~15s on the
+#: reporter's store) while still retrying many times inside the one-day
+#: interval if a worker dies.
+CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -171,6 +223,7 @@ def _store_codex_quota_projection_certificate(
     *,
     sequence: int,
     signatures: Mapping[str, str],
+    prune_ledger_through: "int | None" = None,
 ) -> None:
     """Stamp exact validated signatures only if cache physical state is unchanged.
 
@@ -178,6 +231,19 @@ def _store_codex_quota_projection_certificate(
     A later cache mutation necessarily advances ``sequence``, so a dashboard
     reader fails coherence rather than combining new physical cache data with
     the prior projection certificate.
+
+    ``prune_ledger_through`` (public #5) deletes consumed change-ledger entries
+    in the same transaction. Nothing else prunes them, and nothing bounds them:
+    a ``cache-sync --rebuild`` on a 211K-observation store wipes and re-ingests,
+    which the triggers record as roughly 422K rows (one delete plus one insert
+    each). Entries at or below the committed watermark are provably consumed —
+    the projection that consumed them is already durable — and ``seq`` is
+    ``AUTOINCREMENT``, so a pruned high value is never reissued and the
+    watermark can never be overtaken from below.
+
+    The prune runs even when the certificate itself is declined: a sequence that
+    advanced mid-pass means new evidence landed, not that the old entries are
+    unconsumed.
     """
     path = _cctally_core.CACHE_DB_PATH
     if not path.exists():
@@ -186,8 +252,16 @@ def _store_codex_quota_projection_certificate(
         conn = sqlite3.connect(path)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if prune_ledger_through:
+                try:
+                    conn.execute(
+                        "DELETE FROM quota_window_change_log WHERE seq <= ?",
+                        (int(prune_ledger_through),),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # a cache too old to carry the ledger
             if codex_physical_mutation_seq(conn) != sequence:
-                conn.rollback()
+                conn.commit()
                 return
             payload = json.dumps({
                 "interpretationVersion": _CODEX_QUOTA_INTERPRETATION_VERSION,
@@ -219,17 +293,437 @@ def _stats_projection_signatures_match(
     match for every active root before the reconcile is allowed to short-circuit.
     A missing row, a mismatch, or any ``sqlite3.Error`` degrades to False, which
     forces the full reconcile (fail-safe).
+
+    ACCOUNT-AWARE and ORDER-INDEPENDENT (public #5 Task 9). The signature is
+    per-root by construction, so every ``(root, account)`` row for a root must
+    carry the same value; collapsing the rows into one dictionary let whichever
+    row happened to come last decide, which is a real answer only when they
+    already agree. Requiring the root's rows to agree — and to exist — turns a
+    partially-updated projection from a coin flip into a mismatch, and a
+    mismatch is the fail-safe direction.
     """
     try:
         rows = stats_conn.execute(
-            "SELECT source_root_key, physical_signature FROM quota_projection_state"
+            "SELECT source_root_key, account_key, physical_signature "
+            "  FROM quota_projection_state"
         ).fetchall()
     except sqlite3.Error:
         return False
-    projection = {str(row[0]): str(row[1]) for row in rows}
-    return all(
-        projection.get(root) == cert_sigs.get(root) for root in active_roots
+    by_root: dict[str, set[str]] = {}
+    for row in rows:
+        by_root.setdefault(str(row[0]), set()).add(str(row[2]))
+    for root in active_roots:
+        stored = by_root.get(root)
+        if not stored or len(stored) != 1:
+            return False
+        if next(iter(stored)) != cert_sigs.get(root):
+            return False
+    return True
+
+
+# ── the change ledger's watermark and the state that rides with it ─────────
+
+def _ledger_state(stats_conn: sqlite3.Connection) -> dict | None:
+    """Read the incremental projector's own state, or ``None``.
+
+    ``None`` — a missing row, a missing table, any error — means the projector
+    has no consumed range it can trust and the next pass must be a complete one.
+    Fail-safe by construction: the expensive answer is the correct one.
+    """
+    try:
+        row = stats_conn.execute(
+            "SELECT watermark_seq, interpretation_version, alerts_enabled, "
+            "       next_evaluation_at_utc, last_full_pass_at "
+            "  FROM quota_projection_ledger_state WHERE source='codex'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        return {
+            "watermark": int(row[0]),
+            "interpretation_version": int(row[1]),
+            "alerts_enabled": (
+                None if row[2] is None else bool(int(row[2]))),
+            "next_evaluation_at": (
+                None if row[3] is None else str(row[3])),
+            "last_full_pass_at": (
+                None if row[4] is None else str(row[4])),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _full_verification_due(ledger_state: "dict | None", now: dt.datetime) -> bool:
+    """True when the projection is overdue for a whole-history pass (spec §2).
+
+    Fail-safe in the expensive direction at every step: no state, no stamp, an
+    unparsable stamp and a stamp in the future all read as due. A stamp ahead of
+    ``now`` is a clock that moved backwards, and treating it as satisfied would
+    suspend the verification until wall time caught up.
+    """
+    if ledger_state is None:
+        return True
+    stamp = ledger_state.get("last_full_pass_at")
+    if not stamp:
+        return True
+    try:
+        last = _parse_utc(str(stamp), "last_full_pass_at")
+    except (TypeError, ValueError):
+        return True
+    elapsed = (now - last).total_seconds()
+    if elapsed < 0:
+        return True
+    return elapsed >= CODEX_QUOTA_FULL_VERIFICATION_INTERVAL_SECONDS
+
+
+def _log_codex_worker_outcome(
+    op: str, outcome: str, detail: str = "", *, error: str = "",
+) -> None:
+    """One durable line about a detached Codex worker, in ``hook-tick.log``.
+
+    The workers spawned from the hook path have all three streams on
+    ``/dev/null`` and an exit code nobody observes, so this file is the only
+    place their outcome can land. Best-effort and never raising: a diagnostic
+    must not be able to fail the operation it describes.
+
+    ``detail`` carries the caller's OWN structured ``k=v`` fragments — counts, a
+    duration, a fixed reason token — and is emitted verbatim. Anything derived
+    from an exception goes through ``error`` instead, which is rendered LAST and
+    defused HERE rather than at the call site. That is what makes the privacy
+    guarantee a property of the renderer, the way it already is of
+    ``_codex_lifecycle_log_line``: no future caller can reintroduce a path, a
+    conversation id or a field separator by forgetting to scrub. A caller
+    holding the exception should still pass ``_hook_log_error_detail(exc)``,
+    which additionally narrows the ``OSError`` family's embedded ``filename``
+    away at the source.
+    """
+    try:
+        from _cctally_record import (
+            _hook_log_safe_free_text, _hook_tick_log_line,
+            _hook_tick_log_rotate_if_needed,
+        )
+        stamp = _utc_iso(dt.datetime.now(UTC))
+        suffix = ""
+        if error:
+            safe = _hook_log_safe_free_text(error)
+            if safe:
+                suffix = f" error={safe}"
+        _hook_tick_log_line(
+            f"{stamp} provider=codex op={op} result={outcome}"
+            + (f" {detail}" if detail else "") + suffix)
+        _hook_tick_log_rotate_if_needed()
+    except Exception:
+        pass
+
+
+def _defer_codex_quota_verification() -> str:
+    """Hand the periodic whole-history pass to a detached worker.
+
+    Returns ``"spawned"``, ``"throttled"`` or ``"failed"``, and WRITES the two
+    outcomes an operator would act on to ``hook-tick.log``. No caller
+    distinguishes them — every one of them skips the pass regardless, because a
+    missed pass is bounded staleness the next tick retries while running it
+    inline is the ~14-30s reconcile against Codex's 30-second hook timeout that
+    this whole change exists to remove. So logging here is what stops a
+    permanently failing hand-off from being invisible; the value stays a return
+    for tests.
+
+    ``"throttled"`` is deliberately NOT logged: it is the ordinary state between
+    a spawn and the worker's commit, and the Codex lifecycle throttle is 15
+    seconds, so logging it would bury the two outcomes that matter.
+
+    Marker-first, exactly like ``update-check.last-fetch``: the mtime is stamped
+    BEFORE the spawn, so a worker that dies cannot make every following tick
+    spawn another one. If the marker itself cannot be written we do not spawn at
+    all — without it the spawn rate is unbounded, which is worse than a deferred
+    verification.
+    """
+    marker = _cctally_core.APP_DIR / CODEX_QUOTA_VERIFY_MARKER_NAME
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        age = None
+    if age is not None and 0 <= age < CODEX_QUOTA_VERIFY_SPAWN_THROTTLE_SECONDS:
+        return "throttled"
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        _log_codex_worker_outcome(
+            "quota-verify-spawn", "failed", "reason=marker_unwritable")
+        return "failed"
+    from _cctally_update import _spawn_detached
+    if _spawn_detached(CODEX_QUOTA_VERIFY_COMMAND):
+        _log_codex_worker_outcome("quota-verify-spawn", "spawned")
+        return "spawned"
+    _log_codex_worker_outcome("quota-verify-spawn", "failed", "reason=spawn")
+    return "failed"
+
+
+def cmd_codex_quota_verify_internal(args) -> int:
+    """Hidden ``_codex-quota-verify`` handler: the deferred whole-history pass.
+
+    Reporting only — no ``alert_eligible_root_keys``, because alert eligibility
+    belongs to whoever holds the per-root lifecycle lock and this worker holds
+    none. That matches every other off-hook caller of the verification (the
+    dashboard tick, ``codex quota``), which is the point: the worker is one of
+    those callers, moved off the blocking path.
+
+    ``last_full_pass_at`` is stamped inside the pass's own stats transaction, so
+    a worker that is killed leaves the deadline due and the next tick retries.
+    Always returns 0 — a detached worker's exit code is observed by nobody, and
+    a raised exception would only produce an unread traceback.
+
+    The outcome goes to ``hook-tick.log``, following the ``_update-check``
+    precedent of writing ``update.log`` for exactly this reason. All three of
+    this worker's streams are ``/dev/null`` and its exit code is unobserved, so
+    a bare ``except: pass`` made a persistently failing verification completely
+    invisible — and because the deadline only moves when a pass COMMITS, such a
+    worker respawns every throttle window forever with nothing to show for it.
+    """
+    started = time.monotonic()
+
+    def _log(outcome: str, detail: str = "", *, error: str = "") -> None:
+        _log_codex_worker_outcome(
+            "quota-verify", outcome,
+            f"dur_ms={max(0, int((time.monotonic() - started) * 1000))}"
+            + (f" {detail}" if detail else ""),
+            error=error)
+
+    try:
+        result = reconcile_codex_quota_projection(force_full=True)
+    except Exception as exc:
+        # Same defusing as the lifecycle line, for the same two reasons: the
+        # `OSError` family's `str()` carries a rollout path, and the log's
+        # reader is a last-wins `k=v` comprehension a free-text `=` can beat.
+        # `_log_codex_worker_outcome` performs it; this narrows the `filename`
+        # away first, which only the caller holding the exception can do.
+        from _cctally_record import _hook_log_error_detail
+        _log("error", error=_hook_log_error_detail(exc))
+        return 0
+    _log(
+        "success",
+        f"blocks={int(getattr(result, 'blocks_upserted', 0) or 0)} "
+        f"milestones={int(getattr(result, 'milestones_upserted', 0) or 0)}")
+    return 0
+
+
+def _store_ledger_state(
+    conn: sqlite3.Connection, *, watermark: int,
+    alerts_enabled: "bool | None", next_evaluation_at: "str | None",
+    last_full_pass_at: "str | None",
+) -> None:
+    """Stamp the consumed range, the non-dirtiness alert axes and the deadline.
+
+    Runs on the caller's transaction, alongside the projection it describes.
+    ``last_full_pass_at`` is the caller's decision: a full pass passes its own
+    ``now``, a bounded pass passes the stored value through unchanged.
+    """
+    conn.execute(
+        """INSERT INTO quota_projection_ledger_state
+             (source, watermark_seq, interpretation_version, alerts_enabled,
+              next_evaluation_at_utc, last_full_pass_at)
+           VALUES ('codex',?,?,?,?,?)
+           ON CONFLICT(source) DO UPDATE SET
+             watermark_seq=excluded.watermark_seq,
+             interpretation_version=excluded.interpretation_version,
+             alerts_enabled=excluded.alerts_enabled,
+             next_evaluation_at_utc=excluded.next_evaluation_at_utc,
+             last_full_pass_at=excluded.last_full_pass_at""",
+        (
+            int(watermark), _CODEX_QUOTA_INTERPRETATION_VERSION,
+            None if alerts_enabled is None else int(bool(alerts_enabled)),
+            next_evaluation_at, last_full_pass_at,
+        ),
     )
+
+
+def _ledger_max_seq(cache_conn: sqlite3.Connection) -> int | None:
+    """The ledger's high-water sequence, or ``None`` when unreadable.
+
+    ``None`` (no table — a cache too old to carry the ledger) forces the full
+    path, which is exactly today's behaviour and correct, just not incremental.
+
+    Read from ``sqlite_sequence`` and not only from ``MAX(seq)``, because the
+    projector PRUNES consumed entries: after a prune the table is empty and
+    ``MAX(seq)`` is 0, which would read as "the ledger was reset below the
+    watermark" on every single clean tick — and that reset detection is what
+    forces a whole-history pass. ``AUTOINCREMENT`` keeps its high-water in
+    ``sqlite_sequence`` across a ``DELETE`` and only loses it when the table
+    itself is dropped and recreated, which is exactly the event being detected.
+    ``MAX(seq)`` is still folded in so a cache whose sequence row is missing but
+    whose rows are not degrades to the safe direction.
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM quota_window_change_log"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    high = 0 if row is None else int(row[0])
+    try:
+        row = cache_conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='quota_window_change_log'"
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            high = max(high, int(row[0]))
+    except (sqlite3.Error, TypeError, ValueError):
+        pass
+    return high
+
+
+def _ledger_rows_after(
+    cache_conn: sqlite3.Connection, low: int, high: int,
+) -> list[dict]:
+    """Every ledger entry in ``(low, high]``, as plain dicts for the kernel."""
+    if high <= low:
+        return []
+    columns = ", ".join(
+        f"{side}{name}"
+        for side in ("old_", "new_")
+        for name in _ledger.LEDGER_GROUP_SUFFIXES
+    )
+    previous = cache_conn.row_factory
+    try:
+        cache_conn.row_factory = sqlite3.Row
+        return [
+            dict(row) for row in cache_conn.execute(
+                f"SELECT op, {columns} FROM quota_window_change_log "
+                " WHERE seq > ? AND seq <= ?", (int(low), int(high)),
+            )
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        cache_conn.row_factory = previous
+
+
+def _armed_identities(
+    stats_conn: sqlite3.Connection,
+) -> dict[tuple, tuple[QuotaWindowIdentity, str]]:
+    """Every persisted Codex arming boundary, keyed by its identity tuple.
+
+    This is where the policy axis reads its STORED fingerprints from: the arming
+    row already persists the resolved rule's hash per identity, so no second
+    store is needed to detect a rule change.
+    """
+    try:
+        rows = stats_conn.execute(
+            """SELECT source, source_root_key, account_key, logical_limit_key,
+                      observed_slot, window_minutes, rule_fingerprint
+                 FROM quota_alert_arming WHERE source='codex'"""
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    armed: dict[tuple, tuple[QuotaWindowIdentity, str]] = {}
+    for row in rows:
+        try:
+            identity = QuotaWindowIdentity(
+                source=str(row[0]), source_root_key=str(row[1]),
+                account_key=str(row[2]), logical_limit_key=str(row[3]),
+                observed_slot=str(row[4]), window_minutes=int(row[5]),
+            )
+        except (TypeError, ValueError):
+            continue
+        key = (
+            identity.source, identity.source_root_key, identity.account_key,
+            identity.logical_limit_key, identity.observed_slot,
+            identity.window_minutes,
+        )
+        armed[key] = (identity, str(row[6]))
+    return armed
+
+
+def _resolve_alert_scope(
+    stats_conn: sqlite3.Connection, *, ledger_scope: str, now: dt.datetime,
+    ledger_state: "dict | None", global_enabled: bool, quota_enabled: bool,
+    rules, config, defer_scheduled: bool = False,
+) -> _axes.AlertDirtyScope:
+    """Feed the five-axis kernel from stats.db and the resolved configuration."""
+    armed = _armed_identities(stats_conn)
+    stored = {key: fingerprint for key, (_ident, fingerprint) in armed.items()}
+    resolved = {}
+    for key, (identity, _fingerprint) in armed.items():
+        rule = resolve_quota_rule(
+            identity,
+            default_actual_thresholds=config["actual_thresholds"],
+            default_projected_thresholds=config["projected_thresholds"],
+            rules=rules,
+        )
+        resolved[key] = quota_rule_fingerprint(
+            identity, rule, global_enabled=global_enabled,
+            quota_enabled=quota_enabled,
+        )
+    boundary = None
+    if ledger_state is not None and ledger_state["next_evaluation_at"]:
+        try:
+            boundary = _parse_utc(
+                ledger_state["next_evaluation_at"], "next_evaluation_at_utc")
+        except (TypeError, ValueError):
+            boundary = None
+    return _axes.alert_dirty_scope(
+        ledger_groups=(1,) if ledger_scope == _axes.SCOPE_GROUPS else (),
+        stored_fingerprints=stored,
+        resolved_fingerprints=resolved,
+        gate_before=(
+            None if ledger_state is None else ledger_state["alerts_enabled"]),
+        gate_after=bool(global_enabled and quota_enabled),
+        now=now,
+        next_evaluation_at=boundary,
+        defer_scheduled=defer_scheduled,
+    )
+
+
+def _blocks_missing_reverse_map(stats_conn: sqlite3.Connection) -> bool:
+    """True when any Codex block predates the reverse map.
+
+    A scoped sweep matches on ``physical_group_key``, so a NULL there would
+    silently escape it and the stale block would survive indefinitely. The
+    epoch rebuild (1005 for the column, 1006 as shipped) stamps every row, and
+    this is the guard that turns the
+    one shape it cannot reach — a block written by an older binary against an
+    already-current index — into a full pass rather than a missed one.
+    """
+    try:
+        return bool(stats_conn.execute(
+            "SELECT 1 FROM quota_window_blocks "
+            " WHERE source='codex' AND physical_group_key IS NULL LIMIT 1"
+        ).fetchone())
+    except sqlite3.Error:
+        return True
+
+
+def _normalized_physical_group(group: object) -> tuple[object, ...]:
+    """Coerce one caller-supplied physical group into its bound-parameter form.
+
+    ``window_minutes`` is an INTEGER column, so a string would compare unequal
+    under SQLite's type affinity rules and select nothing; the reset is
+    normalized to an ISO string because the predicate wraps it in
+    ``unixepoch()``, which accepts both the ``Z`` and ``+00:00`` spellings the
+    cache retains.
+    """
+    try:
+        root, limit_key, slot, minutes, reset = group  # type: ignore[misc]
+    except (TypeError, ValueError):
+        raise ValueError(
+            "physical_groups entries must be (source_root_key, "
+            "logical_limit_key, observed_slot, window_minutes, "
+            "canonical_reset) 5-tuples"
+        ) from None
+    if isinstance(minutes, bool) or not isinstance(minutes, int):
+        raise ValueError("physical_groups window_minutes must be an integer")
+    if isinstance(reset, dt.datetime):
+        if reset.tzinfo is None or reset.utcoffset() is None:
+            raise ValueError("physical_groups reset must be timezone-aware")
+        reset = _utc_iso(reset)
+    return (str(root), str(limit_key), str(slot), minutes, str(reset))
+
+
+def _iter_shard_rows(conn, shards):
+    for shard_sql, shard_params in shards:
+        yield from conn.execute(shard_sql, shard_params)
 
 
 def load_codex_quota_observations(
@@ -241,6 +735,7 @@ def load_codex_quota_observations(
     max_rows: int | None = None,
     physical_signatures: dict[str, str] | None = None,
     canonical_resets_between: "tuple[dt.datetime, dt.datetime] | None" = None,
+    physical_groups: "Iterable[tuple[str, str, str, int, str]] | None" = None,
 ) -> tuple[QuotaObservation, ...]:
     """Load only valid root-qualified S1 physical quota rows.
 
@@ -267,6 +762,33 @@ def load_codex_quota_observations(
     continuity fold below therefore still sees each retained window whole.  That
     is what lets the ingest-side spend-adoption pass bound itself to the windows
     one sync touched instead of materializing all history every hook tick.
+
+    ``physical_groups`` (public #5) is the EXACT group filter the incremental
+    projector expands a dirty ledger entry with: an iterable of
+    ``(source_root_key, logical_limit_key, observed_slot, window_minutes,
+    canonical reset ISO)`` tuples, each matched exactly in SQL by its own
+    indexed query. Passing an empty iterable selects nothing and returns ``()``;
+    ``None`` is unbounded, i.e. today's behaviour.
+
+    It is deliberately NOT ``canonical_resets_between`` in disguise. That bound
+    is an inclusive RANGE over one dimension, so across sparse dirty groups it
+    loads everything between the extremes, and even a single reset instant pulls
+    in every unrelated limit key and slot that happens to share it. The range
+    stays for its spend-adoption caller and is not repurposed here.
+
+    The reset member matches ``COALESCE(canonical_resets_at_utc,
+    resets_at_utc)``, never the raw column. Measured on the real store, raw
+    grouping yields 4,064 windows where the canonical anchor yields 608 — the
+    true block count. Matching the raw column fragments every physical window
+    about sevenfold, silently, and nothing fails: the pass simply loads a
+    fraction of each group and materializes a wrong block rather than a stale
+    one.
+
+    The tuples are RAW stored coordinates. Interpretation (snapping a jittered
+    ``window_minutes``, rewriting the limit key from ``observed_model``, folding
+    the account over the population) happens below, in Python, exactly as it
+    does on the unbounded path — so the caller is responsible for widening a
+    dirty group to every raw spelling that snaps onto it before asking for it.
     """
     for name, value in (
         ("captured_at_or_after", captured_at_or_after), ("active_at", active_at),
@@ -294,6 +816,23 @@ def load_codex_quota_observations(
     if max_rows is not None:
         if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows <= 0:
             raise ValueError("max_rows must be a positive integer or None")
+    group_filter: tuple[tuple[object, ...], ...] | None = None
+    if physical_groups is not None:
+        # Neither combination has a coherent meaning, and both would fail
+        # QUIETLY: `max_rows` appends its ORDER BY/LIMIT parameters after the
+        # group disjunction's, and `physical_signatures` must be accumulated
+        # from the COMPLETE root history or the certificate it stamps certifies
+        # a fraction of the evidence.
+        if max_rows is not None:
+            raise ValueError("physical_groups cannot be combined with max_rows")
+        if physical_signatures is not None:
+            raise ValueError(
+                "physical_groups cannot be combined with physical_signatures")
+        group_filter = tuple(sorted({
+            _normalized_physical_group(group) for group in physical_groups
+        }))
+        if not group_filter:
+            return ()
     requested = None if source_root_keys is None else {str(key) for key in source_root_keys}
     owns_conn = cache_conn is None
     if owns_conn:
@@ -315,9 +854,6 @@ def load_codex_quota_observations(
             }
             return required <= columns
 
-        has_session_entries = has_columns(
-            "codex_session_entries", {"source_path", "line_offset", "model"},
-        )
         has_observed_model = has_columns(
             "quota_window_snapshots", {"observed_model"},
         )
@@ -338,26 +874,21 @@ def load_codex_quota_observations(
             "canonical_resets_at_utc" if has_anchor
             else "NULL AS canonical_resets_at_utc"
         )
-        entry_lookup = (
-            "(SELECT entries.model FROM codex_session_entries AS entries "
-            "WHERE entries.source_path=quota_window_snapshots.source_path "
-            "AND entries.line_offset<=quota_window_snapshots.line_offset "
-            "ORDER BY entries.line_offset DESC LIMIT 1)"
+        # Public #5: the model is read from THIS table alone. There used to be a
+        # COALESCE onto the nearest preceding `codex_session_entries.model` at
+        # or before the snapshot's byte offset, for rows written before the
+        # column existed. That fallback made `quota_window_snapshots` an
+        # incomplete dependency set — an accounting row arriving later could
+        # move a window into a different model pool with no quota-row mutation
+        # for the change ledger to record — so cache migration 039 materialized
+        # exactly what it resolved and the fallback was removed. Ingest already
+        # stamps the sticky model onto every quota row it emits, so nothing
+        # forward-looking depended on it. A row with no determinable model stays
+        # NULL and reads as unscoped rather than being fabricated.
+        model_expr = (
+            "quota_window_snapshots.observed_model AS observed_model"
+            if has_observed_model else "NULL AS observed_model"
         )
-        # A file's terminal model is not evidence for an earlier quota sample:
-        # the model may change later in the rollout. Prefer the compact stamp,
-        # then only a nearest-prior accounting context for legacy rows. If
-        # neither exists, leave the pool unscoped rather than fabricating it.
-        fallback_model = entry_lookup if has_session_entries else "NULL"
-        selected_model = (
-            f"COALESCE(quota_window_snapshots.observed_model,{fallback_model})"
-            if has_observed_model and fallback_model != "NULL"
-            else (
-                "quota_window_snapshots.observed_model"
-                if has_observed_model else fallback_model
-            )
-        )
-        model_expr = f"{selected_model} AS observed_model"
         sql = """
             SELECT source, source_root_key, source_path, line_offset,
                    captured_at_utc, observed_slot, logical_limit_key, limit_id,
@@ -422,9 +953,40 @@ def load_codex_quota_observations(
             params.append(max_rows)
         else:
             sql += " ORDER BY source_root_key, captured_at_utc, resets_at_utc, source_path, line_offset"
+        # ONE SHARD PER GROUP (public #5), not one disjunction over all of them.
+        # Measured on a 211K-row / 608-group store: an OR over the five-member
+        # equality gives up and SCANs the table (2 groups 45.7ms, 3 groups
+        # 60.3ms, 8 groups 114.3ms), while the same groups as separate queries
+        # each seek `idx_qws_physical_group` and cost 0.6ms apiece (2 groups
+        # 1.3ms, 3 groups 1.8ms, 8 groups 4.8ms). The disjunction is therefore
+        # O(all history) — exactly the property this whole change removes — and
+        # the shape that keeps the pass proportional to the change is the boring
+        # one. It also keeps the bound-variable count trivially inside SQLite's
+        # 999 ceiling however many groups a burst dirties.
+        #
+        # The unbounded path stays a single shard with no extra predicate, so
+        # its SQL and its plan are byte-identical to before.
+        reset_group_expr = (
+            "COALESCE(canonical_resets_at_utc, resets_at_utc)"
+            if has_anchor else "resets_at_utc"
+        )
+        shards: list[tuple[str, tuple[object, ...]]] = []
+        if group_filter is None:
+            shards.append((sql, tuple(params)))
+        else:
+            head, _, tail = sql.partition(" ORDER BY ")
+            order_by = " ORDER BY " + tail if tail else ""
+            clause = (
+                " AND (source_root_key=? AND logical_limit_key=? "
+                "AND observed_slot=? AND window_minutes=? "
+                f"AND unixepoch({reset_group_expr})=unixepoch(?))"
+            )
+            shard_sql = f"{head}{clause}{order_by}"
+            for group in group_filter:
+                shards.append((shard_sql, (*params, *group)))
         result: list[QuotaObservation] = []
-        signature_tuples: dict[str, list[tuple[object, ...]]] = {}
-        for row in conn.execute(sql, tuple(params)):
+        signature_tuples: dict[str, dict[str, list[tuple[object, ...]]]] = {}
+        for row in _iter_shard_rows(conn, shards):
             required_text = (
                 "source", "source_root_key", "source_path", "captured_at_utc",
                 "observed_slot", "logical_limit_key", "resets_at_utc",
@@ -493,15 +1055,16 @@ def load_codex_quota_observations(
                 # must not suppress unrelated valid windows or accounting.
                 continue
             if physical_signatures is not None:
-                signature_tuples.setdefault(identity.source_root_key, []).append((
-                    identity.source_root_key,
-                    identity.logical_limit_key,
-                    _utc_iso(observation.captured_at),
-                    observation.source_path,
-                    observation.line_offset,
-                    observation.used_percent,
-                    _utc_iso(observation.resets_at),
-                ))
+                # Accumulated PER LOADING UNIT, not per root: the root signature
+                # is a digest over its sorted (unit key, unit digest) pairs, so
+                # a flat per-root list would produce a different value from the
+                # one the projector composes and stores — and the certificate
+                # compares them with `==`.
+                signature_tuples.setdefault(
+                    identity.source_root_key, {},
+                ).setdefault(
+                    _observation_unit_text(observation), [],
+                ).append(_signature_tuple(observation))
             if (
                 captured_at_or_after is not None
                 and observation.captured_at < captured_at_or_after
@@ -509,6 +1072,17 @@ def load_codex_quota_observations(
             ):
                 continue
             result.append(observation)
+        if group_filter is not None and len(shards) > 1:
+            # Each shard is ordered internally; their union is not. Restore the
+            # unbounded path's total order so a bounded load is byte-comparable
+            # with a full one.
+            result.sort(key=lambda observation: (
+                observation.identity.source_root_key,
+                observation.captured_at,
+                observation.resets_at,
+                observation.source_path,
+                observation.line_offset,
+            ))
         # Window-account continuity fold (#341 spec §2): adopt unidentified
         # observations into a same-physical-window identified account (exactly
         # one). Physical signatures above are account-independent (computed from
@@ -520,12 +1094,11 @@ def load_codex_quota_observations(
             physical_signatures.clear()
             roots = requested if requested is not None else set(signature_tuples)
             for root_key in roots:
-                encoded = json.dumps(
-                    sorted(signature_tuples.get(root_key, ())),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                physical_signatures[root_key] = hashlib.sha256(encoded).hexdigest()
+                physical_signatures[root_key] = _ledger.compose_root_signature(
+                    (unit, _ledger.group_digest(tuples))
+                    for unit, tuples in signature_tuples.get(
+                        root_key, {}).items()
+                )
             if captured_at_or_after is not None or max_rows is not None:
                 return load_codex_quota_observations(
                     source_root_keys=requested,
@@ -577,27 +1150,141 @@ def _historic_root_keys(conn: sqlite3.Connection) -> set[str]:
     return roots
 
 
-def _signature(observations: Iterable[QuotaObservation], source_root_key: str) -> str:
-    tuples = [
-        (
-            observation.identity.source_root_key,
-            observation.identity.logical_limit_key,
-            _utc_iso(observation.captured_at),
-            observation.source_path,
-            observation.line_offset,
-            observation.used_percent,
-            _utc_iso(observation.resets_at),
-        )
-        for observation in observations
+def _signature_tuple(observation: QuotaObservation) -> tuple[object, ...]:
+    """The per-observation tuple both the group digest and the old whole-root
+    signature are taken over. Unchanged, so a group's digest covers exactly the
+    rows it owns."""
+    return (
+        observation.identity.source_root_key,
+        observation.identity.logical_limit_key,
+        _utc_iso(observation.captured_at),
+        observation.source_path,
+        observation.line_offset,
+        observation.used_percent,
+        _utc_iso(observation.resets_at),
+    )
+
+
+def _observation_unit_text(observation: QuotaObservation) -> str:
+    """The serialized loading unit one observation belongs to.
+
+    The unit is the reverse map: a ledger entry names it from RAW coordinates
+    while a block stamps it from the INTERPRETED identity, and the two must
+    agree or the scoped sweep looks for a key nothing wrote.
+    """
+    identity = observation.identity
+    anchor = observation.canonical_resets_at or observation.resets_at
+    return _ledger.physical_group_key_text(_ledger.loading_unit_from_identity(
+        source_root_key=identity.source_root_key,
+        logical_limit_key=identity.logical_limit_key,
+        observed_slot=identity.observed_slot,
+        window_minutes=identity.window_minutes,
+        canonical_reset_iso=_utc_iso(anchor),
+    ))
+
+
+def _block_unit_text(block: QuotaBlock) -> str:
+    identity = block.identity
+    return _ledger.physical_group_key_text(_ledger.loading_unit_from_identity(
+        source_root_key=identity.source_root_key,
+        logical_limit_key=identity.logical_limit_key,
+        observed_slot=identity.observed_slot,
+        window_minutes=identity.window_minutes,
+        # `QuotaBlock.resets_at` IS the canonical anchor (#416 §4.1).
+        canonical_reset_iso=_utc_iso(block.resets_at),
+    ))
+
+
+def _group_digests(
+    observations: Iterable[QuotaObservation],
+) -> dict[str, str]:
+    """Digest every loading unit present in ``observations``.
+
+    Only the units the pass LOADED appear, which is exactly right: a bounded
+    pass re-derives the dirty units' digests and leaves every clean unit's
+    stored value alone, and the root signature is then composed from the union.
+    """
+    by_unit: dict[str, list[tuple[object, ...]]] = {}
+    for observation in observations:
+        by_unit.setdefault(_observation_unit_text(observation), []).append(
+            _signature_tuple(observation))
+    return {
+        unit: _ledger.group_digest(tuples) for unit, tuples in by_unit.items()
+    }
+
+
+def _signature(
+    observations: Iterable[QuotaObservation], source_root_key: str,
+) -> str:
+    """One root's physical signature, computed straight from observations.
+
+    The whole-history spelling of the composition: digest each loading unit the
+    root's observations fall into, then compose the root value from those pairs.
+    For a complete observation set this equals what the projector composes from
+    the STORED per-group digests, which is the property that lets a bounded pass
+    and a whole-history pass agree on the certificate.
+
+    Retained (rather than folded into the projector) because it is the honest
+    way for a caller holding observations — a test, a coherence probe — to ask
+    "what should this root's signature be", without going through the blocks.
+    """
+    digests = _group_digests(
+        observation for observation in observations
         if observation.identity.source_root_key == source_root_key
+    )
+    return _ledger.compose_root_signature(digests.items())
+
+
+def _root_group_pairs(
+    conn: sqlite3.Connection, source_root_key: str,
+) -> list[tuple[str, str]]:
+    """The live ``(group key, group digest)`` pairs of one root.
+
+    Read from the blocks rather than from the pass's observations, so a bounded
+    pass composes over the same complete set a whole-history pass does. Orphaned
+    blocks are excluded, which is what makes a swept-to-nothing group drop out
+    of the root's signature with no separate bookkeeping.
+    """
+    return [
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(
+            "SELECT DISTINCT physical_group_key, physical_group_digest "
+            "  FROM quota_window_blocks "
+            " WHERE source='codex' AND source_root_key=? "
+            "   AND orphaned_at IS NULL AND physical_group_key IS NOT NULL "
+            "   AND physical_group_digest IS NOT NULL",
+            (source_root_key,),
+        )
     ]
-    encoded = json.dumps(
-        sorted(tuples), ensure_ascii=False, separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
-def _block_params(block: QuotaBlock, generation: str) -> tuple[object, ...]:
+def _root_accounts(
+    conn: sqlite3.Connection, source_root_key: str,
+) -> set[str]:
+    """The account partitions one root currently projects.
+
+    Derived from the live blocks, not from the pass's observations (#341 +
+    public #5 Task 9): under a bounded pass an account whose only evidence lies
+    in a CLEAN window contributes no observation, so an observation-derived set
+    would drop it and its projection-state row would be left stale. The blocks
+    are the materialized truth, and a retired partition loses its blocks to the
+    sweep, so this both keeps and retires the right rows.
+    """
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT account_key FROM quota_window_blocks "
+            " WHERE source='codex' AND source_root_key=? "
+            "   AND orphaned_at IS NULL",
+            (source_root_key,),
+        )
+        if row[0] is not None
+    }
+
+
+def _block_params(
+    block: QuotaBlock, generation: str, unit: str, digest: str,
+) -> tuple[object, ...]:
     latest = block.observations[-1]
     identity = block.identity
     return (
@@ -606,7 +1293,7 @@ def _block_params(block: QuotaBlock, generation: str) -> tuple[object, ...]:
         identity.limit_name, _utc_iso(block.resets_at), _utc_iso(block.nominal_start_at),
         _utc_iso(block.first_observed_at), _utc_iso(block.last_observed_at),
         block.first_percent, block.current_percent, latest.source_path,
-        latest.line_offset, generation, identity.account_key,
+        latest.line_offset, generation, identity.account_key, unit, digest,
     )
 
 
@@ -618,8 +1305,9 @@ _BLOCK_UPSERT = """
        (source, source_root_key, logical_limit_key, observed_slot,
         window_minutes, limit_id, limit_name, resets_at_utc, nominal_start_at_utc,
         first_observed_at_utc, last_observed_at_utc, first_percent, current_percent,
-        last_source_path, last_line_offset, generation, orphaned_at, account_key)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)
+        last_source_path, last_line_offset, generation, orphaned_at, account_key,
+        physical_group_key, physical_group_digest)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)
     ON CONFLICT(source, source_root_key, account_key, logical_limit_key,
                 observed_slot, window_minutes, resets_at_utc) DO UPDATE SET
       limit_id=excluded.limit_id, limit_name=excluded.limit_name,
@@ -628,7 +1316,9 @@ _BLOCK_UPSERT = """
       last_observed_at_utc=excluded.last_observed_at_utc,
       first_percent=excluded.first_percent, current_percent=excluded.current_percent,
       last_source_path=excluded.last_source_path, last_line_offset=excluded.last_line_offset,
-      generation=excluded.generation, orphaned_at=NULL
+      generation=excluded.generation, orphaned_at=NULL,
+      physical_group_key=excluded.physical_group_key,
+      physical_group_digest=excluded.physical_group_digest
 """
 
 
@@ -660,7 +1350,55 @@ def _milestone_params(
     )
 
 
-def _orphan_unseen(conn: sqlite3.Connection, roots: set[str], generation: str, now_iso: str) -> tuple[int, int]:
+#: Restricts a sweep statement to blocks whose loading unit is dirty. Chunked by
+#: the caller so the ``IN`` list stays inside SQLite's variable budget.
+_UNIT_SCOPE_BLOCKS = " AND physical_group_key IN ({placeholders})"
+
+#: The same restriction for the child tables, expressed through the block that
+#: owns the row. Blocks are ORPHANED, never deleted, so the join still resolves
+#: for a window whose members all disappeared — which is precisely the case the
+#: sweep exists to catch.
+_UNIT_SCOPE_VIA_BLOCK = """
+ AND EXISTS (SELECT 1 FROM quota_window_blocks AS scope
+              WHERE scope.source={alias}.source
+                AND scope.source_root_key={alias}.source_root_key
+                AND scope.account_key={alias}.account_key
+                AND scope.logical_limit_key={alias}.logical_limit_key
+                AND scope.observed_slot={alias}.observed_slot
+                AND scope.window_minutes={alias}.window_minutes
+                AND scope.resets_at_utc={alias}.resets_at_utc
+                AND scope.physical_group_key IN ({placeholders}))
+"""
+
+
+def _chunk(values: Sequence[str], size: int):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _orphan_unseen(
+    conn: sqlite3.Connection, roots: set[str], generation: str, now_iso: str,
+    *, units: "frozenset[str] | None" = None,
+) -> tuple[int, int]:
+    """Orphan whatever this generation did not re-stamp.
+
+    ``units`` is public #5's scoping (spec §2). ``None`` keeps the whole-root
+    sweep, which is what the full path, a rebuild and an interpretation-version
+    bump all want. A non-``None`` set runs the SAME SQL over a bounded root set
+    instead of a different sweep, which is what preserves the child classes a
+    block-only set difference would miss: a milestone threshold that disappears
+    inside a still-present window, an account-specific block variant that
+    vanishes while the physical window remains, and the account-qualified
+    ``quota_threshold_events`` orphan/unorphan reconciliation.
+
+    Two cases a scoped sweep structurally cannot see are handled on the full
+    path only, which runs on an interpretation bump, on rebuild and on
+    ``force_full``: blocks whose physical group is absent from the cache
+    entirely, and milestones on historic roots no longer active.
+    ``_historic_root_keys`` continues to feed that path.
+    """
+    if units is not None:
+        return _orphan_unseen_scoped(conn, units, generation, now_iso)
     if not roots:
         return (0, 0)
     placeholders = ",".join("?" for _ in roots)
@@ -701,6 +1439,63 @@ def _orphan_unseen(conn: sqlite3.Connection, roots: set[str], generation: str, n
         event_sql,
         (generation, now_iso, *sorted(roots)),
     )
+    return (int(blocks), int(milestones))
+
+
+def _orphan_unseen_scoped(
+    conn: sqlite3.Connection, units: "frozenset[str]", generation: str,
+    now_iso: str,
+) -> tuple[int, int]:
+    """The whole-root sweep, bounded to a set of dirty loading units.
+
+    Same three statements, same semantics, one extra predicate each. The child
+    tables are scoped THROUGH the block that owns them rather than by a column
+    of their own: the block's identity columns are the milestone's and the
+    event's, blocks are orphaned rather than deleted, so the join keeps
+    resolving for a window whose members all disappeared.
+    """
+    if not units:
+        return (0, 0)
+    keys = sorted(units)
+    blocks = 0
+    milestones = 0
+    for chunk in _chunk(keys, _SWEEP_KEY_CHUNK):
+        placeholders = ",".join("?" for _ in chunk)
+        blocks += conn.execute(
+            "UPDATE quota_window_blocks SET orphaned_at=COALESCE(orphaned_at, ?) "
+            "WHERE source='codex' AND generation<>?"
+            + _UNIT_SCOPE_BLOCKS.format(placeholders=placeholders),
+            (now_iso, generation, *chunk),
+        ).rowcount
+        milestones += conn.execute(
+            "UPDATE quota_percent_milestones AS milestones "
+            "SET orphaned_at=COALESCE(orphaned_at, ?) "
+            "WHERE milestones.source='codex' AND milestones.generation<>?"
+            + _UNIT_SCOPE_VIA_BLOCK.format(
+                alias="milestones", placeholders=placeholders),
+            (now_iso, generation, *chunk),
+        ).rowcount
+        # Terminal evidence: never recreated, only marked. Same CASE as the
+        # whole-root sweep — the account-qualified join included — restricted to
+        # events whose owning block sits in a dirty unit.
+        conn.execute(
+            "UPDATE quota_threshold_events AS events "
+            "   SET orphaned_at=CASE WHEN EXISTS ("
+            "       SELECT 1 FROM quota_window_blocks AS blocks "
+            "        WHERE blocks.source=events.source "
+            "          AND blocks.source_root_key=events.source_root_key "
+            "          AND blocks.account_key=events.account_key "
+            "          AND blocks.logical_limit_key=events.logical_limit_key "
+            "          AND blocks.observed_slot=events.observed_slot "
+            "          AND blocks.window_minutes=events.window_minutes "
+            "          AND blocks.resets_at_utc=events.resets_at_utc "
+            "          AND blocks.generation=?"
+            "   ) THEN NULL ELSE COALESCE(events.orphaned_at, ?) END "
+            " WHERE events.source='codex'"
+            + _UNIT_SCOPE_VIA_BLOCK.format(
+                alias="events", placeholders=placeholders),
+            (generation, now_iso, *chunk),
+        )
     return (int(blocks), int(milestones))
 
 
@@ -1111,7 +1906,10 @@ def _reanchor_terminal_events(conn: sqlite3.Connection, block) -> None:
 def _apply_quota_projection_rows(
     conn, *, observations, active_roots, now, now_iso,
     sink, alert_eligible_roots, journal_emit=None, journal_disarm=None,
-    journal_terminal=None, holder=None,
+    journal_terminal=None, holder=None, dirty_units=None,
+    ledger_watermark=None, alerts_enabled=None,
+    stored_next_evaluation_at=None, stored_last_full_pass_at=None,
+    stored_alerts_enabled=None, consume_alert_axes=True,
 ):
     """Transaction-neutral quota projection apply (spec §5.3 "projection").
 
@@ -1123,23 +1921,59 @@ def _apply_quota_projection_rows(
     emitter) AND the rebuild re-materialization pass (``sink=None``,
     ``journal_emit=None``, ``alert_eligible_roots`` empty) so the two never drift.
     ``holder`` (optional) captures the certificate signatures + result for the
-    live caller; rebuild passes ``None``."""
+    live caller; rebuild passes ``None``.
+
+    ``dirty_units`` (public #5) is the BOUNDED pass: a set of serialized loading
+    units whose complete current membership ``observations`` carries. ``None`` is
+    the whole-history pass — every other caller, the rebuild, an
+    interpretation-version bump and ``force_full``. It changes exactly two
+    things: the sweep is scoped to those units, and the root signature is
+    composed from the stored per-group digests rather than recomputed from
+    scratch. Everything else runs identically, which is what keeps the two paths
+    from drifting.
+
+    ``consume_alert_axes`` says whether this pass may ADVANCE the two
+    non-dirtiness alert axes it stores (``alerts_enabled``,
+    ``next_evaluation_at``) or must carry the stored values through untouched,
+    the way ``last_full_pass_at`` is carried through by a bounded pass. False
+    means "this pass did not do the work those axes exist to trigger", and there
+    are two such passes. A REPORTING-ONLY pass (no alert-eligible roots — the
+    ``_codex-quota-verify`` worker, the dashboard tick, every ``codex quota``
+    invocation) returns from ``_evaluate_quota_alerts`` at
+    ``if not alert_eligible_roots`` before a single threshold is examined, so
+    stamping the gate would retire a delivery-gate ENABLE with no arming row and
+    no ``suppressed_backfill`` written, and the axis could never re-fire because
+    ``gate_before`` now reads True. A hook tick that DEFERRED axis 4 is the
+    other. ``stored_alerts_enabled`` / ``stored_next_evaluation_at`` are what it
+    carries through.
+
+    ``ledger_watermark`` is stamped INSIDE this transaction. That is deliberate:
+    ``run_stats_ingest`` is the sole stats writer, so advancing it after the
+    commit would need a second cycle — and atomicity is the stronger guarantee
+    anyway. A crash replays the range, which is safe because re-materializing a
+    group is idempotent.
+    """
     historic_roots = _historic_root_keys(conn)
     roots_to_reconcile = active_roots | historic_roots
     if not roots_to_reconcile:
         return
     generation = secrets.token_hex(16)
     blocks = build_blocks(observations)
+    digests = _group_digests(observations)
     for block in blocks:
         _reanchor_terminal_events(conn, block)
-        conn.execute(_BLOCK_UPSERT, _block_params(block, generation))
+        unit = _block_unit_text(block)
+        conn.execute(
+            _BLOCK_UPSERT,
+            _block_params(block, generation, unit, digests.get(unit, "")),
+        )
         for milestone in percent_milestones(block):
             conn.execute(
                 _MILESTONE_UPSERT,
                 _milestone_params(block, milestone, generation),
             )
     blocks_orphaned, milestones_orphaned = _orphan_unseen(
-        conn, roots_to_reconcile, generation, now_iso,
+        conn, roots_to_reconcile, generation, now_iso, units=dirty_units,
     )
     queued = _evaluate_quota_alerts(
         conn, observations=observations,
@@ -1151,22 +1985,28 @@ def _apply_quota_projection_rows(
     # transaction.  A pre-commit failure rolls all projection updates back;
     # a retry sees the prior complete generation or rederives it.
     #
-    # projection_state is (source_root_key, account_key)-keyed (#341 spec §2). The
-    # active account identities are derived from the FOLDED observations (so an
-    # adopted-unidentified window contributes its adopting account, not the raw
-    # `unattributed` stamp); a root with no observations still stamps one
-    # `unattributed` row so its coherence signature is present (byte-stable with
-    # the prior per-root behavior for a single-account install). The
-    # physical_signature stays PER-ROOT (account-independent) — it certifies the
-    # root's physical cache evidence and matches the per-root cache certificate.
-    accounts_by_root: dict[str, set[str]] = {root: set() for root in active_roots}
-    for observation in observations:
-        root = observation.identity.source_root_key
-        if root in accounts_by_root:
-            accounts_by_root[root].add(observation.identity.account_key)
+    # projection_state is (source_root_key, account_key)-keyed (#341 spec §2).
+    # The account partitions and the root signature are both derived from the
+    # LIVE BLOCKS rather than from this pass's observations (public #5 Task 9):
+    # under a bounded pass an account whose only evidence lies in a clean window
+    # contributes nothing to `observations`, so an observation-derived set would
+    # drop it and leave its row carrying a stale signature. A retired partition
+    # loses its blocks to the sweep above, so the same read both keeps and
+    # retires the right rows — and the DELETE below removes what it no longer
+    # names. A root with no blocks at all still stamps one `unattributed` row,
+    # byte-stable with the prior behaviour.
+    signatures: dict[str, str] = {}
     for root_key in sorted(active_roots):
-        accounts = accounts_by_root[root_key] or {_lib_accounts.UNATTRIBUTED}
-        root_signature = _signature(observations, root_key)
+        accounts = _root_accounts(conn, root_key) or {_lib_accounts.UNATTRIBUTED}
+        root_signature = _ledger.compose_root_signature(
+            _root_group_pairs(conn, root_key))
+        signatures[root_key] = root_signature
+        placeholders = ",".join("?" for _ in accounts)
+        conn.execute(
+            "DELETE FROM quota_projection_state WHERE source_root_key=? "
+            "AND account_key NOT IN (" + placeholders + ")",
+            (root_key, *sorted(accounts)),
+        )
         for account_key in sorted(accounts):
             conn.execute(
                 """INSERT INTO quota_projection_state
@@ -1179,14 +2019,59 @@ def _apply_quota_projection_rows(
                      completed_at_utc=excluded.completed_at_utc""",
                 (root_key, account_key, generation, root_signature, now_iso),
             )
+    # The state row is stamped even when ``ledger_watermark`` is ``None`` — a
+    # cache too old to carry the change log, where ``_ledger_max_seq`` cannot
+    # report a sequence. Guarding this whole block on it left such a store with
+    # no row at all, so ``_full_verification_due`` read True forever and it was
+    # permanently "overdue" for a pass it had just run. Harmless in outcome (no
+    # ledger means every pass is full anyway) but dishonest, and it makes the
+    # deadline unusable as a signal. ``0`` is the right watermark there: it is
+    # the only sequence a ledgerless cache can claim to have consumed, and if
+    # the log later appears the pass replays from its first entry, which is
+    # idempotent.
+    #
+    # Axis 4 (spec §3): an observation captured in the FUTURE is skipped as
+    # a threshold qualifier and becomes eligible when wall time passes it,
+    # with no row mutation for the ledger to record. Persisting the earliest
+    # such instant is what turns that into a dirtiness signal.
+    stored_boundary = None
+    if stored_next_evaluation_at:
+        try:
+            stored_boundary = _parse_utc(
+                stored_next_evaluation_at, "next_evaluation_at_utc")
+        except (TypeError, ValueError):
+            stored_boundary = None
+    #
+    # Recording a NEWLY seen future capture is safe from any pass, so that side
+    # stays unconditional; only RETIRING a matured instant is gated, because
+    # that is the half that claims an evaluation happened.
+    boundary = _axes.next_evaluation_boundary(
+        capture_times=[
+            observation.captured_at for observation in observations],
+        now=now, stored=stored_boundary, retain_due=not consume_alert_axes,
+    )
+    _store_ledger_state(
+        conn, watermark=0 if ledger_watermark is None else ledger_watermark,
+        alerts_enabled=(
+            alerts_enabled if consume_alert_axes else stored_alerts_enabled),
+        next_evaluation_at=None if boundary is None else _utc_iso(boundary),
+        # Spec §2: EVERY full pass stamps the verification deadline,
+        # whatever triggered it — the interval itself, a rebuild, an
+        # interpretation bump, `force_full`, or a dirty-unit burst
+        # overflow. `dirty_units is None` is exactly "this pass was
+        # whole-history", so the stamp cannot drift from the thing it
+        # certifies. A bounded pass carries the stored value through
+        # untouched; overwriting it would let an install that never
+        # bursts postpone verification forever.
+        last_full_pass_at=(
+            now_iso if dirty_units is None else stored_last_full_pass_at),
+    )
     if sink is not None:
         # Set-then-dispatch: all claims committed with the cycle before the
         # cycle's post-commit ALERT_DISPATCHER fires them (spec §5.2 step 6).
         sink.extend(queued)
     if holder is not None:
-        holder["signatures"] = {
-            root_key: _signature(observations, root_key) for root_key in active_roots
-        }
+        holder["signatures"] = signatures
         holder["result"] = QuotaProjectionResult(
             generation=generation,
             blocks_upserted=len(blocks),
@@ -1226,12 +2111,102 @@ def rematerialize_quota_projection_for_rebuild(stats_conn, *, now=None) -> None:
         observations = load_codex_quota_observations(
             source_root_keys=None, cache_conn=cache,
         )
+        # A rebuild is a whole-history pass by definition, so it also
+        # initializes the watermark: every ledger entry up to here is already
+        # reflected in what it just materialized, and leaving the watermark at
+        # zero would make the next tick replay the entire ledger for nothing.
+        watermark = _ledger_max_seq(cache)
     finally:
         cache.close()
     _apply_quota_projection_rows(
         stats_conn, observations=observations, active_roots=active_roots,
         now=now, now_iso=now_iso, sink=None,
         alert_eligible_roots=frozenset(), journal_emit=None, holder=None,
+        dirty_units=None, ledger_watermark=watermark,
+        # Reporting-only, but NOT a carry-through: this writes onto a freshly
+        # rebuilt index where there is no stored axis state to preserve, and
+        # recording the boundary from complete evidence is exactly what the
+        # rebuilt row should start life with. A gate of NULL is the fail-safe
+        # value — `gate_before is not True` makes the next alert-eligible pass
+        # widen and do the activation.
+        consume_alert_axes=True,
+    )
+
+
+def _resolve_pass_scope(
+    cache_conn: sqlite3.Connection, *, force_full: bool,
+    ledger_state: "dict | None", ledger_high: "int | None", watermark: int,
+    active_roots: set[str], stale_reverse_map: bool,
+    verification_due: bool = False,
+) -> "tuple[dict | None, int | None]":
+    """Decide between a bounded pass and a whole-history one.
+
+    Returns ``(scope, watermark_target)``. ``scope`` is ``None`` for a full pass
+    or a dict carrying the exact raw groups to load and the loading units to
+    sweep. ``watermark_target`` is the sequence the pass will stamp, or ``None``
+    when there is no ledger to stamp against.
+
+    Every branch that is not provably safe takes the full path. In order:
+
+    * ``force_full`` and a cache with no ledger table are explicit requests.
+    * No stored state at all — a first run, or a rebuilt index — has no consumed
+      range to trust.
+    * A stored interpretation version that is not the current one means the
+      interpreted KEYS may have moved with no row mutation to observe, which is
+      exactly what the ledger cannot see.
+    * ``ledger_high < watermark`` means the ledger was reset under us (a deleted
+      and recreated cache restarts ``AUTOINCREMENT`` at 1), so the stored
+      watermark now points past entries that describe different mutations.
+    * A block with no reverse map cannot be reached by a scoped sweep.
+    * ``verification_due`` is the periodic whole-history pass (spec §2): the
+      scoped sweep cannot see a block whose physical group left the cache
+      entirely, nor a milestone on a historic root, so the interval is what
+      bounds how long either may survive.
+    * More dirty units than ``_MAX_INCREMENTAL_UNITS`` is a burst — a rebuild or
+      a first ingest — where one unbounded scan beats N indexed seeks.
+    """
+    if force_full or ledger_high is None or verification_due:
+        return None, ledger_high
+    if (
+        ledger_state is None
+        or ledger_state["interpretation_version"]
+        != _CODEX_QUOTA_INTERPRETATION_VERSION
+        or ledger_high < watermark
+        or stale_reverse_map
+    ):
+        return None, ledger_high
+    rows = _ledger_rows_after(cache_conn, watermark, ledger_high)
+    raw_groups = _ledger.expand_dirty_groups(rows)
+    # Spec §2: "Liveness may narrow what the LOADER is asked to fetch, because
+    # an inactive root's shard returns nothing anyway; it must never narrow what
+    # the SWEEP is asked to reconcile." A dirty unit names a group to sweep even
+    # when its root has left `codex_source_roots` — that is precisely the case
+    # where its blocks must be orphaned. Deriving `units` from the FILTERED set
+    # dropped the departed root's ledgered deletions while still pruning their
+    # ledger entries, stranding those blocks permanently in
+    # `_historic_root_keys`, the projection state and the dashboard, which is a
+    # regression against the pre-change whole-root `_orphan_unseen`.
+    units = {
+        _ledger.physical_group_key_text(_ledger.loading_unit_from_raw(group))
+        for group in raw_groups
+    }
+    if len(units) > _MAX_INCREMENTAL_UNITS:
+        return None, ledger_high
+    load_groups = raw_groups
+    if active_roots:
+        load_groups = frozenset(
+            group for group in raw_groups if group[0] in active_roots)
+    return (
+        {
+            # The loader matches RAW stored coordinates, so the request has to
+            # enumerate every spelling that snaps onto a dirty group. One minute
+            # of weekly jitter lives in BOTH the limit key and a column, so two
+            # raw groups can interpret into one window and loading only the
+            # mutated one would hand the fold a PARTIAL population.
+            "raw_groups": _ledger.snap_equivalent_raw_groups(load_groups),
+            "units": units,
+        },
+        ledger_high,
     )
 
 
@@ -1240,6 +2215,8 @@ def reconcile_codex_quota_projection(
     source_root_keys: Iterable[str] | None = None,
     alert_eligible_root_keys: Iterable[str] = (),
     now: dt.datetime | None = None,
+    force_full: bool = False,
+    full_pass: str = "inline",
     _before_stats_commit: Callable[[], None] | None = None,
     _after_stats_commit: Callable[[], None] | None = None,
 ) -> QuotaProjectionResult:
@@ -1248,7 +2225,65 @@ def reconcile_codex_quota_projection(
     Reporting reconciles every configured root. Threshold evaluation is limited
     to explicitly lifecycle-eligible roots, so read-only quota commands pass an
     empty set and never create an alert claim or activation boundary.
+
+    By default the pass is BOUNDED to what the change ledger says moved since
+    the stored watermark (public #5). ``force_full=True`` bypasses the ledger
+    entirely and re-materializes everything, which is what the equivalence
+    oracle compares against and what an operator gets from a rebuild.
+
+    ``full_pass`` decides where a WHOLE-HISTORY pass runs. ``"inline"`` is every
+    caller but the hook: the pass happens on this call, which is what makes the
+    verification deadline "satisfied by whichever caller reaches it first".
+    ``"defer"`` is the hook's, and the rule there is absolute — the hook path
+    never runs a whole-history pass inline, whatever put it there. Every route
+    ``_resolve_pass_scope`` has into one (an absent or rebuilt projector state,
+    an interpretation-version bump, a reset ledger, a block missing its reverse
+    map, a dirty-unit burst, a ledgerless cache, and the periodic interval) is
+    handed to the detached ``_codex-quota-verify`` worker instead.
+
+    Two deliberate carve-outs stay inline. Only the first is unreachable from
+    the hook; the second is reachable and stays inline anyway, which is a
+    different claim and the honest one.
+
+    ``force_full`` still runs inline, and no hook caller passes it. It is a
+    programmatic "do it now" — the equivalence oracle and the rebuild path both
+    need it to mean that.
+
+    The spec §3 alert axes also still widen inline, and they ARE reachable here:
+    every hook tick that clears the 15-second lifecycle throttle passes a
+    non-empty ``alert_eligible_root_keys``, so ``alert_scope`` is resolved and
+    the widening branch is live on all of them. That is accepted for axes 2 and
+    3 — a rule change or a delivery-gate ENABLE must write ``suppressed_backfill``
+    terminal rows for already-satisfied blocks rather than dispatch history, and
+    it can only do that by SEEING those blocks; the worker runs reporting-only
+    with no alert-eligible roots, so deferring would break the pass rather than
+    delay it. Both fire on a config change the user just made, so the cost is
+    bounded and attributable.
+
+    Axis 4 is the exception and is DEFERRED under ``"defer"``. It fires on wall
+    clock, not on a config change: a capture stamped in the future (clock skew
+    across a sleep/resume, an NTP correction) sets the boundary, and the first
+    tick after wall time passes it would otherwise run the whole-history load
+    and apply on the blocking path with nothing to have predicted it. A BOUNDED
+    tick carries the stored boundary through untouched instead.
+
+    A tick that widened to whole-history for axis 2 or 3 anyway does retire it,
+    because it did look: at every observation of every active root. Withholding
+    that was an absorbing state rather than a conservative one — the widening
+    routes are exactly the ones that also need to stamp ``alerts_enabled``, so
+    declining both left the same scope standing and repeated the whole-history
+    pass inline on every subsequent tick.
+
+    What is NOT closed: a hook-only install with a steady enabled gate,
+    unchanged rules and a quiet ledger never produces a qualifying pass, so a
+    matured boundary is retained indefinitely. Bounded in cost (the tick stays
+    bounded and fast; the window is re-evaluated the moment it goes
+    ledger-dirty) and under-alerting in direction, but open.
     """
+    if full_pass not in ("inline", "defer"):
+        raise ValueError(
+            "reconcile_codex_quota_projection: full_pass must be "
+            "'inline' or 'defer'")
     if now is None:
         now = dt.datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
@@ -1277,38 +2312,233 @@ def reconcile_codex_quota_projection(
             )
             physical_sequence = codex_physical_mutation_seq(cache)
             certificate = load_codex_quota_projection_certificate(cache)
+            ledger_high = _ledger_max_seq(cache)
         finally:
             cache.commit()
+        # ONE stats read decides the whole shape of the pass: whether the
+        # short-circuit fires, and if not, whether the pass is bounded.
+        ledger_state = None
+        has_arming = False
+        stale_reverse_map = True
+        alert_scope = None
+        stats_conn = _cctally_core.open_db()
+        try:
+            ledger_state = _ledger_state(stats_conn)
+            has_arming = bool(stats_conn.execute(
+                "SELECT 1 FROM quota_alert_arming "
+                "WHERE source='codex' LIMIT 1"
+            ).fetchone())
+            stale_reverse_map = _blocks_missing_reverse_map(stats_conn)
+            signatures_match = (
+                certificate is not None
+                and _stats_projection_signatures_match(
+                    stats_conn, active_roots, certificate[1])
+            )
+            if alert_eligible_roots:
+                alert_scope = _resolve_alert_scope(
+                    stats_conn, ledger_scope=_axes.SCOPE_GROUPS, now=now,
+                    ledger_state=ledger_state,
+                    global_enabled=global_alerts_enabled,
+                    quota_enabled=quota_alerts_enabled,
+                    rules=_rules, config=_config,
+                    defer_scheduled=(full_pass == "defer"),
+                )
+        finally:
+            stats_conn.close()
+
+        watermark = 0 if ledger_state is None else ledger_state["watermark"]
         # Short-circuit: when nothing is alert-eligible and the certificate
         # proves the cache physical state is current AND the stats-side
         # projection still matches it (F1), the ~2.9 s observation load and the
         # whole reconcile are provably a no-op. Any missed concurrent write
         # leaves cur_seq != cert_seq (or a stats-signature mismatch) on the next
         # call, so the scheme is self-healing.
-        if not alert_eligible_roots and certificate is not None:
+        #
+        # The unconsumed-ledger clause is the third leg, and it closes a hole
+        # the certificate alone cannot see: a writer that mutates
+        # `quota_window_snapshots` WITHOUT advancing the physical mutation
+        # sequence (migration 028 does exactly this, and the journal cache
+        # applier did too) leaves the certificate reading as current while real
+        # interpretation drift sits unprocessed. The triggers recorded it, so
+        # the ledger knows even when the sequence does not.
+        #
+        # The projector's own state has to be current too. A stale
+        # interpretation version or a block with no reverse map means the next
+        # pass MUST do work, and skipping on the certificate alone would defer
+        # that repair forever — the certificate cannot see either condition.
+        #
+        # The periodic verification joins them for the same reason. A skipped
+        # pass never stamps the deadline, so letting the short-circuit fire
+        # while it is overdue would leave every subsequent tick overdue too —
+        # the interval would never elapse into anything.
+        verification_due = _full_verification_due(ledger_state, now)
+        projector_state_current = (
+            ledger_state is not None
+            and ledger_state["interpretation_version"]
+            == _CODEX_QUOTA_INTERPRETATION_VERSION
+            and not stale_reverse_map
+        )
+        if (
+            verification_due
+            and full_pass == "defer"
+            # The interval alone. When the projector state is otherwise current
+            # this tick can still do its ordinary BOUNDED work after handing the
+            # verification off, which is why this gate is separate from the
+            # catch-all below: deferring here costs nothing, deferring there
+            # costs this tick's incremental progress.
+            and projector_state_current
+            and ledger_high is not None
+            and ledger_high >= watermark
+        ):
+            # The bounded ingest leg made every part of the hook tick bounded
+            # except this one. The spec's escape hatch — "whichever caller
+            # reaches the deadline first, a dashboard tick or a `codex quota`
+            # invocation" — does not exist for a hook-only install, which is
+            # precisely the reporter's shape, so once a day the whole-history
+            # reconcile would land on the blocking hook path against Codex's
+            # 30-second timeout and fail acceptance criterion 3 for the very
+            # user who reported the bug. Hand it to a detached worker.
+            #
+            # Skipping it on a failed spawn is deliberate: the deadline is only
+            # stamped by a pass that COMPLETES, so the next tick is still due
+            # and retries (throttled). One missed daily verification is bounded
+            # staleness; a 30-second hook stall is the reported defect.
+            _defer_codex_quota_verification()
+            verification_due = False
+        ledger_state_current = projector_state_current and not verification_due
+        if (
+            not force_full
+            and not alert_eligible_roots
+            and certificate is not None
+            and ledger_high is not None
+            and ledger_high == watermark
+            and ledger_state_current
+        ):
             cert_seq, cert_sigs = certificate
             if physical_sequence == cert_seq and active_roots <= set(cert_sigs):
-                stats_conn = _cctally_core.open_db()
-                try:
-                    has_arming = bool(stats_conn.execute(
-                        "SELECT 1 FROM quota_alert_arming "
-                        "WHERE source='codex' LIMIT 1"
-                    ).fetchone())
-                    can_skip_delivery = delivery_enabled or not has_arming
-                    if (
-                        can_skip_delivery
-                        and _stats_projection_signatures_match(
-                            stats_conn, active_roots, cert_sigs
-                        )
-                    ):
-                        return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
-                finally:
-                    stats_conn.close()
-        observations = load_codex_quota_observations(
-            source_root_keys=active_roots, cache_conn=cache,
+                can_skip_delivery = delivery_enabled or not has_arming
+                if can_skip_delivery and signatures_match:
+                    return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+
+        dirty_units, watermark_target = _resolve_pass_scope(
+            cache,
+            force_full=force_full,
+            ledger_state=ledger_state,
+            ledger_high=ledger_high,
+            watermark=watermark,
+            active_roots=active_roots,
+            stale_reverse_map=stale_reverse_map,
+            verification_due=verification_due,
         )
+        if dirty_units is None and full_pass == "defer" and not force_full:
+            # The rule, for every OTHER route into a whole-history pass: an
+            # absent or freshly rebuilt projector state, an interpretation-
+            # version bump, a reset ledger, a block missing its reverse map, a
+            # dirty-unit burst, and a cache too old to carry the change log.
+            #
+            # The rebuilt-state route is the one that matters, and it is not
+            # hypothetical: this feature bumps `STATS_INDEX_EPOCH`, so every
+            # upgrading install rebuilds stats.db from the journal on first
+            # open. Measured on a real 211K-observation store that rebuild alone
+            # cost 76.45s of an 82.05s tick. Running the whole-history pass
+            # inline on top of it, on a path Codex kills at 30 seconds, means
+            # `run_stats_ingest` commits nothing, `last_full_pass_at` is never
+            # stamped, and the next tick repeats it — a non-converging
+            # 30-second-per-turn loop, which is the reported defect delivered by
+            # the fix.
+            #
+            # Unlike the interval gate above, this one performs NO projection
+            # work at all: without a trustworthy watermark there is no bounded
+            # pass to fall back to. That leaves the projection transiently
+            # missing rather than merely stale, and it is accepted — the worker
+            # converges it (throttled retry on failure), every non-hook caller
+            # still runs inline, and a 30-second blocking tick is not an option.
+            _defer_codex_quota_verification()
+            return QuotaProjectionResult(None, 0, 0, 0, 0, 0, 0)
+        # Axis 2/3/4 (spec §3): alert state is not a function of window
+        # dirtiness. A rule change and a delivery-gate ENABLE each require a
+        # semantic pass over the affected identities with no observation having
+        # moved — and activation must write `suppressed_backfill` terminal rows
+        # rather than dispatch history, which it can only do if it actually sees
+        # the blocks. Widening a bounded pass is always safe; missing an
+        # identity is not. Both are driven by a configuration change the user
+        # just made, so the widening is bounded and expected, and it stays
+        # inline even under `defer`.
+        #
+        # Axis 4 does NOT, and the honest statement about it is "reachable from
+        # the hook, and therefore deferred" rather than "unreachable". Every
+        # tick that clears the 15s lifecycle throttle carries eligible roots, so
+        # this branch is live on all of them; a future-clocked capture (clock
+        # skew across a sleep/resume, an NTP correction) would then put one
+        # unannounced whole-history load and apply on the blocking path the
+        # first time wall time passed the boundary. `_resolve_alert_scope`
+        # records it as `REASON_SCHEDULED_DEFERRED` instead, and the boundary is
+        # carried through below so the next pass that CAN afford the widening
+        # still sees it.
+        if (
+            dirty_units is not None
+            and alert_scope is not None
+            and alert_scope.widens(_axes.SCOPE_GROUPS)
+        ):
+            dirty_units = None
+        if dirty_units is None:
+            observations = load_codex_quota_observations(
+                source_root_keys=active_roots, cache_conn=cache,
+            )
+        else:
+            observations = load_codex_quota_observations(
+                source_root_keys=active_roots, cache_conn=cache,
+                physical_groups=dirty_units["raw_groups"],
+            )
+            # A unit whose members ALL disappeared loads nothing, so the loaded
+            # observations alone would not name it and its blocks would never be
+            # swept. The ledger-derived set is authoritative for the sweep; the
+            # loaded set is unioned in only to cover a stored limit key the raw
+            # snap and the interpreted strip disagree on (reachable by hand
+            # repair, not by ingest).
+            dirty_units = frozenset(
+                dirty_units["units"]
+                | {_observation_unit_text(o) for o in observations}
+            )
     finally:
         cache.close()
+
+    # A pass may only advance the two non-dirtiness alert axes it stores if it
+    # actually did the work they exist to trigger.
+    #
+    # A REPORTING-ONLY pass (the `_codex-quota-verify` worker, the dashboard
+    # tick, `codex quota`) never reaches a threshold decision —
+    # `_evaluate_quota_alerts` returns at `if not alert_eligible_roots` — yet it
+    # used to stamp both, so a delivery-gate ENABLE landing on the same tick as
+    # a full pass was consumed with no arming row and no `suppressed_backfill`,
+    # and could not re-fire because `gate_before` then read True. Every
+    # upgrading install is in exactly that state right after the epoch rebuild,
+    # and the daily verification puts installs there routinely. Carrying
+    # eligible roots is what excludes it, and nothing else does.
+    #
+    # The second condition asks whether this pass LOOKED, not whether it
+    # intended to. A bounded tick that deferred axis 4 declined to look, so it
+    # must not retire the boundary. A tick that widened to whole-history for
+    # some OTHER reason did look — at every observation of every active root,
+    # and applied over all of them — so it evaluated the matured instant as
+    # surely as a widening for axis 4 itself would have, and retiring it is
+    # honest. Gating on the deferral alone instead was an absorbing state, not a
+    # conservative one: `alert_dirty_scope` widens whenever `gate_before is not
+    # True` (the NULL a rebuild leaves, the False a disable leaves), the hook is
+    # the only production caller that carries eligible roots AND it always
+    # defers, so a due boundary froze `alerts_enabled` at its stored value and
+    # every following tick re-resolved the identical SCOPE_ALL — the
+    # whole-history reconcile inline on the blocking path, on every turn.
+    #
+    # Reaching this line with `dirty_units is None` under `defer` means
+    # precisely "the alert axes widened it": every other route into a
+    # whole-history pass returned at the catch-all above, and no hook caller
+    # passes `force_full`.
+    consume_alert_axes = bool(alert_eligible_roots & active_roots) and (
+        dirty_units is None
+        or alert_scope is None
+        or _axes.REASON_SCHEDULED_DEFERRED not in alert_scope.reasons
+    )
 
     # ── Apply phase (Task 7 Item 3) ─────────────────────────────────────────
     # The stats.db writes route through the single-flight ingest cycle instead
@@ -1339,7 +2569,19 @@ def reconcile_codex_quota_projection(
             alert_eligible_roots=alert_eligible_roots,
             journal_emit=journal_emit, journal_disarm=journal_disarm,
             journal_terminal=journal_terminal,
-            holder=holder,
+            holder=holder, dirty_units=dirty_units,
+            ledger_watermark=watermark_target,
+            alerts_enabled=delivery_enabled,
+            stored_next_evaluation_at=(
+                None if ledger_state is None
+                else ledger_state["next_evaluation_at"]),
+            stored_last_full_pass_at=(
+                None if ledger_state is None
+                else ledger_state["last_full_pass_at"]),
+            stored_alerts_enabled=(
+                None if ledger_state is None
+                else ledger_state["alerts_enabled"]),
+            consume_alert_axes=consume_alert_axes,
         )
 
     import _cctally_journal as _jr
@@ -1439,10 +2681,14 @@ def reconcile_codex_quota_projection(
     )
 
     # Finalize: the cache-side certificate (self-healing no-op optimization) is
-    # stored only when the apply actually materialized a projection.
+    # stored only when the apply actually materialized a projection. Ledger
+    # pruning rides the same connection and transaction — it is the only other
+    # cache write this function makes, and folding it in avoids adding a second
+    # unflocked mutator.
     if holder["signatures"] is not None:
         _store_codex_quota_projection_certificate(
             sequence=physical_sequence, signatures=holder["signatures"],
+            prune_ledger_through=watermark_target,
         )
     return holder["result"]
 

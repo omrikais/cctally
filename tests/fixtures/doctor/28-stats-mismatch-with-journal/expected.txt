@@ -22,10 +22,10 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1004) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1006) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
-  ✓ Migrations               0/48 applied
-  ⚠ Pending migrations       48 pending
+  ✓ Migrations               0/54 applied
+  ⚠ Pending migrations       54 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -46,7 +46,9 @@ Data
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Codex project metadata   qualified
   ✓ Codex transcript replay  none pending
+  ✓ Codex ingest backlog     no Codex ingest backlog
   ✓ Codex quota              not applicable
+  ✓ Codex quota verification no hand-off in the last 24h
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
@@ -71,4 +73,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 49 OK · 6 WARN · 0 FAIL
+Summary: 51 OK · 6 WARN · 0 FAIL

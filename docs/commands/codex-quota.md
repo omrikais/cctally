@@ -210,6 +210,16 @@ automatically. See [setup](setup.md#codex-quota-lifecycle-hooks) for the
 trust-review boundary, multi-root behavior, and recovery of malformed hook
 configuration.
 
+### What a hook tick does, and what bounds it
+
+Each tick reads whatever Codex rollout bytes are new, then reconciles the quota projection **once**. Both halves are bounded, because the hook blocks the Codex turn until it returns.
+
+The reconciliation is *incremental*: SQLite triggers record which physical quota windows were mutated, and the tick re-materializes only those, rather than re-deriving every window in your history. A whole-history pass still runs at most once a day as a verification sweep, and whichever caller reaches that deadline first pays for it — a dashboard tick or a `cctally codex quota` invocation gets there off the hook path entirely. A `cctally cache-sync --source codex --rebuild` also runs a complete pass by definition.
+
+The ingest half has a wall-clock ceiling, `codex.hook.ingest_budget_seconds` (default 5, see [config](config.md)). When it runs out, the tick records exactly where it stopped and the next tick continues from there, walking your rollouts in a rotation so the tail drains rather than being starved by the actively-appended files at the front. The session the hook is firing for is read first, so live numbers stay correct while history catches up. An explicit `cctally cache-sync --source codex` is never budgeted and always runs to completion — that is the command to run if you want the backlog gone now.
+
+While a backlog exists, `cctally doctor`'s `codex.ingest_backlog` check reports it, and the dashboard's Codex hero notes that history is still loading. Neither is an error: a backlog right after a heavy Codex session is normal and drains on its own. Doctor only warns once it has stayed non-zero for over an hour, which is the shape of a store whose growth outruns the budget rather than one that is simply catching up. The Codex lifecycle log line in `~/.local/share/cctally/logs/hook-tick.log` carries the same figure as `backlog=N`.
+
 ## Multiple Codex accounts
 
 Every quota window, block, milestone and alert is recorded against the account whose rollout produced it, so two accounts sharing one `$CODEX_HOME` keep separate weekly percentages, separate reset boundaries and separate milestone ladders. The account is decided once, when a rollout's bytes are first read, and journaled — a `cctally cache-sync --rebuild` replays those decisions instead of re-deriving them from whoever happens to be signed in at rebuild time. History recorded before that mechanism existed stays in the `unattributed` bucket rather than being guessed at.

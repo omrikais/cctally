@@ -465,6 +465,24 @@ export type ConversationBlock =
       // omitted at capture when the HTTP status text was empty.
       web_search?: { query: string; links: NativeWebSearchResult[]; links_truncated?: boolean };
       web_fetch?: { code: number; code_text?: string };
+      // Backgrounded-MCP recovery (spec 2026-07-31 §5). Claude Code moves an MCP
+      // call that exceeds 120s to a background task and leaves a "still running
+      // after 120s" placeholder as the result; the completion arrives later as a
+      // separate attachment record the kernel joins back here.
+      //
+      // `background_status` is stamped on EVERY backgrounded call, recovered or
+      // not, carrying whatever the notification claimed ('running' when there is
+      // no notification at all). It is NOT the recovered-predicate: a completion
+      // that carried no <result>, and an ambiguity whose candidates are all
+      // completed, both legitimately say "completed" while `result` is still the
+      // placeholder.
+      //
+      // `background_completed_at` is written ONLY by a successful join, so it —
+      // and only it — means the result below is the real response. Renderers
+      // MUST key "recovered" off this field; keying off the status reports false
+      // success over placeholder text. Both absent on every non-background call.
+      background_status?: string;
+      background_completed_at?: string;
     }
   // 'tool_result' BLOCK kind survives ONLY inside a standalone orphan
   // tool_result ITEM (a result the kernel could not fold into a request).

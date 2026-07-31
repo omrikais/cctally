@@ -1280,6 +1280,20 @@ export interface CodexAccountScope {
   alerts: CodexAlertsDomain;
 }
 
+// public #5 — the hook's budgeted Codex ingest leg has a wall-clock ceiling, so
+// it can leave rollouts unread for the next tick. This says how much, so the UI
+// can render "history still loading" without recomputing the judgement.
+//
+// ABSENT means nothing is owed; it is never emitted as a zero-valued object, so
+// the normal payload stays byte-identical. It deliberately does NOT ride on
+// `availability` or `freshness`, which a long and explicitly non-exhaustive list
+// of gates reads.
+export interface CodexIngestBacklog {
+  files: number;
+  bytes: number;
+  since: string | null;
+}
+
 export interface CodexSourceData {
   hero: CodexHero;
   periods: CodexPeriodsDomain;
@@ -1289,6 +1303,8 @@ export interface CodexSourceData {
   projects: CodexProjectsDomain;
   alerts: CodexAlertsDomain;
   cache_report?: CacheReportEnvelope | null;
+  // public #5 — additive, OMITTED when the backlog is zero. Branch on PRESENCE.
+  ingest_backlog?: CodexIngestBacklog;
   // #341 Task 4 — conditional (R8): one card per account (real + the
   // unattributed bucket when non-empty). Absent for a <=1-real-account source.
   accounts?: AccountCard[];

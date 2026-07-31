@@ -45,6 +45,7 @@ reason.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import os
 import sqlite3
 import threading
@@ -97,6 +98,14 @@ class SnapshotSignature(NamedTuple):
     # an account SWITCH with zero new ingested rows, so the idle short-circuit is
     # left and the `active` marker rebuilds on the next tick.
     accounts_digest: str = ""
+    # public #5: the hook's budgeted-ingest backlog record, which feeds the
+    # Codex envelope's `ingest_backlog` field. A tick whose budgeted walk
+    # consumed only deduped or non-`token_count` bytes moves NO other cache leg,
+    # so without this the backlog changes with nothing to publish it and the
+    # hero's "totals will rise" note goes stale or missing until some unrelated
+    # Codex mutation happens along. Empty when nothing is owed (the writer
+    # DELETEs the key at zero), so a fully-ingested store is byte-neutral.
+    codex_ingest_backlog_sig: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -156,6 +165,32 @@ def _codex_physical_mutation_seq(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _codex_ingest_backlog_sig(conn: sqlite3.Connection) -> str:
+    """Digest of the ``codex_ingest_backlog`` record, ``""`` when absent (#5).
+
+    The same O(1) ``cache_meta`` KV read as the mutation counters above — one
+    primary-key lookup on a table with a handful of rows, so this stays off the
+    per-tick cost that #268 removed.
+
+    A DIGEST rather than the parsed counts: the whole record is what the
+    envelope publishes (``files``, ``bytes`` and the one-hour ``since`` clock),
+    and hashing the stored bytes covers every field including any added later,
+    without teaching the signature the record's shape. The writer DELETEs the
+    key once the backlog drains, so ``""`` is both "never had one" and
+    "finished" — which is what keeps the version string byte-identical to the
+    pre-#5 one for the overwhelming majority of installs.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key='codex_ingest_backlog'"
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    if row is None or not row[0]:
+        return ""
+    return hashlib.sha256(str(row[0]).encode("utf-8")).hexdigest()[:16]
+
+
 def _reset_sig(conn: sqlite3.Connection) -> tuple[int, int]:
     """Change-signal over the two reset-event tables combined (spec §3).
 
@@ -207,6 +242,7 @@ def compute_signature(
         codex_physical_mutation_seq=_codex_physical_mutation_seq(cache_conn),
         codex_stats_digest=str(codex_stats_digest),
         accounts_digest=str(accounts_digest),
+        codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
     )
 
 

@@ -545,7 +545,7 @@ def neutral_detail(
     if cref.source == "codex":
         return q.get_codex_conversation(
             conn, cref.conversation_key, effective_speed=speed,
-            after=after, before=before, tail=tail,
+            after=after, before=before, tail=bool(tail),
             limit=limit if limit is not None else 200)
     return _claude_detail(
         conn, cref.native_key, cref.conversation_key,
@@ -799,11 +799,22 @@ def neutral_payload(
     # Claude: tool_use_id + which={input,result}, contract unchanged.
     if not tool_use_id or which not in ("input", "result"):
         return {"status": "not_found", "tool_use_id": tool_use_id, "which": which}
-    loc = lcq.locate_tool_payload(conn, cref.native_key, tool_use_id, which)
+    if which == "result":
+        # Both payload routes address the SAME logical object, so both resolve it
+        # through the same carrier. A naive which="result" lookup finds the
+        # backgrounded-MCP PLACEHOLDER row first and would serve "still running
+        # after 120s" as the full response — 200, and silently wrong content.
+        mode, loc = lcq.locate_result_payload(conn, cref.native_key, tool_use_id)
+        if mode == "background_gone":
+            # A KNOWN background placeholder whose notification is unresolvable:
+            # gone (410), never not_found (404) and never the placeholder text.
+            return {"status": "gone", "tool_use_id": tool_use_id, "which": which}
+    else:
+        mode = which
+        loc = lcq.locate_tool_payload(conn, cref.native_key, tool_use_id, which)
     if loc is None:
         return {"status": "not_found", "tool_use_id": tool_use_id, "which": which}
-    source_path, byte_offset = loc
-    payload = lcq.read_full_payload(source_path, byte_offset, tool_use_id, which)
+    payload = lcq.read_located_payload(loc, tool_use_id, mode)
     if payload is None:
         return {"status": "gone", "tool_use_id": tool_use_id, "which": which}
     return {"status": "ok", **payload}

@@ -1477,15 +1477,24 @@ def _setup_recent_log_stats(seconds: float = 24 * 3600) -> dict:
                     continue
                 if ts < cutoff:
                     continue
-                counts["fires"] += 1
-                last_ts = max(last_ts, ts)
-                # event=NAME
-                ev = "unknown"
+                # event=NAME. Its ABSENCE now means the line is not a hook fire
+                # at all: `hook-tick.log` also carries the detached Codex
+                # workers' outcomes (`op=quota-verify`, `op=quota-verify-spawn`,
+                # `op=replay-drain`), which are `provider=codex op=… result=…`
+                # and name no event. Counting them inflated `fires` and piled
+                # them into `by_event["unknown"]`, which is meant to report hook
+                # payloads whose `hook_event_name` cctally could not read.
+                ev = None
                 for tok in ln.split():
                     if tok.startswith("event="):
                         ev = tok.split("=", 1)[1]
                         break
-                counts["by_event"][ev] = counts["by_event"].get(ev, 0) + 1
+                if ev is None:
+                    continue
+                counts["fires"] += 1
+                last_ts = max(last_ts, ts)
+                counts["by_event"][ev or "unknown"] = (
+                    counts["by_event"].get(ev or "unknown", 0) + 1)
                 if "oauth=ok(" in ln:
                     counts["oauth_ok"] += 1
                 elif "oauth=throttled" in ln:

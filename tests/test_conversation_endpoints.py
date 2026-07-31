@@ -985,6 +985,131 @@ def test_payload_route_source_gone_returns_410(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def _seed_background_payload_rows(ns, tmp_path, *, with_notification=True):
+    """A backgrounded-MCP call: an mcp tool_use, its harness placeholder
+    tool_result, and (optionally) the notification META row whose source_path
+    points at a REAL attachment line on disk."""
+    import sys as _sys
+    _sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
+    import _lib_conversation as _lc
+
+    task_id = "kravg1b9s"
+    big = "Z" * 40000
+    body = ("<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n<status>completed</status>\n"
+            "<summary>MCP task kravg1b9 done.</summary>\n"
+            '<result>{"threadId":"t1","content":"' + big + '"}</result>\n'
+            "</task-notification>")
+    obj = {"type": "attachment", "uuid": "bg_notif", "sessionId": "sbg",
+           "timestamp": "2026-07-30T20:51:16.312Z",
+           "attachment": {"type": "queued_command",
+                          "commandMode": "task-notification", "prompt": body}}
+    p = tmp_path / "background.jsonl"
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj) + "\n")
+
+    placeholder = (
+        f'MCP tool "codex/codex" is still running after 120s. It was moved to '
+        f'the background as task {task_id} and keeps running; you\'ll receive a '
+        f'notification with the result when it completes. To stop it, use '
+        f'TaskStop with task_id "{task_id}".')
+    # The call's own JSONL really exists on disk, so the PUBLIC which='result'
+    # path would happily serve the placeholder text with a 200. Without this the
+    # 410 assertion below would pass vacuously (a missing file is 410 anyway).
+    call_path = tmp_path / "bg-call.jsonl"
+    call_line0 = json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": "toolu_bg", "name": "mcp__codex__codex",
+         "input": {"prompt": "review"}}]}})
+    call_line1 = json.dumps({"message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_bg",
+         "content": [{"type": "text", "text": placeholder}], "is_error": False}]}})
+    with open(call_path, "w", encoding="utf-8") as fh:
+        call_off0 = fh.tell()
+        fh.write(call_line0 + "\n")
+        call_off1 = fh.tell()
+        fh.write(call_line1 + "\n")
+    cache = ns["open_conversations_db"]()
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sbg", "bg_a", None, str(call_path), call_off0, "2026-07-30T20:40:00Z", "assistant",
+         "", json.dumps([{"kind": "tool_use", "name": "mcp__codex__codex",
+                          "input_summary": "{}", "id": "toolu_bg",
+                          "preview": "codex"}]),
+         _MODEL, "mbg", "rbg", None, None, 0))
+    cache.execute(
+        "INSERT OR IGNORE INTO conversation_messages "
+        "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+        " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+        " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("sbg", "bg_r", None, str(call_path), call_off1, "2026-07-30T20:42:00Z",
+         "tool_result", "",
+         json.dumps([{"kind": "tool_result", "text": placeholder,
+                      "truncated": False, "full_length": len(placeholder),
+                      "is_error": False, "tool_use_id": "toolu_bg"}]),
+         None, None, None, None, None, 0))
+    if with_notification:
+        row = _lc.parse_message_row(obj, 0)
+        cache.execute(
+            "INSERT OR IGNORE INTO conversation_messages "
+            "(session_id,uuid,parent_uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,model,msg_id,req_id,cwd,git_branch,"
+            " is_sidechain) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("sbg", "bg_notif", None, str(p), 0, "2026-07-30T20:51:16.312Z",
+             "meta", "", row.blocks_json, None, None, None, None, None, 0))
+    cache.commit()
+    cache.close()
+    return "toolu_bg", '{"threadId":"t1","content":"' + big + '"}'
+
+
+def test_payload_route_serves_a_recovered_background_result(tmp_path, monkeypatch):
+    """A public which=result request for a backgrounded-MCP call is resolved
+    through the INTERNAL background_result carrier and answered with the full
+    text under the unchanged public which:"result" discriminant."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        tuid, full = _seed_background_payload_rows(ns, tmp_path)
+        status, body = _get(
+            port, f"/api/conversation/sbg/payload?tool_use_id={tuid}&which=result")
+        assert status == 200, (status, body)
+        payload = json.loads(body)
+        assert payload["which"] == "result"
+        assert payload["text"] == full
+        assert payload["full_length"] == len(full)
+        assert payload["is_error"] is False
+        # background_result is INTERNAL: it is never an accepted input value.
+        status, _ = _get(
+            port,
+            f"/api/conversation/sbg/payload?tool_use_id={tuid}&which=background_result")
+        assert status == 400
+    finally:
+        srv.shutdown()
+
+
+def test_payload_route_background_notification_gone_returns_410(tmp_path, monkeypatch):
+    """A KNOWN background placeholder whose notification row is gone -> 410,
+    distinct from the 404 an unknown tool_use_id returns."""
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False)
+    try:
+        port = srv.server_address[1]
+        tuid, _full = _seed_background_payload_rows(
+            ns, tmp_path, with_notification=False)
+        status, body = _get(
+            port, f"/api/conversation/sbg/payload?tool_use_id={tuid}&which=result")
+        assert status == 410, (status, body)
+        assert "error" in json.loads(body)
+        status, _ = _get(
+            port, "/api/conversation/sbg/payload?tool_use_id=toolu_absent&which=result")
+        assert status == 404
+    finally:
+        srv.shutdown()
+
+
 def test_sse_update_envelope_carries_transcripts_enabled(tmp_path, monkeypatch):
     """The SSE ``update`` envelope (``/api/events``) MUST carry
     ``transcriptsEnabled`` equal to the per-connection gate value — the same

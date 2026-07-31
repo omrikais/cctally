@@ -2502,7 +2502,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 2,
+  "source_schema_version": 3,
   "sources": {
     "all": {
       "availability": "ok",

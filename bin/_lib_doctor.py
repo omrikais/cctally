@@ -189,6 +189,13 @@ class DoctorState:
     # by the next whole-tree sync that defers none. None = key absent (the
     # normal state) or cache unreadable — the check degrades OK.
     codex_torn_deferred: Optional[dict] = None
+    # public #5 spec §5: what the hook's BUDGETED ingest leg has left to read.
+    # Mirrors the `codex_ingest_backlog` cache_meta record — `{files, bytes,
+    # since}` — or None when the backlog is empty (the record is deleted, never
+    # zeroed). A non-zero backlog is NORMAL right after a heavy burst, so the
+    # leg distinguishes draining from stuck on the `since` stamp rather than on
+    # the counts.
+    codex_ingest_backlog: Optional[dict] = None
     # The byte-zero Codex replay's stall signal. `codex_replay_pending` mirrors
     # the `codex_replay_from_zero_pending` cache_meta marker; `codex_replay_blocked`
     # is `{"at": iso, "files_failed": N, "files_deferred_torn": N}`, written by a
@@ -197,6 +204,12 @@ class DoctorState:
     # state) or cache unreadable — the check degrades OK.
     codex_replay_pending: Optional[bool] = None
     codex_replay_blocked: Optional[dict] = None
+    # `codex_replay_deferred` is `{"since": iso, "at": iso}`, written when a
+    # BUDGETED tick (the Codex hook) declined the replay outright. A hook-only
+    # install produces this and nothing else — the decline returns before the
+    # walk, so `files_failed`/`files_deferred_torn` are both zero, no `blocked`
+    # record is ever written, and the ingest-backlog leg reads a drained store.
+    codex_replay_deferred: Optional[dict] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -229,6 +242,13 @@ class DoctorState:
     codex_quota_windows: Optional[list[dict]] = None
     codex_hook_roots: Optional[list[dict]] = None
     codex_lifecycle_activity_24h: Optional[dict] = None
+    # public #5: 24h outcome counts for the detached `_codex-quota-verify`
+    # worker, parsed from the same bounded log. The lifecycle parser above
+    # cannot supply these — worker lines carry no `source_root_key`, so its
+    # root filter drops every one. Shape:
+    # {"success_count_24h", "error_count_24h", "spawn_failure_count_24h",
+    #  "last_success_at"}. None/absent degrades the check to OK.
+    codex_quota_verify_activity: Optional[dict] = None
     # #311: precomputed five-state classification of settings.json's
     # statusLine.refreshInterval (unavailable/absent/foreign/present/missing),
     # computed by doctor_gather_state via the setup I/O-layer classifier so the
@@ -1115,6 +1135,26 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
     )
 
 
+def _age_seconds(stamp: object, now_utc: dt.datetime) -> Optional[int]:
+    """Seconds between an ISO-8601 UTC stamp and ``now_utc``; None if unusable."""
+    if not stamp:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int((now_utc - parsed.astimezone(dt.timezone.utc)).total_seconds())
+
+
+#: How long a budgeted decline may stand before it stops being self-healing.
+#: The hook hands the drain to a detached worker on every decline (throttled
+#: hourly), so a deferral older than this means the hand-off is not landing.
+#: Same hour as `CODEX_INGEST_BACKLOG_STUCK_SECONDS`, for the same reason.
+CODEX_REPLAY_DEFERRED_WARN_SECONDS = 3600
+
+
 def _check_data_codex_replay(s: DoctorState) -> CheckResult:
     """WARN while a byte-zero Codex replay is STALLED rather than merely pending.
 
@@ -1131,14 +1171,27 @@ def _check_data_codex_replay(s: DoctorState) -> CheckResult:
     between the migration and the next sync, and it clears on its own. The WARN
     needs the durable `blocked` record, which only a completed-but-unsuccessful
     whole-tree walk writes.
+
+    The `deferred` record is the second stall shape (public #5). A BUDGETED tick
+    cannot perform the replay at all, so the Codex hook declines it — and on a
+    hook-only install no unbudgeted caller exists, which froze every Codex sync
+    while `files_failed` and `files_deferred_torn` both stayed zero and no
+    `blocked` record was ever written. The hook now hands the drain to a
+    detached worker, so a RECENT deferral is the ordinary self-healing state and
+    stays `ok`; one that has stood for over an hour means the hand-off is not
+    landing and is the only signal that the install is frozen.
     """
     blocked = s.codex_replay_blocked or {}
+    deferred = s.codex_replay_deferred or {}
     at = blocked.get("at")
+    deferred_since = deferred.get("since")
     details = {
         "pending": bool(s.codex_replay_pending),
         "blocked_at": at,
         "files_failed": blocked.get("files_failed"),
         "files_deferred_torn": blocked.get("files_deferred_torn"),
+        "deferred_since": deferred_since,
+        "deferred_at": deferred.get("at"),
     }
     if s.codex_replay_pending and isinstance(at, str) and at:
         return CheckResult(
@@ -1150,12 +1203,102 @@ def _check_data_codex_replay(s: DoctorState) -> CheckResult:
                          "is truncated), then `cctally cache-sync --source codex`"),
             details=details,
         )
+    if s.codex_replay_pending and isinstance(deferred_since, str) and deferred_since:
+        age_s = _age_seconds(deferred_since, s.now_utc)
+        if age_s is not None and age_s > CODEX_REPLAY_DEFERRED_WARN_SECONDS:
+            return CheckResult(
+                id="data.codex_replay", title="Codex transcript replay",
+                severity="warn",
+                summary=(f"the Codex hook has deferred it since "
+                         f"{deferred_since} — a budgeted tick cannot run the "
+                         "replay, and all Codex ingest is frozen until an "
+                         "unbudgeted sync does"),
+                remediation="Run `cctally cache-sync --source codex`",
+                details=details,
+            )
+        return CheckResult(
+            id="data.codex_replay", title="Codex transcript replay",
+            severity="ok",
+            summary=(f"pending; the Codex hook deferred it at "
+                     f"{deferred.get('at') or deferred_since} and handed the "
+                     "drain to a background worker"),
+            remediation=None, details=details,
+        )
     return CheckResult(
         id="data.codex_replay", title="Codex transcript replay",
         severity="ok",
-        summary="pending (clears on the next Codex sync)"
+        # NOT "clears on the next Codex sync": a budgeted tick — the Codex
+        # hook — declines the replay rather than running it, so on a hook-only
+        # install the next sync is precisely what does not clear it.
+        summary="pending (clears on the next unbudgeted Codex sync)"
                 if s.codex_replay_pending else "none pending",
         remediation=None, details=details,
+    )
+
+
+def _check_data_codex_quota_verification(s: DoctorState) -> CheckResult:
+    """WARN when the detached Codex quota verification is not landing.
+
+    Public #5 moved every whole-history projection pass off the blocking hook
+    path, so on a hook-only install ALL of it now depends on the
+    `_codex-quota-verify` worker. Two of its routes make that dependency sharp
+    rather than cosmetic: the catch-all (a rebuilt stats index, an
+    interpretation bump, a reset ledger, a ledgerless cache) performs no
+    projection work at all, which leaves the projection transiently MISSING —
+    no blocks, no milestones, no alerts — until the worker converges it.
+    Nothing else observes that. `data.codex_quota` is a different question
+    entirely: it reports the freshness of the local rollout OBSERVATIONS, which
+    stay perfectly fresh while the projection derived from them is absent.
+
+    The worker's own streams are `/dev/null` and its exit code is observed by
+    nobody, so it writes its outcome to `hook-tick.log` for exactly this leg to
+    read. The predicate is "failures with no success in 24h": one failed
+    hand-off is ordinary (a contended spawn, a transient lock) and self-heals on
+    the next throttle window, while a worker that has not landed once in a day
+    is the persistent condition — and because the deadline only moves when a
+    pass COMMITS, such a worker re-spawns forever with nothing to show for it.
+
+    Silence is OK, not a failure: an install with no Codex hooks never hands off
+    at all, and every non-hook caller runs the pass inline.
+    """
+    activity = s.codex_quota_verify_activity or {}
+    successes = int(activity.get("success_count_24h") or 0)
+    errors = int(activity.get("error_count_24h") or 0)
+    spawn_failures = int(activity.get("spawn_failure_count_24h") or 0)
+    last_success = activity.get("last_success_at")
+    details = {
+        "success_count_24h": successes,
+        "error_count_24h": errors,
+        "spawn_failure_count_24h": spawn_failures,
+        "last_success_at": (
+            _iso_z(last_success) if isinstance(last_success, dt.datetime)
+            else (last_success if isinstance(last_success, str) else None)
+        ),
+    }
+    failures = errors + spawn_failures
+    if failures and not successes:
+        return CheckResult(
+            id="data.codex_quota_verification",
+            title="Codex quota verification",
+            severity="warn",
+            summary=(
+                f"{failures} failed hand-off(s) and no completed pass in 24h — "
+                "the Codex quota projection is not being verified"),
+            remediation=(
+                "Run `cctally cache-sync --source codex` (every non-hook caller "
+                "runs the pass inline), then check hook-tick.log for "
+                "`op=quota-verify`"),
+            details=details,
+        )
+    return CheckResult(
+        id="data.codex_quota_verification",
+        title="Codex quota verification",
+        severity="ok",
+        summary=(
+            f"{successes} completed, {failures} failed in 24h"
+            if successes or failures else "no hand-off in the last 24h"),
+        remediation=None,
+        details=details,
     )
 
 
@@ -2621,6 +2764,61 @@ def _check_accounts_codex_identity(s: DoctorState) -> CheckResult:
     )
 
 
+#: A backlog younger than this is draining, not stuck. A heavy Codex burst
+#: legitimately leaves work for the next few ticks; only a backlog that has
+#: stayed non-zero CONTINUOUSLY past this is worth an operator's attention.
+CODEX_INGEST_BACKLOG_STUCK_SECONDS = 3600
+
+
+def _check_data_codex_ingest_backlog(s: DoctorState) -> CheckResult:
+    """WARN when the hook's budgeted Codex ingest has been behind for over an hour.
+
+    The hook's ingest leg is bounded in wall clock (public #5 spec §4), so it
+    can legitimately leave a backlog — that is the mechanism working, not a
+    fault. What is worth reporting is a backlog that never drains: a store
+    whose per-tick budget is smaller than its per-tick growth, or a walk that
+    has stopped making progress.
+
+    Per the CLI contract a WARN alone does not change `doctor`'s exit code.
+    """
+    record = s.codex_ingest_backlog or {}
+    try:
+        files = int(record.get("files") or 0)
+    except (TypeError, ValueError):
+        files = 0
+    try:
+        pending_bytes = int(record.get("bytes") or 0)
+    except (TypeError, ValueError):
+        pending_bytes = 0
+    since_text = record.get("since")
+    age_s = _age_seconds(since_text, s.now_utc)
+    details = {"files": files, "bytes": pending_bytes, "since": since_text,
+               "age_s": age_s}
+    if files <= 0:
+        return CheckResult(
+            id="data.codex_ingest_backlog", title="Codex ingest backlog",
+            severity="ok", summary="no Codex ingest backlog",
+            remediation=None, details=details,
+        )
+    if age_s is not None and age_s > CODEX_INGEST_BACKLOG_STUCK_SECONDS:
+        return CheckResult(
+            id="data.codex_ingest_backlog", title="Codex ingest backlog",
+            severity="warn",
+            summary=(f"{files} Codex rollout(s) / {pending_bytes} byte(s) still "
+                     f"unread after {age_s // 3600}h — the hook's budget is not "
+                     "draining them"),
+            remediation="Run `cctally cache-sync --source codex`",
+            details=details,
+        )
+    return CheckResult(
+        id="data.codex_ingest_backlog", title="Codex ingest backlog",
+        severity="ok",
+        summary=(f"{files} Codex rollout(s) / {pending_bytes} byte(s) queued — "
+                 "draining"),
+        remediation=None, details=details,
+    )
+
+
 def _check_accounts_attribution(s: DoctorState) -> CheckResult:
     """WARN when Claude usage is flowing but landing in `unattributed` despite a
     resolved active account (the stamping pipeline is broken), or while the
@@ -2738,7 +2936,10 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         # after the pair rather than between them.
         ("data.codex_project_metadata", "_check_data_codex_project_metadata"),
         ("data.codex_replay", "_check_data_codex_replay"),
+        ("data.codex_ingest_backlog", "_check_data_codex_ingest_backlog"),
         ("data.codex_quota", "_check_data_codex_quota"),
+        ("data.codex_quota_verification",
+         "_check_data_codex_quota_verification"),
         ("data.parse_health", "_check_data_parse_health"),
         ("data.forked_buckets", "_check_data_forked_buckets"),
         ("data.post_credit_milestones", "_check_data_post_credit_milestones"),

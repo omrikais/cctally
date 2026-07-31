@@ -1986,3 +1986,136 @@ def test_source_bundle_rebuilds_on_account_switch(tmp_path, monkeypatch):
                 != first.sources["claude"].data_version)
     finally:
         stats.close()
+
+
+# =========================================================================
+# public #5 — the Codex ingest backlog is part of the Codex data version.
+#
+# The `codex_ingest_backlog` cache_meta record feeds `codex.data.ingest_backlog`,
+# which is what the hero's "totals will rise" note renders from. It was NOT a
+# signature leg, so a backlog-only change reached no envelope: the dispatch
+# signature stayed flat (idle short-circuit) and the memoised Codex source block
+# was reused verbatim. Confirmed in a real browser — writing the record alone
+# produced no envelope change across 90+ seconds of polling, and it surfaced only
+# once an unrelated `codex_physical_mutation_seq` bump forced a rebuild.
+#
+# It usually works because `sync_codex_cache` writes the record alongside newly
+# ingested rows, which does move that sequence. The exposure is a budgeted tick
+# whose walk consumes only deduped or non-`token_count` bytes: the sequence does
+# not move, and the note goes stale or missing until some unrelated Codex
+# mutation happens along.
+# =========================================================================
+
+_BACKLOG_RECORD = '{"bytes": 8192, "files": 3, "since": "2026-07-16T09:00:00Z"}'
+
+
+def _write_backlog(conn, value=_BACKLOG_RECORD):
+    conn.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) VALUES "
+        "('codex_ingest_backlog', ?)", (value,))
+    conn.commit()
+
+
+def _clear_backlog(conn):
+    conn.execute("DELETE FROM cache_meta WHERE key='codex_ingest_backlog'")
+    conn.commit()
+
+
+def test_snapshot_signature_carries_the_codex_ingest_backlog(tmp_path, monkeypatch):
+    """The leg itself: an O(1) `cache_meta` read, empty when nothing is owed."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        assert compute_signature(
+            cache, stats, generation=0).codex_ingest_backlog_sig == ""
+        _write_backlog(cache)
+        owed = compute_signature(cache, stats, generation=0)
+        assert owed.codex_ingest_backlog_sig != ""
+        # Drained is byte-identical to never-had-one: the writer DELETEs the key
+        # at zero, so every install that has finished ingesting keeps exactly
+        # today's version string.
+        _clear_backlog(cache)
+        assert compute_signature(
+            cache, stats, generation=0).codex_ingest_backlog_sig == ""
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_snapshot_data_version_changes_when_only_the_ingest_backlog_changes(
+    tmp_path, monkeypatch,
+):
+    """The dispatch signal: a backlog-only tick must leave the idle path.
+
+    Without this the whole snapshot short-circuits, the source bundle builder is
+    never reached, and no version below it can matter.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        before = compute_signature(cache, stats, generation=0)
+        _write_backlog(cache)
+        after = compute_signature(cache, stats, generation=0)
+        drained = None
+
+        assert before != after, "the idle short-circuit compares the whole tuple"
+        assert (ns["_snapshot_data_version"](before)
+                != ns["_snapshot_data_version"](after))
+
+        _clear_backlog(cache)
+        drained = compute_signature(cache, stats, generation=0)
+        assert ns["_snapshot_data_version"](drained) == \
+            ns["_snapshot_data_version"](before)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
+    tmp_path, monkeypatch,
+):
+    """End to end, in the shape the browser observed.
+
+    `reuse_coherent_source_state` hands back the PRIOR Codex object whenever the
+    version matches, so a backlog written between two builds has to move
+    `codex_version` or the new field never reaches the envelope — even on a full
+    rebuild forced by some other change.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
+    try:
+        first = ns["_cctally_tui"]._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now, display_tz_name="UTC",
+            codex_ingest_contended=False, claude_cost_usd=0.0,
+            claude_total_tokens=0,
+        )
+        assert "ingest_backlog" not in first.sources["codex"].data
+
+        cache = ns["open_cache_db"]()
+        try:
+            _write_backlog(cache)
+        finally:
+            cache.close()
+
+        second = ns["_cctally_tui"]._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=1),
+            display_tz_name="UTC", codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0, prior_bundle=first,
+        )
+
+        codex = second.sources["codex"]
+        assert codex.data_version != first.sources["codex"].data_version
+        assert codex is not first.sources["codex"]
+        assert dict(codex.data["ingest_backlog"]) == {
+            "files": 3, "bytes": 8192, "since": "2026-07-16T09:00:00Z"}
+        # The OTHER provider must not be dragged into a Codex-local change.
+        assert (second.sources["claude"].data_version
+                == first.sources["claude"].data_version)
+    finally:
+        stats.close()

@@ -35,6 +35,8 @@ def test_doctor_state_has_required_fields():
         "codex_entries_count", "codex_last_entry_at", "codex_jsonl_present",
         # #312: safe all-history Codex project-metadata health evidence.
         "codex_project_metadata_health", "codex_project_metadata_error",
+        # public #5: the hook's budgeted-ingest backlog record.
+        "codex_ingest_backlog",
         "dashboard_bind_stored", "runtime_bind",
         "config_json_error",
         "update_state", "update_state_error",
@@ -76,6 +78,11 @@ def test_doctor_state_has_required_fields():
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
+        # public #5: 24h outcomes for the detached `_codex-quota-verify`
+        # worker, which every hook-side whole-history pass now depends on. The
+        # lifecycle counts cannot cover it — worker lines carry no
+        # `source_root_key`, so that parser's root filter drops all of them.
+        "codex_quota_verify_activity",
         # #311: precomputed statusLine.refreshInterval classification.
         "statusline_refresh_state",
         # #318: passive statusline candidate/selected pipeline evidence.
@@ -103,7 +110,10 @@ def test_doctor_state_has_required_fields():
         # The byte-zero Codex replay stall signal (data.codex_replay): the
         # pending marker plus the record a completed-but-unsuccessful whole-tree
         # walk writes when it cannot consume it.
-        "codex_replay_pending", "codex_replay_blocked",
+        # public #5: plus the record a BUDGETED tick writes when it declines
+        # the replay outright — the only stall signal a hook-only install
+        # produces, since that decline never reaches the walk.
+        "codex_replay_pending", "codex_replay_blocked", "codex_replay_deferred",
     }
     assert fields == expected, fields ^ expected
 

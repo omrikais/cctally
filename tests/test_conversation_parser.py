@@ -1317,13 +1317,105 @@ def test_queued_prompt_promoted_to_human():
     assert blocks == [{"kind": "text",
                        "text": "Don't run the Codex review. I'll do it this time."}]
 
-def test_queued_task_notification_dropped():
-    # commandMode=="task-notification" is harness-injected background plumbing,
-    # NOT user-typed — it stays dropped (the proof the prompt gate is non-vacuous:
-    # flip commandMode and the row vanishes).
-    notif = "<task-notification>\n<task-id>ac20b</task-id>\n<status>completed</status>\n</task-notification>"
-    fh = _jsonl(_queued_command(notif, command_mode="task-notification"))
+# --- backgrounded-MCP <task-notification> attachments -------------------------
+# A backgrounded MCP completion arrives ONLY as commandMode=="task-notification"
+# carrying <task-id> and no <tool-use-id>, so unlike the subagent/Monitor shape
+# nothing rescues it read-time. It is promoted here as a BOUNDED META row: text
+# blocks bypass _TOOL_RESULT_CAP, so storing the raw wrapper would put an
+# arbitrary MCP payload in the transcript store and ship it whole to the browser
+# whenever the read-time join misses.
+
+def _bg_notification(task_id="kravg1b9s", status="completed", result='{"c":"x"}',
+                     summary="MCP task kravg1b9 (codex/codex) completed."):
+    parts = ["<task-notification>", f"<task-id>{task_id}</task-id>",
+             f"<status>{status}</status>"]
+    if summary:
+        parts.append(f"<summary>{summary}</summary>")
+    if result is not None:
+        parts.append(f"<result>{result}</result>")
+    parts.append("</task-notification>")
+    return "\n".join(parts)
+
+def test_background_mcp_notification_is_promoted_bounded():
+    big = "x" * 40000
+    body = _bg_notification(result='{"threadId":"t","content":"' + big + '"}')
+    fh = _jsonl(_queued_command(body, command_mode="task-notification"))
+    rows = list(lc.iter_message_rows(fh, "f.jsonl"))
+    assert len(rows) == 1, "notification must no longer be dropped"
+    r = rows[0]
+    assert r.entry_type == lc.META
+    assert r.text == ""
+    assert r.uuid == "q1" and r.session_id == "s1" and r.parent_uuid == "p0"
+    blocks = json.loads(r.blocks_json)
+    assert len(blocks) == 1
+    blk = blocks[0]
+    assert blk["kind"] == "text"
+    assert blk["task_id"] == "kravg1b9s"
+    assert blk["background_status"] == "completed"
+    assert blk["result_truncated"] is True
+    assert blk["result_full_length"] > lc._TOOL_RESULT_CAP
+    assert len(blk["text"]) <= lc._TOOL_RESULT_CAP + 2000   # header + capped result
+    assert "x" * 100 in r.search_tool, "recovered result must be searchable"
+
+
+def test_background_mcp_summary_and_whole_block_have_stable_bounds():
+    # Non-BMP text has the largest ensure_ascii=True escape, so this guards the
+    # serialized storage boundary rather than only Python character counts.
+    body = _bg_notification(
+        result='{"content":"' + ("\U0001f4a5" * 40000) + '"}',
+        summary="\U0001f4a5" * 40000,
+        status="\U0001f4a5" * 40000,
+    )
+    row = list(lc.iter_message_rows(
+        _jsonl(_queued_command(body, command_mode="task-notification")),
+        "f.jsonl",
+    ))[0]
+    block = json.loads(row.blocks_json)[0]
+    assert len(block["summary"]) == 1024
+    assert len(block["background_status"]) == 64
+    assert len(row.blocks_json) <= 230_000
+
+def test_background_mcp_block_carries_an_exact_result_offset():
+    # The stored `text` is a synthesized header PLUS the capped result so an
+    # unjoined notification renders something sane. The read-time join must be
+    # able to strip that header EXACTLY, so the offset is stored rather than
+    # re-derived by scanning for a blank line (a summary containing one would
+    # break that scan).
+    body = _bg_notification(result='{"threadId":"t","content":"hello"}')
+    fh = _jsonl(_queued_command(body, command_mode="task-notification"))
+    blk = json.loads(list(lc.iter_message_rows(fh, "f.jsonl"))[0].blocks_json)[0]
+    assert blk["text"][blk["result_offset"]:] == '{"threadId":"t","content":"hello"}'
+    assert blk["summary"] == "MCP task kravg1b9 (codex/codex) completed."
+    assert blk["result_truncated"] is False
+    assert blk["result_full_length"] == len('{"threadId":"t","content":"hello"}')
+
+def test_background_mcp_notification_without_result_has_no_offset():
+    body = _bg_notification(status="running", result=None)
+    fh = _jsonl(_queued_command(body, command_mode="task-notification"))
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    blk = json.loads(r.blocks_json)[0]
+    assert r.entry_type == lc.META
+    assert blk["background_status"] == "running"
+    assert blk["result_offset"] is None
+    assert blk["result_full_length"] == 0
+    assert r.search_tool == ""
+
+def test_background_mcp_notification_without_task_id_is_dropped():
+    # No identity -> nothing to join to -> not worth a row.
+    body = ("<task-notification>\n<status>completed</status>\n"
+            "<result>{}</result>\n</task-notification>")
+    fh = _jsonl(_queued_command(body, command_mode="task-notification"))
     assert list(lc.iter_message_rows(fh, "f.jsonl")) == []
+
+def test_background_mcp_search_column_matches_a_backfill_from_blocks():
+    # #177 S6 parity invariant: search_tool derived at ingest must equal what
+    # _derive_search_columns produces from the stored blocks_json.
+    body = _bg_notification(result='{"threadId":"t","content":"findable-token"}')
+    fh = _jsonl(_queued_command(body, command_mode="task-notification"))
+    r = list(lc.iter_message_rows(fh, "f.jsonl"))[0]
+    replay, _ = lc._derive_search_columns(json.loads(r.blocks_json))
+    assert replay == r.search_tool
+    assert "findable-token" in r.search_tool
 
 def test_queued_blank_prompt_dropped():
     fh = _jsonl(_queued_command("   "))

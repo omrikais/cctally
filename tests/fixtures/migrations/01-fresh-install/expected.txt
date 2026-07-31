@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 14 known
   · 013_codex_quota_projection_state               pending
   · 014_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 36 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 42 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
@@ -51,11 +51,18 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 36 known
   · 033_codex_reset_anchor_component_closure       pending
   · 034_codex_window_spend_adoption                pending
   · 035_codex_thread_source_inference_replay       pending
-  · 036_test_cache_migration                       pending
+  · 036_codex_quota_window_identity_index          pending
+  · 037_codex_quota_change_ledger                  pending
+  · 038_codex_session_files_ingest_complete        pending
+  · 039_codex_quota_observed_model_backfill        pending
+  · 040_codex_quota_physical_group_index           pending
+  · 041_codex_quota_unresolved_model_index         pending
+  · 042_test_cache_migration                       pending
 
-conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 2 known
+conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 3 known
   · 001_adopt_schema_version_marker                pending
   · 002_codex_thread_source_inference_replay       pending
+  · 003_background_mcp_result_replay               pending
 ## stderr
 
 ## exit

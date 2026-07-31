@@ -4,7 +4,7 @@ Turns the former "per-migration goldens are lazy-adopted; not retroactively
 backfilled" policy into an ENFORCED invariant, now that W3 has backfilled the
 last 7 gaps:
 
-  1. Registry counts are pinned (13 stats / 33 cache) with the test-injection
+  1. Registry counts are pinned (13 stats / 39 cache) with the test-injection
      env var (``CCTALLY_MIGRATION_TEST_MODE``) asserted ABSENT — when it is
      armed, ``bin/_cctally_db`` registers one REAL extra entry in each registry
      that has no golden, so the guard must run against the clean 13/27 shape.
@@ -44,8 +44,8 @@ PER_MIGRATION_ROOT = (
 # Pinned registry sizes. Bump the matching one when a migration ships (see
 # module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 35
-EXPECTED_CONVERSATIONS_COUNT = 2
+EXPECTED_CACHE_COUNT = 41
+EXPECTED_CONVERSATIONS_COUNT = 3
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -104,9 +104,16 @@ MANIFEST = {
     "033_codex_reset_anchor_component_closure": "test_cache_migration_033_per_migration_goldens",
     "034_codex_window_spend_adoption": "test_cache_migration_034_per_migration_goldens",
     "035_codex_thread_source_inference_replay": "test_cache_migration_035_per_migration_goldens",
+    "036_codex_quota_window_identity_index": "test_cache_migration_036_per_migration_goldens",
+    "037_codex_quota_change_ledger": "test_cache_migration_037_per_migration_goldens",
+    "038_codex_session_files_ingest_complete": "test_cache_migration_038_per_migration_goldens",
+    "039_codex_quota_observed_model_backfill": "test_cache_migration_039_per_migration_goldens",
+    "040_codex_quota_physical_group_index": "test_cache_migration_040_per_migration_goldens",
+    "041_codex_quota_unresolved_model_index": "test_cache_migration_041_per_migration_goldens",
     # ── conversations registry (DB journal redesign spec §7.2) ──
     "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
     "002_codex_thread_source_inference_replay": "test_conversations_migration_002_per_migration_goldens",
+    "003_background_mcp_result_replay": "test_conversations_migration_003_per_migration_goldens",
 }
 
 # Golden dir names for conversations migrations carry a ``conversations_``

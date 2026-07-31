@@ -28,6 +28,44 @@ export const CODEX_STALE_CYCLE_NOTE =
   'Codex quota evidence is stale — this spend is current, but the forecast is paused '
   + 'until Codex reports again.';
 
+// public #5 — the Codex hook's ingest leg is budgeted, so on a large or freshly
+// upgraded store some rollout history has not been read yet. Disclosure ONLY:
+// the numbers shown are correct for what IS ingested, and the backlog drains on
+// its own. Deliberately not tied to `availability`/`freshness`, which many
+// unrelated gates read.
+export function codexIngestBacklogNote(
+  backlog: { files: number } | null | undefined,
+): string | null {
+  if (!backlog || backlog.files <= 0) return null;
+  const plural = backlog.files === 1 ? 'session' : 'sessions';
+  return `Codex history is still loading (${backlog.files} ${plural} left) — `
+    + 'totals will rise as it finishes.';
+}
+
+// The VISIBLE form of the same disclosure (QA P2). The sentence above only ever
+// reached a `title` on a non-interactive div — hover-only, so unreachable on
+// touch — which does not tell anyone their totals are incomplete. This is what
+// the hero prints; the sentence stays on the zone's `title`/`aria-label`.
+//
+// Short on purpose: `hero-spent` is the narrowest desktop zone and half a phone
+// width on mobile, and a wrapped three-line caveat is a heavier disclosure than
+// a transient loading state deserves. The `+` is the whole message in one glyph
+// — the number on screen is going to grow.
+export function codexIngestBacklogLabel(
+  backlog: { files: number } | null | undefined,
+): string | null {
+  if (!backlog || backlog.files <= 0) return null;
+  const plural = backlog.files === 1 ? 'session' : 'sessions';
+  return `+${backlog.files} ${plural} still loading`;
+}
+
+// Two independent disclosures can apply at once; joining beats picking, because
+// suppressing either one hides a real caveat about the number on screen.
+export function joinHeroNotes(...notes: Array<string | null>): string | null {
+  const kept = notes.filter((note): note is string => Boolean(note));
+  return kept.length ? kept.join(' ') : null;
+}
+
 export function HeroStrip() {
   const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
@@ -170,6 +208,8 @@ function SharedHero({
   // bounds it bounds stay correct. This must never gate rendering: the values
   // are real, and `Forecast @ reset` already pauses through `forecast.status`.
   const codexCycleStale = codex?.hero?.cycle_freshness === 'stale';
+  const codexBacklogNote = codexIngestBacklogNote(codex?.ingest_backlog);
+  const codexBacklogLabel = codexIngestBacklogLabel(codex?.ingest_backlog);
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
   const quotaForecast = quota?.histories.find((row) => row.key === weekly?.key)?.forecast;
   const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
@@ -247,7 +287,20 @@ function SharedHero({
         unavailableReason={!perAccount && codexUnavailable
           ? warning?.message ?? 'Cycle accounting unavailable'
           : null}
-        spentNote={!perAccount && codexCycleStale ? CODEX_STALE_CYCLE_NOTE : null}
+        // The two disclosures have DIFFERENT scopes and cannot share one gate.
+        // The stale-cycle note is account-scoped — under focus `focusedHero`
+        // derives `cycle_freshness` from that child's own quota summary, and
+        // under All accounts the forecast slot it talks about already reads
+        // "per account" — so #416's D6 blanking keeps it. The ingest backlog is
+        // a store-wide INGEST condition with no per-account meaning, and All
+        // accounts is the LANDING view whose merged headline spend is exactly
+        // the incomplete number it qualifies; suppressing it there hid the
+        // caveat in the one view that most needed it (QA P1).
+        spentNote={joinHeroNotes(
+          perAccount || !codexCycleStale ? null : CODEX_STALE_CYCLE_NOTE,
+          codexBacklogNote,
+        )}
+        spentNoteLabel={codexBacklogLabel}
         perAccountNote={perAccount ? 'per account' : null}
       />
     );
@@ -394,6 +447,7 @@ function CanonicalHero({
   showFiveHour,
   unavailableReason = null,
   spentNote = null,
+  spentNoteLabel = null,
   perAccountNote = null,
 }: {
   weekLabel: string | null | undefined;
@@ -414,6 +468,13 @@ function CanonicalHero({
   // quota evidence is stale. Distinct from `unavailableReason`, which explains
   // an ABSENT hero; when both apply the unavailable reason wins.
   spentNote?: string | null;
+  // public #5 QA P2 — the VISIBLE short form of `spentNote`, printed under the
+  // `$/1%` sub-line. `spentNote` alone only ever reached a `title` on a
+  // non-interactive div, which is hover-only and therefore unreachable on
+  // touch; a disclosure nobody can see does not disclose. Set only for the
+  // store-wide ingest backlog: the account-scoped stale-cycle note keeps its
+  // #350 tooltip-only disposition, and widening that is a separate decision.
+  spentNoteLabel?: string | null;
   // #416 D6 — set when the headline percentage/reset are deliberately BLANK
   // because each account owns an independent quota cycle. Replaces the reset
   // countdown AND every other deliberately-blank slot with a pointer to the
@@ -478,6 +539,15 @@ function CanonicalHero({
       <div
         className="hero-zone hero-spent"
         title={unavailableReason ?? spentNote ?? undefined}
+        // public #5 QA P2: `aria-label` is NOT honoured on the implicit
+        // `generic` role a bare `<div>` carries, so the label below was never
+        // the reliable channel the #350 fix assumed — and the visible note is
+        // `aria-hidden`, which left BOTH channels unreliable. `role="group"` is
+        // the minimal container role that supports an accessible name, so the
+        // label is announced on entry and the visible line can stay hidden
+        // rather than saying the same sentence twice. It matters most for
+        // `unavailableReason`, which has no visible text at all.
+        role="group"
         // #350 QA [P2]: a `title` on a non-interactive div is hover-only — it is
         // unreachable on touch and not reliably announced by screen readers. The
         // visual design stays as chosen (spec §3.8, no new hero visual), but the
@@ -495,6 +565,20 @@ function CanonicalHero({
             ? <><span>{fmt.usd2(dollarPerPct)}</span> / 1% used</>
             : <>$ / 1% used {perAccountValue}</>}
         </div>
+        {/* public #5 QA P2 — a second `hs-sub` line: the zone's own dim
+            `--fs-meta` / `--text-dim` vocabulary, no new class and no new CSS.
+            It carries no bright `<span>`, so it renders strictly dimmer than
+            the `$/1%` line above it, which is the emphasis a transient loading
+            state should have. `aria-hidden` because the zone's `aria-label`
+            already reads the full sentence — announcing both would say it
+            twice. Suppressed while `unavailableReason` is showing, so the
+            visible line and the tooltip never disagree about which note wins.
+            Omitted entirely when null: no empty element, no stray separator. */}
+        {unavailableReason == null && spentNoteLabel != null ? (
+          <div className="hs-sub" data-testid="hero-spent-note" aria-hidden="true">
+            {spentNoteLabel}
+          </div>
+        ) : null}
       </div>
 
       <div className="hero-zone hero-support">

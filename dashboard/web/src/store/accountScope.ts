@@ -243,7 +243,7 @@ export function scopeEnvelope(
   if (sourceEntry?.data == null || accountScopesOf(sourceEntry) == null) return env;
   const focusKey = resolveAccountFocus(env, source, stored);
   if (focusKey == null) return env;
-  const cacheKey = `${source} ${focusKey}`;
+  const cacheKey = `${source}\u0000${focusKey}`;
   let perEnv = memo.get(env as unknown as object);
   if (perEnv == null) {
     perEnv = new Map();

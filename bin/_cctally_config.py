@@ -331,7 +331,21 @@ ALLOWED_CONFIG_KEYS = (
     "budget.codex.accounts",
     "telemetry.enabled",
     "conversation.retention_days",
+    "codex.hook.ingest_budget_seconds",
 )
+
+
+#: Wall-clock budget the native Codex hook gives its ingest leg (public #5
+#: spec §4). It applies to the HOOK path only — an explicit `cctally cache-sync`
+#: still runs to completion.
+CODEX_HOOK_INGEST_BUDGET_DEFAULT_SECONDS = 5.0
+
+#: Codex kills a hook at 30 seconds. The budget is capped strictly BELOW that,
+#: not merely validated positive: a configured 60 would guarantee the timeout
+#: this whole change exists to remove, and the cap leaves room for the rest of
+#: the tick (the reconcile, the budget evaluation, interpreter startup).
+CODEX_HOOK_TIMEOUT_SECONDS = 30.0
+CODEX_HOOK_INGEST_BUDGET_MAX_SECONDS = 20.0
 
 
 _CODEX_BUDGET_LEAF_PREFIX = "budget.codex."
@@ -372,6 +386,62 @@ def _validate_retention_days_value(raw: object) -> int:
             "conversation.retention_days must be >= 0 (use 'off' or 0 to disable)"
         )
     return value
+
+
+def _validate_codex_hook_ingest_budget_value(raw: object) -> float:
+    """Validate a ``config set`` value for ``codex.hook.ingest_budget_seconds``.
+
+    Positive is not enough. Codex kills a hook at
+    ``CODEX_HOOK_TIMEOUT_SECONDS``, so a value at or above
+    ``CODEX_HOOK_INGEST_BUDGET_MAX_SECONDS`` is rejected outright rather than
+    silently clamped: an operator who typed 60 asked for exactly the timeout
+    this budget exists to prevent, and a clamp would hide that.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(
+            "codex.hook.ingest_budget_seconds must be a positive number")
+    if isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                "codex.hook.ingest_budget_seconds must be a positive number, "
+                f"got {raw!r}")
+    elif isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        raise ValueError(
+            "codex.hook.ingest_budget_seconds must be a positive number")
+    if not (value > 0) or value != value or value in (float("inf"),):
+        raise ValueError(
+            "codex.hook.ingest_budget_seconds must be > 0")
+    if value >= CODEX_HOOK_INGEST_BUDGET_MAX_SECONDS:
+        raise ValueError(
+            "codex.hook.ingest_budget_seconds must be < "
+            f"{CODEX_HOOK_INGEST_BUDGET_MAX_SECONDS:g} (Codex kills a hook at "
+            f"{CODEX_HOOK_TIMEOUT_SECONDS:g}s)")
+    return value
+
+
+def resolve_codex_hook_ingest_budget(config: dict) -> float:
+    """The effective hook ingest budget in seconds.
+
+    Any malformed or out-of-range persisted value degrades to the default
+    rather than raising — a hand-edited config must never be able to make the
+    hook itself fail, and the default is the safe direction here.
+    """
+    default = CODEX_HOOK_INGEST_BUDGET_DEFAULT_SECONDS
+    block = config.get("codex") if isinstance(config, dict) else None
+    if not isinstance(block, dict):
+        return default
+    hook = block.get("hook")
+    if not isinstance(hook, dict):
+        return default
+    try:
+        return _validate_codex_hook_ingest_budget_value(
+            hook.get("ingest_budget_seconds"))
+    except ValueError:
+        return default
 
 
 def resolve_retention_days(config: dict) -> int:
@@ -981,6 +1051,10 @@ def _config_known_value(config: dict, key: str) -> "object":
         # Effective transcript-retention window in days (default 180; 0 = keep
         # forever). Malformed persisted data surfaces the safe default (F8).
         return resolve_retention_days(config)
+    if key == "codex.hook.ingest_budget_seconds":
+        # Wall-clock budget for the native Codex hook's ingest leg (public #5).
+        # Malformed or out-of-range persisted data surfaces the default.
+        return resolve_codex_hook_ingest_budget(config)
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Defaults mirror `_is_update_check_due` (True / 24 hours).
         # Hand-edited junk surfaces as the default — matches dashboard.bind.
@@ -1623,6 +1697,41 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 rendered = str(normalized)
             print(f"{key}={rendered}")
         return 0
+    if key == "codex.hook.ingest_budget_seconds":
+        # Validate first; rejection short-circuits before lock acquisition.
+        try:
+            budget = _validate_codex_hook_ingest_budget_value(raw)
+        except ValueError as exc:
+            print(f"cctally: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("codex")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: codex config error: codex must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            hook = block.get("hook")
+            if hook is not None and not isinstance(hook, dict):
+                print(
+                    "cctally: codex config error: codex.hook must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            hook = dict(hook or {})
+            hook["ingest_budget_seconds"] = budget
+            block["hook"] = hook
+            config["codex"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps(
+                {"codex": {"hook": {"ingest_budget_seconds": budget}}}, indent=2))
+        else:
+            print(f"{key}={budget:g}")
+        return 0
     if key == "conversation.retention_days":
         # Validate first; rejection short-circuits before lock acquisition (F8).
         try:
@@ -2156,6 +2265,22 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block[inner_key]
                 if not block:
                     config.pop("statusline", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "codex.hook.ingest_budget_seconds":
+        # Mirror the conversation.retention_days branch: drop the leaf, then
+        # prune an empty `hook` and an empty `codex` so config.json stays tidy.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("codex")
+            hook = block.get("hook") if isinstance(block, dict) else None
+            if isinstance(hook, dict) and "ingest_budget_seconds" in hook:
+                del hook["ingest_budget_seconds"]
+                if not hook:
+                    block.pop("hook", None)
+                if not block:
+                    config.pop("codex", None)
                 save_config(config)
             # idempotent: silent on missing key
         return 0

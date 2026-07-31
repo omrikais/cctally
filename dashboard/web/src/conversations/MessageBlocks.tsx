@@ -239,18 +239,41 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
   }
   const special = specialToolRenderer(call);
   if (special) return special;
-  const status = call.result?.is_error
-    ? ' · error'
-    : call.result?.truncated
-      ? ' · truncated'
-      : '';
+  // Backgrounded MCP call (spec 2026-07-31 §5). RECOVERED is
+  // `background_completed_at` being set — never `background_status ===
+  // 'completed'`, which an unrecovered call can also claim while `result` is
+  // still the "still running after 120s" placeholder (see the block type).
+  // Without this the chip surfaced only error/truncated, so a call that never
+  // came back looked exactly like one that did.
+  const bgDone = call.background_completed_at ?? null;
+  const bgPending = !!call.background_status && bgDone == null;
+  // The background label is a RIGID summary child; at 166px it squeezed
+  // .conv-chip-preview to 6px on a 390px viewport. Each label therefore has a
+  // short wording too, and the @media rule picks one (.conv-status-wide/
+  // -narrow in index.css). ' · truncated' rides on EVERY non-error branch —
+  // pending included, since a clipped placeholder is still clipped.
+  const bgWide = bgPending ? ' · ⋯ running in background' : bgDone ? ' · ran in background' : '';
+  const bgNarrow = bgPending ? ' · ⋯ bg' : bgDone ? ' · bg' : '';
+  const truncated = call.result?.truncated ? ' · truncated' : '';
+  const isErr = !!call.result?.is_error;
+  const status = isErr ? ' · error' : bgWide + truncated;
+  const statusShort = !isErr && bgNarrow ? bgNarrow + truncated : null;
   return (
     <details className="conv-chip conv-chip--tool">
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         {toolIcon(call.name)} <ChipName name={call.name} />
         <span className="conv-chip-preview">{call.preview}</span>
-        {status && <span className="conv-chip-status">{status}</span>}
+        {status && (
+          <span className="conv-chip-status" title={statusShort ? status.trim() : undefined}>
+            {statusShort ? (
+              <>
+                <span className="conv-status-wide">{status}</span>
+                <span className="conv-status-narrow">{statusShort}</span>
+              </>
+            ) : status}
+          </span>
+        )}
       </summary>
       <div className="conv-chip-body conv-chip-body--io">
         <div className="conv-tool-io">
@@ -272,7 +295,9 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
         {call.result ? (
           <div className="conv-tool-io">
             <div className="conv-tool-io-label">
-              result{call.result.is_error ? ' · error' : ' · ok'}
+              result{call.result.is_error
+                ? ' · error'
+                : bgPending ? ' · running in background' : ' · ok'}
               {call.result.truncated ? ' · truncated' : ''}
             </div>
             <CopyButton text={fullResult ?? call.result.text} />

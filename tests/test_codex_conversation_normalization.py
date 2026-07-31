@@ -1194,6 +1194,70 @@ def test_threading_parent_children_from_metadata(tmp_path, monkeypatch):
         conn.close()
 
 
+# --- detail paging (§5.6) ---------------------------------------------------
+
+
+def _detail_keys(detail) -> list[str]:
+    return [it["item_key"] for it in detail["items"]]
+
+
+def test_detail_limit_bounds_the_head_page(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        every = _detail_keys(
+            q.get_codex_conversation(conn, ck, effective_speed="standard", limit=0))
+        assert len(every) == 8
+        head = q.get_codex_conversation(conn, ck, effective_speed="standard", limit=3)
+        assert _detail_keys(head) == every[:3]
+        assert head["page"]["has_before"] is False
+        assert head["page"]["has_after"] is True
+    finally:
+        conn.close()
+
+
+def test_detail_tail_is_a_flag_not_an_item_count(tmp_path, monkeypatch):
+    """``tail`` is the boolean the HTTP layer parses out of ``?tail=1``.
+
+    Consuming it as a count made ``min(True, limit)`` collapse the tail page to a
+    single item, which left the reader's live-tail poll to append the whole head
+    page behind that one item — the reversed anchor-opened conversation.
+    """
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        every = _detail_keys(
+            q.get_codex_conversation(conn, ck, effective_speed="standard", limit=0))
+        tail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", tail=True, limit=3)
+        assert _detail_keys(tail) == every[-3:]
+        assert tail["page"]["has_before"] is True
+        assert tail["page"]["has_after"] is False
+    finally:
+        conn.close()
+
+
+def test_neutral_detail_threads_the_tail_flag_to_codex(tmp_path, monkeypatch):
+    """The dashboard seam: the handler passes a bool straight through."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        every = _detail_keys(
+            disp.neutral_detail(conn, ck, effective_speed="standard", limit=0))
+        assert _detail_keys(disp.neutral_detail(
+            conn, ck, effective_speed="standard", tail=False, limit=3)) == every[:3]
+        assert _detail_keys(disp.neutral_detail(
+            conn, ck, effective_speed="standard", tail=True, limit=3)) == every[-3:]
+    finally:
+        conn.close()
+
+
 # --- status matrix (§5.6) ---------------------------------------------------
 
 

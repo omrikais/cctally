@@ -3188,6 +3188,50 @@ def _claude_accounts_wire(
     return cards
 
 
+def _codex_ingest_backlog_wire(
+    cache_conn: sqlite3.Connection,
+) -> "dict[str, object] | None":
+    """The hook's budgeted-ingest backlog, or ``None`` when there is none.
+
+    Public #5 spec §5. Additive and OMITTED ENTIRELY at zero, so the normal
+    payload stays byte-identical for every install whose Codex history is
+    already ingested — which is nearly all of them, nearly all the time.
+
+    It deliberately does NOT touch ``availability`` or ``freshness``. Those are
+    read by a long and explicitly non-exhaustive list of gates, and degrading a
+    shared signal for a domain-local condition is a failure this project has
+    already hit; the client renders "history still loading" from this field
+    without any shared axis moving.
+
+    Any read or shape failure degrades to ``None``. The record is a health
+    signal, not evidence, and a hand-edited one must never be able to fail the
+    envelope build.
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            ("codex_ingest_backlog",),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        record = json.loads(str(row[0]))
+        files = int(record["files"])
+        pending_bytes = int(record["bytes"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    if files <= 0:
+        return None
+    since = record.get("since")
+    return {
+        "files": files,
+        "bytes": pending_bytes,
+        "since": None if since is None else str(since),
+    }
+
+
 def build_codex_source_state(
     context: DashboardReadContext,
     *,
@@ -3217,6 +3261,7 @@ def build_codex_source_state(
         context,
     )
     projection_incoherent = not coherence.coherent
+    ingest_backlog = _codex_ingest_backlog_wire(context.cache_conn)
     # The cache reader's established report surface treats the ``now`` instant
     # as inclusive.  The qualified adapter is half-open, so extend only its
     # query/result boundary by one microsecond and keep all live budget sums
@@ -3681,6 +3726,12 @@ def build_codex_source_state(
                 "projected_thresholds": context.codex_quota_projected_thresholds,
             },
             "cache_report": cache_report,
+            # public #5 §5: additive, omitted at zero (the `cycle_freshness`
+            # precedent). Never emitted as an empty object — the absence IS the
+            # "nothing owed" state, which is what keeps the normal payload
+            # byte-identical.
+            **({"ingest_backlog": ingest_backlog}
+               if ingest_backlog is not None else {}),
         },
         domain_freshness={
             "hero": (

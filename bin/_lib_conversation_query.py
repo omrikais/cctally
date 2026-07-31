@@ -54,6 +54,11 @@ from _lib_conversation import (
     _is_compaction_body, _is_notification_body, _is_bash_echo_body,
     _strip_remote_control_prefix,
 )
+# Backgrounded-MCP recovery (spec 2026-07-31): the placeholder/notification
+# parsers AND the fail-closed selection rule. The finalize-stage join and
+# locate_tool_payload's background_result mode both call select_background_joins
+# so a card can never display one capped response and load a different full one.
+import _lib_background_mcp as _bg
 
 # ── Opt-in phase instrumentation (issue #276, Session C / M5) ────────────────
 # This kernel is imported DIRECTLY by several tests (tests/test_conversation_*),
@@ -1685,6 +1690,7 @@ def _assemble_session(conn, session_id):
     turn_index = {}                # (msg_id, req_id) -> index into items
     tooluse_index = {}             # tool_use id -> (item, block_dict)
     tool_result_items = []         # placeholder items deferred to Phase 2
+    _bg_placeholder_claims_all = []  # canonical pre-fold claimant pairs
 
     def _index_tool_uses(item):
         # Index every tool_use id -> its (item, block). Idempotent: re-scanning
@@ -1714,6 +1720,8 @@ def _assemble_session(conn, session_id):
             it = _build_simple(row)
             items.append(it)
             tool_result_items.append(it)
+            _bg_placeholder_claims_all.extend(
+                _bg_placeholder_claims(it["blocks"]))
         else:
             it = _build_simple(row)
             items.append(it)
@@ -2050,6 +2058,87 @@ def _assemble_session(conn, session_id):
         _link = agent_link.get(_tuid)
         if _link is not None and _link[0] in subagent_meta:
             subagent_meta[_link[0]]["status"] = _status   # upgrades async_launched -> completed
+
+    # Backgrounded-MCP completion (spec 2026-07-31 §2). The sibling join above
+    # handles shape A — a subagent/Monitor notification carrying <tool-use-id>.
+    # Shape B (an MCP call Claude Code moved to the background after 120s)
+    # carries <task-id> and NO <tool-use-id>, so the bridge is the PLACEHOLDER
+    # tool_result, which names the task twice in two independently worded
+    # places. Runs here, on the UNSLICED item list, so a match can never depend
+    # on page boundaries (get_conversation slices downstream).
+    # Read the canonical PRE-FOLD claims. Phase 2 can fold more than one physical
+    # result into one tool call, and the visible result slot necessarily keeps
+    # only one; collecting there would already have lost conflicting claimants.
+    # The payload resolver independently reconstructs this same canonical-row
+    # population, so capped display and full lookup feed identical claims into
+    # the pure fail-closed selector. Collection rides the existing Phase-1
+    # parse; this finalize stage never reparses the session.
+    _ph_claims = _bg_placeholder_claims_all
+
+    _notifs = []                  # BackgroundNotification, document order
+    _notif_src = {}               # id(notification) -> (item, block)
+    _notif_by_task = {}           # task_id -> [block, …] (status stamping only)
+    for it in items:
+        if it["kind"] != "meta":
+            continue
+        for b in it["blocks"]:
+            # Shared extraction (exact header strip included) so the read-time
+            # join and the full-payload resolver can never diverge.
+            _n = _eligible_bg_notification(it["kind"], it.get("ts"), b)
+            if _n is None:
+                continue
+            _notifs.append(_n)
+            _notif_src[id(_n)] = (it, b)
+            _notif_by_task.setdefault(_n.task_id, []).append(b)
+
+    _joined = _bg.select_background_joins(_ph_claims, _notifs)
+    _bg_drop = set()
+    for _tuid, _n in _joined.items():
+        _hit = tooluse_index.get(_tuid)
+        if _hit is None:
+            continue
+        _owner, _block = _hit
+        _src_item, _src_block = _notif_src[id(_n)]
+        _block["result"] = {
+            "text": _n.result_text,
+            "truncated": bool(_src_block.get("result_truncated")),
+            "full_length": _src_block.get("result_full_length"),
+            "is_error": False,
+        }
+        _block["background_status"] = "completed"
+        _block["background_completed_at"] = _src_item.get("ts")
+        # The Phase-4b fold precedent: the folded row's uuid joins the owner's
+        # member_uuids so jump/permalink ownership, outline mapping and
+        # sidechain-parent lookup all keep resolving.
+        _owner["member_uuids"].append(_src_item["anchor"]["uuid"])
+        _bg_drop.add(id(_src_item))
+    if _bg_drop:
+        items = [it for it in items if id(it) not in _bg_drop]
+
+    # Stamp the status on every call we did NOT recover, so the client renders an
+    # in-flight state rather than a false "ok" (CodexCard reports '✓ ok' for any
+    # non-null non-error result). These notifications stay VISIBLE — a
+    # non-completed one is the only remaining evidence of what happened.
+    _unambiguous_tasks = _bg.unambiguous_placeholder_tasks(_ph_claims)
+    for _tuid in dict.fromkeys(tuid for tuid, _task in _ph_claims):
+        if _tuid in _joined:
+            continue
+        _hit = tooluse_index.get(_tuid)
+        if _hit is None:
+            continue
+        _task = _unambiguous_tasks.get(_tuid)
+        if _task is None:
+            # Conflicting task claims cannot choose a notification or status,
+            # but this is still visibly a background placeholder. Keep the
+            # client in its honest pending state instead of falling through to
+            # the generic non-error "ok" rendering.
+            _hit[1]["background_status"] = "running"
+            continue
+        _cands = _notif_by_task.get(_task) or []
+        _statuses = {c.get("background_status") for c in _cands
+                     if c.get("background_status")}
+        _hit[1]["background_status"] = (
+            _statuses.pop() if len(_statuses) == 1 else "running")
 
     # Derived totals: any child still missing a count gets it from its own
     # subagent_key bucket. tool-count = tool_call/tool_use blocks; duration =
@@ -3922,10 +4011,169 @@ def _manual_snippet(text, q, width=80):
 _FULL_PAYLOAD_CEILING = 1_000_000   # serve up to ~1 MB; protects the HTTP server / browser
 
 
+def _bg_notification_from_block(b):
+    """``BackgroundNotification`` for a stored background-notification block,
+    else ``None``.
+
+    ONE extraction, shared by the finalize-stage join and the full-payload
+    resolver — including the exact header strip: the stored text is
+    ``header\\n\\nresult`` and ``result_offset`` is where the result begins, so
+    the card always receives the bare ``{"threadId":…,"content":…}`` envelope its
+    parser decodes."""
+    if not isinstance(b, dict):
+        return None
+    task = b.get("task_id")
+    if not task:
+        return None
+    off = b.get("result_offset")
+    res = (b.get("text") or "")[off:] if isinstance(off, int) else None
+    return _bg.BackgroundNotification(
+        task, b.get("background_status") or "", b.get("summary") or "",
+        res or None)
+
+
+def _bg_placeholder_claims(blocks):
+    """Every background placeholder claim in one canonical stored row."""
+    out = []
+    if not isinstance(blocks, list):
+        return out
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("kind") != "tool_result":
+            continue
+        task_id = _bg.parse_placeholder_task_id(block.get("text") or "")
+        tool_use_id = block.get("tool_use_id")
+        if task_id and tool_use_id is not None:
+            out.append((tool_use_id, task_id))
+    return out
+
+
+def _eligible_bg_notification(item_kind, timestamp, block):
+    """Assembly/payload shared eligibility for a stored notification row."""
+    if item_kind != "meta" or not isinstance(timestamp, str) or not timestamp:
+        return None
+    return _bg_notification_from_block(block)
+
+
+# Cheap SQL prefilters for the two block shapes the background scan cares about.
+# Both are literal substrings of what must be present, so they can only
+# over-select — a false negative would break the fail-closed guarantee by hiding
+# a second claimant of the same task id.
+_BG_PLACEHOLDER_PROBE = "is still running after "
+_BG_TASK_ID_PROBE = '"task_id":'
+
+
+def _scan_background_session(conn, session_id):
+    """``(placeholders, notifications, {id(notification): (source_path, offset)})``
+    over one session's LOGICAL messages.
+
+    Reproduces ``_assemble_session``'s view rather than approximating it: the
+    physical rows are deduped by uuid keeping the earliest ``(timestamp_utc,
+    id)``, exactly as assembly does, so the full-payload path and the rendered
+    card can never disagree about which notification won. The canonical-row
+    decision is made over the WHOLE session (an id/uuid-only read) before the
+    content prefilter is applied — deciding it inside the prefiltered set would
+    let a later physical row become canonical for a uuid whose earliest row
+    assembly actually chose."""
+    canonical = {}
+    for rid, uuid in conn.execute(
+        "SELECT id, uuid FROM conversation_messages WHERE session_id=? "
+        "ORDER BY timestamp_utc, id", (session_id,)
+    ):
+        if uuid not in canonical:
+            canonical[uuid] = rid
+    keep = set(canonical.values())
+
+    placeholders, notifications, loc_by_notif = [], [], {}
+    for rid, source_path, byte_offset, entry_type, timestamp, blocks_json in conn.execute(
+        "SELECT id, source_path, byte_offset, entry_type, timestamp_utc, blocks_json "
+        "FROM conversation_messages WHERE session_id=? "
+        "AND (instr(blocks_json, ?) > 0 OR instr(blocks_json, ?) > 0) "
+        "ORDER BY timestamp_utc, id",
+        (session_id, _BG_PLACEHOLDER_PROBE, _BG_TASK_ID_PROBE)
+    ):
+        if rid not in keep:
+            continue
+        try:
+            blocks = _json.loads(blocks_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(blocks, list):
+            continue
+        placeholders.extend(_bg_placeholder_claims(blocks))
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("kind") == "tool_result":
+                continue
+            n = _eligible_bg_notification(entry_type, timestamp, b)
+            if n is not None:
+                notifications.append(n)
+                loc_by_notif[id(n)] = (source_path, byte_offset)
+    return placeholders, notifications, loc_by_notif
+
+
+def locate_result_payload(conn, session_id, tool_use_id):
+    """``(mode, location)`` for a PUBLIC ``which='result'`` request.
+
+    ``mode`` is one of:
+
+    - ``'result'`` — an ordinary tool_result; ``location`` is
+      ``locate_tool_payload(..., 'result')`` (``None`` for an unknown id -> 404).
+    - ``'background_result'`` — the id is a backgrounded-MCP placeholder whose
+      completion notification resolves unambiguously; ``location`` is a THREE
+      -tuple ``(source_path, byte_offset, task_id)`` addressing the
+      NOTIFICATION's JSONL line. The task id rides along because the re-read at
+      that offset must prove it landed on THIS task's notification.
+    - ``'background_gone'`` — a KNOWN background placeholder whose notification
+      cannot be resolved (deleted, rotated, still running, or ambiguous). The
+      handler maps this to 410, distinct from the 404 an unknown id returns.
+
+    ``background_result`` is INTERNAL: the response ``read_full_payload`` builds
+    keeps the public ``which: "result"`` discriminant, so neither the client
+    contract nor the endpoint's accepted input surface changes."""
+    has_background_placeholder = conn.execute(
+        "SELECT 1 FROM conversation_messages WHERE session_id=? "
+        "AND instr(blocks_json, ?) > 0 LIMIT 1",
+        (session_id, _BG_PLACEHOLDER_PROBE),
+    ).fetchone()
+    if has_background_placeholder is None:
+        return ("result", locate_tool_payload(conn, session_id, tool_use_id,
+                                              "result"))
+    placeholders, notifications, loc_by_notif = _scan_background_session(
+        conn, session_id)
+    if not any(tuid == tool_use_id for tuid, _task_id in placeholders):
+        return ("result", locate_tool_payload(conn, session_id, tool_use_id,
+                                              "result"))
+    # The SAME fail-closed rule assembly applied — called, never re-derived — so
+    # a card showing the placeholder can't load somebody else's full response.
+    n = _bg.select_background_joins(placeholders, notifications).get(tool_use_id)
+    if n is None:
+        return ("background_gone", None)
+    return ("background_result", loc_by_notif[id(n)] + (n.task_id,))
+
+
+def read_located_payload(loc, tool_use_id, which):
+    """``read_full_payload`` for a location a locator produced.
+
+    The ``background_result`` location is a 3-tuple whose third element is the
+    task id the re-read line must carry; every other mode is a plain
+    ``(source_path, byte_offset)``. Unpacking lives here so both payload routes
+    stay one call and neither can forget the identity check."""
+    return read_full_payload(
+        loc[0], loc[1], tool_use_id, which,
+        expected_task_id=(loc[2] if len(loc) > 2 else None))
+
+
 def locate_tool_payload(conn, session_id, tool_use_id, which):
     """``(source_path, byte_offset)`` for the JSONL line holding the tool_use
     (``which='input'``) or tool_result (``which='result'``) carrying this
     ``tool_use_id`` in this session, else ``None``.
+
+    ``which='background_result'`` is the internal backgrounded-MCP mode: it
+    resolves the placeholder for ``tool_use_id``, reads its task id, and
+    addresses the winning NOTIFICATION row instead — returning the 3-tuple
+    ``(source_path, byte_offset, task_id)`` that mode carries (see
+    ``locate_result_payload``).
 
     The prefilter uses ``instr(blocks_json, ?) > 0`` — NOT ``LIKE`` (Codex P1.4):
     tool_use_ids contain ``_`` (e.g. ``toolu_01SEQ…``), which ``LIKE`` treats as a
@@ -3937,6 +4185,9 @@ def locate_tool_payload(conn, session_id, tool_use_id, which):
     same deterministic ``ORDER BY timestamp_utc, id`` as ``get_conversation``. The
     SELECT runs here (not via ``get_conversation``) because that reader omits
     ``byte_offset`` (Codex P2.5)."""
+    if which == "background_result":
+        mode, loc = locate_result_payload(conn, session_id, tool_use_id)
+        return loc if mode == "background_result" else None
     rows = conn.execute(
         "SELECT source_path, byte_offset, blocks_json FROM conversation_messages "
         "WHERE session_id=? AND instr(blocks_json, ?) > 0 "
@@ -3959,7 +4210,8 @@ def locate_tool_payload(conn, session_id, tool_use_id, which):
     return None
 
 
-def read_full_payload(source_path, byte_offset, tool_use_id, which):
+def read_full_payload(source_path, byte_offset, tool_use_id, which, *,
+                      expected_task_id=None):
     """Re-read the raw JSONL line at ``(source_path, byte_offset)`` and return the
     FULL (un-capped) payload for ``tool_use_id``:
 
@@ -3974,7 +4226,23 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
     JSONL — the documented 410 path) or the id is no longer present in that line.
     ``full_length``/``truncated`` describe the payload against ``_FULL_PAYLOAD_CEILING``
     — honoring #178's "un-capped" spirit for real payloads while bounding the
-    degenerate multi-MB case."""
+    degenerate multi-MB case.
+
+    ``expected_task_id`` is REQUIRED by ``which='background_result'`` and ignored
+    otherwise. That line carries no ``tool_use_id`` to match on, so the task id is
+    the only identity it has: without the check, a rotated file whose stored
+    offset now lands on a DIFFERENT task-notification would serve a foreign
+    result under this call's id. A MISMATCH -> ``None`` (the 410 path), the same
+    fail-closed shape the ``result``/``input`` branches get from their exact id
+    match. An ABSENT one is different in kind: it is a wiring mistake, not a
+    rotation, and it would fail closed for EVERY recovered background result
+    while being indistinguishable in a log from the genuine article — so it
+    raises ``TypeError`` instead of degrading silently."""
+    if which == "background_result" and not expected_task_id:
+        raise TypeError(
+            "read_full_payload(which='background_result') requires a non-empty "
+            "expected_task_id — the notification line has no tool_use_id to "
+            "match on, so the task id is its only identity")
     try:
         with open(source_path, "rb") as fh:
             fh.seek(byte_offset)
@@ -3984,6 +4252,30 @@ def read_full_payload(source_path, byte_offset, tool_use_id, which):
         return None
     if not isinstance(obj, dict):
         return None
+    if which == "background_result":
+        # A backgrounded-MCP completion is an attachment record: it has NO
+        # ``message.content``, which is exactly why the public which='result'
+        # path could never serve it. Re-extract <result> from the raw wrapper.
+        # ``tool_use_id`` is not present in this line at all — it is echoed back
+        # only because the client keyed its request by it, so the TASK ID is the
+        # only identity available and it is checked below.
+        att = obj.get("attachment")
+        if not isinstance(att, dict):
+            return None
+        n = _bg.parse_task_notification(att.get("prompt"))
+        if n is None or not n.result_text:
+            return None      # rotated onto a non-notification line -> 410
+        if n.task_id != expected_task_id:
+            # Rotated onto a DIFFERENT task's notification: well-formed, with a
+            # well-formed <result>, and NOT ours. Serving it would attach a
+            # foreign response to this call. (An absent id never reaches here —
+            # it raised at the top as the wiring bug it is.)
+            return None
+        raw = n.result_text
+        return {"which": "result", "tool_use_id": tool_use_id,
+                "text": raw[:_FULL_PAYLOAD_CEILING], "full_length": len(raw),
+                "truncated": len(raw) > _FULL_PAYLOAD_CEILING,
+                "is_error": False}
     content = (obj.get("message") or {}).get("content")
     if not isinstance(content, list):
         return None

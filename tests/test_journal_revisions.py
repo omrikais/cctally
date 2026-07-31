@@ -7,9 +7,15 @@ import importlib
 
 import pytest
 
+import _cctally_core
 import _lib_journal as J
 from conftest import load_script, redirect_paths
 
+
+#: The binary's own epoch. Hard-coding it here made the parametrize below stale
+#: on every epoch bump for no behavioural reason: what the case distinguishes is
+#: "opened at the current epoch" from "opened legacy", not any particular value.
+CURRENT_EPOCH = _cctally_core.STATS_INDEX_EPOCH
 
 AT = "2026-07-25T12:00:00Z"
 FIXED = dt.datetime(2026, 7, 25, 12, 0, 0, tzinfo=dt.timezone.utc)
@@ -1321,7 +1327,7 @@ def test_live_divergent_same_revision_duplicate_is_quarantined_and_advances(ns):
 
 @pytest.mark.parametrize(
     ("raw_epoch", "opened_epoch"),
-    [(1004, 1004), (0, 1004), (0, 0)],
+    [(CURRENT_EPOCH, CURRENT_EPOCH), (0, CURRENT_EPOCH), (0, 0)],
 )
 def test_live_ingest_acquires_maintenance_before_ingest_lock(
     ns, monkeypatch, raw_epoch, opened_epoch

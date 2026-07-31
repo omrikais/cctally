@@ -23,11 +23,11 @@ Auth
   ✓ OAuth token              present
 Database
   ✓ stats.db                 version 0 / 13 known
-  ✓ cache.db                 version 0 / 35 known
+  ✓ cache.db                 version 0 / 41 known
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/48 applied
-  ⚠ Pending migrations       48 pending
+  ✓ Migrations               0/54 applied
+  ⚠ Pending migrations       54 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -48,8 +48,10 @@ Data
   ✓ Codex cache              1 entries; last sync 60s ago
   ✓ Codex project metadata   qualified
   ✓ Codex transcript replay  none pending
+  ✓ Codex ingest backlog     no Codex ingest backlog
   ⚠ Codex quota              no safely interpreted windows
       → Run `cctally cache-sync --source codex --rebuild`
+  ✓ Codex quota verification no hand-off in the last 24h
   ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
   ✓ Forked week buckets      none
   ✓ Post-credit milestones   no credited weeks
@@ -74,4 +76,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 47 OK · 8 WARN · 0 FAIL
+Summary: 49 OK · 8 WARN · 0 FAIL

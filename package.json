@@ -1,6 +1,6 @@
 {
   "name": "cctally",
-  "version": "1.88.2",
+  "version": "1.89.0",
   "description": "Claude Code usage tracker and local dashboard for Pro/Max subscription limits - weekly cost-per-percent trend, quota forecasts, threshold alerts. ccusage-compatible.",
   "homepage": "https://github.com/omrikais/cctally",
   "repository": {
@@ -64,6 +64,7 @@
     "bin/_lib_alert_axes.py",
     "bin/_lib_alert_dispatch.py",
     "bin/_lib_alerts_payload.py",
+    "bin/_lib_background_mcp.py",
     "bin/_lib_blocks.py",
     "bin/_lib_budget.py",
     "bin/_lib_cache_report.py",
@@ -103,6 +104,8 @@
     "bin/_lib_pricing_check.py",
     "bin/_lib_pricing_debug.py",
     "bin/_lib_quota.py",
+    "bin/_lib_quota_alert_axes.py",
+    "bin/_lib_quota_ledger.py",
     "bin/_lib_readme_refresh.py",
     "bin/_lib_record.py",
     "bin/_lib_rederive.py",

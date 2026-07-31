@@ -275,7 +275,22 @@ def would_block_prod_stats_cutover(path) -> bool:
 #
 # Bump ``_STATS_OPEN_FIXUPS_VERSION`` when a NEW open-time backfill is added, so
 # existing installs re-run the fixups once to pick it up.
-_STATS_OPEN_FIXUPS_VERSION = 1
+#
+# 1 -> 2 (public #5): the quota-projection schema gained
+# ``quota_window_blocks.physical_group_key`` / ``physical_group_digest`` and the
+# ``quota_projection_ledger_state`` row. An epoch-mismatched index resolves that
+# by REBUILD, but a LEGACY index (``user_version <= LEGACY_STATS_HEAD``) takes
+# the in-place cutover instead, and the cutover relies on this open-time schema
+# apply — which a stamped marker skips outright. Without the bump such a DB is
+# stamped at the new epoch while still missing the columns, and every subsequent
+# open returns at the steady-state gate before any schema work could add them:
+# a permanent `no such column: physical_group_key`.
+#
+# 2 -> 3 (public #5, I2 review): the same seam, one column later. The periodic
+# verification adds `quota_projection_ledger_state.last_full_pass_at`, and a
+# legacy index that already ran the fixups at version 2 would skip the schema
+# apply that adds it.
+_STATS_OPEN_FIXUPS_VERSION = 3
 
 
 def stats_open_fixups_current(conn: sqlite3.Connection) -> bool:

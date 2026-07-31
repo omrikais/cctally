@@ -9,12 +9,13 @@ would execute the whole suite (which re-invokes this runner). A short timeout
 is a backstop against that.
 """
 import pathlib
+import shutil
 import subprocess
 
 RUNNER = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally-test-all"
 
 
-def _plan(env_overrides, fake_ncpu="16"):
+def _plan(env_overrides, fake_ncpu="16", runner=RUNNER):
     env = {
         "PATH": __import__("os").environ["PATH"],
         "CCTALLY_TEST_ALL_PLAN": "1",
@@ -22,7 +23,7 @@ def _plan(env_overrides, fake_ncpu="16"):
     }
     env.update(env_overrides)
     proc = subprocess.run(
-        [str(RUNNER)], env=env, capture_output=True, text=True, timeout=30
+        [str(runner)], env=env, capture_output=True, text=True, timeout=30
     )
     return proc
 
@@ -100,3 +101,30 @@ def test_rejects_zero():
 def test_rejects_non_numeric():
     p = _plan({"CCTALLY_OUTER_JOBS": "abc"}, fake_ncpu="16")
     assert p.returncode == 2
+
+
+def test_plan_explicitly_includes_test_remote_harness():
+    p = _plan({})
+    assert p.returncode == 0, p.stderr
+    assert "test-remote" in _kv(p.stdout)["harnesses"].split()
+
+
+def test_non_executable_test_remote_is_a_required_harness_error(tmp_path):
+    repo = tmp_path / "repo"
+    bindir = repo / "bin"
+    bindir.mkdir(parents=True)
+    runner = bindir / "cctally-test-all"
+    shutil.copy2(RUNNER, runner)
+
+    for name in ("codex-quota", "source-aware"):
+        harness = bindir / f"cctally-{name}-test"
+        harness.write_text("#!/usr/bin/env bash\nexit 0\n")
+        harness.chmod(0o755)
+
+    test_remote = bindir / "cctally-test-remote-test"
+    test_remote.write_text("#!/usr/bin/env bash\nexit 0\n")
+    test_remote.chmod(0o644)
+
+    p = _plan({}, runner=runner)
+    assert p.returncode == 2
+    assert "required harness is not executable: test-remote" in p.stderr

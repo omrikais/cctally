@@ -1080,9 +1080,14 @@ def test_the_stats_index_epoch_is_unchanged(stats_ns):
     behaviour. #416 Slice 2 changes no stats schema — the only schema change is
     cache migration 032, and the cache registry is not frozen — so the epoch
     must stay where it is. A future change that genuinely needs a bump will turn
-    this red and force the author to re-read Task 10 Step 6 first."""
+    this red and force the author to re-read Task 10 Step 6 first.
+
+    Public #5 IS such a change and deliberately turned it red: the incremental
+    projector adds the reverse map + composable group digest to
+    `quota_window_blocks` and the `quota_projection_ledger_state` row, which is
+    a stats SCHEMA change against a frozen registry. 1004 -> 1005 -> 1006."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1004
+    assert _cctally_core.STATS_INDEX_EPOCH == 1006
 
 
 # --------------------------------------------------------------------------

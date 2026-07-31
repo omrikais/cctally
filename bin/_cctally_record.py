@@ -169,6 +169,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -4627,27 +4628,135 @@ def _hook_tick_format_log_line(
     )
 
 
+#: A token that is unmistakably a filesystem path: an absolute POSIX path, a
+#: `~`-relative one, or a Windows drive path. The negative lookbehind is what
+#: keeps `Input/output error` and `disk I/O error` intact — a separator with a
+#: word character in front of it is prose, not a root.
+#:
+#: It deliberately does NOT match a RELATIVE path (`.codex/sessions/…`): every
+#: separator in one is preceded by a word character, so widening the lookbehind
+#: to reach it is the same edit that starts eating prose. That is acceptable
+#: because of what the two rules are each for — a relative path carries no
+#: username and no home directory, so the only identifier it can leak is the
+#: conversation id, which the UUID rule below redacts wherever it appears.
+_HOOK_LOG_PATHISH = re.compile(r"(?<!\w)(?:[A-Za-z]:[\\/]|~?/)[^\s'\"]*")
+
+#: A conversation identifier, in or out of path form. Codex names its rollouts
+#: `rollout-<timestamp>-<uuid>.jsonl`, and the `OSError` narrowing only drops
+#: the one that arrives as `filename` — any OTHER exception type quoting a
+#: rollout relatively, or a bare conversation key in one of our own
+#: `ValueError(f"… {key}")` messages, escapes the path rule entirely. A
+#: canonical UUID cannot occur in prose, so this one needs no lookbehind.
+_HOOK_LOG_UUIDISH = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])")
+
+#: `hook-tick.log` free text is read back by a LAST-WINS `k=v` comprehension,
+#: so the value may not contain a separator of its own.
+_HOOK_LOG_FIELD_SEPARATOR_SUBSTITUTE = ":"
+
+
+def _hook_log_safe_free_text(value: str, *, limit: int = 200) -> str:
+    """Collapse one free-text hook-tick log value and defuse it.
+
+    Four transforms, in order: whitespace collapses so a multi-line message
+    cannot split the record; path-shaped tokens are redacted; UUID-shaped ones
+    are redacted separately, because a relative or bare conversation id never
+    reaches the path rule; and ``=`` is substituted so the value cannot
+    impersonate a field. See ``_hook_log_error_detail`` for why each is
+    load-bearing.
+    """
+    collapsed = " ".join(str(value).split())
+    collapsed = _HOOK_LOG_PATHISH.sub("<path>", collapsed)
+    collapsed = _HOOK_LOG_UUIDISH.sub("<uuid>", collapsed)
+    collapsed = collapsed.replace("=", _HOOK_LOG_FIELD_SEPARATOR_SUBSTITUTE)
+    return collapsed[:limit]
+
+
+def _hook_log_error_detail(exc: BaseException, *, limit: int = 200) -> str:
+    """One bounded, privacy-safe ``<class>: <message>`` for a hook-tick line.
+
+    Two things the plain ``f"{type(exc).__name__}: {exc}"`` emits that this
+    durable, deliberately-bounded diagnostic must not.
+
+    A FILESYSTEM PATH. The whole ``OSError`` family puts ``filename`` in its
+    ``str()``, so one ``PermissionError: [Errno 13] Permission denied:
+    '/Users/<name>/.codex/sessions/…/rollout-…-<uuid>.jsonl'`` writes a username
+    AND a conversation identifier into the log — the same exposure for which a
+    traceback was already rejected, without the traceback. The family is
+    narrowed to ``errno``/``strerror``, which is the diagnostic half, and
+    whatever remains is additionally scrubbed of path-shaped AND UUID-shaped
+    tokens: the callers are blanket ``except`` blocks that can catch anything,
+    including our own ``ValueError(f"… {path}")``. The two scrubs are separate
+    rules because the path one recognises only an ABSOLUTE or ``~``-relative
+    root — a relative ``.codex/sessions/…`` spelling escapes it, and so does a
+    bare conversation key, neither of which the ``OSError`` narrowing can reach
+    on a non-``OSError`` type. Between them: a username or home directory can
+    only appear under an absolute or ``~`` root, and a conversation id is a UUID
+    wherever it appears.
+
+    An ``=``. The only real reader of these lines is a LAST-WINS
+    ``{k: v for token in tokens if "=" in token}`` comprehension
+    (``_codex_lifecycle_activity_24h``), so a message containing
+    ``provider=claude`` or ``result=success`` overrides the true field — the
+    record is dropped from doctor's view, or an errored tick is counted as a
+    success. Appending the free text LAST does not protect the fixed columns
+    from that parser; last-wins means it is precisely the position that loses.
+    """
+    detail = (
+        f"[Errno {exc.errno}] {exc.strerror}"
+        if isinstance(exc, OSError) and exc.strerror
+        else str(exc)
+    )
+    return _hook_log_safe_free_text(
+        f"{type(exc).__name__}: {detail}".strip(), limit=limit)
+
+
 def _codex_lifecycle_log_line(
     *, source_root_key: str, event: str, sync: str, result: str,
     blocks: int, milestones: int, alert_eligible_roots: int,
-    quota_alerts: int, budget_alerts: int, dur_ms: int,
+    quota_alerts: int, budget_alerts: int, dur_ms: int, backlog: int = 0,
+    error: str = "",
 ) -> str:
     """Render one privacy-safe root-qualified Codex lifecycle outcome.
 
     Native hook input can contain session paths and conversation identifiers;
     this durable diagnostic deliberately carries only the bounded event label,
-    opaque source root key, aggregate reconciliation counts, and duration.
+    opaque source root key, aggregate reconciliation counts, duration, and — on
+    an errored tick — a DEFUSED exception class and message.
+
+    ``error`` is the one free-text field. It carries the class and message from
+    the hook's blanket except, never a traceback and never anything derived from
+    hook stdin, because a `result=error` tick with nothing else recorded is
+    undiagnosable and has already cost one debugging round.
+
+    Its position is last for readability, NOT for safety, and the comment that
+    claimed otherwise had it backwards. The only real reader of this line is a
+    LAST-WINS `k=v` comprehension (`_codex_lifecycle_activity_24h`), against
+    which last position is the WINNING one — a message containing
+    `provider=claude` dropped the whole record from doctor's view, and one
+    containing `result=success` counted an errored tick as a success. Safety
+    comes from `_hook_log_safe_free_text`, which is what keeps every fixed
+    column authoritative and every path out of the file. A caller holding the
+    exception should pass `_hook_log_error_detail(exc)`, so the `OSError`
+    family's embedded `filename` is narrowed away at the source as well.
     """
     safe_event = "".join(
         char for char in str(event)[:40] if char.isalnum() or char in "-_"
     ) or "unknown"
+    suffix = ""
+    if error:
+        collapsed = _hook_log_safe_free_text(error)
+        if collapsed:
+            suffix = f" error={collapsed}"
     return (
         f"{now_utc_iso()} provider=codex source_root_key={source_root_key} "
         f"event={safe_event} sync={sync} blocks={int(blocks)} "
         f"milestones={int(milestones)} "
         f"alert_eligible_roots={int(alert_eligible_roots)} "
         f"quota_alerts={int(quota_alerts)} budget_alerts={int(budget_alerts)} "
-        f"dur_ms={max(0, int(dur_ms))} result={result}"
+        f"backlog={max(0, int(backlog))} "
+        f"dur_ms={max(0, int(dur_ms))} result={result}{suffix}"
     )
 
 
@@ -4656,7 +4765,54 @@ def _codex_lifecycle_roots():
     return codex_hook_roots(_cctally()._codex_home_roots())
 
 
-def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") -> int:
+def _stats_epoch_rebuild_pending() -> bool:
+    """Would opening stats.db right now trigger a whole-journal rebuild?
+
+    Side-effect-free: a raw read-only ``PRAGMA user_version``, the same probe
+    ``resolve_stats_epoch_mismatch`` re-checks under the maintenance lock.
+
+    Deliberately narrow. A MISSING stats.db is a fresh install, where building
+    the index is cheap and skipping it would leave the hook with nothing to do
+    forever. An UNREADABLE one belongs to the corruption auto-heal path, not
+    here. A LEGACY index (``user_version <= LEGACY_STATS_HEAD``) takes the
+    migration route rather than the epoch rebuild, and predates every epoch
+    this decision is about. Only a readable, post-legacy, wrong-epoch index —
+    exactly what an upgrade across a ``STATS_INDEX_EPOCH`` bump produces —
+    answers True.
+    """
+    path = _cctally_core.DB_PATH
+    try:
+        if not path.exists():
+            return False
+    except OSError:
+        return False
+    try:
+        import _cctally_store
+        version = _cctally_store._raw_user_version(path)
+    except Exception:
+        return False
+    if version < 0 or version <= _cctally_core.LEGACY_STATS_HEAD:
+        return False
+    return version != _cctally_core.STATS_INDEX_EPOCH
+
+
+def _defer_stats_epoch_rebuild() -> str:
+    """Hand a pending stats.db epoch rebuild to the detached quota worker.
+
+    Reuses ``_codex-quota-verify`` rather than adding a third worker: its
+    ``force_full`` pass opens stats.db, which is what performs the rebuild, and
+    the whole-history pass it then runs is exactly the one the freshly rebuilt
+    index needs anyway. Sharing the worker also shares its attempt-stamped
+    throttle, so a rebuild that keeps dying cannot spawn one worker per tick.
+    """
+    from _cctally_quota import _defer_codex_quota_verification
+    return _defer_codex_quota_verification()
+
+
+def _cmd_hook_tick_codex(
+    args: argparse.Namespace, *, event: str = "unknown",
+    transcript_path: str = "",
+) -> int:
     """Run one quiet, foreground Codex lifecycle tick.
 
     Native Codex Stop/SubagentStop hooks may fire concurrently.  Per-root
@@ -4679,6 +4835,7 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
 
     def log_outcome(
         *, sync: str, result: str, projection=None, budget_alerts: int = 0,
+        backlog: int = 0, error: str = "",
     ) -> None:
         blocks = int(getattr(projection, "blocks_upserted", 0) or 0)
         milestones = int(getattr(projection, "milestones_upserted", 0) or 0)
@@ -4695,9 +4852,29 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
                 alert_eligible_roots=len(due_root_keys),
                 quota_alerts=quota_alerts,
                 budget_alerts=budget_alerts,
+                backlog=backlog,
                 dur_ms=dur_ms,
+                error=error,
             ))
         _hook_tick_log_rotate_if_needed()
+
+    # public #5: a pending stats.db epoch rebuild is the one operation on this
+    # path that neither the ingest budget nor the projection's `defer` can
+    # bound, because it happens inside `open_db()` before any of this code gets
+    # a say. Measured on a real 211K-observation / 1,859-rollout store, the
+    # first tick after the epoch bump cost 82.05s wall — 76.45s of it the
+    # journal rebuild — against Codex's 30-second hook timeout. A killed rebuild
+    # commits nothing, so the next tick repeats it: a non-converging
+    # 30-second-per-turn loop, which is the reported defect delivered by the
+    # fix. Hand it to the same detached worker the periodic verification uses
+    # (its `force_full` pass opens stats.db and therefore performs the rebuild)
+    # and acknowledge this tick as a no-op. No lifecycle marker is stamped, so
+    # the next Codex turn re-checks immediately; the spawn itself is throttled.
+    if _stats_epoch_rebuild_pending():
+        _defer_stats_epoch_rebuild()
+        log_outcome(sync="deferred", result="noop")
+        release_lifecycle_locks(locks)
+        return 0
 
     try:
         # Hook stdout/stderr is contractually silent.  Cache migration and
@@ -4707,10 +4884,26 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
             cache = c.open_cache_db()
             try:
                 cache_mod = c._load_sibling("_cctally_cache")
+                # public #5 spec §4: the hook's ingest leg is BUDGETED and
+                # resumable, and it ingests the active rollout first so live
+                # numbers stay correct while history lags. Only this caller
+                # passes a budget — an explicit `cctally cache-sync` still runs
+                # to completion.
+                import _cctally_config as _cfg_codex
+                budget_seconds = _cfg_codex.resolve_codex_hook_ingest_budget(
+                    c.load_config())
                 stats, cache = cache_mod._run_cache_operation_with_recovery(
                     cache,
                     lambda active_conn: c.sync_codex_cache(
-                        active_conn, lock_timeout=0
+                        active_conn, lock_timeout=0,
+                        budget_seconds=budget_seconds,
+                        active_transcript_path=transcript_path or None,
+                        # public #5 spec §4: ONE reconcile per tick. The
+                        # explicit alert-eligible reconcile below can never
+                        # take the certificate short-circuit (it is guarded by
+                        # `not alert_eligible_roots`), so the sync-internal one
+                        # was pure duplicated cost.
+                        quota_reconcile="defer",
                     ),
                     origin="hook.codex_quota.sync",
                 )
@@ -4723,6 +4916,18 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
                 source_root_keys=all_root_keys,
                 alert_eligible_root_keys=due_root_keys,
                 now=dt.datetime.now(dt.timezone.utc),
+                # public #5 spec §2/§4: the hook path NEVER runs a
+                # whole-history quota pass inline — not the once-a-day
+                # verification, and not a rebuilt stats index, an interpretation
+                # bump, a missing reverse map, a reset ledger or a dirty-unit
+                # burst either. On a hook-only install no dashboard tick or
+                # `codex quota` invocation reaches any of them first, so each
+                # would land here as a ~14-30s reconcile on a blocking path
+                # against Codex's 30-second timeout. `defer` hands every one of
+                # them to the detached `_codex-quota-verify` worker; the bounded
+                # ingest above stays foreground, so fresh observations still
+                # precede the turn.
+                full_pass="defer",
             )
             # Vendor-scoped spend is intentionally evaluated once per
             # successful due-set tick, not once per root. Task 7 Item 4: the
@@ -4743,15 +4948,47 @@ def _cmd_hook_tick_codex(args: argparse.Namespace, *, event: str = "unknown") ->
             _jr_codex.run_stats_ingest(
                 mode="authoritative", codex_apply=_codex_budget_leg)
             budget_alerts = _budget_holder["n"]
+        if getattr(stats, "deferred_reason", None) == "replay_pending":
+            # public #5: the budgeted tick declined a byte-zero replay, and on
+            # a hook-only install nothing else would ever perform one — no
+            # dashboard, no `codex quota`, no `cache-sync`. Every following tick
+            # would return at the same decline and Codex ingest would freeze
+            # permanently. Hand the unbudgeted drain to a detached worker.
+            # Outside the cache flocks by construction (the sync released them
+            # before returning) and after the connection closed, so the worker
+            # is not racing this tick for the writer lock.
+            cache_mod._defer_codex_replay_drain()
         mark_lifecycle_success(locks)
         log_outcome(
-            sync="ok", result="success", projection=projection,
+            # A byte-zero Codex replay is not sliceable, so a budgeted tick
+            # declines it outright and hands the unbudgeted drain to a detached
+            # worker (above). Say so in the lifecycle line rather than reporting
+            # a sync that did not walk anything as "ok".
+            sync="deferred" if getattr(stats, "deferred_reason", None) else "ok",
+            result="success", projection=projection,
             budget_alerts=budget_alerts,
+            backlog=int(getattr(stats, "backlog_files", 0) or 0),
         )
-    except Exception:
+    except Exception as exc:
         # A failed sync, projection, or budget evaluation must acknowledge no
         # root.  Hooks are best-effort and remain a successful no-op to Codex.
-        log_outcome(sync="error", result="error")
+        #
+        # The class and message go into the lifecycle line. Discarding them
+        # already cost a debugging round: a changed keyword signature raised
+        # TypeError inside this block and presented as a silent `result=error`
+        # tick indistinguishable from a database failure. No traceback (this is
+        # a durable, privacy-bounded diagnostic and a traceback carries paths),
+        # and nothing reaches stdout or stderr — those stay contractually
+        # silent.
+        #
+        # `_hook_log_error_detail`, not a bare f-string: rejecting the traceback
+        # for carrying paths and then interpolating `str(exc)` was the same leak
+        # one layer down, because the whole `OSError` family embeds `filename`
+        # — a rollout path is a username plus a conversation UUID.
+        log_outcome(
+            sync="error", result="error",
+            error=_hook_log_error_detail(exc),
+        )
         return 0
     finally:
         release_lifecycle_locks(locks)
@@ -4781,7 +5018,10 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         # probes may only drain stdin.  Do not turn an absent payload into a
         # hook failure merely because event observability is unavailable.
         event = meta.get("event", "unknown") if isinstance(meta, dict) else "unknown"
-        return _cmd_hook_tick_codex(args, event=event)
+        transcript = (
+            meta.get("transcript_path", "") if isinstance(meta, dict) else "")
+        return _cmd_hook_tick_codex(
+            args, event=event, transcript_path=str(transcript or ""))
     explain = bool(getattr(args, "explain", False))
     foreground = bool(getattr(args, "foreground", False))
     no_oauth = bool(getattr(args, "no_oauth", False))

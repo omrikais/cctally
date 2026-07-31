@@ -10,7 +10,8 @@ Three concerns:
     so fixture DBs never trigger inline ALTER TABLE migrations at open time.
   * Row seeders: `seed_session_file(...)`, `seed_session_entry(...)`,
     `seed_weekly_usage_snapshot(...)`, `seed_codex_session_file(...)`,
-    `seed_codex_session_entry(...)` — typed, keyword-only inserts with
+    `seed_codex_session_entry(...)`, `seed_codex_source_root(...)`,
+    `seed_codex_quota_snapshot(...)` — typed, keyword-only inserts with
     safe defaults.
   * JSONL emitters: `emit_streaming_pair(...)` — write the
     streaming-intermediate + post-stream-finalization two-row pattern
@@ -1131,6 +1132,99 @@ def _self_test_weekly_cost_seeder() -> None:
     print("OK: weekly_cost seeder")
 
 
+def seed_codex_source_root(
+    conn: sqlite3.Connection,
+    *,
+    source_root_key: str,
+    canonical_root_path: str,
+    first_seen_utc: str = FIXED_LAST_INGESTED_AT,
+    last_seen_utc: str = FIXED_LAST_INGESTED_AT,
+) -> None:
+    """Insert (or refresh) a codex_source_roots row.
+
+    `_cctally_quota._cache_root_keys` reads this table to decide which roots
+    are ACTIVE, so a quota fixture that seeds `quota_window_snapshots` without
+    a matching root row reconciles nothing.
+    """
+    conn.execute(
+        """INSERT INTO codex_source_roots
+           (source_root_key, canonical_root_path, first_seen_utc, last_seen_utc)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(source_root_key) DO UPDATE SET
+             canonical_root_path=excluded.canonical_root_path,
+             last_seen_utc=excluded.last_seen_utc""",
+        (source_root_key, canonical_root_path, first_seen_utc, last_seen_utc),
+    )
+
+
+def seed_codex_quota_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    source_root_key: str,
+    source_path: str,
+    line_offset: int,
+    captured_at_utc: str,
+    logical_limit_key: str,
+    window_minutes: int,
+    used_percent: float,
+    resets_at_utc: str,
+    observed_slot: str = "primary",
+    canonical_resets_at_utc: Optional[str] = None,
+    limit_id: Optional[str] = "codex",
+    limit_name: Optional[str] = None,
+    plan_type: Optional[str] = None,
+    individual_limit_json: Optional[str] = None,
+    reached_type: Optional[str] = None,
+    observed_model: Optional[str] = None,
+    account_key: Optional[str] = None,
+) -> None:
+    """Insert one physical Codex `quota_window_snapshots` row.
+
+    `canonical_resets_at_utc` defaults to `resets_at_utc`, which is what
+    production ingest stores for the FIRST observation of a window (the anchor
+    resolver establishes the anchor at its own raw value). Pass an explicit
+    value to model a jittered later observation folding onto an earlier anchor,
+    or pass the sentinel `""` to model a pre-#416 row whose anchor is still
+    NULL and whose readers fall back to the raw reset.
+    """
+    if canonical_resets_at_utc is None:
+        anchor: Optional[str] = resets_at_utc
+    elif canonical_resets_at_utc == "":
+        anchor = None
+    else:
+        anchor = canonical_resets_at_utc
+    conn.execute(
+        """INSERT INTO quota_window_snapshots
+           (source, source_root_key, source_path, line_offset, captured_at_utc,
+            observed_slot, logical_limit_key, limit_id, limit_name,
+            window_minutes, used_percent, resets_at_utc, plan_type,
+            individual_limit_json, reached_type, observed_model, account_key,
+            canonical_resets_at_utc)
+           VALUES ('codex',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (source_root_key, source_path, line_offset, captured_at_utc,
+         observed_slot, logical_limit_key, limit_id, limit_name,
+         window_minutes, used_percent, resets_at_utc, plan_type,
+         individual_limit_json, reached_type, observed_model, account_key,
+         anchor),
+    )
+
+
+def bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
+    """Advance the Codex physical mutation sequence by one.
+
+    Every real Codex ingest that writes `quota_window_snapshots` bumps this
+    counter in the SAME commit (`_write_codex_file_batch`). A fixture that
+    inserts quota rows without bumping it leaves the projection certificate
+    looking current, so the reconcile short-circuits and the fixture silently
+    exercises nothing.
+    """
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES "
+        "('codex_physical_mutation_seq', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
+    )
+
+
 def _self_test_codex_seeders() -> None:
     """Verify codex seeders round-trip correctly, including None-as-NULL
     for lazy-population fields and the LiteLLM-convention token fields."""
@@ -1186,6 +1280,62 @@ def _self_test_codex_seeders() -> None:
         assert null_row == (None, None, 0), f"lazy-population row mismatch: {null_row}"
         assert tokens == (200, 50, 300, 100, 500), f"token fields mismatch: {tokens}"
     print("OK: codex seeders")
+
+
+def _self_test_codex_quota_seeders() -> None:
+    """Verify the Codex quota-window seeders round-trip, including the
+    canonical-anchor default and the explicit pre-#416 NULL sentinel."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "cache.db"
+        create_cache_db(db)
+        with sqlite3.connect(db) as conn:
+            seed_codex_source_root(
+                conn,
+                source_root_key="root-a",
+                canonical_root_path="/fake/codex/root-a",
+            )
+            seed_codex_quota_snapshot(
+                conn,
+                source_root_key="root-a",
+                source_path="/fake/codex/root-a/rollout.jsonl",
+                line_offset=0,
+                captured_at_utc="2026-04-15T10:00:00Z",
+                logical_limit_key="limit-primary",
+                window_minutes=300,
+                used_percent=12.5,
+                resets_at_utc="2026-04-15T15:00:00Z",
+            )
+            seed_codex_quota_snapshot(
+                conn,
+                source_root_key="root-a",
+                source_path="/fake/codex/root-a/rollout.jsonl",
+                line_offset=1,
+                captured_at_utc="2026-04-15T11:00:00Z",
+                logical_limit_key="limit-primary",
+                window_minutes=300,
+                used_percent=13.5,
+                resets_at_utc="2026-04-15T15:00:00Z",
+                canonical_resets_at_utc="",
+            )
+            bump_codex_physical_mutation_seq(conn)
+            bump_codex_physical_mutation_seq(conn)
+            conn.commit()
+            roots = conn.execute(
+                "SELECT COUNT(*) FROM codex_source_roots").fetchone()[0]
+            anchors = [
+                row[0] for row in conn.execute(
+                    "SELECT canonical_resets_at_utc FROM quota_window_snapshots "
+                    "ORDER BY line_offset")
+            ]
+            seq = conn.execute(
+                "SELECT value FROM cache_meta "
+                "WHERE key='codex_physical_mutation_seq'").fetchone()[0]
+        assert roots == 1, f"expected 1 source root, got {roots}"
+        assert anchors == ["2026-04-15T15:00:00Z", None], (
+            f"canonical anchor round-trip mismatch: {anchors}")
+        assert int(seq) == 2, f"mutation sequence mismatch: {seq}"
+    print("OK: codex quota seeders")
 
 
 def _with_ttl_split(usage: dict, cache_create_tokens: int,
@@ -1398,5 +1548,6 @@ if __name__ == "__main__":
     _self_test_weekly_usage_seeder()
     _self_test_weekly_cost_seeder()
     _self_test_codex_seeders()
+    _self_test_codex_quota_seeders()
     _self_test_emit_streaming_pair()
     print("all self-tests passed")

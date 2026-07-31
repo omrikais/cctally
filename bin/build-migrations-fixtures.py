@@ -5668,6 +5668,615 @@ def build_per_migration_035_codex_thread_source_inference_replay(
     _build_post(pre, post)
 
 
+_PRIOR_CHAIN_THROUGH_035 = (
+    *_PRIOR_CHAIN_THROUGH_031,
+    "032_codex_canonical_reset_anchor",
+    "033_codex_reset_anchor_component_closure",
+    "034_codex_window_spend_adoption",
+    "035_codex_thread_source_inference_replay",
+)
+
+# Fixed stamp for the public-#5 chain, so a regen is byte-idempotent (#197).
+_TS_PUBLIC_5 = "2026-07-31T12:00:00Z"
+
+_QWS_IDENTITY_INDEX = "idx_qws_window_ident"
+
+
+def _load_cctally_for_fixture():
+    """Load ``bin/cctally`` and return the ``_cctally_db`` module.
+
+    The public-#5 builders below share this instead of each redefining the
+    same six-line loader.
+    """
+    import importlib.util as ilu
+    from importlib.machinery import SourceFileLoader
+
+    bin_dir = Path(__file__).resolve().parent
+    loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+    spec = ilu.spec_from_loader("cctally", loader)
+    mod = ilu.module_from_spec(spec)
+    sys.modules["cctally"] = mod
+    loader.exec_module(mod)
+    return sys.modules["_cctally_db"]
+
+
+def _cache_handler(db, name: str):
+    for migration in db._CACHE_MIGRATIONS:
+        if migration.name == name:
+            return migration.handler
+    raise SystemExit(f"{name} not registered")
+
+
+def _seed_public5_quota_rows(conn) -> None:
+    """Two Codex quota observations of ONE physical window, plus its root.
+
+    Every public-#5 golden needs a non-empty ``quota_window_snapshots``: an
+    index over an empty table, a ledger with nothing to record, and a backfill
+    with nothing to backfill would all pass vacuously.
+    """
+    conn.execute(
+        "INSERT INTO codex_source_roots "
+        "(source_root_key, canonical_root_path, first_seen_utc, last_seen_utc) "
+        "VALUES (?,?,?,?)",
+        ("r" * 32, "/roots/rk", _TS_PUBLIC_5, _TS_PUBLIC_5),
+    )
+    rows = [
+        (10, "2026-07-31T10:00:00Z", 11.0),
+        (20, "2026-07-31T11:00:00Z", 12.0),
+    ]
+    conn.executemany(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        " observed_slot, logical_limit_key, limit_id, limit_name, "
+        " window_minutes, used_percent, resets_at_utc, plan_type, "
+        " individual_limit_json, reached_type, observed_model, account_key, "
+        " canonical_resets_at_utc) "
+        "VALUES ('codex',?,?,?,?,'primary','limit-primary','codex',NULL,300,?,"
+        "        '2026-07-31T15:00:00Z','pro',NULL,NULL,NULL,NULL,"
+        "        '2026-07-31T15:00:00Z')",
+        [("r" * 32, "/roots/rk/sessions/a.jsonl", offset, captured, percent)
+         for offset, captured, percent in rows],
+    )
+
+
+def build_per_migration_036_codex_quota_window_identity_index(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the Codex quota window-identity index.
+
+    ``pre.sqlite`` is a genuine 035-head install with the index DROPPED — the
+    shape a pre-#5 install has on disk, because its ``user_version`` already
+    matched the registry head and ``_apply_cache_schema`` was therefore skipped
+    on every steady-state open. That version gate is the whole reason this
+    migration exists. ``post.sqlite`` is that database after the handler: the
+    index is present and no row moved.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "036_codex_quota_window_identity_index"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in _PRIOR_CHAIN_THROUGH_035:
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            _seed_public5_quota_rows(conn)
+            conn.execute(f"DROP INDEX IF EXISTS {_QWS_IDENTITY_INDEX}")
+            conn.execute("PRAGMA user_version=35")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=36")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+_QWS_LEDGER_TRIGGERS = (
+    "trg_qws_ledger_ins", "trg_qws_ledger_del", "trg_qws_ledger_upd")
+
+
+def build_per_migration_037_codex_quota_change_ledger(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the Codex quota change ledger.
+
+    ``pre.sqlite`` is a genuine 036-head install with the ledger table and all
+    three triggers dropped — the shape a pre-#5 install has on disk, because its
+    ``user_version`` already matched the head and the version-gated schema apply
+    never re-ran. ``post.sqlite`` is that database after the handler: table and
+    triggers present, ledger EMPTY (it is a change log, not a snapshot of
+    existing state), and no observation touched.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "037_codex_quota_change_ledger"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            # Triggers first: a trigger whose body references a dropped table
+            # raises when it next fires, so the seed below has to run with
+            # neither present.
+            for trigger in _QWS_LEDGER_TRIGGERS:
+                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute("DROP TABLE IF EXISTS quota_window_change_log")
+            _seed_public5_quota_rows(conn)
+            conn.execute("PRAGMA user_version=36")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=37")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_038_codex_session_files_ingest_complete(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for ``codex_session_files.ingest_complete``.
+
+    ``pre.sqlite`` is a genuine 037-head install carrying two fully-ingested
+    Codex file cursors and NO ``ingest_complete`` column — the shape a pre-#5
+    install has on disk, since its ``user_version`` matched the head and the
+    version-gated schema apply never re-ran. ``post.sqlite`` is that database
+    after the handler: the column exists and BOTH pre-existing rows read 1,
+    which is the whole point of the default. A row that read 0 would be a file
+    the resumable ingest re-scans from its stored offset for no reason.
+
+    SQLite has no ADD COLUMN inverse, so the pre shape is produced by rebuilding
+    the table without the column rather than by dropping it.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "038_codex_session_files_ingest_complete"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            columns = [
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(codex_session_files)")
+                if str(row[1]) != "ingest_complete"
+            ]
+            column_list = ", ".join(columns)
+            conn.execute(
+                "CREATE TABLE codex_session_files_pre038 AS "
+                f"SELECT {column_list} FROM codex_session_files WHERE 0"
+            )
+            conn.execute("DROP TABLE codex_session_files")
+            conn.execute(
+                "ALTER TABLE codex_session_files_pre038 "
+                "RENAME TO codex_session_files"
+            )
+            conn.executemany(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, source_root_key) VALUES (?,?,?,?,?,?)",
+                [
+                    ("/roots/rk/sessions/a.jsonl", 4096, 1, 4096,
+                     _TS_PUBLIC_5, "r" * 32),
+                    ("/roots/rk/sessions/b.jsonl", 8192, 2, 8192,
+                     _TS_PUBLIC_5, "r" * 32),
+                ],
+            )
+            conn.execute("PRAGMA user_version=37")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=38")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_039_codex_quota_observed_model_backfill(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the ``observed_model`` backfill.
+
+    ``pre.sqlite`` is a genuine 038-head install whose Codex quota rows carry a
+    NULL ``observed_model`` — the state a row written before that column existed
+    is in — alongside the accounting rows the read-time fallback resolved
+    against. The three quota rows cover the three outcomes: resolved from the
+    nearest preceding entry, left NULL because nothing precedes it, and left
+    alone because it already carries a stamp.
+
+    ``post.sqlite`` is that database after the handler. Its ledger is NOT empty:
+    the backfill's own DML is recorded by the triggers, which is the change
+    ledger working as designed — migration 028 rewrote this same column and
+    announced nothing.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "039_codex_quota_observed_model_backfill"
+    rollout = "/roots/rk/sessions/a.jsonl"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute(
+                "INSERT INTO codex_source_roots "
+                "(source_root_key, canonical_root_path, first_seen_utc, "
+                " last_seen_utc) VALUES (?,?,?,?)",
+                ("r" * 32, "/roots/rk", _TS_PUBLIC_5, _TS_PUBLIC_5),
+            )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_output_tokens, total_tokens, source_root_key) "
+                "VALUES (?,?,?,'sess','gpt-5.3-codex-spark',1,0,1,0,1,?)",
+                (rollout, 20, "2026-07-31T09:00:00Z", "r" * 32),
+            )
+            rows = [
+                # before any accounting context -> stays NULL
+                (10, None),
+                # after the Spark entry -> resolves to it
+                (30, None),
+                # already stamped -> untouched
+                (40, "gpt-5"),
+            ]
+            conn.executemany(
+                "INSERT INTO quota_window_snapshots "
+                "(source, source_root_key, source_path, line_offset, "
+                " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
+                " limit_name, window_minutes, used_percent, resets_at_utc, "
+                " plan_type, individual_limit_json, reached_type, "
+                " observed_model, account_key, canonical_resets_at_utc) "
+                "VALUES ('codex',?,?,?,'2026-07-31T10:00:00Z','primary',"
+                "        'limit-primary','codex',NULL,300,11.0,"
+                "        '2026-07-31T15:00:00Z','pro',NULL,NULL,?,NULL,"
+                "        '2026-07-31T15:00:00Z')",
+                [("r" * 32, rollout, offset, model) for offset, model in rows],
+            )
+            # The ledger only exists to record what happens NEXT; the seed above
+            # is fixture setup, not a mutation the projector should chase.
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute(
+                "DELETE FROM sqlite_sequence WHERE name='quota_window_change_log'")
+            conn.execute("PRAGMA user_version=38")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=39")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_040_codex_quota_physical_group_index(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the physical-group seek index.
+
+    ``pre.sqlite`` is a genuine 039-head install still carrying 036's
+    ``idx_qws_window_ident`` and no expression index — the shape an install
+    upgraded through the earlier public-#5 chain has on disk. ``post.sqlite`` is
+    that database after the handler: ``idx_qws_physical_group`` present,
+    ``idx_qws_window_ident`` gone, and every observation untouched.
+
+    The seeded rows deliberately share one identity across two windows, so the
+    golden shows the index being built over rows whose only distinguishing
+    member is the canonical reset — the member the replaced index could not
+    seek.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "040_codex_quota_physical_group_index"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            _seed_public5_quota_rows(conn)
+            # The pre-040 shape: 036's index present, the expression index the
+            # schema apply now also writes removed again.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_qws_window_ident "
+                "ON quota_window_snapshots("
+                "  source, source_root_key, logical_limit_key, observed_slot,"
+                "  window_minutes, resets_at_utc, canonical_resets_at_utc,"
+                "  captured_at_utc, used_percent, id)"
+            )
+            conn.execute("DROP INDEX IF EXISTS idx_qws_physical_group")
+            # Fixture setup is not a mutation the projector should chase.
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute(
+                "DELETE FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'")
+            conn.execute("PRAGMA user_version=39")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=40")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_041_codex_quota_unresolved_model_index(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the unresolved-model partial index.
+
+    ``pre.sqlite`` is a genuine 040-head install with the index removed again —
+    the shape an install upgraded through the earlier public-#5 chain has on
+    disk. ``post.sqlite`` is that database after the handler:
+    ``idx_qws_unresolved_model`` present and every observation untouched.
+
+    The seeded rows all carry a resolved ``observed_model``, so the golden also
+    shows the index body being EMPTY on a healthy store — which is the whole
+    point of it: the scan it replaces was paying 212K rows of work to find
+    nothing.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "041_codex_quota_unresolved_model_index"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            _seed_public5_quota_rows(conn)
+            # One of the two rows is RESOLVED, so the golden shows the partial
+            # index covering strictly fewer rows than the table holds. With
+            # both unresolved a full-width index would look identical and the
+            # partial predicate would be untested.
+            conn.execute(
+                "UPDATE quota_window_snapshots SET observed_model='gpt-5' "
+                " WHERE line_offset=10")
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute("DROP INDEX IF EXISTS idx_qws_unresolved_model")
+            # Fixture setup is not a mutation the projector should chase.
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute(
+                "DELETE FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'")
+            conn.execute("PRAGMA user_version=40")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=41")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_conversations_002_codex_thread_source_inference_replay(
     scenario_dir: Path,
 ) -> None:
@@ -5746,6 +6355,99 @@ def build_per_migration_conversations_002_codex_thread_source_inference_replay(
         # from arming under a racing conversations sync), which lands beside the
         # golden. Not fixture output — remove it so a regen leaves no litter.
         lock = dst.with_name(dst.name + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_conversations_003_background_mcp_result_replay(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the backgrounded-MCP byte-zero replay arming.
+
+    ``pre.sqlite`` is a conversations.db at 002-head (schema + the adoption
+    marker + the Codex replay marker 002 armed + one source-file row).
+    ``post.sqlite`` is that database after the handler:
+    ``conversation_background_mcp_reingest_pending`` present, the transcript row
+    untouched, and the Codex marker still exactly where 002 left it — the two
+    replay markers are DISTINCT precisely so a partially-completed replay of
+    either stays recoverable.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "003_background_mcp_result_replay"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        mod = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            mod._apply_conversations_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in ("001_adopt_schema_version_marker",
+                         "002_codex_thread_source_inference_replay"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, TS_STATS_FIVE_APPLIED),
+                )
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("codex_conversation_replay_from_zero_pending", "1"),
+            )
+            conn.execute(
+                "INSERT INTO conversation_source_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 128, 1, 128, "2026-04-15T15:00:00Z"),
+            )
+            conn.execute("PRAGMA user_version=2")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = next(
+            (m.handler for m in mod._CONVERSATIONS_MIGRATIONS
+             if m.name == migration),
+            None,
+        )
+        if handler is None:
+            raise SystemExit(f"conversations migration {migration} not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute("PRAGMA user_version=3")
+            conn.commit()
+        finally:
+            conn.close()
+        # The handler takes `<db>.lock` (the CLAUDE provider flock that keeps it
+        # from arming under a racing conversations sync), which lands beside the
+        # golden. Not fixture output — remove it so a regen leaves no litter.
+        lock = dst.with_name(dst.name + ".lock")
         if lock.exists():
             lock.unlink()
 
@@ -6437,6 +7139,33 @@ def main() -> int:
     build_per_migration_conversations_002_codex_thread_source_inference_replay(
         FIXTURES_ROOT / "per-migration"
         / "conversations_002_codex_thread_source_inference_replay"
+    )
+    build_per_migration_conversations_003_background_mcp_result_replay(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_003_background_mcp_result_replay"
+    )
+    build_per_migration_036_codex_quota_window_identity_index(
+        FIXTURES_ROOT / "per-migration"
+        / "036_codex_quota_window_identity_index"
+    )
+    build_per_migration_037_codex_quota_change_ledger(
+        FIXTURES_ROOT / "per-migration" / "037_codex_quota_change_ledger"
+    )
+    build_per_migration_038_codex_session_files_ingest_complete(
+        FIXTURES_ROOT / "per-migration"
+        / "038_codex_session_files_ingest_complete"
+    )
+    build_per_migration_039_codex_quota_observed_model_backfill(
+        FIXTURES_ROOT / "per-migration"
+        / "039_codex_quota_observed_model_backfill"
+    )
+    build_per_migration_040_codex_quota_physical_group_index(
+        FIXTURES_ROOT / "per-migration"
+        / "040_codex_quota_physical_group_index"
+    )
+    build_per_migration_041_codex_quota_unresolved_model_index(
+        FIXTURES_ROOT / "per-migration"
+        / "041_codex_quota_unresolved_model_index"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

@@ -342,7 +342,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1004  # #410 applied-prefix cursor guard
+    assert core.STATS_INDEX_EPOCH == 1006  # public #5 incremental quota projection
     assert core.LEGACY_STATS_HEAD == 13
 
 

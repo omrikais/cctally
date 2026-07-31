@@ -4244,6 +4244,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "projected_milestones",
         "quota_alert_arming",
         "quota_percent_milestones",
+        "quota_projection_ledger_state",
         "quota_projection_state",
         "quota_threshold_events",
         "quota_window_blocks",
@@ -4298,7 +4299,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "3e0ec46a965c9fa10ac827cfd1656c66ecae50ed289e3aa1c34d2cf6a3e5c4a3"
+    "1e0a8cc22b3dc754cb8a6074ff9d2ef28df77b656dfc65347e4afbcb6edfdfae"
 )
 
 

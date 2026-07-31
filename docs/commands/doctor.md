@@ -127,13 +127,29 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
   *stalled* rather than merely pending. Codex transcript ingest defers on the
   cache-side replay marker (running ahead of the replayed thread rows would
   stamp a permanent `(unassigned)` project), so while that marker stands no
-  Codex transcript is ingested at all. A marker that is only pending is not
-  reported — it clears on the next Codex sync. The WARN fires once a whole-tree
-  sync has *run* and still could not consume it, which is what a persistently
-  torn `auth.json` (or a repeated per-file DB error) produces; `cache-sync`
-  itself still exits 0. Remedy: check or refresh the Codex login, then run
-  `cctally cache-sync --source codex`. Details carry the pending flag, the
-  stall timestamp, and the failed/deferred file counts — never paths.
+  Codex transcript is ingested at all. A marker that is only pending reports OK
+  — it clears on the next **unbudgeted** Codex sync, which is `cctally
+  cache-sync --source codex`, the dashboard, the TUI, or any `cctally codex`
+  command. Not the hook: a byte-zero replay is not sliceable across a
+  wall-clock budget, so a budgeted tick declines it outright rather than
+  committing the wipe and only part of the re-read. There are therefore two
+  stall shapes, and the leg reports both:
+  - **Blocked** — a whole-tree sync *ran* and still could not consume the
+    marker, which is what a persistently torn `auth.json` (or a repeated
+    per-file DB error) produces; `cache-sync` itself still exits 0. WARN.
+    Remedy: check or refresh the Codex login, then run `cctally cache-sync
+    --source codex`.
+  - **Deferred** — the hook declined the replay. It hands the unbudgeted drain
+    to a background worker, so a *recent* deferral is the ordinary self-healing
+    state and reports OK, naming that worker. It becomes a WARN once the
+    deferral has stood for over an hour, which means the hand-off is not
+    landing — on an install that only ever runs the hook, that is the one
+    signal that all Codex ingest is frozen. Remedy: `cctally cache-sync
+    --source codex`. A `blocked` record still outranks a `deferred` one.
+
+  Details carry the pending flag, the blocked timestamp, the failed/deferred
+  file counts, and `deferred_since` / `deferred_at` — never paths.
+- `data.codex_ingest_backlog` — WARN when the Codex hook's *budgeted* ingest has been behind for over an hour. The hook's ingest leg has a wall-clock ceiling (`codex.hook.ingest_budget_seconds`, default 5), so it can legitimately leave rollouts unread for the next tick — that is the mechanism working, and a fresh backlog reports OK with a "draining" summary. The WARN fires only once the backlog has stayed non-zero *continuously* past an hour, which is the shape of a store whose per-tick growth outruns its budget. Remedy: run `cctally cache-sync --source codex`, which is unbudgeted and drains it. Details carry remaining files, remaining bytes, and the timestamp the backlog first appeared — never paths. A WARN alone does not change `doctor`'s exit code.
 - `data.codex_project_metadata` — an all-history, root-qualified partition of
   retained Codex accounting rows. WARN when rows lack a conversation key or a
   same-root conversation-thread join; rebuild with `cctally cache-sync --source
@@ -147,6 +163,7 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
   identity. This is not an OAuth or provider-live check; run a local
   `cctally cache-sync --source codex` (or trigger trusted Codex activity) to
   reread rollout data.
+- `data.codex_quota_verification` — WARN when the detached Codex quota verification worker is not landing. Every whole-history projection pass now runs off the blocking hook path, so on an install driven only by the Codex hook all of it depends on the `_codex-quota-verify` worker — and on the routes where the hook does no projection work of its own (a rebuilt statistics index, a classification change, a reset change log), a worker that never succeeds leaves the Codex projection *missing* rather than merely stale. `data.codex_quota` cannot see that: it reports the freshness of the local rollout observations, which stay perfectly fresh while the projection derived from them is absent. The leg reads the worker's own outcomes from `hook-tick.log` (the worker's streams go nowhere else) and WARNs only on failures with no completed pass in 24 hours — one failed hand-off is ordinary and self-heals on the next throttle window. Silence is OK: an install with no Codex hooks never hands off, and every non-hook caller runs the pass inline. Remedy: `cctally cache-sync --source codex`. Details carry the 24-hour completed / errored / failed-spawn counts and the last completed pass — never paths.
 - `data.parse_health` — WARN when the rolling ingest parse-health record (per vendor, kept in `cache_meta`) shows a malformed or drift-skipped JSONL line within the trailing 7 days — a signal that a Claude Code / Codex session-format change may be silently affecting your numbers; the summary carries the counts and the dominant skip reason. OK otherwise: absent record (pre-first-sync), all-zero counters, or a *stale* anomaly older than 7 days (surfaced as historical counts in the details so a one-off bad line doesn't nag forever). Remediation points at checking for a cctally update / filing an issue; `cctally cache-sync --rebuild` re-baselines the counters.
 - `data.conversation_sessions_rollup` — WARN when the conversation-viewer browse-rail rollup (`conversation_sessions`) has drifted from its source — its row count differs from `COUNT(DISTINCT session_id)` over `conversation_messages` — **and only in a quiescent transcript store**. OK when the counts match, when either is unavailable (the table is absent on a pre-rollup store, or `conversations.db` cannot be read), or while a transcript sync/reingest/backfill is in progress. The in-progress signal is a non-blocking `conversations.db.lock` flock probe plus pending transcript `cache_meta` flags, so a transient mid-sync mismatch never WARNs. Informational only; the next conversation sync re-derives the rollup (`cctally cache-sync --rebuild` forces it). Read-only — the SQLite probe uses zero timeout and the lock probe never blocks.
 

@@ -986,12 +986,21 @@ def _iter_codex_fused_records_with_offsets(
     initial_total_tokens: int = 0,
     source_root_key: str | None = None,
     state: _CodexIterState | None = None,
+    stop_before=None,
 ):
     """Yield typed facts for every complete, valid Codex JSONL object.
 
     Binary readers retain physical byte offsets and strictly reject invalid UTF-8,
     non-finite JSON constants, and non-object JSON.  The mutable state carries
     the shipped accounting resume contract alongside the latest thread facts.
+
+    ``stop_before`` (public #5) is an optional predicate called with the byte
+    offset of each line BEFORE it is read; returning True ends the iteration
+    there, leaving ``fh`` positioned exactly at that offset so the caller can
+    persist it as a resume point. It sits inside the reader rather than in the
+    consuming loop because most lines yield nothing at all — a long run of
+    non-emitting records would otherwise never hand control back, which is
+    precisely the case a wall-clock budget has to survive.
     """
     if state is None:
         state = _CodexIterState()
@@ -1003,6 +1012,9 @@ def _iter_codex_fused_records_with_offsets(
 
     while True:
         line_offset = fh.tell()
+        if stop_before is not None and stop_before(line_offset):
+            fh.seek(line_offset)
+            return
         line = fh.readline()
         if not line:
             return

@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 14 / 14 known
   ✓ 013_codex_quota_projection_state               applied <REDACTED>
   ✓ 014_test_failure_injection                     applied <REDACTED>
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 36 / 36 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 42 / 42 known
   ✓ 001_dedup_highest_wins                         applied <REDACTED>
   ✓ 002_conversation_messages_backfill             applied <REDACTED>
   ✓ 003_conversation_reingest_tool_ids             applied <REDACTED>
@@ -51,11 +51,18 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 36 / 36 known
   ✓ 033_codex_reset_anchor_component_closure       applied <REDACTED>
   ✓ 034_codex_window_spend_adoption                applied <REDACTED>
   ✓ 035_codex_thread_source_inference_replay       applied <REDACTED>
-  ✓ 036_test_cache_migration                       applied <REDACTED>
+  ✓ 036_codex_quota_window_identity_index          applied <REDACTED>
+  ✓ 037_codex_quota_change_ledger                  applied <REDACTED>
+  ✓ 038_codex_session_files_ingest_complete        applied <REDACTED>
+  ✓ 039_codex_quota_observed_model_backfill        applied <REDACTED>
+  ✓ 040_codex_quota_physical_group_index           applied <REDACTED>
+  ✓ 041_codex_quota_unresolved_model_index         applied <REDACTED>
+  ✓ 042_test_cache_migration                       applied <REDACTED>
 
-conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 2 known
+conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 3 known
   · 001_adopt_schema_version_marker                pending
   · 002_codex_thread_source_inference_replay       pending
+  · 003_background_mcp_result_replay               pending
 ## stderr
 
 ## exit

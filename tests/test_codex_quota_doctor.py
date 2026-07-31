@@ -225,7 +225,7 @@ def test_codex_lifecycle_emits_root_keyed_privacy_safe_observability_log(
     monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
     monkeypatch.setitem(
         ns, "sync_codex_cache",
-        lambda _cache, *, lock_timeout: SimpleNamespace(lock_contended=False),
+        lambda _cache, *, lock_timeout, **_budget: SimpleNamespace(lock_contended=False),
     )
     monkeypatch.setitem(
         ns, "reconcile_codex_quota_projection",
@@ -252,3 +252,98 @@ def test_codex_lifecycle_emits_root_keyed_privacy_safe_observability_log(
     assert "private-session-id" not in line
     assert "/private/transcript.jsonl" not in line
     assert "/private/cwd" not in line
+
+
+# ── the `_codex-quota-verify` worker's own doctor leg (public #5) ───────────
+
+def _verify_state(activity):
+    return SimpleNamespace(codex_quota_verify_activity=activity)
+
+
+def test_a_silent_verify_worker_is_ok(tmp_path, monkeypatch):
+    """An install with no Codex hooks never hands off, and every non-hook
+    caller runs the pass inline — silence is the ordinary state, not a fault."""
+    load_script()
+    import _lib_doctor
+
+    for activity in (None, {}, {"success_count_24h": 0, "error_count_24h": 0,
+                               "spawn_failure_count_24h": 0}):
+        result = _lib_doctor._check_data_codex_quota_verification(
+            _verify_state(activity))
+        assert result.severity == "ok"
+    assert result.summary == "no hand-off in the last 24h"
+
+
+def test_failures_with_no_completed_pass_warn(tmp_path, monkeypatch):
+    """The condition the leg exists for.
+
+    Every whole-history projection pass now runs off the blocking hook path, so
+    a hook-only install depends entirely on this worker — and on the catch-all
+    routes the hook does no projection work at all, leaving the projection
+    MISSING until the worker lands. `data.codex_quota` cannot see that: it
+    reports OBSERVATION freshness, which stays fresh while the projection
+    derived from it is absent.
+    """
+    load_script()
+    import _lib_doctor
+
+    result = _lib_doctor._check_data_codex_quota_verification(_verify_state({
+        "success_count_24h": 0, "error_count_24h": 3,
+        "spawn_failure_count_24h": 2, "last_success_at": None,
+    }))
+    assert result.severity == "warn"
+    assert "5 failed hand-off(s)" in result.summary
+    assert "cache-sync --source codex" in (result.remediation or "")
+    assert result.details["error_count_24h"] == 3
+    assert result.details["spawn_failure_count_24h"] == 2
+
+
+def test_one_failure_alongside_a_completed_pass_is_not_a_warning(tmp_path):
+    """A contended spawn or a transient lock self-heals on the next throttle
+    window; only a worker that has not landed once in a day is persistent."""
+    load_script()
+    import _lib_doctor
+
+    result = _lib_doctor._check_data_codex_quota_verification(_verify_state({
+        "success_count_24h": 1, "error_count_24h": 1,
+        "spawn_failure_count_24h": 0, "last_success_at": None,
+    }))
+    assert result.severity == "ok"
+    assert result.summary == "1 completed, 1 failed in 24h"
+
+
+def test_the_verify_activity_parser_ignores_lifecycle_lines(tmp_path, monkeypatch):
+    """The lifecycle parser cannot supply these counts — worker lines carry no
+    `source_root_key`, so its root filter drops every one — and the reverse must
+    hold too: a root-qualified lifecycle line is not a verification outcome."""
+    import datetime as _dt
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_doctor
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    old = (now - _dt.timedelta(days=3)).replace(microsecond=0).isoformat(
+        ).replace("+00:00", "Z")
+    log = _cctally_core.HOOK_TICK_LOG_PATH
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("\n".join([
+        f"{stamp} provider=codex source_root_key=rk event=Stop sync=ok "
+        f"blocks=1 milestones=0 alert_eligible_roots=1 quota_alerts=0 "
+        f"budget_alerts=0 backlog=0 dur_ms=3 result=success",
+        f"{stamp} provider=codex op=quota-verify result=error dur_ms=9 "
+        f"error=OperationalError: database is locked",
+        f"{stamp} provider=codex op=quota-verify-spawn result=failed reason=spawn",
+        f"{stamp} provider=codex op=replay-drain result=success files=2",
+        f"{old} provider=codex op=quota-verify result=success blocks=608",
+    ]) + "\n", encoding="utf-8")
+
+    counts = _cctally_doctor._codex_quota_verify_activity_24h(now_utc=now)
+
+    assert counts["error_count_24h"] == 1
+    assert counts["spawn_failure_count_24h"] == 1
+    assert counts["success_count_24h"] == 0, (
+        "a success outside the 24h window, or the drain worker's line, was "
+        "counted as a completed verification")

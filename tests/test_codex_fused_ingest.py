@@ -197,7 +197,7 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             # account_key (#341): trailing observe-and-stamp column.
             ("account_key", "TEXT", 0),
         ]
-        assert _columns(conn, "codex_session_files")[-7:] == [
+        assert _columns(conn, "codex_session_files")[-8:] == [
             ("source_root_key", "TEXT", 0),
             ("last_native_thread_id", "TEXT", 0),
             ("last_root_thread_id", "TEXT", 0),
@@ -207,6 +207,12 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             ("last_turn_id", "TEXT", 0),
             # account_key (#341): last-observed stamp (diagnostic; NULL ≡ unattributed).
             ("account_key", "TEXT", 0),
+            # ingest_complete (public #5): whether ingestion reached the stored
+            # scan target. NOT NULL DEFAULT 1, so every pre-existing row reads
+            # as complete. TRAILING on purpose — an existing cache receives it
+            # by ALTER after account_key, so a fresh one must build it in the
+            # same position or the two disagree on ordinal.
+            ("ingest_complete", "INTEGER", 1),
         ]
 
         quota_sql = _schema_sql(conn, "quota_window_snapshots")

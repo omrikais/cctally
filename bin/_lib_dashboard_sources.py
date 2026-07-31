@@ -29,7 +29,11 @@ CapabilityStatus = Literal[
 # (`UpdateRunningModal.tsx`, `store/sse.ts`), so an old client demonstrably
 # does meet a new server; `docs/cli-contract.md` calls changing a value's
 # meaning breaking. Version-aware client reaction is deliberately deferred.
-SOURCE_SCHEMA_VERSION = 2
+# 2 -> 3 (public #5): the Codex source gained the additive `ingest_backlog`
+# field. Additive and omitted-when-zero, so the normal payload is byte-identical
+# — but the same `execvp` transition applies, so the bump ships as the signal it
+# has always been rather than as a mechanism the client branches on.
+SOURCE_SCHEMA_VERSION = 3
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")

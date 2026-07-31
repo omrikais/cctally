@@ -3337,6 +3337,46 @@ def _build_telemetry_beat_parser(subparsers, name, *, help_text, xref=None):
     )
     tb.set_defaults(func=c.cmd_telemetry_beat_internal)
 
+def _build_codex_quota_verify_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_codex-quota-verify` parser (public #5 spec §2)."""
+    c = _cctally()
+    qv = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: detached worker that runs the Codex
+                    quota projection's periodic whole-history verification
+                    pass. Spawned by the Codex hook tick when the pass comes
+                    due, so the one unbounded operation in the incremental
+                    design never runs on the blocking hook path. Always returns
+                    0; the deadline is stamped only if the pass completes.
+                    """
+                ),
+    )
+    qv.set_defaults(func=c.cmd_codex_quota_verify_internal)
+
+def _build_codex_replay_drain_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_codex-replay-drain` parser (public #5 §4)."""
+    c = _cctally()
+    rd = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: detached worker that performs the
+                    byte-zero Codex replay a budgeted hook tick declined. The
+                    replay is not sliceable, so the hook never attempts one and
+                    a hook-only install would otherwise freeze all Codex ingest
+                    permanently. Always returns 0; failures are written to
+                    hook-tick.log.
+                    """
+                ),
+    )
+    rd.set_defaults(func=c.cmd_codex_replay_drain_internal)
+
 def _build_repair_symlinks_parser(subparsers, name, *, help_text, xref=None):
     """Build the `repair-symlinks` parser (registered via _REGISTRATION; #279 S6 W3).
 
@@ -3417,6 +3457,8 @@ _REGISTRATION = (
     _Reg('update', _build_update_parser, "Update cctally to the latest version", None, None),
     _Reg('_update-check', _build_update_check_parser, argparse.SUPPRESS, None, None),
     _Reg('_telemetry-beat', _build_telemetry_beat_parser, argparse.SUPPRESS, None, None),
+    _Reg('_codex-quota-verify', _build_codex_quota_verify_parser, argparse.SUPPRESS, None, None),
+    _Reg('_codex-replay-drain', _build_codex_replay_drain_parser, argparse.SUPPRESS, None, None),
     _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
 )
 

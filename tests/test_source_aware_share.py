@@ -656,7 +656,11 @@ def test_source_aware_harness_is_a_required_bundle_gate():
     root = Path(__file__).resolve().parents[1]
     bundle = (root / "bin" / "cctally-test-all").read_text(encoding="utf-8")
 
-    assert "required_harnesses=(codex-quota source-aware)" in bundle
+    required_line = next(
+        line for line in bundle.splitlines() if line.startswith("required_harnesses=(")
+    )
+    required = set(required_line.removeprefix("required_harnesses=(").removesuffix(")").split())
+    assert {"codex-quota", "source-aware", "test-remote"} <= required
 
 
 def _live_release_version(root: Path) -> str:

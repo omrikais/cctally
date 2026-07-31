@@ -349,7 +349,22 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # 1003 -> 1004 (#410 Task B): pair the public journal cursor with the exact
 # prefix atomically applied to the materialized index. A cursor-only hand edit
 # can no longer skip an already-durable event and make its natural key look new.
-STATS_INDEX_EPOCH = 1004
+# 1004 -> 1005 (public #5): the incremental Codex quota projection. Adds the
+# reverse map + composable per-group digest on `quota_window_blocks` and the
+# `quota_projection_ledger_state` row (change-ledger watermark, interpretation
+# version, and the two alert axes that are not functions of window dirtiness).
+# It is an epoch bump and NOT a stats migration because the registry is frozen
+# AND because an epoch-current open returns before any schema work — an
+# `add_column_if_missing` would never run on an upgraded install, so the column
+# would simply never appear. Every upgrading install therefore rebuilds stats.db
+# from the journal on first open; that is the documented resolution for an epoch
+# mismatch and a real one-time cost, not a free change.
+# 1005 -> 1006 (public #5, I2 review): the periodic verification. Adds
+# `quota_projection_ledger_state.last_full_pass_at`, the deadline a time-based
+# full pass is measured against. Same mechanical reason as 1005 — an
+# epoch-current open returns before any schema work — so it is a second bump
+# rather than an amendment to the first.
+STATS_INDEX_EPOCH = 1006
 LEGACY_STATS_HEAD = 13
 
 
@@ -1248,6 +1263,21 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             generation            TEXT    NOT NULL,
             orphaned_at           TEXT,
             account_key           TEXT    NOT NULL DEFAULT 'unattributed',
+            -- public #5: the REVERSE MAP. `physical_group_key` records the
+            -- physical window this block was materialized from, so the
+            -- generation sweep can be scoped to the groups a bounded pass
+            -- actually re-materialized instead of to whole roots.
+            -- `physical_group_digest` is that group's contribution to its
+            -- root's physical signature: the root value is a digest over the
+            -- root's sorted (group key, group digest) pairs, which makes it
+            -- ASSOCIATIVE. A bounded pass recomputes only the dirty groups'
+            -- digests and re-derives the root value from the stored set —
+            -- O(groups), 608 on the real store, against O(observations) at
+            -- 211K. Hanging it off the blocks is what makes it self-maintaining:
+            -- a group swept to nothing loses its blocks and drops out of the
+            -- composition with them.
+            physical_group_key    TEXT,
+            physical_group_digest TEXT,
             UNIQUE(source, source_root_key, account_key, logical_limit_key,
                    observed_slot, window_minutes, resets_at_utc)
         );
@@ -1319,6 +1349,46 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(source_root_key, account_key)
         );
 
+        -- public #5: everything the incremental projector needs to know about
+        -- its own last pass, keyed by provider source. One row, read once per
+        -- reconcile.
+        --
+        -- `watermark_seq` is the highest `quota_window_change_log.seq` this
+        -- index has consumed. It is written INSIDE the same stats transaction
+        -- as the projection it describes, so the two commit or roll back
+        -- together; a crash therefore replays a ledger range rather than
+        -- skipping one, which is safe because re-materializing a group is
+        -- idempotent. (Writing it after the commit would need a second stats
+        -- transaction, and `run_stats_ingest` is the sole stats writer.)
+        --
+        -- `interpretation_version` invalidates the mechanism itself: a
+        -- classification change alters interpreted keys with no row mutation
+        -- for the ledger to observe, so a bump queues one complete pass.
+        --
+        -- `alerts_enabled` / `next_evaluation_at_utc` are the two alert axes
+        -- that are not functions of window dirtiness — a delivery-gate
+        -- transition, and a future-clocked observation that becomes eligible
+        -- when wall time passes it with no row mutation at all.
+        --
+        -- `last_full_pass_at` is the periodic verification's deadline. Two
+        -- cases a scoped sweep structurally cannot see — a block whose physical
+        -- group is absent from the cache entirely, and a milestone on a historic
+        -- root no longer active — are otherwise repairable only by an
+        -- interpretation bump, a rebuild or a burst overflow, none of which
+        -- happen on a normal install. Every full pass stamps it, whatever
+        -- triggered it, so the deadline is satisfied by whichever caller reaches
+        -- it first and the bound on staleness is one interval rather than
+        -- forever. NULL means "never verified", which reads as due.
+        CREATE TABLE IF NOT EXISTS quota_projection_ledger_state (
+            source                 TEXT NOT NULL,
+            watermark_seq          INTEGER NOT NULL DEFAULT 0,
+            interpretation_version INTEGER NOT NULL DEFAULT 0,
+            alerts_enabled         INTEGER,
+            next_evaluation_at_utc TEXT,
+            last_full_pass_at      TEXT,
+            PRIMARY KEY(source)
+        );
+
         CREATE TABLE IF NOT EXISTS quota_alert_arming (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             source            TEXT NOT NULL,
@@ -1361,6 +1431,20 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
                      "quota_threshold_events", "quota_alert_arming"):
             add_column_if_missing(
                 conn, _tbl, "account_key", "TEXT NOT NULL DEFAULT 'unattributed'")
+        # public #5 backstop, and NOT redundant with the CREATE above. An
+        # epoch-MISMATCHED index resolves by rebuild and gets the fresh CREATE;
+        # a LEGACY index (`user_version <= LEGACY_STATS_HEAD`) takes the
+        # in-place cutover, where `CREATE TABLE IF NOT EXISTS` is a no-op over
+        # the table it already has — so the reverse map would never appear and
+        # every reconcile after the cutover would fail on `no such column`.
+        for _col in ("physical_group_key", "physical_group_digest"):
+            add_column_if_missing(conn, "quota_window_blocks", _col, "TEXT")
+        # Same seam, epoch 1006: a LEGACY index that already took the epoch-1005
+        # cutover carries `quota_projection_ledger_state` WITHOUT the periodic
+        # verification's deadline, and `CREATE TABLE IF NOT EXISTS` above is a
+        # no-op over the table it already has.
+        add_column_if_missing(
+            conn, "quota_projection_ledger_state", "last_full_pass_at", "TEXT")
 
 
 def open_db(*, _target_path=None) -> sqlite3.Connection:
@@ -2299,7 +2383,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # Schema-apply compatibility for legacy/test-mode paths that reach this
         # DDL with a pre-pair cursor row. A released epoch-1003 index does NOT
         # use this as an upgrade shortcut: the epoch mismatch rebuilds it into
-        # the complete epoch-1004 schema first.
+        # the complete current-epoch schema first.
         conn.execute(
             "UPDATE journal_cursor "
             "SET applied_segment = segment, applied_offset = offset "

@@ -1005,7 +1005,11 @@ def codex_conversation_source_paths(
 # ── detail assembly (§5.2 / §5.4 / §5.6) ──────────────────────────────────────
 
 
-def _paginate_items(items: list[dict], *, after, before, tail, limit):
+def _paginate_items(items: list[dict], *, after, before, tail: bool, limit: int):
+    # ``tail`` is the flag the HTTP layer parses out of ``?tail=1`` — which page
+    # of ``limit`` to cut, never how many items to return. Treating it as a count
+    # made ``min(True, limit)`` serve a one-item tail page, and ``tail=False``
+    # (the shape every non-tail request arrives in) skip ``limit`` altogether.
     keys = [it["item_key"] for it in items]
     aliases = {
         alias: index
@@ -1022,11 +1026,8 @@ def _paginate_items(items: list[dict], *, after, before, tail, limit):
     elif before is not None and before in aliases:
         hi = aliases[before]
     window = items[lo:hi]
-    if tail is not None:
-        cap = min(tail, limit) if limit else tail
-        window = window[-cap:] if cap else window
-    elif limit:
-        window = window[:limit]
+    if limit:
+        window = window[-limit:] if tail else window[:limit]
     first_key = window[0]["item_key"] if window else None
     last_key = window[-1]["item_key"] if window else None
     has_before = bool(window) and keys.index(first_key) > 0
@@ -1047,7 +1048,7 @@ def get_codex_conversation(
     effective_speed: str,
     after: str | None = None,
     before: str | None = None,
-    tail: int | None = None,
+    tail: bool = False,
     limit: int = 200,
     legacy_export: bool = False,
 ) -> dict:

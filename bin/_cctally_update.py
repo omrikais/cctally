@@ -1328,8 +1328,14 @@ def _do_update_check() -> None:
         c._save_update_state(state)
 
 
-def _spawn_detached(command: str) -> None:
+def _spawn_detached(command: str) -> bool:
     """Fire-and-forget a hidden self-subcommand as a detached worker.
+
+    Returns whether the spawn was issued. The two update/telemetry callers
+    ignore it — they have no alternative to fall back on — but the deferred
+    Codex quota verification needs to distinguish "handed off" from "could not
+    hand off", because the operation it is deferring is one it must NOT then
+    run inline.
 
     Detached `subprocess.Popen` with `start_new_session=True` so a parent
     exit (the user closes the shell) doesn't propagate SIGHUP to the child;
@@ -1349,9 +1355,10 @@ def _spawn_detached(command: str) -> None:
             start_new_session=True,
             close_fds=True,
         )
+        return True
     except Exception:
         # Fire-and-forget: never let a spawn failure propagate.
-        pass
+        return False
 
 
 def _spawn_background_update_check() -> None:

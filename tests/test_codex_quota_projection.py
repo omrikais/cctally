@@ -124,7 +124,18 @@ def _stage_real_s1_codex_root(tmp_path, monkeypatch):
 def test_legacy_spark_quota_rows_are_reinterpreted_as_a_separate_pool(
     tmp_path, monkeypatch,
 ):
+    """#373: a Spark window must never be filed as account weekly quota.
+
+    The evidence path changed with public #5. The loader used to COALESCE a
+    NULL ``observed_model`` onto the nearest preceding
+    ``codex_session_entries.model`` at read time; that made an accounting row
+    able to change a window's interpretation with no quota-row mutation for the
+    change ledger to observe, so the fallback was removed and cache migration
+    039 materializes exactly what it resolved. The #373 guarantee is unchanged
+    and is asserted here end-to-end through the new mechanism.
+    """
     ns, quota = _load(tmp_path, monkeypatch)
+    db = importlib.import_module("_cctally_db")
     root_key = "root-a"
     source_path = "/codex/root-a/spark.jsonl"
     legacy_key = json.dumps({
@@ -152,8 +163,19 @@ def test_legacy_spark_quota_rows_are_reinterpreted_as_a_separate_pool(
             (source_path, _iso(9), root_key),
         )
         cache.commit()
+        backfill = next(
+            migration.handler for migration in db._CACHE_MIGRATIONS
+            if migration.name == "039_codex_quota_observed_model_backfill"
+        )
+        backfill(cache)
+        stamped = cache.execute(
+            "SELECT observed_model FROM quota_window_snapshots "
+            "WHERE source_path=?", (source_path,),
+        ).fetchone()[0]
     finally:
         cache.close()
+
+    assert stamped == "gpt-5.3-codex-spark"
 
     observations = quota.load_codex_quota_observations(
         source_root_keys=(root_key,),

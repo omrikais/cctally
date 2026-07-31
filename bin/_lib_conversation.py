@@ -171,6 +171,7 @@ def _strip_remote_control_prefix(text):
 
 
 _TOOL_RESULT_CAP = 16000   # was 4000; full text always re-derivable from JSONL
+_BACKGROUND_NOTIFICATION_BLOCK_WIRE_CAP = 230_000
 _INPUT_LEAF_CAP = 8000     # max chars per string leaf in a bounded tool input
 _INPUT_TOTAL_CAP = 32000   # honesty backstop on the serialized bounded input
 _INPUT_MAX_NODES = 2000    # max dict-values + list-elements kept before tail elision
@@ -281,16 +282,31 @@ def _queued_prompt_row(obj, t, offset):
     ``{"type":"attachment","attachment":{"type":"queued_command",
     "commandMode":"prompt","prompt":<text>}}`` — carrying its OWN
     uuid/parentUuid/timestamp, with the text in ``attachment.prompt`` rather than
-    ``message.content``. Only ``commandMode=="prompt"`` is promoted: a queued
-    ``task-notification`` (``commandMode=="task-notification"``) is harness-injected
-    background plumbing — the same ``<task-notification>`` content already
-    classifies META when it arrives as a regular line — not something the user
-    typed, so it stays dropped."""
+    ``message.content``.
+
+    ``commandMode=="task-notification"`` is harness-injected background plumbing
+    rather than something the user typed, so it is NOT promoted as a HUMAN turn —
+    but it is no longer dropped either. This used to be justified by "the same
+    <task-notification> content already classifies META when it arrives as a
+    regular line", which is true for ONE notification shape and false for the
+    other, and the distinction is a whole bug class:
+
+      A  subagent / Monitor   arrives as a type:"user" line, joins on
+                              <tool-use-id> -> already classified META
+      B  backgrounded MCP     arrives ONLY as this attachment, carries
+                              <task-id> and NO <tool-use-id> -> nothing
+                              rescued it, so the response was lost
+
+    Claude Code moved MCP dispatch to the background after 120s, which made
+    shape B common; before that the assumption held in practice. Shape B is now
+    promoted as a BOUNDED META row (see ``_background_notification_row``)."""
     if t != "attachment" or not obj.get("uuid"):
         return None
     att = obj.get("attachment")
     if not isinstance(att, dict) or att.get("type") != "queued_command":
         return None
+    if att.get("commandMode") == "task-notification":
+        return _background_notification_row(obj, att.get("prompt"), offset)
     if att.get("commandMode") != "prompt":
         return None
     prompt = att.get("prompt")
@@ -306,6 +322,79 @@ def _queued_prompt_row(obj, t, offset):
     synth = dict(obj)
     synth["message"] = {"role": "user", "content": prompt}
     return _normalize(synth, "user", offset)
+
+
+def _background_notification_row(obj, prompt, offset):
+    """A backgrounded-MCP <task-notification> -> a BOUNDED META ``MessageRow``.
+
+    The raw wrapper is deliberately NOT stored verbatim. Text blocks are not
+    subject to ``_TOOL_RESULT_CAP`` and read-time meta classification restores
+    the whole body, so a verbatim store would put an arbitrary (multi-megabyte)
+    MCP payload into the transcript store and ship it whole to the browser
+    whenever the read-time join misses. Instead the notification is parsed HERE
+    into one bounded text block carrying the identity/status sidecars the
+    read-time join and the full-payload resolver consume.
+
+    ``text`` = a synthesized header plus the capped result, so a notification
+    whose join does NOT fire still renders something sane through the ordinary
+    text path. ``result_offset`` is the EXACT index where the capped result
+    begins inside ``text`` (``None`` when there is no result), so the join can
+    strip the header without re-deriving it — the card must receive the bare
+    ``{"threadId":…,"content":…}`` envelope its parser decodes, and a summary
+    containing a blank line would defeat a scan-based strip.
+
+    Classified META with ``text=""`` — like the shape-A notification already is
+    — which keeps it out of prose FTS, title derivation and the ``human``
+    prompts facet. The capped result still reaches ``search_tool``, so a
+    recovered response stays findable through dashboard search, in-conversation
+    find and ``transcript search``, exactly as the same result delivered inline
+    would be."""
+    import _lib_background_mcp as _bg
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    n = _bg.parse_task_notification(prompt)
+    if n is None:
+        return None            # no <task-id> -> no identity -> nothing to join
+    full = n.result_text or ""
+    capped = full[:_TOOL_RESULT_CAP]
+    header = f"Background task {n.task_id} — {n.status or 'unknown'}"
+    if n.summary:
+        header += f"\n{n.summary}"
+    block = {
+        "kind": "text",
+        "text": header + (("\n\n" + capped) if capped else ""),
+        "task_id": n.task_id,
+        "background_status": n.status,
+        "summary": n.summary,
+        "result_offset": (len(header) + 2) if capped else None,
+        "result_full_length": len(full),
+        "result_truncated": len(full) > _TOOL_RESULT_CAP,
+    }
+    blocks = [block]
+    blocks_json = json.dumps(blocks, separators=(",", ":"))
+    if len(blocks_json) > _BACKGROUND_NOTIFICATION_BLOCK_WIRE_CAP:
+        # All copied fields are capped by the background-MCP kernel. Keep a
+        # fail-closed storage backstop so a future field cannot silently make
+        # this supposedly bounded row unbounded.
+        return None
+    # Derive through the SAME chokepoint a blocks_json backfill would use, so
+    # ingest and any recompute-from-blocks pass agree by construction (#177 S6).
+    search_tool, search_thinking = _derive_search_columns(blocks)
+    return MessageRow(
+        byte_offset=offset,
+        session_id=obj.get("sessionId"),
+        uuid=obj.get("uuid"),
+        parent_uuid=obj.get("parentUuid"),
+        timestamp_utc=obj.get("timestamp"),
+        entry_type=META,
+        text="",
+        blocks_json=blocks_json,
+        model=None, msg_id=None, req_id=None,
+        cwd=obj.get("cwd"), git_branch=obj.get("gitBranch"),
+        is_sidechain=1 if obj.get("isSidechain") else 0,
+        search_tool=search_tool,
+        search_thinking=search_thinking,
+    )
 
 
 @dataclass
@@ -1194,6 +1283,17 @@ def _derive_search_columns(blocks):
             t = b.get("text") or ""
             if t:
                 think_parts.append(t[:_TOOL_RESULT_CAP])
+        elif k == "text" and b.get("task_id") and b.get("result_offset") is not None:
+            # A recovered backgrounded-MCP result. It is TOOL output that merely
+            # rides in a text block (the block shape a renderer without the join
+            # can still display), so it belongs in search_tool — the identical
+            # result delivered inline is searchable and this must not regress to
+            # silently unsearchable. Gated on the task_id + result_offset pair so
+            # an ordinary prose text block is never indexed here (prose already
+            # lives in the `text` column).
+            res = (b.get("text") or "")[b["result_offset"]:]
+            if res:
+                tool_parts.append(res[:_TOOL_RESULT_CAP])
         elif k == "tool_use":
             tool_parts.extend(
                 s[:_TOOL_RESULT_CAP] for s in _aux_strings(b.get("input")))

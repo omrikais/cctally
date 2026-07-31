@@ -41,6 +41,54 @@ def _asst_line(uuid, msg_id, req_id, text, *, sid="s1",
     }) + "\n"
 
 
+def _background_lines(*, sid="s1", task_id="kravg1b9s",
+                      tool_use_id="toolu_bg"):
+    placeholder = (
+        'MCP tool "codex/codex" is still running after 120s. It was moved to '
+        f'the background as task {task_id} and keeps running; you\'ll receive a '
+        'notification with the result when it completes. To stop it, use '
+        f'TaskStop with task_id "{task_id}".'
+    )
+    call = json.dumps({
+        "type": "assistant", "uuid": "a_bg", "sessionId": sid,
+        "requestId": "r_bg", "timestamp": "2026-07-30T20:40:00Z",
+        "message": {
+            "role": "assistant", "id": "m_bg", "model": _MODEL,
+            "content": [{"type": "tool_use", "id": tool_use_id,
+                         "name": "mcp__codex__codex",
+                         "input": {"prompt": "inspect the repository"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+    pending = json.dumps({
+        "type": "user", "uuid": "u_bg", "sessionId": sid,
+        "timestamp": "2026-07-30T20:42:00Z",
+        "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": tool_use_id,
+            "content": placeholder,
+        }]},
+    }) + "\n"
+    result = '{"threadId":"t-live","content":"recovered live"}'
+    notification = json.dumps({
+        "type": "attachment", "uuid": "n_bg", "sessionId": sid,
+        "timestamp": "2026-07-30T20:51:16.312Z",
+        "attachment": {
+            "type": "queued_command", "commandMode": "task-notification",
+            "prompt": (
+                "<task-notification>\n"
+                f"<task-id>{task_id}</task-id>\n"
+                "<status>completed</status>\n"
+                "<summary>MCP task kravg1b9 done.</summary>\n"
+                f"<result>{result}</result>\n"
+                "</task-notification>"
+            ),
+        },
+    }) + "\n"
+    return call + pending, notification, result, tool_use_id
+
+
 def _make_snapshot(ns):
     DataSnapshot = ns["DataSnapshot"]
     return DataSnapshot(
@@ -54,7 +102,7 @@ def _make_snapshot(ns):
 
 
 def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
-          no_sync=False):
+          no_sync=False, initial_jsonl=None):
     """Seed cache.db from a REAL JSONL file (session ``s1``) and start a
     server. Returns ``(srv, projects_dir, session_jsonl)``; caller must
     ``srv.shutdown()``."""
@@ -64,7 +112,11 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     jsonl = projects / "s1.jsonl"
-    jsonl.write_text(_asst_line("a1", "m1", "r1", "answer A", sid="s1"))
+    jsonl.write_text(
+        initial_jsonl
+        if initial_jsonl is not None
+        else _asst_line("a1", "m1", "r1", "answer A", sid="s1")
+    )
 
     # Full core + transcript sync so the watch loop can resolve and baseline
     # the session's independent transcript cursor.
@@ -220,6 +272,102 @@ def test_events_emits_tail_on_file_growth(tmp_path, monkeypatch):
         assert status == 200, (status, body)
         items = json.loads(body)["items"]
         assert any("AA" in (it.get("text") or "") for it in items)
+    finally:
+        srv.shutdown()
+
+
+def test_background_completion_live_tail_updates_the_open_conversation_once(
+        tmp_path, monkeypatch):
+    """A real task-notification appended after the reader SSE is live is
+    incrementally ingested once and immediately changes the same session from
+    its pending placeholder to the recovered payload. This is the direct Task B
+    product path: no restart and no full transcript rebuild."""
+    ns = load_script()
+    initial, notification, result, tool_use_id = _background_lines()
+    srv, _projects, jsonl = _boot(
+        ns, tmp_path, monkeypatch, bind="127.0.0.1", expose=False,
+        initial_jsonl=initial,
+    )
+    try:
+        port = srv.server_address[1]
+        status, body = _get(port, "/api/conversation/s1")
+        assert status == 200, (status, body)
+        before = json.loads(body)
+        pending = next(
+            block
+            for item in before["items"]
+            for block in item.get("blocks", [])
+            if block.get("tool_use_id") == tool_use_id
+        )
+        assert pending["background_status"] == "running"
+        assert "background_completed_at" not in pending
+        assert "still running after 120s" in pending["result"]["text"]
+
+        conn = ns["open_conversations_db"]()
+        try:
+            before_count = conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages WHERE session_id='s1'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        s = _open_sse(port, "/api/conversation/s1/events")
+        try:
+            _read_event(s, marker="event: ready", deadline=8.0)
+            time.sleep(1.0)
+            with open(jsonl, "a", encoding="utf-8") as fh:
+                fh.write(notification)
+            frame = _read_event(s, marker="event: tail", deadline=10.0)
+            assert json.loads(next(
+                line[len("data: "):]
+                for line in frame.splitlines()
+                if line.startswith("data: ")
+            )) == {"sessionId": "s1"}
+        finally:
+            s.close()
+
+        status, body = _get(port, "/api/conversation/s1")
+        assert status == 200, (status, body)
+        after = json.loads(body)
+        recovered = next(
+            block
+            for item in after["items"]
+            for block in item.get("blocks", [])
+            if block.get("tool_use_id") == tool_use_id
+        )
+        assert recovered["background_status"] == "completed"
+        assert recovered["background_completed_at"] == "2026-07-30T20:51:16.312Z"
+        assert recovered["result"]["text"] == result
+        assert all(
+            not any(block.get("task_id") == "kravg1b9s"
+                    for block in item.get("blocks", []))
+            for item in after["items"]
+        ), "the folded notification must not survive as a duplicate meta row"
+
+        status, body = _get(
+            port,
+            f"/api/conversation/s1/payload?tool_use_id={tool_use_id}&which=result",
+        )
+        assert status == 200, (status, body)
+        payload = json.loads(body)
+        assert payload["text"] == result
+        assert payload["full_length"] == len(result)
+
+        conn = ns["open_conversations_db"]()
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages WHERE session_id='s1'"
+            ).fetchone()[0] == before_count + 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE session_id='s1' AND uuid='n_bg' AND entry_type='meta'"
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE session_id!='s1'"
+            ).fetchone()[0] == 0
+        finally:
+            conn.close()
     finally:
         srv.shutdown()
 

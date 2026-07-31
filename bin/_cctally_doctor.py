@@ -414,6 +414,65 @@ def _codex_lifecycle_activity_24h(
     return records
 
 
+def _codex_quota_verify_activity_24h(*, now_utc: "dt.datetime") -> dict:
+    """Aggregate the detached `_codex-quota-verify` worker's 24h outcomes.
+
+    The worker's three streams are `/dev/null` and its exit code is observed by
+    nobody, so `hook-tick.log` is the only place its outcome can land — which is
+    why it writes there. `_codex_lifecycle_activity_24h` above cannot supply
+    this: worker lines carry no `source_root_key`, so its root filter drops
+    every one of them.
+
+    Same bounded-read contract as its sibling — timestamped records, aggregate
+    counters only, never session/prompt/response content.
+    """
+    cutoff = now_utc - dt.timedelta(hours=24)
+    counts: dict = {
+        "success_count_24h": 0,
+        "error_count_24h": 0,
+        "spawn_failure_count_24h": 0,
+        "last_success_at": None,
+    }
+    for path in (
+        _cctally_core.HOOK_TICK_LOG_ROTATED_PATH,
+        _cctally_core.HOOK_TICK_LOG_PATH,
+    ):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            try:
+                captured_at = parse_iso_datetime(
+                    tokens[0], "codex quota verify log timestamp")
+                captured_at = captured_at.astimezone(dt.timezone.utc)
+            except (IndexError, ValueError, TypeError):
+                continue
+            if captured_at > now_utc or captured_at < cutoff:
+                continue
+            fields = {
+                token.split("=", 1)[0]: token.split("=", 1)[1]
+                for token in tokens[1:] if "=" in token
+            }
+            if fields.get("provider") != "codex":
+                continue
+            op = fields.get("op")
+            outcome = fields.get("result")
+            if op == "quota-verify" and outcome == "success":
+                counts["success_count_24h"] += 1
+                prior = counts["last_success_at"]
+                if prior is None or captured_at > prior:
+                    counts["last_success_at"] = captured_at
+            elif op == "quota-verify" and outcome == "error":
+                counts["error_count_24h"] += 1
+            elif op == "quota-verify-spawn" and outcome == "failed":
+                counts["spawn_failure_count_24h"] += 1
+    return counts
+
+
 def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
     """Best-effort account-attribution state for the doctor `accounts.*` legs
     (#341). Never raises: identity + registry reads are read-only and each guard
@@ -1120,6 +1179,12 @@ def _doctor_gather_state_impl(
     except Exception:
         codex_lifecycle_activity_24h = {}
 
+    try:
+        codex_quota_verify_activity = _codex_quota_verify_activity_24h(
+            now_utc=now_utc)
+    except Exception:
+        codex_quota_verify_activity = None
+
     # ── Parse health (#279 S2 F5a) ───────────────────────────────────
     parse_health_claude = parse_health_codex = None
     # #416 review B4: the durable record that a torn Codex `auth.json` halted
@@ -1131,19 +1196,30 @@ def _doctor_gather_state_impl(
     # from the kernel constants, never inline literals.
     codex_replay_pending = None
     codex_replay_blocked = None
+    # public #5: the budgeted-decline record. Same JSON-dict contract as the
+    # blocked one, and the only signal a hook-only install produces when its
+    # Codex ingest is frozen behind an un-runnable replay.
+    codex_replay_deferred = None
+    # public #5 spec §5: the hook's budgeted-ingest backlog record. Absent means
+    # a zero backlog — a drained walk DELETES the row rather than zeroing it, so
+    # None and "nothing owed" are the same state by construction.
+    codex_ingest_backlog = None
     try:
         import _lib_codex_conversation as _codex_kern
         _blocked_key = _codex_kern.CODEX_REPLAY_BLOCKED_KEY
         _pending_key = _codex_kern.CODEX_REPLAY_FROM_ZERO_KEY
+        _deferred_key = _codex_kern.CODEX_REPLAY_DEFERRED_KEY
     except Exception:
         _blocked_key = "codex_replay_from_zero_blocked"
         _pending_key = "codex_replay_from_zero_pending"
+        _deferred_key = "codex_replay_from_zero_deferred"
     try:
         if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 for _key in ("parse_health_claude", "parse_health_codex",
-                             "codex_torn_auth_deferred", _blocked_key):
+                             "codex_torn_auth_deferred", _blocked_key,
+                             _deferred_key, "codex_ingest_backlog"):
                     try:
                         row = conn.execute(
                             "SELECT value FROM cache_meta WHERE key = ?",
@@ -1158,6 +1234,10 @@ def _doctor_gather_state_impl(
                                     parse_health_codex = _parsed
                                 elif _key == _blocked_key:
                                     codex_replay_blocked = _parsed
+                                elif _key == _deferred_key:
+                                    codex_replay_deferred = _parsed
+                                elif _key == "codex_ingest_backlog":
+                                    codex_ingest_backlog = _parsed
                                 else:
                                     codex_torn_deferred = _parsed
                     except (sqlite3.OperationalError, ValueError):
@@ -1744,8 +1824,10 @@ def _doctor_gather_state_impl(
         parse_health_claude=parse_health_claude,
         parse_health_codex=parse_health_codex,
         codex_torn_deferred=codex_torn_deferred,
+        codex_ingest_backlog=codex_ingest_backlog,
         codex_replay_pending=codex_replay_pending,
         codex_replay_blocked=codex_replay_blocked,
+        codex_replay_deferred=codex_replay_deferred,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,
@@ -1765,6 +1847,7 @@ def _doctor_gather_state_impl(
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
         codex_lifecycle_activity_24h=codex_lifecycle_activity_24h,
+        codex_quota_verify_activity=codex_quota_verify_activity,
         # #311: precomputed statusLine.refreshInterval classification.
         statusline_refresh_state=statusline_refresh_state,
         statusline_pipeline=statusline_pipeline,

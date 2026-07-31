@@ -37,7 +37,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 
 
-#: The stats.db table set: the 22 tables `open_db` /
+#: The stats.db table set: the tables `open_db` /
 #: `_apply_quota_projection_schema` create, plus the three framework/marker
 #: tables. Frozen deliberately — `test_every_frozen_table_is_really_created`
 #: fails if one is renamed or dropped, so this list cannot silently rot.
@@ -51,7 +51,7 @@ STATS_TABLES = frozenset({
     "stats_open_fixups", "schema_migrations",
     "schema_migrations_skipped", "quota_window_blocks",
     "quota_percent_milestones", "quota_threshold_events", "quota_alert_arming",
-    "quota_projection_state",
+    "quota_projection_state", "quota_projection_ledger_state",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -94,6 +94,11 @@ FROZEN_WRITE_SITES = {
         "projected_milestones": 1,
         "quota_alert_arming": 1,
         "quota_percent_milestones": 1,
+        # public #5: the `CREATE TABLE IF NOT EXISTS` for the incremental
+        # projector's own state, inside `_apply_quota_projection_schema` — which
+        # runs under `stats_open_time_guard` (maintenance EX +
+        # `stats_write_scope("open-time")`), the sanctioned first-open scope.
+        "quota_projection_ledger_state": 1,
         "quota_projection_state": 3,
         "quota_threshold_events": 1,
         "quota_window_blocks": 1,
@@ -139,12 +144,17 @@ FROZEN_WRITE_SITES = {
         "projected_milestones": 1,
         "weekly_cost_snapshots": 1,
     },
+    # public #5 raised four of these by one: the SCOPED sweep is a second
+    # statement per child table alongside the whole-root one it did not replace,
+    # and `quota_projection_state` gained the DELETE that retires an account
+    # partition the projection no longer names.
     "_cctally_quota.py": {
         "quota_alert_arming": 2,
-        "quota_percent_milestones": 2,
-        "quota_projection_state": 1,
-        "quota_threshold_events": 3,
-        "quota_window_blocks": 2,
+        "quota_percent_milestones": 3,
+        "quota_projection_ledger_state": 1,
+        "quota_projection_state": 2,
+        "quota_threshold_events": 4,
+        "quota_window_blocks": 3,
     },
     "_cctally_record.py": {
         "five_hour_block_models": 2,

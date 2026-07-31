@@ -542,6 +542,38 @@ CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY = (
     _lib_codex_conversation.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY)
 CODEX_REPLAY_BLOCKED_KEY = (
     _lib_codex_conversation.CODEX_REPLAY_BLOCKED_KEY)
+CODEX_REPLAY_DEFERRED_KEY = (
+    _lib_codex_conversation.CODEX_REPLAY_DEFERRED_KEY)
+
+#: The hidden self-subcommand that performs the byte-zero replay a budgeted
+#: tick declined (public #5). Deliberately its own worker rather than a mode of
+#: `_codex-quota-verify`: they repair different things and must not share a
+#: throttle marker or a failure mode (the `_update-check` / `_telemetry-beat`
+#: precedent).
+CODEX_REPLAY_DRAIN_COMMAND = "_codex-replay-drain"
+
+#: Marker whose mtime throttles drain spawns, in ``APP_DIR`` rather than
+#: cache.db because a spawn is process state and the decision is taken with no
+#: cache write transaction open.
+CODEX_REPLAY_DRAIN_MARKER_NAME = "codex-replay-drain.last-attempt"
+
+#: Minimum spacing between drain spawns. Stamped on ATTEMPT, not on success:
+#: the replay marker only disappears when a drain COMPLETES, so every tick in
+#: between still reads as needing one and a success-stamped throttle would put
+#: one worker on the box per 15-second Codex lifecycle tick. An hour, because a
+#: drain re-reads the whole rollout tree (2.7 GB locally) and a persistently
+#: failing one — a torn `auth.json` — would otherwise repeat that hourly cost
+#: far more often than the `doctor` WARN it produces is actionable.
+CODEX_REPLAY_DRAIN_SPAWN_THROTTLE_SECONDS = 3600
+
+#: How long the drain worker waits for the cache writer flocks. The default
+#: ``None`` is a single non-blocking attempt, which spends the whole hourly slot
+#: on whichever ordinary sync happened to hold the lock at that instant. Nobody
+#: is waiting on this process, and the throttle admits at most one of it per
+#: hour, so waiting a couple of minutes is strictly better than forfeiting the
+#: slot. Bounded rather than unbounded so a wedged lock cannot leave the worker
+#: resident indefinitely.
+CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS = 120.0
 
 
 # cache.db WAL hardening (#297). See
@@ -1453,7 +1485,7 @@ def _load_codex_session_files_rows(
 ) -> dict:
     """Cursor rows from ``codex_session_files`` for ONLY the given paths (spec
     §5.1 — the targeted preload must never load every row like the full-sync
-    path). Same 12-tuple value shape as ``sync_codex_cache``'s full ``existing``
+    path). Same 13-tuple value shape as ``sync_codex_cache``'s full ``existing``
     map, so the per-file delta logic is byte-identical between the two modes."""
     out: dict = {}
     if not paths:
@@ -1462,7 +1494,7 @@ def _load_codex_session_files_rows(
         "path, size_bytes, mtime_ns, last_byte_offset, "
         "last_session_id, last_model, last_total_tokens, source_root_key, "
         "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-        "last_conversation_key, last_turn_id"
+        "last_conversation_key, last_turn_id, ingest_complete"
     )
     for i in range(0, len(paths), 400):
         chunk = paths[i:i + 400]
@@ -1473,7 +1505,7 @@ def _load_codex_session_files_rows(
         ):
             out[row[0]] = (
                 row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                row[8], row[9], row[10], row[11], row[12],
+                row[8], row[9], row[10], row[11], row[12], row[13],
             )
     return out
 
@@ -2023,6 +2055,7 @@ def _write_codex_file_batch(
     incarnation: "int | None" = None,
     file_account_decision: "tuple[int, str | None] | None" = None,
     anchor_resolver: "CodexResetAnchorResolver | None" = None,
+    ingest_complete: bool = True,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
 
@@ -2035,7 +2068,14 @@ def _write_codex_file_batch(
     durable attribution decision into THIS transaction, so the decision, the
     rows it stamped and the file watermark commit or roll back as one unit. The
     decision was already journaled (fail-closed) before this call, so a crash
-    between the two replays idempotently rather than losing it."""
+    between the two replays idempotently rather than losing it.
+
+    ``ingest_complete`` (public #5) records whether ingestion actually reached
+    the ``size`` it is about to persist. It MUST be listed in the cursor upsert
+    below: ``INSERT OR REPLACE`` deletes and reinserts the row, so an omitted
+    column silently reverts to its schema DEFAULT of 1 — a budgeted stop would
+    have its own record erased by its own commit, the unread suffix would be
+    skipped as unchanged forever, and nothing would raise."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     if reset_file:
         _delete_codex_file_derived_rows(conn, path_str)
@@ -2116,13 +2156,14 @@ def _write_codex_file_batch(
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
             last_session_id, last_model, last_total_tokens, source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id, account_key)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            last_conversation_key, last_turn_id, account_key, ingest_complete)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
             last_model, last_total_tokens, discovered.source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
             last_conversation_key, last_turn_id, account_key,
+            1 if ingest_complete else 0,
         ),
     )
     if prune_roots:
@@ -2404,6 +2445,7 @@ _TARGETED_DECLINE_FLAGS = (
     "conversation_reingest_nested_agent_pending",    # migration 017
     "conversation_title_fts_backfill_pending",       # migration 018 (P1-2: HERE ONLY)
     "conversation_reingest_file_touches_pending",    # migration 019 (P1-2: HERE ONLY)
+    "conversation_background_mcp_reingest_pending",  # conversations 003
 )
 
 
@@ -2810,6 +2852,7 @@ def sync_cache(
                 " 'conversation_media_reingest_pending',"
                 " 'conversation_queued_prompt_reingest_pending',"
                 " 'conversation_reingest_nested_agent_pending',"
+                " 'conversation_background_mcp_reingest_pending',"
                 " 'conversation_title_fts_backfill_pending',"
                 " 'conversation_reingest_file_touches_pending',"
                 " 'conversation_file_touches_cursor',"
@@ -2981,7 +3024,8 @@ def sync_cache(
                     " 'conversation_reingest_enrichment_pending',"
                     " 'conversation_media_reingest_pending',"
                     " 'conversation_queued_prompt_reingest_pending',"
-                    " 'conversation_reingest_nested_agent_pending')"
+                    " 'conversation_reingest_nested_agent_pending',"
+                    " 'conversation_background_mcp_reingest_pending')"
                 ).fetchone() is not None
             except sqlite3.OperationalError:
                 _reingest = False
@@ -3717,6 +3761,14 @@ def backfill_ai_titles(conn: sqlite3.Connection) -> int:
     return n
 
 
+# Backgrounded-MCP result recovery (spec 2026-07-31 §4). DISTINCT from every
+# flag above on purpose: reusing one would conflate two enrichments and make a
+# partially-completed replay unrecoverable. Armed by conversations migration
+# 003 (in conversations.db — the Claude conversation synchronizer never writes
+# cache.db, so a cache migration would arm a flag nothing reads).
+CONVERSATION_BACKGROUND_MCP_REINGEST_KEY = (
+    "conversation_background_mcp_reingest_pending")
+
 _REINGEST_FLAG_KEYS = (
     "conversation_reingest_pending",
     "conversation_source_tool_use_reingest_pending",
@@ -3724,6 +3776,7 @@ _REINGEST_FLAG_KEYS = (
     "conversation_media_reingest_pending",   # #177 S4 (migration 009)
     "conversation_queued_prompt_reingest_pending",   # migration 014
     "conversation_reingest_nested_agent_pending",    # #217 S1 (migration 017)
+    CONVERSATION_BACKGROUND_MCP_REINGEST_KEY,        # conversations 003
 )
 
 
@@ -3822,6 +3875,7 @@ def _resumable_reingest_conversation_messages(conn):
         " 'conversation_media_reingest_pending',"
         " 'conversation_queued_prompt_reingest_pending',"
         " 'conversation_reingest_nested_agent_pending',"
+        " 'conversation_background_mcp_reingest_pending',"
         " 'conversation_reingest_cursor',"
         " 'conversation_reingest_cursor_gen')")
     conn.commit()
@@ -4828,6 +4882,12 @@ class CodexIngestStats:
     # Deferred WITHOUT advancing their cursor so the next sync re-reads and
     # re-stamps rather than guessing an account (spec §1 stable-read protocol).
     files_deferred_torn: int = 0
+    # public #5 spec §4: what a budgeted (hook-path) walk left undone. Both stay
+    # 0 for every unbudgeted caller, so `cache-sync` and the dashboard are
+    # unaffected — an explicit sync still runs to completion.
+    backlog_files: int = 0
+    backlog_bytes: int = 0
+    budget_exhausted: bool = False
 
     @property
     def targeted_clean(self) -> bool:
@@ -4865,6 +4925,357 @@ def _extend_codex_touched_span(
         spans[key] = (min(current[0], moment), max(current[1], moment))
 
 
+# public #5 spec §4. The budgeted walk's two persisted facts.
+#
+# The resume cursor exists because the discovered order is stable and sorted:
+# without it, the actively-appended files at the FRONT would consume every
+# budget forever and the tail would never drain. It records the file the walk
+# stopped before, by identity AND by ordinal — the identity is exact when the
+# file set is unchanged, and the ordinal is what keeps forward progress when
+# the cursor's target has been deleted or respelled. Falling back to 0 instead
+# would let a store that loses its cursor file each tick restart the cycle
+# forever.
+_CODEX_RESUME_CURSOR_KEY = "codex_ingest_resume_cursor"
+_CODEX_BACKLOG_KEY = "codex_ingest_backlog"
+
+#: The active rollout gets at most this share of the budget, so priority cannot
+#: itself starve the backlog it precedes.
+_CODEX_ACTIVE_FIRST_BUDGET_FRACTION = 0.5
+
+
+def _walk_clock() -> float:
+    """Monotonic clock for the budgeted Codex walk.
+
+    A named indirection rather than a bare ``time.monotonic()`` so the budget
+    is deterministically testable: "expires after exactly one file" is not
+    expressible against a real clock under variable CI load, and a convergence
+    test that cannot pin where the budget stops is not testing convergence.
+    Private test seam, in the same family as ``_on_file_committed``.
+    """
+    return time.monotonic()
+
+
+def _codex_walk_key(discovered: "CodexDiscoveredFile") -> "tuple[str, str]":
+    """The resume cursor's identity: source root plus canonical physical path.
+
+    The canonical path, not the configured spelling: a `$CODEX_HOME` respelling
+    or a symlink change must not read as a different file and silently rewind
+    the walk.
+    """
+    return (str(discovered.source_root_key), str(discovered.physical_path))
+
+
+def _load_codex_resume_cursor(conn: sqlite3.Connection) -> "tuple | None":
+    """``(root_key, physical_path, ordinal)`` or ``None``."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            (_CODEX_RESUME_CURSOR_KEY,)).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+        return (
+            str(payload["root_key"]), str(payload["path"]),
+            int(payload["ordinal"]),
+        )
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def _order_codex_walk(
+    files: "list[CodexDiscoveredFile]",
+    *,
+    cursor: "tuple | None",
+    active_path: "pathlib.Path | None",
+) -> "list[CodexDiscoveredFile]":
+    """The budgeted walk order: active rollout first, then a cursor rotation.
+
+    Rotation rather than truncation is what gives the cycle its wrap semantics:
+    a file inserted BEFORE the cursor is visited at the end of the current
+    cycle rather than jumping the queue, and every file is reached within one
+    cycle no matter where the budget happens to stop.
+    """
+    if not files:
+        return list(files)
+    start = 0
+    if cursor is not None:
+        by_key = {_codex_walk_key(item): index
+                  for index, item in enumerate(files)}
+        exact = by_key.get((cursor[0], cursor[1]))
+        # A vanished cursor keeps its ORDINAL. Restarting at 0 instead would
+        # let a store whose cursor file is deleted every tick re-walk the same
+        # prefix forever and never converge.
+        start = exact if exact is not None else min(cursor[2], len(files) - 1)
+        start = max(0, start)
+    ordered = files[start:] + files[:start]
+    if active_path is not None:
+        for index, item in enumerate(ordered):
+            if item.physical_path == active_path:
+                if index:
+                    ordered = [ordered[index]] + [
+                        entry for position, entry in enumerate(ordered)
+                        if position != index
+                    ]
+                break
+    return ordered
+
+
+def _load_codex_backlog_record(conn: sqlite3.Connection) -> "dict | None":
+    """The stored backlog record, or ``None`` when absent or unreadable."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            (_CODEX_BACKLOG_KEY,)).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    if not row or not row[0]:
+        return None
+    try:
+        parsed = json.loads(str(row[0]))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _write_codex_backlog_record(
+    conn: sqlite3.Connection, *, files: int, owed_bytes: int,
+    since: "str | None",
+) -> None:
+    """Persist the backlog record, minting ``since`` only when it is absent.
+
+    ``since`` is the one-hour staleness clock doctor reads, so it is carried
+    forward rather than re-stamped: re-minting it on every tick would keep the
+    age below an hour forever and the WARN would never fire.
+    """
+    _set_cache_meta(conn, _CODEX_BACKLOG_KEY, json.dumps({
+        "files": int(files),
+        "bytes": int(owed_bytes),
+        "since": since or dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z"),
+    }, sort_keys=True))
+
+
+def _record_codex_replay_deferral(conn: sqlite3.Connection) -> None:
+    """Record that a BUDGETED tick declined the byte-zero replay (public #5).
+
+    The decline returns before both backlog writes, so nothing else can show
+    it: ``stats.backlog_files`` stays 0, the lifecycle line logs ``backlog=0``,
+    ``doctor codex.ingest_backlog`` reports a drained store and the dashboard
+    omits the field. ``codex_replay_from_zero_blocked`` cannot cover it either
+    — only a walk that actually ran writes that one.
+
+    ``since`` carries forward, like the backlog record's: it is how long the
+    freeze has stood, and re-minting it per tick would hold the age below the
+    WARN threshold forever. Best-effort, like every other cache_meta
+    bookkeeping write on this path — a store too damaged to take it has larger
+    problems and must not turn a deferral into a raised hook tick.
+    """
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+    try:
+        prior = None
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ? LIMIT 1",
+            (CODEX_REPLAY_DEFERRED_KEY,)).fetchone()
+        if row and row[0]:
+            try:
+                parsed = json.loads(str(row[0]))
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                prior = parsed.get("since")
+        _set_cache_meta(conn, CODEX_REPLAY_DEFERRED_KEY, json.dumps({
+            "since": prior or now_iso,
+            "at": now_iso,
+        }, sort_keys=True))
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        # Classified family corruption belongs to the shared recovery boundary,
+        # never to a best-effort local except — the same re-raise its two
+        # siblings at the end of this walk already make. Swallowing it here made
+        # a corrupt cache present as an ordinary decline, on the one path a
+        # hook-only install takes every tick.
+        if _cctally_db_sib._is_sqlite_corruption_error(exc):
+            raise
+
+
+def _defer_codex_replay_drain() -> str:
+    """Hand the declined byte-zero replay to a detached worker (public #5).
+
+    Returns ``"spawned"``, ``"throttled"`` or ``"failed"`` — for the lifecycle
+    log and for tests. Same marker-first shape as
+    ``_defer_codex_quota_verification`` and ``update-check.last-fetch``: the
+    mtime is stamped BEFORE the spawn, so a worker that dies cannot make every
+    following tick spawn another, and an unwritable marker means no spawn at
+    all rather than an unbounded spawn rate.
+
+    Deliberately NOT a fallback to running the drain inline. A budgeted tick
+    cannot perform the replay at any speed — it is "clear everything, then
+    re-read everything", and slicing that corrupts account attribution — so
+    there is nothing to fall back to. The record written at the decline site is
+    what makes a drain that never succeeds diagnosable.
+    """
+    marker = _cctally_core.APP_DIR / CODEX_REPLAY_DRAIN_MARKER_NAME
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        age = None
+    if age is not None and 0 <= age < CODEX_REPLAY_DRAIN_SPAWN_THROTTLE_SECONDS:
+        return "throttled"
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        return "failed"
+    from _cctally_update import _spawn_detached
+    return "spawned" if _spawn_detached(CODEX_REPLAY_DRAIN_COMMAND) else "failed"
+
+
+def cmd_codex_replay_drain_internal(args) -> int:
+    """Hidden ``_codex-replay-drain`` handler: the unbudgeted byte-zero replay.
+
+    An ordinary UNBUDGETED ``sync_codex_cache`` — the same call
+    ``cache-sync --source codex`` makes — which is exactly what performs the
+    replay: the pending marker is OR'd into the sync's own ``rebuild``, so the
+    walk captures ``rebuild_known_identities`` before clearing and re-reads
+    every rollout from byte zero.
+
+    Always returns 0: a detached worker's exit code is observed by nobody. A
+    failure is written to ``hook-tick.log`` rather than swallowed, because the
+    condition it repairs (a frozen Codex ingest) is otherwise invisible and
+    both streams are on ``/dev/null``.
+    """
+    from _cctally_record import (
+        _hook_log_error_detail, _hook_log_safe_free_text, _hook_tick_log_line,
+        _hook_tick_log_rotate_if_needed,
+    )
+    started = time.monotonic()
+
+    def _log(outcome: str, detail: str = "", *, error: str = "") -> None:
+        # `detail` is this function's OWN structured `k=v` counters, emitted
+        # verbatim. Free text goes through `error`, which is rendered LAST and
+        # defused HERE — the same shape as `_codex_lifecycle_log_line`, and the
+        # reason the guarantee is a property of the renderer rather than of a
+        # call site remembering to scrub.
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        suffix = ""
+        if error:
+            safe = _hook_log_safe_free_text(error)
+            if safe:
+                suffix = f" error={safe}"
+        _hook_tick_log_line(
+            f"{stamp} provider=codex op=replay-drain result={outcome} "
+            f"dur_ms={max(0, int((time.monotonic() - started) * 1000))}"
+            + (f" {detail}" if detail else "") + suffix)
+        _hook_tick_log_rotate_if_needed()
+
+    try:
+        conn = open_cache_db()
+        try:
+            stats = sync_codex_cache(
+                conn, lock_timeout=CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS)
+        finally:
+            conn.close()
+    except Exception as exc:
+        # This walk touches every rollout, so its `OSError`s carry the most
+        # identifying paths of any worker on this path. `_hook_log_error_detail`
+        # narrows the family's embedded `filename` away at the source; `_log`
+        # defuses whatever is left.
+        _log("error", error=_hook_log_error_detail(exc))
+        return 0
+    if getattr(stats, "lock_contended", False):
+        # A contended sync returns immediately with every counter at zero, so
+        # reporting it as `success files=0` claimed a drain that never walked a
+        # byte — indistinguishable in the log from one that found nothing to do.
+        # Harmless for convergence (the lock holder is itself a sync), but the
+        # log is the only window onto a worker whose streams are /dev/null.
+        _log("contended")
+        return 0
+    _log(
+        "success",
+        f"files={int(getattr(stats, 'files_processed', 0) or 0)} "
+        f"torn={int(getattr(stats, 'files_deferred_torn', 0) or 0)} "
+        f"failed={int(getattr(stats, 'files_failed', 0) or 0)}")
+    return 0
+
+
+def _codex_walk_owes_unread_files(
+    walk: "list[CodexDiscoveredFile]", existing: dict,
+) -> bool:
+    """Could this walk owe bytes for a reason a `stat()` sweep must measure?
+
+    Dict lookups only — deliberately, because this gates
+    ``_codex_backlog_after``, which stats every discovered rollout. True when
+    any discovered file is unknown to the cursor snapshot or is recorded as
+    incompletely ingested; those are the two states a backlog can start from.
+
+    A store where every discovered file is known AND complete can still owe
+    bytes — an active rollout that grew since the last tick — but only a couple
+    of files' worth, and the walk itself commits them within the budget. Paying
+    a full-tree stat sweep on every tick to pre-record that is the wrong trade:
+    it is the steady state, so the sweep ran always and wrote nothing.
+    """
+    for item in walk:
+        prev = existing.get(str(item.source_path))
+        if prev is None:
+            return True
+        complete = prev[12]
+        if complete is not None and not int(complete):
+            return True
+    return False
+
+
+def _codex_backlog_after(
+    remaining: "list[CodexDiscoveredFile]", existing: dict,
+    committed: "dict[str, tuple[int, int, bool]] | None" = None,
+) -> "tuple[int, int]":
+    """``(files, bytes)`` still unread across ``remaining``.
+
+    Stat'ed here rather than tracked incrementally: it runs once per budgeted
+    tick over at most the discovered file count, and a running total would
+    drift the moment a file changed size mid-walk.
+
+    ``existing`` is the PRE-walk cursor snapshot, so a file this tick already
+    advanced would be measured from the offset it had before the tick started —
+    over-reporting the partial file the budget stopped inside by everything the
+    tick just committed, and reporting a brand-new file's whole length. Hence
+    ``committed``: ``{path: (size_bytes, last_byte_offset, ingest_complete)}``
+    for every file this walk committed, which takes precedence.
+    """
+    pending_files = 0
+    pending_bytes = 0
+    for item in remaining:
+        path_str = str(item.source_path)
+        record = None if committed is None else committed.get(path_str)
+        if record is None:
+            prev = existing.get(path_str)
+            if prev is not None:
+                complete = prev[12]
+                record = (
+                    int(prev[0] or 0), int(prev[2] or 0),
+                    True if complete is None else bool(int(complete)),
+                )
+        try:
+            size = item.source_path.stat().st_size
+        except OSError:
+            continue
+        if record is None:
+            offset = 0
+        else:
+            stored_size, offset, complete = record
+            if complete and size == stored_size:
+                continue  # complete and unchanged: nothing owed
+        owed = max(0, size - offset)
+        if owed:
+            pending_files += 1
+            pending_bytes += owed
+    return pending_files, pending_bytes
+
+
 def sync_codex_cache(
     conn: sqlite3.Connection,
     *,
@@ -4872,6 +5283,9 @@ def sync_codex_cache(
     rebuild: bool = False,
     only_paths: "set[str] | None" = None,
     lock_timeout: "float | None" = None,
+    budget_seconds: "float | None" = None,
+    active_transcript_path: "str | None" = None,
+    quota_reconcile: str = "auto",
     _on_first_file_rollback: Callable[[], None] | None = None,
     _on_file_committed: Callable[[str], None] | None = None,
 ) -> CodexIngestStats:
@@ -4886,7 +5300,38 @@ def sync_codex_cache(
     so a lost race does not wipe a cache another process is actively
     populating. If the lock is contended on a rebuild, the cache is left
     untouched and the caller sees `lock_contended=True`.
+
+    ``budget_seconds`` (public #5 spec §4) bounds the walk in wall clock. ONLY
+    the hook passes it; an explicit ``cctally cache-sync`` still runs to
+    completion. The deadline is measured from function entry, not from the
+    ingest loop, so lock acquisition and discovery count against it — the tick's
+    whole cost is what has to fit inside Codex's hook timeout. A budgeted walk
+    starts at a PERSISTED resume cursor and wraps, because the actively-appended
+    files at the front of a sorted walk would otherwise consume every budget
+    forever and the tail would never drain.
+
+    ``active_transcript_path`` is the rollout the hook's stdin payload names.
+    It is ingested first so live numbers stay correct while history lags, and
+    its share of the budget is capped so it cannot itself starve the backlog it
+    precedes. A path that does not resolve to a discovered rollout under the
+    configured Codex roots is ignored, never trusted.
+
+    ``quota_reconcile`` (public #5 spec §4) is ``"auto"`` for every caller but
+    the hook. The hook passes ``"defer"`` and performs the single alert-eligible
+    reconcile itself: it always follows this sync with an explicit
+    ``reconcile_codex_quota_projection(alert_eligible_root_keys=…)``, and that
+    call can never take the certificate short-circuit (it is guarded by
+    ``not alert_eligible_roots``), so the sync-internal reconcile was pure
+    duplicated cost — measured at roughly half of every growing turn. Every
+    other caller keeps ``"auto"``, because the sync-internal reconcile is what
+    keeps the projection current for the dashboard and ``cache-sync``.
     """
+    if quota_reconcile not in ("auto", "defer"):
+        raise ValueError(
+            "sync_codex_cache: quota_reconcile must be 'auto' or 'defer'")
+    started_at = _walk_clock()
+    deadline = (
+        None if budget_seconds is None else started_at + float(budget_seconds))
     stats = CodexIngestStats()
     project_after_unlock = False
     # Per-root instant span this sync wrote — accounting-row timestamps AND
@@ -4936,6 +5381,25 @@ def sync_codex_cache(
         # global quota reconcile) — see the guards threaded through below.
         targeted = only_paths is not None
 
+        # The two ARGUMENT-level contracts are checked here, ahead of the replay
+        # probe, and against the CALLER's `rebuild` rather than the marker-OR'd
+        # one below. Stated after the probe they were unreachable whenever a
+        # replay happened to be armed — the decline returns first — so
+        # `sync_codex_cache(rebuild=True, budget_seconds=5)` raised or silently
+        # deferred depending on a cache_meta row the caller cannot see. A
+        # contract that holds only sometimes is not one.
+        if targeted and rebuild:
+            raise ValueError(
+                "sync_codex_cache: only_paths is incompatible with rebuild")
+        if rebuild and deadline is not None:
+            # A rebuild commits its wipe before the walk starts, so a bounded
+            # rebuild leaves the cache wiped and only partly restored. No
+            # production caller combines them — the hook is the only budgeted
+            # caller and it never asks for a rebuild — so this is a contract,
+            # not a fallback.
+            raise ValueError(
+                "sync_codex_cache: budget_seconds is incompatible with rebuild")
+
         # A pending byte-zero replay is consumed HERE, not by the migration that
         # armed it, so the rebuild path below captures `rebuild_known_identities`
         # before clearing. A migration that cleared `codex_session_files`
@@ -4946,16 +5410,40 @@ def sync_codex_cache(
             "SELECT 1 FROM cache_meta WHERE key=?",
             (CODEX_REPLAY_FROM_ZERO_KEY,),
         ).fetchone() is not None
-        if replay_pending and targeted:
+        if replay_pending and (targeted or deadline is not None):
             # A live-tail tick must DEFER, never raise through the
             # `targeted and rebuild` guard below.
+            #
+            # A BUDGETED tick defers for a stronger reason. The replay is
+            # "clear everything, then re-read everything", and the clear happens
+            # ONCE at the top of the walk, so slicing it across ticks has no
+            # safe outcome. Consuming the marker after a truncated walk is the
+            # #416 spec D1 violation directly: every un-walked rollout that
+            # predates the durable attribution map has no decision in
+            # `codex_file_accounts` AND no entry in the (now-cleared)
+            # `rebuild_known_identities` snapshot, so the next tick sends it to
+            # the live `auth.json` branch and re-attributes historical spend to
+            # whoever is logged in now. Keeping the marker instead is no better:
+            # the next tick re-enters the rebuild, re-wipes the store, and
+            # captures a snapshot holding only the previous tick's files — the
+            # same violation, plus a walk that never converges because every
+            # tick undoes the last one's progress.
+            #
+            # Deferring is only safe because an UNBUDGETED caller eventually
+            # runs it. `cache-sync --source codex`, the dashboard sync, the TUI
+            # and every Codex read command all do — but a hook-only install has
+            # none of them, and that is the reporter's shape. There, every tick
+            # from migration 035 onwards returned here before walking a byte
+            # and Codex ingest froze permanently. So the budgeted decline
+            # RECORDS itself (doctor reads the record) and hands the unbudgeted
+            # drain to a detached worker.
+            if deadline is not None:
+                _record_codex_replay_deferral(conn)
             stats.deferred_reason = "replay_pending"
             return stats
+        # Both incompatible combinations already returned at the decline above,
+        # so the marker-OR'd rebuild needs no second guard.
         rebuild = rebuild or replay_pending
-
-        if targeted and rebuild:
-            raise ValueError(
-                "sync_codex_cache: only_paths is incompatible with rebuild")
 
         # F4 (#313): the reconcile trigger gate is "did the Codex physical
         # mutation sequence advance during this sync", NOT rows_changed —
@@ -5180,13 +5668,13 @@ def sync_codex_cache(
             existing = {
                 row[0]: (
                     row[1], row[2], row[3], row[4], row[5], row[6], row[7],
-                    row[8], row[9], row[10], row[11], row[12],
+                    row[8], row[9], row[10], row[11], row[12], row[13],
                 )
                 for row in conn.execute(
                     "SELECT path, size_bytes, mtime_ns, last_byte_offset, "
                     "last_session_id, last_model, last_total_tokens, source_root_key, "
                     "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
-                    "last_conversation_key, last_turn_id "
+                    "last_conversation_key, last_turn_id, ingest_complete "
                     "FROM codex_session_files"
                 )
             }
@@ -5218,6 +5706,83 @@ def sync_codex_cache(
                     stats.deferred_reason = "truncation"
                     return stats
 
+        # public #5 spec §4: a budgeted walk resumes where the last one stopped
+        # and puts the hook's active rollout first. Every unbudgeted caller
+        # keeps the discovered order exactly, so `cache-sync`, the dashboard and
+        # the targeted live-tail path are byte-identical to before.
+        walk = files
+        active_physical: "pathlib.Path | None" = None
+        if deadline is not None and not targeted:
+            if active_transcript_path:
+                # Validate against the DISCOVERED set rather than trusting the
+                # hook payload: an arbitrary path from stdin must never be able
+                # to name a file outside the configured Codex roots.
+                try:
+                    candidate = _canonical_codex_path(
+                        pathlib.Path(str(active_transcript_path)))
+                except (OSError, ValueError, TypeError):
+                    candidate = None
+                if candidate is not None and any(
+                    item.physical_path == candidate for item in files
+                ):
+                    active_physical = candidate
+            walk = _order_codex_walk(
+                files, cursor=_load_codex_resume_cursor(conn),
+                active_path=active_physical)
+            # The end-of-walk record below cannot describe a walk that never
+            # reaches its end. Every LATER tick is safe — `since` carries
+            # forward, and a tick that dies leaves the previous record standing,
+            # stale but conservative — but the FIRST budgeted tick over a fresh
+            # backlog has no previous record, so dying mid-walk leaves the
+            # backlog reading zero while a real one grows and doctor reports OK.
+            # Record what this tick owes BEFORE it starts.
+            #
+            # The end-of-walk write supersedes this one (and clears it when the
+            # walk drains), and reads this `since` back, so the one-hour clock
+            # still starts when the backlog first appeared. On an already-drained
+            # store the pre-walk figure is whatever the active rollout has
+            # appended, so a reader landing inside the walk can briefly see a
+            # one-file backlog — which is true at that instant, and gone by the
+            # time the tick commits.
+            #
+            # Gated on `_codex_walk_owes_unread_files`, which is dict lookups
+            # only. `_codex_backlog_after` is a full-tree `stat()` sweep, and on
+            # a DRAINED store — exactly the steady state acceptance criterion 1
+            # measures — the record is always absent, so the unconditional form
+            # ran that sweep on every single tick and wrote nothing: 1,859 extra
+            # stats per tick on the real store, on top of the walk's own. The
+            # only backlog a drained store can have is bytes appended to files
+            # it already knows, which is what produced the transient one-file
+            # reading; the sweep is now skipped there entirely.
+            if (
+                _load_codex_backlog_record(conn) is None
+                and _codex_walk_owes_unread_files(walk, existing)
+            ):
+                pre_files, pre_bytes = _codex_backlog_after(walk, existing)
+                if pre_files:
+                    _write_codex_backlog_record(
+                        conn, files=pre_files, owed_bytes=pre_bytes, since=None)
+                    conn.commit()
+        # Where the budget stopped, if it did: the files this tick never
+        # reached. Empty means the walk completed a full cycle.
+        unwalked: "list[CodexDiscoveredFile]" = []
+        # A file the budget stopped INSIDE. The cursor points back at it so the
+        # next tick resumes it immediately, rather than making it wait out a
+        # whole cycle behind files that owe nothing. Last one wins, which is the
+        # right cursor: it is where the OVERALL deadline landed.
+        partial_file: "CodexDiscoveredFile | None" = None
+        # Every file the walk stopped inside, for the backlog COUNT. There can
+        # be more than one: the active rollout has its own capped share of the
+        # budget, so it can stop short while the overall deadline still has room
+        # and a later file then stops short too. Counting only `partial_file`
+        # loses the active rollout's remainder — convergence is unaffected
+        # (active-first revisits it) but the reported figure is wrong.
+        partial_files: "list[CodexDiscoveredFile]" = []
+        # What this walk actually committed, per file:
+        # ``(size_bytes, last_byte_offset, ingest_complete)``. The backlog is
+        # measured against this rather than the pre-walk `existing` snapshot,
+        # which cannot see anything this tick just wrote.
+        committed_state: "dict[str, tuple[int, int, bool]]" = {}
         # #341: per-root active-account cache, resolved once per sync (auth.json
         # is per provider root and rarely changes mid-sync). Keyed by
         # source_root_key. A torn read defers every file under that root.
@@ -5233,7 +5798,14 @@ def sync_codex_cache(
         # the loop stays flat, mirroring sync_cache's walk seam.
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
-        for discovered in files:
+        for _walk_index, discovered in enumerate(walk):
+            # The budget is checked BEFORE a file is opened, so a tick either
+            # commits a file whole (or to a recorded partial offset) or does not
+            # touch it at all.
+            if deadline is not None and _walk_clock() >= deadline:
+                stats.budget_exhausted = True
+                unwalked = list(walk[_walk_index:])
+                break
             jp = discovered.source_path
             path_str = str(jp)
             try:
@@ -5248,6 +5820,12 @@ def sync_codex_cache(
             mtime_ns = st.st_mtime_ns
             prev = existing.get(path_str)
             start_offset = 0
+            # public #5: the byte length this pass COMMITS to scanning, which
+            # `codex_session_files.size_bytes` records and `ingest_complete`
+            # refers to. It equals the observed size everywhere except a resume
+            # of an incomplete target on a file that has since grown, where the
+            # stored target is finished first.
+            scan_target = size
             truncated = False
             initial_session_id: str | None = None
             initial_model: str | None = None
@@ -5271,11 +5849,21 @@ def sync_codex_cache(
                     prev_size, _, prev_offset, prev_sid, prev_model, prev_ttot,
                     prev_root_key, prev_native_thread_id, prev_root_thread_id,
                     prev_parent_thread_id, prev_conversation_key, prev_turn_id,
+                    prev_complete,
                 ) = prev
                 prev_total_tokens = (
                     int(prev_ttot) if prev_ttot is not None else None
                 )
                 requalified = prev_root_key != discovered.source_root_key
+                # public #5 spec §4. `ingest_complete` is 1 for every row a
+                # pre-budget binary wrote and for every file read to its stored
+                # target, so this branch is unreachable until a budgeted stop
+                # writes a 0 — and once one does, the OLD order was wrong: it
+                # compared `size` (the file's full observed length, persisted
+                # whatever offset ingestion reached) against `prev_size` and
+                # skipped on equality, which made the unread suffix permanently
+                # invisible on any rollout that never grows again.
+                incomplete = prev_complete is not None and not int(prev_complete)
                 if targeted and (requalified or size < prev_size):
                     # §5.1 preflight-snapshot scoped: a shrink or requalification
                     # landing AFTER the preflight is declined HERE, per file —
@@ -5287,10 +5875,32 @@ def sync_codex_cache(
                     # — that whole-cache-affecting escalation is the full sync's.
                     stats.files_failed += 1
                     continue
-                if not requalified and size == prev_size:
+                if not requalified and incomplete and size >= prev_offset:
+                    # Resume the stored scan target. Deliberately NOT a
+                    # `delta_append`: that flag is what authorizes consulting
+                    # the live `auth.json` and minting a new account range at
+                    # the resume offset, so a resumed backlog would otherwise
+                    # acquire a later account merely because processing was
+                    # sliced across hooks. The same bytes read in one pass
+                    # carry the account decided at offset 0, and where a budget
+                    # happened to stop must not change that answer.
+                    #
+                    # A file that GREW while its target was incomplete keeps
+                    # the STORED target: the read is capped at `prev_size` and
+                    # the row re-commits that same size, so the suffix written
+                    # after the stop becomes an ordinary delta append on the
+                    # next tick — and may then legitimately mint a new range,
+                    # because those bytes are genuinely new rather than merely
+                    # deferred.
+                    start_offset = prev_offset
+                    scan_target = min(size, prev_size)
+                    initial_session_id = prev_sid
+                    initial_model = prev_model
+                    initial_total_tokens = prev_total_tokens or 0
+                elif not requalified and not incomplete and size == prev_size:
                     stats.files_skipped_unchanged += 1
                     continue
-                if not requalified and size > prev_size:
+                elif not requalified and not incomplete and size > prev_size:
                     start_offset = prev_offset
                     delta_append = True
                     initial_session_id = prev_sid
@@ -5352,14 +5962,19 @@ def sync_codex_cache(
                 # The guard is the whole safety argument: `delta_append` means
                 # `start_offset` is this file's ingest watermark, and the second
                 # condition means the new range starts strictly beyond every
-                # decided range. Today the term is algebraically redundant:
-                # every non-delta branch sets `start_offset = 0`, while every
-                # decided range starts at a non-negative offset, so the strict
-                # comparison alone implies a delta append. Keep the explicit
-                # term as belt-and-suspenders: it pins the semantic permission
-                # to consult auth.json if a future branch changes the offsets.
-                # Auth can therefore mint a range only for bytes NOBODY has
-                # attributed yet; it never re-decides covered bytes.
+                # decided range. Auth can therefore mint a range only for bytes
+                # NOBODY has attributed yet; it never re-decides covered bytes.
+                #
+                # The `delta_append` term is LOAD-BEARING, not belt-and-
+                # suspenders. It used to be algebraically redundant, because
+                # every non-delta branch set `start_offset = 0` and the strict
+                # comparison alone therefore implied a delta append. Public #5's
+                # resumable ingest broke that: the incomplete-resume branch sets
+                # `start_offset = prev_offset` WITHOUT `delta_append`, exactly so
+                # a resumed backlog keeps the account decided at offset zero
+                # rather than acquiring a later one because a budget happened to
+                # slice the work. Drop this term and that resume mints a fresh
+                # range from the live `auth.json` at its stop point.
                 if delta_append and start_offset > account_ranges[-1][0]:
                     root_account = _live_root_account()
                     if root_account.status == "torn":
@@ -5477,6 +6092,36 @@ def sync_codex_cache(
                     context_window=None,
                 )
             yielded_count = 0
+            # public #5: did the read stop SHORT of its scan target? Only that
+            # makes the row incomplete. Reaching the target, a natural EOF and a
+            # trailing incomplete JSONL line are all COMPLETE for the target
+            # this pass committed to — the iterator seeks back to that line's
+            # start and a later size increase resumes it correctly.
+            stopped_short = {"value": False}
+            # The active rollout gets a CAPPED share of the budget. Without the
+            # cap, a huge live transcript would consume every tick and the
+            # backlog behind it would never drain — priority is meant to keep
+            # live numbers correct, not to reorder starvation.
+            file_deadline = deadline
+            if (
+                deadline is not None and active_physical is not None
+                and discovered.physical_path == active_physical
+            ):
+                file_deadline = min(deadline, started_at + float(
+                    budget_seconds) * _CODEX_ACTIVE_FIRST_BUDGET_FRACTION)
+
+            def _stop_before(
+                offset, _limit=scan_target, _short=stopped_short,
+                _deadline=file_deadline,
+            ):
+                # Reaching the target ends the read without making it partial.
+                if offset >= _limit:
+                    return True
+                if _deadline is not None and _walk_clock() >= _deadline:
+                    _short["value"] = True
+                    return True
+                return False
+
             try:
                 with open(jp, "rb") as fh:
                     fh.seek(start_offset)
@@ -5488,6 +6133,7 @@ def sync_codex_cache(
                         initial_total_tokens=initial_total_tokens,
                         source_root_key=discovered.source_root_key,
                         state=iter_state,
+                        stop_before=_stop_before,
                     ):
                         event = emission.event
                         for quota in emission.quotas:
@@ -5665,7 +6311,11 @@ def sync_codex_cache(
                         conn,
                         discovered=discovered,
                         path_str=path_str,
-                        size=size,
+                        # The SCAN TARGET, not the observed size: `size_bytes`
+                        # is what `ingest_complete` refers to, and a resume that
+                        # finishes an old target on a file that has since grown
+                        # must leave the suffix visible as a delta append.
+                        size=scan_target,
                         mtime_ns=mtime_ns,
                         final_offset=final_offset,
                         last_session_id=new_last_session_id,
@@ -5691,6 +6341,7 @@ def sync_codex_cache(
                         incarnation=incarnation,
                         file_account_decision=pending_decision,
                         anchor_resolver=anchor_resolver,
+                        ingest_complete=not stopped_short["value"],
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -5723,6 +6374,12 @@ def sync_codex_cache(
                 anchor_resolver.discard_uncommitted_file()
                 continue
             anchor_resolver.mark_file_committed()
+            committed_state[path_str] = (
+                scan_target, final_offset, not stopped_short["value"])
+            if stopped_short["value"]:
+                stats.budget_exhausted = True
+                partial_file = discovered
+                partial_files.append(discovered)
 
             if not rebuild:
                 # Accounting timestamps share one producer spelling, so the
@@ -5753,9 +6410,73 @@ def sync_codex_cache(
         if progress is not None:
             progress(stats)
         _p_walk.__exit__(None, None, None)
+        # public #5: did this walk actually reach every discovered file? The
+        # end-of-walk markers below describe the WHOLE TREE, and a budget stop
+        # increments neither `files_failed` nor `files_deferred_torn` — so their
+        # zero-count "everything was fine" branches would be satisfied TRIVIALLY
+        # by a walk that looked at almost nothing. Every such branch is gated on
+        # this instead. Both terms are checked because they are set at different
+        # points: the pre-open deadline check fills `unwalked`, while a stop
+        # INSIDE a file only sets the flag.
+        walk_complete = not stats.budget_exhausted and not unwalked
         _p_walk.set_count(stats.files_processed)
         _p_walk.set_meta(skipped=stats.files_skipped_unchanged,
                          rows=stats.rows_changed)
+        # public #5 spec §4/§5: the resume cursor and the backlog record.
+        #
+        # Written once here rather than inside every per-file commit. The
+        # property the spec is protecting is that a crash cannot spuriously
+        # restart the one-hour staleness clock, and that holds: `since` is
+        # carried forward from the existing record and only minted when a
+        # backlog first appears, so a crashed tick leaves the PREVIOUS record
+        # standing (stale but conservative, and recomputed next tick) rather
+        # than erasing the clock.
+        # Runs for every whole-tree sync, budgeted or not: an explicit
+        # `cache-sync` completes the walk and must therefore CLEAR the backlog
+        # it just drained, or doctor and the dashboard would keep reporting it.
+        if not targeted:
+            # Two different questions. The CURSOR asks "where does the next
+            # tick resume", which is where the overall deadline landed:
+            # `partial_file` (the last stop-short) if there is one, else the
+            # first file the walk never opened. The BACKLOG asks "what is still
+            # owed", which is every stop-short plus everything unwalked.
+            cursor_head = (
+                partial_file if partial_file is not None
+                else (unwalked[0] if unwalked else None))
+            backlog_files, backlog_bytes = _codex_backlog_after(
+                partial_files + unwalked, existing, committed_state)
+            stats.backlog_files = backlog_files
+            stats.backlog_bytes = backlog_bytes
+            if cursor_head is not None:
+                head = cursor_head
+                ordinal = 0
+                head_key = _codex_walk_key(head)
+                for index, item in enumerate(files):
+                    # Qualified by root, exactly like the cursor it records: two
+                    # configured roots can resolve to the same canonical path,
+                    # and matching on the path alone would then store the wrong
+                    # ordinal for the fallback.
+                    if _codex_walk_key(item) == head_key:
+                        ordinal = index
+                        break
+                _set_cache_meta(conn, _CODEX_RESUME_CURSOR_KEY, json.dumps({
+                    "root_key": head.source_root_key,
+                    "path": str(head.physical_path),
+                    "ordinal": ordinal,
+                }, sort_keys=True))
+            else:
+                # A complete cycle: the next tick starts at the top again.
+                conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                             (_CODEX_RESUME_CURSOR_KEY,))
+            if backlog_files:
+                prior = _load_codex_backlog_record(conn)
+                _write_codex_backlog_record(
+                    conn, files=backlog_files, owed_bytes=backlog_bytes,
+                    since=None if prior is None else prior.get("since"))
+            else:
+                conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                             (_CODEX_BACKLOG_KEY,))
+            conn.commit()
         # #279 S2 F1: rolling parse-health record (codex half). Same
         # anomaly-delta gate as the Claude tail; the global writer flock
         # excludes a concurrent Claude sync.
@@ -5782,6 +6503,12 @@ def sync_codex_cache(
         # NOT R8-gated. This is a health signal, not account decoration — it
         # names no account and adds no per-account column, the same carve-out
         # `alerts.log`'s runtime state has (docs/accounts-gotchas.md).
+        #
+        # Clearing it requires a walk that actually reached every file
+        # (`walk_complete`). A budgeted walk that stopped before the torn file
+        # defers nothing and would otherwise clear a marker describing a real,
+        # ongoing condition — `doctor` would stop reporting the frozen login
+        # while every rollout under that root stayed stalled.
         if not targeted:
             if stats.files_deferred_torn:
                 _set_cache_meta(conn, "codex_torn_auth_deferred", json.dumps({
@@ -5789,7 +6516,7 @@ def sync_codex_cache(
                     "at": dt.datetime.now(dt.timezone.utc).isoformat(
                         timespec="seconds").replace("+00:00", "Z"),
                 }, sort_keys=True))
-            else:
+            elif walk_complete:
                 conn.execute("DELETE FROM cache_meta WHERE key = ?",
                              ("codex_torn_auth_deferred",))
             # Consume the byte-zero replay marker only after a clean full walk,
@@ -5803,13 +6530,30 @@ def sync_codex_cache(
             # exclusive lock today, so nothing can arm the marker in between —
             # but the conversations side has no such exclusion, and the two
             # clears must keep the same shape.
-            if stats.files_failed == 0 and stats.files_deferred_torn == 0:
+            #
+            # `walk_complete` is the third term for the same reason the torn
+            # marker needs it: a budget-truncated walk fails nothing and defers
+            # nothing, so the zero-count condition alone would consume a marker
+            # (and erase a blocked record) on a walk that reached almost no
+            # file. It is defense in depth today — a budgeted tick declines a
+            # pending replay outright above — but the two clears must keep the
+            # same shape.
+            if (
+                walk_complete
+                and stats.files_failed == 0
+                and stats.files_deferred_torn == 0
+            ):
                 if replay_pending:
                     conn.execute("DELETE FROM cache_meta WHERE key = ?",
                                  (CODEX_REPLAY_FROM_ZERO_KEY,))
                 conn.execute("DELETE FROM cache_meta WHERE key = ?",
                              (CODEX_REPLAY_BLOCKED_KEY,))
-            elif replay_pending:
+                # The budgeted-decline record is cleared by the same walk, for
+                # the same reason: an unbudgeted walk reaching here is exactly
+                # the caller whose absence the record was reporting.
+                conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                             (CODEX_REPLAY_DEFERRED_KEY,))
+            elif replay_pending and walk_complete:
                 # A full walk ran and could NOT consume the marker, so the
                 # replay — and with it every Codex transcript ingest, which
                 # defers behind this marker — is stalled rather than merely
@@ -5822,6 +6566,31 @@ def sync_codex_cache(
                     "files_deferred_torn": stats.files_deferred_torn,
                 }, sort_keys=True))
             conn.commit()
+        # Public #5: resolve any still-unstamped `quota_window_snapshots.
+        # observed_model` from the accounting corpus, using the exact expression
+        # the read path used before the fallback was removed. Cache migration
+        # 039 is the one-time leg; this is the standing one, because `db skip
+        # 039_…` and a fresh journal-repopulated cache both bypass the migration
+        # and would then classify a Spark window as account weekly quota (#373).
+        # Ordered BEFORE the spend adoption below, which reads the model to
+        # decide `model_scoped` and must not see a stale NULL. A row it changes
+        # is real interpretation drift, so the physical mutation sequence
+        # advances with it — otherwise the projection certificate would still
+        # read as current and the reconcile would short-circuit past the ledger
+        # entries the triggers just wrote. Best-effort, like the adoption below:
+        # the resolution is fully re-derivable on the next sync.
+        try:
+            resolved_models = _cctally_db_sib.backfill_codex_quota_observed_model(
+                conn)
+            if resolved_models:
+                _bump_codex_physical_mutation_seq(conn)
+            conn.commit()
+        except sqlite3.DatabaseError as exc:
+            conn.rollback()
+            if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                raise
+            eprint("[cache-sync] could not resolve Codex quota model "
+                   f"attribution: {exc}")
         # Window-scoped spend adoption (spec
         # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
         # Runs AFTER the walk committed and while both cache writer flocks are
@@ -5889,7 +6658,12 @@ def sync_codex_cache(
         # project_after_unlock / deferred_cert_* keep
         # their no-op defaults — the post-flock reconcile paths below then all
         # short-circuit for a targeted call.
-        if not targeted:
+        #
+        # `quota_reconcile="defer"` skips the whole decision, including the
+        # post-flock stats.db open below: the hook does its own reconcile
+        # immediately after this call, and that reconcile re-reads the same
+        # certificate and signatures itself.
+        if not targeted and quota_reconcile == "auto":
             cur_seq = codex_physical_mutation_seq(conn)
             if cur_seq != seq_before:
                 project_after_unlock = True
@@ -5937,7 +6711,7 @@ def sync_codex_cache(
                 project_after_unlock = True
         finally:
             stats_conn.close()
-    if project_after_unlock:
+    if project_after_unlock and quota_reconcile == "auto":
         from _cctally_quota import reconcile_codex_quota_projection
         reconcile_codex_quota_projection()
     return stats
@@ -7895,13 +8669,21 @@ def _prepare_claude_conversation_maintenance(
     *,
     rebuild: bool,
     targeted: bool,
-) -> None:
+) -> bool:
     """Consume transcript-only upgrade work under the conversation flock.
 
     These consumers historically ran inside ``sync_cache`` because prose and
     accounting shared one database.  Keeping them here is the load-bearing
     half of the #320 split: schema upgrades may re-derive transcript state, but
     they never extend the core-cache critical section.
+
+    Returns whether it performed a FROM-ZERO replay. The resumable reingest
+    deletes and reconstructs each source file from offset zero, which restores
+    rows the throttled retention prune already trimmed — and the caller's
+    ``did_from_zero_replay`` was previously set only by
+    ``rebuild or stats.files_reset_truncated > 0``, so a replay consumed here
+    never reached ``_force_retention_prune_after_replay()`` and pruned history
+    silently reappeared until the next ordinary prune.
     """
     if rebuild:
         # The offset-zero walk below re-derives every transcript projection.
@@ -7914,6 +8696,7 @@ def _prepare_claude_conversation_maintenance(
             "'conversation_media_reingest_pending',"
             "'conversation_queued_prompt_reingest_pending',"
             "'conversation_reingest_nested_agent_pending',"
+            "'conversation_background_mcp_reingest_pending',"
             "'conversation_reingest_file_touches_pending',"
             "'conversation_file_touches_cursor',"
             "'conversation_reingest_cursor',"
@@ -7940,10 +8723,12 @@ def _prepare_claude_conversation_maintenance(
         )
         _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
         conn.commit()
-        return
+        # The caller's own offset-zero walk is the replay; it already sets
+        # did_from_zero_replay for the rebuild case.
+        return False
 
     if targeted:
-        return
+        return False
 
     if conn.execute(
         "SELECT 1 FROM cache_meta WHERE key='conversation_backfill_pending'"
@@ -7971,7 +8756,8 @@ def _prepare_claude_conversation_maintenance(
         "'conversation_reingest_enrichment_pending',"
         "'conversation_media_reingest_pending',"
         "'conversation_queued_prompt_reingest_pending',"
-        "'conversation_reingest_nested_agent_pending')"
+        "'conversation_reingest_nested_agent_pending',"
+        "'conversation_background_mcp_reingest_pending')"
     ).fetchone() is not None
     if reingest:
         _resumable_reingest_conversation_messages(conn)
@@ -7982,6 +8768,7 @@ def _prepare_claude_conversation_maintenance(
     _consume_promote_command_args(conn)
     _consume_title_fts(conn)
     _consume_file_touches(conn)
+    return reingest
 
 
 def _report_conversation_progress(
@@ -8047,7 +8834,7 @@ def sync_claude_conversations(
             conn.commit()
 
         _report_conversation_progress(progress, "prepare", stats)
-        _prepare_claude_conversation_maintenance(
+        maintenance_replayed = _prepare_claude_conversation_maintenance(
             conn, rebuild=rebuild, targeted=targeted
         )
 
@@ -8219,7 +9006,10 @@ def sync_claude_conversations(
         _report_conversation_progress(progress, "checkpoint", stats)
         _harden_conversation_sidecars()
         _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
-        did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
+        # `maintenance_replayed` is the third from-zero source: a resumable
+        # reingest consumed above also rebuilds every source file from offset 0.
+        did_from_zero_replay = (
+            rebuild or stats.files_reset_truncated > 0 or maintenance_replayed)
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)

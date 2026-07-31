@@ -137,8 +137,26 @@ STUB_SRC = '''#!/usr/bin/env python3
 
 Modes: serve (normal), nobanner, die (banner then exit), unresponsive
 (binds and accepts via backlog but never answers HTTP).
+
+nobanner writes its diagnostic and exits before the heavyweight imports and
+the bind. That ordering is load-bearing, not tidiness: the caller's banner
+poll re-reads the log and then breaks on observed child death, so exiting
+makes "the line is in the log" happen-before "the caller gives up". A variant
+that printed and then stayed alive would instead be read at a 0.1s-tick
+deadline, which a cold interpreter under a loaded CI box loses (measured: a
+2.5s startup tail against a 0.5s window).
 """
-import argparse, http.server, os, pathlib, sys, threading, time
+import os, sys
+
+mode = os.environ.get("CCTALLY_STUB_MODE", "serve")
+if mode == "nobanner":
+    # Emit SOMETHING that is not a banner, so the failure path's log echo is
+    # pinned against real captured content rather than only the empty-log
+    # placeholder. This is what a real dashboard dying mid-startup looks like.
+    print("STUB-DIAGNOSTIC: no banner for you", flush=True)
+    sys.exit(0)
+
+import argparse, http.server, pathlib, threading, time
 
 p = argparse.ArgumentParser()
 p.add_argument("command")
@@ -159,7 +177,6 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-mode = os.environ.get("CCTALLY_STUB_MODE", "serve")
 srv = http.server.ThreadingHTTPServer((args.host, args.port), H)
 bound = srv.server_address[1]
 
@@ -167,12 +184,7 @@ rec = os.environ.get("CCTALLY_STUB_RECORD")
 if rec:
     pathlib.Path(rec).write_text("requested=%s\\nbound=%s\\n" % (args.port, bound))
 
-if mode == "nobanner":
-    # Emit SOMETHING that is not a banner, so the failure path's log echo is
-    # pinned against real captured content rather than only the empty-log
-    # placeholder. This is what a real dashboard dying mid-startup looks like.
-    print("STUB-DIAGNOSTIC: no banner for you", flush=True)
-elif mode == "silent":
+if mode == "silent":
     pass                       # writes nothing at all — the empty-log branch
 else:
     # Byte-identical to bin/_cctally_dashboard.py's loopback banner.
@@ -238,9 +250,17 @@ def test_explicit_port_reaches_the_dashboard(stub, tmp_path):
     assert f"url=http://127.0.0.1:{p}/" in r.stdout.splitlines(), r.stdout
 
 
-# --- Case F: no banner at all --------------------------------------------
+# --- Case F: output, but never a banner -----------------------------------
 def test_no_banner_fails_loudly(stub, tmp_path):
-    r = run_dashboard_selftest(stub, tmp_path, mode="nobanner", wait_ticks=5)
+    """Deliberately NOT tick-pinned: the stub exits right after it prints.
+
+    The poll breaks as soon as it observes the child gone, so the wait budget
+    is a ceiling this never spends (~0.4s end to end) rather than a deadline
+    the child has to beat. Pinning it low is what made this flaky on CI: a
+    cold interpreter under load took up to 2.5s to reach its first write and
+    the log was still empty when a 0.5s window closed.
+    """
+    r = run_dashboard_selftest(stub, tmp_path, mode="nobanner")
     assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert "did not report a bound port" in r.stderr, r.stderr
     # Pin the CONTENT, not just the prefix: asserting only "dashboard|" would

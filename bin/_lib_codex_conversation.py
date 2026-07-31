@@ -90,6 +90,14 @@ CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY = (
 # `CODEX_REPLAY_FROM_ZERO_KEY` — the replay is stalled, not merely pending, and
 # Codex transcript ingest is deferred behind it. Read by `doctor`.
 CODEX_REPLAY_BLOCKED_KEY = "codex_replay_from_zero_blocked"
+# Written when a BUDGETED tick declined the replay outright (public #5 §4). A
+# byte-zero replay is not sliceable, so the hook path never attempts one — but
+# that decline returns before the ingest-backlog record is written, so without
+# this key a hook-only install whose every Codex sync is frozen reads as a
+# drained store on `doctor`, in the lifecycle line and in the dashboard
+# envelope. `{since, at}`: `since` is when the freeze started and carries
+# forward across ticks, `at` is the most recent decline.
+CODEX_REPLAY_DEFERRED_KEY = "codex_replay_from_zero_deferred"
 
 # Structural wrapper prefixes skipped during title selection (§4.3), pinned from
 # the corpus (title-wrapper-window). Prefix-structural, never content heuristics.

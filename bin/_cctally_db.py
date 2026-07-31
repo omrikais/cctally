@@ -3100,6 +3100,259 @@ def _is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
     return False
 
 
+# Public #5: every column of ``quota_window_snapshots`` that feeds INTERPRETATION.
+# The UPDATE trigger fires ``AFTER UPDATE OF`` exactly this list, and the list is
+# the mechanism's one silent-skip hazard: a column omitted here lets its mutation
+# commit while the ledger stays quiet, so the projector never learns the window
+# is dirty and the stale block survives indefinitely.
+#
+# ``source`` is included because it is the trigger's own scope predicate — a row
+# flipped from 'claude' to 'codex' mints a Codex observation, and without this
+# entry no trigger would fire for it.
+#
+# ``source_path`` / ``line_offset`` are included even though no writer SETs them
+# today (ingest INSERTs OR IGNOREs; requalification DELETEs and re-INSERTs, both
+# ledgered; the migrations that UPDATE this table touch only ``observed_model``
+# and ``canonical_resets_at_utc``). They feed
+# ``quota_window_blocks.last_source_path``/``last_line_offset``, milestone
+# provenance and the per-group digest, so a future in-place rewrite of either
+# would be a silent skip. ``AFTER UPDATE OF`` fires on the statement's SET list,
+# so listing a column nobody sets costs exactly zero ledger rows — this buys the
+# removal of a whole hazard class for nothing.
+#
+# The one column NOT here is ``id``: the AUTOINCREMENT surrogate key, which no
+# interpretation reads.
+_QUOTA_WINDOW_SEMANTIC_COLUMNS = (
+    "source",
+    "source_root_key",
+    "source_path",
+    "line_offset",
+    "logical_limit_key",
+    "observed_slot",
+    "window_minutes",
+    "resets_at_utc",
+    "canonical_resets_at_utc",
+    "captured_at_utc",
+    "used_percent",
+    "limit_id",
+    "limit_name",
+    "plan_type",
+    "individual_limit_json",
+    "reached_type",
+    "observed_model",
+    "account_key",
+)
+
+# The physical group coordinates a ledger entry records, in row-image order.
+_QUOTA_WINDOW_GROUP_COLUMNS = (
+    "source_root_key",
+    "logical_limit_key",
+    "observed_slot",
+    "window_minutes",
+    "resets_at_utc",
+    "canonical_resets_at_utc",
+)
+
+
+def _codex_quota_ledger_ddl() -> tuple[str, ...]:
+    """DDL for the Codex quota change ledger and its three triggers.
+
+    Public #5 spec §1. The ledger records, per mutation, the RAW physical group
+    coordinates of the affected rows — for the old row image, the new one, or
+    both. The projector expands those coordinates to the group's complete
+    current membership and re-interprets it through the existing Python read
+    path.
+
+    The triggers must NEVER compute an interpreted key. Interpretation snaps a
+    jittered ``window_minutes``, rewrites ``logical_limit_key`` from
+    ``observed_model``, and folds the account over the window's whole
+    population — the last of which is population-dependent and cannot be
+    expressed per-row in SQL at all. Keeping exactly one implementation of the
+    interpretation rules, in Python, is the point of recording raw scope.
+
+    Triggers rather than writer discipline is also the point: the entry commits
+    in the same transaction as the mutation, so ordinary migration DML and
+    manual repair are captured automatically, with no rule for a future author
+    to remember.
+
+    ``seq`` is AUTOINCREMENT, not a bare rowid alias: the projector's watermark
+    needs a value that is never reused, or a pruned ledger could reissue a seq
+    at or below the watermark and that entry would be skipped forever.
+
+    The three triggers are DROPped before they are created, while the table
+    keeps ``IF NOT EXISTS``. A trigger is stateless, so re-creating it costs
+    nothing and loses nothing; ``CREATE TRIGGER IF NOT EXISTS`` alone would
+    silently keep an older body after ``_QUOTA_WINDOW_SEMANTIC_COLUMNS`` grows,
+    and a stale ``UPDATE OF`` list is exactly the silent-skip this mechanism
+    exists to remove. The ledger ROWS are never dropped.
+    """
+    old_cols = ", ".join(f"old_{name}" for name in _QUOTA_WINDOW_GROUP_COLUMNS)
+    new_cols = ", ".join(f"new_{name}" for name in _QUOTA_WINDOW_GROUP_COLUMNS)
+    old_vals = ", ".join(f"OLD.{name}" for name in _QUOTA_WINDOW_GROUP_COLUMNS)
+    new_vals = ", ".join(f"NEW.{name}" for name in _QUOTA_WINDOW_GROUP_COLUMNS)
+    update_of = ", ".join(_QUOTA_WINDOW_SEMANTIC_COLUMNS)
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS quota_window_change_log (
+            seq                         INTEGER PRIMARY KEY AUTOINCREMENT,
+            op                          TEXT NOT NULL
+                CHECK(op IN ('insert','delete','update')),
+            old_source_root_key         TEXT,
+            old_logical_limit_key       TEXT,
+            old_observed_slot           TEXT,
+            old_window_minutes          INTEGER,
+            old_resets_at_utc           TEXT,
+            old_canonical_resets_at_utc TEXT,
+            new_source_root_key         TEXT,
+            new_logical_limit_key       TEXT,
+            new_observed_slot           TEXT,
+            new_window_minutes          INTEGER,
+            new_resets_at_utc           TEXT,
+            new_canonical_resets_at_utc TEXT
+        )
+        """,
+        "DROP TRIGGER IF EXISTS trg_qws_ledger_ins",
+        f"""
+        CREATE TRIGGER trg_qws_ledger_ins
+        AFTER INSERT ON quota_window_snapshots
+        WHEN NEW.source = 'codex'
+        BEGIN
+            INSERT INTO quota_window_change_log (op, {new_cols})
+            VALUES ('insert', {new_vals});
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_qws_ledger_del",
+        f"""
+        CREATE TRIGGER trg_qws_ledger_del
+        AFTER DELETE ON quota_window_snapshots
+        WHEN OLD.source = 'codex'
+        BEGIN
+            INSERT INTO quota_window_change_log (op, {old_cols})
+            VALUES ('delete', {old_vals});
+        END
+        """,
+        "DROP TRIGGER IF EXISTS trg_qws_ledger_upd",
+        f"""
+        CREATE TRIGGER trg_qws_ledger_upd
+        AFTER UPDATE OF {update_of} ON quota_window_snapshots
+        WHEN OLD.source = 'codex' OR NEW.source = 'codex'
+        BEGIN
+            INSERT INTO quota_window_change_log (op, {old_cols}, {new_cols})
+            VALUES ('update', {old_vals}, {new_vals});
+        END
+        """,
+    )
+
+
+#: The physical group's five members, in seek order, plus the expression the
+#: reader actually matches on. ``unixepoch(COALESCE(...))`` is indexed VERBATIM
+#: because SQLite only uses an expression index when the query's expression
+#: matches the indexed one — indexing the bare ``COALESCE`` while the reader
+#: wraps it in ``unixepoch`` silently buys nothing.
+_QUOTA_GROUP_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_qws_physical_group "
+    "ON quota_window_snapshots("
+    "  source_root_key, logical_limit_key, observed_slot, window_minutes,"
+    "  unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)))"
+    " WHERE source='codex'"
+)
+
+
+def _apply_codex_quota_group_index(conn: sqlite3.Connection) -> None:
+    """Create the physical-group seek index, idempotently.
+
+    Public #5 Task 5. This REPLACES ``idx_qws_window_ident``, which Task 1 built
+    to the plan's prescribed column list and which measurement then disqualified
+    on both counts it was meant to serve. Against a 211K-row / 608-group store:
+
+    * The group filter's reset member is ``unixepoch(COALESCE(
+      canonical_resets_at_utc, resets_at_utc))``, and a b-tree over the two raw
+      reset columns cannot seek an equality on that expression. Only the
+      five-column prefix was usable, so one group's query still walked every
+      reset under its limit key — 19.7ms. With this expression index the same
+      query seeks all five members: 0.60ms, a 33x difference that is the
+      difference between "proportional to the change" and "proportional to
+      history".
+    * The full-sweep load reads nine columns the identity index does not carry
+      (``source_path``, ``line_offset``, ``limit_id``, ``limit_name``,
+      ``plan_type``, ``individual_limit_json``, ``reached_type``,
+      ``observed_model``, ``account_key``), so it was never covering and the
+      planner scanned anyway — 451ms with the index present, 451ms without it.
+      It also did not change the plan for ``_first_block_physical_tuple``
+      (28.2ms scanning either way). It earned nothing and charged ten columns of
+      write cost on every ingested observation.
+
+    The partial ``WHERE source='codex'`` keeps Claude quota rows out of it, and
+    makes the four leading members sufficient on their own for a Codex-scoped
+    identity read.
+
+    Guarded on ``canonical_resets_at_utc`` for the same reason the ledger is: a
+    legacy-shape cache whose schema apply took the FTS early-return before that
+    column add would raise ``no such column`` here.
+    """
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if not cols or "canonical_resets_at_utc" not in cols:
+        return
+    conn.execute(_QUOTA_GROUP_INDEX_DDL)
+    conn.execute("DROP INDEX IF EXISTS idx_qws_window_ident")
+
+
+#: Partial index over the rows the standing `observed_model` resolution can
+#: still change. Public #5 Task 10a Step 14: the resolution runs at the tail of
+#: EVERY Codex sync (that is what closes the #373 Spark-pool hole on a
+#: `db skip 039` install and on a cache repopulated from the journal), and its
+#: `WHERE source='codex' AND observed_model IS NULL` had only the
+#: `source`-leading unique index to work with — measured at 39.8ms per tick on a
+#: 212K-row store that has NOTHING left to resolve, against a 264ms steady-state
+#: tick. The index body holds only unresolved rows (6 on that store), so it
+#: costs essentially nothing to maintain and turns the recurring scan into a
+#: seek. Gating the call behind a completion marker was the alternative and is
+#: strictly worse: a marker cannot see a raw `observed_model` rewrite, which is
+#: exactly the case migration 028 performs.
+_QUOTA_UNRESOLVED_MODEL_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_qws_unresolved_model"
+    " ON quota_window_snapshots(source)"
+    " WHERE observed_model IS NULL"
+)
+
+
+def _apply_codex_quota_unresolved_model_index(conn: sqlite3.Connection) -> None:
+    """Create the unresolved-model partial index, idempotently.
+
+    Guarded on the column for the same reason the ledger and the group index
+    are: a legacy-shape cache whose schema apply took the FTS early-return
+    before `observed_model` existed would raise `no such column` here.
+    """
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if not cols or "observed_model" not in cols:
+        return
+    conn.execute(_QUOTA_UNRESOLVED_MODEL_INDEX_DDL)
+
+
+def _apply_codex_quota_change_ledger(conn: sqlite3.Connection) -> None:
+    """Create the Codex quota change ledger + triggers, idempotently.
+
+    Guarded on ``canonical_resets_at_utc``: a legacy-shape cache whose schema
+    apply took the FTS early-return before that column add would make every
+    trigger body fail to resolve. Such a cache keeps today's whole-history
+    sweep, which is correct, just not incremental.
+    """
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if not cols or "canonical_resets_at_utc" not in cols:
+        return
+    for statement in _codex_quota_ledger_ddl():
+        conn.execute(statement)
+
+
 # === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
 
 
@@ -3573,6 +3826,29 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "session_files", "account_key", "TEXT")
     add_column_if_missing(conn, "codex_session_entries", "account_key", "TEXT")
     add_column_if_missing(conn, "codex_session_files", "account_key", "TEXT")
+    # Public #5: whether ingestion actually reached the stored scan target.
+    #
+    # `_write_codex_file_batch` persists the file's full observed `st_size`
+    # alongside whatever `final_offset` ingestion reached, and the delta
+    # detector skips on `size == prev_size` without consulting the offset. A
+    # hook-budgeted mid-file stop under that representation would make the
+    # unread suffix permanently invisible on any rollout that never grows
+    # again. This flag is what lets detection consult completeness first.
+    #
+    # DEFAULT 1 so every pre-existing row reads as complete, preserving today's
+    # behaviour exactly — only a budgeted partial stop writes 0. NOT NULL with a
+    # non-null default is a metadata-only ALTER in SQLite, so this does not
+    # rewrite a large codex_session_files.
+    #
+    # It sits HERE, immediately after the last previously-added
+    # codex_session_files column, and NOT beside last_turn_id where it reads
+    # more naturally: ALTER TABLE ADD COLUMN appends, so an existing cache would
+    # receive it after account_key while a fresh one built it before, and the
+    # two would disagree on ordinal (the #195 hazard, stated there in the same
+    # words).
+    add_column_if_missing(
+        conn, "codex_session_files", "ingest_complete",
+        "INTEGER NOT NULL DEFAULT 1")
     add_column_if_missing(conn, "quota_window_snapshots", "account_key", "TEXT")
     # #195: the cache-write TTL split. NULLable with NO DEFAULT — NULL is the
     # "split unknown" sentinel a pre-#195 row produces for free, and a real
@@ -3692,6 +3968,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     # backfill over existing history.
     add_column_if_missing(
         conn, "quota_window_snapshots", "canonical_resets_at_utc", "TEXT")
+    # Public #5: the index the exact physical-group filter seeks. Kept OUT of
+    # the top executescript for the same reason as idx_entries_mutation_seq — on
+    # an existing DB the CREATE TABLE there is a no-op, so observed_model /
+    # canonical_resets_at_utc do not exist yet and an index over them would
+    # raise; it must follow the add_column_if_missing calls above. Still BEFORE
+    # the legacy-FTS early-return, so an old-shape cache.db receives it.
+    _apply_codex_quota_group_index(conn)
+    _apply_codex_quota_unresolved_model_index(conn)
+    _apply_codex_quota_change_ledger(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -3844,6 +4129,12 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS codex_session_entries;
         DROP TABLE IF EXISTS codex_session_files;
         DROP TABLE IF EXISTS quota_window_snapshots;
+        -- Public #5: the quota change ledger is an accounting concern that
+        -- rides in via _apply_cache_schema above. Dropping the snapshots table
+        -- already removed its triggers (SQLite drops a table's triggers with
+        -- it), so this only clears the now-orphan ledger and keeps
+        -- conversations.db transcripts-only.
+        DROP TABLE IF EXISTS quota_window_change_log;
         DROP TABLE IF EXISTS codex_conversation_threads;
         DROP TABLE IF EXISTS codex_source_roots;
         -- #416: the Codex attribution map is a cache.db accounting concern; it
@@ -3968,6 +4259,51 @@ def _conv_002_codex_thread_source_inference_replay(
     try:
         _set_cache_meta(
             conn, _cctally_cache.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY, "1")
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("003_background_mcp_result_replay")
+def _conv_003_background_mcp_result_replay(conn: sqlite3.Connection) -> None:
+    """Arm the byte-zero replay that recovers backgrounded-MCP results.
+
+    Spec:
+    ``docs/superpowers/specs/2026-07-31-background-mcp-result-recovery-design.md``
+    §4.
+
+    Claude Code moved MCP dispatch to the background after 120s, and the parser
+    dropped the resulting attachment record — so every such response is missing
+    from already-ingested history. The parser now promotes it, but only for
+    bytes read AFTER the fix; this marker makes the next non-targeted
+    ``sync_claude_conversations`` re-walk the Claude JSONL corpus from offset
+    zero so existing sessions recover too.
+
+    This belongs in conversations.db, NOT cache.db: transcript rows and their
+    replay markers live here, and the Claude conversation synchronizer never
+    writes cache.db — a cache migration would arm a flag the conversation walker
+    never reads.
+
+    Writes a marker ONLY; it clears no table. The key is DISTINCT from every
+    existing reingest flag so a partially-completed replay stays recoverable —
+    reusing one would conflate two enrichments.
+
+    Takes the Claude provider flock first and DEFERS on contention, the way
+    conversations 002 does for Codex. Idempotency comes from physical uniqueness
+    on ``(source_path, byte_offset)`` plus the replay's delete-then-reinsert per
+    source file; re-running this handler rewrites the same marker. NO self-stamp
+    — the dispatcher central-stamps on a clean return (#140).
+
+    A ``--no-sync`` reader stays pre-backfill until the next full conversation
+    sync; the cost is one full re-walk of the Claude JSONL corpus.
+    """
+    import _cctally_cache
+
+    held = _acquire_conversations_db_claude_provider_flock(
+        conn, migration="conversations 003 background_mcp replay")
+    try:
+        _set_cache_meta(
+            conn, _cctally_cache.CONVERSATION_BACKGROUND_MCP_REINGEST_KEY, "1")
         conn.commit()
     finally:
         _release_cache_db_writer_flocks(held)
@@ -4764,6 +5100,47 @@ def _acquire_conversations_db_codex_provider_flock(
     if held is None:
         raise MigrationGateNotMet(
             f"conversations.db Codex lock held by a concurrent Codex "
+            f"conversation sync; deferring {migration}"
+        )
+    return held
+
+
+def _acquire_conversations_db_claude_provider_flock(
+    conn: sqlite3.Connection,
+    *,
+    migration: str,
+) -> list[int]:
+    """Take the ``<conversations.db>.lock`` sibling, or DEFER.
+
+    The CLAUDE analogue of ``_acquire_conversations_db_codex_provider_flock``.
+    It derives ``<main-db-file>.lock`` (via ``_cache_db_lock_path_for_conn``,
+    which is store-agnostic) rather than the ``.codex.lock`` sibling — for a
+    conversations connection that resolves to exactly the path
+    ``sync_claude_conversations`` serializes on
+    (``_cctally_core.CONVERSATIONS_LOCK_PATH``).
+
+    The conversations dispatcher runs inside ``_conversations_open_guarded``,
+    which holds ``CONVERSATIONS_LOCK_MAINTENANCE_PATH`` only SHARED, so without
+    this a marker can be armed in the middle of a walk that already read it as
+    absent — and that walk's completion clears EVERY reingest flag, consuming a
+    backfill it never performed. Deferring leaves the migration pending, so it
+    arms cleanly at the next open.
+    """
+    provider_path = _cache_db_lock_path_for_conn(conn)
+    if provider_path is None:
+        return []
+
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    try:
+        held = acquire_ordered_flocks([(provider_path, fcntl.LOCK_EX)])
+    except OSError as exc:
+        raise MigrationGateNotMet(
+            f"conversations.db Claude lock unavailable; deferring {migration}"
+        ) from exc
+    if held is None:
+        raise MigrationGateNotMet(
+            f"conversations.db Claude lock held by a concurrent Claude "
             f"conversation sync; deferring {migration}"
         )
     return held
@@ -6254,6 +6631,255 @@ def _035_codex_thread_source_inference_replay(conn: sqlite3.Connection) -> None:
     import _cctally_cache
 
     _set_cache_meta(conn, _cctally_cache.CODEX_REPLAY_FROM_ZERO_KEY, "1")
+    conn.commit()
+
+
+@cache_migration("036_codex_quota_window_identity_index")
+def _036_codex_quota_window_identity_index(conn: sqlite3.Connection) -> None:
+    """Public #5: land the Codex quota window-identity covering index.
+
+    The index itself is created by ``_apply_cache_schema`` (the repo's
+    index-addition rule). This migration exists because that schema apply is
+    VERSION-GATED: a steady-state open compares ``PRAGMA user_version`` against
+    ``len(_CACHE_MIGRATIONS)`` and skips the whole DDL pass when they match
+    (``_cctally_store.schema_current``). Registering here bumps the head, so an
+    already-current install re-runs the schema apply and gains the index. Same
+    mechanism migrations 029/031/032 rely on.
+
+    The idempotent DDL below is the handler's self-contained copy, and it is
+    what the per-migration golden exercises (the golden's ``pre.sqlite`` is a
+    genuine 035-head install that predates the index).
+
+    The two columns the index reaches beyond the original table DDL —
+    ``observed_model`` and ``canonical_resets_at_utc`` — are guarded rather than
+    assumed: a legacy-shape cache whose FTS early-return fired before those
+    ``add_column_if_missing`` calls would otherwise raise ``no such column``
+    here and fail the migration. Only ``canonical_resets_at_utc`` is in the
+    index, so that is the one probed.
+
+    SUPERSEDED by 040. Measurement against a real-scale store disqualified this
+    index on both counts it was meant to serve — it cannot seek the group
+    filter's ``unixepoch(COALESCE(...))`` reset member, and it is not covering
+    for the full-sweep load either — so 040 replaces it with an expression index
+    and drops it. The handler is kept verbatim because an install that has not
+    yet reached 040 still runs it, and its golden pins that behaviour; the end
+    state after 040 is what matters.
+
+    Re-running is a no-op. NO self-stamp — the dispatcher central-stamps on a
+    clean return (#140).
+    """
+    cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if "canonical_resets_at_utc" not in cols:
+        return
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qws_window_ident "
+        "ON quota_window_snapshots("
+        "  source, source_root_key, logical_limit_key, observed_slot,"
+        "  window_minutes, resets_at_utc, canonical_resets_at_utc,"
+        "  captured_at_utc, used_percent, id)"
+    )
+    conn.commit()
+
+
+@cache_migration("037_codex_quota_change_ledger")
+def _037_codex_quota_change_ledger(conn: sqlite3.Connection) -> None:
+    """Public #5: land the Codex quota change ledger and its triggers.
+
+    Same version-gate reason as 036: ``_apply_cache_schema`` creates both, but a
+    steady-state open at the registry head skips that whole DDL pass, so an
+    install that never re-runs it would silently keep mutating
+    ``quota_window_snapshots`` with no ledger behind it — and the projector
+    would then believe nothing had changed. Registering here bumps the head and
+    forces the apply.
+
+    Delegates to the same ``_apply_codex_quota_change_ledger`` production uses;
+    re-implementing the DDL here would let the migration and the schema drift,
+    and a drifted trigger is a silent-skip, not an error.
+
+    The ledger deliberately starts EMPTY. It is a change log, not a snapshot of
+    existing state — an install whose watermark has never been set has no
+    consumed range, and the projector's first pass on a fresh watermark is a
+    full sweep anyway.
+
+    Re-running is a no-op (every statement is IF NOT EXISTS). NO self-stamp —
+    the dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_codex_quota_change_ledger(conn)
+    conn.commit()
+
+
+@cache_migration("038_codex_session_files_ingest_complete")
+def _038_codex_session_files_ingest_complete(conn: sqlite3.Connection) -> None:
+    """Public #5: land ``codex_session_files.ingest_complete``.
+
+    The column itself is a plain addition, so it lands through
+    ``add_column_if_missing`` in ``_apply_cache_schema`` (the idempotent guard
+    pattern — no marker, no version). This migration exists to bump the registry
+    head so a steady-state install re-runs the version-gated schema apply and
+    actually gains it, the same mechanism 029/031/032/036 rely on.
+
+    There is deliberately NO backfill. ``DEFAULT 1`` already reads every
+    pre-existing row as complete, which is exactly today's behaviour: before
+    the budgeted ingest exists, every committed file WAS scanned to its stored
+    target. Writing 0 anywhere here would strand real history behind a resume
+    that never happens.
+
+    Re-running is a no-op. NO self-stamp — the dispatcher central-stamps on a
+    clean return (#140).
+    """
+    add_column_if_missing(
+        conn, "codex_session_files", "ingest_complete",
+        "INTEGER NOT NULL DEFAULT 1")
+    conn.commit()
+
+
+# The read-time fallback ``load_codex_quota_observations`` used before public #5:
+# the nearest preceding accounting model at or before the snapshot's byte offset,
+# within the SAME rollout. Reproduced here VERBATIM — the backfill is only
+# provably equivalent to the behaviour it replaces if it computes the identical
+# expression, so this string is the contract, not a paraphrase of it.
+_QUOTA_OBSERVED_MODEL_LOOKUP_SQL = """
+        (SELECT entries.model FROM codex_session_entries AS entries
+          WHERE entries.source_path = quota_window_snapshots.source_path
+            AND entries.line_offset <= quota_window_snapshots.line_offset
+          ORDER BY entries.line_offset DESC LIMIT 1)
+"""
+
+# The ``IS NOT NULL`` guard repeats the same expression rather than widening the
+# UPDATE to every unstamped row. Without it a row the lookup cannot resolve is
+# "updated" from NULL to NULL: the result is identical, but the UPDATE trigger
+# fires on it, so the handler dirties a window it did not change AND stops being
+# a true no-op on re-run — it would append fresh ledger entries on every
+# markerless retry. Equivalent by construction: a row skipped by the guard is
+# exactly a row the SET would have written NULL to.
+_QUOTA_OBSERVED_MODEL_BACKFILL_SQL = f"""
+    UPDATE quota_window_snapshots
+       SET observed_model = {_QUOTA_OBSERVED_MODEL_LOOKUP_SQL}
+     WHERE source = 'codex' AND observed_model IS NULL
+       AND {_QUOTA_OBSERVED_MODEL_LOOKUP_SQL} IS NOT NULL
+"""
+
+
+def backfill_codex_quota_observed_model(conn: sqlite3.Connection) -> int:
+    """Resolve unstamped ``quota_window_snapshots.observed_model`` in place.
+
+    Returns the number of rows the resolution actually changed, so a caller can
+    decide whether the Codex physical mutation sequence has to advance.
+
+    Shared by cache migration 039 and by the tail of ``sync_codex_cache``. The
+    migration alone is not sufficient, because the #373 Spark-pool guarantee
+    then holds only where 039 ran and two supported paths skip it:
+    ``cctally db skip 039_…``, and a fresh cache repopulated from the journal
+    (a fresh install fast-stamps every migration handler without invoking it,
+    and the journal cache leg re-materializes rows carrying whatever
+    ``observed_model`` was journaled — NULL for anything captured before the
+    column existed). Running it at the end of every Codex sync closes both:
+    the statement only considers rows that are still NULL AND whose lookup
+    resolves, so on a healthy store it is a near-no-op.
+
+    Does NOT commit — the caller owns the transaction boundary.
+    """
+    quota_cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if "observed_model" not in quota_cols:
+        # A legacy-shape cache whose schema apply never reached the column.
+        # Nothing to backfill; the reader's unscoped default is unchanged.
+        return 0
+    entry_cols = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(codex_session_entries)")
+    }
+    if not {"source_path", "line_offset", "model"} <= entry_cols:
+        # No accounting corpus to resolve against — the fallback could not have
+        # resolved anything either, so leaving every row NULL IS the equivalent
+        # result.
+        return 0
+    return int(conn.execute(_QUOTA_OBSERVED_MODEL_BACKFILL_SQL).rowcount)
+
+
+@cache_migration("039_codex_quota_observed_model_backfill")
+def _039_codex_quota_observed_model_backfill(conn: sqlite3.Connection) -> None:
+    """Public #5: make ``quota_window_snapshots`` the complete dependency set.
+
+    The change ledger records mutations of ``quota_window_snapshots``, which is
+    sufficient only if nothing outside that table can change how a window is
+    interpreted. Until now something could: with a NULL ``observed_model`` the
+    loader fell back to the nearest preceding ``codex_session_entries.model`` at
+    or before the snapshot's ``line_offset``, so an accounting row arriving
+    later could move a window into a different model pool with no quota-row
+    mutation to observe.
+
+    The dependency is ELIMINATED rather than ledgered — extending the triggers
+    to a second table would grow the mechanism's surface for one legacy case.
+    This backfill materializes exactly what the fallback resolved, ingest
+    already stamps the same sticky model forward onto every quota row it emits,
+    and the read-time COALESCE is removed in the same change.
+
+    A row with no determinable model stays NULL and reads as unscoped — which
+    is today's behaviour when both sources are NULL. Nothing is fabricated.
+
+    Idempotent by construction: only rows whose ``observed_model`` is still NULL
+    AND whose lookup actually resolves are considered, so a re-run over its own
+    output writes nothing at all — not even a NULL-to-NULL update, which would
+    fire the ledger trigger and dirty a window that never changed. Its real DML
+    IS ledgered, which is the mechanism working as designed: a migration that
+    rewrites this column no longer has to remember to announce it.
+
+    The migration is the ONE-TIME leg. It is not the whole guarantee: `db skip`
+    and a fresh journal-repopulated cache both bypass it, so ``sync_codex_cache``
+    runs the same helper on every Codex sync.
+
+    NO self-stamp — the dispatcher central-stamps on a clean return (#140).
+    """
+    backfill_codex_quota_observed_model(conn)
+    conn.commit()
+
+
+@cache_migration("040_codex_quota_physical_group_index")
+def _040_codex_quota_physical_group_index(conn: sqlite3.Connection) -> None:
+    """Public #5: seek the physical group, and stop paying for what does not.
+
+    Creates ``idx_qws_physical_group`` and drops 036's
+    ``idx_qws_window_ident``. The reasoning and the numbers live on
+    ``_apply_codex_quota_group_index``, which this delegates to so the migration
+    and the schema apply cannot drift; in short, an expression index over
+    ``unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc))`` takes one
+    group's load from 19.7ms to 0.60ms on a 211K-row store, and the index it
+    replaces changed no query plan at all while charging ten columns of write
+    cost per ingested observation.
+
+    Same version-gate reason as 036/037/038: the schema apply that creates the
+    index is skipped outright by a steady-state open, so registering here is
+    what makes an already-current install pick it up.
+
+    Re-running is a no-op (``IF NOT EXISTS`` / ``IF EXISTS``). NO self-stamp —
+    the dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_codex_quota_group_index(conn)
+    conn.commit()
+
+
+@cache_migration("041_codex_quota_unresolved_model_index")
+def _041_codex_quota_unresolved_model_index(conn: sqlite3.Connection) -> None:
+    """Public #5: stop rescanning 212K rows for six unresolved ones.
+
+    Creates ``idx_qws_unresolved_model``. The reasoning and the numbers live on
+    ``_apply_codex_quota_unresolved_model_index``, which this delegates to so
+    the migration and the schema apply cannot drift.
+
+    Same version-gate reason as 036/037/038/040: the schema apply that creates
+    the index is skipped outright by a steady-state open, so registering here is
+    what makes an already-current install pick it up.
+
+    Re-running is a no-op (``IF NOT EXISTS``). NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    _apply_codex_quota_unresolved_model_index(conn)
     conn.commit()
 
 

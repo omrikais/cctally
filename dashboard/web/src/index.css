@@ -10201,6 +10201,22 @@ mark.current {
 .conv-chip--result .conv-chip-status,
 .conv-chip--tool .conv-chip-status { color: var(--accent-amber); }
 
+/* One label, two lengths — shared by .conv-chip-status and the Codex card's
+   .conv-codex-summary-status. The backgrounded-MCP wordings ("⋯ running in
+   background", "ran in background") are long AND rigid (`flex: 0 0 auto`), so
+   at 390px they consumed the summary and drove the two flexible children to
+   zero: .conv-chip-name 0px of 36 and .conv-chip-preview 0px of 471 on the
+   Codex card, .conv-chip-preview 6px of 145 on the generic chip. The renderer
+   emits both wordings and this pair picks one, which is the same trade
+   .conv-codex-bg-done makes below — equal specificity, the media rule winning
+   on source order, never a specificity hack. The prompt preview is the chip's
+   primary identifier and must survive the narrow viewport. */
+.conv-status-narrow { display: none; }
+@media (max-width: 640px) {
+  .conv-status-wide { display: none; }
+  .conv-status-narrow { display: inline; }
+}
+
 /* #177 S4: quiet MCP server pill on the chip header (Q5-A). */
 .conv-chip-server {
   flex: none;
@@ -11966,6 +11982,55 @@ mark.current {
 .conv-codex-thread { color: #cdbdf6; border-color: rgba(192,132,252,.4); background: rgba(192,132,252,.12); }
 .conv-codex-summary-status { font-size: 11px; color: var(--accent-green); flex: 0 0 auto; }
 .conv-codex-summary-status--err { color: var(--accent-red); }
+/* Backgrounded MCP call that never came back (spec 2026-07-31 §5) — amber, so
+   it reads as "unfinished" rather than green "done". This matches the generic
+   tool chip, whose status is ALSO amber — but read the override, not the base:
+   `.conv-chip-status` declares `var(--text-faint)` and the very next rule
+   (`.conv-chip--tool .conv-chip-status`) repaints it `var(--accent-amber)`.
+   Both surfaces measure rgb(251,191,36) in the browser. Note the generic chip's
+   amber is its BLANKET status colour — error and truncated wear it too — so
+   amber there marks "the status line has something to say", not severity. */
+.conv-codex-summary-status--pending { color: var(--accent-amber); }
+/* A pending Codex card has two primary identifiers: its run identity and its
+   prompt. Keeping all six summary children on one flex line left only 40.17px
+   of prompt at 390px and 0px at 320px (the 102.09px model pill and 59.61px
+   narrow status are intentionally rigid). At mobile widths, put identity on
+   row one and status + prompt on row two. The state class keeps this correction
+   out of completed/error cards, and the media query keeps desktop byte-for-byte
+   in its original flex layout. The fixed leading columns total less than the
+   250px card interior measured at a 320px viewport, so neither row overflows. */
+@media (max-width: 640px) {
+  .conv-codex--pending > summary {
+    display: grid;
+    grid-template-columns: auto auto auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+  }
+  .conv-codex--pending > summary > .conv-codex-summary-status--pending {
+    grid-column: 1 / 4;
+    grid-row: 2;
+  }
+  .conv-codex--pending > summary > :is(.conv-codex-model, .conv-codex-thread) {
+    justify-self: start;
+  }
+  .conv-codex--pending > summary > .conv-chip-preview {
+    grid-column: 4;
+    grid-row: 2;
+  }
+}
+/* Completion marker on a RECOVERED background call. Deliberately NOT a rigid
+   pill like .conv-codex-model/-thread: it is the longest item in the summary,
+   and adding a third rigid child overflowed the summary at 390px (measured
+   scrollWidth 426 vs clientWidth 320). It shrinks and ellipsises instead, and
+   below 640px it drops out entirely — the same trade the plan chip already
+   makes for .conv-todo-preview — so the prompt preview (the primary
+   identifier) keeps the narrow summary. The status chip beside it is short and
+   rigid, so the in-flight/ok signal itself never disappears. */
+.conv-codex-bg-done {
+  font-size: var(--fs-eyebrow); color: var(--text-faint);
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@media (max-width: 640px) { .conv-codex-bg-done { display: none; } }
 
 .conv-codex-body { padding: 0; }
 .conv-codex-bar {

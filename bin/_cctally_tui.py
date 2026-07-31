@@ -2286,7 +2286,13 @@ def _snapshot_data_version(sig) -> str:
     # account switch with zero new rows still flips the SSE change-signal. Empty
     # for every <=1-account install (byte-neutral — never appended).
     acct = getattr(sig, "accounts_digest", "")
-    return out if not acct else f"{out}.a{acct}"
+    out = out if not acct else f"{out}.a{acct}"
+    # public #5: a budgeted tick can change the Codex ingest backlog while every
+    # other leg stays flat, and the envelope publishes that backlog. Folding it
+    # in is what leaves the idle short-circuit so the source bundle is rebuilt
+    # at all. Empty once the backlog has drained, so it is byte-neutral there.
+    backlog = getattr(sig, "codex_ingest_backlog_sig", "")
+    return out if not backlog else f"{out}.b{backlog}"
 
 
 def _tui_source_copy(value: object) -> object:
@@ -2618,10 +2624,18 @@ def _tui_build_source_bundle(
             accounts_digest=accounts_digest,
         )
         _acct_suffix = f":a{accounts_digest}" if accounts_digest else ""
+        # public #5: the hook's budgeted ingest can change what the Codex
+        # envelope owes without moving `codex_physical_mutation_seq` — a tick
+        # whose walk consumed only deduped or non-`token_count` bytes commits
+        # no row. Without this leg `reuse_coherent_source_state` hands back the
+        # prior Codex object and the `ingest_backlog` field never reaches the
+        # wire. Empty (and so byte-neutral) once the backlog has drained.
+        _backlog = getattr(signature, "codex_ingest_backlog_sig", "")
+        _backlog_suffix = f":b{_backlog}" if _backlog else ""
         codex_version = (
             f"codex:{signature.max_codex_id}:"
             f"{signature.codex_physical_mutation_seq}:{stats_digest}:"
-            f"{semantics.codex_identity}{_acct_suffix}"
+            f"{semantics.codex_identity}{_acct_suffix}{_backlog_suffix}"
         )
         claude_version = (
             f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"

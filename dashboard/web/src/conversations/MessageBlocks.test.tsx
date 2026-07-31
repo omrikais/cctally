@@ -135,6 +135,127 @@ describe('MessageBlocks (ordered walk + tool-run grouping)', () => {
     expect(c2.textContent).toContain('no result');
   });
 
+  // The generic tool card surfaces only error + truncated, so a backgrounded
+  // MCP call whose result is still the "still running after 120s" placeholder
+  // looked like an ordinary completed call. RECOVERED means
+  // `background_completed_at` is set — a `background_status` of "completed" is
+  // stamped from the notification's own claim and does NOT imply a recovery.
+  it('marks a still-running background call as in-flight, not ok', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'running',
+                        result: { text: 'MCP tool "codex/codex" is still running after 120s.',
+                                  truncated: false, is_error: false } })]}
+      />,
+    );
+    expect(container.querySelector('.conv-chip-status')!.textContent)
+      .toContain('running in background');
+    // The result panel must not label it ok either.
+    expect(container.textContent).toContain('result · running in background');
+    expect(container.textContent).not.toContain('result · ok');
+  });
+
+  it('treats a completed-without-result background call as in-flight too', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'completed',
+                        result: { text: 'MCP tool "codex/codex" is still running after 120s.',
+                                  truncated: false, is_error: false } })]}
+      />,
+    );
+    expect(container.querySelector('.conv-chip-status')!.textContent)
+      .toContain('running in background');
+  });
+
+  it('marks a recovered background call as completed', () => {
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'completed',
+                        background_completed_at: '2026-07-30T20:51:16.312Z',
+                        result: { text: 'the real answer', truncated: false, is_error: false } })]}
+      />,
+    );
+    expect(container.querySelector('.conv-chip-status')!.textContent)
+      .toContain('ran in background');
+    expect(container.querySelector('.conv-chip-status')!.textContent)
+      .not.toContain('running in background');
+  });
+
+  it('reports a FAILED background call as an error on BOTH the chip and the result panel', () => {
+    // Error precedence over pending is the one stated behavioural property of
+    // the two ternaries (summary status + result panel label) and had no
+    // coverage: reordering either would relabel a genuinely failed background
+    // call "running in background" and hide the failure.
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'running',
+                        result: { text: 'boom', truncated: false, is_error: true } })]}
+      />,
+    );
+    expect(container.querySelector('.conv-chip-status')!.textContent).toBe(' · error');
+    expect(container.textContent).toContain('result · error');
+    expect(container.textContent).not.toContain('running in background');
+  });
+
+  it('keeps the truncated flag on a still-running background call', () => {
+    // The pending branch used to REPLACE the whole status, dropping ' ·
+    // truncated' — a silent behaviour change: a clipped placeholder looked
+    // complete, and the "load full result" affordance had no header hint.
+    const { container } = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'running',
+                        result: { text: 'MCP tool "codex/codex" is still running after 120s.',
+                                  truncated: true, is_error: false } })]}
+      />,
+    );
+    const status = container.querySelector('.conv-chip-status')!;
+    expect(status.textContent).toContain('running in background');
+    expect(status.textContent).toContain('truncated');
+  });
+
+  // The background label is a RIGID summary child (166px measured at 390px),
+  // which squeezed .conv-chip-preview to 6px. It ships in two lengths and CSS
+  // picks one per viewport; JSDOM cannot evaluate the @media flip, so this pins
+  // the markup the flip needs and the browser gate verifies the widths.
+  it('ships the background labels in a wide and a narrow form', () => {
+    const pending = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'running',
+                        result: { text: 'still running', truncated: false, is_error: false } })]}
+      />,
+    ).container.querySelector('.conv-chip-status')!;
+    expect(pending.querySelector('.conv-status-wide')!.textContent).toBe(' · ⋯ running in background');
+    expect(pending.querySelector('.conv-status-narrow')!.textContent).toBe(' · ⋯ bg');
+    expect(pending.getAttribute('title')).toBe('· ⋯ running in background');
+
+    const done = render(
+      <MessageBlocks
+        blocks={[call({ name: 'mcp__codex__codex', background_status: 'completed',
+                        background_completed_at: '2026-07-30T20:51:16.312Z',
+                        result: { text: 'the real answer', truncated: false, is_error: false } })]}
+      />,
+    ).container.querySelector('.conv-chip-status')!;
+    expect(done.querySelector('.conv-status-wide')!.textContent).toBe(' · ran in background');
+    expect(done.querySelector('.conv-status-narrow')!.textContent).toBe(' · bg');
+  });
+
+  it('a status with nothing to shorten stays a single label', () => {
+    // Non-vacuity: the two-length treatment applies to the background labels
+    // only — a plain ' · truncated' must not grow a duplicate text node.
+    const { container } = render(
+      <MessageBlocks blocks={[call({ result: { text: 'partial', truncated: true, is_error: false } })]} />,
+    );
+    const status = container.querySelector('.conv-chip-status')!;
+    expect(status.textContent).toBe(' · truncated');
+    expect(status.querySelector('.conv-status-wide')).toBeNull();
+    expect(status.querySelector('.conv-status-narrow')).toBeNull();
+  });
+
+  it('leaves a non-background tool call status untouched', () => {
+    const { container } = render(<MessageBlocks blocks={[call({})]} />);
+    expect(container.querySelector('.conv-chip-status')).toBeNull();
+  });
+
   it('every chip has a chevron affordance', () => {
     const { container } = render(<MessageBlocks blocks={[{ kind: 'thinking', text: 'hm' }]} />);
     expect(container.querySelector('.conv-chev')).not.toBeNull();

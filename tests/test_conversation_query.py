@@ -4940,3 +4940,315 @@ def test_conversation_exists_true_false():
          timestamp_utc="t", entry_type="human", text="hi")
     assert cq.conversation_exists(c, "s1") is True
     assert cq.conversation_exists(c, "nope") is False
+
+
+# ---- backgrounded-MCP result recovery (spec 2026-07-31 §2) -------------------
+# Shape B: the completion arrives ONLY as an attachment carrying <task-id> and
+# NO <tool-use-id>, so the bridge back to the call is the placeholder
+# tool_result, which names the task twice. The selection FAILS CLOSED: a task id
+# claimed by more than one placeholder — or matched by more than one completed
+# notification — joins NOTHING and the placeholder stands.
+
+def _bg_placeholder(task_id="kravg1b9s", tool='codex/codex'):
+    return (
+        f'MCP tool "{tool}" is still running after 120s. It was moved to the '
+        f'background as task {task_id} and keeps running; you\'ll receive a '
+        f'notification with the result when it completes. You can keep working '
+        f'in the meantime. To stop it, use TaskStop with task_id "{task_id}". '
+        f'Note: it does not survive exiting this session.'
+    )
+
+
+def _seed_bg_call(conn, *, sid, tool_use_id, task_id, uuid_a, uuid_r,
+                  ts_a="2026-06-01T00:00:01Z", ts_r="2026-06-01T00:00:02Z",
+                  source_path="a.jsonl", off_a=0, off_r=1, msg_id=None,
+                  placeholder=None):
+    """An mcp__codex__codex tool_use plus its harness placeholder tool_result."""
+    _msg(conn, session_id=sid, uuid=uuid_a, source_path=source_path,
+         byte_offset=off_a, timestamp_utc=ts_a, entry_type="assistant", text="",
+         blocks_json=_json.dumps([{"kind": "tool_use", "name": "mcp__codex__codex",
+                                   "input_summary": "{}", "id": tool_use_id,
+                                   "preview": "codex"}]),
+         msg_id=(msg_id or f"m_{tool_use_id}"), req_id=f"r_{tool_use_id}")
+    _msg(conn, session_id=sid, uuid=uuid_r, source_path=source_path,
+         byte_offset=off_r, timestamp_utc=ts_r, entry_type="tool_result", text="",
+         blocks_json=_json.dumps([{
+             "kind": "tool_result",
+             "text": placeholder if placeholder is not None else _bg_placeholder(task_id),
+             "truncated": False, "full_length": 400, "is_error": False,
+             "tool_use_id": tool_use_id}]))
+
+
+def _seed_bg_notification(conn, *, sid, uuid, task_id, result,
+                          status="completed", summary="MCP task xx done.",
+                          ts="2026-06-01T00:00:09Z", source_path="a.jsonl",
+                          byte_offset=9, truncated=False):
+    """The bounded META row `_background_notification_row` writes at ingest."""
+    header = f"Background task {task_id} — {status or 'unknown'}"
+    if summary:
+        header += f"\n{summary}"
+    block = {"kind": "text",
+             "text": header + (("\n\n" + result) if result else ""),
+             "task_id": task_id, "background_status": status, "summary": summary,
+             "result_offset": (len(header) + 2) if result else None,
+             "result_full_length": len(result or ""),
+             "result_truncated": truncated}
+    _msg(conn, session_id=sid, uuid=uuid, source_path=source_path,
+         byte_offset=byte_offset, timestamp_utc=ts, entry_type="meta", text="",
+         blocks_json=_json.dumps([block]),
+         search_tool=(result or ""))
+
+
+def _bg_call_block(items, tool_use_id):
+    for it in items:
+        for b in it["blocks"]:
+            if b.get("kind") == "tool_call" and b.get("tool_use_id") == tool_use_id:
+                return b
+    raise AssertionError(f"no tool_call {tool_use_id} in items")
+
+
+def _bg_notification_items(items):
+    return [it for it in items
+            if any(b.get("task_id") for b in it["blocks"])]
+
+
+def test_background_result_is_joined_into_the_call():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="kravg1b9s",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="kravg1b9s",
+                          result='{"threadId":"t1","content":"hello"}',
+                          ts="2026-07-30T20:51:16.312Z")
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert '"content":"hello"' in call["result"]["text"]
+    assert call["background_status"] == "completed"
+    assert call["background_completed_at"] == "2026-07-30T20:51:16.312Z"
+    assert not _bg_notification_items(items), "a folded row must be removed"
+    owner = next(it for it in items if it["kind"] == "assistant")
+    assert "u_notif" in owner["member_uuids"]
+
+
+def test_background_join_strips_the_synthesized_header():
+    # The stored notification text is `header\n\n<result>`. The card decodes a
+    # BARE {"threadId":…,"content":…} envelope — leaving the header on would make
+    # the parse fail and silently fall back to raw rendering.
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="kravg1b9s",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="kravg1b9s",
+                          result='{"threadId":"t1","content":"hello"}')
+    call = _bg_call_block(cq.get_conversation(conn, "s1")["items"], "toolu_A")
+    assert call["result"]["text"] == '{"threadId":"t1","content":"hello"}'
+    assert "Background task" not in call["result"]["text"]
+
+
+def test_background_join_carries_truncation_metadata():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="t1",
+                          result='{"content":"x"}', truncated=True)
+    call = _bg_call_block(cq.get_conversation(conn, "s1")["items"], "toolu_A")
+    assert call["result"]["truncated"] is True
+    assert call["result"]["full_length"] == len('{"content":"x"}')
+    assert call["result"]["is_error"] is False
+
+
+def test_running_notification_keeps_placeholder_and_stays_visible():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="t1",
+                          result=None, status="running")
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert "still running after 120s" in call["result"]["text"]
+    assert call["background_status"] == "running"
+    assert "background_completed_at" not in call
+    assert _bg_notification_items(items), \
+        "a non-completed notification is the only evidence — never fold it"
+
+
+def test_completed_without_result_keeps_placeholder_and_stays_visible():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="t1",
+                          result=None, status="completed")
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert "still running after 120s" in call["result"]["text"]
+    assert call["background_status"] == "completed"
+    assert _bg_notification_items(items)
+
+
+def test_a_completed_status_alone_is_never_a_recovery():
+    """The client's recovered-predicate is ``background_completed_at`` is set —
+    NOT ``background_status == 'completed'``.
+
+    `background_status` is stamped from whatever the notification claimed, and
+    two unrecovered cases legitimately claim "completed": a completion carrying
+    no <result>, and an ambiguity whose candidates are all completed. Deriving
+    "recovered" from the status would render `✓ ok` directly above the "still
+    running after 120s" placeholder — the exact false success spec §5 exists to
+    prevent. `background_completed_at` is stamped ONLY by a real join, so it is
+    the honest predicate."""
+    # (a) completed, no <result>.
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="t1",
+                          result=None, status="completed")
+    call = _bg_call_block(cq.get_conversation(conn, "s1")["items"], "toolu_A")
+    assert call["background_status"] == "completed"
+    assert "background_completed_at" not in call, (
+        "an unrecovered call must fail the recovered-predicate")
+    assert "still running after 120s" in call["result"]["text"]
+
+    # (b) ambiguity in which EVERY candidate is completed.
+    conn = _conn()
+    _seed_bg_call(conn, sid="s2", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s2", uuid="n1", task_id="t1",
+                          result='{"content":"a"}', byte_offset=9)
+    _seed_bg_notification(conn, sid="s2", uuid="n2", task_id="t1",
+                          result='{"content":"b"}', byte_offset=10,
+                          ts="2026-06-01T00:00:10Z")
+    call = _bg_call_block(cq.get_conversation(conn, "s2")["items"], "toolu_A")
+    assert call["background_status"] == "completed"
+    assert "background_completed_at" not in call
+    assert "still running after 120s" in call["result"]["text"]
+
+    # Non-vacuity: a REAL recovery does carry it.
+    conn = _conn()
+    _seed_bg_call(conn, sid="s3", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s3", uuid="u_notif", task_id="t1",
+                          result='{"content":"real"}')
+    call = _bg_call_block(cq.get_conversation(conn, "s3")["items"], "toolu_A")
+    assert call["background_completed_at"] == "2026-06-01T00:00:09Z"
+
+
+def test_absent_notification_leaves_placeholder_untouched():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    call = _bg_call_block(cq.get_conversation(conn, "s1")["items"], "toolu_A")
+    assert "still running after 120s" in call["result"]["text"]
+    assert call["background_status"] == "running"
+
+
+def test_repeated_task_id_joins_nothing():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="dup",
+                  uuid_a="a1", uuid_r="u1", off_a=0, off_r=1)
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_B", task_id="dup",
+                  uuid_a="a2", uuid_r="u2", off_a=2, off_r=3,
+                  ts_a="2026-06-01T00:00:03Z", ts_r="2026-06-01T00:00:04Z")
+    _seed_bg_notification(conn, sid="s1", uuid="u_notif", task_id="dup",
+                          result='{"content":"which one?"}')
+    items = cq.get_conversation(conn, "s1")["items"]
+    for tuid in ("toolu_A", "toolu_B"):
+        assert "still running after 120s" in _bg_call_block(items, tuid)["result"]["text"]
+    assert _bg_notification_items(items), "an unjoined notification stays visible"
+
+
+def test_conflicting_task_claims_for_one_tool_id_join_nothing():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    # A surviving standalone result disagrees with the result already folded
+    # into the call. Both are claimants; neither may win by insertion order.
+    _msg(conn, session_id="s1", uuid="u2", source_path="b.jsonl",
+         byte_offset=2, timestamp_utc="2026-06-01T00:00:03Z",
+         entry_type="tool_result", text="",
+         blocks_json=_json.dumps([{
+             "kind": "tool_result", "text": _bg_placeholder("t2"),
+             "truncated": False, "full_length": 400, "is_error": False,
+             "tool_use_id": "toolu_A"}]))
+    _seed_bg_notification(conn, sid="s1", uuid="n1", task_id="t1",
+                          result='{"content":"one"}', byte_offset=9)
+    _seed_bg_notification(conn, sid="s1", uuid="n2", task_id="t2",
+                          result='{"content":"two"}', byte_offset=10,
+                          ts="2026-06-01T00:00:10Z")
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert "still running after 120s" in call["result"]["text"]
+    assert call["background_status"] == "running", (
+        "an ambiguous claimant must still render pending, never false-success")
+    assert "background_completed_at" not in call
+
+
+def test_missing_completion_timestamp_is_not_recovered():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="n1", task_id="t1",
+                          result='{"content":"no provenance"}', ts=None)
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert "still running after 120s" in call["result"]["text"]
+    assert "background_completed_at" not in call
+    assert _bg_notification_items(items), (
+        "timestamp-less completion stays visible instead of looking recovered")
+
+
+def test_two_completed_notifications_for_one_task_join_nothing():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="t1",
+                  uuid_a="a1", uuid_r="u1")
+    _seed_bg_notification(conn, sid="s1", uuid="n1", task_id="t1",
+                          result='{"content":"a"}', byte_offset=9)
+    _seed_bg_notification(conn, sid="s1", uuid="n2", task_id="t1",
+                          result='{"content":"b"}', byte_offset=10,
+                          ts="2026-06-01T00:00:10Z")
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert "still running after 120s" in _bg_call_block(items, "toolu_A")["result"]["text"]
+
+
+def test_out_of_order_and_concurrent_calls_join_correctly():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="tA",
+                  uuid_a="a1", uuid_r="u1", off_a=0, off_r=1)
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_B", task_id="tB",
+                  uuid_a="a2", uuid_r="u2", off_a=2, off_r=3,
+                  ts_a="2026-06-01T00:00:03Z", ts_r="2026-06-01T00:00:04Z")
+    # B completes FIRST, A second.
+    _seed_bg_notification(conn, sid="s1", uuid="nB", task_id="tB",
+                          result='{"content":"B"}', byte_offset=8,
+                          ts="2026-06-01T00:00:08Z")
+    _seed_bg_notification(conn, sid="s1", uuid="nA", task_id="tA",
+                          result='{"content":"A"}', byte_offset=9,
+                          ts="2026-06-01T00:00:09Z")
+    items = cq.get_conversation(conn, "s1")["items"]
+    assert '"content":"A"' in _bg_call_block(items, "toolu_A")["result"]["text"]
+    assert '"content":"B"' in _bg_call_block(items, "toolu_B")["result"]["text"]
+    assert not _bg_notification_items(items)
+
+
+def test_resumed_session_across_source_files_joins():
+    # A resumed session is assembled across every source file; the notification
+    # can land in a different JSONL than the call it completes.
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="tA",
+                  uuid_a="a1", uuid_r="u1", source_path="a.jsonl")
+    _seed_bg_notification(conn, sid="s1", uuid="nA", task_id="tA",
+                          result='{"content":"resumed"}', source_path="b.jsonl",
+                          byte_offset=0)
+    call = _bg_call_block(cq.get_conversation(conn, "s1")["items"], "toolu_A")
+    assert '"content":"resumed"' in call["result"]["text"]
+
+
+def test_ordinary_prose_naming_a_task_is_never_a_placeholder():
+    conn = _conn()
+    _seed_bg_call(conn, sid="s1", tool_use_id="toolu_A", task_id="tA",
+                  uuid_a="a1", uuid_r="u1",
+                  placeholder="We moved as task tA to the background yesterday.")
+    _seed_bg_notification(conn, sid="s1", uuid="nA", task_id="tA",
+                          result='{"content":"nope"}')
+    items = cq.get_conversation(conn, "s1")["items"]
+    call = _bg_call_block(items, "toolu_A")
+    assert call["result"]["text"] == "We moved as task tA to the background yesterday."
+    assert "background_status" not in call
+    assert _bg_notification_items(items)
