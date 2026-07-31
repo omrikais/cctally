@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-07-28"
+PRICING_SNAPSHOT_DATE = "2026-07-31"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -99,7 +99,9 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured/verified: 2026-07-28 (see PRICING_SNAPSHOT_DATE)
+# - Captured/verified: 2026-07-28. PRICING_SNAPSHOT_DATE has since moved to
+#   2026-07-31 for the Codex-side gpt-5.6-terra/-luna correction (#441); these
+#   Claude values were NOT re-verified that day.
 # - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
 #   update in PRs touching this table.
 #   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
@@ -386,9 +388,10 @@ _unknown_model_warnings: set[str] = set()
 #
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured: 2026-07-19 — the last full Codex sync. PRICING_SNAPSHOT_DATE moved
-#   ahead to 2026-07-24 for the Claude-side opus-5 sync; these Codex values were
-#   NOT re-verified that day.
+# - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
+#   since moved for two targeted syncs (2026-07-24, the Claude-side opus-5 sync;
+#   2026-07-31, the gpt-5.6-terra/-luna correction logged below). Codex values
+#   outside those two corrections were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -402,6 +405,16 @@ _unknown_model_warnings: set[str] = set()
 #   2026-07-19: verified all tracked values and the complete openai-provider
 #   gpt-5* model set against the live LiteLLM snapshot; no named table entries
 #   were missing. Official OpenAI model pages were used as the vendor cross-check.
+#   2026-07-31 (#441): OpenAI repriced two gpt-5.6 variants on 2026-07-30 —
+#   gpt-5.6-terra $2.50/$15 -> $2.00/$12 per MTok, and gpt-5.6-luna $1.00/$6 ->
+#   $0.20/$1.20 (an 80% cut) — which left our 2026-07-10 values stale on all six
+#   cost fields each. Adopted the vendor's post-cut rates from
+#   developers.openai.com/api/docs/pricing (standard + long-context tiers, all
+#   twelve fields), which match the live LiteLLM snapshot exactly. This is NOT
+#   the introductory-rate pattern PRICING_DRIFT_ALLOWLIST exists to suppress:
+#   the vendor lists these as standard ongoing prices with no promotional or
+#   expiring annotation, so the durable rate is the cut rate. gpt-5.6 and
+#   gpt-5.6-sol were not repriced and are unchanged.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -494,10 +507,12 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_read_input_token_cost_above_272k_tokens": 1e-06,
         "output_cost_per_token_above_272k_tokens": 4.5e-05,
     },
-    # ── 2026-07-10 sync: gpt-5.6 family (LiteLLM openai-provider entries) ──
+    # ── gpt-5.6 family (LiteLLM openai-provider entries) ──
     # Exact model_prices_and_context_window.json values; each carries the
-    # above-272k tier (max_input_tokens 1050000). gpt-5.6 and gpt-5.6-sol share
-    # gpt-5.5's rate card; -terra matches gpt-5.4; -luna is the cheapest tier.
+    # above-272k tier (max_input_tokens 1050000). gpt-5.6 and gpt-5.6-sol keep
+    # gpt-5.5's rate card from the 2026-07-10 sync; -terra and -luna carry
+    # OpenAI's 2026-07-30 post-cut rates (#441) and no longer track gpt-5.4's
+    # card or any other model's.
     "gpt-5.6": {
         "input_cost_per_token": 5e-06,
         "cache_read_input_token_cost": 5e-07,
@@ -515,20 +530,20 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token_above_272k_tokens": 4.5e-05,
     },
     "gpt-5.6-terra": {
-        "input_cost_per_token": 2.5e-06,
-        "cache_read_input_token_cost": 2.5e-07,
-        "output_cost_per_token": 1.5e-05,
-        "input_cost_per_token_above_272k_tokens": 5e-06,
-        "cache_read_input_token_cost_above_272k_tokens": 5e-07,
-        "output_cost_per_token_above_272k_tokens": 2.25e-05,
+        "input_cost_per_token": 2e-06,
+        "cache_read_input_token_cost": 2e-07,
+        "output_cost_per_token": 1.2e-05,
+        "input_cost_per_token_above_272k_tokens": 4e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 4e-07,
+        "output_cost_per_token_above_272k_tokens": 1.8e-05,
     },
     "gpt-5.6-luna": {
-        "input_cost_per_token": 1e-06,
-        "cache_read_input_token_cost": 1e-07,
-        "output_cost_per_token": 6e-06,
-        "input_cost_per_token_above_272k_tokens": 2e-06,
-        "cache_read_input_token_cost_above_272k_tokens": 2e-07,
-        "output_cost_per_token_above_272k_tokens": 9e-06,
+        "input_cost_per_token": 2e-07,
+        "cache_read_input_token_cost": 2e-08,
+        "output_cost_per_token": 1.2e-06,
+        "input_cost_per_token_above_272k_tokens": 4e-07,
+        "cache_read_input_token_cost_above_272k_tokens": 4e-08,
+        "output_cost_per_token_above_272k_tokens": 1.8e-06,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every

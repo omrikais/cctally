@@ -140,8 +140,12 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
     hub = ns["SSEHub"]()
     initial = ns["_empty_dashboard_snapshot"]()
     ref = ns["_SnapshotRef"](initial)
+    # `captured_at_utc` is stamped at seconds precision and the current-week
+    # sample filter is `captured_at <= pinned_now`, so the rebuild must be
+    # pinned at or after the writes — as a live rebuild always is.
     rebuild = ns["_make_run_sync_now_locked"](
-        ref=ref, hub=hub, pinned_now=now, display_tz_pref_override=None,
+        ref=ref, hub=hub, pinned_now=dt.datetime.now(dt.timezone.utc),
+        display_tz_pref_override=None,
         runtime_bind="127.0.0.1",
     )
     rebuild(skip_sync=True)

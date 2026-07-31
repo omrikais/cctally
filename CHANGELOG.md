@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.88.2] - 2026-07-31
+
+### Fixed
+- Codex costs for the GPT-5.6 Terra and Luna models now use OpenAI's current published rates. OpenAI cut both models on 2026-07-30 — Terra from $2.50 to $2.00 per million input tokens, and Luna by 80%, from $1.00 to $0.20 — while cctally's embedded rate card still held the pre-cut prices, so Terra usage priced about 25% high and Luna usage about five times high across `codex-daily`, `codex-monthly`, `codex-weekly` and `codex-session`, the Codex half of `budget` and its spend alerts, and the dashboard. Both models now carry the published post-cut rates across the standard and long-context tiers. Codex costs are recalculated every time they are read, so corrected figures appear immediately with no rebuild; cctally stores one rate per model rather than a dated price history, so Terra and Luna usage from before the cut is now valued at the new rates as well, and budget alerts already recorded keep the amount they were recorded with. Sol and the base GPT-5.6 model were not repriced and are unchanged. (#441)
+
 ## [1.88.1] - 2026-07-31
 
 ### Fixed
