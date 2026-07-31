@@ -1222,7 +1222,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 1,
+  "source_schema_version": 2,
   "sources": {
     "all": {
       "availability": "ok",

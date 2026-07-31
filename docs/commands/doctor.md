@@ -123,6 +123,17 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
   never creates, prunes, repairs, or otherwise changes pipeline files.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
+- `data.codex_replay` — WARN when a byte-zero Codex transcript replay is
+  *stalled* rather than merely pending. Codex transcript ingest defers on the
+  cache-side replay marker (running ahead of the replayed thread rows would
+  stamp a permanent `(unassigned)` project), so while that marker stands no
+  Codex transcript is ingested at all. A marker that is only pending is not
+  reported — it clears on the next Codex sync. The WARN fires once a whole-tree
+  sync has *run* and still could not consume it, which is what a persistently
+  torn `auth.json` (or a repeated per-file DB error) produces; `cache-sync`
+  itself still exits 0. Remedy: check or refresh the Codex login, then run
+  `cctally cache-sync --source codex`. Details carry the pending flag, the
+  stall timestamp, and the failed/deferred file counts — never paths.
 - `data.codex_project_metadata` — an all-history, root-qualified partition of
   retained Codex accounting rows. WARN when rows lack a conversation key or a
   same-root conversation-thread join; rebuild with `cctally cache-sync --source

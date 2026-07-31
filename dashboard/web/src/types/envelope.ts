@@ -906,10 +906,22 @@ export interface CodexQuotaForecast {
 export interface CodexQuotaActiveRow {
   key: string;
   current_percent: number;
+  /**
+   * #429 — evidence recency: the newest PHYSICAL observation for this quota
+   * identity, the same one that produced `freshness` and `stale_after_seconds`.
+   * NOT the interpreted baseline, which is a value axis and belongs to
+   * `current_percent`.
+   */
   captured_at: string;
   resets_at: string;
   freshness: QuotaEvidenceFreshness;
   stale_after_seconds: number | null;
+  /**
+   * #429 — the owning account. Emitted only under decoration (>1 REAL
+   * account), matching its `quota.histories` sibling, so a <=1-real-account
+   * install stays byte-identical. Consumers must treat it as optional.
+   */
+  account_key?: string;
 }
 
 export interface CodexQuotaSummary {

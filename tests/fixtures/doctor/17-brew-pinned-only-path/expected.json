@@ -209,7 +209,7 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 34,
+                            "registry_size": 35,
                             "user_version": 0
                         },
                         "stats.db": {
@@ -264,7 +264,8 @@
                                     "031_codex_file_account_map",
                                     "032_codex_canonical_reset_anchor",
                                     "033_codex_reset_anchor_component_closure",
-                                    "034_codex_window_spend_adoption"
+                                    "034_codex_window_spend_adoption",
+                                    "035_codex_thread_source_inference_replay"
                                 ],
                                 "skipped": []
                             },
@@ -292,7 +293,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/47 applied",
+                    "summary": "0/48 applied",
                     "title": "Migrations"
                 },
                 {
@@ -485,13 +486,17 @@
                             [
                                 "cache.db",
                                 "034_codex_window_spend_adoption"
+                            ],
+                            [
+                                "cache.db",
+                                "035_codex_thread_source_inference_replay"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "47 pending",
+                    "summary": "48 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -681,6 +686,18 @@
                     "severity": "ok",
                     "summary": "qualified",
                     "title": "Codex project metadata"
+                },
+                {
+                    "details": {
+                        "blocked_at": null,
+                        "files_deferred_torn": null,
+                        "files_failed": null,
+                        "pending": false
+                    },
+                    "id": "data.codex_replay",
+                    "severity": "ok",
+                    "summary": "none pending",
+                    "title": "Codex transcript replay"
                 },
                 {
                     "details": {
@@ -910,7 +927,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 48,
+            "ok": 49,
             "warn": 6
         },
         "severity": "warn"

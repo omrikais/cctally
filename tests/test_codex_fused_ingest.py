@@ -528,10 +528,15 @@ def test_byte_zero_replay_backfills_conversation_key_when_both_ids_exist(
         conn.close()
 
 
-def test_byte_zero_replay_does_not_fabricate_key_without_thread_source(
+def test_byte_zero_replay_infers_a_key_without_thread_source(
     tmp_path, monkeypatch,
 ):
-    """A modern accounting record with no thread source must retain NULL key."""
+    """A modern accounting record with no thread source still gains an identity.
+
+    Codex is mid-rollout on ``thread_source``; abandoning the key when it is
+    absent costs the rollout its thread row and every normalized message, so
+    the category is inferred instead.
+    """
     ns, _provider_root, rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     records = _object_records("modern-full")
     del records[0]["payload"]["thread_source"]
@@ -548,7 +553,14 @@ def test_byte_zero_replay_does_not_fabricate_key_without_thread_source(
         ).fetchone()
         assert row is not None
         assert row[0]
-        assert row[1] is None
+        assert row[1] is not None
+        assert conn.execute(
+            "SELECT root_thread_id FROM codex_conversation_threads"
+        ).fetchone() == ("user",)
+        # The stored raw field keeps reporting what the provider actually sent.
+        assert conn.execute(
+            "SELECT thread_source_json FROM codex_conversation_threads"
+        ).fetchone() == (None,)
     finally:
         conn.close()
 
@@ -1371,10 +1383,11 @@ def test_thread_metadata_uses_native_root_and_immediate_parent_as_distinct_field
     "payload",
     [
         {"thread_source": "root-thread"},
-        {"session_id": "native-thread", "forked_from_id": "immediate-parent"},
+        {"forked_from_id": "immediate-parent"},
     ],
 )
-def test_thread_metadata_omits_conversation_key_without_native_or_root(payload):
+def test_thread_metadata_omits_conversation_key_without_a_native_id(payload):
+    """The one surviving gate: no ``session_id`` and no ``id`` means no key."""
     record = {"timestamp": "2026-07-14T12:00:00Z", "type": "session_meta", "payload": payload}
     emission = next(FUSED_ITER(
         io.BytesIO((_canonical_json(record) + "\n").encode("utf-8")),
@@ -1382,6 +1395,25 @@ def test_thread_metadata_omits_conversation_key_without_native_or_root(payload):
     ))
     assert emission.thread is not None
     assert emission.thread.conversation_key is None
+
+
+def test_thread_metadata_infers_the_category_when_thread_source_is_absent():
+    """A native id with no ``thread_source`` now mints an identity anchored on
+    the inferred ``user`` category rather than being abandoned."""
+    record = {
+        "timestamp": "2026-07-14T12:00:00Z", "type": "session_meta",
+        "payload": {"session_id": "native-thread", "forked_from_id": "immediate-parent"},
+    }
+    emission = next(FUSED_ITER(
+        io.BytesIO((_canonical_json(record) + "\n").encode("utf-8")),
+        "/synthetic/missing-thread-field.jsonl", source_root_key=identity.source_root_key(ROOT_A),
+    ))
+    assert emission.thread is not None
+    assert emission.thread.root_thread_id == "user"
+    assert emission.thread.parent_thread_id == "immediate-parent"
+    assert emission.thread.conversation_key == identity.canonical_identity(
+        "codex", "conversation", ROOT_A, "native-thread", "user"
+    )
 
 
 def test_identical_quota_observations_under_two_roots_have_distinct_logical_keys():

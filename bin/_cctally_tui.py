@@ -271,6 +271,7 @@ from _cctally_dashboard_sources import (
     resolve_dashboard_source_semantics,
 )
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -2803,7 +2804,7 @@ def _tui_build_source_bundle(
         codex = refresh_codex_source_clock(codex, now_utc=now_utc)
         combined = compose_all_state(claude, codex)
         bundle = SourceDashboardBundle(
-            source_schema_version=1,
+            source_schema_version=SOURCE_SCHEMA_VERSION,
             default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={"claude": claude, "codex": codex, "all": combined},
@@ -2877,7 +2878,7 @@ def _tui_hydrating_source_bundle() -> SourceDashboardBundle:
         domain_freshness={"hero": "stale", "quota": "stale", "sessions": "stale"},
     )
     return SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},

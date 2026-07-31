@@ -11,7 +11,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       47 pending
+  ⚠ Pending migrations       48 pending
       → Run any cctally command — opens the DB and applies pending migrations
 Journal
 Data
@@ -22,4 +22,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 48 OK · 6 WARN · 0 FAIL
+Summary: 49 OK · 6 WARN · 0 FAIL

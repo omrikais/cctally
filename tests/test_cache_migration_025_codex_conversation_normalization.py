@@ -149,6 +149,15 @@ def _version(conn) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _cache_head() -> int:
+    """The cache registry head. Read from the registry, never hard-coded: these
+    tests assert the dispatcher advanced `user_version` to HEAD after replaying
+    the whole chain, which is a statement about the chain's end, not about any
+    particular migration number."""
+    db = _db_module()
+    return len(db._CACHE_MIGRATIONS)
+
+
 def _norm_count(conn) -> int:
     try:
         return conn.execute(
@@ -231,7 +240,7 @@ def test_025_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 
@@ -258,7 +267,7 @@ def test_025_defers_without_mutation_while_codex_lock_is_held(tmp_path, monkeypa
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 
@@ -286,7 +295,7 @@ def test_025_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(tmp
         _assert_head_replay_is_recleared(conn)
         assert _marker(conn) == 1
         assert _successor_marker(conn) == 1
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 

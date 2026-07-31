@@ -100,6 +100,10 @@ def test_doctor_state_has_required_fields():
         # #416 review B4: durable record of a torn Codex auth.json halting
         # ingest (accounts.codex_identity).
         "codex_torn_deferred",
+        # The byte-zero Codex replay stall signal (data.codex_replay): the
+        # pending marker plus the record a completed-but-unsuccessful whole-tree
+        # walk writes when it cannot consume it.
+        "codex_replay_pending", "codex_replay_blocked",
     }
     assert fields == expected, fields ^ expected
 

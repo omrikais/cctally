@@ -41,7 +41,21 @@ REQUIRED_SCENARIOS = (
     "session-d-reasoning-lifecycle-markers",
     # #335 Session E retained native-family truth/privacy disposition.
     "session-e-native-families",
+    # thread_source-inference: rollouts whose session_meta OMITS the field, plus
+    # the three mixed-shape files that pin the §3.3 per-record stateless rule.
+    "thread-source-absent-mcp", "thread-source-absent-subagent",
+    "thread-source-mixed-explicit-first", "thread-source-mixed-missing-first",
+    "thread-source-mixed-changed-native", "thread-source-mixed-continuity",
 )
+
+class _Omit:
+    """Sentinel: this `session_meta` key is ABSENT, not null."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "OMIT"
+
+
+OMIT = _Omit()
 
 SHARED_ID = "11111111-1111-4111-8111-111111111111"
 ROOT_A = "/synthetic/root-a/project-red"
@@ -66,6 +80,20 @@ SESSION_E_THREAD = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 # (its own thread/session id) so a route-level export can resolve a v1 key and
 # prove the qualified anon plan scrubs the documented secret patterns end-to-end.
 SECRET_SESSION = "55555555-5555-4555-8555-555555555555"
+# Rollouts whose `session_meta` OMITS `thread_source` — the shape every Codex
+# client except recent Desktop writes today. Before the inference rule these got
+# no conversation identity at all, so they produced neither a thread row nor a
+# single normalized message and were invisible in the viewer. Distinct ids so
+# each ingests as its own conversation. Synthetic, never provider-derived.
+TS_MCP_SESSION = "66666666-6666-4666-8666-666666666666"
+TS_SUBAGENT_SESSION = "77777777-7777-4777-8777-777777777777"
+# The mixed-shape files: two `session_meta` records in ONE file, one carrying an
+# explicit `thread_source` and one omitting it. §3.3's per-record stateless rule
+# is what keeps the parser's sticky thread state and the `last_conversation_key`
+# / `last_root_thread_id` delta-resume cursors a function of the file's own
+# bytes; nothing in the pre-existing corpus mixes the two shapes.
+TS_MIXED_SESSION = "88888888-8888-4888-8888-888888888888"
+TS_MIXED_SECOND_SESSION = "99999999-9999-4999-8999-999999999999"
 # The Claude-side seed reuses SHARED_ID as its sessionId so the collision proof
 # can show Codex/Claude assemblies share ZERO rows on content, not just key
 # inequality. A known-priced model keeps the sync-time cost pass warning-free.
@@ -96,16 +124,24 @@ def _write_jsonl(path: Path, records: list[dict], malformed_tail: str | None = N
 
 
 def _session_meta(*, root: str = ROOT_A, source: object = "codex", session_id: str = SHARED_ID,
-                  record_id: str = "root-thread-a", thread_source: str = "root-thread-a",
-                  forked_from_id: str = "root-thread-a") -> dict:
-    return {"timestamp": "2026-07-14T12:00:00Z", "type": "session_meta", "payload": {
+                  record_id: str = "root-thread-a", thread_source: object = "root-thread-a",
+                  forked_from_id: str = "root-thread-a",
+                  timestamp: str = "2026-07-14T12:00:00Z") -> dict:
+    payload = {
         "id": record_id, "session_id": session_id, "cwd": root,
         "git": {"branch": "fixture-branch", "repository": "fixture-repository"},
         "source": source, "thread_source": thread_source, "forked_from_id": forked_from_id,
         "model_provider": "fixture-provider", "model": MODEL, "context_window": 272000,
         "model_context_window": 272000, "user": "fixture-user", "instructions": "synthetic instructions",
         "tools": [{"name": "fixture-tool"}],
-    }}
+    }
+    # `thread_source=OMIT` reproduces the provider shape this whole fixture
+    # family exists for: Codex is mid-rollout on the field, and the CLI behind
+    # the MCP server simply does not write the key. Writing `null` instead would
+    # be a DIFFERENT shape (present-but-empty), so the key must be absent.
+    if thread_source is OMIT:
+        del payload["thread_source"]
+    return {"timestamp": timestamp, "type": "session_meta", "payload": payload}
 
 
 def _rate_limits(*, malformed: bool = False) -> dict:
@@ -1098,6 +1134,59 @@ def _claude_thinking_reference_records() -> list[dict]:
     ]
 
 
+def _absent_thread_source_records(
+    *, session_id: str, record_id: str, source: object, subject: str,
+) -> list[dict]:
+    """One turned conversation whose `session_meta` omits `thread_source`.
+
+    Carries prose, a turn and an accounting event, because a thread row alone
+    does not make a conversation visible — the viewer lists from normalized
+    MESSAGES. `cwd` and git metadata are present so the rollup must resolve a
+    real project rather than degrading to `(unassigned)`.
+    """
+    return [
+        _session_meta(session_id=session_id, record_id=record_id, source=source,
+                      thread_source=OMIT, forked_from_id=record_id,
+                      timestamp="2026-07-16T09:00:00Z"),
+        _turn_context("2026-07-16T09:01:00Z", f"turn-{record_id}"),
+        _response_message("2026-07-16T09:02:00Z", "user", f"{subject} question"),
+        _response_message("2026-07-16T09:03:00Z", "assistant", f"{subject} answer"),
+        _token_event(timestamp="2026-07-16T09:04:00Z", include_quota=False),
+    ]
+
+
+def _mixed_thread_source_records(
+    *, first_thread_source: object, second_thread_source: object,
+    second_session_id: str,
+) -> list[dict]:
+    """Two `session_meta` records in one file with different field shapes.
+
+    The parser treats each `session_meta` as REPLACING the sticky thread state,
+    and every later event inherits it — so if inference were allowed to inherit
+    the previous record's category, the second half of the file would silently
+    re-key. Each half carries its own prose so both keys reach normalized rows,
+    and the split point is a natural delta-resume boundary.
+    """
+    return [
+        _session_meta(session_id=TS_MIXED_SESSION, record_id="mixed-first",
+                      thread_source=first_thread_source,
+                      forked_from_id="mixed-first",
+                      timestamp="2026-07-16T10:00:00Z"),
+        _turn_context("2026-07-16T10:01:00Z", "turn-mixed-first"),
+        _response_message("2026-07-16T10:02:00Z", "user", "Mixed first question"),
+        _response_message("2026-07-16T10:03:00Z", "assistant", "Mixed first answer"),
+        _token_event(timestamp="2026-07-16T10:04:00Z", include_quota=False),
+        _session_meta(session_id=second_session_id, record_id="mixed-second",
+                      thread_source=second_thread_source,
+                      forked_from_id="mixed-second",
+                      timestamp="2026-07-16T10:05:00Z"),
+        _turn_context("2026-07-16T10:06:00Z", "turn-mixed-second"),
+        _response_message("2026-07-16T10:07:00Z", "user", "Mixed second question"),
+        _response_message("2026-07-16T10:08:00Z", "assistant", "Mixed second answer"),
+        _token_event(timestamp="2026-07-16T10:09:00Z", include_quota=False),
+    ]
+
+
 def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
     full = [_session_meta(), {"timestamp": "2026-07-14T12:01:00Z", "type": "turn_context", "payload": {"turn_id": "turn-a", "model": MODEL, "model_context_window": 272000}}, _token_event(), *_response_items(), *_lifecycle_events()]
     duplicate = [_session_meta()]
@@ -1156,6 +1245,33 @@ def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
             _response_message("2026-07-14T17:13:00Z", "assistant", "Child thread answer"),
             _token_event(timestamp="2026-07-14T17:14:00Z"),
         ], None),
+        "thread-source-absent-mcp": (_absent_thread_source_records(
+            session_id=TS_MCP_SESSION, record_id="ts-absent-mcp",
+            source="mcp", subject="MCP session"), None),
+        "thread-source-absent-subagent": (_absent_thread_source_records(
+            session_id=TS_SUBAGENT_SESSION, record_id="ts-absent-subagent",
+            source={"subagent": {"thread_spawn": {"depth": 1}}},
+            subject="Subagent session"), None),
+        # The explicit value is deliberately NOT the value inference would
+        # produce, so the transition is observable in the key. A file where both
+        # halves resolve to the same category is the separate continuity case
+        # below.
+        "thread-source-mixed-explicit-first": (_mixed_thread_source_records(
+            first_thread_source="subagent", second_thread_source=OMIT,
+            second_session_id=TS_MIXED_SESSION), None),
+        "thread-source-mixed-missing-first": (_mixed_thread_source_records(
+            first_thread_source=OMIT, second_thread_source="subagent",
+            second_session_id=TS_MIXED_SESSION), None),
+        "thread-source-mixed-changed-native": (_mixed_thread_source_records(
+            first_thread_source="subagent", second_thread_source=OMIT,
+            second_session_id=TS_MIXED_SECOND_SESSION), None),
+        # Spec §3.2's reason for inferring rather than minting a null parent: a
+        # thread spanning the Codex release that starts emitting `thread_source`
+        # keeps ONE identity, because the inferred category equals the emitted
+        # one. Same native id, explicit `user` then absent -> one key.
+        "thread-source-mixed-continuity": (_mixed_thread_source_records(
+            first_thread_source="user", second_thread_source=OMIT,
+            second_session_id=TS_MIXED_SESSION), None),
         "mirror-pairing": (_mirror_pairing_records(), None),
         "unturned-event-prose": (_unturned_event_prose_records(), None),
         "title-wrapper-window": (_title_wrapper_window_records(), None),
@@ -1403,6 +1519,7 @@ def _manifest() -> dict:
                 {"version": 5, "date": "2026-07-22", "change": "#332 Task A conversation plan, web, MCP, agent-operation, exact child-link, ambiguous-link rejection, and local-image-reference fixture family."},
                 {"version": 6, "date": "2026-07-22", "change": "#334 Task A conversation reasoning title/body/absence, lifecycle correlation/rejection, and closed trailing Git/memory marker fixture family."},
                 {"version": 7, "date": "2026-07-22", "change": "#335 Session E conversation fixtures for retained world-state, inter-agent metadata, turn-context, unknown-family, and compact reader privacy/presentation coverage."},
+                {"version": 8, "date": "2026-07-31", "change": "thread_source inference: conversation-identity rollouts whose session_meta OMITS thread_source (string and single-key-object source forms) plus four mixed-shape files pinning the per-record stateless rule across explicit/absent transitions, a changed native id, a delta-resume boundary, and the same-category continuity case."},
             ]}
 
 

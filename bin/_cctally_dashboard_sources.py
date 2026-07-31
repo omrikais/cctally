@@ -183,6 +183,64 @@ def _codex_history_row_is_model_scoped(row: object) -> bool:
     return bool(isinstance(row, Mapping) and row.get("model_scoped"))
 
 
+def _active_row_from_history(
+    history_row: Mapping[str, object], *, now_utc: dt.datetime,
+) -> dict[str, object] | None:
+    """Project a serialized quota history row onto its ``summary.active[]`` row.
+
+    #429 §4.1. The ONE home for the active-window predicate and the active-row
+    shape, so the initial build and ``refresh_codex_source_clock`` cannot
+    disagree about what ``captured_at`` means — the defect this fixes. Callers
+    must keep no separate copy of any part of the predicate, including the #373
+    model-pool exclusion: a live Spark/foreign-pool window must never reach an
+    account-level aggregate.
+
+    Both call sites see the same serialized shape. The clock's forecast refresh
+    rewrites ``status``, ``remaining_seconds`` and ``projected_percent`` but
+    never ``current_percent`` or ``resets_at``, so the fields read here are
+    identical at build time and at every tick.
+
+    #428: the liveness predicate and the emitted ``resets_at`` are the SAME
+    ``forecast.resets_at``, which is ``baseline.canonical_resets_at``
+    (``_lib_quota.forecast_quota``). The client compares ``active[].resets_at``
+    against ``hero.cycle.resets_at`` (``activeWeeklyKeys``) to decide which
+    weekly history is the live one, so both must carry that one anchor.
+    """
+    if _codex_history_row_is_model_scoped(history_row):
+        return None
+    forecast = history_row.get("forecast")
+    if not isinstance(forecast, Mapping):
+        return None
+    current = forecast.get("current_percent")
+    if not isinstance(current, (int, float)) or isinstance(current, bool):
+        return None
+    resets_at = forecast.get("resets_at")
+    try:
+        reset = dt.datetime.fromisoformat(
+            str(resets_at).replace("Z", "+00:00")
+        ).astimezone(UTC)
+    except (TypeError, ValueError):
+        return None
+    if reset <= now_utc:
+        return None
+    row: dict[str, object] = {
+        "key": history_row.get("key"),
+        "current_percent": current,
+        # #429 §3: evidence recency — the newest PHYSICAL observation, the same
+        # one that produced this row's `freshness` and `stale_after_seconds`.
+        # Not the interpreted baseline, which is a value axis and belongs to
+        # `current_percent` alone.
+        "captured_at": history_row.get("captured_at"),
+        "resets_at": resets_at,
+        "freshness": history_row.get("freshness"),
+        "stale_after_seconds": history_row.get("stale_after_seconds"),
+    }
+    account_key = history_row.get("account_key")
+    if account_key:
+        row["account_key"] = account_key
+    return row
+
+
 def _resolve_codex_weekly_cycle(
     observations: Iterable[object],
     now_utc: dt.datetime,
@@ -1693,6 +1751,7 @@ def _quota_read_model(
     *,
     accounting_entries: Iterable[object] = (),
     account_key: str | None = None,
+    decorated: bool,
 ) -> dict[str, object]:
     """Use S2's pure history/block/forecast kernels over cache evidence.
 
@@ -1714,9 +1773,11 @@ def _quota_read_model(
     cost_entries = tuple(accounting_entries)
     histories = build_history(quota_observations)
     blocks = build_blocks(quota_observations)
-    history_rows: list[dict[str, object]] = []
     milestone_rows: list[dict[str, object]] = []
-    active_rows: list[dict[str, object]] = []
+    # #429 §4.2: one candidate unit per identity — (ordinal, history row, active
+    # projection or None) — so the cap retains PAIRS instead of capping the two
+    # lists independently and in different orders.
+    candidates: list[tuple[int, dict[str, object], dict[str, object] | None]] = []
     # R8 (#341 Task 4): the per-account `account_key` is serialized onto each
     # history row ONLY when the Codex provider has >1 REAL account, so the
     # dashboard client can scope per-account quota rows instead of merging them.
@@ -1726,13 +1787,12 @@ def _quota_read_model(
     # public history view is LOSSY — capped at `SOURCE_HISTORY_LIMIT` and without
     # `logical_limit_key` — so it cannot resolve the cycle authoritatively. Build
     # time owns resolution; a `clock_data` decision deadline forces the rebuild.
-    _codex_decorated = False
-    try:
-        import _cctally_account
-        _codex_decorated = _cctally_account.provider_is_decorated(
-            context.stats_conn, "codex")
-    except Exception:
-        _codex_decorated = False
+    #
+    # #429 §4.4: the caller owns this gate. Re-querying here, per parent AND per
+    # child, let a transient failure emit decorated scopes whose quota rows were
+    # silently unstamped — and the active-row helper cannot project a field the
+    # history row never carried.
+    _codex_decorated = decorated
     for history in histories:
         identity = history.identity
         key_parts = (
@@ -1777,21 +1837,11 @@ def _quota_read_model(
                 "confidence": forecast.confidence,
             },
         }
-        history_rows.append(row)
-        if _codex_history_row_is_model_scoped(row):
-            continue
-        # #428: the client compares `active[].resets_at` against
-        # `hero.cycle.resets_at` (`activeWeeklyKeys`) to decide which weekly
-        # history is the live one, so both must carry the SAME anchor.
-        if baseline is not None and baseline.canonical_resets_at > context.now_utc:
-            active_rows.append({
-                "key": dashboard_resource_key("quota", "codex", *key_parts),
-                "current_percent": baseline.used_percent,
-                "captured_at": baseline.captured_at.astimezone(UTC).isoformat(),
-                "resets_at": baseline.canonical_resets_at.astimezone(UTC).isoformat(),
-                "freshness": freshness.state,
-                "stale_after_seconds": freshness.stale_after_seconds,
-            })
+        candidates.append((
+            len(candidates),
+            row,
+            _active_row_from_history(row, now_utc=context.now_utc),
+        ))
     for block in blocks:
         identity = block.identity
         block_parts = (
@@ -1899,20 +1949,21 @@ def _quota_read_model(
                 "marginal_usd": max(0.0, cumulative_usd - previous_cumulative),
             })
             previous_cumulative = cumulative_usd
-    latest_percent = max(
-        (float(row["current_percent"]) for row in active_rows), default=None,
-    )
-    active_freshness = (
-        "fresh" if active_rows and all(row["freshness"] == "fresh" for row in active_rows)
-        else ("unavailable" if not active_rows else "stale")
-    )
     # Active account identities are presentation-critical. Independent
     # model-scoped pools are also legitimate provider facts, so reserve the
     # remaining cap space for their newest captures before inactive account
     # history. Opaque resource-key order is only a stable tie-breaker.
-    active_keys = {str(row["key"]) for row in active_rows}
+    #
+    # #429 §4.2 — retention decides ONCE per (history, active) unit, then each
+    # list is emitted in its own established order: histories in retention
+    # order, actives in identity order. Emitting both in a single order would
+    # reorder active rows below the cap and move bytes for every install.
+    active_keys = {
+        str(active["key"]) for _, _, active in candidates if active is not None
+    }
 
-    def _history_retention_key(row):
+    def _history_retention_key(unit):
+        _, row, _ = unit
         key = str(row["key"])
         if key in active_keys:
             return (0, 0.0, key)
@@ -1927,11 +1978,22 @@ def _quota_read_model(
             return (1, -captured_epoch, key)
         return (2, 0.0, key)
 
-    history_rows.sort(key=_history_retention_key)
-    history_rows = history_rows[:SOURCE_HISTORY_LIMIT]
+    retained = sorted(candidates, key=_history_retention_key)[:SOURCE_HISTORY_LIMIT]
+    history_rows = [row for _, row, _ in retained]
+    active_rows = [
+        active
+        for _, _, active in sorted(retained, key=lambda unit: unit[0])
+        if active is not None
+    ]
+    latest_percent = max(
+        (float(row["current_percent"]) for row in active_rows), default=None,
+    )
+    active_freshness = (
+        "fresh" if active_rows and all(row["freshness"] == "fresh" for row in active_rows)
+        else ("unavailable" if not active_rows else "stale")
+    )
     milestone_rows.sort(key=lambda row: str(row["captured_at"]), reverse=True)
     milestone_rows = milestone_rows[:SOURCE_HISTORY_LIMIT]
-    active_rows = active_rows[:SOURCE_HISTORY_LIMIT]
     return {
         "summary": {
             "window_count": len(blocks),
@@ -2035,6 +2097,117 @@ def _refresh_budget_status_clock(
     }
 
 
+def _scoped_quota_identity(row: Mapping[str, object]) -> tuple[str, str]:
+    """#429 §3.1. `dashboard_resource_key` carries no account, and two accounts
+    sharing one $CODEX_HOME root emit the same key, so bare key is not an
+    identity under decoration. `"unattributed"` is a legitimate account here."""
+    return (str(row.get("account_key") or ""), str(row.get("key")))
+
+
+def _reclock_quota_domain(
+    quota: Mapping[str, object], *, now_utc: dt.datetime,
+) -> dict[str, object]:
+    """Re-evaluate a quota domain's row freshness and summary against ``now``.
+
+    #429 §4.3. Replaces ONLY `histories` and `summary`; `blocks`, `milestones`
+    and `cycle_index` are carried through untouched, because the per-account
+    scopes carry them and a scope that lost them would render empty.
+
+    Emits TUPLES, matching what `_quota_read_model` publishes. Publication
+    freezes lists into tuples anyway, so this is byte-identical on the wire —
+    but it is what lets the caller detect an unchanged domain by comparing the
+    result against the frozen original. A list would never compare equal to the
+    tuple it was frozen from (``[] != ()``), the caller would report a change on
+    every tick, and the retain/degrade paths that assert the EXACT prior ``data``
+    object is handed back would break.
+    """
+    refreshed = dict(quota)
+    refreshed_histories: list[dict[str, object]] = []
+    active_rows: list[dict[str, object]] = []
+    for raw_history in quota.get("histories", ()):
+        if not isinstance(raw_history, Mapping):
+            continue
+        history = dict(raw_history)
+        # #350 spec §3.9: this is a PER-ROW value and must never shadow the
+        # envelope-level `freshness`. It used to, so after the loop the
+        # envelope held the LAST retained history row's freshness — often an
+        # inactive row, and with a single weekly history the active weekly
+        # one, which silently marked the whole provider stale on an idle
+        # stale crossing and tripped idle eligibility on its own.
+        row_freshness = _clock_freshness(
+            history.get("captured_at"), history.get("stale_after_seconds"), now_utc,
+        )
+        history["freshness"] = row_freshness
+        forecast = history.get("forecast")
+        if isinstance(forecast, Mapping):
+            forecast = dict(forecast)
+            resets_at = forecast.get("resets_at")
+            try:
+                reset = dt.datetime.fromisoformat(
+                    str(resets_at).replace("Z", "+00:00")
+                ).astimezone(UTC)
+            except (TypeError, ValueError):
+                reset = None
+            remaining = max(0, int((reset - now_utc).total_seconds())) if reset else None
+            forecast["remaining_seconds"] = remaining
+            sample_count = int(forecast.get("sample_count") or 0)
+            if row_freshness == "future":
+                forecast["status"] = "future"
+            elif row_freshness == "stale":
+                forecast["status"] = "stale"
+            elif sample_count == 0:
+                forecast["status"] = "insufficient-history"
+            else:
+                forecast["status"] = "ok"
+            rate = forecast.get("rate_percent_per_hour")
+            current = forecast.get("current_percent")
+            if (
+                isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                and isinstance(current, (int, float)) and not isinstance(current, bool)
+                and remaining is not None
+            ):
+                forecast["projected_percent"] = min(
+                    100.0, max(float(current), float(current) + float(rate) * remaining / 3600),
+                )
+            history["forecast"] = forecast
+        # Called unconditionally, exactly as the build calls it. The helper
+        # already returns None for a row without a usable forecast, and keeping
+        # a caller-side `isinstance(forecast, Mapping)` guard here would put a
+        # fragment of the predicate back on the caller — the split #429 exists
+        # to remove.
+        active = _active_row_from_history(history, now_utc=now_utc)
+        if active is not None:
+            active_rows.append(active)
+        refreshed_histories.append(history)
+    summary = dict(quota.get("summary") or {})
+    prior_active = summary.get("active")
+    if isinstance(prior_active, (tuple, list)):
+        # #429 §3.1: scoped identity, not bare key — two decorated rows can
+        # share one key and would collapse into a single map entry.
+        active_order = {
+            _scoped_quota_identity(row): index
+            for index, row in enumerate(prior_active)
+            if isinstance(row, Mapping)
+        }
+        active_rows.sort(
+            key=lambda row: active_order.get(
+                _scoped_quota_identity(row), len(active_order)),
+        )
+    summary.update({
+        "active_window_count": len(active_rows),
+        "latest_percent": max(
+            (float(row["current_percent"]) for row in active_rows), default=None),
+        "freshness": (
+            "fresh" if active_rows and all(row["freshness"] == "fresh" for row in active_rows)
+            else ("unavailable" if not active_rows else "stale")
+        ),
+        "active": tuple(active_rows),
+    })
+    refreshed["histories"] = tuple(refreshed_histories)
+    refreshed["summary"] = summary
+    return refreshed
+
+
 def refresh_codex_source_clock(
     state: SourceDashboardState,
     *,
@@ -2059,148 +2232,48 @@ def refresh_codex_source_clock(
     freshness = state.freshness
     domain_freshness = dict(state.domain_freshness or {})
     if isinstance(quota, Mapping):
-        quota = dict(quota)
-        refreshed_histories: list[dict[str, object]] = []
-        active_rows: list[dict[str, object]] = []
-        for raw_history in quota.get("histories", ()):
-            if not isinstance(raw_history, Mapping):
-                continue
-            history = dict(raw_history)
-            # #350 spec §3.9: this is a PER-ROW value and must never shadow the
-            # envelope-level `freshness`. It used to, so after the loop the
-            # envelope held the LAST retained history row's freshness — often an
-            # inactive row, and with a single weekly history the active weekly
-            # one, which silently marked the whole provider stale on an idle
-            # stale crossing and tripped idle eligibility on its own.
-            row_freshness = _clock_freshness(
-                history.get("captured_at"), history.get("stale_after_seconds"), now_utc,
-            )
-            history["freshness"] = row_freshness
-            forecast = history.get("forecast")
-            if isinstance(forecast, Mapping):
-                forecast = dict(forecast)
-                resets_at = forecast.get("resets_at")
-                try:
-                    reset = dt.datetime.fromisoformat(
-                        str(resets_at).replace("Z", "+00:00")
-                    ).astimezone(UTC)
-                except (TypeError, ValueError):
-                    reset = None
-                remaining = max(0, int((reset - now_utc).total_seconds())) if reset else None
-                forecast["remaining_seconds"] = remaining
-                sample_count = int(forecast.get("sample_count") or 0)
-                if row_freshness == "future":
-                    forecast["status"] = "future"
-                elif row_freshness == "stale":
-                    forecast["status"] = "stale"
-                elif sample_count == 0:
-                    forecast["status"] = "insufficient-history"
-                else:
-                    forecast["status"] = "ok"
-                rate = forecast.get("rate_percent_per_hour")
-                current = forecast.get("current_percent")
-                if (
-                    isinstance(rate, (int, float)) and not isinstance(rate, bool)
-                    and isinstance(current, (int, float)) and not isinstance(current, bool)
-                    and remaining is not None
-                ):
-                    forecast["projected_percent"] = min(
-                        100.0, max(float(current), float(current) + float(rate) * remaining / 3600),
-                    )
-                history["forecast"] = forecast
-                # #373: same rule as the initial build, through the same
-                # predicate, so the two paths cannot drift.
-                if (
-                    not _codex_history_row_is_model_scoped(history)
-                    and reset is not None and reset > now_utc and current is not None
-                ):
-                    active_rows.append({
-                        "key": history.get("key"),
-                        "current_percent": current,
-                        "captured_at": history.get("captured_at"),
-                        "resets_at": resets_at,
-                        "freshness": row_freshness,
-                        "stale_after_seconds": history.get("stale_after_seconds"),
-                    })
-            refreshed_histories.append(history)
-        quota["histories"] = refreshed_histories
-        latest_percent = max(
-            (float(row["current_percent"]) for row in active_rows), default=None,
-        )
-        summary = dict(quota.get("summary") or {})
-        prior_active = summary.get("active")
-        if isinstance(prior_active, (tuple, list)):
-            active_order = {
-                str(row.get("key")): index
-                for index, row in enumerate(prior_active)
-                if isinstance(row, Mapping)
-            }
-            active_rows.sort(
-                key=lambda row: active_order.get(str(row.get("key")), len(active_order)),
-            )
-        summary.update({
-            "active_window_count": len(active_rows),
-            "latest_percent": latest_percent,
-            "freshness": (
-                "fresh" if active_rows and all(row["freshness"] == "fresh" for row in active_rows)
-                else ("unavailable" if not active_rows else "stale")
-            ),
-            "active": active_rows,
-        })
-        # Only account-level active histories reach ``active_rows``; the shared
-        # model-scoped predicate above excludes foreign pools. An unavailable
-        # active set is a capability/data-availability fact, not invented
-        # staleness, so only the exact stale verdict moves this axis.
-        domain_freshness["quota"] = (
-            "stale" if summary["freshness"] == "stale" else "fresh"
-        )
-        quota["summary"] = summary
+        reclocked = _reclock_quota_domain(quota, now_utc=now_utc)
+        quota_changed = reclocked != quota
+        quota = reclocked
         data["quota"] = quota
-        quota_changed = bool(refreshed_histories)
-        hero = data.get("hero")
-        hero_capability = state.capabilities.get("hero")
-        if (
-            isinstance(hero, Mapping)
-            and isinstance(hero.get("cycle"), Mapping)
-            and hero_capability is not None
-            and hero_capability.status == "supported"
-        ):
-            # #350 spec §3.3: the clock no longer RE-DERIVES cycle validity.
-            # Its public-history view is lossy (capped, no `logical_limit_key`,
-            # no `quota_identity`), so it cannot resolve the cycle correctly —
-            # and per §2.2 it cannot simply trust the old verdict forever either,
-            # because resolution is time-dependent on frozen evidence. Build time
-            # owns resolution and records a decision deadline in `clock_data`; the
-            # tick rebuilds authoritatively at the crossing. All the clock keeps
-            # is this cheap invariant guard: a cycle that has already RESET cannot
-            # bound current accounting, so it degrades exactly as before.
-            # Expiry is also deadline candidate #1, so the two paths are disjoint
-            # belt-and-suspenders rather than a single mechanism.
-            if _clock_cycle_expired(hero.get("cycle"), now_utc):
-                hero = dict(hero)
-                for field in (
-                    "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
-                    "reasoning_output_tokens", "total_tokens", "cycle",
-                ):
-                    hero[field] = None
-                data["hero"] = hero
-                refreshed_capabilities = dict(state.capabilities)
-                refreshed_capabilities["hero"] = CapabilityRecord(
-                    "unavailable", "missing-or-conflicting-native-cycle",
-                )
-                capabilities = refreshed_capabilities
-                warnings = tuple(
-                    warning for warning in state.warnings
-                    if warning.code != "codex_cycle_unavailable"
-                ) + (SourceDashboardWarning(
-                    "codex_cycle_unavailable",
-                    "Codex native reset cycle is unavailable.",
-                    "hero",
-                ),)
-                availability = "partial"
-                cycle_changed = True
+        # Only account-level active histories reach the summary; the shared
+        # model-scoped predicate excludes foreign pools. An unavailable active
+        # set is a capability/data-availability fact, not invented staleness,
+        # so only the exact stale verdict moves this axis. #429 §4.3 keeps this
+        # deriving from the TOP-LEVEL summary only — the #350 §3.9 rule that a
+        # row-level freshness value never touches `state.freshness` extends to
+        # the per-account scopes clocked below.
+        domain_freshness["quota"] = (
+            "stale" if quota["summary"]["freshness"] == "stale" else "fresh"
+        )
+    # #429 §4.3: the per-account scopes are independent evidence domains and
+    # were never clocked at all, so a focused account read frozen freshness
+    # forever. The published state is recursively frozen (`MappingProxyType`),
+    # so nothing may be mutated in place — copy outward: the scopes mapping,
+    # then the scope, then only that scope's `quota`.
+    scopes = data.get("account_scopes")
+    scopes_changed = False
+    if isinstance(scopes, Mapping):
+        rebuilt_scopes = dict(scopes)
+        for scope_key, scope in scopes.items():
+            if not isinstance(scope, Mapping):
+                continue
+            scope_quota = scope.get("quota")
+            if not isinstance(scope_quota, Mapping):
+                continue
+            reclocked_scope_quota = _reclock_quota_domain(
+                scope_quota, now_utc=now_utc)
+            if reclocked_scope_quota == scope_quota:
+                continue
+            rebuilt_scope = dict(scope)
+            rebuilt_scope["quota"] = reclocked_scope_quota
+            rebuilt_scopes[scope_key] = rebuilt_scope
+            scopes_changed = True
+        if scopes_changed:
+            data["account_scopes"] = rebuilt_scopes
     budget_domain = data.get("budget")
     budget_changed = False
+    refreshed_budget = None
     if isinstance(budget_domain, Mapping):
         budget_domain = dict(budget_domain)
         refreshed_budget = _refresh_budget_status_clock(
@@ -2214,13 +2287,62 @@ def refresh_codex_source_clock(
         if refreshed_budget is not None:
             budget_domain["status"] = refreshed_budget
             data["budget"] = budget_domain
-            hero = data.get("hero")
-            if isinstance(hero, Mapping):
-                hero = dict(hero)
-                hero["budget"] = refreshed_budget
-                data["hero"] = hero
             budget_changed = True
-    if not (quota_changed or budget_changed or cycle_changed):
+    # #429 §4.5: all three hero mutations compose on ONE copy, in a stated
+    # order. Three independent `dict(hero)` copies let the last write win, which
+    # is how `hero["quota"]` stayed frozen at its build-time value while
+    # `quota["summary"]` advanced.
+    hero = data.get("hero")
+    if isinstance(hero, Mapping):
+        hero = dict(hero)
+        # 1. quota first — `_clock_cycle_expired` reads `hero["cycle"]`, never
+        #    `hero["quota"]`, so replacing quota cannot affect the predicate.
+        if isinstance(quota, Mapping):
+            hero["quota"] = quota["summary"]
+        # 2. cycle expiry, with its capability/warning consequences.
+        #    #350 spec §3.3: the clock no longer RE-DERIVES cycle validity. Its
+        #    public-history view is lossy (capped, no `logical_limit_key`, no
+        #    `quota_identity`), so it cannot resolve the cycle correctly — and
+        #    per §2.2 it cannot simply trust the old verdict forever either,
+        #    because resolution is time-dependent on frozen evidence. Build time
+        #    owns resolution and records a decision deadline in `clock_data`; the
+        #    tick rebuilds authoritatively at the crossing. All the clock keeps
+        #    is this cheap invariant guard: a cycle that has already RESET cannot
+        #    bound current accounting, so it degrades exactly as before. Expiry
+        #    is also deadline candidate #1, so the two paths are disjoint
+        #    belt-and-suspenders rather than a single mechanism.
+        hero_capability = state.capabilities.get("hero")
+        if (
+            isinstance(hero.get("cycle"), Mapping)
+            and hero_capability is not None
+            and hero_capability.status == "supported"
+            and _clock_cycle_expired(hero.get("cycle"), now_utc)
+        ):
+            for field in (
+                "cost_usd", "input_tokens", "cached_input_tokens", "output_tokens",
+                "reasoning_output_tokens", "total_tokens", "cycle",
+            ):
+                hero[field] = None
+            refreshed_capabilities = dict(state.capabilities)
+            refreshed_capabilities["hero"] = CapabilityRecord(
+                "unavailable", "missing-or-conflicting-native-cycle",
+            )
+            capabilities = refreshed_capabilities
+            warnings = tuple(
+                warning for warning in state.warnings
+                if warning.code != "codex_cycle_unavailable"
+            ) + (SourceDashboardWarning(
+                "codex_cycle_unavailable",
+                "Codex native reset cycle is unavailable.",
+                "hero",
+            ),)
+            availability = "partial"
+            cycle_changed = True
+        # 3. budget last
+        if refreshed_budget is not None:
+            hero["budget"] = refreshed_budget
+        data["hero"] = hero
+    if not (quota_changed or budget_changed or cycle_changed or scopes_changed):
         return state
     refreshed_state = SourceDashboardState(
         source=state.source,
@@ -2832,6 +2954,9 @@ def _codex_account_scopes_wire(
         quota = _quota_read_model(
             context, account_observations, accounting_entries=rows,
             account_key=key,
+            # #429 §4.4: this wire is only ever reached under decoration — the
+            # caller gates the whole `account_scopes` surface on it.
+            decorated=True,
         )
         # Each decorated child owns the only honest cycle index for that
         # account. Reusing a merged parent index here would render account A's
@@ -3228,6 +3353,7 @@ def build_codex_source_state(
         context,
         quota_observations,
         accounting_entries=visible_accounting_entries,
+        decorated=_codex_decorated,
     )
     # R8 gate, resolved ONCE and threaded (#341 Task 4 / #416 §5.8). Every
     # per-account decoration below — block/alert/budget `account_key`, the

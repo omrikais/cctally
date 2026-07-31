@@ -18,6 +18,7 @@ import sys
 import threading
 from http.client import HTTPConnection
 
+from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
 from conftest import load_script, redirect_paths
 
 # A real model id from CLAUDE_MODEL_PRICING so token-derived cost is non-zero.
@@ -163,7 +164,7 @@ def _make_snapshot(ns, *, with_codex_label=False):
             codex, "private_session_labels", {key: "Private first prompt"},
         )
         snapshot.source_bundle = SourceDashboardBundle(
-            source_schema_version=1, default_source="claude",
+            source_schema_version=SOURCE_SCHEMA_VERSION, default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={
                 "claude": claude,

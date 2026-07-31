@@ -9,6 +9,7 @@ import pytest
 
 from conftest import load_script
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -83,7 +84,7 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
         data={"hero": {"cost_usd": 0.0, "total_tokens": 0}},
     )
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
@@ -92,7 +93,7 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
     envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
 
     assert {key: envelope[key] for key in legacy} == legacy
-    assert envelope["source_schema_version"] == 1
+    assert envelope["source_schema_version"] == SOURCE_SCHEMA_VERSION
     assert envelope["default_source"] == "claude"
     assert envelope["source_order"] == ["claude", "codex", "all"]
     assert envelope["sources"]["claude"]["data"] == {
@@ -141,7 +142,7 @@ def test_codex_labels_are_injected_per_request_into_parent_and_account_rows():
     object.__setattr__(codex, "private_session_labels", {key: label})
     snap = ns["_empty_dashboard_snapshot"]()
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1, default_source="claude",
+        source_schema_version=SOURCE_SCHEMA_VERSION, default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={
             "claude": claude,

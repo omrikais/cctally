@@ -3925,6 +3925,54 @@ def _conv_001_adopt_schema_version_marker(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@conversations_migration("002_codex_thread_source_inference_replay")
+def _conv_002_codex_thread_source_inference_replay(
+    conn: sqlite3.Connection,
+) -> None:
+    """Arm the conversations half of the byte-zero Codex replay.
+
+    Spec:
+    ``docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md``
+    §4.3.
+
+    Writes a marker ONLY; it clears no table. ``sync_codex_conversations``
+    consumes it, and DEFERS while the cache-side marker is still pending —
+    ``_recompute_codex_rollups`` resolves project attribution from the cache-side
+    thread row, and a missing one stamps a materialized ``"(unassigned)"`` the
+    read path then prefers permanently.
+
+    The key is DISTINCT from ``conversation_rebuild_codex_pending`` on purpose.
+    ``_ensure_codex_conversation_contract`` consumes that one by replaying
+    normalization over already-retained events — which preserves their NULL
+    conversation keys — and then deletes it, so a ``dashboard --no-sync`` or
+    qualified CLI read between this migration and the next real sync would
+    silently discard the repair.
+
+    Takes the Codex conversations provider flock first, the way cache migration
+    ``028_split_conversation_store`` does, and DEFERS on contention. The
+    conversations dispatcher runs inside ``_conversations_open_guarded``, which
+    holds ``CONVERSATIONS_LOCK_MAINTENANCE_PATH`` only SHARED, while
+    ``sync_codex_conversations`` serializes on ``CONVERSATIONS_LOCK_CODEX_PATH``
+    — so without this lock the marker can be armed in the middle of a walk that
+    already read it as absent, and that walk's finalize would clear a replay it
+    never performed. Deferring leaves the migration pending, so it arms cleanly
+    at the next open.
+
+    Idempotent: re-running rewrites the same marker. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
+    """
+    import _cctally_cache
+
+    held = _acquire_conversations_db_codex_provider_flock(
+        conn, migration="conversations 002 thread_source replay")
+    try:
+        _set_cache_meta(
+            conn, _cctally_cache.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY, "1")
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
 # #177 S6: the consolidated multi-column external-content FTS5 table that
 # replaces the old conversation_fts(text) + conversation_fts_aux(search_aux)
 # pair. The three column names MUST match the conversation_messages columns BY
@@ -4679,6 +4727,44 @@ def _acquire_cache_db_codex_provider_flock(
         raise MigrationGateNotMet(
             f"cache.db Codex lock held by a concurrent Codex sync; "
             f"deferring cache {migration}"
+        )
+    return held
+
+
+def _acquire_conversations_db_codex_provider_flock(
+    conn: sqlite3.Connection,
+    *,
+    migration: str,
+) -> list[int]:
+    """Take the ``<conversations.db>.codex.lock`` sibling, or DEFER.
+
+    The conversations dispatcher runs under a SHARED maintenance flock, so —
+    unlike the cache dispatcher — it does not exclude the provider sync that
+    owns the marker lifecycle. A conversations handler that writes a marker
+    ``sync_codex_conversations`` consumes must therefore hold the same
+    provider lock that sync holds, or it can arm mid-walk and have its marker
+    swallowed by a walk that already read it as absent.
+
+    Derived from the connection (the lock-path helper is store-agnostic: main DB
+    file + ``.codex.lock``), so a migration test never contends on the caller's
+    real conversations lock.
+    """
+    provider_path = _cache_db_codex_lock_path_for_conn(conn)
+    if provider_path is None:
+        return []
+
+    from _lib_cache_writer_lock import acquire_ordered_flocks
+
+    try:
+        held = acquire_ordered_flocks([(provider_path, fcntl.LOCK_EX)])
+    except OSError as exc:
+        raise MigrationGateNotMet(
+            f"conversations.db Codex lock unavailable; deferring {migration}"
+        ) from exc
+    if held is None:
+        raise MigrationGateNotMet(
+            f"conversations.db Codex lock held by a concurrent Codex "
+            f"conversation sync; deferring {migration}"
         )
     return held
 
@@ -6133,6 +6219,42 @@ def _034_codex_window_spend_adoption(conn: sqlite3.Connection) -> None:
             raise
     finally:
         _release_cache_db_writer_flocks(held)
+
+
+@cache_migration("035_codex_thread_source_inference_replay")
+def _035_codex_thread_source_inference_replay(conn: sqlite3.Connection) -> None:
+    """Arm a byte-zero Codex replay so rollouts whose ``session_meta`` omits
+    ``thread_source`` gain a conversation identity.
+
+    Spec:
+    ``docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md``
+    §4.3.
+
+    The repair must re-read the rollout bytes: the retained events carry NULL
+    conversation keys and the in-place normalization replay preserves them.
+
+    Writes a marker ONLY. ``sync_codex_cache`` consumes it and ORs it into its
+    own ``rebuild``, which is what makes the rebuild path capture
+    ``rebuild_known_identities`` BEFORE the clear. Clearing here instead would
+    delete ``codex_session_files`` out of band, leaving the next ordinary sync
+    with an empty snapshot — every re-read rollout would fall through to the
+    live-``auth.json`` branch and pre-mechanism Codex spend would be
+    re-attributed to whoever is authenticated now (#416 spec D1). Migrations 026
+    and 027 predate that snapshot and are already stamped, so this would be the
+    first migration to hit it live.
+
+    No provider flock: unlike handlers 024-027 and 034 this writes one
+    ``cache_meta`` row and touches no Codex-derived table, so a concurrent
+    ``sync_codex_cache`` has nothing to interleave with — and if one is mid-walk,
+    arming the marker simply defers the replay to the following sync.
+
+    Idempotent: re-running rewrites the same marker. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
+    """
+    import _cctally_cache
+
+    _set_cache_meta(conn, _cctally_cache.CODEX_REPLAY_FROM_ZERO_KEY, "1")
+    conn.commit()
 
 
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===

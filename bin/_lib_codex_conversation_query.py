@@ -35,6 +35,13 @@ from _lib_pricing import _calculate_codex_entry_cost
 # authoritative; a held-lock deferral leaves it pending.
 CODEX_NORMALIZATION_MIGRATION = "025_codex_conversation_normalization"
 
+# The provider-local rebuild marker migration 028's byte-zero replay arms. Its
+# sibling — the thread_source-inference replay marker — is
+# ``kern.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY``; both are named, never
+# inlined as SQL literals, so a rename cannot leave this probe testing a key
+# nothing writes any more.
+CODEX_CONTRACT_REBUILD_MARKER = "conversation_rebuild_codex_pending"
+
 # Domain separations for the opaque item-key encoding (§5.2). The source-path
 # fingerprint is a domain-separated hash, NEVER a raw path (privacy-safe).
 CODEX_ITEM_KEY_DOMAIN = b"cctally-codex-item-key-v1\0"
@@ -93,6 +100,12 @@ def codex_normalization_authoritative(conn: sqlite3.Connection) -> bool:
     Split stores use their provider-local rebuild marker: current schema alone
     is not authority while migration 028's byte-zero replay is pending. Legacy
     monolithic/bare connections retain the migration-025 stamp contract.
+
+    EITHER pending marker withholds authority. The thread_source-inference
+    replay (conversations migration 002) is armed by its own key precisely
+    because the contract replay must not consume it, so a probe that tested only
+    the contract marker would report a not-yet-repaired store as authoritative
+    to every ``--no-sync`` read.
     """
     try:
         split = conn.execute(
@@ -101,8 +114,9 @@ def codex_normalization_authoritative(conn: sqlite3.Connection) -> bool:
         ).fetchone() is not None
         if split:
             pending = conn.execute(
-                "SELECT 1 FROM cache_meta "
-                "WHERE key='conversation_rebuild_codex_pending'"
+                "SELECT 1 FROM cache_meta WHERE key IN (?,?) LIMIT 1",
+                (CODEX_CONTRACT_REBUILD_MARKER,
+                 kern.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY),
             ).fetchone() is not None
             version = conn.execute(
                 "SELECT value FROM cache_meta "

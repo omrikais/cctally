@@ -5557,6 +5557,202 @@ def build_per_migration_034_codex_window_spend_adoption(
     _build_post(pre, post)
 
 
+def build_per_migration_035_codex_thread_source_inference_replay(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the cache-side byte-zero replay arming.
+
+    Spec:
+    ``docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md``
+    §4.3.
+
+    ``pre.sqlite`` is a 034-head install carrying one Codex accounting row and
+    its file cursor, with no replay marker. ``post.sqlite`` is that database
+    after the handler: the ``codex_replay_from_zero_pending`` marker is present
+    and EVERY Codex row family is byte-identical. The handler arms a replay; it
+    must never perform one, because clearing here would strand the next ordinary
+    sync with an empty ``rebuild_known_identities`` snapshot.
+    """
+    import importlib.util as ilu
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    bin_dir = Path(__file__).resolve().parent
+    migration = "035_codex_thread_source_inference_replay"
+
+    def _load_cctally():
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+        spec = ilu.spec_from_loader("cctally", loader)
+        mod = ilu.module_from_spec(spec)
+        sys.modules["cctally"] = mod
+        loader.exec_module(mod)
+        return mod, sys.modules["_cctally_db"]
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_031,
+                         "032_codex_canonical_reset_anchor",
+                         "033_codex_reset_anchor_component_closure",
+                         "034_codex_window_spend_adoption"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, "2026-07-30T12:00:00Z"),
+                )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " input_tokens, cached_input_tokens, output_tokens, "
+                " reasoning_output_tokens, total_tokens, source_root_key, "
+                " conversation_key, account_key) "
+                "VALUES (?,?,?,'session','gpt-5',1000,0,0,0,1000,?,NULL,NULL)",
+                ("/roots/rk/sessions/a.jsonl", 10, "2026-07-29T04:00:00Z",
+                 "r" * 32),
+            )
+            conn.execute(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, source_root_key) VALUES (?,?,?,?,?,?)",
+                ("/roots/rk/sessions/a.jsonl", 4096, 1, 4096,
+                 "2026-07-29T04:00:00Z", "r" * 32),
+            )
+            conn.execute("PRAGMA user_version=34")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        _load_cctally()
+        db = sys.modules["_cctally_db"]
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler = next(
+                (item.handler for item in db._CACHE_MIGRATIONS
+                 if item.name == migration),
+                None,
+            )
+            if handler is None:
+                raise SystemExit(f"{migration} not registered")
+            handler(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, "2026-07-30T12:00:00Z"),
+            )
+            conn.execute("PRAGMA user_version=35")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_conversations_002_codex_thread_source_inference_replay(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for the conversations-side byte-zero replay arming.
+
+    ``pre.sqlite`` is a conversations.db at 001-head (schema + the adoption
+    marker + one source-file row). ``post.sqlite`` is that database after the
+    handler: ``codex_conversation_replay_from_zero_pending`` present, the
+    transcript row untouched, and ``conversation_rebuild_codex_pending``
+    conspicuously ABSENT — the two markers are distinct precisely so the
+    contract replay cannot consume this one.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "002_codex_thread_source_inference_replay"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        mod = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            mod._apply_conversations_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                ("001_adopt_schema_version_marker", TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute(
+                "INSERT INTO conversation_source_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("/fake/.claude/projects/-Users-u-proj/sess.jsonl",
+                 128, 1, 128, "2026-04-15T15:00:00Z"),
+            )
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = next(
+            (m.handler for m in mod._CONVERSATIONS_MIGRATIONS
+             if m.name == migration),
+            None,
+        )
+        if handler is None:
+            raise SystemExit(f"conversations migration {migration} not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute("PRAGMA user_version=2")
+            conn.commit()
+        finally:
+            conn.close()
+        # The handler takes `<db>.codex.lock` (the provider flock that keeps it
+        # from arming under a racing conversations sync), which lands beside the
+        # golden. Not fixture output — remove it so a regen leaves no litter.
+        lock = dst.with_name(dst.name + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
 ) -> None:
@@ -6233,6 +6429,14 @@ def main() -> int:
     build_per_migration_conversations_001_adopt_schema_version_marker(
         FIXTURES_ROOT / "per-migration"
         / "conversations_001_adopt_schema_version_marker"
+    )
+    build_per_migration_035_codex_thread_source_inference_replay(
+        FIXTURES_ROOT / "per-migration"
+        / "035_codex_thread_source_inference_replay"
+    )
+    build_per_migration_conversations_002_codex_thread_source_inference_replay(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_002_codex_thread_source_inference_replay"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

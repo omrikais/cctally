@@ -22,7 +22,14 @@ CapabilityStatus = Literal[
     "supported", "derived", "unavailable", "deferred", "not_applicable",
 ]
 
-SOURCE_SCHEMA_VERSION = 1
+# #429 §3.2 — bumped to 2 because `active[].captured_at` changed MEANING (the
+# newest physical observation, not the interpreted baseline). The in-place
+# update flow `execvp`s the server while the already-loaded client reconnects
+# over its existing EventSource without reloading its JS
+# (`UpdateRunningModal.tsx`, `store/sse.ts`), so an old client demonstrably
+# does meet a new server; `docs/cli-contract.md` calls changing a value's
+# meaning breaking. Version-aware client reaction is deliberately deferred.
+SOURCE_SCHEMA_VERSION = 2
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")

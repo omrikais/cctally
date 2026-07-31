@@ -195,6 +195,15 @@ def _version(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _cache_head() -> int:
+    """The cache registry head. Read from the registry, never hard-coded: these
+    tests assert the dispatcher advanced `user_version` to HEAD after replaying
+    the whole chain, which is a statement about the chain's end, not about any
+    particular migration number."""
+    db = _db_module()
+    return len(db._CACHE_MIGRATIONS)
+
+
 def _assert_codex_cleared_claude_unchanged(
     conn: sqlite3.Connection, *, legacy_claude_messages: bool = True,
 ) -> None:
@@ -280,7 +289,7 @@ def test_024_crash_after_handler_before_stamp_retries_safely(tmp_path, monkeypat
         # Head is 34 after the window-scoped spend adoption repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 
@@ -314,7 +323,7 @@ def test_024_open_cache_db_defers_without_mutation_while_codex_lock_is_held(
         # Head is 34 after the window-scoped spend adoption repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 
@@ -349,7 +358,7 @@ def test_024_eager_dispatch_defers_without_mutation_while_codex_lock_is_held(
         # Head is 34 after the window-scoped spend adoption repair; the
         # seeded unattributed cutover op lets 029 resolve so the chain reaches
         # head (rather than gate-deferring on the legacy Claude sentinel row).
-        assert _version(conn) == 34
+        assert _version(conn) == _cache_head()
     finally:
         conn.close()
 

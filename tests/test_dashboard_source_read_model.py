@@ -7,6 +7,7 @@ import pathlib
 import sqlite3
 import shutil
 import sys
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from _cctally_dashboard_sources import (
     resolve_dashboard_source_semantics,
 )
 from conftest import load_script, redirect_paths
+from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
 from _lib_quota import QuotaObservation, QuotaWindowIdentity
 
 
@@ -2807,6 +2809,7 @@ def test_quota_hero_summary_uses_the_active_baseline_not_a_historical_high_water
                 now_utc=now, display_tz_name="UTC",
             ),
             observations,
+            decorated=False,
         )
 
         assert quota["summary"]["latest_percent"] == 20.0
@@ -2847,6 +2850,7 @@ def test_dashboard_quota_read_model_caps_histories_active_rows_and_milestones():
                 now_utc=now, display_tz_name="UTC",
             ),
             observations,
+            decorated=False,
         )
 
         assert len(quota["histories"]) <= source_module.SOURCE_HISTORY_LIMIT
@@ -2923,6 +2927,7 @@ def test_dashboard_quota_cap_reserves_freshest_model_scoped_history(monkeypatch)
                 display_tz_name="UTC",
             ),
             (*active, *inactive_standard, *model_scoped),
+            decorated=False,
         )
     finally:
         cache.close()
@@ -3005,6 +3010,7 @@ def test_dashboard_quota_milestones_include_native_window_and_accounting_costs()
             ),
             observations,
             accounting_entries=accounting_entries,
+            decorated=False,
         )
 
         milestone = quota["milestones"][0]
@@ -3112,6 +3118,7 @@ def test_dashboard_current_cycle_uses_complete_durable_quota_breakdown():
                 now_utc=now, display_tz_name="UTC", speed="standard",
             ),
             observations,
+            decorated=False,
         )
 
         weekly = [
@@ -3565,7 +3572,7 @@ def test_reused_codex_state_is_clocked_before_all_composition(tmp_path, monkeypa
         )
         prior_claude = initial_bundle.sources["claude"]
         prior_bundle = tui.SourceDashboardBundle(
-            source_schema_version=1,
+            source_schema_version=SOURCE_SCHEMA_VERSION,
             default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={
@@ -3731,3 +3738,417 @@ def test_account_a_expiry_repins_the_hero_to_a_live_sibling(tmp_path, monkeypatc
     finally:
         cache.close()
         stats.close()
+
+
+# =========================================================================
+# #429 — one quota identity resolves to one `captured_at`, one `freshness`
+# and one `stale_after_seconds` everywhere in a single envelope.
+# =========================================================================
+
+_429_NOW = dt.datetime(2026, 4, 24, 13, 0, tzinfo=UTC)
+
+
+def _quota_observations_with_repeated_value(
+    now: dt.datetime = _429_NOW,
+    *,
+    root: str = "429-root",
+    logical_limit_key: str = "429-limit",
+    account_key: str | None = None,
+) -> tuple[QuotaObservation, ...]:
+    """One weekly identity whose newest PHYSICAL capture repeats the value.
+
+    `build_history` collapses consecutive equal `logical_value_tuple`
+    observations, so the retained INTERPRETED baseline is the first capture
+    while `quota_freshness` reads the last PHYSICAL one — the exact idle case
+    where the build's `baseline.captured_at` and the row's own evidence
+    timestamp disagree. Three captures: a distinct earlier value so the block
+    has a real interpreted run, then a repeated value across two captures.
+    """
+    reset = now + dt.timedelta(days=3)
+    return (
+        _quota_observation(
+            root=root, window_minutes=10_080, resets_at=reset,
+            captured_at=now - dt.timedelta(minutes=50),
+            logical_limit_key=logical_limit_key, used_percent=9.0,
+            line_offset=1, account_key=account_key,
+        ),
+        _quota_observation(
+            root=root, window_minutes=10_080, resets_at=reset,
+            captured_at=now - dt.timedelta(minutes=40),
+            logical_limit_key=logical_limit_key, used_percent=12.0,
+            line_offset=2, account_key=account_key,
+        ),
+        _quota_observation(
+            root=root, window_minutes=10_080, resets_at=reset,
+            captured_at=now - dt.timedelta(minutes=5),
+            logical_limit_key=logical_limit_key, used_percent=12.0,
+            line_offset=3, account_key=account_key,
+        ),
+    )
+
+
+def test_forecast_baseline_matches_build_baseline():
+    """#429: the shared active-row helper reads forecast.current_percent, which
+    re-derives its baseline from physical observations. If that ever diverged
+    from the build's own select_baseline, active rows would change value
+    silently — not just their timestamp."""
+    from _lib_quota import build_history, forecast_quota, select_baseline
+
+    now = _429_NOW
+    observations = _quota_observations_with_repeated_value(now)
+    histories = build_history(observations)
+    assert len(histories) == 1
+    history = histories[0]
+    baseline = select_baseline(history.observations, now)
+    forecast = forecast_quota(history.physical_observations, now)
+    assert baseline is not None
+    assert forecast.current_percent == baseline.used_percent
+    assert forecast.resets_at == baseline.canonical_resets_at
+
+
+def _build_codex_state_from(
+    observations,
+    *,
+    now_utc,
+    tmp_path,
+    monkeypatch,
+    data_version="429-v1",
+):
+    """Build a real Codex source state over exactly ``observations``.
+
+    Uses the production builder rather than a hand-assembled state, because the
+    #429 defect lives in the disagreement between that builder and the idle
+    clock — a hand-built state would beg the question.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations",
+        lambda **_kwargs: tuple(observations),
+    )
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        return source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats,
+                range_start=now_utc - dt.timedelta(days=30),
+                now_utc=now_utc, display_tz_name="UTC", week_start_idx=0,
+            ),
+            data_version=data_version,
+        )
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_clock_at_build_instant_is_a_noop(tmp_path, monkeypatch):
+    """#429 §5.1: refresh_codex_source_clock claims same-instant identity
+    (_cctally_tui.py:2799). It is false today — the build fills
+    active[].captured_at from the interpreted baseline while the clock refills
+    it from the latest physical observation."""
+    from _lib_quota import build_history, quota_freshness, select_baseline
+
+    now = _429_NOW
+    # Precondition, asserted rather than assumed: repeated logical value, so the
+    # newest PHYSICAL capture is newer than the newest INTERPRETED one.
+    observations = _quota_observations_with_repeated_value(now)
+    history = build_history(observations)[0]
+    baseline = select_baseline(history.observations, now)
+    freshness = quota_freshness(history.physical_observations, now)
+    assert baseline.captured_at < freshness.captured_at, (
+        "fixture does not exercise the defect: baseline and latest physical "
+        "resolve to the same capture"
+    )
+
+    state = _build_codex_state_from(
+        observations, now_utc=now, tmp_path=tmp_path, monkeypatch=monkeypatch,
+    )
+    clocked = refresh_codex_source_clock(state, now_utc=now)
+    assert clocked == state
+
+
+def _three_hundred_active_identities(
+    now: dt.datetime = _429_NOW, *, count: int = 300, peak_on_discarded: bool = False,
+) -> tuple[QuotaObservation, ...]:
+    """``count`` live 5h identities, deliberately above ``SOURCE_HISTORY_LIMIT``.
+
+    With ``peak_on_discarded`` the highest ``current_percent`` is placed on an
+    identity the retention cap DISCARDS, so a summary scalar computed before the
+    cap reports a percentage that appears nowhere in the published active set.
+    """
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    specs = []
+    for index in range(count):
+        root = f"429-root-{index:03d}"
+        logical_limit_key = f"429-limit-{index:03d}"
+        specs.append((
+            source_module.dashboard_resource_key(
+                "quota", "codex", root, logical_limit_key, "primary", 300,
+            ),
+            root,
+            logical_limit_key,
+        ))
+    peak_index: int | None = None
+    if peak_on_discarded:
+        # Every identity is active, so the retention key ties on its first two
+        # components and the cap keeps the SOURCE_HISTORY_LIMIT lowest keys.
+        discarded = sorted(specs)[source_module.SOURCE_HISTORY_LIMIT:]
+        assert discarded, "precondition: the fixture must exceed the cap"
+        peak_index = next(
+            index for index, spec in enumerate(specs) if spec[0] == discarded[0][0]
+        )
+    observations: list[QuotaObservation] = []
+    for index, (_key, root, logical_limit_key) in enumerate(specs):
+        used = 99.0 if index == peak_index else 10.0 + (index % 7)
+        for offset, (minutes, percent) in enumerate(
+            ((20, used - 1.0), (5, used)), start=1,
+        ):
+            observations.append(_quota_observation(
+                root=root, window_minutes=300,
+                resets_at=now + dt.timedelta(hours=4),
+                captured_at=now - dt.timedelta(minutes=minutes),
+                logical_limit_key=logical_limit_key, used_percent=percent,
+                line_offset=offset,
+            ))
+    return tuple(observations)
+
+
+def test_retained_active_rows_all_have_retained_histories(tmp_path, monkeypatch):
+    """#429 §4.2: histories and active rows were capped independently and in
+    different orders, so above SOURCE_HISTORY_LIMIT the clock — which sees only
+    retained histories — could not reproduce the build."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    now = _429_NOW
+    observations = _three_hundred_active_identities(now)
+    state = _build_codex_state_from(
+        observations, now_utc=now, tmp_path=tmp_path, monkeypatch=monkeypatch,
+        data_version="429-retention-v1",
+    )
+    quota = state.data["quota"]
+    history_keys = {str(row["key"]) for row in quota["histories"]}
+    active_keys = [str(row["key"]) for row in quota["summary"]["active"]]
+
+    assert active_keys, "precondition: the fixture publishes active rows"
+    assert len(active_keys) <= source_module.SOURCE_HISTORY_LIMIT
+    assert set(active_keys) <= history_keys
+
+    clocked = refresh_codex_source_clock(state, now_utc=now)
+    clocked_active = [
+        str(row["key"]) for row in clocked.data["quota"]["summary"]["active"]
+    ]
+    assert clocked_active == active_keys      # membership AND order
+    assert clocked == state
+
+
+def test_summary_scalars_derive_from_retained_active_rows(tmp_path, monkeypatch):
+    """#429 §4.2 step 6: latest_percent and freshness were computed pre-cap."""
+    now = _429_NOW
+    # Highest percentage sits on an identity that the cap discards.
+    observations = _three_hundred_active_identities(now, peak_on_discarded=True)
+    summary = _build_codex_state_from(
+        observations, now_utc=now, tmp_path=tmp_path, monkeypatch=monkeypatch,
+        data_version="429-retention-v2",
+    ).data["quota"]["summary"]
+    retained = summary["active"]
+    assert summary["active_window_count"] == len(retained)
+    assert summary["latest_percent"] == max(
+        float(row["current_percent"]) for row in retained)
+    assert summary["latest_percent"] != 99.0, (
+        "the discarded identity's peak must not survive as a summary scalar")
+    assert summary["freshness"] == "fresh"
+
+
+def _build_codex_state_with_expiring_cycle_and_budget(
+    tmp_path, monkeypatch, *, now_utc=NOW, data_version="429-composite-v1",
+):
+    """A state whose quota, hero cycle and budget all move on the same tick."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    config = {
+        "collector": {"week_start": "sunday"},
+        "budget": {
+            "codex": {
+                "amount_usd": 10.0,
+                "period": "calendar-month",
+                "alert_thresholds": [80, 100],
+            },
+        },
+    }
+    _install_weekly_only_cycle(
+        monkeypatch, source_module,
+        reset=now_utc + dt.timedelta(hours=1),
+        root=_cache_root_key(cache),
+        captured_at=now_utc - dt.timedelta(minutes=10),
+    )
+    try:
+        return source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=now_utc, display_tz_name="UTC", week_start_idx=6,
+                week_start_name="sunday",
+                codex_budget=ns["_get_budget_config"](config)["codex"],
+            ),
+            data_version=data_version,
+        )
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_hero_quota_tracks_the_clocked_top_level_summary(tmp_path, monkeypatch):
+    """#429 §4.5: hero.quota and quota.summary are separate frozen mappings
+    after publication; the clock replaced only one of them."""
+    now = _429_NOW
+    state = _build_codex_state_from(
+        _quota_observations_with_repeated_value(now), now_utc=now,
+        tmp_path=tmp_path, monkeypatch=monkeypatch, data_version="429-hero-v1",
+    )
+    assert state.data["hero"]["quota"]["freshness"] == "fresh", (
+        "precondition: the build publishes a fresh summary to age")
+    later = now + dt.timedelta(hours=2)
+    clocked = refresh_codex_source_clock(state, now_utc=later)
+    assert clocked.data["hero"]["quota"] == clocked.data["quota"]["summary"]
+    assert clocked.data["hero"]["quota"]["freshness"] == "stale"
+
+
+def test_one_tick_applies_quota_expiry_and_budget_together(tmp_path, monkeypatch):
+    """#429 §4.5: three hero mutations compose on ONE hero copy; three
+    independent copies would let the last write win."""
+    state = _build_codex_state_with_expiring_cycle_and_budget(tmp_path, monkeypatch)
+    assert state.capabilities["hero"].status == "supported"
+    assert isinstance(state.data["hero"]["cycle"], Mapping)
+    assert state.data["hero"]["budget"] is not None
+
+    later = NOW + dt.timedelta(hours=2)     # past freshness AND cycle reset
+    clocked = refresh_codex_source_clock(state, now_utc=later)
+    hero = clocked.data["hero"]
+    assert hero["cycle"] is None                  # expiry cleared it
+    assert hero["cost_usd"] is None
+    assert hero["budget"] == clocked.data["budget"]["status"]   # budget applied
+    assert hero["quota"] == clocked.data["quota"]["summary"]    # quota applied
+    assert clocked.capabilities["hero"].status == "unavailable"
+    assert any(w.code == "codex_cycle_unavailable" for w in clocked.warnings)
+
+
+# -------------------------------------------------------------------------
+# #429 §5.6 — the non-regression oracle. Regenerated goldens accept whatever
+# bytes they are given, and no single run can execute both the pre- and
+# post-change code, so the comparison is against a COMMITTED pre-change
+# artifact captured with `bin/` reverted to the branch point.
+# -------------------------------------------------------------------------
+
+# Lives under `tests/golden/`, NOT beside the dashboard harness fixtures: that
+# directory is rebuilt IN PLACE by `bin/build-dashboard-fixtures.py` during the
+# shell pool, so a pytest reader of it would race the rebuild under the #296
+# overlap (`tests/test_test_all_overlap_safety.py` enforces this).
+_429_PRE_CHANGE_ENVELOPE = (
+    REPO_ROOT / "tests" / "golden" / "429-pre-change-source-envelope.json"
+)
+ALLOWED_DELTAS = {"captured_at", "account_key", "source_schema_version"}
+# NOT a wire semantic: `data_version` embeds `current_generation()`, a
+# process-global counter that advances as other tests run, so the same envelope
+# built twice in one pytest session carries two different tokens. It is a
+# cache-invalidation key, never rendered, and is excluded from BOTH comparisons.
+VOLATILE_FIELDS = {"data_version"}
+
+
+def _capture_undecorated_codex_envelope(tmp_path, monkeypatch):
+    """The full, undecorated source envelope over the #429 repeated-value fixture.
+
+    The fixture must REPEAT a logical value, otherwise the interpreted baseline
+    and the latest physical capture coincide and the artifact cannot witness the
+    change at all.
+
+    Deliberately does NOT sync the Codex corpus. Every Codex resource key is
+    derived from `source_root_key`, which `_seeded_context` roots at the
+    per-test `tmp_path` — so a corpus-backed capture re-salts every
+    `quota:` / `session:` / `project:` key and its `data_version` on each run,
+    and could never be committed as a stable oracle. The observations carry a
+    literal root instead, which keeps every emitted key reproducible.
+    """
+    import json as _json
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # `redirect_paths` moves HOME (so `~/.codex` is covered) but leaves
+    # $CODEX_HOME, and `resolve_dashboard_source_semantics` calls
+    # `_resolve_codex_speed("auto")`, which walks $CODEX_HOME roots' config.toml
+    # and can flip `speed` to `fast` — which feeds cost. A committed oracle must
+    # not depend on the developer's environment.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    tui = sys.modules["_cctally_tui"]
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    _install_observations(
+        monkeypatch, source_module, _quota_observations_with_repeated_value(NOW),
+    )
+    cache = ns["open_cache_db"]()
+    stats = ns["open_db"]()
+    try:
+        bundle = _build_tick_bundle(tui, stats, now_utc=NOW)
+        envelope = sys.modules[
+            "_cctally_dashboard_envelope"
+        ]._source_bundle_to_envelope(bundle)
+        return _json.loads(_json.dumps(envelope, sort_keys=True, default=str))
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _deep_diff(before, after, path=""):
+    """Yield ``(path, old, new)`` for every leaf that differs."""
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(set(before) | set(after)):
+            child = f"{path}.{key}" if path else str(key)
+            if key not in before:
+                yield (child, None, after[key])
+            elif key not in after:
+                yield (child, before[key], None)
+            else:
+                yield from _deep_diff(before[key], after[key], child)
+    elif isinstance(before, list) and isinstance(after, list):
+        for index in range(max(len(before), len(after))):
+            child = f"{path}[{index}]"
+            if index >= len(before):
+                yield (child, None, after[index])
+            elif index >= len(after):
+                yield (child, before[index], None)
+            else:
+                yield from _deep_diff(before[index], after[index], child)
+    elif before != after:
+        yield (path, before, after)
+
+
+def test_undecorated_envelope_changes_only_in_allowed_fields(tmp_path, monkeypatch):
+    """#429 §5.6: goldens accept whatever bytes they are given. This compares
+    against a committed PRE-change artifact and allows exactly three fields."""
+    import json as _json
+
+    before = _json.loads(_429_PRE_CHANGE_ENVELOPE.read_text())
+    after = _capture_undecorated_codex_envelope(tmp_path, monkeypatch)
+    diffs = [
+        (path, old, new) for path, old, new in _deep_diff(before, after)
+        if path.split(".")[-1] not in VOLATILE_FIELDS
+    ]
+    unexpected = [
+        (path, old, new) for path, old, new in diffs
+        if path.split(".")[-1] not in ALLOWED_DELTAS
+    ]
+    assert unexpected == [], f"unintended envelope changes: {unexpected}"
+    assert any(p.endswith("captured_at") for p, _, _ in diffs), (
+        "fixture does not exercise the change at all")
+    assert not any(p.endswith("account_key") for p, _, _ in diffs), (
+        "R8: an undecorated install must gain no account_key")
+
+
+def test_claude_source_state_is_unchanged(tmp_path, monkeypatch):
+    """#429 AC4: the Claude side is not in scope and must be bit-identical."""
+    import json as _json
+
+    before = _json.loads(_429_PRE_CHANGE_ENVELOPE.read_text())
+    after = _capture_undecorated_codex_envelope(tmp_path, monkeypatch)
+    strip = lambda entry: {
+        key: value for key, value in entry.items() if key not in VOLATILE_FIELDS
+    }
+    assert strip(after["sources"]["claude"]) == strip(before["sources"]["claude"])

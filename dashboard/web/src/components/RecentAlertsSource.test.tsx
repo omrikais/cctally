@@ -45,7 +45,7 @@ function makeBundle(over?: { claudeAlerts?: unknown[]; codexAlerts?: CodexAlertR
     data: { ...codexData, alerts: { rows: over?.codexAlerts ?? codexData.alerts.rows } },
   });
   return {
-    source_schema_version: 1,
+    source_schema_version: 2,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: { claude, codex, all: makeAllSourceEntry(claude, codex) },

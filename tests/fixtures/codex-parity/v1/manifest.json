@@ -1951,6 +1951,11 @@
       "change": "#335 Session E conversation fixtures for retained world-state, inter-agent metadata, turn-context, unknown-family, and compact reader privacy/presentation coverage.",
       "date": "2026-07-22",
       "version": 7
+    },
+    {
+      "change": "thread_source inference: conversation-identity rollouts whose session_meta OMITS thread_source (string and single-key-object source forms) plus four mixed-shape files pinning the per-record stateless rule across explicit/absent transitions, a changed native id, a delta-resume boundary, and the same-category continuity case.",
+      "date": "2026-07-31",
+      "version": 8
     }
   ],
   "identityFields": [
@@ -2023,6 +2028,12 @@
     "session-d-reasoning-lifecycle-markers": "rollouts/session-d-reasoning-lifecycle-markers.jsonl",
     "session-e-native-families": "rollouts/session-e-native-families.jsonl",
     "stale-cache": "rollouts/stale-cache.jsonl",
+    "thread-source-absent-mcp": "rollouts/thread-source-absent-mcp.jsonl",
+    "thread-source-absent-subagent": "rollouts/thread-source-absent-subagent.jsonl",
+    "thread-source-mixed-changed-native": "rollouts/thread-source-mixed-changed-native.jsonl",
+    "thread-source-mixed-continuity": "rollouts/thread-source-mixed-continuity.jsonl",
+    "thread-source-mixed-explicit-first": "rollouts/thread-source-mixed-explicit-first.jsonl",
+    "thread-source-mixed-missing-first": "rollouts/thread-source-mixed-missing-first.jsonl",
     "title-wrapper-window": "rollouts/title-wrapper-window.jsonl",
     "unknown-records": "rollouts/unknown-records.jsonl",
     "unturned-event-prose": "rollouts/unturned-event-prose.jsonl"

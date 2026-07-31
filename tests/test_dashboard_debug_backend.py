@@ -15,6 +15,7 @@ import threading
 from http.client import HTTPConnection
 
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -74,7 +75,7 @@ def _source_bundle(now):
     claude = state("claude", cost=1.0)
     codex = state("codex", cost=2.0)
     return SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},

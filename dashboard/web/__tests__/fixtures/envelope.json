@@ -656,7 +656,7 @@
       }
     ]
   },
-  "source_schema_version": 1,
+  "source_schema_version": 2,
   "default_source": "claude",
   "source_order": ["claude", "codex", "all"],
   "sources": {

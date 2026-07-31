@@ -189,6 +189,14 @@ class DoctorState:
     # by the next whole-tree sync that defers none. None = key absent (the
     # normal state) or cache unreadable — the check degrades OK.
     codex_torn_deferred: Optional[dict] = None
+    # The byte-zero Codex replay's stall signal. `codex_replay_pending` mirrors
+    # the `codex_replay_from_zero_pending` cache_meta marker; `codex_replay_blocked`
+    # is `{"at": iso, "files_failed": N, "files_deferred_torn": N}`, written by a
+    # whole-tree Codex sync that RAN and still could not consume it, and deleted
+    # by the next clean whole-tree sync. Both None = key absent (the normal
+    # state) or cache unreadable — the check degrades OK.
+    codex_replay_pending: Optional[bool] = None
+    codex_replay_blocked: Optional[dict] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -1104,6 +1112,50 @@ def _check_data_codex_cache(s: DoctorState) -> CheckResult:
                 else f"{count:,} entries",
         remediation=None,
         details={"entries": count, "codex_last_entry_age_s": age_s},
+    )
+
+
+def _check_data_codex_replay(s: DoctorState) -> CheckResult:
+    """WARN while a byte-zero Codex replay is STALLED rather than merely pending.
+
+    `sync_codex_conversations` defers on the cache-side replay marker, so as long
+    as that marker stands no Codex transcript is ingested at all. The deferral is
+    protective — running ahead of the replayed thread rows stamps a materialized
+    `"(unassigned)"` project the read path then prefers permanently — so the fix
+    is never to drop it. But a whole-tree sync that runs and still cannot consume
+    the marker (a persistently torn `auth.json`, a repeated per-file DB error)
+    holds that deferral open indefinitely, and `cache-sync` still exits 0. This
+    leg is the only standing signal that Codex transcript ingest has stopped.
+
+    A marker that is merely pending is NOT reported: it is the ordinary state
+    between the migration and the next sync, and it clears on its own. The WARN
+    needs the durable `blocked` record, which only a completed-but-unsuccessful
+    whole-tree walk writes.
+    """
+    blocked = s.codex_replay_blocked or {}
+    at = blocked.get("at")
+    details = {
+        "pending": bool(s.codex_replay_pending),
+        "blocked_at": at,
+        "files_failed": blocked.get("files_failed"),
+        "files_deferred_torn": blocked.get("files_deferred_torn"),
+    }
+    if s.codex_replay_pending and isinstance(at, str) and at:
+        return CheckResult(
+            id="data.codex_replay", title="Codex transcript replay",
+            severity="warn",
+            summary=(f"stalled since {at} — Codex transcript ingest is "
+                     "deferred until it completes"),
+            remediation=("Check the Codex auth.json (re-run `codex login` if it "
+                         "is truncated), then `cctally cache-sync --source codex`"),
+            details=details,
+        )
+    return CheckResult(
+        id="data.codex_replay", title="Codex transcript replay",
+        severity="ok",
+        summary="pending (clears on the next Codex sync)"
+                if s.codex_replay_pending else "none pending",
+        remediation=None, details=details,
     )
 
 
@@ -2680,7 +2732,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("data.statusline_pipeline", "_check_statusline_pipeline"),
         ("data.cache_sync_state", "_check_data_cache_sync_state"),
         ("data.codex_cache", "_check_data_codex_cache"),
+        # `data.codex_project_metadata` must stay IMMEDIATELY after
+        # `data.codex_cache` (pinned by
+        # tests/test_doctor_codex_project_metadata.py), so the replay leg goes
+        # after the pair rather than between them.
         ("data.codex_project_metadata", "_check_data_codex_project_metadata"),
+        ("data.codex_replay", "_check_data_codex_replay"),
         ("data.codex_quota", "_check_data_codex_quota"),
         ("data.parse_health", "_check_data_parse_health"),
         ("data.forked_buckets", "_check_data_forked_buckets"),

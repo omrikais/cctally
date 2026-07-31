@@ -8,6 +8,7 @@ import pytest
 import _lib_dashboard_sources as source_kernel
 
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -122,13 +123,13 @@ def test_source_dashboard_bundle_is_frozen_with_stage_one_constants():
     codex = _provider_state("codex")
     all_sources = source_kernel.compose_all_state(claude, codex)
     bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": all_sources},
     )
 
-    assert bundle.source_schema_version == 1
+    assert bundle.source_schema_version == SOURCE_SCHEMA_VERSION
     assert bundle.default_source == "claude"
     assert bundle.source_order == ("claude", "codex", "all")
     with pytest.raises(TypeError):
@@ -140,7 +141,7 @@ def test_source_dashboard_bundle_rejects_a_torn_provider_map():
 
     with pytest.raises(ValueError, match="exactly claude, codex, and all"):
         SourceDashboardBundle(
-            source_schema_version=1,
+            source_schema_version=SOURCE_SCHEMA_VERSION,
             default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={"codex": codex},

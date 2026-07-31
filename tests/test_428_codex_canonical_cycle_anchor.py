@@ -122,7 +122,7 @@ def _quota_read_model(ns, observations, now=NOW):
         now_utc=now,
         display_tz_name="UTC",
     )
-    return ds._quota_read_model(context, observations)
+    return ds._quota_read_model(context, observations, decorated=False)
 
 
 def test_the_fixture_really_is_jittered():

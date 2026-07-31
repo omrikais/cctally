@@ -187,7 +187,13 @@ def test_the_merged_quota_subtree_only_gains_account_keys(codex_env):
     `account_key` per history row by design), so assert the exact movement
     instead — every added path is an `account_key`, nothing is removed, and no
     value that existed before changed. A pooled percentage, a moved boundary or
-    a re-costed milestone would all show up as a CHANGED value."""
+    a re-costed milestone would all show up as a CHANGED value.
+
+    #429 §3.1: the active rows are projections of those history rows and now
+    carry the same R8-gated ownership key, because a bare resource key is not
+    an identity under decoration — two accounts sharing one `$CODEX_HOME` root
+    emit the same key. The claim is unchanged in kind: keys ADDED, none removed,
+    zero pre-existing values changed."""
     _ns, cache, stats, source_module, _root = codex_env
     before = _build(source_module, cache, stats, version="quota-v1").data["quota"]
     _decorate(stats)
@@ -202,7 +208,16 @@ def test_the_merged_quota_subtree_only_gains_account_keys(codex_env):
         key for key in set(before_flat) & set(after_flat)
         if before_flat[key] != after_flat[key]
     )
-    assert added == [f".histories[{index}].account_key" for index in range(4)]
+    assert added == sorted(
+        [f".histories[{index}].account_key" for index in range(4)]
+        + [
+            f".summary.active[{index}].account_key"
+            for index in range(len(after["summary"]["active"]))
+        ]
+    )
+    assert len(after["summary"]["active"]) == 4, (
+        "precondition: all four windows are live, so every active row is "
+        "stamped — an empty active set would make the added-keys claim vacuous")
     assert removed == []
     assert changed == []
 
@@ -1062,3 +1077,216 @@ def test_a_block_only_account_key_still_gets_a_scope(codex_env):
     assert data["account_scopes"][ghost]["is_empty"] is True, (
         "a block-only key owns neither accounting rows nor observations, so it "
         "must report the honest empty state rather than another account's")
+
+
+# --------------------------------------------------------------------------
+# #429 §4.3 — account scopes are independent evidence domains and must be
+# clocked, each at its OWN deadline.
+# --------------------------------------------------------------------------
+
+
+def _weekly_observation(root, account_key, *, captured_at, weekly_reset, used_weekly):
+    return QuotaObservation(
+        identity=QuotaWindowIdentity(
+            source="codex", source_root_key=root, logical_limit_key="limit",
+            observed_slot="primary", window_minutes=10_080,
+            account_key=account_key,
+        ),
+        captured_at=captured_at,
+        used_percent=used_weekly, resets_at=weekly_reset,
+        source_path=f"/private/{account_key[:4]}-429.jsonl", line_offset=1,
+    )
+
+
+def _build_decorated_codex_state(
+    tmp_path, monkeypatch, *, account_a_captured_at, account_b_captured_at,
+    now_utc=NOW, data_version="429-scopes-v1",
+):
+    """A decorated two-account state whose accounts carry STAGGERED captures.
+
+    The shared `codex_env` fixture stamps both accounts with one timestamp, so
+    their freshness flips together and a never-clocked scope is indistinguishable
+    from a correctly-clocked one.
+    """
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _split_corpus_accounts(cache)
+    observations = (
+        _weekly_observation(
+            root, _ACCT_A, captured_at=account_a_captured_at,
+            weekly_reset=now_utc + dt.timedelta(days=2), used_weekly=40.0,
+        ),
+        _weekly_observation(
+            root, _ACCT_B, captured_at=account_b_captured_at,
+            weekly_reset=now_utc + dt.timedelta(days=3), used_weekly=55.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    _decorate(stats)
+    try:
+        return source_module.build_codex_source_state(
+            _context(cache, stats), data_version=data_version)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_account_scopes_are_clocked_independently(tmp_path, monkeypatch):
+    """#429 §4.3: account scopes were never clocked, so a focused account read
+    frozen freshness. They are independent evidence domains and must each flip
+    at their OWN deadline, not together."""
+    now = NOW
+    state = _build_decorated_codex_state(
+        tmp_path, monkeypatch,
+        account_a_captured_at=now - dt.timedelta(minutes=10),
+        account_b_captured_at=now - dt.timedelta(minutes=55),
+        now_utc=now,
+    )
+    scopes = state.data["account_scopes"]
+    assert scopes[_ACCT_A]["quota"]["summary"]["freshness"] == "fresh"
+    assert scopes[_ACCT_B]["quota"]["summary"]["freshness"] == "fresh"
+
+    # +10 min: only B has crossed its 3600 s weekly bound.
+    later = now + dt.timedelta(minutes=10)
+    clocked = sys.modules["_cctally_dashboard_sources"].refresh_codex_source_clock(
+        state, now_utc=later)
+    clocked_scopes = clocked.data["account_scopes"]
+    assert clocked_scopes[_ACCT_A]["quota"]["summary"]["freshness"] == "fresh"
+    assert clocked_scopes[_ACCT_B]["quota"]["summary"]["freshness"] == "stale"
+    # Untouched siblings survive the copy chain.
+    assert clocked_scopes[_ACCT_A]["is_empty"] is False
+    assert "cycle_index" in clocked_scopes[_ACCT_A]["quota"]
+    assert "blocks" in clocked_scopes[_ACCT_A]["quota"]
+    assert clocked_scopes[_ACCT_A]["periods"] == scopes[_ACCT_A]["periods"]
+
+
+def _rebuild_state_with_active(state, active_rows):
+    """A copy of `state` whose TOP-LEVEL quota summary carries `active_rows`."""
+    import dataclasses
+
+    data = dict(state.data)
+    quota = dict(data["quota"])
+    summary = dict(quota["summary"])
+    summary["active"] = tuple(dict(row) for row in active_rows)
+    quota["summary"] = summary
+    data["quota"] = quota
+    return dataclasses.replace(state, data=data)
+
+
+def test_clock_restores_prior_active_order_per_account(tmp_path, monkeypatch):
+    """#429 §3.1: the clock restores the PRIOR active order, and two decorated
+    accounts sharing one `$CODEX_HOME` root publish one bare resource key.
+
+    Keying that restoration on the bare key collapses both rows into a single
+    map entry — every colliding row then draws the same sort index and the
+    stable sort silently falls back to history order. This test fails if
+    `_scoped_quota_identity` is replaced by `str(row["key"])`, which the
+    pre-#429 code did.
+    """
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    state = _build_decorated_codex_state(
+        tmp_path, monkeypatch,
+        account_a_captured_at=NOW - dt.timedelta(minutes=10),
+        account_b_captured_at=NOW - dt.timedelta(minutes=20),
+        data_version="429-order-v1",
+    )
+    active = list(state.data["quota"]["summary"]["active"])
+    assert len(active) == 2, "fixture must publish both accounts' live windows"
+    assert len({str(row["key"]) for row in active}) == 1, (
+        "fixture must have both accounts colliding on ONE bare resource key — "
+        "otherwise bare-key restoration would work and this proves nothing"
+    )
+
+    # Publish a state whose active order is the REVERSE of history order, so
+    # restoring it requires telling the two same-key rows apart.
+    reordered = _rebuild_state_with_active(state, tuple(reversed(active)))
+    expected = [
+        row["account_key"]
+        for row in reordered.data["quota"]["summary"]["active"]
+    ]
+    assert expected == list(reversed(
+        [row["account_key"] for row in active])), "reversal did not take"
+
+    clocked = source_module.refresh_codex_source_clock(reordered, now_utc=NOW)
+    got = [
+        row["account_key"] for row in clocked.data["quota"]["summary"]["active"]
+    ]
+    assert got == expected
+
+
+def _decorated_codex_envelope_with_staggered_captures(tmp_path, monkeypatch):
+    """The SERIALIZED codex source entry of a decorated, staggered fixture."""
+    state = _build_decorated_codex_state(
+        tmp_path, monkeypatch,
+        account_a_captured_at=NOW - dt.timedelta(minutes=10),
+        account_b_captured_at=NOW - dt.timedelta(minutes=55),
+        data_version="429-guard-v1",
+    )
+    wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(state)
+    return {"sources": {"codex": wire}}
+
+
+def _walk_scoped_quota_evidence(envelope):
+    """Yield (scoped_identity, subtree_name, evidence_tuple) for every quota row."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    codex = envelope["sources"]["codex"]["data"]
+
+    def rows(container, name):
+        for row in container:
+            yield (
+                source_module._scoped_quota_identity(row), name,
+                (row.get("captured_at"), row.get("freshness"),
+                 row.get("stale_after_seconds")),
+            )
+    yield from rows(codex["hero"]["quota"]["active"], "hero.quota.active")
+    yield from rows(codex["quota"]["summary"]["active"], "quota.summary.active")
+    yield from rows(codex["quota"]["histories"], "quota.histories")
+    for scope_key, scope in (codex.get("account_scopes") or {}).items():
+        yield from rows(
+            scope["quota"]["summary"]["active"], f"scope[{scope_key}].active")
+        yield from rows(
+            scope["quota"]["histories"], f"scope[{scope_key}].histories")
+
+
+def test_one_scoped_identity_resolves_to_one_evidence_tuple(tmp_path, monkeypatch):
+    """#429 §5.2."""
+    envelope = _decorated_codex_envelope_with_staggered_captures(
+        tmp_path, monkeypatch)
+    seen: dict[tuple, tuple] = {}
+    subtrees: dict[tuple, set] = {}
+    for identity, subtree, evidence in _walk_scoped_quota_evidence(envelope):
+        if identity in seen:
+            assert seen[identity] == evidence, (
+                f"{identity} disagrees between {subtrees[identity]} and {subtree}")
+        seen[identity] = evidence
+        subtrees.setdefault(identity, set()).add(subtree)
+
+    # Non-vacuity — all three, because "appears in two subtrees" is satisfiable
+    # by the equal hero/summary copies alone while skipping scopes entirely.
+    assert any(
+        {"quota.histories"} & s and any(t.endswith(".active") for t in s)
+        for s in subtrees.values()
+    ), "no identity appeared in both a history and its active projection"
+    assert any(
+        any(t.startswith("scope[") for t in s) and "quota.summary.active" in s
+        for s in subtrees.values()
+    ), "no identity appeared in both the parent and a child scope"
+    codex = envelope["sources"]["codex"]["data"]
+    stamped = 0
+    for scope_key, scope in codex["account_scopes"].items():
+        for row in scope["quota"]["summary"]["active"]:
+            if "account_key" in row:
+                assert row["account_key"] == scope_key
+                stamped += 1
+    assert stamped >= 2, (
+        "R8/§3.1: a decorated envelope must stamp `account_key` on child active "
+        "rows — without it every scoped identity degenerates to ('', key) and "
+        "the invariant above holds vacuously")
+    # The scoped identity is load-bearing, not decorative: these two accounts
+    # share one $CODEX_HOME root and therefore ONE bare resource key, with
+    # different evidence. A bare-key invariant would be false by construction.
+    parent_active = codex["quota"]["summary"]["active"]
+    assert len({row["key"] for row in parent_active}) < len(parent_active), (
+        "precondition: the fixture must collide two accounts on one bare key")

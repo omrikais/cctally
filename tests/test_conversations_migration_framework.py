@@ -31,6 +31,12 @@ def _user_version(conn) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _head(ns) -> int:
+    """The conversations registry head. Read from the registry rather than
+    hard-coded, so a new conversations migration does not restate this file."""
+    return len(ns["_CONVERSATIONS_MIGRATIONS"])
+
+
 def _applied_markers(conn) -> set:
     try:
         return {
@@ -42,11 +48,11 @@ def _applied_markers(conn) -> set:
 
 
 def test_fresh_conversations_db_gets_ledger_and_user_version(ns):
-    """A fresh conversations.db comes up at ``user_version = 1`` with the 001
-    marker stamped in its own ``schema_migrations`` ledger."""
+    """A fresh conversations.db comes up at the registry head with every marker
+    stamped in its own ``schema_migrations`` ledger."""
     conn = ns["open_conversations_db"](attach_cache=False)
     try:
-        assert _user_version(conn) == 1
+        assert _user_version(conn) == _head(ns)
         assert "001_adopt_schema_version_marker" in _applied_markers(conn)
     finally:
         conn.close()
@@ -73,7 +79,7 @@ def test_populated_conversations_db_adopts_without_data_change(ns):
 
     conn2 = ns["open_conversations_db"](attach_cache=False)
     try:
-        assert _user_version(conn2) == 1
+        assert _user_version(conn2) == _head(ns)
         assert "001_adopt_schema_version_marker" in _applied_markers(conn2)
         # Data untouched — the source-file row is still there.
         cnt = conn2.execute(

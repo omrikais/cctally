@@ -11,6 +11,7 @@ from dataclasses import replace
 import pytest
 
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -122,7 +123,7 @@ def _boot(ns, tmp_path, monkeypatch):
     codex = _state("codex", now, total_cost=2.0)
     snap = ns["_empty_dashboard_snapshot"]()
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
@@ -241,7 +242,7 @@ def _set_hero_freshness(ns, *, claude=None, codex=None):
     new_claude = changed(old_claude, claude)
     new_codex = changed(old_codex, codex)
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={
@@ -622,7 +623,7 @@ def test_codex_data_change_updates_digest_and_compose_drift(monkeypatch, tmp_pat
         )
         claude = snap.source_bundle.sources["claude"]
         snap.source_bundle = SourceDashboardBundle(
-            source_schema_version=1, default_source="claude",
+            source_schema_version=SOURCE_SCHEMA_VERSION, default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={
                 "claude": claude, "codex": changed_codex,
@@ -844,7 +845,7 @@ def _boot_forecast(ns, tmp_path, monkeypatch, *, status, projected=82.5):
     )
     snap = ns["_empty_dashboard_snapshot"]()
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
@@ -953,7 +954,7 @@ def test_share_forecast_blanks_after_an_idle_clock_turns_the_status_stale(
 
         claude = bundle.sources["claude"]
         snap.source_bundle = SourceDashboardBundle(
-            source_schema_version=1,
+            source_schema_version=SOURCE_SCHEMA_VERSION,
             default_source="claude",
             source_order=("claude", "codex", "all"),
             sources={

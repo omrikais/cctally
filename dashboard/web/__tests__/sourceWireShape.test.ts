@@ -21,7 +21,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     const env = fixture as Record<string, unknown>;
 
     // The four bundle fields are TOP-LEVEL siblings, not nested under `sources`.
-    expect(env.source_schema_version).toBe(1);
+    expect(env.source_schema_version).toBe(2);
     expect(env.default_source).toBe('claude');
     expect(env.source_order).toEqual(['claude', 'codex', 'all']);
   });
@@ -75,7 +75,7 @@ describe('S4 source envelope wire shape (guard)', () => {
     const slice = makeSourceEnvelope() as unknown as Record<string, unknown>;
 
     // Top-level siblings, mirroring the JSON fixture + the real serializer.
-    expect(slice.source_schema_version).toBe(1);
+    expect(slice.source_schema_version).toBe(2);
     expect(slice.default_source).toBe('claude');
     expect(slice.source_order).toEqual(['claude', 'codex', 'all']);
 

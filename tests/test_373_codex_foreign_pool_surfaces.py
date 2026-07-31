@@ -191,7 +191,7 @@ def _quota_read_model(ns, observations, now):
         now_utc=now,
         display_tz_name="UTC",
     )
-    return ds._quota_read_model(context, observations)
+    return ds._quota_read_model(context, observations, decorated=False)
 
 
 def test_model_scoped_row_is_listed_but_excluded_from_account_aggregates(ns):

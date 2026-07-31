@@ -549,15 +549,48 @@ def _canonical_container(value: object) -> str | None:
     return _codex_canonical_json(value)
 
 
+# Codex is mid-rollout on `thread_source`: Desktop 0.146.0-alpha.3.1 emits it,
+# the CLI 0.146.0 behind the MCP server does not. Abandoning the identity when
+# it is absent costs the rollout its thread row AND every normalized message,
+# so infer the category the provider would most likely emit instead. Inferring
+# rather than minting a null parent keeps one identity across the release that
+# starts emitting the field.
+_CODEX_DEFAULT_THREAD_SOURCE = "user"
+
+
+def _inferred_codex_thread_source(payload: dict[str, Any]) -> str:
+    """The thread-origin category for one ``session_meta`` payload.
+
+    Per-record and stateless: a later ``session_meta`` never inherits an earlier
+    one's category, so a file's key sequence is a function of its own bytes.
+    The string form of ``source`` is deliberately never used — ``source:
+    "vscode"`` co-occurs with ``thread_source: "user"``, so the client name and
+    the origin category are orthogonal vocabularies.
+    """
+    explicit = _codex_string(payload.get("thread_source"))
+    if explicit is not None:
+        return explicit
+    source = payload.get("source")
+    if isinstance(source, dict) and len(source) == 1:
+        # A single-key object is the shape Codex uses for `{"subagent": {...}}`.
+        # Guard every malformed variant: the identity encoder REJECTS an empty
+        # parent key, so an unguarded rule turns bad metadata into an ingest
+        # exception rather than a degraded-but-working ingest.
+        only_key = _codex_string(next(iter(source)))
+        if only_key is not None:
+            return only_key
+    return _CODEX_DEFAULT_THREAD_SOURCE
+
+
 def _thread_metadata_from_session_meta(
     payload: dict[str, Any], path_str: str, source_root_key: str | None,
 ) -> CodexThreadMetadata:
     accounting_id = _codex_string(payload.get("id"))
     native_thread_id = _codex_string(payload.get("session_id")) or accounting_id
-    root_thread_id = _codex_string(payload.get("thread_source"))
+    root_thread_id = _inferred_codex_thread_source(payload)
     parent_thread_id = _codex_string(payload.get("forked_from_id"))
     conversation_key = None
-    if native_thread_id is not None and root_thread_id is not None:
+    if native_thread_id is not None:
         conversation_key = canonical_identity_from_root_key(
             "codex", "conversation", source_root_key, native_thread_id, root_thread_id
         )

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
     SourceDashboardBundle,
     SourceDashboardState,
@@ -58,7 +59,7 @@ def _boot(ns, tmp_path, monkeypatch):
     })
     snap = ns["_empty_dashboard_snapshot"]()
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},
@@ -177,7 +178,7 @@ def _boot_real_codex(ns, tmp_path, monkeypatch, *, incomplete_metadata=False):
     snap = ns["_empty_dashboard_snapshot"]()
     snap.generated_at = now
     snap.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={"claude": claude, "codex": codex, "all": compose_all_state(claude, codex)},

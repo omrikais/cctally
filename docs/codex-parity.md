@@ -107,8 +107,9 @@ S6 makes S1's write-only physical corpus readable. Inside the same per-file
 browse rollups, replayable from the stored events by cache migration
 `025_codex_conversation_normalization`; the normalized corpus gets its own
 external-content FTS index with an independent lifecycle, and an explicit
-`normalization_pending` capability state covers caches whose events predate the
-migration. Provider-neutral assembly kernels then derive the
+`normalization_pending` capability state covers every store whose normalized
+corpus is not yet authoritative — events predating that migration, or a
+byte-zero replay still pending. Provider-neutral assembly kernels then derive the
 first-meaningful-prompt title, digest-exact mirror pairing, canonical rendered
 items with a qualified stable `item_key`, per-turn cost attribution
 reconciling to a priced conversation total under an explicit

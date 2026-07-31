@@ -539,7 +539,8 @@ export interface ForecastPresentation {
 //
 // The server already answers the question and publishes the answer:
 // `_quota_read_model` appends a `quota.summary.active[]` row, keyed identically
-// to the history row, only when `baseline.resets_at > now`. That set is exactly
+// to the history row, only when `_active_row_from_history` says the window is
+// live (#429). That set is exactly
 // this predicate, per WINDOW. Reading it keeps the decision in the one place
 // that owns it — build time — instead of re-deriving cycle validity on the
 // client from a view #350 documented as lossy for precisely that purpose.
@@ -551,8 +552,10 @@ export interface ForecastPresentation {
 // two accounts sharing one `$CODEX_HOME` root — the shape
 // `adopt_unidentified_observations` and `_codex_account_scopes_wire` are both
 // written for — produce two history rows under ONE key, and the merged parent
-// lists that key once, contributed by whichever account is live. A liveness
-// lookup for ONE account must therefore come from THAT account's
+// lists that key TWICE when both are live, once per account, with independent
+// evidence (#429 — the decorated fixture disproves the "listed once" reading
+// this comment used to carry; the scoped identity is `(account_key, key)`).
+// A liveness lookup for ONE account must therefore come from THAT account's
 // `account_scopes` child, whose `quota` is built by `_quota_read_model` over
 // that account's own observations. The parent's set answers only the
 // provider-wide question "is any window with this key live", which is not the

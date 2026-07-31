@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from conftest import load_script, redirect_paths
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     SourceDashboardBundle,
     SourceDashboardState,
     compose_all_state,
@@ -207,6 +208,7 @@ def test_http_snapshot_emits_singular_cycle_and_retained_independent_pool(
                 display_tz_name="UTC",
             ),
             observations,
+            decorated=False,
         )
     finally:
         cache.close()
@@ -234,7 +236,7 @@ def test_http_snapshot_emits_singular_cycle_and_retained_independent_pool(
     )
     snapshot = ns["_empty_dashboard_snapshot"]()
     snapshot.source_bundle = SourceDashboardBundle(
-        source_schema_version=1,
+        source_schema_version=SOURCE_SCHEMA_VERSION,
         default_source="claude",
         source_order=("claude", "codex", "all"),
         sources={

@@ -352,7 +352,12 @@ def test_export_v1_codex_pending_exits_1(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cq, "codex_normalization_authoritative", lambda conn: False)
     rc = ns["cmd_transcript"](_ns_export(key))
     assert rc == 1
-    assert "025" in capsys.readouterr().err     # cites migration 025
+    err = capsys.readouterr().err
+    # A store deferred by a byte-zero replay marker reaches this same branch, so
+    # the note must name the pending work generically — never a migration that
+    # was applied long ago.
+    assert "the pending work runs on the next cache open" in err
+    assert "025" not in err
 
 
 def test_export_codex_cli_http_byte_parity(tmp_path, monkeypatch, capsysbinary):
@@ -450,7 +455,10 @@ def test_search_codex_pending_exit_0_with_note(tmp_path, monkeypatch, capsys):
     rc = ns["cmd_transcript"](_ns_search("Synthetic", source="codex", json=True))
     assert rc == 0                               # navigation: "nothing yet" is truthful
     captured = capsys.readouterr()
-    assert "025" in captured.err                 # one stderr note citing migration 025
+    # Same generic wording as the export note: a replay-deferred store lands here
+    # too, and telling the user to wait for migration 025 would be false.
+    assert "the pending work runs on the next cache open" in captured.err
+    assert "025" not in captured.err
     payload = json.loads(captured.out)
     assert payload["source"] == "codex" and payload["hits"] == []
 

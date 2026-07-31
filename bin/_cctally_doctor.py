@@ -1125,12 +1125,25 @@ def _doctor_gather_state_impl(
     # #416 review B4: the durable record that a torn Codex `auth.json` halted
     # ingest. Same cache_meta read, same degrade-to-None-on-anything contract.
     codex_torn_deferred = None
+    # The byte-zero Codex replay stall signal. The marker itself is a bare "1";
+    # the sibling `blocked` record is the JSON one, so it is read through the
+    # same loop while the marker gets a plain existence probe. Key names come
+    # from the kernel constants, never inline literals.
+    codex_replay_pending = None
+    codex_replay_blocked = None
+    try:
+        import _lib_codex_conversation as _codex_kern
+        _blocked_key = _codex_kern.CODEX_REPLAY_BLOCKED_KEY
+        _pending_key = _codex_kern.CODEX_REPLAY_FROM_ZERO_KEY
+    except Exception:
+        _blocked_key = "codex_replay_from_zero_blocked"
+        _pending_key = "codex_replay_from_zero_pending"
     try:
         if _cache_probe_allowed and _cctally_core.CACHE_DB_PATH.exists():
             conn = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
             try:
                 for _key in ("parse_health_claude", "parse_health_codex",
-                             "codex_torn_auth_deferred"):
+                             "codex_torn_auth_deferred", _blocked_key):
                     try:
                         row = conn.execute(
                             "SELECT value FROM cache_meta WHERE key = ?",
@@ -1143,10 +1156,19 @@ def _doctor_gather_state_impl(
                                     parse_health_claude = _parsed
                                 elif _key == "parse_health_codex":
                                     parse_health_codex = _parsed
+                                elif _key == _blocked_key:
+                                    codex_replay_blocked = _parsed
                                 else:
                                     codex_torn_deferred = _parsed
                     except (sqlite3.OperationalError, ValueError):
                         pass
+                try:
+                    codex_replay_pending = conn.execute(
+                        "SELECT 1 FROM cache_meta WHERE key = ?",
+                        (_pending_key,),
+                    ).fetchone() is not None
+                except sqlite3.OperationalError:
+                    pass
             finally:
                 conn.close()
     except Exception:
@@ -1722,6 +1744,8 @@ def _doctor_gather_state_impl(
         parse_health_claude=parse_health_claude,
         parse_health_codex=parse_health_codex,
         codex_torn_deferred=codex_torn_deferred,
+        codex_replay_pending=codex_replay_pending,
+        codex_replay_blocked=codex_replay_blocked,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,

@@ -548,13 +548,20 @@ function makeDecoratedCodexParentOnly(): CodexSourceData {
     hero: {
       ...base.hero,
       // `hero.quota` is BUILT FROM `quota.summary`: the source builder passes
-      // `quota["summary"]` straight into the hero, so the two agree at the
-      // point of construction. They are not guaranteed equal in a DELIVERED
-      // envelope — a captured production snapshot carried older `captured_at`
-      // values in `hero.quota.active[]` than in `quota.summary.active[]` for
-      // two rows, meaning the hero it shipped came from an earlier generation.
-      // Keeping them in step here is still what a coherent single-generation
-      // wire looks like, which is what a fixture should model.
+      // `quota["summary"]` straight into the hero. Publication then FREEZES the
+      // two into separate mappings holding equal values, so keeping them in
+      // step is a promise about value equality, not aliasing.
+      //
+      // #429: a captured production snapshot once carried older `captured_at`
+      // values in `hero.quota.active[]` than in `quota.summary.active[]`. That
+      // was NOT an earlier hero generation, as this comment previously
+      // reasoned — the build filled the active row's `captured_at` from the
+      // interpreted baseline while the idle clock refilled it from the latest
+      // physical observation, and the clock only ever replaced
+      // `quota.summary`. The server now derives both from one helper and
+      // re-derives the hero's copy on every tick, so the delivered envelope is
+      // coherent too. This fixture already modelled the coherent wire and is
+      // unchanged.
       quota: summary,
       cycles: [
         {
@@ -1084,7 +1091,7 @@ export function makeSourceEnvelope(
   overrides?: Partial<SourceEnvelopeSlice>,
 ): SourceEnvelopeSlice {
   return {
-    source_schema_version: 1,
+    source_schema_version: 2,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

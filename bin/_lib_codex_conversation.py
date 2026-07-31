@@ -74,6 +74,23 @@ CODEX_TITLE_MAX = _TITLE_MAX
 # migration (the store is wholly re-derivable).
 CODEX_CONVERSATION_CONTRACT_VERSION = "5"
 
+# Byte-zero Codex replay markers (spec
+# docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md
+# §4.3). One `cache_meta` key per store, armed by cache migration 035 /
+# conversations migration 002 and consumed inside the sync function that owns
+# the correct replay semantics. They live in this kernel because three layers
+# read them — the cache glue that consumes them, the read-side authority probe,
+# and the doctor I/O shell — and a SQL string literal in any one of them would
+# silently outlive a rename of the others.
+CODEX_REPLAY_FROM_ZERO_KEY = "codex_replay_from_zero_pending"
+CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY = (
+    "codex_conversation_replay_from_zero_pending"
+)
+# Written when a whole-tree Codex sync completed and still could NOT consume
+# `CODEX_REPLAY_FROM_ZERO_KEY` — the replay is stalled, not merely pending, and
+# Codex transcript ingest is deferred behind it. Read by `doctor`.
+CODEX_REPLAY_BLOCKED_KEY = "codex_replay_from_zero_blocked"
+
 # Structural wrapper prefixes skipped during title selection (§4.3), pinned from
 # the corpus (title-wrapper-window). Prefix-structural, never content heuristics.
 CODEX_TITLE_SKIP_PREFIXES: tuple[str, ...] = (

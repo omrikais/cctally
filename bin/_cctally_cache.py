@@ -511,6 +511,38 @@ _codex_conversation_fts_full_clear = _cctally_db_sib._codex_conversation_fts_ful
 # writes (#179) so the ON CONFLICT idiom lives in one place. Caller commits.
 _set_cache_meta = _cctally_db_sib._set_cache_meta
 
+# Byte-zero Codex replay markers (spec
+# docs/superpowers/specs/2026-07-30-codex-thread-source-inference-design.md
+# §4.3). Cache migration 035 / conversations migration 002 write them and clear
+# NO table; the sync functions consume them, because only the sync owns the
+# replay semantics that keep the repair safe:
+#
+#   * `sync_codex_cache` ORs the cache-side marker into its own `rebuild`, so
+#     the rebuild path captures `rebuild_known_identities` before clearing. A
+#     migration clearing `codex_session_files` directly would leave the next
+#     ordinary sync with an empty snapshot, sending every re-read rollout to the
+#     live-`auth.json` branch and re-attributing historical spend (§4.1).
+#   * `sync_codex_conversations` defers on the CONVERSATIONS marker until the
+#     cache-side one has cleared, because `_recompute_codex_rollups` reads the
+#     thread row from cache.db and a missing one stamps a materialized
+#     "(unassigned)" project the read path then prefers permanently (§4.2).
+#
+# The conversations key is deliberately DISTINCT from
+# `conversation_rebuild_codex_pending`: `_ensure_codex_conversation_contract`
+# consumes that one by replaying normalization over already-retained events —
+# which preserves their NULL conversation keys — and then deletes it, silently
+# discarding the repair.
+#
+# The keys themselves are defined in the pure kernel `_lib_codex_conversation`
+# and re-exported here, so the read-side authority probe and the doctor shell
+# bind the same names instead of repeating a SQL string literal.
+CODEX_REPLAY_FROM_ZERO_KEY = (
+    _lib_codex_conversation.CODEX_REPLAY_FROM_ZERO_KEY)
+CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY = (
+    _lib_codex_conversation.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY)
+CODEX_REPLAY_BLOCKED_KEY = (
+    _lib_codex_conversation.CODEX_REPLAY_BLOCKED_KEY)
+
 
 # cache.db WAL hardening (#297). See
 # docs/superpowers/specs/2026-07-13-cache-db-wal-hardening-design.md.
@@ -4903,6 +4935,24 @@ def sync_codex_cache(
         # and bypasses every whole-tree operation (orphan prune, root prune,
         # global quota reconcile) — see the guards threaded through below.
         targeted = only_paths is not None
+
+        # A pending byte-zero replay is consumed HERE, not by the migration that
+        # armed it, so the rebuild path below captures `rebuild_known_identities`
+        # before clearing. A migration that cleared `codex_session_files`
+        # directly would leave the next ordinary sync with an empty snapshot,
+        # sending every re-read rollout to the live-auth branch and
+        # re-attributing historical spend to whoever is authenticated now.
+        replay_pending = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (CODEX_REPLAY_FROM_ZERO_KEY,),
+        ).fetchone() is not None
+        if replay_pending and targeted:
+            # A live-tail tick must DEFER, never raise through the
+            # `targeted and rebuild` guard below.
+            stats.deferred_reason = "replay_pending"
+            return stats
+        rebuild = rebuild or replay_pending
+
         if targeted and rebuild:
             raise ValueError(
                 "sync_codex_cache: only_paths is incompatible with rebuild")
@@ -5742,6 +5792,35 @@ def sync_codex_cache(
             else:
                 conn.execute("DELETE FROM cache_meta WHERE key = ?",
                              ("codex_torn_auth_deferred",))
+            # Consume the byte-zero replay marker only after a clean full walk,
+            # and only when THIS call observed it. A contended call returned
+            # long before here, and a walk that failed or deferred a file leaves
+            # the marker standing — a surviving marker is what makes the repair
+            # retry on the next sync, and it is also what keeps
+            # `sync_codex_conversations` deferred until the cache side genuinely
+            # holds the replayed thread rows (§4.2). The `replay_pending` guard
+            # is defense in depth: `open_cache_db` and this walk share an
+            # exclusive lock today, so nothing can arm the marker in between —
+            # but the conversations side has no such exclusion, and the two
+            # clears must keep the same shape.
+            if stats.files_failed == 0 and stats.files_deferred_torn == 0:
+                if replay_pending:
+                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                 (CODEX_REPLAY_FROM_ZERO_KEY,))
+                conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                             (CODEX_REPLAY_BLOCKED_KEY,))
+            elif replay_pending:
+                # A full walk ran and could NOT consume the marker, so the
+                # replay — and with it every Codex transcript ingest, which
+                # defers behind this marker — is stalled rather than merely
+                # not-yet-run. `doctor` reads this; the deferral itself stays,
+                # because running ahead is what stamps "(unassigned)" (§4.2).
+                _set_cache_meta(conn, CODEX_REPLAY_BLOCKED_KEY, json.dumps({
+                    "at": dt.datetime.now(dt.timezone.utc).isoformat(
+                        timespec="seconds").replace("+00:00", "Z"),
+                    "files_failed": stats.files_failed,
+                    "files_deferred_torn": stats.files_deferred_torn,
+                }, sort_keys=True))
             conn.commit()
         # Window-scoped spend adoption (spec
         # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
@@ -7747,6 +7826,15 @@ def _ensure_codex_conversation_contract(conn: sqlite3.Connection) -> bool:
     JSONL. They still must remain usable after an upgrade, so replay only the
     already-retained physical events under the provider-local conversation lock.
     Empty stores keep their existing rebuild marker for the next real sync.
+
+    This must NEVER consume ``CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY`` (§4.3).
+    Do not merge the two keys during a tidy-up: this replay runs over
+    already-retained events, which preserves their NULL conversation keys, and
+    then deletes the flag it consumed — so a ``dashboard --no-sync`` or qualified
+    CLI read landing between the migration and the next real sync would silently
+    discard the byte-zero repair. Only a re-read from offset zero can mint the
+    missing identities, which is why that marker belongs to
+    ``sync_codex_conversations`` alone.
     """
     current = _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION
 
@@ -8145,6 +8233,24 @@ def sync_claude_conversations(
     return stats
 
 
+def _cache_side_replay_pending(conn: sqlite3.Connection) -> bool:
+    """Whether cache.db still has a byte-zero Codex replay pending (§4.3).
+
+    Read through the ``cache_db`` attachment conversation connections already
+    carry, and qualified: ``cache_meta`` exists in BOTH stores, so an unqualified
+    name would resolve to conversations.db's own table and never see the
+    cache-side marker. A bare or legacy connection without the attachment
+    reports False rather than raising, so it cannot wedge the conversations sync.
+    """
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cache_db.cache_meta WHERE key=?",
+            (CODEX_REPLAY_FROM_ZERO_KEY,),
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
 def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
     """Clear only the re-derivable Codex transcript families."""
     conn.execute("DELETE FROM codex_conversation_events")
@@ -8191,10 +8297,25 @@ def sync_codex_conversations(
                 != _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION
             )
         )
-        if (pending_rebuild or contract_rebuild) and targeted:
+        codex_replay_pending = conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY,),
+        ).fetchone() is not None
+        # Ordering (§4.2): the cache replay must finish first.
+        # `_recompute_codex_rollups` reads `codex_conversation_threads` from
+        # cache.db, and a missing thread row does not yield NULL — it stamps a
+        # materialized "(unassigned)" project that the read path then PREFERS,
+        # permanently, for any conversation with no later activity. The two
+        # stores are synced by independent paths (the dashboard runs conversation
+        # sync in its own worker), so nothing else orders them.
+        if _cache_side_replay_pending(conn):
+            stats.deferred_reason = "cache_replay_pending"
+            return stats
+        if (pending_rebuild or contract_rebuild or codex_replay_pending) and targeted:
             stats.deferred_reason = "rebuild_pending"
             return stats
-        rebuild = rebuild or pending_rebuild or contract_rebuild
+        rebuild = (
+            rebuild or pending_rebuild or contract_rebuild or codex_replay_pending)
         if rebuild:
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
@@ -8494,6 +8615,17 @@ def sync_codex_conversations(
                 "DELETE FROM cache_meta "
                 "WHERE key='conversation_rebuild_codex_pending'"
             )
+            # Clear ONLY the marker this call observed. The dispatcher that
+            # arms it holds `CONVERSATIONS_LOCK_MAINTENANCE_PATH` shared while
+            # this walk serializes on `CONVERSATIONS_LOCK_CODEX_PATH`, so a
+            # marker armed after the read above belongs to a replay this walk
+            # never performed — and deleting it would strand the repair for
+            # good, since the migration is stamped and never re-arms.
+            if codex_replay_pending:
+                conn.execute(
+                    "DELETE FROM cache_meta WHERE key=?",
+                    (CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY,),
+                )
             conn.commit()
         _report_conversation_progress(progress, "checkpoint", stats)
         _harden_conversation_sidecars()

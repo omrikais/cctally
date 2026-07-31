@@ -53,6 +53,7 @@ from _cctally_core import (
     _get_budget_config,
 )
 from _lib_dashboard_sources import (
+    SOURCE_SCHEMA_VERSION,
     dashboard_resource_key as _dashboard_resource_key,
 )
 from _lib_display_tz import _compute_display_block, format_display_dt
@@ -720,7 +721,7 @@ def _source_bundle_to_envelope(bundle: object | None) -> dict:
     unavailable = {source: _unavailable_source_wire() for source in ("claude", "codex", "all")}
     if bundle is None:
         return {
-            "source_schema_version": 1,
+            "source_schema_version": SOURCE_SCHEMA_VERSION,
             "default_source": "claude",
             "source_order": ["claude", "codex", "all"],
             "sources": unavailable,
@@ -741,7 +742,7 @@ def _source_bundle_to_envelope(bundle: object | None) -> dict:
         }
     except Exception:  # Never turn an unexpected snapshot shape into request-thread I/O.
         return {
-            "source_schema_version": 1,
+            "source_schema_version": SOURCE_SCHEMA_VERSION,
             "default_source": "claude",
             "source_order": ["claude", "codex", "all"],
             "sources": unavailable,

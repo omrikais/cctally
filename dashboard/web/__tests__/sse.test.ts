@@ -173,7 +173,7 @@ function withSources<T extends object>(env: T, alerts: ReturnType<typeof alert>[
     // Real wire shape (#294 S5 QA): the source fields spread at the envelope
     // TOP level; `sources` is the FLAT per-source map. `collectToastAlertRows`
     // reads `env.sources.claude.data.alerts.rows`.
-    source_schema_version: 1,
+    source_schema_version: 2,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: {

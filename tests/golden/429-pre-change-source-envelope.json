@@ -1,0 +1,588 @@
+{
+  "default_source": "claude",
+  "source_order": [
+    "claude",
+    "codex",
+    "all"
+  ],
+  "source_schema_version": 1,
+  "sources": {
+    "all": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native-union",
+          "status": "derived"
+        },
+        "budget": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        },
+        "hero": {
+          "semantics": "compatible-provider-totals",
+          "status": "derived"
+        },
+        "quota": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "combined": {
+          "cost_usd": 0.0,
+          "total_tokens": 0
+        },
+        "providers": {
+          "claude": {
+            "alerts": {
+              "rows": []
+            },
+            "budget": {
+              "label": "Claude subscription budget"
+            },
+            "hero": {
+              "cost_usd": 0.0,
+              "total_tokens": 0
+            },
+            "periods": {
+              "daily": {
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "rows": []
+            },
+            "quota": {
+              "blocks": [],
+              "milestones": []
+            },
+            "sessions": {
+              "rows": []
+            }
+          },
+          "codex": {
+            "alerts": {
+              "actual_thresholds": [
+                90,
+                95
+              ],
+              "projected_thresholds": [],
+              "rows": []
+            },
+            "budget": {
+              "milestones": [],
+              "projected": [],
+              "status": null
+            },
+            "cache_report": {
+              "anomaly_threshold_pp": 15,
+              "anomaly_window_days": 14,
+              "by_model": [],
+              "by_project": [],
+              "days": [],
+              "fourteen_day_counterfactual_usd": 0.0,
+              "fourteen_day_efficiency_ratio": 0.0,
+              "is_empty": true,
+              "seven_day_anomaly_count": 0,
+              "seven_day_net_usd": 0.0,
+              "today": {
+                "anomaly_reasons": [],
+                "anomaly_triggered": false,
+                "baseline_daily_row_count": 0,
+                "baseline_median_percent": null,
+                "cache_hit_percent": 0.0,
+                "date": "2026-07-20",
+                "delta_pp": null,
+                "net_usd": 0.0,
+                "saved_usd": 0.0,
+                "wasted_usd": 0.0
+              },
+              "window_days": 14
+            },
+            "hero": {
+              "alerts": {
+                "count": 0
+              },
+              "budget": null,
+              "cached_input_tokens": 0,
+              "cost_usd": 0.0,
+              "cycle": {
+                "resets_at": "2026-07-23T00:00:00+00:00",
+                "start_at": "2026-07-16T00:00:00+00:00",
+                "window_minutes": 10080
+              },
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "quota": {
+                "active": [
+                  {
+                    "captured_at": "2026-07-19T23:20:00+00:00",
+                    "current_percent": 12.0,
+                    "freshness": "fresh",
+                    "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                    "resets_at": "2026-07-23T00:00:00+00:00",
+                    "stale_after_seconds": 3600
+                  }
+                ],
+                "active_window_count": 1,
+                "freshness": "fresh",
+                "latest_percent": 12.0,
+                "window_count": 1
+              },
+              "reasoning_output_tokens": 0,
+              "total_tokens": 0
+            },
+            "periods": {
+              "daily": {
+                "display_tz": "UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "monthly": {
+                "display_tz": "UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "weekly": {
+                "display_tz": "UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "rows": [],
+              "total_cost_usd": 0.0,
+              "total_tokens": 0
+            },
+            "quota": {
+              "blocks": [],
+              "cycle_index": [],
+              "histories": [
+                {
+                  "captured_at": "2026-07-19T23:55:00+00:00",
+                  "current_percent": 12.0,
+                  "forecast": {
+                    "confidence": "low",
+                    "current_percent": 12.0,
+                    "projected_percent": 21.0,
+                    "rate_percent_per_hour": 0.125,
+                    "remaining_seconds": 259200,
+                    "resets_at": "2026-07-23T00:00:00+00:00",
+                    "sample_count": 1,
+                    "sample_span_seconds": 345600,
+                    "status": "ok"
+                  },
+                  "freshness": "fresh",
+                  "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                  "label": "7-day limit",
+                  "observed_slot": "primary",
+                  "source": "codex",
+                  "stale_after_seconds": 3600,
+                  "window_minutes": 10080
+                }
+              ],
+              "milestones": [
+                {
+                  "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+                  "captured_at": "2026-07-19T23:20:00+00:00",
+                  "cumulative_usd": 0.0,
+                  "key": "quota_milestone:0p6bBAcijCm6ENu1hWB4oxfPLTFo6pMqekdDYLfNUrw",
+                  "marginal_usd": 0.0,
+                  "percent": 10,
+                  "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                  "resets_at": "2026-07-23T00:00:00+00:00",
+                  "source": "codex",
+                  "window_minutes": 10080
+                },
+                {
+                  "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+                  "captured_at": "2026-07-19T23:20:00+00:00",
+                  "cumulative_usd": 0.0,
+                  "key": "quota_milestone:2ufz4L9InZDS4KO-P_HYEjN-c1Uf9JGTC0HMHaOs9-c",
+                  "marginal_usd": 0.0,
+                  "percent": 11,
+                  "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                  "resets_at": "2026-07-23T00:00:00+00:00",
+                  "source": "codex",
+                  "window_minutes": 10080
+                },
+                {
+                  "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+                  "captured_at": "2026-07-19T23:20:00+00:00",
+                  "cumulative_usd": 0.0,
+                  "key": "quota_milestone:zaQpcaM2gJudGR1kHv3TCxb-8m2kvkqFXOsS7kiQFfQ",
+                  "marginal_usd": 0.0,
+                  "percent": 12,
+                  "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                  "resets_at": "2026-07-23T00:00:00+00:00",
+                  "source": "codex",
+                  "window_minutes": 10080
+                }
+              ],
+              "summary": {
+                "active": [
+                  {
+                    "captured_at": "2026-07-19T23:55:00+00:00",
+                    "current_percent": 12.0,
+                    "freshness": "fresh",
+                    "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                    "resets_at": "2026-07-23T00:00:00+00:00",
+                    "stale_after_seconds": 3600
+                  }
+                ],
+                "active_window_count": 1,
+                "freshness": "fresh",
+                "latest_percent": 12.0,
+                "window_count": 1
+              }
+            },
+            "sessions": {
+              "rows": [],
+              "total_cost_usd": 0.0,
+              "total_sessions": 0,
+              "total_tokens": 0
+            }
+          }
+        }
+      },
+      "data_version": "all:88cfe601e1aa2206991683c7",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-07-20T00:00:00Z",
+      "warnings": []
+    },
+    "claude": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "sessions": {
+          "semantics": "legacy-session-rollup",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "budget": {
+          "label": "Claude subscription budget"
+        },
+        "hero": {
+          "cost_usd": 0.0,
+          "total_tokens": 0
+        },
+        "periods": {
+          "daily": {
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "rows": []
+        },
+        "quota": {
+          "blocks": [],
+          "milestones": []
+        },
+        "sessions": {
+          "rows": []
+        }
+      },
+      "data_version": "claude:0:0:0:0:0:0:0:da9fd0dc177aaf922299e646",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-07-20T00:00:00Z",
+      "warnings": []
+    },
+    "codex": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "calendar-period",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "inclusive-input-token-reuse",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "native-reset-cycle",
+          "status": "supported"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "qualified-attribution",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "native-windows",
+          "status": "derived"
+        },
+        "sessions": {
+          "semantics": "inclusive-input-tokens",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "native-reset-cycles",
+          "status": "derived"
+        }
+      },
+      "data": {
+        "alerts": {
+          "actual_thresholds": [
+            90,
+            95
+          ],
+          "projected_thresholds": [],
+          "rows": []
+        },
+        "budget": {
+          "milestones": [],
+          "projected": [],
+          "status": null
+        },
+        "cache_report": {
+          "anomaly_threshold_pp": 15,
+          "anomaly_window_days": 14,
+          "by_model": [],
+          "by_project": [],
+          "days": [],
+          "fourteen_day_counterfactual_usd": 0.0,
+          "fourteen_day_efficiency_ratio": 0.0,
+          "is_empty": true,
+          "seven_day_anomaly_count": 0,
+          "seven_day_net_usd": 0.0,
+          "today": {
+            "anomaly_reasons": [],
+            "anomaly_triggered": false,
+            "baseline_daily_row_count": 0,
+            "baseline_median_percent": null,
+            "cache_hit_percent": 0.0,
+            "date": "2026-07-20",
+            "delta_pp": null,
+            "net_usd": 0.0,
+            "saved_usd": 0.0,
+            "wasted_usd": 0.0
+          },
+          "window_days": 14
+        },
+        "hero": {
+          "alerts": {
+            "count": 0
+          },
+          "budget": null,
+          "cached_input_tokens": 0,
+          "cost_usd": 0.0,
+          "cycle": {
+            "resets_at": "2026-07-23T00:00:00+00:00",
+            "start_at": "2026-07-16T00:00:00+00:00",
+            "window_minutes": 10080
+          },
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "quota": {
+            "active": [
+              {
+                "captured_at": "2026-07-19T23:20:00+00:00",
+                "current_percent": 12.0,
+                "freshness": "fresh",
+                "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                "resets_at": "2026-07-23T00:00:00+00:00",
+                "stale_after_seconds": 3600
+              }
+            ],
+            "active_window_count": 1,
+            "freshness": "fresh",
+            "latest_percent": 12.0,
+            "window_count": 1
+          },
+          "reasoning_output_tokens": 0,
+          "total_tokens": 0
+        },
+        "periods": {
+          "daily": {
+            "display_tz": "UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "monthly": {
+            "display_tz": "UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "weekly": {
+            "display_tz": "UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "rows": [],
+          "total_cost_usd": 0.0,
+          "total_tokens": 0
+        },
+        "quota": {
+          "blocks": [],
+          "cycle_index": [],
+          "histories": [
+            {
+              "captured_at": "2026-07-19T23:55:00+00:00",
+              "current_percent": 12.0,
+              "forecast": {
+                "confidence": "low",
+                "current_percent": 12.0,
+                "projected_percent": 21.0,
+                "rate_percent_per_hour": 0.125,
+                "remaining_seconds": 259200,
+                "resets_at": "2026-07-23T00:00:00+00:00",
+                "sample_count": 1,
+                "sample_span_seconds": 345600,
+                "status": "ok"
+              },
+              "freshness": "fresh",
+              "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+              "label": "7-day limit",
+              "observed_slot": "primary",
+              "source": "codex",
+              "stale_after_seconds": 3600,
+              "window_minutes": 10080
+            }
+          ],
+          "milestones": [
+            {
+              "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+              "captured_at": "2026-07-19T23:20:00+00:00",
+              "cumulative_usd": 0.0,
+              "key": "quota_milestone:0p6bBAcijCm6ENu1hWB4oxfPLTFo6pMqekdDYLfNUrw",
+              "marginal_usd": 0.0,
+              "percent": 10,
+              "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+              "resets_at": "2026-07-23T00:00:00+00:00",
+              "source": "codex",
+              "window_minutes": 10080
+            },
+            {
+              "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+              "captured_at": "2026-07-19T23:20:00+00:00",
+              "cumulative_usd": 0.0,
+              "key": "quota_milestone:2ufz4L9InZDS4KO-P_HYEjN-c1Uf9JGTC0HMHaOs9-c",
+              "marginal_usd": 0.0,
+              "percent": 11,
+              "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+              "resets_at": "2026-07-23T00:00:00+00:00",
+              "source": "codex",
+              "window_minutes": 10080
+            },
+            {
+              "block_key": "block:r6pTlmB2QOKS3JC7bSNHcy4JPB0xOBtGzcPDl9Jzo6w",
+              "captured_at": "2026-07-19T23:20:00+00:00",
+              "cumulative_usd": 0.0,
+              "key": "quota_milestone:zaQpcaM2gJudGR1kHv3TCxb-8m2kvkqFXOsS7kiQFfQ",
+              "marginal_usd": 0.0,
+              "percent": 12,
+              "quota_key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+              "resets_at": "2026-07-23T00:00:00+00:00",
+              "source": "codex",
+              "window_minutes": 10080
+            }
+          ],
+          "summary": {
+            "active": [
+              {
+                "captured_at": "2026-07-19T23:55:00+00:00",
+                "current_percent": 12.0,
+                "freshness": "fresh",
+                "key": "quota:r2p_vOZ0gjVIL8OkX3ycsfJxTcTJRz2czSOchqD-5-0",
+                "resets_at": "2026-07-23T00:00:00+00:00",
+                "stale_after_seconds": 3600
+              }
+            ],
+            "active_window_count": 1,
+            "freshness": "fresh",
+            "latest_percent": 12.0,
+            "window_count": 1
+          }
+        },
+        "sessions": {
+          "rows": [],
+          "total_cost_usd": 0.0,
+          "total_sessions": 0,
+          "total_tokens": 0
+        }
+      },
+      "data_version": "codex:0:0:2512cce3fee33a347bbb2519e16d29b883c5daadc74609224cb68215c50f3593:e91ed8e472eaf5f990b67c97",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-07-20T00:00:00Z",
+      "warnings": []
+    }
+  }
+}
