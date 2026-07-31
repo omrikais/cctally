@@ -660,7 +660,17 @@ def test_source_aware_harness_is_a_required_bundle_gate():
         line for line in bundle.splitlines() if line.startswith("required_harnesses=(")
     )
     required = set(required_line.removeprefix("required_harnesses=(").removesuffix(")").split())
-    assert {"codex-quota", "source-aware", "test-remote"} <= required
+    assert {"codex-quota", "source-aware"} <= required
+
+    # test-remote is maintainer-local and deliberately unmirrored, so it is
+    # required only where it is supposed to exist: demanding it unconditionally
+    # took every public CI job down on the v1.89.0 snapshot before a single
+    # harness ran. The behavioral contract (private tree refuses a missing or
+    # non-executable harness; public subset plans cleanly without it) is pinned
+    # in tests/test_test_all_scheduler.py; guard the conditional here so it
+    # cannot be dropped back to an unconditional literal unnoticed.
+    assert "required_harnesses+=(test-remote)" in bundle
+    assert '[ -f "$REPO_ROOT/.mirror-allowlist" ]' in bundle
 
 
 def _live_release_version(root: Path) -> str:

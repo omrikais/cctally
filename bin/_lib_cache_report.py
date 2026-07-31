@@ -119,6 +119,11 @@ CACHE_REPORT_MIN_BASELINE_SESSIONS = 10
 # dashboard/web/src/types/envelope.ts:71 — keeps the two surfaces in
 # lockstep so a typo on either side fails type-check.
 CacheAnomalyReason = Literal["net_negative", "cache_drop"]
+# Every predicate _classify_anomalies can run, in reason-append order. The
+# TypeScript mirror is CACHE_ANOMALY_PREDICATES in cacheReportVerdict.ts.
+CACHE_ANOMALY_PREDICATES: tuple[CacheAnomalyReason, ...] = (
+    "net_negative", "cache_drop",
+)
 
 
 @dataclass
@@ -185,6 +190,10 @@ class CacheRow:
     # Anomaly (populated by _classify_anomalies)
     anomaly_triggered: bool = False
     anomaly_reasons: list[CacheAnomalyReason] = field(default_factory=list)
+    # Predicates the classifier did NOT run for this row. Empty means every
+    # predicate was evaluated; a non-empty list is what lets the dashboard
+    # distinguish "evaluated, clean" from "never evaluated" (issue #443 F2).
+    anomaly_unevaluated: list[CacheAnomalyReason] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -767,6 +776,7 @@ def _classify_anomalies(
         for row in rows:
             row.anomaly_triggered = False
             row.anomaly_reasons = []
+            row.anomaly_unevaluated = list(CACHE_ANOMALY_PREDICATES)
         return
     if not rows:
         return
@@ -782,24 +792,31 @@ def _classify_anomalies(
 
     for i, row in enumerate(rows):
         reasons: list[CacheAnomalyReason] = []
+        unevaluated: list[CacheAnomalyReason] = []
 
         # Trigger 1: net_negative (no baseline needed; cache-activity guard).
         if row.cache_creation_tokens + row.cache_read_tokens > 0:
             if row.net_usd < 0:
                 reasons.append("net_negative")
+        else:
+            unevaluated.append("net_negative")
 
         # Trigger 2: cache_drop (requires baseline).
         anchor = anchors[i]
+        median = None
         if anchor is not None:
             median = _compute_baseline_median(
                 rows, anchor=anchor,
                 window_days=window_days, min_samples=min_baseline,
                 exclude_row=row, is_session_mode=is_session_mode,
             )
-            if median is not None and (median - row.cache_hit_percent) >= threshold_pp:
-                reasons.append("cache_drop")
+        if median is None:
+            unevaluated.append("cache_drop")
+        elif (median - row.cache_hit_percent) >= threshold_pp:
+            reasons.append("cache_drop")
 
         row.anomaly_reasons = reasons
+        row.anomaly_unevaluated = unevaluated
         row.anomaly_triggered = bool(reasons)
 
 

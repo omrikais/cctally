@@ -138,6 +138,12 @@ export interface CacheReportDailyRow {
   net_usd: number;
   anomaly_triggered: boolean;
   anomaly_reasons: CacheAnomalyReason[];
+  // #443 S1 — predicates the classifier did not run for this row. Absent on
+  // pre-S1 envelopes and on the Codex wire until S2; absent means [].
+  anomaly_unevaluated?: CacheAnomalyReason[];
+  // #443 S1 — false only for the builder's synthetic today row. Absent means
+  // observed, so an older envelope renders exactly as it does today.
+  observed?: boolean;
 }
 
 export interface CacheReportBreakdownRow {
@@ -157,6 +163,9 @@ export interface CacheReportTodaySpotlight {
   anomaly_triggered: boolean;
   anomaly_reasons: CacheAnomalyReason[];
   baseline_daily_row_count: number;
+  // #443 S1 — see CacheReportDailyRow.
+  anomaly_unevaluated?: CacheAnomalyReason[];
+  observed?: boolean;
 }
 
 export interface CacheReportEnvelope {

@@ -230,8 +230,34 @@ describe('provider-neutral dashboard presentation adapters', () => {
       source: 'codex',
       status: 'empty',
       reason: 'No Codex cache activity is available for this window.',
-      value: codexReport,
+      // #443 F7 — the value is dropped alongside the status flip, so the
+      // populated branch cannot render KPIs beside the empty chip.
+      value: null,
     });
+  });
+
+  it('nulls the value when a report is empty so no KPI branch can render', () => {
+    const env = cloneFixture();
+    const claudeReport = structuredClone(env.cache_report!);
+    claudeReport.is_empty = true;
+    env.cache_report = claudeReport;
+
+    const composition = presentationCacheReportComposition(env, 'all');
+    const claude = composition.sections.find((s) => s.source === 'claude')!;
+    expect(claude.status).toBe('empty');
+    expect(claude.value).toBeNull();
+  });
+
+  it('keeps the value for a degraded section', () => {
+    const env = cloneFixture();
+    env.sources!.codex.data!.cache_report = structuredClone(env.cache_report!);
+    env.sources!.codex.freshness = 'stale';
+    delete env.sources!.codex.domain_freshness;
+
+    const composition = presentationCacheReportComposition(env, 'all');
+    const codex = composition.sections.find((s) => s.source === 'codex')!;
+    expect(codex.status).toBe('degraded');
+    expect(codex.value).not.toBeNull();
   });
 
   it('does not degrade Forecast or Cache for an unrelated Projects warning', () => {

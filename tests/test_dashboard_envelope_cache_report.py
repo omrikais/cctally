@@ -191,11 +191,14 @@ def test_cache_report_snapshot_to_dict_keys(monkeypatch):
         "date", "cache_hit_percent", "baseline_median_percent",
         "delta_pp", "net_usd", "saved_usd", "wasted_usd",
         "anomaly_triggered", "anomaly_reasons", "baseline_daily_row_count",
+        # #443 S1 — additive; absence-defaults reproduce pre-S1 rendering.
+        "anomaly_unevaluated", "observed",
     }
     assert set(out["today"].keys()) == today_keys
-    # days[].anomaly_reasons round-trips as list (not tuple) for JSON.
+    # days[] tuples round-trip as lists (not tuples) for JSON.
     for d in out["days"]:
         assert isinstance(d["anomaly_reasons"], list)
+        assert isinstance(d["anomaly_unevaluated"], list)
     # Hardcoded v1 invariants.
     assert out["window_days"] == 14
     assert out["anomaly_window_days"] == 14
@@ -598,3 +601,109 @@ def test_build_cache_report_snapshot_evicts_rolled_out_day(monkeypatch):
     assert sc.cache_report_day_get("2026-05-20") is None
 
     sc.reset_cache_report_state()  # don't leak module state into sibling tests
+
+
+# ---------------------------------------------------------------------------
+# #443 S1 — `observed` + `anomaly_unevaluated` on the wire.
+#
+# These live here rather than in tests/test_cache_report_builder.py (where
+# the plan placed them) because the snapshot factories they need are the
+# _bootstrap_dashboard / _make_joined_entry helpers in THIS file; the kernel
+# test module never loads the dashboard builder.
+# ---------------------------------------------------------------------------
+
+def _snapshot_with_history_but_no_today(monkeypatch):
+    """14 rows: 13 real days ending yesterday + the builder's synthetic today."""
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_joined_entry(
+            ts_utc=dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc),
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+        )
+        for d in range(7, 20)  # 2026-05-07 .. 2026-05-19, NOTHING on 05-20
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries", lambda *a, **kw: entries)
+    return dash, dash.build_cache_report_snapshot(
+        now_utc=now_utc, anomaly_threshold_pp=15, anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+
+
+def _snapshot_with_activity_today(monkeypatch):
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_joined_entry(
+            ts_utc=dt.datetime(2026, 5, d, 12, 0, tzinfo=dt.timezone.utc),
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+        )
+        for d in range(7, 21)  # includes 2026-05-20
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries", lambda *a, **kw: entries)
+    return dash, dash.build_cache_report_snapshot(
+        now_utc=now_utc, anomaly_threshold_pp=15, anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+
+
+def test_synthetic_today_row_is_unobserved_with_nothing_evaluated(monkeypatch):
+    """History but no activity today: the synthetic row must not claim to be
+    a measurement, and must not claim a clean verdict."""
+    _dash, snap = _snapshot_with_history_but_no_today(monkeypatch)
+    assert snap.today.observed is False
+    assert sorted(snap.today.anomaly_unevaluated) == ["cache_drop", "net_negative"]
+    newest = snap.days[0]
+    assert newest.date == "2026-05-20"
+    assert newest.observed is False
+    assert sorted(newest.anomaly_unevaluated) == ["cache_drop", "net_negative"]
+
+
+def test_real_rows_are_observed(monkeypatch):
+    _dash, snap = _snapshot_with_activity_today(monkeypatch)
+    assert snap.today.observed is True
+    assert all(d.observed for d in snap.days)
+
+
+def test_real_rows_carry_the_kernel_unevaluated_list(monkeypatch):
+    """The oldest rows of a 14-day render structurally cannot be evaluated for
+    cache_drop, and the wire must say so rather than defaulting to []."""
+    _dash, snap = _snapshot_with_activity_today(monkeypatch)
+    oldest = snap.days[-1]
+    assert oldest.observed is True
+    assert "cache_drop" in oldest.anomaly_unevaluated
+
+
+def test_empty_snapshot_claims_nothing_measured_or_evaluated(monkeypatch):
+    """The no-entries snapshot took the dataclass defaults, so its today
+    spotlight claimed ``observed=True`` with an empty unevaluated list for a
+    day that was definitionally never measured or classified — and the
+    ``no-data`` dashboard golden froze that claim. Unreachable in rendering,
+    but it is the same fabricating default this session removes elsewhere."""
+    dash, cctally_ns = _bootstrap_dashboard()
+    monkeypatch.setitem(cctally_ns, "get_claude_session_entries", lambda *a, **kw: [])
+    snap = dash.build_cache_report_snapshot(
+        now_utc=dt.datetime(2026, 5, 20, 23, 0, tzinfo=dt.timezone.utc),
+        anomaly_threshold_pp=15, anomaly_window_days=14,
+        display_tz=ZoneInfo("Etc/UTC"),
+    )
+    assert snap.is_empty is True
+    assert snap.today.observed is False
+    assert sorted(snap.today.anomaly_unevaluated) == ["cache_drop", "net_negative"]
+    wire = dash._cache_report_snapshot_to_dict(snap)
+    assert wire["today"]["observed"] is False
+    assert wire["today"]["anomaly_unevaluated"] == ["net_negative", "cache_drop"]
+
+
+def test_wire_dict_carries_both_fields(monkeypatch):
+    dash, snap = _snapshot_with_history_but_no_today(monkeypatch)
+    wire = dash._cache_report_snapshot_to_dict(snap)
+    assert wire["today"]["observed"] is False
+    assert wire["today"]["anomaly_unevaluated"] == ["net_negative", "cache_drop"]
+    assert wire["days"][0]["observed"] is False
+    assert "anomaly_unevaluated" in wire["days"][0]
+    assert isinstance(wire["days"][0]["anomaly_unevaluated"], list)

@@ -115,12 +115,17 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "net_negative",
+          "cache_drop"
+        ],
         "cache_creation_tokens": 0,
         "cache_hit_percent": 0.0,
         "cache_read_tokens": 0,
         "date": "2026-04-16",
         "input_tokens": 120000,
         "net_usd": 0.0,
+        "observed": true,
         "output_tokens": 18000,
         "saved_usd": 0.0,
         "wasted_usd": 0.0
@@ -134,12 +139,17 @@
     "today": {
       "anomaly_reasons": [],
       "anomaly_triggered": false,
+      "anomaly_unevaluated": [
+        "net_negative",
+        "cache_drop"
+      ],
       "baseline_daily_row_count": 0,
       "baseline_median_percent": null,
       "cache_hit_percent": 0.0,
       "date": "2026-04-16",
       "delta_pp": null,
       "net_usd": 0.0,
+      "observed": true,
       "saved_usd": 0.0,
       "wasted_usd": 0.0
     },

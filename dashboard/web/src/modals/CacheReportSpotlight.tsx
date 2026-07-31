@@ -9,9 +9,11 @@
 // matches the panel border accent.
 //
 // Spec 2026-05-21 §3.3.
+import type { ReactNode } from 'react';
 import type { CacheReportEnvelope } from '../types/envelope';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
+import { cacheReportVerdict } from '../lib/cacheReportVerdict';
 
 export interface CacheReportSpotlightProps {
   cr: CacheReportEnvelope;
@@ -19,20 +21,11 @@ export interface CacheReportSpotlightProps {
 }
 
 export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheReportSpotlightProps) {
-  const insufficient =
-    cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
-  // Insufficient baseline takes precedence over anomaly_triggered: during
-  // the first 1–4 captured days a `net_negative` today already sets
-  // `cr.today.anomaly_triggered = true` (the server-side classifier skips
-  // only `cache_drop` when samples are thin) — but the panel and the
-  // outer modal-card chrome both stay teal under "Building baseline"
-  // copy until the 5-day floor exists. The spotlight pill, the section
-  // sub-card border, and the reasons line MUST follow the same gate so
-  // the spotlight doesn't contradict the panel handoff with an amber
-  // ⚠ Anomaly state on the same baseline-building day. Pairs with the
-  // identical gates in CacheReportPanel.tsx:147 and
-  // CacheReportModal.tsx:111.
-  const anomalous = cr.today.anomaly_triggered && !insufficient;
+  const verdict = cacheReportVerdict(cr);
+  const { insufficient } = verdict;
+  const anomalous = verdict.chromeAmber;
+  const todayObserved = verdict.todayObserved;
+  const observedDays = cr.days.filter((d) => d.observed !== false).length;
 
   let pill: { text: string; cls: string };
   if (insufficient) {
@@ -42,9 +35,20 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
     };
   } else if (anomalous) {
     pill = { text: '⚠ Anomaly', cls: '' };
+  } else if (!todayObserved) {
+    // Both predicates are unevaluated for a synthetic today row, so a
+    // Healthy pill here would be a verdict over nothing (#443 F1).
+    pill = { text: '· No activity today', cls: 'thin' };
   } else {
     pill = { text: '✓ Healthy', cls: 'ok' };
   }
+
+  // One statement of the rule: a field that was never measured renders an em
+  // dash, so a real $0.00 break-even day stays distinguishable from an absent
+  // one. The 14d median is deliberately NOT wrapped — it is known even when
+  // today is not.
+  const unmeasured = (node: ReactNode) =>
+    todayObserved ? node : <span className="m-unavailable">—</span>;
   if (nativeCacheOnly) {
     pill = { text: 'Provider cache reuse', cls: 'ok' };
   }
@@ -69,7 +73,7 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
       <div className="crm-section-head crm-sh-spotlight">
         Today's spotlight
         <span className="meta">
-          {fmt.calDate(cr.today.date)} · {cr.days.length} days observed
+          {fmt.calDate(cr.today.date)} · {observedDays} days observed
         </span>
       </div>
       <div className={`crm-spotlight${anomalous ? ' anom' : ''}`}>
@@ -80,7 +84,7 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
             <strong>
               {nativeCacheOnly && cr.days.length === 0
                 ? <span className="m-unavailable">Unavailable</span>
-                : `${fmt.pctFloor(cr.today.cache_hit_percent)}%`}
+                : unmeasured(`${fmt.pctFloor(cr.today.cache_hit_percent)}%`)}
             </strong>
           </span>
           <span>
@@ -88,15 +92,15 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
             <strong>{median !== null ? `${fmt.pctFloor(median)}%` : <span className="m-unavailable">Unavailable</span>}</strong>
           </span>
           <span>
-            <span className="k">Δ</span> <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : deltaText}</strong>
+            <span className="k">Δ</span> <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(deltaText)}</strong>
           </span>
           <span>
             <span className="k">Net</span>{' '}
-            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : fmt.usdSigned(cr.today.net_usd)}</strong>
+            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(fmt.usdSigned(cr.today.net_usd))}</strong>
           </span>
           <span>
             <span className="k">Saved / Wasted</span>{' '}
-            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : `$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`}</strong>
+            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(`$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`)}</strong>
           </span>
         </div>
         {anomalous && cr.today.anomaly_reasons.length > 0 && (

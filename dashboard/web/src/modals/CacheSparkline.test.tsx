@@ -253,3 +253,142 @@ describe('<CacheSparkline /> size=large auto-zoom (CR-1, #250)', () => {
     expect(container.querySelector('.cr-spark-axis-top')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// #443 S1 F1 — a synthetic today row is not a measurement.
+// ---------------------------------------------------------------------------
+
+describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
+  it('omits an unobserved trailing day from the polyline', () => {
+    const days = [
+      { ...row('2026-07-31', 0), observed: false },   // newest-first
+      row('2026-07-30', 71),
+      row('2026-07-29', 68),
+    ];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={69}
+        today_marker_color="green"
+        size="large"
+      />,
+    );
+    const points = container.querySelector('polyline')!.getAttribute('points')!;
+    // Three x-slots exist, but only two are plotted.
+    expect(points.trim().split(/\s+/)).toHaveLength(2);
+  });
+
+  it('renders a dashed guide instead of a data point for an unobserved today', () => {
+    const days = [{ ...row('2026-07-31', 0), observed: false }, row('2026-07-30', 71)];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="mini"
+      />,
+    );
+    expect(container.querySelector('[data-testid="cr-spark-today-marker"]')).toBeNull();
+    expect(container.querySelector('[data-testid="cr-spark-today-unobserved"]')).not.toBeNull();
+  });
+
+  it('keeps the unobserved value out of the auto-zoom domain', () => {
+    const days = [
+      { ...row('2026-07-31', 0), observed: false },
+      row('2026-07-30', 71),
+      row('2026-07-29', 69),
+    ];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="large"
+      />,
+    );
+    // The bottom axis label would read 0% if the synthetic zero reached the domain.
+    expect(container.querySelector('.cr-spark-axis-bot')!.textContent).not.toBe('0%');
+  });
+
+  it('keeps the unobserved row x-slot so Today stays rightmost', () => {
+    const days = [
+      { ...row('2026-07-31', 0), observed: false },
+      row('2026-07-30', 71),
+      row('2026-07-29', 69),
+    ];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="large"
+      />,
+    );
+    const guide = container.querySelector('[data-testid="cr-spark-today-unobserved"]')!;
+    // 800-wide viewBox, three slots -> the last slot is the right edge, inset
+    // by half the guide's stroke width so the WHOLE stroke stays inside the
+    // viewBox. A stroke centred on x=800 is half-clipped by the SVG's overflow
+    // and the surviving sliver reads as the chart frame's border, not a marker.
+    expect(guide.getAttribute('x1')).toBe('799.5');
+    expect(guide.getAttribute('x2')).toBe('799.5');
+    // The polyline therefore stops short of the right edge.
+    const points = container.querySelector('polyline')!.getAttribute('points')!;
+    expect(points).not.toContain('800.0,');
+  });
+
+  it('insets the mini guide by the same half-stroke', () => {
+    const days = [
+      { ...row('2026-07-31', 0), observed: false },
+      row('2026-07-30', 71),
+      row('2026-07-29', 69),
+    ];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="mini"
+      />,
+    );
+    // 272-wide viewBox, same 1-unit stroke.
+    expect(
+      container.querySelector('[data-testid="cr-spark-today-unobserved"]')!.getAttribute('x1'),
+    ).toBe('271.5');
+  });
+
+  it('leaves the observed today marker on the un-inset data x (no data point moved)', () => {
+    const days = [row('2026-07-31', 73), row('2026-07-30', 71), row('2026-07-29', 69)];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="large"
+      />,
+    );
+    // The inset is a guide-only concern: the today circle and the polyline's
+    // last plotted coordinate both stay on the raw x-slot.
+    expect(
+      container.querySelector('[data-testid="cr-spark-today-marker"]')!.getAttribute('cx'),
+    ).toBe('800');
+    expect(container.querySelector('polyline')!.getAttribute('points')!).toContain('800.0,');
+  });
+
+  it('counts only observed days in the accessible label', () => {
+    const days = [
+      { ...row('2026-07-31', 0), observed: false },
+      row('2026-07-30', 71),
+      row('2026-07-29', 69),
+    ];
+    const { container } = render(
+      <CacheSparkline
+        days={days}
+        baseline_median_percent={70}
+        today_marker_color="green"
+        size="large"
+      />,
+    );
+    expect(container.querySelector('svg.cr-spark')!.getAttribute('aria-label'))
+      .toBe('Cache hit % timeline, 2 days');
+  });
+});

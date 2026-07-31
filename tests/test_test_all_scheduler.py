@@ -109,7 +109,10 @@ def test_plan_explicitly_includes_test_remote_harness():
     assert "test-remote" in _kv(p.stdout)["harnesses"].split()
 
 
-def test_non_executable_test_remote_is_a_required_harness_error(tmp_path):
+def _tree(tmp_path, *, private, test_remote_mode):
+    """A synthetic checkout. ``private`` writes .mirror-allowlist, which is
+    itself unmirrored and so marks the private tree; ``test_remote_mode`` is
+    None to omit the maintainer-local harness entirely (the public shape)."""
     repo = tmp_path / "repo"
     bindir = repo / "bin"
     bindir.mkdir(parents=True)
@@ -121,10 +124,38 @@ def test_non_executable_test_remote_is_a_required_harness_error(tmp_path):
         harness.write_text("#!/usr/bin/env bash\nexit 0\n")
         harness.chmod(0o755)
 
-    test_remote = bindir / "cctally-test-remote-test"
-    test_remote.write_text("#!/usr/bin/env bash\nexit 0\n")
-    test_remote.chmod(0o644)
+    if private:
+        (repo / ".mirror-allowlist").write_text("bin/cctally-test-all\n")
+    if test_remote_mode is not None:
+        test_remote = bindir / "cctally-test-remote-test"
+        test_remote.write_text("#!/usr/bin/env bash\nexit 0\n")
+        test_remote.chmod(test_remote_mode)
+    return runner
 
+
+def test_non_executable_test_remote_is_a_required_harness_error(tmp_path):
+    runner = _tree(tmp_path, private=True, test_remote_mode=0o644)
     p = _plan({}, runner=runner)
     assert p.returncode == 2
     assert "required harness is not executable: test-remote" in p.stderr
+
+
+def test_missing_test_remote_is_a_required_harness_error_in_private_tree(
+        tmp_path):
+    """Deleting it outright is as bad as losing its executable bit (#446)."""
+    runner = _tree(tmp_path, private=True, test_remote_mode=None)
+    p = _plan({}, runner=runner)
+    assert p.returncode == 2
+    assert "required harness is not executable: test-remote" in p.stderr
+
+
+def test_public_subset_tree_does_not_require_the_private_test_remote_harness(
+        tmp_path):
+    """The public mirror ships no bin/cctally-test-remote-test — .mirror-allowlist
+    excludes both it and the wrapper as maintainer-local tooling, and excludes
+    itself. Requiring it there hard-fails the public CI matrix before a single
+    harness runs (issue #131: the public matrix runs the shipped subset only)."""
+    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    p = _plan({}, runner=runner)
+    assert p.returncode == 0, p.stderr
+    assert "test-remote" not in _kv(p.stdout)["harnesses"].split()

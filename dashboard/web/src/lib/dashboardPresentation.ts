@@ -889,6 +889,12 @@ export function presentationCacheReportComposition(
         return {
           ...section,
           status: 'empty' as const,
+          // #443 F7 — the populated branch rendered KPIs and a healthy
+          // verdict alongside the empty chip. Dropping the value makes that
+          // state unrepresentable rather than merely discouraged; both
+          // consumers already have a `report == null` branch. Deliberately
+          // NOT applied to `degraded`, which keeps its value.
+          value: null,
           reason: `No ${providerLabel(source)} cache activity is available for this window.`,
         };
       }

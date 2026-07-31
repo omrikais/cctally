@@ -1127,3 +1127,95 @@ def test_cached_cache_report_day_is_frozen():
     # frozen _ProjectPartial value.
     with pytest.raises(AttributeError):
         unit.project_partials[0][1].net_usd = 1.0
+
+
+# ---------------------------------------------------------------------------
+# #443 S1 — _classify_anomalies records the predicates it DECLINED to run.
+#
+# Rows are built through `_make_daily_row` rather than by passing
+# `cache_hit_percent=` to the constructor: on `CacheRow` that name is a
+# read-only property derived from the token counters, not a field.
+# ---------------------------------------------------------------------------
+
+def test_unevaluated_records_cache_drop_when_baseline_thin():
+    """Fewer than CACHE_REPORT_MIN_BASELINE_DAYS baseline rows -> cache_drop
+    is skipped, and that skip is recorded rather than discarded."""
+    rows = [
+        _make_daily_row("2026-07-30", (100, 0, 233), 1.0),   # ~70% hit
+        _make_daily_row("2026-07-31", (700, 0, 30), 1.0),    # ~4% hit
+    ]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    for row in rows:
+        assert "cache_drop" in row.anomaly_unevaluated
+        assert row.anomaly_triggered is False
+
+
+def test_unevaluated_records_net_negative_when_no_cache_activity():
+    """The cache-activity guard suppresses net_negative; record the skip."""
+    rows = [_make_daily_row("2026-07-31", (100, 0, 0), -5.0)]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    assert "net_negative" in rows[0].anomaly_unevaluated
+    assert rows[0].anomaly_triggered is False
+
+
+def test_unevaluated_is_empty_when_every_predicate_ran():
+    """Six rows give the newest a real baseline; both predicates evaluate."""
+    rows = [
+        _make_daily_row(f"2026-07-{25 + i}", (100, 0, 233), 1.0)
+        for i in range(6)
+    ]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    assert rows[-1].anomaly_unevaluated == []
+
+
+def test_unevaluated_lists_every_predicate_when_disabled():
+    """enabled=False evaluates nothing; an empty list would claim otherwise."""
+    rows = [_make_daily_row("2026-07-31", (700, 0, 30), -5.0)]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=False)
+    assert sorted(rows[0].anomaly_unevaluated) == ["cache_drop", "net_negative"]
+    assert rows[0].anomaly_triggered is False
+    assert rows[0].anomaly_reasons == []
+
+
+def test_unevaluated_resets_across_repeated_classification():
+    """The classifier mutates in place and may run twice; the list must be
+    replaced, never appended to."""
+    rows = [_make_daily_row("2026-07-31", (100, 0, 0), -5.0)]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    first = list(rows[0].anomaly_unevaluated)
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    assert rows[0].anomaly_unevaluated == first
+
+
+def test_unevaluated_populated_in_session_mode():
+    """CacheRow and the classifier are shared with session mode."""
+    rows = [
+        crk.CacheRow(
+            session_id="s1",
+            last_activity=dt.datetime(2026, 7, 31, tzinfo=dt.timezone.utc),
+            input_tokens=100, cache_creation_tokens=0, cache_read_tokens=233,
+            output_tokens=50, net_usd=1.0,
+        ),
+    ]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    assert "cache_drop" in rows[0].anomaly_unevaluated
+
+
+def test_classification_behavior_is_unchanged_by_metadata_addition():
+    """anomaly_triggered / anomaly_reasons must be byte-identical to the
+    pre-change classifier. Golden values captured from main at 307c6dc6d.
+
+    Six ~70%-hit positive-net days give the seventh row a real baseline; the
+    seventh is both net-negative and >15pp below the median, so it must fire
+    both triggers in append order.
+    """
+    rows = [
+        _make_daily_row(f"2026-07-{20 + i}", (100, 0, 233), 1.0)
+        for i in range(6)
+    ]
+    rows.append(_make_daily_row("2026-07-26", (700, 0, 30), -2.0))
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14)
+    assert [r.anomaly_triggered for r in rows] == [
+        False, False, False, False, False, False, True,
+    ]
+    assert rows[-1].anomaly_reasons == ["net_negative", "cache_drop"]

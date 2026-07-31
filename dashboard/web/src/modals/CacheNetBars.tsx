@@ -127,7 +127,16 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
               stroke="var(--border-soft)"
               strokeWidth={1}
             />
-            {ordered.map((d, i) => {
+            {/* Map with the index FIRST so an unobserved day keeps its x-slot
+                and its axis label, then drop it from the drawn bars. #443's
+                governing rule is that no surface renders a synthetic zero as a
+                measurement, and a 1px green tick tagged data-sign="pos" is
+                exactly that — visibly contradicting the sparkline directly
+                above, which already stops short of the today slot. */}
+            {ordered
+              .map((d, i) => ({ d, i }))
+              .filter(({ d }) => d.observed !== false)
+              .map(({ d, i }) => {
               const x = cfg.padX + i * (barWidth + cfg.barGap);
               if (d.net_usd >= 0) {
                 const greenH = d.saved_usd * yScale;
@@ -214,7 +223,12 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
       preserveAspectRatio="none"
       aria-label={`14-day net dollar bars, ${ordered.length} days`}
     >
-      {ordered.map((d, i) => {
+      {/* Index-first map, then filter: the unobserved day keeps its x-slot but
+          draws no bar (#443 — a synthetic zero is not a measurement). */}
+      {ordered
+        .map((d, i) => ({ d, i }))
+        .filter(({ d }) => d.observed !== false)
+        .map(({ d, i }) => {
         const x = cfg.padX + i * (barWidth + cfg.barGap);
         // Floor at 1 px so a $0 day still leaves a visible nub.
         const h = Math.max(1, (Math.abs(d.net_usd) / maxAbsNet) * usable);

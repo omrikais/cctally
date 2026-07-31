@@ -115,6 +115,77 @@ describe('<CacheNetBars size="mini" /> (issue #77 P2-4)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #443 S1 — an unobserved day is not a measurement, so it draws no bar. Its
+// x-slot survives: the sparkline directly above already reserves the slot and
+// stops the polyline short, and the two charts share the positional "Today"
+// contract.
+// ---------------------------------------------------------------------------
+
+function daysWithUnobservedToday(): CacheReportDailyRow[] {
+  const days = sampleDays();
+  days[0] = {
+    ...days[0],
+    cache_hit_percent: 0,
+    input_tokens: 0, output_tokens: 0,
+    cache_creation_tokens: 0, cache_read_tokens: 0,
+    saved_usd: 0, wasted_usd: 0, net_usd: 0,
+    anomaly_unevaluated: ['net_negative', 'cache_drop'],
+    observed: false,
+  };
+  return days;
+}
+
+describe('<CacheNetBars /> #443 S1 unobserved day', () => {
+  it('draws no large bar for the unobserved day but keeps its x-slot', () => {
+    const { container } = render(
+      <CacheNetBars days={daysWithUnobservedToday()} size="large" />,
+    );
+    const bars = container.querySelectorAll('[data-testid="crm-netbar"]');
+    expect(bars.length).toBe(13);
+    expect(
+      container.querySelector('[data-testid="crm-netbar"][data-date="2026-05-20"]'),
+    ).toBeNull();
+    // The slot itself survives: the axis still labels the rightmost position
+    // "Today", and the remaining bars keep the x positions they had when the
+    // synthetic row was drawn.
+    const texts = Array.from(container.querySelectorAll('svg text'))
+      .map((t) => t.textContent);
+    expect(texts).toContain('Today');
+    expect(texts.length).toBe(14);
+    const observed = render(
+      <CacheNetBars days={sampleDays()} size="large" />,
+    );
+    const xOf = (root: ParentNode, date: string) =>
+      root
+        .querySelector(`[data-testid="crm-netbar"][data-date="${date}"] rect`)
+        ?.getAttribute('x')
+      ?? root
+        .querySelector(`[data-testid="crm-netbar"][data-date="${date}"]`)
+        ?.getAttribute('x');
+    expect(xOf(container, '2026-05-19')).toBe(xOf(observed.container, '2026-05-19'));
+    expect(xOf(container, '2026-05-07')).toBe(xOf(observed.container, '2026-05-07'));
+  });
+
+  it('draws no mini bar for the unobserved day but keeps its x-slot', () => {
+    const { container } = render(
+      <CacheNetBars days={daysWithUnobservedToday()} size="mini" />,
+    );
+    const bars = container.querySelectorAll('[data-testid="crm-netbar-mini"]');
+    expect(bars.length).toBe(13);
+    expect(
+      container.querySelector('[data-testid="crm-netbar-mini"][data-date="2026-05-20"]'),
+    ).toBeNull();
+    const observed = render(<CacheNetBars days={sampleDays()} size="mini" />);
+    const xOf = (root: ParentNode, date: string) =>
+      root
+        .querySelector(`[data-testid="crm-netbar-mini"][data-date="${date}"]`)
+        ?.getAttribute('x');
+    expect(xOf(container, '2026-05-19')).toBe(xOf(observed.container, '2026-05-19'));
+    expect(xOf(container, '2026-05-07')).toBe(xOf(observed.container, '2026-05-07'));
+  });
+});
+
 describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
   it('renders the section header and chart-frame for the modal', () => {
     const { container } = render(

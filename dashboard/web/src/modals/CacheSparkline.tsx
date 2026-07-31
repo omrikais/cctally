@@ -62,6 +62,10 @@ const SIZES = {
   large: { width: 800, height: 90, padTop: 6, padBot: 6 },
 } as const;
 
+/** Stroke width of the unobserved-today guide, shared by both variants. */
+const TODAY_GUIDE_STROKE = 1;
+const TODAY_GUIDE_HALF_STROKE = TODAY_GUIDE_STROKE / 2;
+
 export function CacheSparkline({
   days,
   baseline_median_percent,
@@ -80,7 +84,9 @@ export function CacheSparkline({
   // mislead). Empty `ordered` degenerates to {lo:0, hi:100}.
   const domain = isLarge
     ? computeAutoZoomDomain(
-        ordered.map((d) => d.cache_hit_percent),
+        // #443 F1 — a synthetic today row is not a measurement; letting its
+        // zero into the domain would drag the whole scale down.
+        ordered.filter((d) => d.observed !== false).map((d) => d.cache_hit_percent),
         baseline_median_percent,
         CACHE_REPORT_BAND_PP,
       )
@@ -129,21 +135,38 @@ export function CacheSparkline({
     return (i / (ordered.length - 1)) * cfg.width;
   };
 
+  // Map with the index FIRST so unobserved rows keep their x-slot, then drop
+  // them from the plotted path. The line therefore ends at the last observed
+  // day rather than diving to a synthetic zero (#443 F1). Domain filtering
+  // alone would not do this: points are plotted independently of the domain,
+  // and the mini variant has no auto-zoom at all.
   const points = ordered
-    .map((d, i) =>
-      `${xFor(i).toFixed(1)},${yFor(d.cache_hit_percent).toFixed(1)}`,
-    )
+    .map((d, i) => ({ d, i }))
+    .filter(({ d }) => d.observed !== false)
+    .map(({ d, i }) => `${xFor(i).toFixed(1)},${yFor(d.cache_hit_percent).toFixed(1)}`)
     .join(' ');
+
   const todayIdx = ordered.length - 1;
+  const todayRow = ordered[todayIdx];
+  const todayObserved = todayRow.observed !== false;
   const todayCx = xFor(todayIdx);
-  const todayCy = yFor(ordered[todayIdx].cache_hit_percent);
+  const todayCy = yFor(todayRow.cache_hit_percent);
+  // The unobserved-today guide is a zero-width vertical stroke, so at
+  // x == cfg.width exactly half of it falls outside the viewBox and is clipped
+  // away by the SVG's overflow — the surviving sliver sits on top of the chart
+  // frame's right border and reads as chrome rather than a marker. Inset it by
+  // half the stroke width (1 user unit for both variants) so the full stroke is
+  // inside. Data points are NOT moved: the polyline and the today circle keep
+  // using `todayCx`, which the circle survives because it extends leftward.
+  const todayGuideCx = Math.min(todayCx, cfg.width - TODAY_GUIDE_HALF_STROKE);
+  const observedCount = ordered.filter((d) => d.observed !== false).length;
 
   const svg = (
     <svg
       className="cr-spark"
       {...svgSizeProps}
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
-      aria-label={`Cache hit % timeline, ${ordered.length} days`}
+      aria-label={`Cache hit % timeline, ${observedCount} days`}
     >
       {/* Gridlines (large only) — three horizontal rules at the zoomed
           domain's hi / mid / lo so the user can read the polyline's
@@ -207,13 +230,30 @@ export function CacheSparkline({
         stroke="var(--accent-cyan)"
         strokeWidth={isLarge ? 2 : 1.5}
       />
-      <circle
-        cx={todayCx}
-        cy={todayCy}
-        r={isLarge ? 5 : 3.5}
-        fill={today_marker_color}
-        data-testid="cr-spark-today-marker"
-      />
+      {todayObserved ? (
+        <circle
+          cx={todayCx}
+          cy={todayCy}
+          r={isLarge ? 5 : 3.5}
+          fill={today_marker_color}
+          data-testid="cr-spark-today-marker"
+        />
+      ) : (
+        // No activity today: mark the position without asserting a value.
+        // A filled dot at 0% is exactly the measured-looking zero F1 removes.
+        <line
+          x1={todayGuideCx}
+          x2={todayGuideCx}
+          y1={cfg.padTop}
+          y2={cfg.height - cfg.padBot}
+          stroke="var(--text-dim)"
+          strokeWidth={TODAY_GUIDE_STROKE}
+          strokeDasharray="3,3"
+          data-testid="cr-spark-today-unobserved"
+        >
+          <title>No activity today</title>
+        </line>
+      )}
     </svg>
   );
 

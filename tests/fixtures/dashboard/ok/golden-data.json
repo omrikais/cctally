@@ -427,12 +427,17 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "net_negative",
+          "cache_drop"
+        ],
         "cache_creation_tokens": 0,
         "cache_hit_percent": 0.0,
         "cache_read_tokens": 0,
         "date": "2026-04-16",
         "input_tokens": 760000,
         "net_usd": 0.0,
+        "observed": true,
         "output_tokens": 118000,
         "saved_usd": 0.0,
         "wasted_usd": 0.0
@@ -440,12 +445,16 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "cache_drop"
+        ],
         "cache_creation_tokens": 1342871,
         "cache_hit_percent": 16.718000847835725,
         "cache_read_tokens": 691723,
         "date": "2026-04-15",
         "input_tokens": 2103000,
         "net_usd": 0.8604988499999999,
+        "observed": true,
         "output_tokens": 334000,
         "saved_usd": 1.8676521000000001,
         "wasted_usd": 1.00715325
@@ -453,12 +462,16 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "cache_drop"
+        ],
         "cache_creation_tokens": 1220988,
         "cache_hit_percent": 20.940228874598972,
         "cache_read_tokens": 854189,
         "date": "2026-04-14",
         "input_tokens": 2004000,
         "net_usd": 1.3905693000000001,
+        "observed": true,
         "output_tokens": 319000,
         "saved_usd": 2.3063103000000003,
         "wasted_usd": 0.915741
@@ -466,12 +479,17 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "net_negative",
+          "cache_drop"
+        ],
         "cache_creation_tokens": 0,
         "cache_hit_percent": 0.0,
         "cache_read_tokens": 0,
         "date": "2026-04-13",
         "input_tokens": 720000,
         "net_usd": 0.0,
+        "observed": true,
         "output_tokens": 116000,
         "saved_usd": 0.0,
         "wasted_usd": 0.0
@@ -479,12 +497,17 @@
       {
         "anomaly_reasons": [],
         "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "net_negative",
+          "cache_drop"
+        ],
         "cache_creation_tokens": 0,
         "cache_hit_percent": 0.0,
         "cache_read_tokens": 0,
         "date": "2026-04-08",
         "input_tokens": 3820000,
         "net_usd": 0.0,
+        "observed": true,
         "output_tokens": 764000,
         "saved_usd": 0.0,
         "wasted_usd": 0.0
@@ -498,12 +521,17 @@
     "today": {
       "anomaly_reasons": [],
       "anomaly_triggered": false,
+      "anomaly_unevaluated": [
+        "net_negative",
+        "cache_drop"
+      ],
       "baseline_daily_row_count": 4,
       "baseline_median_percent": null,
       "cache_hit_percent": 0.0,
       "date": "2026-04-16",
       "delta_pp": null,
       "net_usd": 0.0,
+      "observed": true,
       "saved_usd": 0.0,
       "wasted_usd": 0.0
     },

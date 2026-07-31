@@ -43,12 +43,17 @@
     "today": {
       "anomaly_reasons": [],
       "anomaly_triggered": false,
+      "anomaly_unevaluated": [
+        "net_negative",
+        "cache_drop"
+      ],
       "baseline_daily_row_count": 0,
       "baseline_median_percent": null,
       "cache_hit_percent": 0.0,
       "date": "2026-04-20",
       "delta_pp": null,
       "net_usd": 0.0,
+      "observed": false,
       "saved_usd": 0.0,
       "wasted_usd": 0.0
     },

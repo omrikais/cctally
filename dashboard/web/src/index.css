@@ -4962,6 +4962,7 @@ mark.current {
     white-space: nowrap;
   }
   .modal-header .share-icon,
+  .modal-header .provider-section-status,
   .modal-header .modal-close { flex-shrink: 0; }
   .modal-close {
     width: 44px; height: 44px;
@@ -6466,11 +6467,42 @@ mark.current {
      letting the subtitle shrink and stay on one line. */
   .crm-subtitle {
     min-width: 0;
-    flex-shrink: 1;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    /* `.modal-header` computes `gap: normal` (zero), and the h2 below is
+       flex-shrink:0, so the title's right edge and the subtitle's left edge
+       met at exactly 0 px — "Cache Report14d · C…". The ellipsis used to
+       supply the separation by accident; this margin supplies it on purpose.
+       Not shrinkable, so it comes out of the subtitle's own content box. */
+    margin-left: 10px;
   }
+  /* #443 S1 — the settings gear is a fixed-size control like the share and
+     close buttons, so freeze it the same way (the degraded status chip is
+     frozen alongside them in the shared rule above). What is left shrinking is
+     then exactly the two text children. */
+  .modal-header [data-cr-settings-toggle] { flex-shrink: 0; }
+  /* #443 S1 — with the chip and the gear frozen, the remaining deficit still
+     splits between the title and the subtitle in proportion to their base
+     widths, which truncated the title to "Cach…". Pin the title and let the
+     subtitle absorb all of it: the subtitle is already an abbreviation at this
+     width, so its truncation costs nothing.
+     Pinning is only safe because this modal's title is the hard-coded
+     12-character constant "Cache Report" (<Modal title=…> in
+     CacheReportModal.tsx) and fits at 320 px. A longer or dynamic title would
+     not shrink either, and would push the overflow onto the trailing controls
+     instead. */
+  .modal-header:has(.crm-subtitle) h2 { flex-shrink: 0; }
+}
+
+/* Below ~340 px the subtitle is the only thing still shrinking, and the
+   deficit squeezes it past the point of meaning — at 320 px it rendered as
+   "1…" in 18 px of a 98 px natural width, carrying no information while still
+   costing the row width. Drop it entirely instead; the same facts (window
+   length and source) are in the modal body. Pinned one pixel under 340 so the
+   340 px cohort keeps a readable abbreviation. */
+@media (max-width: 339px) {
+  .crm-subtitle { display: none; }
 }
 
 /* =========================================================================
@@ -6481,6 +6513,27 @@ mark.current {
 
 .crm-header {
   border-bottom: 1px solid color-mix(in srgb, var(--accent-teal) 28%, transparent);
+}
+
+/* #443 S1 — the degraded-source chip lives in the modal header; its reason
+   line does not. `.modal-header` is `display:flex; flex-wrap:nowrap` with a
+   computed `gap` of `normal` (zero), so an unconstrained reason there shares a
+   row with the <h2> and the subtitle and wraps both at every reason length.
+   The reason renders as a full-width body line instead — the same split the
+   panel already uses (chip in the header, reason at the foot). */
+.crm-status-reason {
+  margin-bottom: 14px;
+}
+/* `margin-left: auto` is what right-clusters the chip against the trailing
+   controls — the same idiom as `.modal-header .share-icon` — and it collapses
+   to zero the moment the header overflows. It has to be restated here: this
+   descendant selector outranks the base `.provider-section-status` regardless
+   of source order, so any other value would silently replace the auto and hand
+   the chip to `space-between`'s even distribution instead. The right inset
+   keeps the chip off the settings gear. */
+.modal-header .provider-section-status {
+  margin-left: auto;
+  margin-right: 10px;
 }
 
 /* Today's spotlight sub-card */
@@ -6646,7 +6699,34 @@ mark.current {
 .ch-table tbody td.net-neg  { color: var(--accent-amber); }
 .ch-table tbody td.flag-warn { color: var(--accent-amber); }
 .ch-table tbody td.flag-ok   { color: var(--text-faint); }
+/* #443 S1 — the row was never evaluated. Subordinate to both ✓ and ⚠, but a
+   single middot at --text-faint carries so little ink that the cell reads as
+   EMPTY rather than as a neutral marker; --text-dim plus extra size is what
+   makes it read as deliberate. The size comes from `transform`, not
+   `font-size`, so the taller glyph cannot grow the line box and leave the
+   unevaluated rows out of the table's row rhythm.
+   `.crm-flag-glyph` is the class `DailyFlagGlyph` puts on the glyph span; it is
+   selected by name rather than by markup position so a wrapper added inside the
+   component cannot silently drop the scale. */
+.ch-table tbody td.flag-none { color: var(--text-dim); }
+.ch-table tbody td.flag-none .crm-flag-glyph,
+.crm-daily-card-head .cd-flag.flag-none .crm-flag-glyph {
+  display: inline-block;
+  transform: scale(1.8);
+  transform-origin: center;
+}
 .ch-table tbody tr:hover td  { background: rgba(255,255,255,0.02); }
+
+/* #443 S1 — the daily flag/band legend. Dimmed and meta-sized to match the
+   other explanatory lines in this modal (.crm-section .meta,
+   .provider-section-reason); at body weight it read as a headline flush
+   against the uppercase section head above it. */
+.crm-daily-legend {
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+  line-height: 1.45;
+  margin-bottom: 8px;
+}
 
 /* CR-2 — mobile daily-rows cards. Rendered only through the useIsMobile() JS
    branch (≤640w), so no @media gate is needed; the labeled 2-col grid replaces
@@ -6673,6 +6753,7 @@ mark.current {
 }
 .crm-daily-card-head .cd-flag.flag-warn { color: var(--accent-amber); }
 .crm-daily-card-head .cd-flag.flag-ok   { color: var(--text-faint); }
+.crm-daily-card-head .cd-flag.flag-none { color: var(--text-dim); }
 .crm-daily-card-grid {
   display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px;
 }

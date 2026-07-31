@@ -382,7 +382,10 @@ describe('<CacheReportModal /> anomaly spotlight', () => {
       },
     })));
     render(<CacheReportModal />);
-    expect(screen.getByText(/⚠ Anomaly/i)).toBeInTheDocument();
+    // Scoped to the spotlight pill: the #443 S1 daily legend also spells out
+    // the glyph vocabulary, so a document-wide query matches twice.
+    expect(document.querySelector('.crm-spotlight .pill')!.textContent)
+      .toMatch(/⚠ Anomaly/i);
     // Reasons codes
     expect(screen.getByText(/cache_drop/)).toBeInTheDocument();
     expect(screen.getByText(/net_negative/)).toBeInTheDocument();
@@ -417,7 +420,10 @@ describe('<CacheReportModal /> anomaly spotlight', () => {
     })));
     render(<CacheReportModal />);
     expect(screen.getByText(/Building baseline · 3\/5 days/i)).toBeInTheDocument();
-    expect(screen.queryByText(/⚠ Anomaly/i)).toBeNull();
+    // Scoped to the pill — the #443 S1 legend mentions the ⚠ glyph on every
+    // render, so a document-wide absence query can never hold.
+    expect(document.querySelector('.crm-spotlight .pill')!.textContent)
+      .not.toMatch(/⚠ Anomaly/i);
   });
 });
 
@@ -689,5 +695,318 @@ describe('<CacheReportModal /> integration (panel click -> modal open)', () => {
     ).toBeNull();
     // Snapshot still present (panel still mounted).
     expect(getState().snapshot?.cache_report).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S1 — unevaluated vs evaluated-clean, legend, unobserved rows, failure.
+// ---------------------------------------------------------------------------
+
+function unobservedTodayReport(): CacheReportEnvelope {
+  const base = makeCacheReport();
+  // 14 rows, one of them the builder's synthetic today at index 0.
+  const days = [
+    {
+      ...base.days[0], date: '2026-05-20', cache_hit_percent: 0,
+      input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0,
+      cache_read_tokens: 0, saved_usd: 0, wasted_usd: 0, net_usd: 0,
+      anomaly_unevaluated: ['net_negative' as const, 'cache_drop' as const],
+      observed: false,
+    },
+    ...base.days.slice(0, 13),
+  ];
+  return {
+    ...base,
+    today: {
+      ...base.today, cache_hit_percent: 0, net_usd: 0, saved_usd: 0,
+      wasted_usd: 0,
+      anomaly_unevaluated: ['net_negative', 'cache_drop'], observed: false,
+    },
+    days,
+  };
+}
+
+function partialAndUnevaluatedRowsReport(): CacheReportEnvelope {
+  const base = makeCacheReport();
+  const days = [...base.days];
+  // Row 0: partial — cache_drop alone could not be evaluated.
+  days[0] = { ...days[0], anomaly_unevaluated: ['cache_drop'] };
+  // Row 1: fully unevaluated but observed.
+  days[1] = {
+    ...days[1], anomaly_unevaluated: ['net_negative', 'cache_drop'],
+  };
+  return { ...base, days };
+}
+
+function unevaluatedOldestRowReport(): CacheReportEnvelope {
+  const base = makeCacheReport();
+  const days = [...base.days];
+  days[days.length - 1] = {
+    ...days[days.length - 1],
+    anomaly_unevaluated: ['net_negative', 'cache_drop'],
+  };
+  return { ...base, days };
+}
+
+function thinBaselineNetNegativeReport(): CacheReportEnvelope {
+  const base = makeCacheReport();
+  const days = [...base.days];
+  days[0] = {
+    ...days[0], net_usd: -0.42,
+    anomaly_triggered: true, anomaly_reasons: ['net_negative'],
+    anomaly_unevaluated: ['cache_drop'],
+  };
+  return {
+    ...base,
+    today: { ...base.today, baseline_daily_row_count: 3 },
+    days,
+  };
+}
+
+describe('<CacheReportModal /> #443 S1 flag column', () => {
+  it('renders a neutral flag for a row whose cache_drop was not evaluated', () => {
+    updateSnapshot(envelopeWith(unevaluatedOldestRowReport()));
+    render(<CacheReportModal />);
+    const row = screen.getAllByTestId('crm-daily-row').at(-1)!;
+    expect(row.querySelector('td:last-child')!.textContent).toBe('·');
+  });
+
+  it('gives partial and fully-unevaluated rows distinct accessible names', () => {
+    updateSnapshot(envelopeWith(partialAndUnevaluatedRowsReport()));
+    render(<CacheReportModal />);
+    expect(screen.getByLabelText(/^not evaluated — cache_drop could not be evaluated/))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText(/net_negative and cache_drop could not be evaluated/))
+      .toBeInTheDocument();
+  });
+
+  it('names the unobserved row as nothing measured', () => {
+    updateSnapshot(envelopeWith(unobservedTodayReport()));
+    render(<CacheReportModal />);
+    expect(screen.getByLabelText(/nothing measured to evaluate/)).toBeInTheDocument();
+  });
+
+  it('still flags a thin-baseline net-negative row as an anomaly', () => {
+    updateSnapshot(envelopeWith(thinBaselineNetNegativeReport()));
+    render(<CacheReportModal />);
+    const row = screen.getAllByTestId('crm-daily-row')[0];
+    expect(row.textContent).toContain('⚠');
+  });
+
+  // The neutral middot is only legible because index.css scales it up, and the
+  // rule that does so selects `.crm-flag-glyph`. Assert the hook by name, since
+  // dropping it is a silent visual regression JSDOM cannot otherwise observe.
+  it('carries the crm-flag-glyph styling hook on the desktop glyph', () => {
+    updateSnapshot(envelopeWith(unevaluatedOldestRowReport()));
+    render(<CacheReportModal />);
+    const cell = screen.getAllByTestId('crm-daily-row').at(-1)!
+      .querySelector('td:last-child')!;
+    expect(cell.className).toContain('flag-none');
+    const glyph = cell.querySelector('.crm-flag-glyph');
+    expect(glyph).not.toBeNull();
+    expect(glyph!.textContent).toBe('·');
+  });
+
+  it('carries the crm-flag-glyph styling hook on the mobile card glyph', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(unevaluatedOldestRowReport()));
+    render(<CacheReportModal />);
+    const card = screen.getAllByTestId('crm-daily-card').at(-1)!;
+    const glyph = card.querySelector('.cd-flag.flag-none .crm-flag-glyph');
+    expect(glyph).not.toBeNull();
+    expect(glyph!.textContent).toBe('·');
+  });
+});
+
+describe('<CacheReportModal /> #443 S1 legend', () => {
+  it('explains both the flag glyphs and the Cache % band in a legend', () => {
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    const legend = screen.getByTestId('crm-daily-legend');
+    expect(legend.textContent).toContain('not evaluated');
+    expect(legend.textContent).toContain('±5pp');
+  });
+
+  it('renders the legend in the mobile card layout too', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(makeCacheReport()));
+    render(<CacheReportModal />);
+    expect(screen.getByTestId('crm-daily-legend')).toBeInTheDocument();
+  });
+});
+
+describe('<CacheReportModal /> #443 S1 unobserved rows', () => {
+  it('renders em dashes for an unobserved row instead of zeros', () => {
+    updateSnapshot(envelopeWith(unobservedTodayReport()));
+    render(<CacheReportModal />);
+    const row = screen.getAllByTestId('crm-daily-row')[0];
+    expect(row.textContent).not.toContain('0%');
+    expect(row.textContent).toContain('—');
+  });
+
+  it('renders em dashes for an unobserved mobile card too', () => {
+    stubMobileMedia(true);
+    updateSnapshot(envelopeWith(unobservedTodayReport()));
+    render(<CacheReportModal />);
+    const card = screen.getAllByTestId('crm-daily-card')[0];
+    expect(card.textContent).not.toContain('0%');
+    expect(card.textContent).toContain('—');
+  });
+
+  it('excludes the synthetic row from the observed-day count', () => {
+    updateSnapshot(envelopeWith(unobservedTodayReport()));   // 14 rows, one synthetic
+    render(<CacheReportModal />);
+    // Both the spotlight head and the daily-rows head carry the count, and
+    // both must exclude the synthetic row.
+    expect(screen.getAllByText(/13 days observed/)).toHaveLength(2);
+  });
+});
+
+describe('<CacheReportModal /> #443 S1 failed branch', () => {
+  it('states the failure when a null report is not hydrating', () => {
+    const e = baseEnvelope();
+    e.hydrating = false;
+    updateSnapshot(e);
+    render(<CacheReportModal />);
+    expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
+  });
+
+  it('still says Loading… while hydrating', () => {
+    const e = baseEnvelope();
+    e.hydrating = true;
+    updateSnapshot(e);
+    render(<CacheReportModal />);
+    expect(screen.getByText(/Loading…/)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S1 review — the single-source modal never computed a composition, so a
+// degraded source showed a confident verdict here while the panel behind it
+// said "degraded". Mirrors the panel's two cases.
+// ---------------------------------------------------------------------------
+
+function withSources(cr: CacheReportEnvelope): Envelope {
+  const e = envelopeWith(cr);
+  e.source_schema_version = 2;
+  e.default_source = 'claude';
+  e.source_order = ['claude', 'codex', 'all'];
+  e.sources = {
+    claude: {
+      source: 'claude', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: {},
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+    codex: {
+      source: 'codex', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: { cache_report: null },
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+    all: {
+      source: 'all', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: {},
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+  } as unknown as Envelope['sources'];
+  return e;
+}
+
+function degradedClaudeEnvelope(cr = makeCacheReport()): Envelope {
+  const e = withSources(cr);
+  e.sources!.claude.freshness = 'stale';
+  delete (e.sources!.claude as { domain_freshness?: unknown }).domain_freshness;
+  return e;
+}
+
+describe('<CacheReportModal /> #443 S1 provider status', () => {
+  it('shows the provider status chip and reason when degraded', () => {
+    updateSnapshot(degradedClaudeEnvelope());
+    render(<CacheReportModal />);
+    expect(document.querySelector('.provider-section-status')!.textContent)
+      .toBe('degraded');
+    expect(document.querySelector('.provider-section-reason')!.textContent)
+      .toMatch(/stale/i);
+    // The verdict is retained: it was evaluated, on data that is old.
+    expect(screen.getByText(/today's spotlight/i)).toBeInTheDocument();
+  });
+
+  it('renders the empty body with the chip and reason for a degraded empty source', () => {
+    updateSnapshot(degradedClaudeEnvelope(makeCacheReport({ is_empty: true, days: [] })));
+    render(<CacheReportModal />);
+    expect(screen.getByText(/no claude activity in the last 14 days/i))
+      .toBeInTheDocument();
+    expect(document.querySelector('.provider-section-status')).not.toBeNull();
+    expect(document.querySelector('.provider-section-reason')).not.toBeNull();
+    expect(screen.queryByText(/today's spotlight/i)).toBeNull();
+  });
+
+  it('shows no chip for an available source', () => {
+    updateSnapshot(withSources(makeCacheReport()));
+    render(<CacheReportModal />);
+    expect(document.querySelector('.provider-section-status')).toBeNull();
+    expect(document.querySelector('.provider-section-reason')).toBeNull();
+  });
+
+  // Real-browser QA: `.modal-header` is flex/nowrap with a zero computed gap,
+  // so an unconstrained reason there wrapped the <h2> and the subtitle onto two
+  // lines at every reason length. The chip stays; the reason moves to the body.
+  it('keeps the reason out of the modal header, in the body above the spotlight', () => {
+    updateSnapshot(degradedClaudeEnvelope());
+    render(<CacheReportModal />);
+    const header = document.querySelector('.modal-header')!;
+    // The chip is still a header child — only the reason moved.
+    expect(header.querySelector('.provider-section-status')).not.toBeNull();
+    expect(header.querySelector('.provider-section-reason')).toBeNull();
+
+    const reason = document.querySelector('.provider-section-reason')!;
+    const body = document.querySelector('.modal-body')!;
+    expect(body.contains(reason)).toBe(true);
+    // Full-width body line above the spotlight, matching the panel's placement.
+    const spotlight = document.querySelector('.crm-spotlight')!;
+    expect(
+      reason.compareDocumentPosition(spotlight) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S1 review — the all-mode section gained observedDayCount + measured();
+// nothing exercised either.
+// ---------------------------------------------------------------------------
+
+describe('<CacheReportModal /> #443 S1 all-mode not-measured treatment', () => {
+  function allModeEnvelope(cr: CacheReportEnvelope): Envelope {
+    return withSources(cr);
+  }
+
+  it('excludes the synthetic row from the all-mode observed-day count', () => {
+    updateSnapshot(allModeEnvelope(unobservedTodayReport()));  // 14 rows, one synthetic
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportModal />);
+    const claude = document.querySelector('[data-provider-section="claude"]')!;
+    expect(claude.textContent).toContain('13 observed');
+    expect(claude.textContent).not.toContain('14 observed');
+  });
+
+  it('renders an em dash instead of a measured zero in the all-mode daily summary', () => {
+    updateSnapshot(allModeEnvelope(unobservedTodayReport()));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportModal />);
+    const rows = document.querySelectorAll(
+      '[data-provider-section="claude"] .provider-daily-summary-row',
+    );
+    const synthetic = rows[0];
+    expect(synthetic.textContent).not.toContain('0%');
+    expect(synthetic.textContent).not.toContain('$0.00');
+    expect(synthetic.textContent).toContain('—');
+    // The net cell drops its sign colouring too — an unmeasured day is
+    // neither positive nor negative.
+    expect(synthetic.querySelector('.net-pos')).toBeNull();
+    expect(synthetic.querySelector('.net-neg')).toBeNull();
+    // A real row beside it still renders its measurement.
+    expect(rows[1].textContent).toMatch(/%/);
   });
 });

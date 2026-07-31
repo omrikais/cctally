@@ -100,7 +100,15 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # Discovery still supplies its ordering, while this guard prevents an
 # accidental executable-bit regression from silently dropping it from every
 # bundle run.
-required_harnesses=(codex-quota source-aware test-remote)
+required_harnesses=(codex-quota source-aware)
+# test-remote's harness is maintainer-local and deliberately unmirrored, so it
+# is required only in the private checkout. .mirror-allowlist excludes itself,
+# which makes its presence the discriminator: absent means this tree IS the
+# shipped public subset, where demanding a file the mirror never carries would
+# fail CI before a single harness runs (#131).
+if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
+    required_harnesses+=(test-remote)
+fi
 for required in "${required_harnesses[@]}"; do
     if [ ! -x "$REPO_ROOT/bin/cctally-${required}-test" ]; then
         echo "cctally-test-all: required harness is not executable: $required" >&2

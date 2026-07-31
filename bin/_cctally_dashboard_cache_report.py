@@ -135,6 +135,12 @@ class CacheReportDailyRow:
     net_usd: float
     anomaly_triggered: bool
     anomaly_reasons: tuple[str, ...]
+    # #443 S1. `anomaly_unevaluated` = the predicates the classifier declined
+    # to run for this row; `observed` is False only for the builder's
+    # synthetic today row. Both default so their absence reproduces pre-S1
+    # rendering exactly.
+    anomaly_unevaluated: tuple[str, ...] = ()
+    observed: bool = True
 
 
 @dataclass(frozen=True)
@@ -161,6 +167,9 @@ class CacheReportTodaySpotlight:
     anomaly_triggered: bool
     anomaly_reasons: tuple[str, ...]
     baseline_daily_row_count: int
+    # #443 S1 — see CacheReportDailyRow.
+    anomaly_unevaluated: tuple[str, ...] = ()
+    observed: bool = True
 
 
 def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | None":
@@ -189,6 +198,8 @@ def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | 
             "anomaly_triggered": cr.today.anomaly_triggered,
             "anomaly_reasons": list(cr.today.anomaly_reasons),
             "baseline_daily_row_count": cr.today.baseline_daily_row_count,
+            "anomaly_unevaluated": list(cr.today.anomaly_unevaluated),
+            "observed": cr.today.observed,
         },
         "days": [
             {
@@ -203,6 +214,8 @@ def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | 
                 "net_usd": d.net_usd,
                 "anomaly_triggered": d.anomaly_triggered,
                 "anomaly_reasons": list(d.anomaly_reasons),
+                "anomaly_unevaluated": list(d.anomaly_unevaluated),
+                "observed": d.observed,
             }
             for d in cr.days
         ],
@@ -319,6 +332,12 @@ def _cache_report_empty(
 ):
     """The empty (no in-window entries) ``CacheReportSnapshot`` — factored so the
     warm and cold builder paths share one ``is_empty`` return (#272 §6)."""
+    crk = _cache_report_load_kernel()
+    # #443 S1 — the dataclass defaults would claim ``observed=True`` with an
+    # empty ``anomaly_unevaluated`` for a day that was definitionally never
+    # measured or classified. That is the fabricating default this session
+    # removes everywhere else, so it is stated explicitly here too even though
+    # the empty branch short-circuits before any of it renders.
     empty_today = CacheReportTodaySpotlight(
         date=today_iso,
         cache_hit_percent=0.0,
@@ -328,6 +347,8 @@ def _cache_report_empty(
         anomaly_triggered=False,
         anomaly_reasons=(),
         baseline_daily_row_count=0,
+        anomaly_unevaluated=tuple(crk.CACHE_ANOMALY_PREDICATES),
+        observed=False,
     )
     return CacheReportSnapshot(
         window_days=window_days,
@@ -555,6 +576,10 @@ def build_cache_report_snapshot(
             anomaly_triggered=False,
             anomaly_reasons=(),
             baseline_daily_row_count=baseline_daily_row_count,
+            # This row never reaches the classifier, so nothing was evaluated
+            # for it and nothing was measured behind it (#443 S1 F1/F2).
+            anomaly_unevaluated=tuple(crk.CACHE_ANOMALY_PREDICATES),
+            observed=False,
         )
     else:
         today_spotlight = CacheReportTodaySpotlight(
@@ -568,6 +593,8 @@ def build_cache_report_snapshot(
             anomaly_triggered=today_row.anomaly_triggered,
             anomaly_reasons=tuple(today_row.anomaly_reasons),
             baseline_daily_row_count=baseline_daily_row_count,
+            anomaly_unevaluated=tuple(today_row.anomaly_unevaluated),
+            observed=True,
         )
 
     # Daily rows — newest first, capped at ``window_days``.
@@ -615,6 +642,8 @@ def build_cache_report_snapshot(
                 net_usd=0.0,
                 anomaly_triggered=False,
                 anomaly_reasons=(),
+                anomaly_unevaluated=tuple(crk.CACHE_ANOMALY_PREDICATES),
+                observed=False,
             )
         )
     days_newest_first.extend(
@@ -630,6 +659,8 @@ def build_cache_report_snapshot(
             net_usd=r.net_usd,
             anomaly_triggered=r.anomaly_triggered,
             anomaly_reasons=tuple(r.anomaly_reasons),
+            anomaly_unevaluated=tuple(r.anomaly_unevaluated),
+            observed=True,
         )
         for r in raw_days_newest_first
     )

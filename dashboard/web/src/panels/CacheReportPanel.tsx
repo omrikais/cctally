@@ -41,6 +41,7 @@ import { CacheNetBars } from '../modals/CacheNetBars';
 import { cardRegionClick } from '../lib/cardRegion';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
+import { cacheReportVerdict } from '../lib/cacheReportVerdict';
 import {
   presentationCacheDays,
   presentationCacheReportComposition,
@@ -61,6 +62,10 @@ function CacheProviderSummary({
 }) {
   const report = section.value;
   const windowNetUsd = report?.days.reduce((sum, day) => sum + day.net_usd, 0) ?? 0;
+  // #443 F6 — this summary applied no insufficient gate, so it read "anomaly"
+  // for data the panel beside it called "building baseline". Both now call the
+  // same helper, which resolves the contradiction as a consequence.
+  const verdict = report == null ? null : cacheReportVerdict(report);
   return (
     <div
       className="source-provider-section provider-summary-card cache-provider-summary"
@@ -80,7 +85,11 @@ function CacheProviderSummary({
           <div className="provider-summary-kpis">
             <div>
               <span className="provider-summary-label">Cache hit</span>
-              <strong className="provider-summary-value">{fmt.pctFloor(report.today.cache_hit_percent)}%</strong>
+              <strong className="provider-summary-value">
+                {verdict!.todayObserved
+                  ? `${fmt.pctFloor(report.today.cache_hit_percent)}%`
+                  : '—'}
+              </strong>
             </div>
             <div>
               <span className="provider-summary-label">{report.window_days}d net</span>
@@ -90,7 +99,15 @@ function CacheProviderSummary({
             </div>
           </div>
           <div className="provider-summary-foot">
-            <span>{report.today.anomaly_triggered ? '⚠ anomaly' : '✓ healthy'}</span>
+            <span>
+              {verdict!.insufficient
+                ? `~ Building baseline · ${report.today.baseline_daily_row_count}/${CACHE_REPORT_MIN_BASELINE_DAYS}`
+                : verdict!.chromeAmber
+                  ? '⚠ anomaly'
+                  : verdict!.todayObserved
+                    ? '✓ healthy'
+                    : '· no activity today'}
+            </span>
             <span>{report.window_days}d native report</span>
           </div>
           {section.reason && <div className="provider-section-reason">{section.reason}</div>}
@@ -172,6 +189,24 @@ export function CacheReportPanel() {
     is_empty: adaptedDays.length === 0,
   };
   const cr = activeSource === 'claude' ? env?.cache_report : nativeReport ?? adapted;
+  // #443 F5 — the composition was already computed above and then discarded
+  // outside the `all` branch, so a stale or degraded source rendered a
+  // confident verdict here while the `all` view showed a warning chip beside
+  // the same data. Reuse it. Deliberately NOT a SourceChip: the bare
+  // single-source panel is a layering contract pinned by cacheReportSource.
+  const section = composition.sections[0];
+  const hydrating = presentationProviders(env, activeSource).hydrating;
+  // The chip and reason describe the availability of the SECTION's own report.
+  // When Codex has daily rows but no native report the rendered object is the
+  // `adapted` compatibility fallback, not `section.value`, and labelling that
+  // with the section's "Codex cache report is unavailable." would pair a full
+  // verdict with a chip denying the report exists. Saying nothing there is the
+  // honest option until S2 (F3/F4) designs the fallback's own presentation.
+  const rendersSectionValue = (cr ?? null) === (section?.value ?? null);
+  const statusChip = section && rendersSectionValue && section.status !== 'available' ? (
+    <span className="provider-section-status">{section.status}</span>
+  ) : null;
+  const statusReason = section && rendersSectionValue ? section.reason : null;
   // Mobile-driven collapse (< 720 px). The `.cache-report-collapsed`
   // modifier class hides the sparkline + secondary subline via the
   // existing @media rule at index.css:4186 so the panel reads as a
@@ -185,7 +220,12 @@ export function CacheReportPanel() {
   // still renders so panelOrder / drag-and-drop / keymap routing have
   // a real DOM target; click is wired so the modal can open even before
   // the first sync tick.
-  if (!cr) {
+  // Branch 1 — cold start. Gated on the value being ABSENT, not on `hydrating`
+  // alone: types/envelope.ts:104-106 guarantees a populated-but-incomplete
+  // snapshot stays visible, and A2's progressive republish actually produces
+  // one, so testing `hydrating` first would hide real data during every
+  // progressive load.
+  if (!cr && hydrating) {
     return (
       <section
         className={`panel accent-teal${collapseClass}`}
@@ -208,21 +248,16 @@ export function CacheReportPanel() {
             <PanelGrip />
           </div>
         </div>
-        {/* #278 §1.4: during the cheap first-paint seed the cache-report block
-            hasn't been built yet; show a loading skeleton body. When NOT
-            hydrating, `!cr` is a build-failure/no-cache edge — keep the
-            header-only minimal placeholder. */}
-        {presentationProviders(env, activeSource).hydrating && (
-          <div className="panel-body">
-            <PanelSkeleton lines={2} />
-          </div>
-        )}
+        <div className="panel-body">
+          <PanelSkeleton lines={2} />
+        </div>
       </section>
     );
   }
 
-  // Empty-state — no Claude activity in the window.
-  if (cr.is_empty) {
+  // Branch 2 — #443 F8. A null report that is NOT hydrating is a build
+  // failure, and printing "(loading)" for it was an indefinite lie.
+  if (!cr) {
     return (
       <section
         className={`panel accent-teal${collapseClass}`}
@@ -237,6 +272,50 @@ export function CacheReportPanel() {
         <div className="panel-header" style={{ justifyContent: 'space-between' }}>
           <div className="cr-panel-header-inner">
             <h2 style={{ color: TEAL }}>Cache Report</h2>
+            {statusChip}
+          </div>
+          <div className="panel-header-actions">
+            <ExpandButton label="Cache Report" onOpen={openModal} />
+            <PanelGrip />
+          </div>
+        </div>
+        <div className="cr-status-row">
+          <span className="cr-glyph thin">−</span>
+          <div>
+            <div className="cr-headline">Cache Report unavailable</div>
+            <div className="cr-subline">
+              The snapshot could not be built. Retrying on the next sync.
+            </div>
+            {statusReason && <div className="cr-subline">{statusReason}</div>}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  // Empty-state — no Claude activity in the window.
+  if (cr.is_empty) {
+    // Spec §4.2 branch 2 keeps this card's copy unchanged, so an ordinary
+    // cold start must not gain a second, redundant way of saying "nothing
+    // here yet". Branch 4 (degraded AND empty) still needs its label, so the
+    // suppression is keyed on the status rather than on emptiness.
+    const emptyChip = section?.status === 'empty' ? null : statusChip;
+    const emptyReason = section?.status === 'empty' ? null : statusReason;
+    return (
+      <section
+        className={`panel accent-teal${collapseClass}`}
+        id="panel-cache-report"
+        data-panel-kind="cache-report"
+        data-source={activeSource}
+        role="region"
+        aria-label="Cache Report"
+        onClick={cardRegionClick(openModal)}
+        style={{ cursor: 'pointer' }}
+      >
+        <div className="panel-header" style={{ justifyContent: 'space-between' }}>
+          <div className="cr-panel-header-inner">
+            <h2 style={{ color: TEAL }}>Cache Report</h2>
+            {emptyChip}
           </div>
           <div className="panel-header-actions">
             <ExpandButton label="Cache Report" onOpen={openModal} />
@@ -248,15 +327,17 @@ export function CacheReportPanel() {
           <div>
             <div className="cr-headline">No {activeSource === 'codex' ? 'Codex' : 'Claude'} activity yet</div>
             <div className="cr-subline">Run a session to start tracking</div>
+            {emptyReason && <div className="cr-subline">{emptyReason}</div>}
           </div>
         </div>
       </section>
     );
   }
 
+  const verdict = cacheReportVerdict(cr);
   const anomalous = cr.today.anomaly_triggered;
-  const insufficient =
-    cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
+  const { insufficient } = verdict;
+  const todayObserved = verdict.todayObserved;
 
   // Accent class flip (anomalous => amber). The header color follows the
   // same flip so the title text reads correctly against the bordered
@@ -271,7 +352,7 @@ export function CacheReportPanel() {
   // amber here would render a false warning before the baseline is
   // established and contradict the headline copy below
   // (CacheReportModal mirrors the same gate on .modal-card).
-  const chromeAmber = anomalous && !insufficient;
+  const chromeAmber = verdict.chromeAmber;
   const accentClass = chromeAmber ? 'accent-amber' : 'accent-teal';
   const headerColor = chromeAmber ? AMBER : TEAL;
   const todayMarker = chromeAmber ? AMBER : GREEN;
@@ -284,11 +365,13 @@ export function CacheReportPanel() {
     glyph = { icon: '~', cls: 'thin' };
     const n = cr.today.baseline_daily_row_count;
     headline = <>Building baseline · {n}/{CACHE_REPORT_MIN_BASELINE_DAYS} days</>;
-    sublineFirst = (
+    sublineFirst = todayObserved ? (
       <>
         Today: cache hit {fmt.pctFloor(cr.today.cache_hit_percent)}% · net{' '}
         {fmt.usdSigned(cr.today.net_usd)}
       </>
+    ) : (
+      <>No activity today</>
     );
   } else if (anomalous) {
     glyph = { icon: '⚠', cls: 'warn' };
@@ -321,6 +404,20 @@ export function CacheReportPanel() {
           : '—'}{' '}
         · net{' '}
         <span className="warn">{fmt.usdSigned(cr.today.net_usd)}</span>
+      </>
+    );
+  } else if (!todayObserved) {
+    // Neutral glyph, not a check: both predicates are unevaluated for a
+    // synthetic today row, so a check would be a verdict over nothing.
+    glyph = { icon: '·', cls: 'thin' };
+    headline = <>No activity today</>;
+    sublineFirst = (
+      <>
+        vs 14d median{' '}
+        {cr.today.baseline_median_percent !== null
+          ? fmt.pctFloor(cr.today.baseline_median_percent) + '%'
+          : '—'}{' '}
+        · net —
       </>
     );
   } else {
@@ -376,6 +473,7 @@ export function CacheReportPanel() {
             Cache Report
             {chromeAmber && <span className="sub">⚠ Today</span>}
           </h2>
+          {statusChip}
         </div>
         <div className="panel-header-actions">
           <ExpandButton label="Cache Report" onOpen={openModal} />
@@ -409,6 +507,9 @@ export function CacheReportPanel() {
       )}
 
       <div className="cr-subline second">{sublineSecond}</div>
+      {statusReason && (
+        <div className="provider-section-reason">{statusReason}</div>
+      )}
     </section>
   );
 }

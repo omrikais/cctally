@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.89.1] - 2026-07-31
+
+### Fixed
+- Cache Report no longer shows a healthy measured 0% on a day with no activity yet — the panel, spotlight, daily rows, sparkline and net-$ bars now mark an unmeasured day explicitly (#443).
+- Cache Report daily rows whose anomaly predicates could not be evaluated now render a neutral flag with an explanatory legend, instead of a green check (#443).
+- Cache Report single-source views now show a provider's degraded or stale status chip, matching what the all-sources view already showed (#443).
+- The all-sources Cache Report summary no longer reports an anomaly for data the panel beside it calls "building baseline" (#443).
+- An empty Cache Report source no longer renders KPIs and a healthy verdict alongside its empty label (#443).
+- A Cache Report that failed to build now says so, instead of showing an indefinite loading state (#443).
+- Internal (maintainer-only): the public repository's CI matrix no longer fails before running a single test. v1.89.0 started treating three harnesses as mandatory so that a lost executable bit could not silently drop one from a full-suite run, but one of them — the remote-test transport harness — is maintainer-local tooling that the public mirror deliberately never carries, so on every public checkout the guard refused immediately and took all three Python versions down with it. The requirement now applies only in the private checkout, where the file is supposed to exist, while the public matrix goes on running the shipped subset as designed. Nothing the guard was added to catch has been given up: in the private tree a harness that loses its executable bit — or disappears outright — still fails the run. (#446)
+
 ## [1.89.0] - 2026-07-31
 
 ### Fixed

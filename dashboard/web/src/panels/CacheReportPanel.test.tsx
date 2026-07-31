@@ -5,8 +5,11 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { CacheReportPanel } from './CacheReportPanel';
+import envelopeFixture from '../../__tests__/fixtures/envelope.json';
+import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
 import {
   _resetForTests,
+  dispatch,
   getState,
   updateSnapshot,
 } from '../store/store';
@@ -370,5 +373,250 @@ describe('<CacheReportPanel /> 14d-net subline (issue #77 P2-4)', () => {
     // watchdog hint shows up in .cr-subline.second.
     const subline = document.querySelector('.cr-subline.second');
     expect(subline?.textContent).not.toMatch(/14d net:/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S1 — branch order, provider status, and the all-mode summary.
+// ---------------------------------------------------------------------------
+
+function unobservedTodayCacheReport(): CacheReportEnvelope {
+  const base = healthyCacheReport();
+  return {
+    ...base,
+    today: {
+      ...base.today,
+      cache_hit_percent: 0,
+      net_usd: 0, saved_usd: 0, wasted_usd: 0,
+      anomaly_triggered: false, anomaly_reasons: [],
+      anomaly_unevaluated: ['net_negative', 'cache_drop'],
+      observed: false,
+    },
+    days: [
+      {
+        ...base.days[0], date: '2026-05-21', cache_hit_percent: 0,
+        input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0,
+        cache_read_tokens: 0, saved_usd: 0, wasted_usd: 0, net_usd: 0,
+        anomaly_unevaluated: ['net_negative', 'cache_drop'], observed: false,
+      },
+      ...base.days,
+    ],
+  };
+}
+
+function thinBaselineUnobservedCacheReport(): CacheReportEnvelope {
+  const base = unobservedTodayCacheReport();
+  return {
+    ...base,
+    today: {
+      ...base.today,
+      baseline_median_percent: null, delta_pp: null,
+      baseline_daily_row_count: 3,
+    },
+  };
+}
+
+function thinBaselineNetNegativeCacheReport(): CacheReportEnvelope {
+  const base = healthyCacheReport();
+  return {
+    ...base,
+    today: {
+      ...base.today,
+      baseline_median_percent: null, delta_pp: null,
+      baseline_daily_row_count: 3,
+      net_usd: -0.42, saved_usd: 0.1, wasted_usd: 0.52,
+      anomaly_triggered: true, anomaly_reasons: ['net_negative'],
+      anomaly_unevaluated: ['cache_drop'],
+    },
+    days: base.days.slice(0, 3),
+  };
+}
+
+function withCodexSection(cr: CacheReportEnvelope): Envelope {
+  // Minimal source bundle so `all` mode composes two sections.
+  const e = envelopeWith(cr);
+  e.source_schema_version = 2;
+  e.default_source = 'claude';
+  e.source_order = ['claude', 'codex', 'all'];
+  e.sources = {
+    claude: {
+      source: 'claude', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: {},
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+    codex: {
+      source: 'codex', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: { cache_report: null },
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+    all: {
+      source: 'all', availability: 'ok', freshness: 'fresh',
+      warnings: [], data_version: 'v1', last_success_at: null,
+      capabilities: {}, data: {},
+      domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+    },
+  } as unknown as Envelope['sources'];
+  return e;
+}
+
+function degradedClaudeEnvelope(cr = healthyCacheReport()): Envelope {
+  const e = withCodexSection(cr);
+  e.sources!.claude.freshness = 'stale';
+  delete (e.sources!.claude as { domain_freshness?: unknown }).domain_freshness;
+  return e;
+}
+
+describe('<CacheReportPanel /> #443 S1 hydrating vs failed', () => {
+  it('keeps a populated report visible while hydrating', () => {
+    // types/envelope.ts:104 — a populated-but-incomplete panel shows its data.
+    const e = envelopeWith(healthyCacheReport());
+    e.hydrating = true;
+    updateSnapshot(e);
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/cache hit/i)).toBeInTheDocument();
+    expect(document.querySelector('.panel-skeleton')).toBeNull();
+  });
+
+  it('renders a skeleton only when hydrating with no value', () => {
+    const e = baseEnvelope();
+    e.hydrating = true;
+    updateSnapshot(e);
+    render(<CacheReportPanel />);
+    expect(document.querySelector('.panel-skeleton')).not.toBeNull();
+  });
+
+  it('states the failure when a null report is not hydrating', () => {
+    const e = baseEnvelope();
+    e.hydrating = false;
+    updateSnapshot(e);
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
+    expect(screen.queryByText(/\(loading\)/)).toBeNull();
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 provider status in single-source view', () => {
+  it('shows the provider status chip in single-source view when degraded', () => {
+    updateSnapshot(degradedClaudeEnvelope());
+    render(<CacheReportPanel />);
+    expect(document.querySelector('.provider-section-status')!.textContent).toBe('degraded');
+    expect(screen.getByText(/cache hit/i)).toBeInTheDocument();   // verdict retained
+    expect(document.querySelector('.source-chip')).toBeNull();     // panel stays bare
+  });
+
+  it('renders the empty body with a chip for a degraded empty source', () => {
+    updateSnapshot(degradedClaudeEnvelope(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/No Claude activity yet/)).toBeInTheDocument();
+    expect(document.querySelector('.provider-section-status')).not.toBeNull();
+    expect(screen.queryByText(/cache hit/i)).toBeNull();
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 all-mode summary', () => {
+  it('applies the insufficient gate in the all-mode summary', () => {
+    // Thin baseline + net_negative: the panel says Building baseline, so the
+    // all-mode summary must not say anomaly for the same data (#443 F6).
+    updateSnapshot(withCodexSection(thinBaselineNetNegativeCacheReport()));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportPanel />);
+    const claude = document.querySelector('[data-provider-section="claude"]')!;
+    expect(claude.textContent).not.toContain('⚠ anomaly');
+    expect(claude.textContent).toContain('Building baseline');
+  });
+
+  it('does not print a measured zero in the all-mode summary KPI', () => {
+    updateSnapshot(withCodexSection(unobservedTodayCacheReport()));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportPanel />);
+    const claude = document.querySelector('[data-provider-section="claude"]')!;
+    expect(claude.textContent).not.toContain('Cache hit0%');
+    expect(claude.textContent).toContain('no activity today');
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 chip never contradicts the rendered report', () => {
+  it('suppresses the chip and reason when the Codex fallback is what renders', () => {
+    // Codex has daily rows but no native cache_report, so `section` is
+    // `unavailable` while `cr` is the `adapted` compatibility object. Labelling
+    // a full verdict "Codex cache report is unavailable." contradicts the
+    // screen; S2 (F3/F4) owns the fallback's own presentation.
+    const e = {
+      ...(structuredClone(envelopeFixture) as unknown as Envelope),
+      ...makeSourceEnvelope(),
+    };
+    e.sources!.codex.data!.cache_report = null;
+    updateSnapshot(e);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<CacheReportPanel />);
+    // The fallback VERDICT branch is on screen — not the failure branch, which
+    // renders a .cr-headline of its own and would make this pass vacuously.
+    expect(document.querySelector('[data-source="codex"]')).not.toBeNull();
+    expect(document.querySelector('.cr-spark')).not.toBeNull();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
+    // … so neither the chip nor the reason may deny the report exists.
+    expect(document.querySelector('.provider-section-status')).toBeNull();
+    expect(document.querySelector('.provider-section-reason')).toBeNull();
+    expect(screen.queryByText(/cache report is unavailable/i)).toBeNull();
+  });
+
+  it('keeps the chip on the failure branch, where the section value really is null', () => {
+    const e = baseEnvelope();
+    e.hydrating = false;
+    e.source_schema_version = 2;
+    e.default_source = 'claude';
+    e.source_order = ['claude', 'codex', 'all'];
+    e.sources = {
+      claude: {
+        source: 'claude', availability: 'unavailable', freshness: 'fresh',
+        warnings: [], data_version: 'v1', last_success_at: null,
+        capabilities: {}, data: null,
+        domain_freshness: { hero: 'fresh', quota: 'fresh', sessions: 'fresh' },
+      },
+    } as unknown as Envelope['sources'];
+    updateSnapshot(e);
+    render(<CacheReportPanel />);
+    expect(document.querySelector('.provider-section-status')!.textContent)
+      .toBe('unavailable');
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 empty card copy', () => {
+  it('adds no chip or reason to the ordinary cold-start empty card', () => {
+    // Spec §4.2 branch 2 — this card's copy is unchanged. An `empty` chip plus
+    // "No Claude cache activity is available for this window." beneath
+    // "No Claude activity yet / Run a session to start tracking" says the same
+    // thing three times.
+    updateSnapshot(withCodexSection(emptyCacheReport()));
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/No Claude activity yet/)).toBeInTheDocument();
+    expect(screen.getByText(/Run a session to start tracking/)).toBeInTheDocument();
+    expect(document.querySelector('.provider-section-status')).toBeNull();
+    expect(screen.queryByText(/is available for this window/i)).toBeNull();
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 not-measured headline', () => {
+  it('renders the not-measured headline in the healthy branch', () => {
+    updateSnapshot(envelopeWith(unobservedTodayCacheReport()));
+    render(<CacheReportPanel />);
+    // Scoped to .cr-headline: the sparkline's unobserved guide carries an
+    // accessible <title> with the same words, which is deliberate.
+    expect(document.querySelector('.cr-headline')!.textContent)
+      .toBe('No activity today');
+    expect(screen.queryByText(/Today: cache hit 0%/)).toBeNull();
+    expect(screen.queryByText('✓')).toBeNull();
+    expect(document.querySelector('.cr-glyph')!.textContent).toBe('·');
+  });
+
+  it('keeps baseline progress in the headline when unobserved and thin', () => {
+    updateSnapshot(envelopeWith(thinBaselineUnobservedCacheReport()));
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/Building baseline · 3\/5 days/)).toBeInTheDocument();
+    // insufficient still owns the headline; the subline carries the modifier.
+    expect(document.querySelector('.cr-subline')!.textContent)
+      .toBe('No activity today');
   });
 });
