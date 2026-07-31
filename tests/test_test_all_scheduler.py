@@ -12,7 +12,14 @@ import pathlib
 import shutil
 import subprocess
 
+import pytest
+
 RUNNER = pathlib.Path(__file__).resolve().parents[1] / "bin" / "cctally-test-all"
+# .mirror-allowlist excludes itself from the mirror, so its presence is exactly the
+# marker bin/cctally-test-all uses to require the maintainer-local test-remote harness.
+PRIVATE_TREE = (
+    pathlib.Path(__file__).resolve().parents[1] / ".mirror-allowlist"
+).exists()
 
 
 def _plan(env_overrides, fake_ncpu="16", runner=RUNNER):
@@ -103,6 +110,10 @@ def test_rejects_non_numeric():
     assert p.returncode == 2
 
 
+@pytest.mark.skipif(
+    not PRIVATE_TREE,
+    reason="test-remote is maintainer-local; the public mirror ships no such harness",
+)
 def test_plan_explicitly_includes_test_remote_harness():
     p = _plan({})
     assert p.returncode == 0, p.stderr

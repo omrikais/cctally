@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.89.2] - 2026-07-31
+
+### Fixed
+- Internal (maintainer-only): the public repository's CI matrix no longer fails on a test that requires maintainer-local tooling to be present. v1.89.1 stopped the remote-test transport harness from being treated as mandatory on a public checkout, but a test in the shipped suite still asserted that the same harness appears in a planned full-suite run — so the public matrix moved from failing before any test ran to failing on that one test, again across all three Python versions. That assertion now applies only in the private checkout, keyed off the very marker the runner itself uses to decide the harness is required, so the public suite skips it and the private tree still asserts it in full. (#446)
+
 ## [1.89.1] - 2026-07-31
 
 ### Fixed
