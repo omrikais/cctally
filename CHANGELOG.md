@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.90.1] - 2026-08-02
+
+### Fixed
+- Internal (maintainer-only): the public release snapshot no longer ships the issue-triage pytest modules without the private workflow implementation they import. Those tests now stay behind the same mirror boundary as their `.agent-workflows` dependencies, preventing collection failures across the public Python matrix.
+
 ## [1.90.0] - 2026-08-02
 
 ### Added
