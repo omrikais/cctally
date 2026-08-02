@@ -14,7 +14,10 @@
       "netUsd": 0.44375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -49,7 +52,10 @@
       "netUsd": 0.44375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -84,7 +90,10 @@
       "netUsd": 0.44375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -119,7 +128,10 @@
       "netUsd": 0.44375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -154,7 +166,10 @@
       "netUsd": 0.44375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -191,7 +206,8 @@
         "triggered": true,
         "reasons": [
           "cache_drop"
-        ]
+        ],
+        "unevaluated": []
       },
       "modelBreakdowns": [
         {

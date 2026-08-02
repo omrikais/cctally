@@ -846,6 +846,14 @@ def _sync_failure_envelope(
             "action": "cctally db repair --db stats --yes",
         }
 
+    if attributed("stats"):
+        return {
+            "kind": "maintenance_active",
+            "label": "stats index rebuilding",
+            "detail": "The dashboard statistics index is rebuilding in the background.",
+            "action": None,
+        }
+
     # conversations.db is intentionally outside core dashboard generations.
     # Typed transcript ownership therefore degrades through the generic server
     # contract: Doctor owns integrity diagnosis, and raw SQLite wording must

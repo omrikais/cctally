@@ -56,6 +56,47 @@ describe('cacheRowVerdict', () => {
   });
 });
 
+// #443 S2 — the applicable predicate set is a PARAMETER, because "every
+// predicate unevaluated" is a per-provider question. Codex can only ever
+// evaluate cache_drop, so a Codex row carrying it alone is fully unevaluated,
+// not half-evaluated; resolving it against the Claude pair pinned the Codex
+// Flag column at `partial` in perpetuity (spec §2, §4.6).
+describe('cacheRowVerdict provider-scoped predicates', () => {
+  it('resolves an evaluable Codex row as clean, not partial', () => {
+    const v = cacheRowVerdict(
+      row({ anomaly_unevaluated: [] }),
+      ['cache_drop'],
+    );
+    expect(v.state).toBe('clean');
+  });
+
+  it('resolves a thin-baseline Codex row as unevaluated, not partial', () => {
+    const v = cacheRowVerdict(
+      row({ anomaly_unevaluated: ['cache_drop'] }),
+      ['cache_drop'],
+    );
+    expect(v.state).toBe('unevaluated');
+  });
+
+  it('defaults to the Claude pair when no set is given', () => {
+    // The S1 compatibility seam: a pre-S2 envelope publishes no
+    // anomaly_predicates and must resolve exactly as it does today.
+    const v = cacheRowVerdict(row({ anomaly_unevaluated: ['cache_drop'] }));
+    expect(v.state).toBe('partial');
+  });
+
+  it('keeps a triggered Codex row anomalous ahead of the unevaluated check', () => {
+    expect(cacheRowVerdict(
+      row({
+        anomaly_triggered: true,
+        anomaly_reasons: ['cache_drop'],
+        anomaly_unevaluated: [],
+      }),
+      ['cache_drop'],
+    ).state).toBe('anomalous');
+  });
+});
+
 describe('cacheRowFlagGlyph', () => {
   it('maps the four states onto three glyphs', () => {
     expect(cacheRowFlagGlyph('anomalous')).toBe('⚠');
@@ -135,5 +176,61 @@ describe('cacheReportVerdict', () => {
 
   it('defaults todayObserved to true when the field is absent', () => {
     expect(cacheReportVerdict(report()).todayObserved).toBe(true);
+  });
+
+  // The one that matters (#443 S2 §4.6): threading the set into the leaf
+  // helper alone leaves this function deriving today's verdict against the
+  // Claude pair, and the session's headline behaviour silently does not land.
+  it('passes the report predicate set through cacheReportVerdict', () => {
+    const cr = {
+      anomaly_predicates: ['cache_drop'],
+      today: {
+        baseline_daily_row_count: 9, anomaly_triggered: false,
+        anomaly_reasons: [], anomaly_unevaluated: ['cache_drop'],
+      },
+    } as never;
+    expect(cacheReportVerdict(cr).today.state).toBe('unevaluated');
+  });
+
+  it('still resolves an absent predicate set against the Claude pair', () => {
+    expect(cacheReportVerdict(report({
+      anomaly_unevaluated: ['cache_drop'],
+    })).today.state).toBe('partial');
+  });
+});
+
+// #443 S2 QA P2. The earlier review concluded the predicate threading was
+// structurally correct but behaviourally unobservable, because `partial` and
+// `unevaluated` collapse to one class and one glyph. That is true of the
+// class and the glyph — but NOT of the label, which names the predicates and
+// is rendered into both `title` and `aria-label`. So the observable test spec
+// §5 asked for does exist; it just lives here rather than on the glyph.
+describe('cacheRowFlagLabel provider vocabulary', () => {
+  const codexReason = (p: string) => (p === 'cache_drop' ? 'reuse drop' : p);
+
+  it('renders the raw predicate name for Claude, unchanged', () => {
+    expect(cacheRowFlagLabel('partial', ['cache_drop'])).toBe(
+      'not evaluated — cache_drop could not be evaluated for this day');
+  });
+
+  it('renders the Codex wording, never the raw identifier', () => {
+    const label = cacheRowFlagLabel('partial', ['cache_drop'], true, codexReason);
+    expect(label).toContain('reuse drop');
+    // The point of the finding: this string reaches a screen reader.
+    expect(label).not.toContain('cache_drop');
+  });
+
+  it('translates every predicate in a multi-predicate label', () => {
+    const label = cacheRowFlagLabel(
+      'unevaluated', ['net_negative', 'cache_drop'], true, codexReason);
+    expect(label).toContain('reuse drop');
+    expect(label).not.toContain('cache_drop');
+    // net_negative has no Codex translation and passes through untouched.
+    expect(label).toContain('net_negative');
+  });
+
+  it('is byte-identical with an identity translator and with none', () => {
+    expect(cacheRowFlagLabel('partial', ['cache_drop'], true, (p) => p))
+      .toBe(cacheRowFlagLabel('partial', ['cache_drop']));
   });
 });

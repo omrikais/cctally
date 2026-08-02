@@ -254,20 +254,28 @@ function CodexTokenGrid({ totals }: { totals: CodexTokenTotals }) {
   const cacheHit = totals.input_tokens > 0
     ? totals.cached_input_tokens / totals.input_tokens * 100
     : null;
-  const tokenTiles: Array<[string, number, boolean]> = [
+  // #443 S2 — this grid is Codex-only, so it takes the Codex vocabulary:
+  // OpenAI reuses cached input, it does not serve a Claude cache hit.
+  // `cacheHit` is null when there is no input to take a ratio of, and a
+  // null must render as unmeasured — the previous `?? 0` printed a
+  // confident 0.0% with a zero-width bar for a percentage nobody computed.
+  const tokenTiles: Array<[string, number | null, boolean]> = [
     ['Input', totals.input_tokens, false],
     ['Output', totals.output_tokens, false],
     ['Cached input', totals.cached_input_tokens, false],
     ['Reasoning', totals.reasoning_output_tokens, false],
-    ['Cache hit %', cacheHit ?? 0, true],
+    ['Reuse %', cacheHit, true],
   ];
   return (
     <div className="msess-tok-grid">
       {tokenTiles.map(([label, value, percent]) => (
         <div key={label} className={`msess-tok-tile${percent ? ' cache-hit' : ''}`}>
           <div className="lbl">{label}</div>
-          <div className="n">{percent ? `${value.toFixed(1)}%` : value.toLocaleString('en-US')}</div>
-          {percent ? <div className="bar"><div className="fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} /></div> : null}
+          <div className="n">
+            {value === null ? '—'
+              : percent ? `${value.toFixed(1)}%` : value.toLocaleString('en-US')}
+          </div>
+          {percent && value !== null ? <div className="bar"><div className="fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }} /></div> : null}
         </div>
       ))}
     </div>

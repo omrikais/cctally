@@ -38,7 +38,9 @@
 // and BlockTimeline.tsx precedent.
 import type { CacheReportDailyRow } from '../types/envelope';
 import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
+import { cachePercent, cacheVocabulary } from '../lib/cacheReportVocabulary';
 import { computeAutoZoomDomain } from '../lib/chartDomain';
+import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
 
 export interface CacheSparklineProps {
   /** Newest-first daily rows from the envelope. Up to 14 entries. */
@@ -55,6 +57,12 @@ export interface CacheSparklineProps {
    *   HTML axis labels for the modal.
    */
   size: 'mini' | 'large';
+  /**
+   * Which provider's cache vocabulary the accessible name uses (#443 S2 §4.4).
+   * Absent means the Claude/neutral copy, matching the wire's own rule that
+   * absence carries the Claude meaning.
+   */
+  source?: string;
 }
 
 const SIZES = {
@@ -64,18 +72,31 @@ const SIZES = {
 
 /** Stroke width of the unobserved-today guide, shared by both variants. */
 const TODAY_GUIDE_STROKE = 1;
-const TODAY_GUIDE_HALF_STROKE = TODAY_GUIDE_STROKE / 2;
 
 export function CacheSparkline({
   days,
   baseline_median_percent,
   today_marker_color,
   size,
+  source,
 }: CacheSparklineProps) {
+  const vocab = cacheVocabulary(source ?? 'claude');
   const cfg = SIZES[size];
   const isLarge = size === 'large';
   // Reverse newest-first envelope so the polyline renders oldest -> newest.
   const ordered = [...days].reverse();
+
+  // Index FIRST so every row keeps its x-slot, then resolve the percentage and
+  // drop what cannot be plotted. Two things are unplottable and they are not
+  // the same: an unobserved day was never measured (#443 S1 F1), and a row
+  // publishing NEITHER percent key has nothing to place on the y-axis at all
+  // (#443 S2 §4.3). Reading `cache_hit_percent` directly gave the second case
+  // an `undefined` that propagated into a NaN domain and a NaN-coordinate
+  // polyline — invisible to any text assertion, and a visibly broken chart.
+  const plottable = ordered
+    .map((d, i) => ({ d, i, pct: cachePercent(d) }))
+    .filter(({ d, pct }) => d.observed !== false && pct !== null) as
+      Array<{ d: CacheReportDailyRow; i: number; pct: number }>;
 
   // Auto-zoom the y-domain for the large variant only (CR-1, #250): fit
   // to the data band + the median +/-band so the polyline shows real
@@ -86,7 +107,7 @@ export function CacheSparkline({
     ? computeAutoZoomDomain(
         // #443 F1 — a synthetic today row is not a measurement; letting its
         // zero into the domain would drag the whole scale down.
-        ordered.filter((d) => d.observed !== false).map((d) => d.cache_hit_percent),
+        plottable.map(({ pct }) => pct),
         baseline_median_percent,
         CACHE_REPORT_BAND_PP,
       )
@@ -131,42 +152,40 @@ export function CacheSparkline({
     return cfg.padTop + (1 - t) * (cfg.height - cfg.padTop - cfg.padBot);
   };
   const xFor = (i: number): number => {
-    if (ordered.length === 1) return cfg.width / 2;
-    return (i / (ordered.length - 1)) * cfg.width;
+    return cacheReportChartSlot(size, i, ordered.length).center;
   };
 
-  // Map with the index FIRST so unobserved rows keep their x-slot, then drop
-  // them from the plotted path. The line therefore ends at the last observed
-  // day rather than diving to a synthetic zero (#443 F1). Domain filtering
-  // alone would not do this: points are plotted independently of the domain,
-  // and the mini variant has no auto-zoom at all.
-  const points = ordered
-    .map((d, i) => ({ d, i }))
-    .filter(({ d }) => d.observed !== false)
-    .map(({ d, i }) => `${xFor(i).toFixed(1)},${yFor(d.cache_hit_percent).toFixed(1)}`)
+  // The line therefore ends at the last plottable day rather than diving to a
+  // synthetic zero (#443 F1) or to NaN (#443 S2). Domain filtering alone would
+  // not do this: points are plotted independently of the domain, and the mini
+  // variant has no auto-zoom at all.
+  const points = plottable
+    .map(({ i, pct }) => `${xFor(i).toFixed(1)},${yFor(pct).toFixed(1)}`)
     .join(' ');
 
   const todayIdx = ordered.length - 1;
   const todayRow = ordered[todayIdx];
+  const todayPct = cachePercent(todayRow);
   const todayObserved = todayRow.observed !== false;
+  const todayPlottable = todayObserved && todayPct !== null;
   const todayCx = xFor(todayIdx);
-  const todayCy = yFor(todayRow.cache_hit_percent);
-  // The unobserved-today guide is a zero-width vertical stroke, so at
-  // x == cfg.width exactly half of it falls outside the viewBox and is clipped
-  // away by the SVG's overflow — the surviving sliver sits on top of the chart
-  // frame's right border and reads as chrome rather than a marker. Inset it by
-  // half the stroke width (1 user unit for both variants) so the full stroke is
-  // inside. Data points are NOT moved: the polyline and the today circle keep
-  // using `todayCx`, which the circle survives because it extends leftward.
-  const todayGuideCx = Math.min(todayCx, cfg.width - TODAY_GUIDE_HALF_STROKE);
-  const observedCount = ordered.filter((d) => d.observed !== false).length;
+  // The shared band-center contract keeps the guide fully inside the viewBox;
+  // unlike the former edge-to-edge sparkline, no one-off inset is needed.
+  const todayGuideCx = todayCx;
+  // #443 S2 QA P3-b noted that this announces the MEASURED count while the
+  // net-bars beside it announce the window, so a screen-reader user hears two
+  // sizes for one report. Left alone deliberately: counting only observed
+  // days here is an S1 decision with its own test, and reconciling the two
+  // charts is a presentation call that belongs in a design gate, not a QA
+  // fix-up. Tracked in cctally-dev#469.
+  const plottedCount = plottable.length;
 
   const svg = (
     <svg
       className="cr-spark"
       {...svgSizeProps}
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
-      aria-label={`Cache hit % timeline, ${observedCount} days`}
+      aria-label={`${vocab.sparklineLabel}, ${plottedCount} days`}
     >
       {/* Gridlines (large only) — three horizontal rules at the zoomed
           domain's hi / mid / lo so the user can read the polyline's
@@ -230,17 +249,18 @@ export function CacheSparkline({
         stroke="var(--accent-cyan)"
         strokeWidth={isLarge ? 2 : 1.5}
       />
-      {todayObserved ? (
+      {todayPlottable ? (
         <circle
           cx={todayCx}
-          cy={todayCy}
+          cy={yFor(todayPct!)}
           r={isLarge ? 5 : 3.5}
           fill={today_marker_color}
           data-testid="cr-spark-today-marker"
         />
       ) : (
-        // No activity today: mark the position without asserting a value.
-        // A filled dot at 0% is exactly the measured-looking zero F1 removes.
+        // Nothing to place on the y-axis: mark the position without asserting
+        // a value. A filled dot at 0% is exactly the measured-looking zero F1
+        // removes, and one at NaN does not render at all.
         <line
           x1={todayGuideCx}
           x2={todayGuideCx}
@@ -251,7 +271,11 @@ export function CacheSparkline({
           strokeDasharray="3,3"
           data-testid="cr-spark-today-unobserved"
         >
-          <title>No activity today</title>
+          <title>
+            {todayObserved
+              ? 'No cache percentage published for today'
+              : 'No activity today'}
+          </title>
         </line>
       )}
     </svg>

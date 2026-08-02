@@ -1489,6 +1489,21 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     _cctally_store = importlib.import_module("_cctally_store")
 
     ensure_dirs()
+    # #453: probe the live index before the maintenance-shared opener. During
+    # a large detached rebuild that opener can wait for its bounded 5-second
+    # guard; a statusline arriving mid-replay would otherwise pay that delay
+    # (and can reach more than one stats opener in a single render). The raw
+    # probe is read-only and deliberately recognizes only a readable,
+    # post-legacy wrong epoch. Missing/unreadable/legacy indexes retain their
+    # established guarded-open paths. The post-open epoch gate below remains a
+    # race-closing defense if the version changes after this probe.
+    if (
+        _target_path is None
+        and _cctally_store.stats_epoch_enabled()
+        and _cctally_store.stats_epoch_rebuild_pending(db_path)
+    ):
+        outcome = _cctally_store.defer_stats_epoch_rebuild()
+        raise c.StatsEpochRebuildDeferred(outcome)
     # #386: the opener half of the physical-replacement protocol. This replaces
     # three bare `repair_marker.exists()` checks around an unguarded connect —
     # which observed no quarantine-pending record and held no maintenance lock,
@@ -1589,11 +1604,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         if _target_path is None:
             if _uv > LEGACY_STATS_HEAD:
                 # Neither legacy (<=13) nor the current epoch — a future epoch or
-                # a stray value. Resolve by journal REBUILD (spec §7.1), never by
-                # the corruption heal path (disjoint); a mismatch with no journal
-                # is a hard error, never a silent rebuild-to-empty.
+                # a stray value. Ordinary live callers must not pay whole-journal
+                # replay inline or read the schema-incompatible old index. Hand
+                # the existing synchronous resolver to its dedicated worker and
+                # fail promptly; explicit maintenance and the worker itself call
+                # that resolver directly. Corruption/legacy paths stay disjoint.
                 conn.close()
-                return _cctally_store.resolve_stats_epoch_mismatch()
+                outcome = _cctally_store.defer_stats_epoch_rebuild()
+                raise c.StatsEpochRebuildDeferred(outcome)
             # _uv <= LEGACY_STATS_HEAD → a pre-journal install: cut over below. A
             # dev/worktree binary must REFUSE to cut over a DB in the real prod
             # dir (mirrors #146 — the epoch stamp would brick the installed

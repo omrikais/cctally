@@ -775,9 +775,10 @@ def test_concurrent_renders_yield_at_most_one_snapshot(tmp_path):
     marker re-check serialize the detached feeders so the herd cannot each
     fork-and-insert a duplicate row.
 
-    Uses real subprocesses (the herd is cross-process) and polls the
-    detached feeders' DB to quiescence (per the hook-tick completion-
-    condition pattern) so no detached child outlives this test."""
+    Uses real subprocesses (the herd is cross-process), then drives the real
+    next-tick retry contract while polling the detached feeders' DB to
+    quiescence. Forking is deliberately best-effort under process pressure;
+    an unlaunched winner leaves its candidate spooled for a later tick."""
     tmp_home = tmp_path / "home"
     tmp_data = tmp_path / "data"
     (tmp_home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
@@ -796,17 +797,17 @@ def test_concurrent_renders_yield_at_most_one_snapshot(tmp_path):
         five_pct=12.0, five_resets_epoch=now + 2 * 3600,
     )).encode()
 
-    n_procs = 5
-    procs = [
-        subprocess.Popen(
+    def start_tick():
+        return subprocess.Popen(
             # No --color flag: stdout is a pipe (not a TTY) so color is
             # auto-off; passing a value to the store_true --color errors.
             [sys.executable, str(_CCTALLY_BIN), "statusline"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, env=env,
         )
-        for _ in range(n_procs)
-    ]
+
+    n_procs = 5
+    procs = [start_tick() for _ in range(n_procs)]
     for p in procs:
         try:
             p.stdin.write(payload)
@@ -816,22 +817,39 @@ def test_concurrent_renders_yield_at_most_one_snapshot(tmp_path):
     for p in procs:
         p.wait(timeout=30)
 
-    # The winning render's persist runs in a DETACHED child that outlives the
-    # `statusline` process, so poll the DB until the count is stable (the
-    # feeder has quiesced) before asserting.
-    deadline = time.time() + 25.0
-    last = _count_snapshots(db_path)
-    stable = 0
-    while time.time() < deadline:
-        time.sleep(0.4)
-        cur = _count_snapshots(db_path)
-        if cur == last:
-            stable += 1
-            if stable >= 5 and cur >= 1:
-                break
-        else:
-            stable = 0
-            last = cur
+    # The winning persist runs in a DETACHED child that outlives its render.
+    # Poll to quiescence, but if no child launched under CI process pressure,
+    # issue another real tick so the retained candidate gets another chance.
+    # This follows the production delivery contract rather than lengthening a
+    # one-shot sleep deadline and remains bounded if the fork path is broken.
+    delivered = False
+    for attempt in range(4):
+        if attempt:
+            retry = start_tick()
+            try:
+                retry.stdin.write(payload)
+                retry.stdin.close()
+            except BrokenPipeError:
+                pass
+            retry.wait(timeout=30)
+
+        deadline = time.monotonic() + 8.0
+        last = _count_snapshots(db_path)
+        stable = 0
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            cur = _count_snapshots(db_path)
+            if cur == last:
+                stable += 1
+                if stable >= 5 and cur >= 1:
+                    delivered = True
+                    break
+            else:
+                stable = 0
+                last = cur
+        if delivered:
+            break
+
     final = _count_snapshots(db_path)
     assert final <= 1, f"thundering herd produced {final} snapshots (want <= 1)"
     assert final == 1, f"expected exactly one snapshot from the herd, got {final}"

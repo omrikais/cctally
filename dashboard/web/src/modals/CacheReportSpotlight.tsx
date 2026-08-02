@@ -14,13 +14,24 @@ import type { CacheReportEnvelope } from '../types/envelope';
 import { fmt } from '../lib/fmt';
 import { CACHE_REPORT_MIN_BASELINE_DAYS } from '../lib/cache-report-constants';
 import { cacheReportVerdict } from '../lib/cacheReportVerdict';
+import {
+  cachePercentText, cacheVocabulary, notApplicableReason,
+} from '../lib/cacheReportVocabulary';
+import { CacheNotApplicable } from './CacheNotApplicable';
 
 export interface CacheReportSpotlightProps {
   cr: CacheReportEnvelope;
-  nativeCacheOnly?: boolean;
+  /** Provider whose cache vocabulary this spotlight renders (#443 S2 §4.4). */
+  source?: string;
 }
 
-export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheReportSpotlightProps) {
+export function CacheReportSpotlight({ cr, source }: CacheReportSpotlightProps) {
+  const vocab = cacheVocabulary(source ?? 'claude');
+  // Read from the MAP, never from the value: Codex keeps publishing a numeric
+  // `wasted_usd` through the transition release, so a client inferring
+  // applicability from nullness would read its structural zero as a real
+  // break-even measurement (#443 S2 §3.3).
+  const wastedNotApplicable = notApplicableReason(cr, 'wasted_usd');
   const verdict = cacheReportVerdict(cr);
   const { insufficient } = verdict;
   const anomalous = verdict.chromeAmber;
@@ -49,9 +60,6 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
   // today is not.
   const unmeasured = (node: ReactNode) =>
     todayObserved ? node : <span className="m-unavailable">—</span>;
-  if (nativeCacheOnly) {
-    pill = { text: 'Provider cache reuse', cls: 'ok' };
-  }
 
   const median = cr.today.baseline_median_percent;
   const delta = cr.today.delta_pp;
@@ -80,11 +88,10 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
         <div className="crm-spotlight-row">
           <span className={`pill${pill.cls ? ' ' + pill.cls : ''}`}>{pill.text}</span>
           <span>
-            <span className="k">Cache hit</span>{' '}
+            <span className="k">{vocab.percentLabel}</span>{' '}
             <strong>
-              {nativeCacheOnly && cr.days.length === 0
-                ? <span className="m-unavailable">Unavailable</span>
-                : unmeasured(`${fmt.pctFloor(cr.today.cache_hit_percent)}%`)}
+              {unmeasured(cachePercentText(cr.today)
+                ?? <span className="m-unavailable">Unavailable</span>)}
             </strong>
           </span>
           <span>
@@ -92,15 +99,26 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
             <strong>{median !== null ? `${fmt.pctFloor(median)}%` : <span className="m-unavailable">Unavailable</span>}</strong>
           </span>
           <span>
-            <span className="k">Δ</span> <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(deltaText)}</strong>
+            <span className="k">Δ</span> <strong>{unmeasured(deltaText)}</strong>
           </span>
           <span>
             <span className="k">Net</span>{' '}
-            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(fmt.usdSigned(cr.today.net_usd))}</strong>
+            <strong>{unmeasured(fmt.usdSigned(cr.today.net_usd))}</strong>
           </span>
           <span>
             <span className="k">Saved / Wasted</span>{' '}
-            <strong>{nativeCacheOnly ? <span className="m-unavailable">Unavailable</span> : unmeasured(`$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`)}</strong>
+            <strong>{unmeasured(
+              // Saved is a real Codex measurement and is kept; only the Wasted
+              // half is structurally absent.
+              wastedNotApplicable == null
+                ? `$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`
+                : (
+                  <>
+                    {`$${cr.today.saved_usd.toFixed(2)} / `}
+                    <CacheNotApplicable reason={wastedNotApplicable} />
+                  </>
+                ),
+            )}</strong>
           </span>
         </div>
         {anomalous && cr.today.anomaly_reasons.length > 0 && (
@@ -109,10 +127,10 @@ export function CacheReportSpotlight({ cr, nativeCacheOnly = false }: CacheRepor
             {cr.today.anomaly_reasons.map((r, i) => (
               <span key={r}>
                 {i > 0 && ' · '}
-                <code>{r}</code>
+                <code>{vocab.reasonLabel(r)}</code>
               </span>
             ))}
-            {'  |  '}thresholds: {cr.anomaly_threshold_pp}pp drop, net &lt; 0
+            {'  |  '}thresholds: {vocab.thresholdLegend(cr.anomaly_threshold_pp)}
           </div>
         )}
       </div>

@@ -24,8 +24,9 @@
 # Exits non-zero if any scenario fails. A trap ensures stray server PIDs die
 # on harness exit / Ctrl-C.
 #
-# The nine fixture scenarios (ok, warn, over, reset-week, no-data,
-# utc-tz, tz-override, projected-alerts, command-secret) run in parallel
+# The eleven fixture scenarios (ok, warn, over, reset-week, no-data,
+# utc-tz, tz-override, projected-alerts, command-secret,
+# codex-cache-active, codex-cache-idle) run in parallel
 # via `xargs -P`
 # — each scenario
 # already has its own scratch HOME under $SCRATCH_ROOT/<name> and
@@ -865,11 +866,11 @@ run_scenario () {
     fi
 }
 
-# Dispatch the nine fixture scenarios in parallel. Each scenario's
+# Dispatch the eleven fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.

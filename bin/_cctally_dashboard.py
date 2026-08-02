@@ -5644,7 +5644,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # documented default when neither the request nor the
             # persisted config carries an explicit value.
             persisted_cr = merged.get("cache_report") or {}
-            stored_threshold = persisted_cr.get("anomaly_threshold_pp", 15)
+            # #443 S3 F17: the echo is a fifth reader of this setting. It used
+            # to carry its own hard-coded 15, so a hand-edited non-integer in
+            # config.json would be echoed verbatim to the settings composer
+            # while both read paths classified at the default.
+            stored_threshold = _cache_report_load_kernel().resolve_cache_report_threshold(
+                persisted_cr.get("anomaly_threshold_pp")
+            )
             out["cache_report"] = {
                 "anomaly_threshold_pp": stored_threshold,
             }
@@ -6912,6 +6918,12 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
             display_tz_pref_override=display_tz_pref_override,
             stats_heal_attempted=False,
         )
+    except c.StatsEpochRebuildDeferred as exc:
+        return _dashboard_stats_epoch_deferred_snapshot(
+            args,
+            pinned_now=pinned_now,
+            exc=exc,
+        )
     except tui._StatsSnapshotCorruption as fault:
         # The once-builder's finally has closed the cheap-seed stats handle.
         tui._tui_heal_post_query_stats(fault.cause)
@@ -6921,6 +6933,53 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
             display_tz_pref_override=display_tz_pref_override,
             stats_heal_attempted=True,
         )
+
+
+def _dashboard_stats_epoch_deferred_snapshot(args, *, pinned_now, exc):
+    """Bind promptly with a typed degraded frame while replay runs detached."""
+
+    import time as _time
+
+    c = _cctally()
+    tui = c._cctally_tui
+    now_utc = pinned_now or dt.datetime.now(dt.timezone.utc)
+    hydrating = not getattr(args, "no_sync", False)
+    errors = [f"stats-open: {exc}"]
+    envelope_precompute = None
+    try:
+        envelope_precompute = tui._tui_precompute_envelope_config(load_config())
+    except Exception as precompute_exc:  # noqa: BLE001 — bind must continue
+        errors.append(f"envelope-precompute: {precompute_exc}")
+    # The real doctor shallow gather opens stats repeatedly. Once the detached
+    # worker owns maintenance-exclusive, doing that before HTTP bind reintroduces
+    # the exact multi-second startup stall this path exists to remove. Supply a
+    # schema-valid, privacy-safe warning block; the first successful background
+    # snapshot replaces it with a real doctor payload.
+    doctor_payload = {
+        "severity": "warn",
+        "counts": {"ok": 0, "warn": 1, "fail": 0},
+        "generated_at": now_utc.astimezone(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "fingerprint": "sha1:" + ("0" * 40),
+    }
+    replacements = {
+        "last_sync_at": _time.monotonic(),
+        "last_sync_error": "; ".join(errors),
+        "sync_failures": (
+            tui.SyncFailureAttribution(
+                leg="stats-open",
+                database="stats",
+                corruption=False,
+            ),
+        ),
+        "doctor_payload": doctor_payload,
+        "envelope_precompute": envelope_precompute,
+        "hydrating": hydrating,
+    }
+    if hydrating:
+        replacements["source_bundle"] = tui._tui_hydrating_source_bundle()
+    return dataclasses.replace(tui._tui_empty_snapshot(now_utc), **replacements)
 
 
 def _dashboard_initial_snapshot_once(
@@ -7058,6 +7117,103 @@ def _dashboard_initial_snapshot_once(
     )
 
 
+_DASHBOARD_QA_STATES = frozenset({
+    "hydrating", "failed", "forensics-degraded",
+})
+
+
+def _dashboard_qa_state_from_env() -> str | None:
+    """Resolve the explicit, test-only Cache Report server state.
+
+    The master switch is intentionally separate from the requested state so a
+    stray environment variable cannot alter a normal dashboard. These states
+    transform a real server snapshot after its production builders run; they
+    never replace endpoint payloads in the browser and never affect CLI data.
+    """
+    requested = os.environ.get("CCTALLY_DASHBOARD_QA_STATE", "").strip()
+    if (
+        not requested
+        or os.environ.get("CCTALLY_DASHBOARD_QA") != "1"
+        or not _cctally()._is_dev_checkout()
+    ):
+        return None
+    if requested not in _DASHBOARD_QA_STATES:
+        raise ValueError(
+            "CCTALLY_DASHBOARD_QA_STATE must be one of: "
+            + ", ".join(sorted(_DASHBOARD_QA_STATES))
+        )
+    return requested
+
+
+def _dashboard_apply_qa_state(snapshot, state: str | None):
+    """Apply one guarded QA state to a real dashboard snapshot."""
+    if state is None:
+        return snapshot
+    if state not in _DASHBOARD_QA_STATES:
+        raise ValueError("unsupported dashboard QA state")
+    tui = _cctally()._cctally_tui
+    if state == "hydrating":
+        return dataclasses.replace(
+            snapshot,
+            hydrating=True,
+            cache_report=None,
+            source_bundle=tui._tui_hydrating_source_bundle(),
+        )
+    bundle = getattr(snapshot, "source_bundle", None)
+    if bundle is None:
+        raise ValueError("dashboard QA state requires a built source bundle")
+
+    physical = {}
+    for source in ("claude", "codex"):
+        current = bundle.sources[source]
+        capabilities = dict(current.capabilities)
+        capabilities["forensics"] = tui.CapabilityRecord(
+            "unavailable", f"qa-{state}",
+        )
+        warning = tui.SourceDashboardWarning(
+            f"qa_{state.replace('-', '_')}",
+            (
+                "Cache forensics are degraded for deterministic QA."
+                if state == "forensics-degraded"
+                else "Cache forensics failed for deterministic QA."
+            ),
+            "forensics",
+        )
+        if state == "forensics-degraded":
+            physical[source] = dataclasses.replace(
+                current,
+                availability="partial",
+                warnings=tuple(current.warnings) + (warning,),
+                capabilities=capabilities,
+                data_version=f"{current.data_version}:qa-degraded",
+            )
+        else:
+            physical[source] = dataclasses.replace(
+                current,
+                availability="unavailable",
+                freshness="stale",
+                warnings=(warning,),
+                capabilities=capabilities,
+                data=None,
+                last_success_at=None,
+                domain_freshness={
+                    "hero": "stale", "quota": "stale", "sessions": "stale",
+                },
+                data_version=f"{current.data_version}:qa-failed",
+            )
+    physical["all"] = tui.compose_all_state(
+        physical["claude"], physical["codex"],
+    )
+    return dataclasses.replace(
+        snapshot,
+        hydrating=False,
+        cache_report=(
+            None if state == "failed" else getattr(snapshot, "cache_report", None)
+        ),
+        source_bundle=dataclasses.replace(bundle, sources=physical),
+    )
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Launch the live web dashboard."""
     import signal as _signal
@@ -7165,6 +7321,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         # stamp so the envelope emits sync_age_s=None and the JS client
         # renders the documented `sync paused` state.
         initial = dataclasses.replace(initial, last_sync_at=None)
+    initial = _dashboard_apply_qa_state(initial, _dashboard_qa_state_from_env())
 
     ref = _SnapshotRef(initial)
     hub = SSEHub()

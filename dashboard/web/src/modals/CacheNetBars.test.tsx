@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { render } from '@testing-library/react';
 import { CacheNetBars } from './CacheNetBars';
 import type { CacheReportDailyRow } from '../types/envelope';
+import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
 
 function row(date: string, net: number): CacheReportDailyRow {
   return {
@@ -209,6 +210,16 @@ describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
     // renders "May 07" (CR-5 unification), never the raw "05-07" slice.
     expect(texts).toContain('May 07');
     expect(texts).not.toContain('05-07');
+  });
+
+  it('centers the Today label on the shared large chart slot', () => {
+    const { container } = render(<CacheNetBars days={sampleDays()} size="large" />);
+    const today = Array.from(container.querySelectorAll('svg text'))
+      .find((label) => label.textContent === 'Today')!;
+    expect(Number(today.getAttribute('x'))).toBeCloseTo(
+      cacheReportChartSlot('large', 13, 14).center,
+      6,
+    );
   });
 
   it('shows the empty placeholder copy when days is empty', () => {

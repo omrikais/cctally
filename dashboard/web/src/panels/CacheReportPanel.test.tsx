@@ -1,12 +1,17 @@
 // CacheReportPanel — anomaly-watchdog panel for the dashboard.
 // Spec 2026-05-21 §2. State coverage: healthy, anomalous,
 // insufficient-baseline, empty, click-to-open dispatch.
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { CacheReportPanel } from './CacheReportPanel';
 import envelopeFixture from '../../__tests__/fixtures/envelope.json';
-import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
+import {
+  ACCOUNT_A,
+  ACCOUNT_EMPTY,
+  makeDecoratedCodexSourceData,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 import {
   _resetForTests,
   dispatch,
@@ -15,6 +20,7 @@ import {
 } from '../store/store';
 import type {
   CacheReportEnvelope,
+  CodexSourceData,
   Envelope,
 } from '../types/envelope';
 
@@ -244,6 +250,16 @@ describe('<CacheReportPanel /> empty state', () => {
     expect(screen.getByText(/No Claude activity yet/i)).toBeInTheDocument();
     // Sparkline omitted in empty state.
     expect(document.querySelector('.cr-spark')).toBeNull();
+  });
+
+  it('uses quiet empty chrome that stays distinct from a failed build', () => {
+    updateSnapshot(envelopeWith(emptyCacheReport()));
+    const { container } = render(<CacheReportPanel />);
+    const glyph = container.querySelector('.cr-glyph')!;
+    expect(glyph.textContent).toBe('−');
+    expect(glyph.classList.contains('empty')).toBe(true);
+    expect(container.querySelector('.panel')?.getAttribute('aria-label'))
+      .toBe('Cache Report · empty');
   });
 });
 
@@ -495,6 +511,19 @@ describe('<CacheReportPanel /> #443 S1 hydrating vs failed', () => {
     expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
     expect(screen.queryByText(/\(loading\)/)).toBeNull();
   });
+
+  it('uses warning failure chrome and an accessible failed-state label', () => {
+    const e = baseEnvelope();
+    e.hydrating = false;
+    updateSnapshot(e);
+    const { container } = render(<CacheReportPanel />);
+    const glyph = container.querySelector('.cr-glyph')!;
+    expect(glyph.textContent).toBe('!');
+    expect(glyph.classList.contains('fail')).toBe(true);
+    expect(container.querySelector('.panel')?.classList.contains('accent-amber')).toBe(true);
+    expect(container.querySelector('.panel')?.getAttribute('aria-label'))
+      .toBe('Cache Report · failed');
+  });
 });
 
 describe('<CacheReportPanel /> #443 S1 provider status in single-source view', () => {
@@ -537,12 +566,14 @@ describe('<CacheReportPanel /> #443 S1 all-mode summary', () => {
   });
 });
 
-describe('<CacheReportPanel /> #443 S1 chip never contradicts the rendered report', () => {
-  it('suppresses the chip and reason when the Codex fallback is what renders', () => {
-    // Codex has daily rows but no native cache_report, so `section` is
-    // `unavailable` while `cr` is the `adapted` compatibility object. Labelling
-    // a full verdict "Codex cache report is unavailable." contradicts the
-    // screen; S2 (F3/F4) owns the fallback's own presentation.
+describe('<CacheReportPanel /> #443 S2 the Codex compatibility fallback is gone', () => {
+  // S1 could only suppress the chip here, because `cr` was the `adapted`
+  // fabrication rather than the section's value and labelling a full verdict
+  // "Codex cache report is unavailable." would have contradicted the screen.
+  // S2 deletes the fabrication instead: the panel renders the section's own
+  // value, so the chip describes exactly what is on screen and the
+  // rendersSectionValue guard has nothing left to guard.
+  it('states the unavailability instead of fabricating a verdict from daily rows', () => {
     const e = {
       ...(structuredClone(envelopeFixture) as unknown as Envelope),
       ...makeSourceEnvelope(),
@@ -551,17 +582,70 @@ describe('<CacheReportPanel /> #443 S1 chip never contradicts the rendered repor
     updateSnapshot(e);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
     render(<CacheReportPanel />);
-    // The fallback VERDICT branch is on screen — not the failure branch, which
-    // renders a .cr-headline of its own and would make this pass vacuously.
     expect(document.querySelector('[data-source="codex"]')).not.toBeNull();
-    expect(document.querySelector('.cr-spark')).not.toBeNull();
-    expect(screen.queryByText(/could not be built/i)).toBeNull();
-    // … so neither the chip nor the reason may deny the report exists.
-    expect(document.querySelector('.provider-section-status')).toBeNull();
-    expect(document.querySelector('.provider-section-reason')).toBeNull();
-    expect(screen.queryByText(/cache report is unavailable/i)).toBeNull();
+    // No invented report: no sparkline, no median, no verdict.
+    expect(document.querySelector('.cr-spark')).toBeNull();
+    expect(screen.getByText(/Cache Report unavailable/i)).toBeInTheDocument();
+    // … and the chip and reason are now unconditional, because the rendered
+    // object IS the section's value.
+    expect(document.querySelector('.provider-section-status')!.textContent)
+      .toBe('unavailable');
+    expect(screen.getByText(/Codex cache report is unavailable/i))
+      .toBeInTheDocument();
   });
 
+  it('reads an available-but-empty Codex source as empty, never as a build failure', () => {
+    // dashboardPresentation nulls section.value for an available-and-empty
+    // report (S1's F7 fix), so emptiness reaches the panel as a STATUS on a
+    // null value. Routing `cr` through the section without honouring that
+    // would tell an idle user the snapshot could not be built.
+    const e = {
+      ...(structuredClone(envelopeFixture) as unknown as Envelope),
+      ...makeSourceEnvelope(),
+    };
+    e.sources!.codex.data!.cache_report = {
+      ...emptyCacheReport(), is_empty: true, days: [],
+    };
+    updateSnapshot(e);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/No Codex activity yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
+  });
+
+  it('reads a focused account with no Codex child as empty, not as a build failure', () => {
+    // accountScope.ts synthesizes the child with is_empty: true and
+    // cache_report: null, and leaves the ENTRY's availability at 'ok' — so the
+    // section reads `unavailable`, not `empty`. This is an ordinary path, not
+    // a stale envelope, and it must not accuse the snapshot of failing.
+    const slice = makeSourceEnvelope() as unknown as {
+      sources: { codex: { data: CodexSourceData } };
+    };
+    slice.sources.codex.data = makeDecoratedCodexSourceData();
+    updateSnapshot(slice as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_EMPTY });
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/No Codex activity yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
+  });
+
+  it('still calls a populated account with a missing report a build failure', () => {
+    // Non-vacuity for the case above: the account-empty escape must not
+    // swallow a genuinely absent report for an account that HAS activity.
+    const slice = makeSourceEnvelope() as unknown as {
+      sources: { codex: { data: CodexSourceData } };
+    };
+    slice.sources.codex.data = makeDecoratedCodexSourceData();
+    updateSnapshot(slice as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_A });
+    render(<CacheReportPanel />);
+    expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
+  });
+});
+
+describe('<CacheReportPanel /> #443 S1 chip never contradicts the rendered report', () => {
   it('keeps the chip on the failure branch, where the section value really is null', () => {
     const e = baseEnvelope();
     e.hydrating = false;
@@ -618,5 +702,112 @@ describe('<CacheReportPanel /> #443 S1 not-measured headline', () => {
     // insufficient still owns the headline; the subline carries the modifier.
     expect(document.querySelector('.cr-subline')!.textContent)
       .toBe('No activity today');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S2 §4.5 (F26) — the panel's window labels are the report's own window,
+// not a hard-coded 14. S1 already did this for the modal header and the
+// all-mode summary; these were the four literals left behind.
+// ---------------------------------------------------------------------------
+
+describe('<CacheReportPanel /> #443 S2 window labels', () => {
+  function withWindow(days: number, over: Partial<CacheReportEnvelope> = {}) {
+    const base = healthyCacheReport();
+    return { ...base, window_days: days, ...over };
+  }
+
+  it.each([
+    ['healthy', {}],
+    ['anomalous', {
+      today: {
+        ...healthyCacheReport().today,
+        cache_hit_percent: 49, delta_pp: 18, net_usd: -0.42,
+        anomaly_triggered: true,
+        anomaly_reasons: ['cache_drop' as const, 'net_negative' as const],
+      },
+    }],
+    ['unobserved-today', {
+      today: {
+        ...healthyCacheReport().today,
+        cache_hit_percent: 0, net_usd: 0, saved_usd: 0, wasted_usd: 0,
+        anomaly_unevaluated: ['net_negative' as const, 'cache_drop' as const],
+        observed: false,
+      },
+    }],
+  ])('the %s subline names the report window, not a hard-coded 14', (_name, over) => {
+    updateSnapshot(envelopeWith(withWindow(7, over)));
+    render(<CacheReportPanel />);
+    const subline = document.querySelector('.cr-subline')!.textContent!;
+    expect(subline).toContain('vs 7d median');
+    expect(subline).not.toContain('vs 14d median');
+  });
+
+  it('the net subline names the report window too', () => {
+    updateSnapshot(envelopeWith(withWindow(7)));
+    render(<CacheReportPanel />);
+    const second = document.querySelector('.cr-subline.second')!.textContent!;
+    expect(second).toContain('7d net:');
+    expect(second).not.toContain('14d net:');
+  });
+});
+
+describe('<CacheReportPanel /> #443 S2 survives a source flip while mounted', () => {
+  // REGRESSION (review P0-1). `useAccountScope` is three
+  // `useSyncExternalStore` calls, and it was introduced BELOW the
+  // `activeSource === 'all'` early return — so the panel rendered 3 hooks in
+  // all-mode and 6 in single-source mode.
+  //
+  // Every other test in this file dispatches SET_ACTIVE_SOURCE *before*
+  // render(), which pins the hook count for the component's whole life and
+  // cannot observe this. The panel is mounted `key={id}` by panel id, NOT by
+  // source (App.tsx), so the real instance survives the flip that the header
+  // segmented control and the keyboard shortcut both dispatch. With no error
+  // boundary anywhere in the app, the thrown hook-order error unmounted the
+  // entire dashboard to a blank page.
+  //
+  // Flip AFTER mounting, in both directions, or this test is vacuous.
+  function mountedEnvelope(): Envelope {
+    return {
+      ...(structuredClone(envelopeFixture) as unknown as Envelope),
+      ...makeSourceEnvelope(),
+    };
+  }
+
+  it('does not throw when the source flips from all to a single provider', () => {
+    updateSnapshot(mountedEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportPanel />);
+    expect(document.querySelector('[data-source="all"]')).not.toBeNull();
+
+    expect(() => {
+      act(() => { dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' }); });
+    }).not.toThrow();
+    expect(document.querySelector('[data-source="all"]')).toBeNull();
+    expect(document.querySelector('#panel-cache-report')).not.toBeNull();
+  });
+
+  it('does not throw when the source flips from a single provider to all', () => {
+    updateSnapshot(mountedEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<CacheReportPanel />);
+    expect(document.querySelector('[data-source="all"]')).toBeNull();
+
+    expect(() => {
+      act(() => { dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }); });
+    }).not.toThrow();
+    expect(document.querySelector('[data-source="all"]')).not.toBeNull();
+  });
+
+  it('survives a round trip through every source', () => {
+    updateSnapshot(mountedEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<CacheReportPanel />);
+    expect(() => {
+      for (const source of ['claude', 'codex', 'all', 'codex', 'claude', 'all'] as const) {
+        act(() => { dispatch({ type: 'SET_ACTIVE_SOURCE', source }); });
+      }
+    }).not.toThrow();
+    expect(document.querySelector('#panel-cache-report')).not.toBeNull();
   });
 });

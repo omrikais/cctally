@@ -33,7 +33,9 @@ import {
   makeSourceEnvelope,
   withSharedRootWeeklyWindows,
 } from '../test-utils/sourceEnvelope';
-import type { CodexSourceData, Envelope } from '../types/envelope';
+import type {
+  CacheReportEnvelope, CodexSourceData, Envelope,
+} from '../types/envelope';
 
 function decoratedEnv(
   data: CodexSourceData = makeDecoratedCodexSourceData(),
@@ -121,13 +123,61 @@ describe('Trend modal expands the focused account', () => {
 });
 
 describe('Cache report modal expands the focused account', () => {
+  // #443 S2 — this used to read the merged parent's DAILY ROWS through the
+  // client-side compatibility fallback, which fabricated a cache report from
+  // them whenever Codex published none. That fallback is deleted, so the
+  // binding is now pinned where it actually lives: the per-account
+  // `cache_report` child, which `composeScopedData` passes through.
+  function withPerAccountCacheReports(): CodexSourceData {
+    const data = makeDecoratedCodexSourceData();
+    const report = (marker: string, pct: number): CacheReportEnvelope => ({
+      window_days: 14,
+      anomaly_threshold_pp: 15,
+      anomaly_window_days: 14,
+      today: {
+        date: `2026-04-24`, cache_hit_percent: pct,
+        baseline_median_percent: pct, delta_pp: 0,
+        net_usd: 1, saved_usd: 1, wasted_usd: 0,
+        anomaly_triggered: false, anomaly_reasons: [],
+        baseline_daily_row_count: 13,
+      },
+      days: [{
+        date: `2026-04-24`, cache_hit_percent: pct,
+        input_tokens: 10, output_tokens: 4,
+        cache_creation_tokens: 0, cache_read_tokens: 2,
+        saved_usd: 1, wasted_usd: 0, net_usd: 1,
+        anomaly_triggered: false, anomaly_reasons: [],
+      }],
+      by_project: [{ key: `proj-${marker}`, cache_hit_percent: pct, net_usd: 1 }],
+      by_model: [],
+      seven_day_net_usd: 1,
+      seven_day_anomaly_count: 0,
+      fourteen_day_counterfactual_usd: 1,
+      fourteen_day_efficiency_ratio: 1,
+      is_empty: false,
+    });
+    data.cache_report = report('MERGED', 91);
+    data.account_scopes![ACCOUNT_B].cache_report = report('B', 42);
+    return data;
+  }
+
   it('tabulates that account days', () => {
-    openScoped('cache-report', ACCOUNT_B);
+    openScoped('cache-report', ACCOUNT_B, withPerAccountCacheReports());
     const { container } = render(<CacheReportModal />);
     // Non-vacuity: the modal really did render its daily table.
     expect(container.textContent).toContain('Daily rows');
-    // 480K input tokens is the MERGED day; account B's own day carries 10.
-    expect(container.textContent).not.toContain('480K');
+    expect(container.textContent).toContain('proj-B');
+    // 91% is the MERGED parent report; account B's own report reads 42%.
+    expect(container.textContent).toContain('42%');
+    expect(container.textContent).not.toContain('91%');
+    expect(container.textContent).not.toContain('proj-MERGED');
+  });
+
+  it('still paints the merged parent report under All accounts', () => {
+    openScoped('cache-report', null, withPerAccountCacheReports());
+    const { container } = render(<CacheReportModal />);
+    expect(container.textContent).toContain('proj-MERGED');
+    expect(container.textContent).toContain('91%');
   });
 });
 

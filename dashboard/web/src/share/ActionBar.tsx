@@ -48,6 +48,7 @@ function recordHistory(args: {
   // #294 S5 §7 — the flow's captured source; stamped into the history record so
   // "same panel, different source" rows stay distinct server-side.
   source: DashboardSelection;
+  account?: string | null;
 }): void {
   void appendHistory({
     panel: args.panel,
@@ -61,6 +62,7 @@ function recordHistory(args: {
     format: args.options.format,
     destination: args.destination,
     source: args.source,
+    account: args.account,
   }).catch(() => { /* non-fatal — see comment above */ });
 }
 
@@ -77,6 +79,8 @@ interface Props {
   // history request this ActionBar issues. Optional with a 'claude' default
   // (the compatibility path; ShareModal always supplies it).
   source?: DashboardSelection;
+  // #346 — captured account qualifier; null stays absent on the wire.
+  account?: string | null;
   templateId: string | null;
   options: ShareOptions;
   onOptionsChange: (next: ShareOptions) => void;
@@ -118,7 +122,9 @@ function triggerDownload(filename: string, blob: Blob): void {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-export function ActionBar({ panel, source = 'claude', templateId, options, onOptionsChange }: Props) {
+export function ActionBar({
+  panel, source = 'claude', account = null, templateId, options, onOptionsChange,
+}: Props) {
   const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket' | 'png' | 'print'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // M3.5 — short-lived "✓ Added" feedback flash on the + Basket button
@@ -185,6 +191,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
       // options state via Knobs.
       options,
       source,
+      account,
     });
     return { body: resp.body, format: options.format };
   };
@@ -200,7 +207,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
       }
       await navigator.clipboard.writeText(body);
       showToast('Copied');
-      recordHistory({ panel, template_id: templateId, options, destination: 'copy', source });
+      recordHistory({ panel, template_id: templateId, options, destination: 'copy', source, account });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -221,7 +228,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
       const blob = new Blob([body], { type: mimeFor(format) });
       triggerDownload(shareFilename(panel, format), blob);
       showToast('Downloaded');
-      recordHistory({ panel, template_id: templateId, options, destination: 'download', source });
+      recordHistory({ panel, template_id: templateId, options, destination: 'download', source, account });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -257,6 +264,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
         template_id: templateId,
         options,
         source,
+        account,
       });
       const item = makeBasketItem({
         panel,
@@ -267,6 +275,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
         kernel_version: resp.snapshot.kernel_version,
         label_hint: sharePanelLabel(panel),
         source,
+        account,
       });
       dispatch({ type: 'BASKET_ADD', item });
       // BASKET_ADD can be rejected when the basket is already at the
@@ -306,7 +315,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
       // revoke it (the user may want to keep the tab open). Browsers
       // GC blob URLs when the window unloads.
       window.open(url, '_blank', 'noopener,noreferrer');
-      recordHistory({ panel, template_id: templateId, options, destination: 'open', source });
+      recordHistory({ panel, template_id: templateId, options, destination: 'open', source, account });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -335,7 +344,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
       // keep the `cctally-<panel>-<utcdate>.png` shape from spec §6.5.
       triggerDownload(shareFilename(panel, 'svg').replace(/\.svg$/, '.png'), png);
       showToast('PNG downloaded');
-      recordHistory({ panel, template_id: templateId, options, destination: 'png', source });
+      recordHistory({ panel, template_id: templateId, options, destination: 'png', source, account });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
@@ -359,7 +368,7 @@ export function ActionBar({ panel, source = 'claude', templateId, options, onOpt
     try {
       const { body } = await fetchForExport();
       printPdf(body);
-      recordHistory({ panel, template_id: templateId, options, destination: 'print', source });
+      recordHistory({ panel, template_id: templateId, options, destination: 'print', source, account });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError

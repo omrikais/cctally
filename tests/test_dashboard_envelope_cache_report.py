@@ -707,3 +707,165 @@ def test_wire_dict_carries_both_fields(monkeypatch):
     assert wire["days"][0]["observed"] is False
     assert "anomaly_unevaluated" in wire["days"][0]
     assert isinstance(wire["days"][0]["anomaly_unevaluated"], list)
+
+
+# === #443 S2 — Claude wire byte-stability pin =============================
+# The F18 refactor routes this serializer through the shared
+# bin/_lib_cache_report_wire.py builder. The safety property that
+# justifies S2 touching the Claude serializer at all is that its output
+# does not move by a single byte, which is what keeps the nine dashboard
+# goldens' Claude cache_report blocks unmoved.
+#
+# CLAUDE_WIRE_EXPECTED below was captured from the PRE-refactor
+# serializer and pasted here. It is hand-authored expected data. NEVER
+# regenerate it from the function under test — that would make the pin
+# assert only that the code equals itself.
+#
+# The plan filed this test under tests/test_cache_report_builder.py, but
+# that file covers the pure kernel _lib_cache_report and neither imports
+# the dashboard serializer nor has a CacheReportSnapshot helper. This
+# file is where _cache_report_snapshot_to_dict is already exercised.
+
+_PIN_HIT = 74.07407407407408
+_PIN_SAVED = 0.0054
+_PIN_WASTED = 0.00015000000000000001
+_PIN_NET = 0.00525
+
+
+def _pin_day(date: str, unevaluated: list[str]) -> dict:
+    return {
+        "date": date,
+        "cache_hit_percent": _PIN_HIT,
+        "input_tokens": 500,
+        "output_tokens": 100,
+        "cache_creation_tokens": 200,
+        "cache_read_tokens": 2000,
+        "saved_usd": _PIN_SAVED,
+        "wasted_usd": _PIN_WASTED,
+        "net_usd": _PIN_NET,
+        "anomaly_triggered": False,
+        "anomaly_reasons": [],
+        "anomaly_unevaluated": unevaluated,
+        "observed": True,
+    }
+
+
+CLAUDE_WIRE_EXPECTED = {
+    "window_days": 14,
+    "anomaly_threshold_pp": 15,
+    "anomaly_window_days": 14,
+    "today": {
+        "date": "2026-07-31",
+        "cache_hit_percent": _PIN_HIT,
+        "baseline_median_percent": _PIN_HIT,
+        "delta_pp": 0.0,
+        "net_usd": _PIN_NET,
+        "saved_usd": _PIN_SAVED,
+        "wasted_usd": _PIN_WASTED,
+        "anomaly_triggered": False,
+        "anomaly_reasons": [],
+        "baseline_daily_row_count": 7,
+        "anomaly_unevaluated": [],
+        "observed": True,
+    },
+    "days": [
+        _pin_day("2026-07-31", []),
+        _pin_day("2026-07-30", []),
+        _pin_day("2026-07-29", []),
+        _pin_day("2026-07-28", ["cache_drop"]),
+        _pin_day("2026-07-27", ["cache_drop"]),
+        _pin_day("2026-07-26", ["cache_drop"]),
+        _pin_day("2026-07-25", ["cache_drop"]),
+        _pin_day("2026-07-24", ["cache_drop"]),
+    ],
+    "by_project": [
+        {"key": "/proj/a", "cache_hit_percent": _PIN_HIT, "net_usd": 0.042},
+    ],
+    "by_model": [
+        {
+            # #443 S3 F21: was 0.041999999999999996 — one ULP below
+            # by_project's 0.042 for the SAME eight 0.00525 addends,
+            # because the by-model fold accumulated with `+=` while
+            # by_project already went through `stable_sum`. Both axes now
+            # stable-sum, so the two agree, which is what
+            # `_aggregate_cache_breakdown_from_rows` always claimed.
+            "key": "claude-sonnet-4-5",
+            "cache_hit_percent": _PIN_HIT,
+            "net_usd": 0.042,
+        },
+    ],
+    "seven_day_net_usd": 0.036750000000000005,
+    "seven_day_anomaly_count": 0,
+    "fourteen_day_counterfactual_usd": 0.0432,
+    "fourteen_day_efficiency_ratio": 0.972972972972973,
+    "is_empty": False,
+}
+
+
+def test_claude_serializer_output_is_byte_stable(monkeypatch):
+    """The F18 refactor must not move a single byte of Claude output.
+
+    This is the evidence for the spec 3.1 scope call — the reason S2 is
+    allowed into the Claude serializer at all. A diff here is a
+    regression, never a stale expectation.
+
+    One value has been updated since, ONCE, and deliberately: #443 S3 F21
+    made the by-model cache-dollar fold order-independent, which moved
+    `by_model[0].net_usd` by a single ULP onto the value `by_project`
+    already published for the same data. That is recorded inline at the
+    constant with its arithmetic. It does not soften the rule above — a
+    diff without that kind of written, measured justification is a
+    regression.
+    """
+    import json
+
+    dash, cctally_ns = _bootstrap_dashboard()
+    now_utc = dt.datetime(2026, 7, 31, 23, 0, tzinfo=dt.timezone.utc)
+    entries = [
+        _make_joined_entry(
+            ts_utc=dt.datetime(2026, 7, d, 12, 0, tzinfo=dt.timezone.utc),
+            cache_read=2000, cache_creation=200,
+            input_tokens=500, output_tokens=100,
+            project_path="/proj/a",
+        )
+        for d in range(24, 32)
+    ]
+    monkeypatch.setitem(
+        cctally_ns, "get_claude_session_entries", lambda *a, **kw: entries,
+    )
+    snap = dash.build_cache_report_snapshot(
+        now_utc=now_utc, anomaly_threshold_pp=15,
+        anomaly_window_days=14, display_tz=ZoneInfo("Etc/UTC"),
+    )
+    got = dash._cache_report_snapshot_to_dict(snap)
+    assert json.dumps(got, sort_keys=True) == json.dumps(
+        CLAUDE_WIRE_EXPECTED, sort_keys=True
+    )
+    # Key ORDER is part of the contract the goldens capture, so compare the
+    # unsorted serialization too — sort_keys alone would pass over a
+    # reordering that restales all nine dashboard goldens.
+    assert json.dumps(got) == json.dumps(CLAUDE_WIRE_EXPECTED)
+
+
+def test_source_schema_version_is_unchanged_by_s2():
+    """#443 S2 is a purely additive wire change, so the version stays 3.
+
+    Every field S2 adds is optional and Codex-only, and no published value
+    changes meaning — the transitional percent key and the numeric
+    wasted/efficiency figures are both retained. The bump to 4 belongs to
+    the follow-up release that removes them, together with the note in
+    docs/dashboard-gotchas.md. This pin exists so the value reads as
+    considered rather than forgotten.
+    """
+    from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
+    assert SOURCE_SCHEMA_VERSION == 3
+
+
+# Spec §5 also asked for Codex "field-survival assertions" HERE. They live
+# elsewhere deliberately: this file exercises the CLAUDE serializer, and a
+# Codex assertion built on it would have to fabricate a Codex snapshot
+# rather than observe one. Survival is covered where the fields actually
+# travel — the `codex-cache-active` / `codex-cache-idle` goldens, and
+# tests/test_dashboard_source_read_model.py, which drives
+# `_codex_cache_report_wire` end to end. Recorded so the gap between spec
+# and tree reads as a decision rather than an omission.

@@ -1,0 +1,70 @@
+{
+  "repository": "omrikais/cctally-dev",
+  "sourceFingerprints": {
+    "101": "ecf68792cba5c2b80145e56e56c9664303351916f609fd0ef08b590944729a49",
+    "102": "9ab2fc10735b7c5a1b45a68822bd03f0d688aa8a021a424543484c42d0c2ca7b",
+    "103": "14601774a2b1298853fde10016fa0fde6ffaab7b2f904a271588ba4dce8535b4",
+    "104": "d548bd164ef8697314c0e32faf2b30f9248de613afdc2849495563e622388b10",
+    "105": "a530b27dc12745c6f3727647f625f7f602e3ab3dbeaa7d37220ba7da859072ed",
+    "106": "f657f1220a3c076cfeaf352ee7ae79e2e39dc42ddcabc4538bd721189b0bd63c",
+    "107": "2293b8518b09a2349f7da0ce6812386db32092d0d0989eae4690758b165899f7"
+  },
+  "issues": [
+    {
+      "number": 101,
+      "title": "Correctness regression corrupts weekly totals",
+      "body": "A current-main reproduction shows weekly totals double-count a retained row. This blocks reliable reports.",
+      "labels": ["bug", "correctness"],
+      "comments": ["Reproduced today on current main with fixture weekly-double-count."],
+      "state": "OPEN"
+    },
+    {
+      "number": 102,
+      "title": "Flaky weekly totals test overlaps correctness report",
+      "body": "The weekly fixture flakes intermittently. It may share a cause with #101, but no causal link is proven.",
+      "labels": ["bug", "testing"],
+      "comments": ["Observed twice; relationship to #101 remains uncertain."],
+      "state": "OPEN"
+    },
+    {
+      "number": 103,
+      "title": "Tracking: reporting reliability follow-ups",
+      "body": "Parked meta tracker collecting future reporting ideas. It is not an executable implementation unit.",
+      "labels": ["tracking"],
+      "comments": [],
+      "state": "OPEN"
+    },
+    {
+      "number": 104,
+      "title": "Epic: provider-aware reporting",
+      "body": "Several planned sessions shipped, but acceptance still requires parity evidence across every reporting surface.",
+      "labels": ["epic"],
+      "comments": ["Sessions S1-S4 merged; cross-surface acceptance remains unchecked."],
+      "state": "OPEN"
+    },
+    {
+      "number": 105,
+      "title": "Add provider field to exports and alerts",
+      "body": "Another issue shipped export provider metadata, but alerts and one renderer remain unresolved.",
+      "labels": ["enhancement"],
+      "comments": ["Partially overlaps #104 and may be partially subsumed; residual alerts scope remains."],
+      "state": "OPEN"
+    },
+    {
+      "number": 106,
+      "title": "Fix cache rebuild deadlock",
+      "body": "A comment claims this was merged, but supplies no current-main reproduction or acceptance run.",
+      "labels": ["bug"],
+      "comments": ["Believed fixed by an older branch merge."],
+      "state": "OPEN"
+    },
+    {
+      "number": 107,
+      "title": "Incorrect quota-window grouping",
+      "body": "Distinct physical quota windows can be grouped together, producing incorrect blocks. No existing category label is apparent in this fixture.",
+      "labels": [],
+      "comments": ["Needs categorization after checking for semantically equivalent repository labels."],
+      "state": "OPEN"
+    }
+  ]
+}

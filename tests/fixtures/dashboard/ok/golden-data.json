@@ -456,7 +456,7 @@
         "net_usd": 0.8604988499999999,
         "observed": true,
         "output_tokens": 334000,
-        "saved_usd": 1.8676521000000001,
+        "saved_usd": 1.8676521,
         "wasted_usd": 1.00715325
       },
       {
@@ -5953,6 +5953,9 @@
               "status": null
             },
             "cache_report": {
+              "anomaly_predicates": [
+                "cache_drop"
+              ],
               "anomaly_threshold_pp": 15,
               "anomaly_window_days": 14,
               "by_model": [],
@@ -5961,17 +5964,26 @@
               "fourteen_day_counterfactual_usd": 0.0,
               "fourteen_day_efficiency_ratio": 0.0,
               "is_empty": true,
+              "not_applicable": {
+                "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
+                "wasted_usd": "OpenAI charges no cache-write premium, so Codex has no wasted-cache figure."
+              },
               "seven_day_anomaly_count": 0,
               "seven_day_net_usd": 0.0,
               "today": {
                 "anomaly_reasons": [],
                 "anomaly_triggered": false,
+                "anomaly_unevaluated": [
+                  "cache_drop"
+                ],
                 "baseline_daily_row_count": 0,
                 "baseline_median_percent": null,
                 "cache_hit_percent": 0.0,
+                "cached_input_percent": 0.0,
                 "date": "2026-04-16",
                 "delta_pp": null,
                 "net_usd": 0.0,
+                "observed": false,
                 "saved_usd": 0.0,
                 "wasted_usd": 0.0
               },
@@ -9525,6 +9537,9 @@
           "status": null
         },
         "cache_report": {
+          "anomaly_predicates": [
+            "cache_drop"
+          ],
           "anomaly_threshold_pp": 15,
           "anomaly_window_days": 14,
           "by_model": [],
@@ -9533,17 +9548,26 @@
           "fourteen_day_counterfactual_usd": 0.0,
           "fourteen_day_efficiency_ratio": 0.0,
           "is_empty": true,
+          "not_applicable": {
+            "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
+            "wasted_usd": "OpenAI charges no cache-write premium, so Codex has no wasted-cache figure."
+          },
           "seven_day_anomaly_count": 0,
           "seven_day_net_usd": 0.0,
           "today": {
             "anomaly_reasons": [],
             "anomaly_triggered": false,
+            "anomaly_unevaluated": [
+              "cache_drop"
+            ],
             "baseline_daily_row_count": 0,
             "baseline_median_percent": null,
             "cache_hit_percent": 0.0,
+            "cached_input_percent": 0.0,
             "date": "2026-04-16",
             "delta_pp": null,
             "net_usd": 0.0,
+            "observed": false,
             "saved_usd": 0.0,
             "wasted_usd": 0.0
           },

@@ -14,7 +14,10 @@
       "netUsd": 0.53375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -49,7 +52,10 @@
       "netUsd": 0.53375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {
@@ -84,7 +90,10 @@
       "netUsd": 0.53375,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {

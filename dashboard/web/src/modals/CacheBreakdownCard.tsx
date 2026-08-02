@@ -19,11 +19,11 @@
 // Spec 2026-05-21 §3.8; basename change: #251 CR-4.
 import type { CacheReportBreakdownRow } from '../types/envelope';
 import { fmt } from '../lib/fmt';
+import { cachePercentText } from '../lib/cacheReportVocabulary';
 
 export interface CacheBreakdownCardProps {
   kind: 'projects' | 'models';
   rows: CacheReportBreakdownRow[];
-  unavailableReason?: string;
 }
 
 // Basename of a filesystem path — the last non-empty segment. CR-4:
@@ -36,7 +36,7 @@ function basename(path: string): string {
   return parts.length ? parts[parts.length - 1] : path;
 }
 
-export function CacheBreakdownCard({ kind, rows, unavailableReason }: CacheBreakdownCardProps) {
+export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
   const cls = kind === 'projects' ? 'bd-projects' : 'bd-models';
   const label = kind === 'projects' ? 'By project' : 'By model';
   const emptyText =
@@ -48,9 +48,7 @@ export function CacheBreakdownCard({ kind, rows, unavailableReason }: CacheBreak
   return (
     <div className={`crm-bd-card ${cls}`} data-bd-kind={kind}>
       <div className="crm-bd-head">{label}</div>
-      {unavailableReason ? (
-        <div className="empty m-unavailable">{unavailableReason}</div>
-      ) : rows.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="empty">{emptyText}</div>
       ) : (
         <table>
@@ -66,7 +64,7 @@ export function CacheBreakdownCard({ kind, rows, unavailableReason }: CacheBreak
                   >
                     {display}
                   </td>
-                  <td>{fmt.pctFloor(r.cache_hit_percent)}%</td>
+                  <td>{cachePercentText(r) ?? <span className="m-unavailable">—</span>}</td>
                   <td className={r.net_usd >= 0 ? 'net-pos' : 'net-neg'}>
                     {fmt.usdSigned(r.net_usd)}
                   </td>

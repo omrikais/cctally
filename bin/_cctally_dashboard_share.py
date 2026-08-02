@@ -2590,6 +2590,7 @@ def _handle_share_history_post_impl(handler) -> None:
     destination = req.get("destination")
     try:
         source, _ = _share_source_selection(req)
+        account = _share_account_selection(req)
     except ValueError:
         handler._respond_json(400, {
             "code": "source_capability_unavailable",
@@ -2661,6 +2662,7 @@ def _handle_share_history_post_impl(handler) -> None:
         "template_id": template_id,
         "options": options,
         "source": source,
+        **({"account": account} if account is not None else {}),
         "format": fmt,
         "destination": destination,
         "exported_at": _share_now_utc_iso(),

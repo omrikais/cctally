@@ -38,6 +38,34 @@ afterEach(() => {
 });
 
 describe('+ Basket', () => {
+  it('captures the account qualifier in the render request and basket item', async () => {
+    const account = 'b'.repeat(32);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        body: 'md body', content_type: 'text/markdown',
+        snapshot: {
+          kernel_version: 1, panel: 'weekly', template_id: 'weekly-recap',
+          options: defaults(), generated_at: '2026-05-11T09:00:00Z',
+          data_digest: 'sha256:account-b', account,
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <ActionBar
+        panel="weekly" source="codex" account={account}
+        templateId="weekly-recap" options={defaults()} onOptionsChange={() => {}}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /\+ basket/i }));
+    });
+    const request = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(request.account).toBe(account);
+    expect(getState().basket.items[0].account).toBe(account);
+  });
+
   it('clicking + Basket fetches the recipe and dispatches BASKET_ADD', async () => {
     vi.stubGlobal(
       'fetch',

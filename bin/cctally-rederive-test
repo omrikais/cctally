@@ -479,9 +479,14 @@ finally:
 assert core.APP_DIR.joinpath("hwm-7d").read_bytes() == b"sentinel-week 77\n"
 assert core.APP_DIR.joinpath("hwm-5h").read_bytes() == b"sentinel-block 44\n"
 
-segment = next(core.JOURNAL_DIR.glob("observations-*.jsonl"))
 original = pathlib.Path(os.environ["HOME"]).parent / "original-segment.jsonl"
-assert segment.read_bytes().startswith(original.read_bytes())
+original_bytes = original.read_bytes()
+original_segments = [
+    segment
+    for segment in core.JOURNAL_DIR.glob("observations-*.jsonl")
+    if segment.read_bytes().startswith(original_bytes)
+]
+assert len(original_segments) == 1
 
 independent = pathlib.Path(os.environ["HOME"]).parent / "independent.db"
 runtime.rebuild_stats_index(

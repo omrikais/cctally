@@ -464,7 +464,6 @@ def _render_cache_day_rows(
             raw_rows.append((bd_cells, ROW_BREAKDOWN))
 
     tot_inp = sum(row.input_tokens for row in rows)
-    tot_out = sum(row.output_tokens for row in rows)
     tot_cc = sum(row.cache_creation_tokens for row in rows)
     tot_cr = sum(row.cache_read_tokens for row in rows)
     tot_tokens = sum(row.total_tokens for row in rows)
@@ -613,7 +612,6 @@ def _render_cache_session_rows(
             raw_rows.append((bd_cells, ROW_BREAKDOWN))
 
     tot_inp = sum(r.input_tokens for r in rows)
-    tot_out = sum(r.output_tokens for r in rows)
     tot_cc = sum(r.cache_creation_tokens for r in rows)
     tot_cr = sum(r.cache_read_tokens for r in rows)
     tot_tokens = sum(r.total_tokens for r in rows)
@@ -934,8 +932,11 @@ def _cache_report_json_payload(
     Daily mode keeps the top-level `days` key and per-row `totalCost` /
     totals.totalCost aliases for backward compat. Session mode uses
     `sessions` and adds sessionId / projectPath / lastActivity /
-    sourcePaths per row. Anomaly object is always emitted with
-    triggered=false / reasons=[] until Task 5 populates it.
+    sourcePaths per row. The anomaly object is always emitted: it
+    carries `triggered` / `reasons` from `_classify_anomalies` plus
+    `unevaluated` (the predicates the classifier declined to run for that
+    row), so a consumer can tell "evaluated, clean" from "never
+    evaluated".
     """
     top_key = "sessions" if mode == "session" else "days"
 
@@ -954,6 +955,7 @@ def _cache_report_json_payload(
             "anomaly": {
                 "triggered": r.anomaly_triggered,
                 "reasons": list(r.anomaly_reasons),
+                "unevaluated": list(r.anomaly_unevaluated),
             },
             "modelBreakdowns": [
                 {
@@ -1065,7 +1067,10 @@ def _sort_cache_rows(
         if anchor is None and r.date:
             # Use .astimezone() (OS tzdb) rather than .replace(tzinfo=...) so
             # DST-straddling dates resolve to the correct offset — same idiom
-            # as _annotate_anomalies._row_anchor.
+            # as `_row_anchor`, which is a module-level function in
+            # bin/_lib_cache_report.py — NOT an attribute of this file's
+            # `_annotate_anomalies` shim, which is what the old citation
+            # implied.
             # internal fallback: host-local intentional
             anchor = dt.datetime.strptime(r.date, "%Y-%m-%d").astimezone()
         # Use tz-aware sentinel to avoid naive-vs-aware comparison errors.

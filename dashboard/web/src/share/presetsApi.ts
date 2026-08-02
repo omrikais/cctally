@@ -136,6 +136,7 @@ export interface HistoryRecord {
   // history/digest identity server-side, so "same panel, different source" rows
   // are DISTINCT (no dedup/collapse). Optional on read (legacy → claude).
   source?: DashboardSelection;
+  account?: string;
 }
 
 export interface HistoryResponse {
@@ -151,6 +152,7 @@ export interface AppendHistoryArgs {
   destination: string;
   // #294 S5 §7 — the share flow's captured source (stamped explicitly).
   source?: DashboardSelection;
+  account?: string | null;
 }
 
 export async function listHistory(
@@ -165,10 +167,11 @@ export async function appendHistory(
   args: AppendHistoryArgs,
   init?: { signal?: AbortSignal },
 ): Promise<HistoryRecord> {
+  const { account, ...legacyArgs } = args;
   return jsonOrThrow<HistoryRecord>(await fetch('/api/share/history', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(args),
+    body: JSON.stringify(account == null ? legacyArgs : { ...legacyArgs, account }),
     signal: init?.signal,
   }));
 }

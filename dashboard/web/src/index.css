@@ -6409,6 +6409,8 @@ mark.current {
 .cr-glyph.ok    { color: var(--accent-green); }
 .cr-glyph.warn  { color: var(--accent-amber); }
 .cr-glyph.thin  { color: var(--text-dim); }
+.cr-glyph.empty { color: var(--text-dim); }
+.cr-glyph.fail  { color: var(--accent-amber); font-weight: 800; }
 
 .cr-headline {
   font-size: var(--fs-body); color: var(--text);
@@ -6426,18 +6428,15 @@ mark.current {
 
 .cr-spark { display: block; margin-top: 10px; }
 
-/* Mini net-bars wrapper edge-to-edge fills the panel below the
-   sparkline (issue #77 P2-4 Round 2). The panel is a flex column
-   (.panel { display: flex; flex-direction: column }), so giving this
-   container flex: 1 1 auto pulls it down to consume all leftover
-   vertical space between the sparkline and the 14d-net subline. The
-   inner SVG renders width: 100% / height: 100% with
-   preserveAspectRatio="none" so the bars stretch to whatever rect the
-   wrapper resolves to at the current panel height. */
+/* Mini net-bars keep the compact 60px chart proportion from the design
+   reference. They must not absorb the panel's leftover height: doing so made
+   the bars occupy almost half a normal card and visually dominate the verdict. */
 .cr-netbars-mini-wrap {
   display: flex;
-  flex: 1 1 auto;
-  min-height: 60px; /* don't collapse to nothing in unusually tight layouts */
+  flex: 0 0 60px;
+  height: 60px;
+  min-height: 60px;
+  max-height: 60px;
   margin-top: 6px;
 }
 .cr-netbars-mini {
@@ -6454,12 +6453,7 @@ mark.current {
    prior 719 px mismatch — under the larger value, the @media block
    was unreachable between 641-719 px because the class never landed
    there. Update both sides together if this number ever moves. */
-@media (max-width: 640px) {
-  .panel.cache-report-collapsed .cr-spark,
-  .panel.cache-report-collapsed .cr-netbars-mini-wrap,
-  .panel.cache-report-collapsed .cr-subline.second {
-    display: none;
-  }
+@media (max-width: 783px) {
   /* CR-3 — the sticky mobile header over-truncated the title to "Cache ⋯"
      because the long subtitle crowded the row. The subtitle text is already
      shortened via the useIsMobile() branch; keep it from re-crowding the title
@@ -6493,6 +6487,14 @@ mark.current {
      not shrink either, and would push the overflow onto the trailing controls
      instead. */
   .modal-header:has(.crm-subtitle) h2 { flex-shrink: 0; }
+}
+
+@media (max-width: 640px) {
+  .panel.cache-report-collapsed .cr-spark,
+  .panel.cache-report-collapsed .cr-netbars-mini-wrap,
+  .panel.cache-report-collapsed .cr-subline.second {
+    display: none;
+  }
 }
 
 /* Below ~340 px the subtitle is the only thing still shrinking, and the
@@ -6885,9 +6887,10 @@ mark.current {
   .crm-breakdowns { grid-template-columns: 1fr; }
 }
 
-/* Modal-side mobile reflow (< 720 px). The panel-side mobile reflow
-   sits above in the @media block. */
-@media (max-width: 719px) {
+/* Modal-side phone sheet. React switches from the desktop table to fully
+   labeled cards at this same breakpoint, so CSS must not independently hide
+   the table header in the 641–719px band. */
+@media (max-width: 640px) {
   /* Table → card form, mirroring the trend modal pattern at
      index.css:3236+. */
   .ch-table thead { display: none; }

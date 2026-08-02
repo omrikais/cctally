@@ -115,4 +115,47 @@ describe('#293 S4 SHARE-1 — mobile preview-first render reorder', () => {
       expect(body.source).toBe('codex');
     });
   });
+
+  it('desktop preview keeps the account captured when the share flow opened', async () => {
+    stubMatchMedia(false);
+    const captured = 'b'.repeat(32);
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch({
+        type: 'OPEN_SHARE', panel: 'weekly', triggerId: null,
+        source: 'codex', account: captured,
+      });
+      // The global selector can move while the modal is open. The request must
+      // remain qualified by the flow's frozen account, not this later value.
+      dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: 'a'.repeat(32) });
+    });
+
+    await waitFor(() => {
+      const renderCall = (fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+        ([url]) => typeof url === 'string' && url.includes('/api/share/render'),
+      );
+      expect(renderCall).toBeDefined();
+      const body = JSON.parse((renderCall?.[1] as RequestInit).body as string);
+      expect(body.account).toBe(captured);
+    });
+  });
+
+  it('does not claim an account scope for Claude panels that remain unfiltered', async () => {
+    stubMatchMedia(false);
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch({
+        type: 'OPEN_SHARE', panel: 'weekly', triggerId: null,
+        source: 'claude', account: 'b'.repeat(32),
+      });
+    });
+    await waitFor(() => {
+      const renderCall = (fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+        ([url]) => typeof url === 'string' && url.includes('/api/share/render'),
+      );
+      expect(renderCall).toBeDefined();
+      const body = JSON.parse((renderCall?.[1] as RequestInit).body as string);
+      expect(body).not.toHaveProperty('account');
+    });
+  });
 });

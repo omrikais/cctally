@@ -160,6 +160,24 @@ def _tree(root: pathlib.Path) -> dict[str, tuple]:
     }
 
 
+def _journal_records(journal_dir: pathlib.Path) -> list[tuple[pathlib.Path, dict]]:
+    return [
+        (segment, json.loads(line))
+        for segment in sorted(journal_dir.glob("*.jsonl"))
+        for line in segment.read_bytes().splitlines()
+    ]
+
+
+def _journal_repair_audits(
+    journal_dir: pathlib.Path,
+) -> list[tuple[pathlib.Path, dict]]:
+    return [
+        (segment, record)
+        for segment, record in _journal_records(journal_dir)
+        if record.get("src") == "journal-repair"
+    ]
+
+
 def _run(
     app_dir: pathlib.Path,
     *args: str,
@@ -449,18 +467,18 @@ def test_apply_appends_one_exact_audit_and_rebuilds_usable_index(tmp_path):
     acknowledged = payload["acknowledgedViolations"][0]
     assert acknowledged["fingerprint"] == violation["fingerprint"]
     assert acknowledged["auditId"] == payload["auditId"]
-    assert payload["journalHighWater"]["offset"] > len(original)
     assert payload["rebuild"]["journalProtocolViolations"] == []
     assert [
         item["fingerprint"]
         for item in payload["rebuild"]["journalAcknowledgedProtocolViolations"]
     ] == [violation["fingerprint"]]
 
-    final_bytes = segment.read_bytes()
-    assert final_bytes.startswith(original)
-    appended = final_bytes[len(original):].splitlines()
-    assert len(appended) == 1
-    audit = json.loads(appended[0])
+    assert segment.read_bytes().startswith(original)
+    [(audit_segment, audit)] = _journal_repair_audits(journal_dir)
+    assert payload["journalHighWater"] == {
+        "segment": audit_segment.name,
+        "offset": audit_segment.stat().st_size,
+    }
     assert audit["id"] == payload["auditId"]
     assert audit["payload"]["journal_high_water"] == {
         "segment": segment.name,
@@ -510,7 +528,7 @@ def test_repeated_exact_apply_reports_already_resolved_without_append(tmp_path):
     )
     assert first.returncode == 0, first.stderr
     first_payload = json.loads(first.stdout)
-    after_first = segment.read_bytes()
+    after_first = _tree(journal_dir)
 
     repeated = _run(
         app_dir, "--violation", fingerprint, "--yes", "--json"
@@ -533,7 +551,7 @@ def test_repeated_exact_apply_reports_already_resolved_without_append(tmp_path):
         }
     ]
     assert payload["rebuild"] is None
-    assert segment.read_bytes() == after_first
+    assert _tree(journal_dir) == after_first
 
 
 def test_replay_rejects_changed_bytes_inside_the_audited_raw_prefix(tmp_path):
@@ -563,8 +581,8 @@ def test_replay_rejects_changed_bytes_inside_the_audited_raw_prefix(tmp_path):
         "--json",
     )
     assert applied.returncode == 0, applied.stderr
+    assert len(_journal_repair_audits(journal_dir)) == 1
     audited_bytes = segment.read_bytes()
-    assert audited_bytes.count(b'"src":"journal-repair"') == 1
     assert b'"value":"a"' in audited_bytes
     segment.write_bytes(
         audited_bytes.replace(b'"value":"a"', b'"value":"b"', 1)
@@ -577,7 +595,7 @@ def test_replay_rejects_changed_bytes_inside_the_audited_raw_prefix(tmp_path):
     assert payload["schemaVersion"] == 1
     assert payload["status"] == "failed"
     assert "raw-prefix binding does not match" in payload["errors"][0]
-    assert segment.read_bytes().count(b'"src":"journal-repair"') == 1
+    assert len(_journal_repair_audits(journal_dir)) == 1
 
 
 def test_all_seven_classes_share_one_exact_audit_and_new_divergence_reopens(
@@ -631,9 +649,8 @@ def test_all_seven_classes_share_one_exact_audit_and_new_divergence_reopens(
     assert payload["status"] == "applied"
     assert payload["unacknowledgedViolations"] == []
     assert len(payload["acknowledgedViolations"]) == len(STRUCTURAL_KINDS)
-    appended = segment.read_bytes()[len(original):].splitlines()
-    assert len(appended) == 1
-    audit = json.loads(appended[0])
+    assert segment.read_bytes().startswith(original)
+    [(audit_segment, audit)] = _journal_repair_audits(journal_dir)
     assert audit["id"] == payload["auditId"]
     assert audit["payload"]["journal_high_water"] == {
         "segment": segment.name,
@@ -644,7 +661,7 @@ def test_all_seven_classes_share_one_exact_audit_and_new_divergence_reopens(
     ] == sorted(fingerprints)
 
     later = _valid_later_event()
-    with segment.open("ab") as handle:
+    with audit_segment.open("ab") as handle:
         handle.write(journal.encode_line(later))
     rebuilt = _run_cli(
         app_dir, "db", "rebuild", "--db", "stats", "--json"
@@ -678,7 +695,7 @@ def test_all_seven_classes_share_one_exact_audit_and_new_divergence_reopens(
     original_begin = records[1]
     newly_divergent = copy.deepcopy(original_begin)
     newly_divergent["protocol_extension"] = "new-after-audit"
-    with segment.open("ab") as handle:
+    with audit_segment.open("ab") as handle:
         handle.write(journal.encode_line(newly_divergent))
     reopened = json.loads(_run(app_dir, "--json").stdout)
     assert len(reopened["acknowledgedViolations"]) == len(STRUCTURAL_KINDS)
@@ -886,11 +903,7 @@ def test_real_sigkill_after_audit_converges_to_one_audit_and_index(tmp_path):
     payload = json.loads(recovered.stdout)
     assert payload["status"] == "recovered"
     assert payload["rebuild"] is not None
-    audits = [
-        json.loads(line)
-        for line in segment.read_bytes().splitlines()
-        if json.loads(line).get("src") == "journal-repair"
-    ]
+    audits = [record for _segment, record in _journal_repair_audits(journal_dir)]
     assert len(audits) == 1
     assert audits[0]["id"] == payload["auditId"]
     conn = sqlite3.connect(app_dir / "stats.db")
@@ -967,11 +980,7 @@ def test_real_sigkill_during_common_scratch_fold_recovers(tmp_path):
     assert recovered.returncode == 0, recovered.stderr
     payload = json.loads(recovered.stdout)
     assert payload["status"] == "recovered"
-    audits = [
-        json.loads(line)
-        for line in segment.read_bytes().splitlines()
-        if json.loads(line).get("src") == "journal-repair"
-    ]
+    audits = [record for _segment, record in _journal_repair_audits(journal_dir)]
     assert len(audits) == 1
     conn = sqlite3.connect(app_dir / "stats.db")
     try:
@@ -1022,7 +1031,7 @@ def test_post_audit_sqlite_rebuild_error_keeps_exit3_json_and_recovers(tmp_path)
         "auditId"
     ]
     assert "injected scratch sqlite failure" in payload["errors"][0]
-    assert segment.read_bytes().count(b'"src":"journal-repair"') == 1
+    assert len(_journal_repair_audits(journal_dir)) == 1
 
     recovered = _run(
         app_dir,
@@ -1035,7 +1044,7 @@ def test_post_audit_sqlite_rebuild_error_keeps_exit3_json_and_recovers(tmp_path)
     recovered_payload = json.loads(recovered.stdout)
     assert recovered_payload["status"] == "recovered"
     assert recovered_payload["auditId"] == payload["auditId"]
-    assert segment.read_bytes().count(b'"src":"journal-repair"') == 1
+    assert len(_journal_repair_audits(journal_dir)) == 1
 
 
 def test_doctor_moves_from_exact_fail_remedy_to_truthful_warn(tmp_path):
@@ -1298,9 +1307,5 @@ def test_live_dashboard_refusal_then_identical_retry_converges(tmp_path):
     retry_payload = json.loads(retried.stdout)
     assert retry_payload["status"] == "recovered"
     assert retry_payload["auditId"] == refusal["auditId"]
-    audits = [
-        json.loads(line)
-        for line in segment.read_bytes().splitlines()
-        if json.loads(line).get("src") == "journal-repair"
-    ]
+    audits = [record for _segment, record in _journal_repair_audits(journal_dir)]
     assert len(audits) == 1

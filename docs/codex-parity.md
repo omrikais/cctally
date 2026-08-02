@@ -221,10 +221,31 @@ blended transcript.
 | `diff` | supported | deferred | S3 | Compare compatible, source-qualified measures. |
 | `range-cost` | supported | deferred | S3 | USD is source-native before optional combination. |
 | `cache-report` cache hit rate | supported | not applicable | S3 | Codex has no Claude cache hit/miss/create/read analogue. |
-| Codex token-reuse forensics | not applicable | deferred | S3 | `cached_input_tokens` may be a truthful provider-native outcome, never a hit rate. |
+| Codex token-reuse forensics | not applicable | supported | S3 | Shipped on the CLI: `build_codex_reuse_result` publishes `cachedInputPercent` / `cachedInputTokens` under a "Cached Input" column with the share title "Token Reuse Report". `cached_input_tokens` is a truthful provider-native outcome, never a hit rate. |
 | share formats | supported | deferred | S3 | Share artifacts retain source-qualified identity. |
 | JSON/config behavior | supported | deferred | S3 | New JSON fields are additive and use `schemaVersion` conventions. |
 | source-aware composition | deferred | deferred | S3 | All-source views retain source labels and native detail. |
+
+### Cache Report vocabulary
+
+Normative. This subsection is what the CLI, the dashboard wire, and the dashboard UI must all conform to; the two rows immediately above must be read with it.
+
+| Concept | Claude | Codex |
+|---|---|---|
+| Percent | cache hit rate — `cache_hit_percent` | cached input — `cached_input_percent`, labelled "Cached input" |
+| Saved | cache savings | reuse savings — a real measurement, kept |
+| Wasted | cache-write premium not recovered | not applicable — OpenAI charges no cache-write premium |
+| Net | saved − wasted | not applicable as a distinct concept; definitionally equals saved |
+| Efficiency | saved ÷ (saved + \|wasted\|) | not applicable |
+| Predicates | `{net_negative, cache_drop}` | `{cache_drop}`, worded "reuse drop" in user copy |
+
+**The names are not invented here, and the CLI is the reference implementation.** `cache-report --source codex` does not route through `bin/_cctally_cache_report.py` at all — it routes to `build_codex_reuse_result` in `bin/_lib_source_analytics.py`, which already renders a "Cached Input" column, publishes `cachedInputPercent` / `cachedInputTokens`, and titles its share artifact "Token Reuse Report". That kernel contains no anomaly concept whatsoever. This subsection documents what the CLI does and requires the dashboard wire and UI to match it; the CLI itself is unmodified by #443 S2.
+
+**Not applicable is not unevaluated.** "Unevaluated" means the predicate or figure could be computed given more data — a thin baseline resolves with time. "Not applicable" means the concept does not exist for that provider and never will. `net_negative` is not a Codex predicate that failed to run; it is not a Codex predicate. Codex `wasted_usd` is not unknown; it is structurally absent. This is what keeps the Codex Flag column from reading `partial` in perpetuity.
+
+**One threshold.** `anomaly_threshold_pp` stays a single global setting and governs the reuse-drop predicate on Codex exactly as it governs `cache_drop` on Claude. No per-provider threshold exists.
+
+**Transitional debt — three items that ship together, tracked in #465.** For one release the Codex wire still publishes the legacy `cache_hit_percent` alongside the authoritative `cached_input_percent`, and still publishes `wasted_usd` and `fourteen_day_efficiency_ratio` as numbers rather than `null`, with the `not_applicable` map as the authoritative signal a current client renders from. Both retentions exist for the same reason: a browser tab that spans a `cctally update` receives the new payload over its existing EventSource without reloading its JavaScript, and that tab calls `.toFixed(2)` on `wasted_usd` and `Math.round(x * 100)` on the efficiency ratio. Because every #443 S2 field is optional and additive and no published value changed meaning, `SOURCE_SCHEMA_VERSION` deliberately stays 3. Removing the percent alias, publishing the nulls, and bumping the version to 4 (with the note at `docs/dashboard-gotchas.md:439`) must land in one release — publishing the nulls without removing the old readers is exactly the crash this transition avoids.
 
 ### Dashboard
 

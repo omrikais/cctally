@@ -844,6 +844,31 @@ def test_history_post_returns_recipe_with_server_fields(dashboard_server):
     assert isinstance(body.get("exported_at"), str) and body["exported_at"]
 
 
+def test_history_post_preserves_valid_account_and_omits_agnostic(dashboard_server):
+    """Account is additive metadata; legacy history bytes keep no null field."""
+    port, _ = dashboard_server
+    account = "b" * 32
+    base = {
+        "panel": "weekly",
+        "template_id": "weekly-recap",
+        "options": {"format": "md"},
+        "format": "md",
+        "destination": "download",
+        "source": "codex",
+    }
+    records = []
+    for payload in ({**base, "account": account}, base):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/share/history",
+            data=json.dumps(payload).encode(), method="POST",
+            headers=_csrf_headers(port),
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            records.append(json.loads(r.read()))
+    assert records[0]["account"] == account
+    assert "account" not in records[1]
+
+
 def test_history_post_rejects_unknown_panel(dashboard_server):
     """Panel validation mirrors presets POST — refuses non-share-capable
     panels with HTTP 400."""

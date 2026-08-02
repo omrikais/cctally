@@ -50,9 +50,29 @@ describe.each(['claude', 'codex', 'all'] as const)(
     });
 
     it('keeps all Cache Report composition slots', () => {
-      const { container } = renderFor(source, <CacheReportModal />);
+      // #443 S2 — the shipped fixture publishes no Codex `cache_report`, and
+      // the composition slots used to appear there only because the client
+      // fabricated a report from raw daily rows. That fallback is deleted, so
+      // the parity claim is now stated over a provider that actually HAS a
+      // report: seed Codex's from Claude's rather than assert slots over an
+      // absent one, which would only pin the unavailable body.
+      const composed = structuredClone(envelope);
+      composed.sources!.codex.data!.cache_report =
+        structuredClone(composed.cache_report!);
+      composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
+      act(() => {
+        updateSnapshot(composed);
+        dispatch({ type: 'SET_ACTIVE_SOURCE', source });
+      });
+      const { container } = render(<CacheReportModal />);
       expect(container.textContent).toContain("Today's spotlight");
-      expect(container.textContent).toContain('Cache hit %');
+      // Parity is about the SLOTS, not the wording: #443 S2 gives Codex its own
+      // cache vocabulary, so the timeline heading reads "Cached input %" there
+      // and "Cache hit %" everywhere else. Asserting the Claude literal for
+      // every source would pin the very copy the vocabulary contract fixes.
+      expect(container.querySelector('.crm-sh-timeline')?.textContent).toContain(
+        source === 'codex' ? 'Cached input %' : 'Cache hit %',
+      );
       expect(container.textContent).toContain('Net $ per day');
       expect(container.textContent).toContain('Daily rows');
       expect(container.querySelector('[data-bd-kind="projects"]')).not.toBeNull();

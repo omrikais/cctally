@@ -720,7 +720,8 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
     conn.execute(f"PRAGMA user_version = {core.STATS_INDEX_EPOCH + 1}")
     conn.commit()
     conn.close()
-    healed = core.open_db()  # detects mismatch -> rebuild
+    import _cctally_store as store
+    healed = store.resolve_stats_epoch_mismatch()
     try:
         assert healed.execute("PRAGMA user_version").fetchone()[0] == \
             core.STATS_INDEX_EPOCH
@@ -744,8 +745,9 @@ def test_epoch_mismatch_without_journal_hard_errors(ns):
     conn.commit()
     conn.close()
     import _cctally_db as db
+    import _cctally_store as store
     with pytest.raises(db.StatsEpochMismatchError):
-        core.open_db()
+        store.resolve_stats_epoch_mismatch()
 
 
 # ==========================================================================

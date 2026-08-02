@@ -83,6 +83,10 @@ export interface ShareSnapshot {
   options: ShareOptions;
   generated_at: string;
   data_digest: string;
+  // Additive account metadata. The server omits both for agnostic shares and
+  // anonymizes the label unless reveal_projects was explicitly enabled.
+  account?: string;
+  account_label?: string;
 }
 
 export interface ShareRenderResponse {

@@ -115,9 +115,42 @@ CACHE_REPORT_MIN_BASELINE_DAYS = 5
 CACHE_REPORT_MIN_BASELINE_SESSIONS = 10
 
 
-# Literal alias mirroring TS `CacheAnomalyReason` at
-# dashboard/web/src/types/envelope.ts:71 — keeps the two surfaces in
-# lockstep so a typo on either side fails type-check.
+# Anomaly-threshold bounds and default. #443 S3 F17: four sites used to
+# decide independently what `cache_report.anomaly_threshold_pp` means —
+# the Claude read path, the Codex read path, the persistence gate, and
+# the client form. The three Python sites now resolve through here; the
+# TypeScript form's bounds are pinned by
+# tests/test_cache_report_constant_parity.py.
+CACHE_REPORT_DEFAULT_THRESHOLD_PP = 15
+CACHE_REPORT_THRESHOLD_MIN_PP = 1
+CACHE_REPORT_THRESHOLD_MAX_PP = 100
+
+
+def cache_report_threshold_is_valid(raw: object) -> bool:
+    """True when ``raw`` is an in-range int. ``bool`` is not an int here."""
+    return (
+        isinstance(raw, int)
+        and not isinstance(raw, bool)
+        and CACHE_REPORT_THRESHOLD_MIN_PP <= raw <= CACHE_REPORT_THRESHOLD_MAX_PP
+    )
+
+
+def resolve_cache_report_threshold(raw: object) -> int:
+    """Read-path resolution: strict and silent.
+
+    Anything not an in-range int resolves to the default. Callers run
+    inside the per-tick dashboard build loop, so this never warns.
+    """
+    if cache_report_threshold_is_valid(raw):
+        return int(raw)
+    return CACHE_REPORT_DEFAULT_THRESHOLD_PP
+
+
+# Mirrored in TypeScript as the `CacheAnomalyReason` union in
+# dashboard/web/src/types/envelope.ts. The two are kept in lockstep by
+# test_ts_anomaly_reason_union_matches_the_python_literal in
+# tests/test_cache_report_constant_parity.py — NOT by type-check: a
+# Literal-only change on this side compiles fine on both.
 CacheAnomalyReason = Literal["net_negative", "cache_drop"]
 # Every predicate _classify_anomalies can run, in reason-append order. The
 # TypeScript mirror is CACHE_ANOMALY_PREDICATES in cacheReportVerdict.ts.
@@ -219,6 +252,14 @@ class _Bucket:
     zero. The breakdown aggregator only populates the token + cache-$
     fields (``output_tokens`` / ``cost`` stay zero); that's fine — the
     by-project / by-model paths don't surface them.
+
+    The three cache-dollar totals are NOT accumulated with ``+=``.
+    Producers append each addend via ``add_cache_dollars`` and call
+    ``resolve_cache_dollars`` once (#443 S3 F20/F21): a left-to-right
+    float fold over near-cancelling addends is order-dependent, and
+    ``net_usd`` feeds the strict ``< 0`` ``net_negative`` predicate, so
+    entry order alone could flip an anomaly verdict. The token and
+    ``cost`` accumulators stay ``+=`` — ints, or a float no verdict reads.
     """
     input_tokens: int = 0
     output_tokens: int = 0
@@ -228,6 +269,21 @@ class _Bucket:
     saved_usd: float = 0.0
     wasted_usd: float = 0.0
     net_usd: float = 0.0
+    saved_parts: list[float] = field(default_factory=list)
+    wasted_parts: list[float] = field(default_factory=list)
+    net_parts: list[float] = field(default_factory=list)
+
+    def add_cache_dollars(self, saved: float, wasted: float, net: float) -> None:
+        """Retain one addend triple; nothing is folded until resolve."""
+        self.saved_parts.append(saved)
+        self.wasted_parts.append(wasted)
+        self.net_parts.append(net)
+
+    def resolve_cache_dollars(self) -> None:
+        """Collapse the retained addends into order-independent totals."""
+        self.saved_usd = stable_sum(self.saved_parts)
+        self.wasted_usd = stable_sum(self.wasted_parts)
+        self.net_usd = stable_sum(self.net_parts)
 
 
 @dataclass(frozen=True)
@@ -462,9 +518,7 @@ def _aggregate_cache_by_day(
         b.cache_creation_tokens += create_tok
         b.cache_read_tokens += read_tok
         b.cost += cost
-        b.saved_usd += saved
-        b.wasted_usd += wasted
-        b.net_usd += net
+        b.add_cache_dollars(saved, wasted, net)
 
     result: list[CacheRow] = []
     for day_key in sorted(day_model_buckets.keys()):
@@ -472,6 +526,7 @@ def _aggregate_cache_by_day(
         row = CacheRow(date=day_key)
         for model_name in sorted(models.keys()):
             b = models[model_name]
+            b.resolve_cache_dollars()
             mb = CacheModelBreakdown(
                 model_name=model_name,
                 input_tokens=b.input_tokens,
@@ -492,9 +547,12 @@ def _aggregate_cache_by_day(
             row.cache_creation_tokens += mb.cache_creation_tokens
             row.cache_read_tokens += mb.cache_read_tokens
             row.cost += mb.cost
-            row.saved_usd += mb.saved_usd
-            row.wasted_usd += mb.wasted_usd
-            row.net_usd += mb.net_usd
+        # #443 S3 F21: the model-to-row fold, stably summed. Both layers,
+        # or neither works — the order-dependence originates one layer
+        # below, in the same-model entry fold above.
+        row.saved_usd = stable_sum(mb.saved_usd for mb in row.model_breakdowns)
+        row.wasted_usd = stable_sum(mb.wasted_usd for mb in row.model_breakdowns)
+        row.net_usd = stable_sum(mb.net_usd for mb in row.model_breakdowns)
         result.append(row)
     return result
 
@@ -632,9 +690,7 @@ def _aggregate_cache_by_session(
                 cache_1h_tokens=getattr(entry, "cache_1h_tokens", None),
                 speed=getattr(entry, "speed", None),
             )
-            mb_raw.saved_usd += saved
-            mb_raw.wasted_usd += wasted
-            mb_raw.net_usd += net
+            mb_raw.add_cache_dollars(saved, wasted, net)
 
         row = CacheRow(
             session_id=sid,
@@ -644,6 +700,7 @@ def _aggregate_cache_by_session(
         )
         for model_name in sorted(model_buckets.keys()):
             mb_raw = model_buckets[model_name]
+            mb_raw.resolve_cache_dollars()
             mb = CacheModelBreakdown(
                 model_name=model_name,
                 input_tokens=mb_raw.input_tokens,
@@ -666,9 +723,10 @@ def _aggregate_cache_by_session(
             row.cache_creation_tokens += mb.cache_creation_tokens
             row.cache_read_tokens += mb.cache_read_tokens
             row.cost += mb.cost
-            row.saved_usd += mb.saved_usd
-            row.wasted_usd += mb.wasted_usd
-            row.net_usd += mb.net_usd
+        # #443 S3 F21 — the model-to-row fold; see the day aggregator.
+        row.saved_usd = stable_sum(mb.saved_usd for mb in row.model_breakdowns)
+        row.wasted_usd = stable_sum(mb.wasted_usd for mb in row.model_breakdowns)
+        row.net_usd = stable_sum(mb.net_usd for mb in row.model_breakdowns)
         result.append(row)
 
     # Initial ordering descending by last_activity; the CLI's
@@ -693,6 +751,13 @@ def _row_anchor(r: CacheRow) -> dt.datetime | None:
     gives the correct offset for the given date — avoids DST drift on
     dates that straddle a DST boundary. Mirrors the idiom in
     ``_parse_cli_date_range``.
+
+    Since #443 S3 F22 the BASELINE only reaches this for session rows:
+    daily windowing compares calendar dates directly, precisely because
+    a per-date correct offset and an elapsed ``timedelta(days=N)`` bound
+    disagree across a transition. The daily branch stays as the shared
+    definition of "where a daily row sits in time" — it is what
+    ``_sort_cache_rows``'s tiebreaker mirrors.
     """
     if r.last_activity is not None:
         return r.last_activity
@@ -702,45 +767,82 @@ def _row_anchor(r: CacheRow) -> dt.datetime | None:
     return None
 
 
-def _compute_baseline_median(
+def _baseline_samples(
     rows: list[CacheRow],
     *,
-    anchor: dt.datetime,
     window_days: int,
-    min_samples: int,
+    anchor: dt.datetime | None = None,
+    anchor_date: dt.date | None = None,
     exclude_row: CacheRow | None = None,
     is_session_mode: bool = False,
-) -> float | None:
-    """Median ``cache_hit_percent`` across rows whose anchor falls in
-    ``[anchor − window_days, anchor − upper_offset]``.
+) -> list[float]:
+    """Every ``cache_hit_percent`` admitted to the baseline window.
 
-    Returns ``None`` when fewer than ``min_samples`` rows qualify. The
-    upper offset is ``1s`` in session mode (recent sessions stay
-    eligible even when they collide on the second) and ``1d`` in daily
-    mode (yesterday IS in the baseline but today is excluded).
+    ONE definition of the population, so a published sample count and the
+    median cannot disagree (#443 S3 F22).
 
-    ``exclude_row`` lets the per-row classifier skip the focal row when
-    computing the baseline median for that row — without this, a row's
-    own hit % would self-include in its baseline. Callers passing the
-    cross-row "median over the whole window" (e.g. the dashboard
-    spotlight) leave ``exclude_row=None``.
+    ``exclude_row`` lets the per-row classifier skip the focal row —
+    without it, a row's own hit % would self-include in its baseline.
+    Callers wanting the cross-row "median over the whole window" (the
+    dashboard spotlight) leave it ``None``.
     """
-    import statistics
-
-    upper_offset = (
-        dt.timedelta(seconds=1) if is_session_mode else dt.timedelta(days=1)
-    )
-    lower_bound = anchor - dt.timedelta(days=window_days)
-    upper_bound = anchor - upper_offset
     values: list[float] = []
+    if is_session_mode:
+        # Session anchors are real timestamps, so elapsed-time windowing
+        # is correct here. The upper offset is 1s rather than 1d so
+        # recent sessions stay eligible even when they collide on the
+        # second.
+        if anchor is None:
+            raise ValueError("session mode requires an anchor instant")
+        lower = anchor - dt.timedelta(days=window_days)
+        upper = anchor - dt.timedelta(seconds=1)
+        for r in rows:
+            if exclude_row is not None and r is exclude_row:
+                continue
+            ra = _row_anchor(r)
+            if ra is not None and lower <= ra <= upper:
+                values.append(r.cache_hit_percent)
+        return values
+
+    # Daily mode compares CALENDAR DATES. Daily anchors are date
+    # midnights that follow DST, so an elapsed ``timedelta(days=N)`` bound
+    # excluded a row exactly N calendar days old whenever the UTC offset
+    # changed inside the window — the row landed one hour outside and the
+    # panel then read "baseline sufficient" from a count the median did
+    # not share (#443 S3 F22). ``anchor_date - 1`` is the upper bound
+    # because yesterday IS in the baseline but today is excluded.
+    if anchor_date is None:
+        raise ValueError("daily mode requires an anchor_date")
+    lower_date = anchor_date - dt.timedelta(days=window_days)
+    upper_date = anchor_date - dt.timedelta(days=1)
     for r in rows:
         if exclude_row is not None and r is exclude_row:
             continue
-        ra = _row_anchor(r)
-        if ra is None:
+        if not r.date:
             continue
-        if lower_bound <= ra <= upper_bound:
+        rd = dt.date.fromisoformat(r.date)
+        if lower_date <= rd <= upper_date:
             values.append(r.cache_hit_percent)
+    return values
+
+
+def _compute_baseline_median(
+    rows: list[CacheRow],
+    *,
+    window_days: int,
+    min_samples: int,
+    anchor: dt.datetime | None = None,
+    anchor_date: dt.date | None = None,
+    exclude_row: CacheRow | None = None,
+    is_session_mode: bool = False,
+) -> float | None:
+    """Median over ``_baseline_samples``; ``None`` below ``min_samples``."""
+    import statistics
+
+    values = _baseline_samples(
+        rows, window_days=window_days, anchor=anchor, anchor_date=anchor_date,
+        exclude_row=exclude_row, is_session_mode=is_session_mode,
+    )
     if len(values) < min_samples:
         return None
     return statistics.median(values)
@@ -787,8 +889,11 @@ def _classify_anomalies(
         else CACHE_REPORT_MIN_BASELINE_DAYS
     )
 
-    # Pre-compute anchors once to avoid O(n²·datetime-parse) overhead.
-    anchors: list[dt.datetime | None] = [_row_anchor(r) for r in rows]
+    # Session-mode only: the daily path anchors on the row's own date
+    # string instead (#443 S3 F22), so it has nothing to pre-compute.
+    anchors: list[dt.datetime | None] = (
+        [_row_anchor(r) for r in rows] if is_session_mode else []
+    )
 
     for i, row in enumerate(rows):
         reasons: list[CacheAnomalyReason] = []
@@ -802,13 +907,20 @@ def _classify_anomalies(
             unevaluated.append("net_negative")
 
         # Trigger 2: cache_drop (requires baseline).
-        anchor = anchors[i]
         median = None
-        if anchor is not None:
+        if is_session_mode:
+            anchor = anchors[i]
+            if anchor is not None:
+                median = _compute_baseline_median(
+                    rows, anchor=anchor,
+                    window_days=window_days, min_samples=min_baseline,
+                    exclude_row=row, is_session_mode=True,
+                )
+        elif row.date:
             median = _compute_baseline_median(
-                rows, anchor=anchor,
+                rows, anchor_date=dt.date.fromisoformat(row.date),
                 window_days=window_days, min_samples=min_baseline,
-                exclude_row=row, is_session_mode=is_session_mode,
+                exclude_row=row, is_session_mode=False,
             )
         if median is None:
             unevaluated.append("cache_drop")
@@ -921,12 +1033,11 @@ def _aggregate_cache_breakdown(
                 cache_1h_tokens=getattr(e, "cache_1h_tokens", None),
                 speed=getattr(e, "speed", None),
             )
-        b.saved_usd += saved
-        b.wasted_usd += wasted
-        b.net_usd += net
+        b.add_cache_dollars(saved, wasted, net)
 
     out: list[CacheBreakdownRow] = []
     for key, b in buckets.items():
+        b.resolve_cache_dollars()   # #443 S3 F21 — the per-entry fold.
         out.append(CacheBreakdownRow(
             key=key,
             cache_hit_percent=_compute_cache_hit_percent(
@@ -972,10 +1083,13 @@ def _aggregate_cache_breakdown_from_rows(
             b.input_tokens += mb.input_tokens
             b.cache_creation_tokens += mb.cache_creation_tokens
             b.cache_read_tokens += mb.cache_read_tokens
-            b.net_usd += mb.net_usd
+            # #443 S3 F21 — the cross-row model fold, retained then
+            # stably summed below.
+            b.add_cache_dollars(mb.saved_usd, mb.wasted_usd, mb.net_usd)
 
     out: list[CacheBreakdownRow] = []
     for key, b in buckets.items():
+        b.resolve_cache_dollars()
         out.append(CacheBreakdownRow(
             key=key,
             cache_hit_percent=_compute_cache_hit_percent(
@@ -1319,8 +1433,14 @@ class _CacheReportResult:
     "other" rows (excluding today's row) over the trailing
     ``anomaly_window_days`` — populated in day mode only (session mode
     has no equivalent "today" concept). Surfaced here so the dashboard
-    snapshot builder can read it without re-running
-    ``_compute_baseline_median`` over the same data (EFF-3).
+    snapshot builder can read it without re-running the baseline over the
+    same data (EFF-3).
+
+    ``today_baseline_sample_count`` is how many rows that median was
+    taken over. Both publishers used to count every non-today row instead,
+    unbounded by the baseline window, so the count could report a
+    sufficient baseline while the median was absent (#443 S3 F22). Derived
+    from one population here so the two cannot diverge again.
     """
     rows: list[CacheRow]
     mode: Literal["day", "session"]
@@ -1329,6 +1449,7 @@ class _CacheReportResult:
     anomaly_window_days: int
     display_tz_key: str | None
     today_baseline_median: float | None = None
+    today_baseline_sample_count: int = 0
 
 
 def _aggregate_cache_report_rows(
@@ -1397,30 +1518,37 @@ def classify_and_summarize(
     )
 
     # EFF-3: surface today's baseline median directly on the result so
-    # the dashboard snapshot builder doesn't have to re-run
-    # _compute_baseline_median over the same row set. Day-mode only —
-    # session mode has no equivalent "today" anchor concept. Anchor
-    # construction mirrors the pre-EFF-3 adapter byte-for-byte —
-    # the strptime + astimezone(display_tz_or_UTC) pair treats the
-    # naive parsed datetime as host-local before shifting, which IS
-    # the prior contract; do not change without re-verifying the
-    # dashboard envelope's today.baseline_median_percent stays stable
-    # against the existing golden fixtures.
+    # the dashboard snapshot builder doesn't have to re-run the baseline
+    # over the same row set. Day-mode only — session mode has no
+    # equivalent "today" concept.
+    #
+    # One current day per invocation (#443 S3 F23): ``today_iso`` resolves
+    # through the SAME ``_resolve_bucket_tz`` the row keys were bucketed by,
+    # so the focal day cannot name a date the rows are not keyed by. It
+    # previously fell back to UTC while bucketing fell back to host-local,
+    # which diverged on every non-UTC host.
+    #
+    # One baseline population per invocation (#443 S3 F22): the published
+    # sample count is derived from the samples the median was taken over,
+    # so "count says the baseline is sufficient, median says it is absent"
+    # is unrepresentable rather than merely absent.
     today_baseline_median: float | None = None
+    today_baseline_sample_count = 0
     if mode == "day":
         today_iso = now_utc.astimezone(
-            display_tz if display_tz is not None else dt.timezone.utc
+            _resolve_bucket_tz(display_tz)
         ).strftime("%Y-%m-%d")
-        today_anchor = dt.datetime.strptime(today_iso, "%Y-%m-%d").astimezone(
-            display_tz if display_tz is not None else dt.timezone.utc
-        )
         other_rows = [r for r in rows if r.date != today_iso]
-        today_baseline_median = _compute_baseline_median(
+        samples = _baseline_samples(
             other_rows,
-            anchor=today_anchor,
+            anchor_date=dt.date.fromisoformat(today_iso),
             window_days=anomaly_window_days,
-            min_samples=CACHE_REPORT_MIN_BASELINE_DAYS,
+            is_session_mode=False,
         )
+        today_baseline_sample_count = len(samples)
+        if len(samples) >= CACHE_REPORT_MIN_BASELINE_DAYS:
+            import statistics
+            today_baseline_median = statistics.median(samples)
 
     return _CacheReportResult(
         rows=rows,
@@ -1430,6 +1558,7 @@ def classify_and_summarize(
         anomaly_window_days=anomaly_window_days,
         display_tz_key=display_tz.key if display_tz is not None else None,
         today_baseline_median=today_baseline_median,
+        today_baseline_sample_count=today_baseline_sample_count,
     )
 
 

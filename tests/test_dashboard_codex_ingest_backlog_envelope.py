@@ -127,11 +127,42 @@ def _set_backlog(cache, record):
     cache.commit()
 
 
+def _without_cache_report(state: dict) -> dict:
+    """Drop `data.cache_report` from both sides of an oracle comparison.
+
+    #443 S2 deliberately changed what the Codex cache report publishes, so
+    this oracle's copy of that subtree is known-stale BY DESIGN: it captures
+    the exact bug S2 fixed. Its `days` list holds one row dated 2026-07-14
+    while `today.date` is 2026-07-20 — precisely the state in which both
+    dashboard charts label a real older row "Today" while the spotlight
+    publishes a fabricated 0%. S2 inserts a synthetic unobserved today row
+    there and adds the Codex vocabulary fields (`cached_input_percent`,
+    `not_applicable`, `anomaly_predicates`, `anomaly_unevaluated`,
+    `observed`) beside it.
+
+    Regenerating the oracle is NOT the fix. It was captured with `bin/`
+    reverted to before the ingest-backlog change, and that provenance is the
+    only reason it can falsify anything; recapturing it now would make it
+    assert that the code equals itself.
+
+    The cache-report subtree is covered instead by the two dedicated
+    dashboard goldens (`codex-cache-active` / `codex-cache-idle`) and by
+    tests/test_dashboard_source_read_model.py. Everything else in the Codex
+    source envelope — including the `availability` and `freshness` signals
+    these two tests exist to protect — is still pinned here.
+    """
+    return {**state,
+            "data": {key: value for key, value in state["data"].items()
+                     if key != "cache_report"}}
+
+
 def test_a_store_with_no_backlog_matches_the_pre_change_oracle(codex_state):
     """The byte-identity claim, against a snapshot taken before the field."""
     _ns, _cache, build = codex_state
     oracle = json.loads(ORACLE.read_text())
-    assert build() == oracle
+    assert _without_cache_report(build()) == _without_cache_report(oracle)
+    # The carve-out is scoped to one subtree, not to the field's own claim.
+    assert "ingest_backlog" not in build()["data"]
 
 
 def test_a_backlog_adds_exactly_one_subtree_and_nothing_else(codex_state):
@@ -155,7 +186,7 @@ def test_a_backlog_adds_exactly_one_subtree_and_nothing_else(codex_state):
     added = after["data"].pop("ingest_backlog")
     assert added == {
         "files": 4, "bytes": 8192, "since": "2026-07-16T09:00:00Z"}
-    assert after == oracle, (
+    assert _without_cache_report(after) == _without_cache_report(oracle), (
         "the backlog field changed something other than its own subtree")
 
 

@@ -102,6 +102,12 @@ export function ShareModalRoot() {
           <ShareModal
             panel={slot.panel}
             source={slot.source}
+            // Only Codex currently publishes the per-panel `account_scopes`
+            // read model. Claude focus decorates the hero but its panels are
+            // explicitly unfiltered, so qualifying those bodies would assert
+            // a false scope. Keep them account-agnostic until the data plane
+            // exposes equivalent children.
+            account={slot.source === 'codex' ? slot.account : null}
             initialParams={slot.params}
             onClose={close}
           />

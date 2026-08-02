@@ -761,14 +761,15 @@ def resolve_dashboard_source_semantics(
     quota_alerts = c._get_quota_alerts_config(raw_config)
     raw_cache_report = raw_config.get("cache_report")
     raw_cache_threshold = (
-        raw_cache_report.get("anomaly_threshold_pp", 15)
-        if isinstance(raw_cache_report, Mapping) else 15
+        raw_cache_report.get("anomaly_threshold_pp")
+        if isinstance(raw_cache_report, Mapping) else None
     )
-    cache_threshold = (
-        int(raw_cache_threshold)
-        if isinstance(raw_cache_threshold, int) and not isinstance(raw_cache_threshold, bool)
-        and 1 <= raw_cache_threshold <= 100 else 15
-    )
+    # #443 S3 F17: one definition of what the setting means, shared with
+    # the Claude read path and the persistence gate. An absent key
+    # reaches the resolver as None and defaults there, not here.
+    cache_threshold = c._load_sibling(
+        "_lib_cache_report"
+    ).resolve_cache_report_threshold(raw_cache_threshold)
     raw_codex_budget = budget_config.get("codex")
     codex_budget = (
         MappingProxyType(dict(raw_codex_budget))
@@ -1043,6 +1044,8 @@ def _codex_cache_report_wire(
     """
     c = sys.modules["cctally"]
     crk = c._load_sibling("_lib_cache_report")
+    # #443 S2 F18 — the one serializer shared with the Claude producer.
+    wire = c._load_sibling("_lib_cache_report_wire")
     display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
     cutoff = now_utc - dt.timedelta(days=window_days)
 
@@ -1107,24 +1110,35 @@ def _codex_cache_report_wire(
             },
         ))
 
-    today_iso = now_utc.astimezone(display_tz or UTC).strftime("%Y-%m-%d")
+    # One current day per invocation (#443 S3 F23): the focal day and the
+    # entry filter below both resolve through the SAME zone the kernel
+    # buckets by. ``display_tz or UTC`` diverged from host-local bucketing
+    # on every non-UTC host, which published a fabricated spotlight and let
+    # the breakdowns draw from a different entry population than the days.
+    bucket_tz = crk._resolve_bucket_tz(display_tz)
+    today_iso = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
     if not wrapped:
-        return {
-            "window_days": window_days,
-            "anomaly_threshold_pp": anomaly_threshold_pp,
-            "anomaly_window_days": window_days,
-            "today": {
+        # An empty store measured nothing, so ``observed`` is False and
+        # every applicable predicate is unevaluated. The client
+        # short-circuits on ``is_empty`` before reading either, so this
+        # costs nothing and keeps the empty and populated returns one shape.
+        return wire.build_cache_report_wire(
+            provider="codex", window_days=window_days,
+            anomaly_threshold_pp=anomaly_threshold_pp,
+            anomaly_window_days=window_days,
+            today={
                 "date": today_iso, "cache_hit_percent": 0.0,
                 "baseline_median_percent": None, "delta_pp": None,
                 "net_usd": 0.0, "saved_usd": 0.0, "wasted_usd": 0.0,
                 "anomaly_triggered": False, "anomaly_reasons": (),
                 "baseline_daily_row_count": 0,
+                "anomaly_unevaluated": wire.CODEX_PREDICATES, "observed": False,
             },
-            "days": (), "by_project": (), "by_model": (),
-            "seven_day_net_usd": 0.0, "seven_day_anomaly_count": 0,
-            "fourteen_day_counterfactual_usd": 0.0,
-            "fourteen_day_efficiency_ratio": 0.0, "is_empty": True,
-        }
+            days=(), by_project=(), by_model=(),
+            seven_day_net_usd=0.0, seven_day_anomaly_count=0,
+            fourteen_day_counterfactual_usd=0.0,
+            fourteen_day_efficiency_ratio=0.0, is_empty=True,
+        )
 
     result = crk._build_cache_report(
         wrapped,
@@ -1137,7 +1151,14 @@ def _codex_cache_report_wire(
         cost_calculator=lambda _model, _usage, _mode, cost: float(cost or 0.0),
     )
     raw_rows = sorted(result.rows, key=lambda row: row.date or "", reverse=True)
-    days = tuple({
+    today_row = next((row for row in raw_rows if row.date == today_iso), None)
+    # #443 F13/F14 — both charts label their rightmost element "Today"
+    # positionally, so an idle day left the newest REAL row wearing that
+    # label while the spotlight published a fabricated 0%. The Claude
+    # builder solves this with a synthetic row for exactly this reason;
+    # Codex now does the same. Slice AFTER inserting, as Claude does.
+    synthetic_today = today_row is None
+    day_dicts = [{
         "date": row.date or "",
         "cache_hit_percent": row.cache_hit_percent,
         "input_tokens": row.input_tokens,
@@ -1149,15 +1170,28 @@ def _codex_cache_report_wire(
         "net_usd": row.net_usd,
         "anomaly_triggered": row.anomaly_triggered,
         "anomaly_reasons": tuple(row.anomaly_reasons),
-    } for row in raw_rows[:window_days])
-    today_row = next((row for row in raw_rows if row.date == today_iso), None)
-    baseline_count = sum(1 for row in raw_rows if row.date != today_iso)
+        "anomaly_unevaluated": tuple(getattr(row, "anomaly_unevaluated", ())),
+        "observed": True,
+    } for row in raw_rows]
+    if synthetic_today:
+        day_dicts.insert(0, {
+            "date": today_iso, "cache_hit_percent": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_creation_tokens": 0, "cache_read_tokens": 0,
+            "saved_usd": 0.0, "wasted_usd": 0.0, "net_usd": 0.0,
+            "anomaly_triggered": False, "anomaly_reasons": (),
+            "anomaly_unevaluated": wire.CODEX_PREDICATES, "observed": False,
+        })
+    days = tuple(day_dicts[:window_days])
+    # #443 S3 F22: the rows the median was actually taken over, not every
+    # non-today row. The old count was unbounded by the baseline window.
+    baseline_count = result.today_baseline_sample_count
     baseline = result.today_baseline_median
     today_hit = today_row.cache_hit_percent if today_row else 0.0
     kept_dates = {row["date"] for row in days}
     kept_entries = [
         entry for entry in wrapped
-        if entry.timestamp.astimezone(display_tz or UTC).strftime("%Y-%m-%d") in kept_dates
+        if entry.timestamp.astimezone(bucket_tz).strftime("%Y-%m-%d") in kept_dates
     ]
     by_project = crk._aggregate_cache_breakdown(
         kept_entries, key_fn=lambda entry: entry.project_path,
@@ -1171,11 +1205,12 @@ def _codex_cache_report_wire(
     saved_total = stable_sum(float(row["saved_usd"]) for row in days)
     wasted_total = stable_sum(float(row["wasted_usd"]) for row in days)
     efficiency_denom = saved_total + abs(wasted_total)
-    return {
-        "window_days": window_days,
-        "anomaly_threshold_pp": anomaly_threshold_pp,
-        "anomaly_window_days": window_days,
-        "today": {
+    return wire.build_cache_report_wire(
+        provider="codex",
+        window_days=window_days,
+        anomaly_threshold_pp=anomaly_threshold_pp,
+        anomaly_window_days=window_days,
+        today={
             "date": today_iso,
             "cache_hit_percent": today_hit,
             "baseline_median_percent": baseline,
@@ -1186,24 +1221,34 @@ def _codex_cache_report_wire(
             "anomaly_triggered": today_row.anomaly_triggered if today_row else False,
             "anomaly_reasons": tuple(today_row.anomaly_reasons) if today_row else (),
             "baseline_daily_row_count": baseline_count,
+            "anomaly_unevaluated": (
+                tuple(getattr(today_row, "anomaly_unevaluated", ()))
+                if today_row else wire.CODEX_PREDICATES
+            ),
+            "observed": today_row is not None,
         },
-        "days": days,
-        "by_project": tuple({
+        days=days,
+        by_project=tuple({
             "key": row.key, "cache_hit_percent": row.cache_hit_percent,
             "net_usd": row.net_usd,
         } for row in by_project),
-        "by_model": tuple({
+        by_model=tuple({
             "key": row.key, "cache_hit_percent": row.cache_hit_percent,
             "net_usd": row.net_usd,
         } for row in by_model),
-        "seven_day_net_usd": stable_sum(float(row["net_usd"]) for row in seven),
-        "seven_day_anomaly_count": sum(bool(row["anomaly_triggered"]) for row in seven),
-        "fourteen_day_counterfactual_usd": saved_total,
-        "fourteen_day_efficiency_ratio": (
+        seven_day_net_usd=stable_sum(float(row["net_usd"]) for row in seven),
+        # Placeholder: on the Codex path the builder RECOMPUTES this from
+        # the day blocks it has already filtered, because a count taken
+        # here would still include verdicts whose only reason is about to
+        # be dropped as inapplicable. Computing it twice would just invite
+        # the two to drift.
+        seven_day_anomaly_count=0,
+        fourteen_day_counterfactual_usd=saved_total,
+        fourteen_day_efficiency_ratio=(
             saved_total / efficiency_denom if efficiency_denom > 1e-9 else 0.0
         ),
-        "is_empty": False,
-    }
+        is_empty=False,
+    )
 
 
 def _codex_conversation_metadata(

@@ -258,6 +258,7 @@ export function ComposerModal() {
         template_id: it.template_id,
         options: { ...it.options, reveal_projects: !anonOnExport },
         source: it.source,
+        account: it.account,
       });
       const refreshed = makeBasketItem({
         panel: it.panel,
@@ -268,6 +269,7 @@ export function ComposerModal() {
         kernel_version: resp.snapshot.kernel_version,
         label_hint: it.label_hint,
         source: it.source,
+        account: it.account,
         id: it.id,
       });
       // Remove + re-add at the same index. The pair mutates

@@ -291,6 +291,68 @@ def test_no_sync_keeps_full_build(monkeypatch, tmp_path):
     assert env["hydrating"] is False
 
 
+def test_cache_report_qa_state_requires_explicit_master_switch(monkeypatch, tmp_path):
+    ns = _load_with_empty_roots(monkeypatch, tmp_path)
+    dashboard = _dash_mod()
+    monkeypatch.setenv("CCTALLY_DASHBOARD_QA_STATE", "failed")
+    monkeypatch.delenv("CCTALLY_DASHBOARD_QA", raising=False)
+    assert dashboard._dashboard_qa_state_from_env() is None
+    monkeypatch.setenv("CCTALLY_DASHBOARD_QA", "1")
+    monkeypatch.setitem(ns, "_is_dev_checkout", lambda: True)
+    assert dashboard._dashboard_qa_state_from_env() == "failed"
+    monkeypatch.setitem(ns, "_is_dev_checkout", lambda: False)
+    assert dashboard._dashboard_qa_state_from_env() is None
+
+
+def test_cache_report_qa_states_preserve_real_data_or_fail_explicitly(
+    monkeypatch, tmp_path,
+):
+    ns = _load_with_fixture(monkeypatch, tmp_path, "ok")
+    dashboard = _dash_mod()
+    args = types.SimpleNamespace(no_sync=True, host="127.0.0.1")
+    full = dashboard._dashboard_initial_snapshot(
+        args, pinned_now=OK_AS_OF, display_tz_pref_override=None,
+    )
+
+    degraded = dashboard._dashboard_apply_qa_state(full, "forensics-degraded")
+    degraded_env = ns["snapshot_to_envelope"](degraded, now_utc=OK_AS_OF)
+    assert degraded_env["hydrating"] is False
+    assert degraded_env["sources"]["claude"]["availability"] == "partial"
+    assert degraded_env["cache_report"] is not None
+    assert any(
+        warning["domain"] == "forensics"
+        for warning in degraded_env["sources"]["claude"]["warnings"]
+    )
+
+    failed = dashboard._dashboard_apply_qa_state(full, "failed")
+    failed_env = ns["snapshot_to_envelope"](failed, now_utc=OK_AS_OF)
+    assert failed_env["sources"]["claude"]["availability"] == "unavailable"
+    assert failed_env["sources"]["claude"]["data"] is None
+    assert failed_env["cache_report"] is None
+
+    hydrating = dashboard._dashboard_apply_qa_state(full, "hydrating")
+    hydrating_env = ns["snapshot_to_envelope"](hydrating, now_utc=OK_AS_OF)
+    assert hydrating_env["hydrating"] is True
+    assert hydrating_env["sources"]["claude"]["data"] is None
+    assert hydrating_env["cache_report"] is None
+
+
+def test_cache_report_qa_fixture_reaches_amber_and_mixed_signs(
+    monkeypatch, tmp_path,
+):
+    ns = _load_with_fixture(monkeypatch, tmp_path, "cache-report-qa")
+    args = types.SimpleNamespace(no_sync=True, host="127.0.0.1")
+    full = _dash_mod()._dashboard_initial_snapshot(
+        args, pinned_now=OK_AS_OF, display_tz_pref_override=None,
+    )
+    report = ns["snapshot_to_envelope"](full, now_utc=OK_AS_OF)["cache_report"]
+    assert report["today"]["baseline_daily_row_count"] >= 5
+    assert report["today"]["anomaly_triggered"] is True
+    assert "cache_drop" in report["today"]["anomaly_reasons"]
+    signs = {"negative" if day["net_usd"] < 0 else "positive" for day in report["days"]}
+    assert signs == {"negative", "positive"}
+
+
 def _read_url_port(proc, deadline_s):
     """Block on the subprocess stdout until the 'serving …:PORT' line (printed
     right after the socket bind), returning (port, elapsed_since_start)."""

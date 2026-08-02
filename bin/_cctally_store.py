@@ -1460,6 +1460,185 @@ HEAL_HOOK = _stats_heal_hook
 # a HARD ERROR (``StatsEpochMismatchError``) — never a silent rebuild-to-empty.
 
 _EPOCH_MISMATCH_ACTIVE = False
+STATS_EPOCH_REBUILD_COMMAND = "_stats-epoch-rebuild"
+_STATS_EPOCH_REBUILD_RETRY_SECONDS = 60.0
+
+
+def _stats_epoch_rebuild_path(name: str) -> pathlib.Path:
+    return pathlib.Path(_cctally_core.APP_DIR) / name
+
+
+def _stats_epoch_rebuild_marker_path() -> pathlib.Path:
+    return _stats_epoch_rebuild_path("stats-epoch-rebuild.pending")
+
+
+def _stats_epoch_rebuild_admission_path() -> pathlib.Path:
+    return _stats_epoch_rebuild_path("stats-epoch-rebuild.admission.lock")
+
+
+def _stats_epoch_rebuild_worker_path() -> pathlib.Path:
+    return _stats_epoch_rebuild_path("stats-epoch-rebuild.worker.lock")
+
+
+def _stats_epoch_rebuild_log_path() -> pathlib.Path:
+    return pathlib.Path(_cctally_core.LOG_DIR) / "stats-epoch-rebuild.log"
+
+
+def _unlink_stats_epoch_marker() -> None:
+    try:
+        _stats_epoch_rebuild_marker_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _stats_epoch_rebuild_worker_active() -> bool:
+    """Probe the worker flock without waiting or disturbing its owner."""
+    try:
+        fd = os.open(
+            _stats_epoch_rebuild_worker_path(),
+            os.O_WRONLY | os.O_CREAT,
+            0o600,
+        )
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+def _log_stats_epoch_rebuild(outcome: str, *, error: Exception | None = None) -> None:
+    """Append one path-safe worker result line.
+
+    Detached worker streams are `/dev/null`; this small log is its only
+    diagnostic. Error detail is deliberately structural (class plus numeric
+    SQLite/OS code), never free-form exception text that may carry private
+    paths or `key=value` fragments.
+    """
+    try:
+        log_path = _stats_epoch_rebuild_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        detail = ""
+        if error is not None:
+            code = getattr(error, "sqlite_errorcode", None)
+            if code is None:
+                code = getattr(error, "errno", None)
+            detail = f" error={type(error).__name__}"
+            if code is not None:
+                detail += f" code={int(code)}"
+        line = (
+            f"{_cctally_core.now_utc_iso()} worker=stats-epoch-rebuild "
+            f"result={outcome}{detail}\n"
+        ).encode("utf-8")
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def defer_stats_epoch_rebuild() -> str:
+    """Schedule one retryable detached epoch worker without blocking callers."""
+    try:
+        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
+        admission_fd = os.open(
+            _stats_epoch_rebuild_admission_path(),
+            os.O_WRONLY | os.O_CREAT,
+            0o600,
+        )
+    except OSError:
+        return "failed"
+    try:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "pending"
+        marker = _stats_epoch_rebuild_marker_path()
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except FileNotFoundError:
+            age = None
+        except OSError:
+            return "failed"
+        if age is not None and age < _STATS_EPOCH_REBUILD_RETRY_SECONDS:
+            return "pending"
+        if _stats_epoch_rebuild_worker_active():
+            # A representative replay outlives the marker retry interval.
+            # Refresh the admission stamp instead of launching a process that
+            # can only lose the worker flock and exit.
+            try:
+                os.utime(marker, None)
+            except OSError:
+                pass
+            return "pending"
+        try:
+            marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(marker_fd)
+            os.utime(marker, None)
+        except OSError:
+            return "failed"
+        from _cctally_update import _spawn_detached
+        if _spawn_detached(STATS_EPOCH_REBUILD_COMMAND):
+            return "spawned"
+        _unlink_stats_epoch_marker()
+        return "failed"
+    finally:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(admission_fd)
+
+
+def cmd_stats_epoch_rebuild_internal(args) -> int:
+    """Hidden detached worker: converge a pending stats epoch exactly once."""
+    del args
+    try:
+        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
+        worker_fd = os.open(
+            _stats_epoch_rebuild_worker_path(),
+            os.O_WRONLY | os.O_CREAT,
+            0o600,
+        )
+    except OSError as exc:
+        _log_stats_epoch_rebuild("error", error=exc)
+        return 0
+    try:
+        try:
+            fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        if not stats_epoch_rebuild_pending():
+            _unlink_stats_epoch_marker()
+            _log_stats_epoch_rebuild("current")
+            return 0
+        try:
+            conn = resolve_stats_epoch_mismatch()
+            conn.close()
+        except Exception as exc:
+            _log_stats_epoch_rebuild("error", error=exc)
+            return 0
+        _unlink_stats_epoch_marker()
+        _log_stats_epoch_rebuild("success")
+        return 0
+    finally:
+        try:
+            fcntl.flock(worker_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(worker_fd)
 
 
 def _raw_user_version(path) -> int:
@@ -1473,6 +1652,27 @@ def _raw_user_version(path) -> int:
             c.close()
     except sqlite3.DatabaseError:
         return -1
+
+
+def stats_epoch_rebuild_pending(path=None) -> bool:
+    """Whether an ordinary live open would require whole-journal replay.
+
+    Missing indexes are cheap fresh installs. Unreadable indexes belong to the
+    corruption classifier, and legacy indexes take the one-time cutover path.
+    Only a readable post-legacy index at a non-current epoch is deferrable.
+    """
+    candidate = pathlib.Path(
+        _cctally_core.DB_PATH if path is None else path
+    )
+    try:
+        if not candidate.exists():
+            return False
+    except OSError:
+        return False
+    version = _raw_user_version(candidate)
+    if version < 0 or version <= _cctally_core.LEGACY_STATS_HEAD:
+        return False
+    return version != _cctally_core.STATS_INDEX_EPOCH
 
 
 def resolve_stats_epoch_mismatch():

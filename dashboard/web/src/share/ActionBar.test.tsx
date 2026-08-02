@@ -59,6 +59,37 @@ afterEach(() => {
 });
 
 describe('<ActionBar>', () => {
+  it('Copy keeps the captured account on render and history requests', async () => {
+    const fetchMock = vi.fn().mockImplementation((url: string) => Promise.resolve({
+      ok: true,
+      json: async () => url === '/api/share/render'
+        ? { body: '# Weekly', content_type: 'text/markdown', snapshot: {} }
+        : { recipe_id: 'r1', exported_at: '2026-08-01T00:00:00Z' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    stubProperty(navigator, 'clipboard', { writeText });
+    const account = 'b'.repeat(32);
+
+    render(
+      <ActionBar
+        panel="weekly"
+        source="codex"
+        account={account}
+        templateId="weekly-recap"
+        options={defaults()}
+        onOptionsChange={() => {}}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^copy$/i }));
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const bodies = fetchMock.mock.calls.map(([, init]) =>
+      JSON.parse((init as RequestInit).body as string));
+    expect(bodies.map((body) => body.account)).toEqual([account, account]);
+  });
+
   it('Copy button writes the rendered body to the clipboard', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,

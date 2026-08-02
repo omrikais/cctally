@@ -383,7 +383,7 @@ def test_codex_tick_defers_a_pending_stats_epoch_rebuild(
     calls: list[str] = []
     spawned: list[str] = []
 
-    import _cctally_quota as quota_mod
+    import _cctally_store as store
     import _cctally_update
     monkeypatch.setattr(
         _cctally_update, "_spawn_detached",
@@ -404,7 +404,7 @@ def test_codex_tick_defers_a_pending_stats_epoch_rebuild(
     assert calls == [], (
         "the tick opened the cache and ran the sync behind a pending epoch "
         "rebuild, so `open_db()` was about to replay the whole journal inline")
-    assert spawned == [quota_mod.CODEX_QUOTA_VERIFY_COMMAND]
+    assert spawned == [store.STATS_EPOCH_REBUILD_COMMAND]
     log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
     assert "sync=deferred" in log and "result=noop" in log
     marker_dir = ns["APP_DIR"] / "codex-hook-tick"

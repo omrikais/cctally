@@ -471,9 +471,9 @@ def test_compute_baseline_median_returns_none_when_thin():
         for d in (1, 2)
     ]
     # Anchor today; only 2 baseline days exist → None at min_samples=DAYS.
-    today = dt.datetime(2026, 5, 20).astimezone()
+    # Daily mode anchors on a calendar DATE (#443 S3 F22), not an instant.
     median = crk._compute_baseline_median(
-        rows, anchor=today, window_days=14,
+        rows, anchor_date=dt.date(2026, 5, 20), window_days=14,
         min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
     )
     assert median is None
@@ -487,9 +487,8 @@ def test_compute_baseline_median_returns_value_when_sufficient():
         _make_daily_row(f"2026-05-{d:02d}", (100, 0, 233), 1.0)
         for d in range(1, 8)
     ]
-    anchor = dt.datetime(2026, 5, 8).astimezone()
     median = crk._compute_baseline_median(
-        rows, anchor=anchor, window_days=14,
+        rows, anchor_date=dt.date(2026, 5, 8), window_days=14,
         min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
     )
     assert median is not None
@@ -635,13 +634,10 @@ def test_build_cache_report_surfaces_today_baseline_median():
     # Reproduce what the dashboard adapter used to compute by hand
     # (pre-EFF-3 second pass).
     today_iso = "2026-05-21"
-    today_anchor = dt.datetime.strptime(today_iso, "%Y-%m-%d").astimezone(
-        dt.timezone.utc
-    )
     other_rows = [r for r in result.rows if r.date != today_iso]
     expected = crk._compute_baseline_median(
-        other_rows, anchor=today_anchor, window_days=14,
-        min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
+        other_rows, anchor_date=dt.date.fromisoformat(today_iso),
+        window_days=14, min_samples=crk.CACHE_REPORT_MIN_BASELINE_DAYS,
     )
 
     assert result.today_baseline_median is not None

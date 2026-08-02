@@ -550,6 +550,9 @@ def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
     monkeypatch, tmp_path,
 ):
     ns = load_script()
+    monkeypatch.setitem(
+        ns, "_share_now_utc_iso", lambda: "2026-08-01T12:00:00Z"
+    )
     server, thread = _boot(ns, tmp_path, monkeypatch)
     try:
         status, fresh = _render(
@@ -560,6 +563,9 @@ def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
         )
         assert status == 200
         _set_hero_freshness(ns, claude="stale")
+        monkeypatch.setitem(
+            ns, "_share_now_utc_iso", lambda: "2026-08-01T12:00:01Z"
+        )
         status, stale = _render(
             server,
             source_marker=None,
@@ -567,7 +573,13 @@ def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
             template_id="current-week-recap",
         )
         assert status == 200
-        assert stale == fresh
+        assert stale["body"] == fresh["body"]
+        assert stale["content_type"] == fresh["content_type"]
+        assert fresh["snapshot"]["generated_at"] == "2026-08-01T12:00:00Z"
+        assert stale["snapshot"] == {
+            **fresh["snapshot"],
+            "generated_at": "2026-08-01T12:00:01Z",
+        }
         assert "stale provider-cycle evidence" not in stale["body"]
     finally:
         server.shutdown()

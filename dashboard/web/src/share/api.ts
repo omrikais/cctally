@@ -58,13 +58,18 @@ export async function renderShare(
     // compiling; the share flow always supplies it. The server adds source_label
     // chrome for explicit-source requests.
     source?: DashboardSelection;
+    // #346 — account captured with the source when the share flow opened.
+    // null/undefined is deliberately omitted from the JSON body so the
+    // account-agnostic request remains byte-identical.
+    account?: string | null;
   },
   init?: { signal?: AbortSignal },
 ): Promise<ShareRenderResponse> {
+  const { account, ...legacyArgs } = args;
   return jsonOrThrow(await fetch('/api/share/render', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(args),
+    body: JSON.stringify(account == null ? legacyArgs : { ...legacyArgs, account }),
     signal: init?.signal,
   }));
 }

@@ -33,6 +33,7 @@ export interface ComposeRequest {
       // captured under, so a mixed-source basket composes as provider-labeled
       // sections (no blended snapshot exists client-side).
       source: DashboardSelection;
+      account?: string;
     };
   }>;
 }
@@ -78,6 +79,7 @@ export function buildComposeRequest(
         data_digest_at_add: it.data_digest_at_add,
         kernel_version: it.kernel_version,
         source: it.source,
+        ...(it.account == null ? {} : { account: it.account }),
       },
     })),
   };

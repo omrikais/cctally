@@ -1,0 +1,2011 @@
+{
+  "alerts": [],
+  "alerts_settings": {
+    "budget_enabled": false,
+    "budget_thresholds": [
+      90,
+      100
+    ],
+    "codex_budget_alerts_enabled": false,
+    "codex_budget_configured": false,
+    "codex_projected_enabled": false,
+    "command_configured": false,
+    "enabled": false,
+    "five_hour_thresholds": [
+      90,
+      95
+    ],
+    "notifier": "auto",
+    "project_alerts_enabled": false,
+    "projected_budget_enabled": false,
+    "projected_weekly_enabled": false,
+    "weekly_thresholds": [
+      90,
+      95
+    ]
+  },
+  "blocks": {
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
+  },
+  "cache_report": {
+    "anomaly_threshold_pp": 15,
+    "anomaly_window_days": 14,
+    "by_model": [],
+    "by_project": [],
+    "days": [],
+    "fourteen_day_counterfactual_usd": 0.0,
+    "fourteen_day_efficiency_ratio": 0.0,
+    "is_empty": true,
+    "seven_day_anomaly_count": 0,
+    "seven_day_net_usd": 0.0,
+    "today": {
+      "anomaly_reasons": [],
+      "anomaly_triggered": false,
+      "anomaly_unevaluated": [
+        "net_negative",
+        "cache_drop"
+      ],
+      "baseline_daily_row_count": 0,
+      "baseline_median_percent": null,
+      "cache_hit_percent": 0.0,
+      "date": "2026-04-20",
+      "delta_pp": null,
+      "net_usd": 0.0,
+      "observed": false,
+      "saved_usd": 0.0,
+      "wasted_usd": 0.0
+    },
+    "window_days": 14
+  },
+  "current_week": null,
+  "daily": {
+    "peak": null,
+    "quantile_thresholds": [],
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
+  },
+  "dashboard_prefs": {
+    "cache_failure_markers": true,
+    "live_tail": true
+  },
+  "data_version": "__VER__",
+  "default_source": "claude",
+  "display": {
+    "offset_label": "UTC",
+    "offset_seconds": 0,
+    "resolved_tz": "Etc/UTC",
+    "tz": "local"
+  },
+  "doctor": "__DOCTOR_BLOCK__",
+  "envelope_version": 2,
+  "forecast": null,
+  "generated_at": "__NOW__",
+  "header": {
+    "dollar_per_pct": null,
+    "five_hour_pct": null,
+    "forecast_pct": null,
+    "forecast_verdict": null,
+    "used_pct": null,
+    "vs_last_week_delta": null,
+    "week_label": null
+  },
+  "hydrating": false,
+  "last_sync_at": null,
+  "last_sync_error": null,
+  "monthly": {
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
+  },
+  "projects": {
+    "current_week": {
+      "rows": [],
+      "total_cost_usd": 0.0,
+      "week_label": "wk Apr 20",
+      "week_start_at": "2026-04-20T00:00:00Z",
+      "week_start_date": "2026-04-20"
+    },
+    "trend": {
+      "projects": [],
+      "weeks": [
+        {
+          "total_cost_usd": 0.0,
+          "total_pct": null,
+          "week_label": "wk Apr 20",
+          "week_start_date": "2026-04-20"
+        }
+      ],
+      "window_weeks": 1
+    }
+  },
+  "sessions": {
+    "rows": [],
+    "sort_key": "started_desc",
+    "total": 0
+  },
+  "source_order": [
+    "claude",
+    "codex",
+    "all"
+  ],
+  "source_schema_version": 3,
+  "sources": {
+    "all": {
+      "availability": "partial",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native-union",
+          "status": "derived"
+        },
+        "budget": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        },
+        "hero": {
+          "semantics": "compatible-provider-totals",
+          "status": "derived"
+        },
+        "quota": {
+          "semantics": "provider-native",
+          "status": "not_applicable"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "combined": null,
+        "providers": {
+          "claude": {
+            "alerts": {
+              "rows": []
+            },
+            "budget": {
+              "forecast": null,
+              "settings": {
+                "budget_enabled": false,
+                "budget_thresholds": [
+                  90,
+                  100
+                ],
+                "command_configured": false,
+                "enabled": false,
+                "five_hour_thresholds": [
+                  90,
+                  95
+                ],
+                "notifier": "auto",
+                "project_alerts_enabled": false,
+                "projected_budget_enabled": false,
+                "projected_weekly_enabled": false,
+                "weekly_thresholds": [
+                  90,
+                  95
+                ]
+              }
+            },
+            "hero": {
+              "cost_usd": 0.0,
+              "current_week": {},
+              "forecast": null,
+              "header": {
+                "dollar_per_pct": null,
+                "five_hour_pct": null,
+                "forecast_pct": null,
+                "forecast_verdict": null,
+                "used_pct": null,
+                "vs_last_week_delta": null,
+                "week_label": null
+              },
+              "total_tokens": 0,
+              "trend": null
+            },
+            "periods": {
+              "daily": {
+                "peak": null,
+                "quantile_thresholds": [],
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "monthly": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              },
+              "weekly": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "current_week": {
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "week_label": "wk Apr 20",
+                "week_start_at": "2026-04-20T00:00:00Z",
+                "week_start_date": "2026-04-20"
+              },
+              "rows": [],
+              "trend": {
+                "projects": [],
+                "weeks": [
+                  {
+                    "total_cost_usd": 0.0,
+                    "total_pct": null,
+                    "week_label": "wk Apr 20",
+                    "week_start_date": "2026-04-20"
+                  }
+                ],
+                "window_weeks": 1
+              }
+            },
+            "quota": {
+              "blocks": [],
+              "current_week": {},
+              "five_hour_milestones": [],
+              "milestones": []
+            },
+            "sessions": {
+              "rows": [],
+              "sort_key": "started_desc",
+              "total": 0
+            }
+          },
+          "codex": {
+            "alerts": {
+              "actual_thresholds": [
+                90,
+                95
+              ],
+              "projected_thresholds": [],
+              "rows": []
+            },
+            "budget": {
+              "milestones": [],
+              "projected": [],
+              "status": null
+            },
+            "cache_report": {
+              "anomaly_predicates": [
+                "cache_drop"
+              ],
+              "anomaly_threshold_pp": 15,
+              "anomaly_window_days": 14,
+              "by_model": [
+                {
+                  "cache_hit_percent": 68.0,
+                  "cached_input_percent": 68.0,
+                  "key": "gpt-5",
+                  "net_usd": 0.19890000000000002
+                }
+              ],
+              "by_project": [
+                {
+                  "cache_hit_percent": 68.0,
+                  "cached_input_percent": 68.0,
+                  "key": "fixture-codex-project",
+                  "net_usd": 0.19890000000000002
+                }
+              ],
+              "days": [
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 0.0,
+                  "cache_read_tokens": 0,
+                  "cached_input_percent": 0.0,
+                  "date": "2026-04-20",
+                  "input_tokens": 0,
+                  "net_usd": 0.0,
+                  "observed": false,
+                  "output_tokens": 0,
+                  "saved_usd": 0.0,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 64.0,
+                  "cache_read_tokens": 12800,
+                  "cached_input_percent": 64.0,
+                  "date": "2026-04-19",
+                  "input_tokens": 7200,
+                  "net_usd": 0.0144,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.0144,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 68.0,
+                  "cache_read_tokens": 13600,
+                  "cached_input_percent": 68.0,
+                  "date": "2026-04-18",
+                  "input_tokens": 6400,
+                  "net_usd": 0.015300000000000001,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.015300000000000001,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 72.0,
+                  "cache_read_tokens": 14400,
+                  "cached_input_percent": 72.0,
+                  "date": "2026-04-17",
+                  "input_tokens": 5600,
+                  "net_usd": 0.016200000000000003,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.016200000000000003,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 76.0,
+                  "cache_read_tokens": 15200,
+                  "cached_input_percent": 76.0,
+                  "date": "2026-04-16",
+                  "input_tokens": 4800,
+                  "net_usd": 0.017100000000000004,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.017100000000000004,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 60.0,
+                  "cache_read_tokens": 12000,
+                  "cached_input_percent": 60.0,
+                  "date": "2026-04-15",
+                  "input_tokens": 8000,
+                  "net_usd": 0.013500000000000002,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.013500000000000002,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 64.0,
+                  "cache_read_tokens": 12800,
+                  "cached_input_percent": 64.0,
+                  "date": "2026-04-14",
+                  "input_tokens": 7200,
+                  "net_usd": 0.0144,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.0144,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 68.0,
+                  "cache_read_tokens": 13600,
+                  "cached_input_percent": 68.0,
+                  "date": "2026-04-13",
+                  "input_tokens": 6400,
+                  "net_usd": 0.015300000000000001,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.015300000000000001,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 72.0,
+                  "cache_read_tokens": 14400,
+                  "cached_input_percent": 72.0,
+                  "date": "2026-04-12",
+                  "input_tokens": 5600,
+                  "net_usd": 0.016200000000000003,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.016200000000000003,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 76.0,
+                  "cache_read_tokens": 15200,
+                  "cached_input_percent": 76.0,
+                  "date": "2026-04-11",
+                  "input_tokens": 4800,
+                  "net_usd": 0.017100000000000004,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.017100000000000004,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 60.0,
+                  "cache_read_tokens": 12000,
+                  "cached_input_percent": 60.0,
+                  "date": "2026-04-10",
+                  "input_tokens": 8000,
+                  "net_usd": 0.013500000000000002,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.013500000000000002,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 64.0,
+                  "cache_read_tokens": 12800,
+                  "cached_input_percent": 64.0,
+                  "date": "2026-04-09",
+                  "input_tokens": 7200,
+                  "net_usd": 0.0144,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.0144,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 68.0,
+                  "cache_read_tokens": 13600,
+                  "cached_input_percent": 68.0,
+                  "date": "2026-04-08",
+                  "input_tokens": 6400,
+                  "net_usd": 0.015300000000000001,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.015300000000000001,
+                  "wasted_usd": 0.0
+                },
+                {
+                  "anomaly_reasons": [],
+                  "anomaly_triggered": false,
+                  "anomaly_unevaluated": [
+                    "cache_drop"
+                  ],
+                  "cache_creation_tokens": 0,
+                  "cache_hit_percent": 72.0,
+                  "cache_read_tokens": 14400,
+                  "cached_input_percent": 72.0,
+                  "date": "2026-04-07",
+                  "input_tokens": 5600,
+                  "net_usd": 0.016200000000000003,
+                  "observed": true,
+                  "output_tokens": 1500,
+                  "saved_usd": 0.016200000000000003,
+                  "wasted_usd": 0.0
+                }
+              ],
+              "fourteen_day_counterfactual_usd": 0.19890000000000002,
+              "fourteen_day_efficiency_ratio": 1.0,
+              "is_empty": false,
+              "not_applicable": {
+                "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
+                "wasted_usd": "OpenAI charges no cache-write premium, so Codex has no wasted-cache figure."
+              },
+              "seven_day_anomaly_count": 0,
+              "seven_day_net_usd": 0.09090000000000001,
+              "today": {
+                "anomaly_reasons": [],
+                "anomaly_triggered": false,
+                "anomaly_unevaluated": [
+                  "cache_drop"
+                ],
+                "baseline_daily_row_count": 13,
+                "baseline_median_percent": 68.0,
+                "cache_hit_percent": 0.0,
+                "cached_input_percent": 0.0,
+                "date": "2026-04-20",
+                "delta_pp": -68.0,
+                "net_usd": 0.0,
+                "observed": false,
+                "saved_usd": 0.0,
+                "wasted_usd": 0.0
+              },
+              "window_days": 14
+            },
+            "hero": {
+              "alerts": {
+                "count": 0
+              },
+              "budget": null,
+              "cached_input_tokens": null,
+              "cost_usd": null,
+              "cycle": null,
+              "input_tokens": null,
+              "output_tokens": null,
+              "quota": {
+                "active": [],
+                "active_window_count": 0,
+                "freshness": "unavailable",
+                "latest_percent": null,
+                "window_count": 0
+              },
+              "reasoning_output_tokens": null,
+              "total_tokens": null
+            },
+            "periods": {
+              "daily": {
+                "display_tz": "Etc/UTC",
+                "rows": [
+                  {
+                    "cached_input_tokens": 14400,
+                    "cost_usd": 0.0238,
+                    "input_tokens": 20000,
+                    "label": "2026-04-07",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 14400,
+                        "cost": 0.0238,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 13600,
+                    "cost_usd": 0.0247,
+                    "input_tokens": 20000,
+                    "label": "2026-04-08",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 13600,
+                        "cost": 0.0247,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 12800,
+                    "cost_usd": 0.025600000000000005,
+                    "input_tokens": 20000,
+                    "label": "2026-04-09",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 12800,
+                        "cost": 0.025600000000000005,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 12000,
+                    "cost_usd": 0.026500000000000003,
+                    "input_tokens": 20000,
+                    "label": "2026-04-10",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 12000,
+                        "cost": 0.026500000000000003,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 15200,
+                    "cost_usd": 0.022900000000000004,
+                    "input_tokens": 20000,
+                    "label": "2026-04-11",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 15200,
+                        "cost": 0.022900000000000004,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 14400,
+                    "cost_usd": 0.0238,
+                    "input_tokens": 20000,
+                    "label": "2026-04-12",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 14400,
+                        "cost": 0.0238,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 13600,
+                    "cost_usd": 0.0247,
+                    "input_tokens": 20000,
+                    "label": "2026-04-13",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 13600,
+                        "cost": 0.0247,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 12800,
+                    "cost_usd": 0.025600000000000005,
+                    "input_tokens": 20000,
+                    "label": "2026-04-14",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 12800,
+                        "cost": 0.025600000000000005,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 12000,
+                    "cost_usd": 0.026500000000000003,
+                    "input_tokens": 20000,
+                    "label": "2026-04-15",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 12000,
+                        "cost": 0.026500000000000003,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 15200,
+                    "cost_usd": 0.022900000000000004,
+                    "input_tokens": 20000,
+                    "label": "2026-04-16",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 15200,
+                        "cost": 0.022900000000000004,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 14400,
+                    "cost_usd": 0.0238,
+                    "input_tokens": 20000,
+                    "label": "2026-04-17",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 14400,
+                        "cost": 0.0238,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 13600,
+                    "cost_usd": 0.0247,
+                    "input_tokens": 20000,
+                    "label": "2026-04-18",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 13600,
+                        "cost": 0.0247,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  },
+                  {
+                    "cached_input_tokens": 12800,
+                    "cost_usd": 0.025600000000000005,
+                    "input_tokens": 20000,
+                    "label": "2026-04-19",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 12800,
+                        "cost": 0.025600000000000005,
+                        "inputTokens": 20000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 1500,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 21500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 1500,
+                    "reasoning_output_tokens": 300,
+                    "total_tokens": 21500
+                  }
+                ],
+                "total_cost_usd": 0.3211,
+                "total_tokens": 279500
+              },
+              "monthly": {
+                "display_tz": "Etc/UTC",
+                "rows": [
+                  {
+                    "cached_input_tokens": 176800,
+                    "cost_usd": 0.3211,
+                    "input_tokens": 260000,
+                    "label": "2026-04",
+                    "model_breakdowns": [
+                      {
+                        "cachedInputTokens": 176800,
+                        "cost": 0.3211,
+                        "inputTokens": 260000,
+                        "isFallback": false,
+                        "modelName": "gpt-5",
+                        "outputTokens": 19500,
+                        "reasoningOutputTokens": 3900,
+                        "totalTokens": 279500
+                      }
+                    ],
+                    "models": [
+                      "gpt-5"
+                    ],
+                    "output_tokens": 19500,
+                    "reasoning_output_tokens": 3900,
+                    "total_tokens": 279500
+                  }
+                ],
+                "total_cost_usd": 0.3211,
+                "total_tokens": 279500
+              },
+              "weekly": {
+                "display_tz": "Etc/UTC",
+                "rows": [],
+                "total_cost_usd": 0.0,
+                "total_tokens": 0
+              }
+            },
+            "projects": {
+              "rows": [
+                {
+                  "cached_input_tokens": 176800,
+                  "cost_usd": 0.32110000000000005,
+                  "first_seen": "2026-04-07T06:00:00+00:00",
+                  "input_tokens": 260000,
+                  "key": "project:fUajlgcuUL1UQZW1G_RaGqCYdBa9FGQt93o5A54G-d0",
+                  "label": "fixture-codex-project",
+                  "last_seen": "2026-04-19T06:00:00+00:00",
+                  "output_tokens": 19500,
+                  "reasoning_output_tokens": 3900,
+                  "session_count": 1,
+                  "source": "codex",
+                  "total_tokens": 279500
+                }
+              ],
+              "total_cost_usd": 0.32110000000000005,
+              "total_tokens": 279500
+            },
+            "quota": {
+              "blocks": [],
+              "cycle_index": [],
+              "histories": [],
+              "milestones": [],
+              "summary": {
+                "active": [],
+                "active_window_count": 0,
+                "freshness": "unavailable",
+                "latest_percent": null,
+                "window_count": 0
+              }
+            },
+            "sessions": {
+              "rows": [
+                {
+                  "cached_input_tokens": 176800,
+                  "cost_usd": 0.3211,
+                  "duration_min": 17280,
+                  "input_tokens": 260000,
+                  "key": "session:DQ0x9YaVqFCghAfA93OOpTU0xRiKnqB5iB5gzg0YFJk",
+                  "last_activity": "2026-04-19T06:00:00+00:00",
+                  "model_breakdowns": [
+                    {
+                      "cachedInputTokens": 176800,
+                      "cost": 0.3211,
+                      "inputTokens": 260000,
+                      "isFallback": false,
+                      "modelName": "gpt-5",
+                      "outputTokens": 19500,
+                      "reasoningOutputTokens": 3900,
+                      "totalTokens": 279500
+                    }
+                  ],
+                  "models": [
+                    "gpt-5"
+                  ],
+                  "output_tokens": 19500,
+                  "project": "fixture-codex-project",
+                  "project_key": "project:0c1c107bba2c54d1fe47bea1",
+                  "reasoning_output_tokens": 3900,
+                  "source": "codex",
+                  "started_at": "2026-04-07T06:00:00Z",
+                  "total_tokens": 279500
+                }
+              ],
+              "total_cost_usd": 0.3211,
+              "total_sessions": 1,
+              "total_tokens": 279500
+            }
+          }
+        }
+      },
+      "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": [
+        {
+          "code": "codex_projection_incoherent",
+          "domain": "hero",
+          "message": "Codex quota projection is unavailable."
+        },
+        {
+          "code": "codex_cycle_unavailable",
+          "domain": "hero",
+          "message": "Codex native reset cycle is unavailable."
+        }
+      ]
+    },
+    "claude": {
+      "availability": "empty",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "legacy-projection",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        },
+        "sessions": {
+          "semantics": "legacy-session-rollup",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "subscription-week",
+          "status": "supported"
+        }
+      },
+      "data": {
+        "alerts": {
+          "rows": []
+        },
+        "budget": {
+          "forecast": null,
+          "settings": {
+            "budget_enabled": false,
+            "budget_thresholds": [
+              90,
+              100
+            ],
+            "command_configured": false,
+            "enabled": false,
+            "five_hour_thresholds": [
+              90,
+              95
+            ],
+            "notifier": "auto",
+            "project_alerts_enabled": false,
+            "projected_budget_enabled": false,
+            "projected_weekly_enabled": false,
+            "weekly_thresholds": [
+              90,
+              95
+            ]
+          }
+        },
+        "hero": {
+          "cost_usd": 0.0,
+          "current_week": {},
+          "forecast": null,
+          "header": {
+            "dollar_per_pct": null,
+            "five_hour_pct": null,
+            "forecast_pct": null,
+            "forecast_verdict": null,
+            "used_pct": null,
+            "vs_last_week_delta": null,
+            "week_label": null
+          },
+          "total_tokens": 0,
+          "trend": null
+        },
+        "periods": {
+          "daily": {
+            "peak": null,
+            "quantile_thresholds": [],
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "monthly": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          },
+          "weekly": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "current_week": {
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "week_label": "wk Apr 20",
+            "week_start_at": "2026-04-20T00:00:00Z",
+            "week_start_date": "2026-04-20"
+          },
+          "rows": [],
+          "trend": {
+            "projects": [],
+            "weeks": [
+              {
+                "total_cost_usd": 0.0,
+                "total_pct": null,
+                "week_label": "wk Apr 20",
+                "week_start_date": "2026-04-20"
+              }
+            ],
+            "window_weeks": 1
+          }
+        },
+        "quota": {
+          "blocks": [],
+          "current_week": {},
+          "five_hour_milestones": [],
+          "milestones": []
+        },
+        "sessions": {
+          "rows": [],
+          "sort_key": "started_desc",
+          "total": 0
+        }
+      },
+      "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": []
+    },
+    "codex": {
+      "availability": "partial",
+      "capabilities": {
+        "alerts": {
+          "semantics": "provider-native",
+          "status": "supported"
+        },
+        "budget": {
+          "semantics": "calendar-period",
+          "status": "supported"
+        },
+        "daily": {
+          "semantics": "calendar-day",
+          "status": "supported"
+        },
+        "forensics": {
+          "semantics": "inclusive-input-token-reuse",
+          "status": "supported"
+        },
+        "hero": {
+          "semantics": "projection-incoherent",
+          "status": "unavailable"
+        },
+        "monthly": {
+          "semantics": "calendar-month",
+          "status": "supported"
+        },
+        "projects": {
+          "semantics": "qualified-attribution",
+          "status": "supported"
+        },
+        "quota": {
+          "semantics": "native-windows",
+          "status": "derived"
+        },
+        "sessions": {
+          "semantics": "inclusive-input-tokens",
+          "status": "supported"
+        },
+        "weekly": {
+          "semantics": "native-reset-cycles",
+          "status": "derived"
+        }
+      },
+      "data": {
+        "alerts": {
+          "actual_thresholds": [
+            90,
+            95
+          ],
+          "projected_thresholds": [],
+          "rows": []
+        },
+        "budget": {
+          "milestones": [],
+          "projected": [],
+          "status": null
+        },
+        "cache_report": {
+          "anomaly_predicates": [
+            "cache_drop"
+          ],
+          "anomaly_threshold_pp": 15,
+          "anomaly_window_days": 14,
+          "by_model": [
+            {
+              "cache_hit_percent": 68.0,
+              "cached_input_percent": 68.0,
+              "key": "gpt-5",
+              "net_usd": 0.19890000000000002
+            }
+          ],
+          "by_project": [
+            {
+              "cache_hit_percent": 68.0,
+              "cached_input_percent": 68.0,
+              "key": "fixture-codex-project",
+              "net_usd": 0.19890000000000002
+            }
+          ],
+          "days": [
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 0.0,
+              "cache_read_tokens": 0,
+              "cached_input_percent": 0.0,
+              "date": "2026-04-20",
+              "input_tokens": 0,
+              "net_usd": 0.0,
+              "observed": false,
+              "output_tokens": 0,
+              "saved_usd": 0.0,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 64.0,
+              "cache_read_tokens": 12800,
+              "cached_input_percent": 64.0,
+              "date": "2026-04-19",
+              "input_tokens": 7200,
+              "net_usd": 0.0144,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.0144,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 68.0,
+              "cache_read_tokens": 13600,
+              "cached_input_percent": 68.0,
+              "date": "2026-04-18",
+              "input_tokens": 6400,
+              "net_usd": 0.015300000000000001,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.015300000000000001,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 72.0,
+              "cache_read_tokens": 14400,
+              "cached_input_percent": 72.0,
+              "date": "2026-04-17",
+              "input_tokens": 5600,
+              "net_usd": 0.016200000000000003,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.016200000000000003,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 76.0,
+              "cache_read_tokens": 15200,
+              "cached_input_percent": 76.0,
+              "date": "2026-04-16",
+              "input_tokens": 4800,
+              "net_usd": 0.017100000000000004,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.017100000000000004,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 60.0,
+              "cache_read_tokens": 12000,
+              "cached_input_percent": 60.0,
+              "date": "2026-04-15",
+              "input_tokens": 8000,
+              "net_usd": 0.013500000000000002,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.013500000000000002,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 64.0,
+              "cache_read_tokens": 12800,
+              "cached_input_percent": 64.0,
+              "date": "2026-04-14",
+              "input_tokens": 7200,
+              "net_usd": 0.0144,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.0144,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 68.0,
+              "cache_read_tokens": 13600,
+              "cached_input_percent": 68.0,
+              "date": "2026-04-13",
+              "input_tokens": 6400,
+              "net_usd": 0.015300000000000001,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.015300000000000001,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 72.0,
+              "cache_read_tokens": 14400,
+              "cached_input_percent": 72.0,
+              "date": "2026-04-12",
+              "input_tokens": 5600,
+              "net_usd": 0.016200000000000003,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.016200000000000003,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 76.0,
+              "cache_read_tokens": 15200,
+              "cached_input_percent": 76.0,
+              "date": "2026-04-11",
+              "input_tokens": 4800,
+              "net_usd": 0.017100000000000004,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.017100000000000004,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 60.0,
+              "cache_read_tokens": 12000,
+              "cached_input_percent": 60.0,
+              "date": "2026-04-10",
+              "input_tokens": 8000,
+              "net_usd": 0.013500000000000002,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.013500000000000002,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 64.0,
+              "cache_read_tokens": 12800,
+              "cached_input_percent": 64.0,
+              "date": "2026-04-09",
+              "input_tokens": 7200,
+              "net_usd": 0.0144,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.0144,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 68.0,
+              "cache_read_tokens": 13600,
+              "cached_input_percent": 68.0,
+              "date": "2026-04-08",
+              "input_tokens": 6400,
+              "net_usd": 0.015300000000000001,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.015300000000000001,
+              "wasted_usd": 0.0
+            },
+            {
+              "anomaly_reasons": [],
+              "anomaly_triggered": false,
+              "anomaly_unevaluated": [
+                "cache_drop"
+              ],
+              "cache_creation_tokens": 0,
+              "cache_hit_percent": 72.0,
+              "cache_read_tokens": 14400,
+              "cached_input_percent": 72.0,
+              "date": "2026-04-07",
+              "input_tokens": 5600,
+              "net_usd": 0.016200000000000003,
+              "observed": true,
+              "output_tokens": 1500,
+              "saved_usd": 0.016200000000000003,
+              "wasted_usd": 0.0
+            }
+          ],
+          "fourteen_day_counterfactual_usd": 0.19890000000000002,
+          "fourteen_day_efficiency_ratio": 1.0,
+          "is_empty": false,
+          "not_applicable": {
+            "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
+            "wasted_usd": "OpenAI charges no cache-write premium, so Codex has no wasted-cache figure."
+          },
+          "seven_day_anomaly_count": 0,
+          "seven_day_net_usd": 0.09090000000000001,
+          "today": {
+            "anomaly_reasons": [],
+            "anomaly_triggered": false,
+            "anomaly_unevaluated": [
+              "cache_drop"
+            ],
+            "baseline_daily_row_count": 13,
+            "baseline_median_percent": 68.0,
+            "cache_hit_percent": 0.0,
+            "cached_input_percent": 0.0,
+            "date": "2026-04-20",
+            "delta_pp": -68.0,
+            "net_usd": 0.0,
+            "observed": false,
+            "saved_usd": 0.0,
+            "wasted_usd": 0.0
+          },
+          "window_days": 14
+        },
+        "hero": {
+          "alerts": {
+            "count": 0
+          },
+          "budget": null,
+          "cached_input_tokens": null,
+          "cost_usd": null,
+          "cycle": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "quota": {
+            "active": [],
+            "active_window_count": 0,
+            "freshness": "unavailable",
+            "latest_percent": null,
+            "window_count": 0
+          },
+          "reasoning_output_tokens": null,
+          "total_tokens": null
+        },
+        "periods": {
+          "daily": {
+            "display_tz": "Etc/UTC",
+            "rows": [
+              {
+                "cached_input_tokens": 14400,
+                "cost_usd": 0.0238,
+                "input_tokens": 20000,
+                "label": "2026-04-07",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 14400,
+                    "cost": 0.0238,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 13600,
+                "cost_usd": 0.0247,
+                "input_tokens": 20000,
+                "label": "2026-04-08",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 13600,
+                    "cost": 0.0247,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 12800,
+                "cost_usd": 0.025600000000000005,
+                "input_tokens": 20000,
+                "label": "2026-04-09",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 12800,
+                    "cost": 0.025600000000000005,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 12000,
+                "cost_usd": 0.026500000000000003,
+                "input_tokens": 20000,
+                "label": "2026-04-10",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 12000,
+                    "cost": 0.026500000000000003,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 15200,
+                "cost_usd": 0.022900000000000004,
+                "input_tokens": 20000,
+                "label": "2026-04-11",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 15200,
+                    "cost": 0.022900000000000004,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 14400,
+                "cost_usd": 0.0238,
+                "input_tokens": 20000,
+                "label": "2026-04-12",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 14400,
+                    "cost": 0.0238,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 13600,
+                "cost_usd": 0.0247,
+                "input_tokens": 20000,
+                "label": "2026-04-13",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 13600,
+                    "cost": 0.0247,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 12800,
+                "cost_usd": 0.025600000000000005,
+                "input_tokens": 20000,
+                "label": "2026-04-14",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 12800,
+                    "cost": 0.025600000000000005,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 12000,
+                "cost_usd": 0.026500000000000003,
+                "input_tokens": 20000,
+                "label": "2026-04-15",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 12000,
+                    "cost": 0.026500000000000003,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 15200,
+                "cost_usd": 0.022900000000000004,
+                "input_tokens": 20000,
+                "label": "2026-04-16",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 15200,
+                    "cost": 0.022900000000000004,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 14400,
+                "cost_usd": 0.0238,
+                "input_tokens": 20000,
+                "label": "2026-04-17",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 14400,
+                    "cost": 0.0238,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 13600,
+                "cost_usd": 0.0247,
+                "input_tokens": 20000,
+                "label": "2026-04-18",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 13600,
+                    "cost": 0.0247,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              },
+              {
+                "cached_input_tokens": 12800,
+                "cost_usd": 0.025600000000000005,
+                "input_tokens": 20000,
+                "label": "2026-04-19",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 12800,
+                    "cost": 0.025600000000000005,
+                    "inputTokens": 20000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 1500,
+                    "reasoningOutputTokens": 300,
+                    "totalTokens": 21500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 1500,
+                "reasoning_output_tokens": 300,
+                "total_tokens": 21500
+              }
+            ],
+            "total_cost_usd": 0.3211,
+            "total_tokens": 279500
+          },
+          "monthly": {
+            "display_tz": "Etc/UTC",
+            "rows": [
+              {
+                "cached_input_tokens": 176800,
+                "cost_usd": 0.3211,
+                "input_tokens": 260000,
+                "label": "2026-04",
+                "model_breakdowns": [
+                  {
+                    "cachedInputTokens": 176800,
+                    "cost": 0.3211,
+                    "inputTokens": 260000,
+                    "isFallback": false,
+                    "modelName": "gpt-5",
+                    "outputTokens": 19500,
+                    "reasoningOutputTokens": 3900,
+                    "totalTokens": 279500
+                  }
+                ],
+                "models": [
+                  "gpt-5"
+                ],
+                "output_tokens": 19500,
+                "reasoning_output_tokens": 3900,
+                "total_tokens": 279500
+              }
+            ],
+            "total_cost_usd": 0.3211,
+            "total_tokens": 279500
+          },
+          "weekly": {
+            "display_tz": "Etc/UTC",
+            "rows": [],
+            "total_cost_usd": 0.0,
+            "total_tokens": 0
+          }
+        },
+        "projects": {
+          "rows": [
+            {
+              "cached_input_tokens": 176800,
+              "cost_usd": 0.32110000000000005,
+              "first_seen": "2026-04-07T06:00:00+00:00",
+              "input_tokens": 260000,
+              "key": "project:fUajlgcuUL1UQZW1G_RaGqCYdBa9FGQt93o5A54G-d0",
+              "label": "fixture-codex-project",
+              "last_seen": "2026-04-19T06:00:00+00:00",
+              "output_tokens": 19500,
+              "reasoning_output_tokens": 3900,
+              "session_count": 1,
+              "source": "codex",
+              "total_tokens": 279500
+            }
+          ],
+          "total_cost_usd": 0.32110000000000005,
+          "total_tokens": 279500
+        },
+        "quota": {
+          "blocks": [],
+          "cycle_index": [],
+          "histories": [],
+          "milestones": [],
+          "summary": {
+            "active": [],
+            "active_window_count": 0,
+            "freshness": "unavailable",
+            "latest_percent": null,
+            "window_count": 0
+          }
+        },
+        "sessions": {
+          "rows": [
+            {
+              "cached_input_tokens": 176800,
+              "cost_usd": 0.3211,
+              "duration_min": 17280,
+              "input_tokens": 260000,
+              "key": "session:DQ0x9YaVqFCghAfA93OOpTU0xRiKnqB5iB5gzg0YFJk",
+              "last_activity": "2026-04-19T06:00:00+00:00",
+              "model_breakdowns": [
+                {
+                  "cachedInputTokens": 176800,
+                  "cost": 0.3211,
+                  "inputTokens": 260000,
+                  "isFallback": false,
+                  "modelName": "gpt-5",
+                  "outputTokens": 19500,
+                  "reasoningOutputTokens": 3900,
+                  "totalTokens": 279500
+                }
+              ],
+              "models": [
+                "gpt-5"
+              ],
+              "output_tokens": 19500,
+              "project": "fixture-codex-project",
+              "project_key": "project:0c1c107bba2c54d1fe47bea1",
+              "reasoning_output_tokens": 3900,
+              "source": "codex",
+              "started_at": "2026-04-07T06:00:00Z",
+              "total_tokens": 279500
+            }
+          ],
+          "total_cost_usd": 0.3211,
+          "total_sessions": 1,
+          "total_tokens": 279500
+        }
+      },
+      "data_version": "__VER__",
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
+      "freshness": "fresh",
+      "last_success_at": "2026-04-20T12:00:00Z",
+      "warnings": [
+        {
+          "code": "codex_projection_incoherent",
+          "domain": "hero",
+          "message": "Codex quota projection is unavailable."
+        },
+        {
+          "code": "codex_cycle_unavailable",
+          "domain": "hero",
+          "message": "Codex native reset cycle is unavailable."
+        }
+      ]
+    }
+  },
+  "sync_age_s": null,
+  "sync_failure": null,
+  "transcriptsEnabled": true,
+  "trend": null,
+  "update": "__UPDATE_BLOCK__",
+  "weekly": {
+    "rows": [],
+    "total_cost_usd": 0.0,
+    "total_tokens": 0
+  }
+}

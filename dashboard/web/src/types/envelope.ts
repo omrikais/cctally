@@ -128,6 +128,12 @@ export type CacheAnomalyReason = 'net_negative' | 'cache_drop';
 
 export interface CacheReportDailyRow {
   date: string;                       // YYYY-MM-DD in display tz
+  // #443 S2 — Codex publishes `cached_input_percent` as authoritative and
+  // repeats the value on `cache_hit_percent` for one transitional release, so a
+  // tab spanning a `cctally update` keeps reading a number. Claude publishes
+  // only the legacy key. Read BOTH through `lib/cacheReportVocabulary`'s
+  // `cachePercent`, never either field directly.
+  cached_input_percent?: number;
   cache_hit_percent: number;
   input_tokens: number;
   output_tokens: number;
@@ -148,12 +154,14 @@ export interface CacheReportDailyRow {
 
 export interface CacheReportBreakdownRow {
   key: string;
+  cached_input_percent?: number;      // #443 S2 — see CacheReportDailyRow.
   cache_hit_percent: number;
   net_usd: number;
 }
 
 export interface CacheReportTodaySpotlight {
   date: string;
+  cached_input_percent?: number;      // #443 S2 — see CacheReportDailyRow.
   cache_hit_percent: number;
   baseline_median_percent: number | null;
   delta_pp: number | null;
@@ -181,6 +189,18 @@ export interface CacheReportEnvelope {
   fourteen_day_counterfactual_usd: number;
   fourteen_day_efficiency_ratio: number;
   is_empty: boolean;
+  // #443 S2 — Codex-only, both optional; absence carries the Claude
+  // meaning. `not_applicable` maps a field name to the reason it can never
+  // hold a measurement on this provider. It is the AUTHORITATIVE signal
+  // that `wasted_usd` / `fourteen_day_efficiency_ratio` are meaningless
+  // here: those keys stay numeric through the transition release, so their
+  // VALUES cannot be used to detect inapplicability (cctally-dev#465).
+  not_applicable?: Record<string, string>;
+  // Which anomaly predicates the provider can evaluate at all. Absent
+  // means the full Claude set. A predicate outside this list is NOT
+  // unevaluated — it is structurally unreachable, which is a different
+  // thing and must not render as "not enough data yet".
+  anomaly_predicates?: CacheAnomalyReason[];
 }
 
 export interface DoctorEnvelope {

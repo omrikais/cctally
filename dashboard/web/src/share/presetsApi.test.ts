@@ -163,6 +163,25 @@ describe('presetsApi', () => {
     expect(rec.recipe_id).toBe('abc123');
   });
 
+  it('appendHistory carries a focused account and omits an agnostic one', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ recipe_id: 'abc123' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const account = 'b'.repeat(32);
+    const common = {
+      panel: 'weekly' as const, template_id: 'weekly-recap', options: defaults(),
+      format: 'md', destination: 'copy', source: 'codex' as const,
+    };
+    await appendHistory({ ...common, account });
+    await appendHistory({ ...common, account: null });
+    const focused = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const agnostic = JSON.parse((fetchSpy.mock.calls[1][1] as RequestInit).body as string);
+    expect(focused.account).toBe(account);
+    expect(agnostic).not.toHaveProperty('account');
+  });
+
   it('clearHistory DELETEs /api/share/history', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(null, { status: 204 }),

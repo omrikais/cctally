@@ -1,4 +1,5 @@
 import { fmt } from '../lib/fmt';
+import { cacheVocabulary } from '../lib/cacheReportVocabulary';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { ModelCostBars } from './ModelCostBars';
 import type { PeriodRow } from '../types/envelope';
@@ -82,7 +83,9 @@ export function PeriodDetailCard({
         )}
         {row.cache_hit_pct != null && (
           <div className="t cache">
-            <span className="k">Cache hit</span>
+            {/* #443 S2 — source-aware: on a Codex row this figure is
+                cached_input / input, which is token reuse, not a cache hit. */}
+            <span className="k">{cacheVocabulary(row.source ?? 'claude').percentLabel}</span>
             <span className="v">{row.cache_hit_pct.toFixed(1)}%</span>
             <div className="bar">
               <div

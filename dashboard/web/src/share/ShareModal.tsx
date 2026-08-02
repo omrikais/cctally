@@ -51,6 +51,8 @@ interface Props {
   // Optional with a 'claude' default: production always supplies it via
   // ShareModalRoot; the default keeps the compatibility path for older callers.
   source?: DashboardSelection;
+  // #346 — frozen with source by OPEN_SHARE; null means account-agnostic.
+  account?: string | null;
   onClose: () => void;
   // Opaque per-panel params forwarded from the store's `shareModal.params`
   // slot (set by the opener via `dispatch(openShareModal(..., params))`).
@@ -90,7 +92,7 @@ function mergeOptions(base: ShareOptions, override: Partial<ShareOptions> | unde
   return next;
 }
 
-export function ShareModal({ panel, source = 'claude', onClose, initialParams }: Props) {
+export function ShareModal({ panel, source = 'claude', account = null, onClose, initialParams }: Props) {
   const cardRef = useRef<HTMLDivElement>(null);
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
@@ -264,6 +266,7 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
             <PreviewPane
               panel={panel}
               source={source}
+              account={account}
               templateId={selectedTemplateId}
               options={options}
             />
@@ -301,6 +304,7 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
               <PreviewPane
                 panel={panel}
                 source={source}
+                account={account}
                 templateId={selectedTemplateId}
                 options={options}
               />
@@ -313,6 +317,7 @@ export function ShareModal({ panel, source = 'claude', onClose, initialParams }:
         <ActionBar
           panel={panel}
           source={source}
+          account={account}
           templateId={selectedTemplateId}
           options={options}
           onOptionsChange={handleOptionsChange}

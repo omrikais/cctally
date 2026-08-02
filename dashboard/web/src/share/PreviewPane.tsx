@@ -28,6 +28,8 @@ interface Props {
   // surfaced as label chrome so the preview matches what the artifact says.
   // Optional with a 'claude' default (compatibility path).
   source?: DashboardSelection;
+  // #346 — frozen account qualifier for the lifetime of this share flow.
+  account?: string | null;
   templateId: string | null;
   options: ShareOptions;
 }
@@ -50,7 +52,7 @@ const initialPreviewState: PreviewState = {
   errorField: null,
 };
 
-export function PreviewPane({ panel, source = 'claude', templateId, options }: Props) {
+export function PreviewPane({ panel, source = 'claude', account = null, templateId, options }: Props) {
   const [preview, setPreview] = useState<PreviewState>(initialPreviewState);
   // Per-fetch AbortController, set when a fetch starts and aborted when
   // the next fetch starts (or the component unmounts).
@@ -80,7 +82,7 @@ export function PreviewPane({ panel, source = 'claude', templateId, options }: P
       const previewOptions: ShareOptions = { ...options, reveal_projects: true };
 
       renderShare(
-        { panel, template_id: templateId, options: previewOptions, source },
+        { panel, template_id: templateId, options: previewOptions, source, account },
         { signal: ctl.signal },
       )
         .then((resp) => {
@@ -129,7 +131,7 @@ export function PreviewPane({ panel, source = 'claude', templateId, options }: P
       // effect's `setTimeout` aborts old in-flight requests at start.
       // On unmount we abort below in a separate effect.
     };
-  }, [panel, source, templateId, options]);
+  }, [panel, source, account, templateId, options]);
 
   // Unmount cleanup: abort any pending request so React doesn't warn
   // about a setState on an unmounted component if a slow fetch resolves

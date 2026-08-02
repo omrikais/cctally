@@ -6,7 +6,7 @@ Writes one pair of (stats.db, cache.db) per scenario under
 All schema/seeding goes through ``bin/_fixture_builders.py`` — do not
 duplicate schema here. Idempotent: each builder overwrites existing DBs.
 
-Ten scenarios:
+Twelve scenarios:
   * ``ok``         — current week at ~40% with 8 weeks of history; forecast
                      verdict ``"ok"`` (renders as GOOD in the browser).
   * ``warn``       — current week at ~67% with a heavy recent-24h burn that
@@ -42,6 +42,17 @@ Ten scenarios:
                      SSE ``alerts_settings`` mirror and the POST echo must
                      surface only ``command_configured: true`` and never leak
                      the raw template / ``SECRETXYZ`` token to a client.
+  * ``codex-cache-active`` — 14 days of fully-qualified Codex rollout
+                     entries INCLUDING today (#443 S2 F27). Every other
+                     scenario ships an empty Codex source, so no assembled
+                     golden proved a COMPUTED Codex cache report survives
+                     envelope assembly.
+  * ``codex-cache-idle`` — the same history with nothing dated today, so
+                     the golden captures the synthetic unobserved today
+                     row (#443 F13/F14) at ``days[0]``.
+  * ``cache-report-qa`` — production-shaped Claude cache activity with six
+                     baseline days, an amber cache-drop today, and both
+                     positive/negative net days for real-browser QA (#452).
 
 Each scenario writes ``input.env`` containing a single line
 ``AS_OF=<iso-utc>`` consumed by the dashboard harness via
@@ -74,6 +85,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    seed_codex_conversation_thread,
+    seed_codex_session_entry,
+    seed_codex_session_file,
+    seed_codex_source_root,
     seed_session_entry,
     seed_session_file,
     seed_week_reset_event,
@@ -1449,6 +1464,189 @@ def build_command_secret(as_of: dt.datetime) -> None:
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
+# === #443 S2 — Codex cache-report scenarios ==============================
+# Every pre-existing scenario ships an EMPTY Codex source, so no assembled
+# golden ever proved a COMPUTED Codex cache report survives envelope
+# assembly (#443 F27). These two do, and the pair is what separates the
+# two truths S2 adds: `codex-cache-active` has a real row for today,
+# `codex-cache-idle` has none and must therefore publish a synthetic
+# unobserved one.
+
+_CODEX_ROOT_KEY = "fixture-codex-root"
+_CODEX_ROOT_PATH = "/fake/codex"
+_CODEX_CWD = "/fake/repos/fixture-codex-project"
+
+
+def _seed_codex_history(
+    cache_conn: sqlite3.Connection, *, as_of: dt.datetime, day_offsets: list[int],
+) -> None:
+    """Seed one fully-qualified Codex rollout with one entry per offset day.
+
+    Fully-qualified means the entry carries `source_root_key` +
+    `conversation_key` AND a matching `codex_conversation_threads` row, so
+    `load_codex_project_metadata_health` classifies every row as qualified
+    and the dashboard resolves a real project label instead of degrading to
+    the unqualified accounting fallback.
+    """
+    seed_codex_source_root(
+        cache_conn,
+        source_root_key=_CODEX_ROOT_KEY,
+        canonical_root_path=_CODEX_ROOT_PATH,
+    )
+    session_id = "fixture-codex-0000-0000-000000000001"
+    conversation_key = f"v1.{_CODEX_ROOT_KEY}.{session_id}"
+    file_path = f"{_CODEX_ROOT_PATH}/sessions/{session_id}.jsonl"
+    seed_codex_session_file(
+        cache_conn,
+        path=file_path,
+        last_session_id=session_id,
+        last_model="gpt-5",
+        source_root_key=_CODEX_ROOT_KEY,
+        last_native_thread_id=session_id,
+        last_conversation_key=conversation_key,
+    )
+    seed_codex_conversation_thread(
+        cache_conn,
+        conversation_key=conversation_key,
+        source_root_key=_CODEX_ROOT_KEY,
+        native_thread_id=session_id,
+        source_path=file_path,
+        cwd=_CODEX_CWD,
+    )
+    # Cached share walks 60/64/68/72/76% and repeats, so the daily rows
+    # differ from one another and the baseline median is a real statistic
+    # rather than a constant. Deterministic: derived only from the offset.
+    for line_offset, offset in enumerate(day_offsets):
+        # 06:00, not the scenario's own 12:00 AS_OF instant. The qualified
+        # Codex reader compares `timestamp_utc` LEXICALLY against a bound
+        # nudged to `AS_OF + 1us`, and `_iso()` here emits a `Z` suffix where
+        # production writes `+00:00` (see #467). `'Z' (0x5A) > '.' (0x2E)`,
+        # so a fixture row stamped exactly at AS_OF sorts AFTER the bound and
+        # is excluded — which would leave `codex-cache-active` publishing the
+        # synthetic today row and make it indistinguishable from
+        # `codex-cache-idle`. Production rows are unaffected: they carry
+        # `+00:00`, and `'+' (0x2B) < '.'`, so they sort before the bound as
+        # intended. Seeding away from the boundary sidesteps the format gap
+        # without encoding it into the scenario.
+        ts = (as_of - dt.timedelta(days=offset)).replace(
+            hour=6, minute=0, second=0, microsecond=0)
+        input_tokens = 20_000
+        cached = input_tokens * (60 + 4 * (offset % 5)) // 100
+        seed_codex_session_entry(
+            cache_conn,
+            source_path=file_path,
+            line_offset=line_offset,
+            timestamp_utc=_iso(ts),
+            session_id=session_id,
+            model="gpt-5",
+            input_tokens=input_tokens,
+            cached_input_tokens=cached,
+            output_tokens=1_500,
+            reasoning_output_tokens=300,
+            total_tokens=input_tokens + 1_500,
+            source_root_key=_CODEX_ROOT_KEY,
+            conversation_key=conversation_key,
+        )
+
+
+def _build_codex_cache_scenario(
+    name: str, as_of: dt.datetime, *, day_offsets: list[int],
+) -> None:
+    scenario_dir, app_dir = _scenario_dirs(name)
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        _seed_codex_history(cache_conn, as_of=as_of, day_offsets=day_offsets)
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+def build_codex_cache_active(as_of: dt.datetime) -> None:
+    """14 days of Codex history INCLUDING today.
+
+    Proves a computed, non-empty Codex cache report survives envelope
+    assembly: `cached_input_percent` beside the transitional
+    `cache_hit_percent`, a populated `not_applicable`,
+    `anomaly_predicates == ["cache_drop"]`, and real breakdowns.
+    """
+    _build_codex_cache_scenario(
+        "codex-cache-active", as_of, day_offsets=list(range(0, 14)))
+
+
+def build_codex_cache_idle(as_of: dt.datetime) -> None:
+    """The same history with NOTHING dated today.
+
+    Proves the synthetic unobserved today row survives assembly: `days[0]`
+    carries today's date with `observed: false` rather than leaving the
+    newest real row wearing the chart's positional "Today" label.
+    """
+    _build_codex_cache_scenario(
+        "codex-cache-idle", as_of, day_offsets=list(range(1, 14)))
+
+
+def build_cache_report_qa(as_of: dt.datetime) -> None:
+    """Reach the rich Cache Report QA state through production aggregation.
+
+    Start from the ordinary ``ok`` fixture so every surrounding dashboard
+    panel remains realistic, then append seven cache-shaped days. Six prior
+    days satisfy the classifier's baseline floor; today is creation-heavy and
+    far below that baseline, so the real classifier emits amber ``cache_drop``.
+    Read-heavy and creation-heavy rows make the mini net bars mixed-sign.
+    """
+    build_ok(as_of)
+    source_app = FIXTURES_DIR / "ok" / ".local" / "share" / "cctally"
+    scenario_dir, app_dir = _scenario_dirs("cache-report-qa")
+    create_stats_db(app_dir / "stats.db")
+    create_cache_db(app_dir / "cache.db")
+    for filename in ("stats.db", "cache.db"):
+        source = sqlite3.connect(source_app / filename)
+        target = sqlite3.connect(app_dir / filename)
+        try:
+            source.backup(target)
+        finally:
+            source.close()
+            target.close()
+    config_text = (source_app / "config.json").read_text()
+    (app_dir / "config.json").write_text(config_text)
+
+    cache_conn = sqlite3.connect(app_dir / "cache.db")
+    try:
+        entries = []
+        # Five unequivocally read-heavy days plus one negative prior day: the
+        # baseline has >=5 samples and the chart proves both signs.
+        for offset in range(6, 1, -1):
+            day = (as_of - dt.timedelta(days=offset)).replace(
+                hour=10, minute=0, second=0, microsecond=0,
+            )
+            entries.append((day, 50_000, 5_000, 50_000, 1_200_000))
+        prior_negative = (as_of - dt.timedelta(days=1)).replace(
+            hour=10, minute=0, second=0, microsecond=0,
+        )
+        entries.append((prior_negative, 50_000, 5_000, 1_000_000, 20_000))
+        today = as_of.replace(hour=10, minute=0, second=0, microsecond=0)
+        entries.append((today, 50_000, 5_000, 1_200_000, 10_000))
+        _seed_session(
+            cache_conn,
+            session_id="cache-report-qa-0000-0000-0000-000000000001",
+            project_path="/fake/repos/cache-report-qa",
+            model="claude-sonnet-4-6",
+            entries=entries,
+        )
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -1485,6 +1683,18 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "command-secret": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_command_secret,
+    ),
+    "codex-cache-active": (
+        dt.datetime(2026, 4, 20, 12, 0, 0, tzinfo=dt.timezone.utc),
+        build_codex_cache_active,
+    ),
+    "codex-cache-idle": (
+        dt.datetime(2026, 4, 20, 12, 0, 0, tzinfo=dt.timezone.utc),
+        build_codex_cache_idle,
+    ),
+    "cache-report-qa": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_cache_report_qa,
     ),
 }
 

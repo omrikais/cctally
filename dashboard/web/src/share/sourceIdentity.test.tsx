@@ -106,6 +106,38 @@ describe('renderShare / compose bodies stamp source (§7)', () => {
     });
     expect(req.sections.map((s) => s.snapshot.source)).toEqual(['claude', 'codex']);
   });
+
+  it('render and compose carry a focused account but omit the field when agnostic', async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(JSON.stringify({ body: 'x', content_type: 'text/markdown', snapshot: {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const account = 'b'.repeat(32);
+    await renderShare({
+      panel: 'weekly', template_id: 'weekly-recap', options: opts(),
+      source: 'codex', account,
+    });
+    const renderBody = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(renderBody.account).toBe(account);
+
+    const focused = makeBasketItem({
+      panel: 'weekly', template_id: 'weekly-recap', options: opts(),
+      added_at: 'a', data_digest_at_add: 'd', kernel_version: 1,
+      label_hint: 'Weekly', source: 'codex', account,
+    });
+    const agnostic = makeBasketItem({
+      panel: 'daily', template_id: 'daily-recap', options: opts(),
+      added_at: 'a', data_digest_at_add: 'd', kernel_version: 1,
+      label_hint: 'Daily', source: 'codex', account: null,
+    });
+    const req = buildComposeRequest([focused, agnostic], {
+      title: 't', theme: 'light', format: 'md', no_branding: false, reveal_projects: false,
+    });
+    expect(req.sections[0].snapshot.account).toBe(account);
+    expect(req.sections[1].snapshot).not.toHaveProperty('account');
+  });
 });
 
 describe('basket legacy-item load (§7)', () => {

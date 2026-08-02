@@ -26,11 +26,14 @@
 // sparkline above it on the panel).
 import type { CacheReportDailyRow } from '../types/envelope';
 import { fmt } from '../lib/fmt';
+import { cacheVocabulary } from '../lib/cacheReportVocabulary';
+import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
 
 export interface CacheNetBarsProps {
   days: CacheReportDailyRow[];   // newest-first; render oldest-first
   size: 'mini' | 'large';
-  unavailableReason?: string;
+  /** Provider whose vocabulary the heading and caption use (#443 S2 §4.4). */
+  source?: string;
 }
 
 const SIZES = {
@@ -38,24 +41,11 @@ const SIZES = {
   large: { width: 800, height: 110, padX: 28, padTop: 28, padBot: 28, barGap: 4 },
 } as const;
 
-export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProps) {
+export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
+  const vocab = cacheVocabulary(source ?? 'claude');
   const cfg = SIZES[size];
   const isLarge = size === 'large';
   const ordered = [...days].reverse();
-
-  if (isLarge && unavailableReason) {
-    return (
-      <div className="crm-section modal-cache-unavailable">
-        <div className="crm-section-head crm-sh-net">
-          Net $ per day · saved (green) − wasted (red)
-          <span className="meta">provider-native limitation</span>
-        </div>
-        <div className="crm-chart-frame netbars">
-          <div className="m-unavailable" style={{ padding: '16px 4px' }}>{unavailableReason}</div>
-        </div>
-      </div>
-    );
-  }
 
   if (ordered.length === 0) {
     if (isLarge) {
@@ -103,13 +93,13 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
     );
     const yScale = (cfg.height - cfg.padTop - cfg.padBot) / 2 / maxAbsNet;
     const midY = cfg.padTop + (cfg.height - cfg.padTop - cfg.padBot) / 2;
-    const barWidth = (cfg.width - cfg.padX * 2) / ordered.length - cfg.barGap;
+    const slot = (i: number) => cacheReportChartSlot(size, i, ordered.length);
 
     return (
       <div className="crm-section">
         <div className="crm-section-head crm-sh-net">
-          Net $ per day · saved (green) − wasted (red)
-          <span className="meta">positive bars = caching helped</span>
+          {vocab.netBarsHeading}
+          <span className="meta">{vocab.netBarsCaption}</span>
         </div>
         <div className="crm-chart-frame netbars">
           <svg
@@ -137,7 +127,7 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
               .map((d, i) => ({ d, i }))
               .filter(({ d }) => d.observed !== false)
               .map(({ d, i }) => {
-              const x = cfg.padX + i * (barWidth + cfg.barGap);
+              const { left: x, width: barWidth } = slot(i);
               if (d.net_usd >= 0) {
                 const greenH = d.saved_usd * yScale;
                 const redH = d.wasted_usd * yScale;
@@ -183,7 +173,7 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
             })}
             {/* x-axis labels: M-D for day 0..N-2; "Today" for the last. */}
             {ordered.map((d, i) => {
-              const x = cfg.padX + i * (barWidth + cfg.barGap) + barWidth / 2;
+              const x = slot(i).center;
               const isLast = i === ordered.length - 1;
               const label = isLast ? 'Today' : fmt.calDate(d.date);
               return (
@@ -212,7 +202,7 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
     1e-9,
     ...ordered.map((d) => Math.abs(d.net_usd)),
   );
-  const barWidth = (cfg.width - cfg.padX * 2) / ordered.length - cfg.barGap;
+  const slot = (i: number) => cacheReportChartSlot(size, i, ordered.length);
 
   return (
     <svg
@@ -229,7 +219,7 @@ export function CacheNetBars({ days, size, unavailableReason }: CacheNetBarsProp
         .map((d, i) => ({ d, i }))
         .filter(({ d }) => d.observed !== false)
         .map(({ d, i }) => {
-        const x = cfg.padX + i * (barWidth + cfg.barGap);
+        const { left: x, width: barWidth } = slot(i);
         // Floor at 1 px so a $0 day still leaves a visible nub.
         const h = Math.max(1, (Math.abs(d.net_usd) / maxAbsNet) * usable);
         const y = cfg.height - cfg.padBot - h;

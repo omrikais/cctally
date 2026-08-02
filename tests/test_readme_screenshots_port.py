@@ -13,6 +13,7 @@ import http.server
 import os
 import socket
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -37,6 +38,32 @@ class _Ok200Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _QuietThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """Keep expected probe disconnects out of process-global stderr."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
+
+
+def test_fixture_server_swallows_expected_client_disconnect(capsys):
+    """A probe that resets its socket must not pollute another test's stderr."""
+    srv = _QuietThreadingHTTPServer(("127.0.0.1", 0), _Ok200Handler)
+    try:
+        try:
+            raise ConnectionResetError("probe disconnected")
+        except ConnectionResetError:
+            srv.handle_error(None, ("127.0.0.1", 12345))
+    finally:
+        srv.server_close()
+    assert capsys.readouterr().err == ""
+
+
 @contextlib.contextmanager
 def default_port_occupied():
     """Guarantee a real HTTP responder on 127.0.0.1:8789 for the duration.
@@ -51,7 +78,7 @@ def default_port_occupied():
     accepted: it means we could not bind, not that a listener exists.
     """
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", DEFAULT_PORT), _Ok200Handler)
+        srv = _QuietThreadingHTTPServer(("127.0.0.1", DEFAULT_PORT), _Ok200Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             yield
@@ -75,7 +102,7 @@ def free_port() -> int:
 @contextlib.contextmanager
 def holding(port: int):
     """Hold `port` with a real HTTP responder."""
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Ok200Handler)
+    srv = _QuietThreadingHTTPServer(("127.0.0.1", port), _Ok200Handler)
     with srv:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:

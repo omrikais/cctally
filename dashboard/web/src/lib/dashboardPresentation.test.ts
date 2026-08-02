@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import {
   presentationCacheReportComposition,
-  presentationCacheDays,
   presentationBlocks,
   presentationDailyRows,
   presentationForecastComposition,
@@ -510,30 +509,6 @@ describe('provider-neutral dashboard presentation adapters', () => {
       { label: '2026-07', cost_usd: 2, input_tokens: 2, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 2, models: [] },
     ];
     expect(presentationPeriodRows(env, 'codex', 'monthly').map((row) => row.label)).toEqual(['2026-07', '2026-06']);
-  });
-
-  it('uses inclusive Codex input as the cache-hit denominator exactly once', () => {
-    const env = cloneFixture();
-    env.sources!.codex.data!.periods.daily.rows = [{
-      label: '2026-07-18', cost_usd: 1, input_tokens: 100,
-      cached_input_tokens: 98, output_tokens: 1, reasoning_output_tokens: 0,
-      total_tokens: 101, models: ['gpt-5.6-sol'],
-    }];
-
-    expect(presentationCacheDays(env, 'codex')?.[0].cache_hit_percent).toBe(98);
-  });
-
-  it('uses the provider-computed Codex cache report instead of zero-dollar synthesis', () => {
-    const env = cloneFixture();
-    const report = structuredClone(env.cache_report!);
-    report.days[0].saved_usd = 12.5;
-    report.days[0].net_usd = 12.5;
-    (env.sources!.codex.data! as unknown as { cache_report: typeof report }).cache_report = report;
-
-    expect(presentationCacheDays(env, 'codex')?.[0]).toMatchObject({
-      saved_usd: 12.5,
-      net_usd: 12.5,
-    });
   });
 
   it('gap-fills Codex daily rows to the canonical Claude calendar shape', () => {

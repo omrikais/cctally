@@ -37,6 +37,9 @@ export interface BasketItem {
   // items without a `source` load as 'claude' on read WITHOUT rewriting storage
   // (the field is non-destructive).
   source: DashboardSelection;
+  // #346 — optional frozen account qualifier. Absent, rather than null, keeps
+  // legacy/All-account storage byte-identical.
+  account?: string;
 }
 
 export interface BasketSlice {
@@ -105,7 +108,13 @@ export function basketReducer(state: BasketSlice, action: BasketAction): BasketS
 // here means the master store (which calls makeBasketItem from
 // ActionBar's "+ Basket" handler) and any future tests share the same
 // shape contract.
-export function makeBasketItem(args: Omit<BasketItem, 'id' | 'source'> & { id?: string; source?: DashboardSelection }): BasketItem {
+export function makeBasketItem(
+  args: Omit<BasketItem, 'id' | 'source' | 'account'> & {
+    id?: string;
+    source?: DashboardSelection;
+    account?: string | null;
+  },
+): BasketItem {
   return {
     id: args.id ?? cryptoRandomItemId(),
     panel: args.panel,
@@ -117,6 +126,7 @@ export function makeBasketItem(args: Omit<BasketItem, 'id' | 'source'> & { id?: 
     label_hint: args.label_hint,
     // Additive: default to 'claude' when a caller omits it (legacy call sites).
     source: args.source ?? 'claude',
+    ...(args.account == null ? {} : { account: args.account }),
   };
 }
 

@@ -82,6 +82,16 @@ describe('#247 S1 card-chrome contract', () => {
   });
 });
 
+describe('#452 Cache Report header icon contract', () => {
+  it('renders the standard decorative header icon without an inline color', () => {
+    const { container } = render(<CacheReportPanel />);
+    const icon = container.querySelector('.panel-header svg.icon');
+    expect(icon).not.toBeNull();
+    expect(icon?.getAttribute('aria-hidden')).toBe('true');
+    expect((icon as SVGElement & { style: CSSStyleDeclaration }).style.color).toBe('');
+  });
+});
+
 // #247 S1 (spec acceptance #6) — uniform header affordance grammar across
 // the dashboard GRID panels. The S1 facelift gave every panel header the same
 // chrome shape; the two header affordances are NOT decorative — each is

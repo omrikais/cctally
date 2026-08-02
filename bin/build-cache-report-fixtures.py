@@ -436,6 +436,213 @@ def build_by_session_merged_resume():
     )
 
 
+# === #443 S3 F28 — CLI flag coverage ====================================
+# No fixture set --anomaly-threshold-pp / --anomaly-window-days /
+# --no-anomaly, and none set an explicit --sort, so the CLI defaults were
+# the only thing under golden coverage: `date` in day mode and `net` in
+# session mode. The harness runs each fixture once per output mode with ONE
+# shared FLAGS value, so each flag combination needs its own scenario.
+#
+# Every identifier below is synthetic (`/fake/...`) — these paths classify
+# public and ship to the mirror.
+
+_FLAG_AS_OF = dt.datetime(2026, 4, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def _seed_multi_drop(scenario_dir: Path) -> None:
+    """Seven days carrying TWO cache drops of different magnitudes.
+
+    A single-anomaly dataset cannot distinguish the anomaly flags from one
+    another: every one of them can only manifest as "the trigger stopped
+    firing", so `--anomaly-threshold-pp 45`, `--anomaly-window-days 3` and
+    `--no-anomaly` all produce byte-identical triggered/reasons output on it.
+    Before #474, the CLI JSON also omitted `anomaly.unevaluated`, making
+    "evaluated, clean" and "never evaluated" indistinguishable. The JSON now
+    exposes that state, while this two-drop shape continues to prove the three
+    flags' distinct triggered/reasons behavior.
+
+    Two drops at different magnitudes fixes that. Baseline rows sit at
+    ~83.3% hit; 04-14 drops ~20pp and 04-15 drops ~41pp. The per-row
+    baseline only looks BACKWARD, and needs 5 samples, so 04-14 and 04-15
+    are the only rows that can be evaluated at all under `--days 7`:
+
+        default (threshold 15, window 14) -> BOTH 04-14 and 04-15 fire
+        --anomaly-threshold-pp 30         -> only 04-15 fires
+        --anomaly-window-days 3           -> neither: a 3-day window
+                                             admits at most 3 samples,
+                                             below the 5-sample minimum
+
+    Three distinct row-flag counts on identical data, so each golden pins
+    its own flag rather than a shared "nothing fired" state.
+    """
+    db_dir = scenario_dir / ".local/share/cctally"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    create_stats_db(db_dir / "stats.db")
+    create_cache_db(db_dir / "cache.db")
+    rows = [
+        # (day, input, cache_create, cache_read) -> hit % over a 120k total
+        ( 9, 15_000, 5_000, 100_000),   # 83.3%
+        (10, 15_000, 5_000, 100_000),   # 83.3%
+        (11, 15_000, 5_000, 100_000),   # 83.3%
+        (12, 15_000, 5_000, 100_000),   # 83.3%
+        (13, 15_000, 5_000, 100_000),   # 83.3%
+        (14, 39_000, 5_000,  76_000),   # 63.3% -> 20.0pp drop
+        (15, 30_000, 5_000,  25_000),   # 41.7% -> 41.6pp drop
+    ]
+    with sqlite3.connect(db_dir / "cache.db") as conn:
+        seed_session_file(
+            conn,
+            path="/fake/jsonl/anomaly-flags-session.jsonl",
+            session_id="anomaly-flags-session-uuid",
+            project_path="/fake/repos/flags",
+        )
+        for i, (day, inp, cc, cr) in enumerate(rows):
+            seed_session_entry(
+                conn,
+                source_path="/fake/jsonl/anomaly-flags-session.jsonl",
+                line_offset=i,
+                timestamp_utc=_iso(dt.datetime(
+                    2026, 4, day, 9, 0, 0, tzinfo=dt.timezone.utc)),
+                model="claude-opus-4-7",
+                input_tokens=inp,
+                output_tokens=1_500,
+                cache_create=cc,
+                cache_read=cr,
+            )
+        conn.commit()
+
+
+def _seed_net_negative(scenario_dir: Path) -> None:
+    """Byte-identical seeding to `net-negative-anomaly`.
+
+    `--no-anomaly` needs a control it can be read against. Sharing that
+    fixture's data makes the ONLY difference between the two goldens the
+    flag itself — and `net_negative` is the predicate no threshold or
+    window value can suppress, so this scenario is the one that proves
+    `--no-anomaly` disables the classifier rather than merely failing to
+    trip it.
+    """
+    db_dir = scenario_dir / ".local/share/cctally"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    create_stats_db(db_dir / "stats.db")
+    create_cache_db(db_dir / "cache.db")
+    with sqlite3.connect(db_dir / "cache.db") as conn:
+        seed_session_file(
+            conn,
+            path="/fake/jsonl/nna-session.jsonl",
+            session_id="nna-negative-session-uuid",
+            project_path="/fake/repos/wasteful",
+        )
+        entries = [
+            (10, 20_000, 2_000, 800_000, 5_000),
+            ( 4, 10_000, 1_000, 600_000, 2_000),
+        ]
+        for i, (hours_back, inp, out, cc, cr) in enumerate(entries):
+            seed_session_entry(
+                conn,
+                source_path="/fake/jsonl/nna-session.jsonl",
+                line_offset=i,
+                timestamp_utc=_iso(_FLAG_AS_OF - dt.timedelta(hours=hours_back)),
+                model="claude-opus-4-7",
+                input_tokens=inp,
+                output_tokens=out,
+                cache_create=cc,
+                cache_read=cr,
+            )
+        conn.commit()
+
+
+def _seed_sort_scenario(scenario_dir: Path) -> None:
+    """Five days ordered differently under every sort key.
+
+    A fixture whose rows happen to order the same way under two keys
+    proves nothing about which branch ran, so the day shapes are chosen
+    so `date`, `cache`, `recent`, `cost` and `anomaly` each yield a
+    distinct row order. 2026-04-13 carries far more cache-write than
+    cache-read tokens, so its net is negative and it is the row the
+    `anomaly` sort has to lift to the top.
+    """
+    db_dir = scenario_dir / ".local/share/cctally"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    create_stats_db(db_dir / "stats.db")
+    create_cache_db(db_dir / "cache.db")
+    rows = [
+        # (day, input, output, cache_create, cache_read)  -> hit % is
+        # cache_read / (input + create + read), each engineered to 100k.
+        (11, 10_000,  1_000,  2_000,  88_000),   # 88%
+        (12, 40_000, 20_000,  5_000,  55_000),   # 55%
+        (13, 30_000,  5_000, 60_000,  10_000),   # 10%, net < 0
+        (14, 30_000, 10_000,  3_000,  67_000),   # 67%
+        (15, 20_000,  2_000,  4_000,  76_000),   # 76%
+    ]
+    with sqlite3.connect(db_dir / "cache.db") as conn:
+        seed_session_file(
+            conn,
+            path="/fake/jsonl/sort-keys-session.jsonl",
+            session_id="sort-keys-session-uuid",
+            project_path="/fake/repos/sortkeys",
+        )
+        for i, (day, inp, out, cc, cr) in enumerate(rows):
+            seed_session_entry(
+                conn,
+                source_path="/fake/jsonl/sort-keys-session.jsonl",
+                line_offset=i,
+                timestamp_utc=_iso(dt.datetime(
+                    2026, 4, day, 9, 0, 0, tzinfo=dt.timezone.utc)),
+                model="claude-opus-4-7",
+                input_tokens=inp,
+                output_tokens=out,
+                cache_create=cc,
+                cache_read=cr,
+            )
+        conn.commit()
+
+
+def _write_flag_scenario(name: str, seed, flags: str | None) -> None:
+    scenario_dir = FIXTURES_DIR / name
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    seed(scenario_dir)
+    body = f'AS_OF="{_iso(_FLAG_AS_OF)}"\n'
+    if flags is not None:
+        body += f'FLAGS="{flags}"\n'
+    (scenario_dir / "input.env").write_text(body)
+
+
+def build_anomaly_flag_scenarios():
+    """One scenario per anomaly flag, each with a same-data control."""
+    # The control: no flags, so the two other scenarios on this data are
+    # read against what the defaults do rather than against nothing.
+    _write_flag_scenario("anomaly-multi-drop-default", _seed_multi_drop, None)
+    # Above the 20.0pp drop, below the 41.6pp one -> exactly one row fires.
+    _write_flag_scenario(
+        "anomaly-threshold-flag", _seed_multi_drop, "--anomaly-threshold-pp 30",
+    )
+    # A 3-day baseline window admits at most 3 samples, below
+    # CACHE_REPORT_MIN_BASELINE_DAYS=5 -> cache_drop is never evaluated.
+    _write_flag_scenario(
+        "anomaly-window-flag", _seed_multi_drop, "--anomaly-window-days 3",
+    )
+    # Classifier off entirely, on the net_negative data no threshold or
+    # window value can clear. Read against `net-negative-anomaly`, which
+    # is the same data with no flag.
+    _write_flag_scenario(
+        "anomaly-disabled-flag", _seed_net_negative, "--no-anomaly",
+    )
+
+
+def build_sort_flag_scenarios():
+    """The four sort keys the CLI defaults never reach (#443 S3 F28).
+
+    `date` (day-mode default) and `net` (session-mode default) are already
+    covered by the existing fixtures, so these four bring all six keys
+    under golden coverage.
+    """
+    for key in ("cache", "recent", "cost", "anomaly"):
+        _write_flag_scenario(
+            f"sort-{key}", _seed_sort_scenario, f"--sort {key}",
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -459,4 +666,6 @@ if __name__ == "__main__":
     build_thin_samples_no_baseline()
     build_days_flag_trailing_window()
     build_by_session_merged_resume()
+    build_anomaly_flag_scenarios()
+    build_sort_flag_scenarios()
     print(f"Built fixtures under {FIXTURES_DIR}")

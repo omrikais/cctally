@@ -1,0 +1,39 @@
+{
+  "repository": {"id": "R1", "nameWithOwner": "omrikais/cctally-dev"},
+  "labels": [
+    {"id": "L1", "name": "bug", "description": "Something is not working", "color": "d73a4a"}
+  ],
+  "milestones": [{"id": "MS1", "number": 1, "title": "Backlog"}],
+  "issues": [
+    {
+      "number": 103, "id": "I103", "title": "Third", "body": "third body", "state": "OPEN",
+      "labels": [{"name": "bug", "description": "Something is not working", "color": "d73a4a"}],
+      "milestone": null, "assignees": [],
+      "comments": [{"id": "C103", "body": "evidence", "author": "alice", "createdAt": "2026-08-01T00:00:00Z"}],
+      "relationships": [], "linkedReferences": []
+    },
+    {
+      "number": 900, "id": "I900", "title": "[Tracking] Open issue triage and execution order",
+      "body": "<!-- cctally-issue-triage:tracker:v1 -->", "state": "OPEN", "labels": [], "milestone": null,
+      "assignees": [], "comments": [], "relationships": [], "linkedReferences": []
+    },
+    {
+      "number": 101, "id": "I101", "title": "First", "body": "first body", "state": "OPEN",
+      "labels": [{"name": "bug", "description": "Something is not working", "color": "d73a4a"}],
+      "milestone": {"number": 1, "title": "Backlog"}, "assignees": [{"login": "alice"}],
+      "comments": [{"id": "C101", "body": "user evidence", "author": "alice", "createdAt": "2026-08-01T00:00:00Z"}],
+      "relationships": [{"kind": "blocks", "issue": 102, "owned": false}],
+      "linkedReferences": [{"kind": "pull-request", "number": 77, "state": "MERGED"}]
+    },
+    {
+      "number": 102, "id": "I102", "title": "Second", "body": "second body", "state": "OPEN",
+      "labels": [], "milestone": null, "assignees": [],
+      "comments": [{"id": "M102", "body": "<!-- cctally-issue-triage:record:v1 -->\n{}", "author": "bot", "createdAt": "2026-08-01T00:00:00Z"}],
+      "relationships": [], "linkedReferences": [{"kind": "issue", "number": 101, "state": "OPEN"}]
+    }
+  ],
+  "tracker": {"number": 900, "id": "I900", "url": "https://github.test/issues/900"},
+  "project": {"id": "P1", "number": 4, "url": "https://github.test/projects/4", "fields": []},
+  "managedRecords": [],
+  "reconcilerState": null
+}

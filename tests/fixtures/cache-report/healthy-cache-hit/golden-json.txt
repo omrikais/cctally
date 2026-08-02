@@ -14,7 +14,10 @@
       "netUsd": 3.727875,
       "anomaly": {
         "triggered": false,
-        "reasons": []
+        "reasons": [],
+        "unevaluated": [
+          "cache_drop"
+        ]
       },
       "modelBreakdowns": [
         {

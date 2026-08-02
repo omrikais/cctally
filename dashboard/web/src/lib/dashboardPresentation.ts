@@ -2,7 +2,6 @@ import type {
   AllSourceData,
   BlocksPanelRow,
   CacheReportEnvelope,
-  CacheReportDailyRow,
   CodexPeriodBucket,
   CodexQuotaBlockRow,
   CodexQuotaDomain,
@@ -840,32 +839,11 @@ export function presentationBlocks(env: Envelope | null, selection: DashboardSel
   return selection === 'claude' ? claude : selection === 'codex' ? codex : [...claude, ...codex];
 }
 
-export function presentationCacheDays(env: Envelope | null, selection: DashboardSelection): CacheReportDailyRow[] | null {
-  if (selection === 'claude') return env?.cache_report?.days ?? null;
-  const native = presentationProviders(env, selection).codex?.cache_report;
-  if (native != null) return native.days;
-  const rows = presentationDailyRows(env, selection);
-  return rows.map((row) => {
-    // Codex input_tokens is cache-inclusive. codexDailyRow already normalizes
-    // the provider-native ratio, so adding cached input to the denominator a
-    // second time would force heavily cached days toward the implausible 50%
-    // seen in the parity screenshots.
-    const pct = row.cache_hit_pct ?? 0;
-    return {
-      date: row.date,
-      cache_hit_percent: pct,
-      input_tokens: row.input_tokens,
-      output_tokens: row.output_tokens,
-      cache_creation_tokens: row.cache_creation_tokens,
-      cache_read_tokens: row.cache_read_tokens,
-      saved_usd: 0,
-      wasted_usd: 0,
-      net_usd: 0,
-      anomaly_triggered: false,
-      anomaly_reasons: [],
-    };
-  });
-}
+// #443 S2 — `presentationCacheDays` is DELETED. Its only two production
+// consumers were the panel's `adapted` and the modal's `sourceCr`, the
+// fabricating fallbacks that session removed: it synthesized a daily series
+// with hard-zero saved/wasted/net dollars, which those fallbacks then dressed
+// up as a report. Nothing derives a cache report from raw daily rows any more.
 
 export function presentationCacheReportComposition(
   env: Envelope | null,

@@ -59,7 +59,7 @@ anomaly verdict. Per-model rows remain visible for both providers.
 | `--offline` | No-op (pricing always embedded). |
 | `--project PROJECT` | Filter to a specific project. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
-| `--json` | Machine-readable JSON. |
+| `--json` | Machine-readable JSON. Claude row anomaly objects include `triggered`, `reasons`, and `unevaluated`; the additive `unevaluated` key keeps `schemaVersion: 1`. |
 | `--anomaly-threshold-pp PP` | Claude Cache% drop threshold for the `cache_drop` trigger. Default `15`. |
 | `--anomaly-window-days N` | Claude trailing baseline window in days. Default `14`. |
 | `--no-anomaly` | Disable Claude `cache_drop` and `net_negative` triggers. |
@@ -105,12 +105,13 @@ qualified join and returns the explicit unavailable envelope with exit 3. The
 all-source form retains both source blocks and has the same exit-3 rule for that
 requested filter.
 
-- **Anomaly baseline silent-skips when samples are thin.** The
+- **Anomaly baseline skips when samples are thin.** The
   `cache_drop` trigger needs ≥5 daily rows or ≥10 session rows in the
   trailing `--anomaly-window-days` window. With fewer samples, the trigger
-  is silently skipped (no warning) — looks like a missed regression but
-  is the correct behavior to avoid first-two-weeks false positives.
-  Widen `--days` or inspect `--days N --json | jq '.days[].anomaly.reasons'`.
+  is skipped in terminal output to avoid first-two-weeks false positives.
+  JSON distinguishes that state from an evaluated-clean row by listing
+  `cache_drop` under `anomaly.unevaluated`; widen `--days`, or inspect both
+  lists with `--days N --json | jq '.days[].anomaly | {reasons, unevaluated}'`.
 - `--since` / `--until` accept either pure-date (`2026-04-10`) or
   full-ISO (`2026-04-10T10:00:00Z`). Mixed-format same-day windows
   collapse to empty (e.g. `--since 20260418 --until 2026-04-18`) — fix:

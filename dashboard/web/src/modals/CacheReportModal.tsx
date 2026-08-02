@@ -21,8 +21,7 @@
 // Spec 2026-05-21 §3.
 import { useState, useSyncExternalStore } from 'react';
 import { Modal } from './Modal';
-import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
-import { useDisplayTz } from '../hooks/useDisplayTz';
+import { useAccountScope, useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { CacheReportSpotlight } from './CacheReportSpotlight';
 import { CacheSparkline } from './CacheSparkline';
@@ -31,7 +30,6 @@ import { CacheBreakdownCard } from './CacheBreakdownCard';
 import { CacheReportSettings } from './CacheReportSettings';
 import { fmt } from '../lib/fmt';
 import {
-  presentationCacheDays,
   presentationCacheReportComposition,
   presentationProviders,
   type ProviderPresentationSection,
@@ -45,31 +43,38 @@ import {
 } from '../lib/cacheReportVerdict';
 import { getState, subscribeStore } from '../store/store';
 import type { DashboardSelection } from '../types/envelope';
+import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
 import {
-  CACHE_REPORT_BAND_PP,
-  CACHE_REPORT_MIN_BASELINE_DAYS,
-} from '../lib/cache-report-constants';
-import type { CacheReportDailyRow, CacheReportEnvelope } from '../types/envelope';
+  cachePercent, cachePercentText, cacheVocabulary, notApplicableReason,
+  type CacheVocabulary,
+} from '../lib/cacheReportVocabulary';
+import { CacheNotApplicable } from './CacheNotApplicable';
+import type {
+  CacheAnomalyReason, CacheReportDailyRow, CacheReportEnvelope,
+} from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
 
 // Shared per-row coloring rules for the daily section (desktop table + mobile
 // cards render from the same derivation, so the two surfaces never diverge):
-//   - hit-bad iff the row's cache_hit_percent sits more than the displayed
-//     ±BAND_PP band below today's baseline median (see the long note at the
-//     desktop table for why this is band-bound, not the anomaly classifier);
+//   - hit-bad iff the row's percentage sits more than the displayed ±BAND_PP
+//     band below today's baseline median (see the long note at the desktop
+//     table for why this is band-bound, not the anomaly classifier);
 //   - net-neg iff net_usd < 0;
-//   - baselineKnown gates the neutral (uncolored) hit cell when no baseline
-//     exists yet.
+//   - `comparable` gates the neutral (uncolored) hit cell. It needs BOTH ends
+//     of the comparison: a baseline to compare against, and — #443 S2 §4.3 — a
+//     percentage to compare. This rule reads the RAW number, not `pctFloor`, so
+//     a row publishing neither percent key previously evaluated
+//     `undefined < 62`, which is false, and the row silently rendered hit-good:
+//     a colour asserting it sat inside the band.
 function dailyRowFlags(
   d: CacheReportDailyRow,
   baselineMedian: number | null,
-): { baselineKnown: boolean; isHitBad: boolean; isNetNeg: boolean } {
-  const baselineKnown = baselineMedian !== null;
+): { comparable: boolean; isHitBad: boolean; isNetNeg: boolean } {
+  const pct = cachePercent(d);
+  const comparable = baselineMedian !== null && pct !== null;
   const isHitBad =
-    baselineKnown &&
-    baselineMedian !== null &&
-    d.cache_hit_percent < baselineMedian - CACHE_REPORT_BAND_PP;
-  return { baselineKnown, isHitBad, isNetNeg: d.net_usd < 0 };
+    comparable && pct! < baselineMedian! - CACHE_REPORT_BAND_PP;
+  return { comparable, isHitBad, isNetNeg: d.net_usd < 0 };
 }
 
 // One derivation for BOTH the desktop table and the mobile cards, so the two
@@ -78,13 +83,27 @@ function dailyRowFlags(
 // name, which is what names the predicate that did not run. The state->class
 // map lives in the chokepoint beside the state->glyph map, so adding a state
 // is one edit rather than two.
-function dailyFlagClass(d: CacheReportDailyRow): string {
-  return cacheRowFlagClass(cacheRowVerdict(d).state);
+//
+// #443 S2 — both take the report's applicable predicate set and forward it.
+// Deriving a row verdict here against the module default would leave every
+// Codex row resolving against the Claude pair, which is the exact silent
+// no-op spec §4.6 names.
+function dailyFlagClass(
+  d: CacheReportDailyRow,
+  predicates?: readonly CacheAnomalyReason[],
+): string {
+  return cacheRowFlagClass(cacheRowVerdict(d, predicates).state);
 }
 
-function DailyFlagGlyph({ d }: { d: CacheReportDailyRow }) {
-  const v = cacheRowVerdict(d);
-  const label = cacheRowFlagLabel(v.state, v.unevaluated, v.observed);
+function DailyFlagGlyph(
+  { d, predicates, reasonLabel }: {
+    d: CacheReportDailyRow;
+    predicates?: readonly CacheAnomalyReason[];
+    reasonLabel?: (predicate: CacheAnomalyReason) => string;
+  },
+) {
+  const v = cacheRowVerdict(d, predicates);
+  const label = cacheRowFlagLabel(v.state, v.unevaluated, v.observed, reasonLabel);
   return (
     // `crm-flag-glyph` is the hook the neutral-marker rule in index.css selects
     // on (`td.flag-none .crm-flag-glyph`). It is a styling contract, not
@@ -100,12 +119,12 @@ function DailyFlagGlyph({ d }: { d: CacheReportDailyRow }) {
 // independent signals — the displayed ±BAND_PP band and the configurable
 // anomaly classifier. The epic's preserve list requires them explained rather
 // than collapsed, which is also what resolves "red percent beside a green ✓".
-function DailyLegend() {
+function DailyLegend({ vocab }: { vocab: CacheVocabulary }) {
   return (
     <div className="crm-daily-legend" data-testid="crm-daily-legend">
       Flag: ✓ evaluated, no anomaly — ⚠ anomaly — · not evaluated
-      (each flag's label names what was skipped). Cache % colour tracks
-      the displayed ±{CACHE_REPORT_BAND_PP}pp band around the median,
+      (each flag's label names what was skipped). {vocab.percentColumnHeader} colour
+      tracks the displayed ±{CACHE_REPORT_BAND_PP}pp band around the median,
       which is deliberately separate from the configurable anomaly
       threshold.
     </div>
@@ -122,21 +141,15 @@ function observedDayCount(days: CacheReportDailyRow[]): number {
   return days.filter((d) => d.observed !== false).length;
 }
 
-function median(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1
-    ? sorted[middle]
-    : (sorted[middle - 1] + sorted[middle]) / 2;
-}
-
 function AllCacheReportSection({
   section,
 }: {
   section: ProviderPresentationSection<CacheReportEnvelope>;
 }) {
   const report = section.value;
+  // Each section renders in its OWN provider's vocabulary — the merged `all`
+  // selection has none of its own to pick (#443 S2 §4.4).
+  const vocab = cacheVocabulary(section.source);
   return (
     <section
       className="provider-composition-section cache-provider-detail"
@@ -155,11 +168,11 @@ function AllCacheReportSection({
       ) : (
         <>
           <div className="crm-section">
-            <CacheReportSpotlight cr={report} />
+            <CacheReportSpotlight cr={report} source={section.source} />
           </div>
           <div className="crm-section">
             <div className="crm-section-head crm-sh-timeline">
-              Cache hit % — {report.window_days}-day timeline
+              {vocab.timelineHeading} — {report.window_days}-day timeline
               <span className="meta">provider-local</span>
             </div>
             <div className="crm-chart-frame timeline">
@@ -168,10 +181,11 @@ function AllCacheReportSection({
                 baseline_median_percent={report.today.baseline_median_percent}
                 today_marker_color={report.today.anomaly_triggered ? 'var(--accent-amber)' : 'var(--accent-green)'}
                 size="large"
+                source={section.source}
               />
             </div>
           </div>
-          <CacheNetBars days={report.days} size="large" />
+          <CacheNetBars days={report.days} size="large" source={section.source} />
           <div className="crm-counterfactual">
             Provider-local counterfactual:{' '}
             <strong>+${report.fourteen_day_counterfactual_usd.toFixed(2)}</strong>
@@ -185,7 +199,7 @@ function AllCacheReportSection({
               {report.days.map((day) => (
                 <div className="provider-daily-summary-row" key={day.date}>
                   <span>{fmt.calDate(day.date)}</span>
-                  <span>{measured(day, <>{fmt.pctFloor(day.cache_hit_percent)}%</>)}</span>
+                  <span>{measured(day, <>{cachePercentText(day) ?? '—'}</>)}</span>
                   <span className={day.observed === false ? '' : day.net_usd < 0 ? 'net-neg' : 'net-pos'}>
                     {measured(day, <>{fmt.usdSigned(day.net_usd)}</>)}
                   </span>
@@ -223,64 +237,89 @@ function AllCacheReportModal() {
 function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
   // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
   const env = useScopedSnapshot(source);
-  const display = useDisplayTz();
-  const isClaude = source === 'claude';
-  const nativeReport = env?.sources?.codex?.data?.cache_report ?? null;
-  const sourceRows = isClaude
-    ? null
-    : (presentationCacheDays(env, source) ?? [])
-        .filter((row) => row.input_tokens + row.cache_read_tokens + row.output_tokens > 0)
-        .slice(0, 14);
-  const baseline = sourceRows == null ? null : median(sourceRows.slice(1).map((row) => row.cache_hit_percent));
-  const first = sourceRows?.[0];
-  const sourceCr: CacheReportEnvelope | null = nativeReport ?? (sourceRows == null ? null : {
-    window_days: 14,
-    anomaly_threshold_pp: CACHE_REPORT_BAND_PP,
-    anomaly_window_days: 14,
-    today: {
-      date: first?.date ?? fmt.calendarDateKey(env?.generated_at, {
-        tz: display.resolvedTz,
-        offsetLabel: display.offsetLabel,
-      }) ?? '1970-01-01',
-      cache_hit_percent: first?.cache_hit_percent ?? 0,
-      baseline_median_percent: baseline,
-      delta_pp: first == null || baseline == null ? null : first.cache_hit_percent - baseline,
-      net_usd: 0,
-      saved_usd: 0,
-      wasted_usd: 0,
-      anomaly_triggered: false,
-      anomaly_reasons: [],
-      baseline_daily_row_count: Math.max(CACHE_REPORT_MIN_BASELINE_DAYS, sourceRows.length),
-    },
-    days: sourceRows,
-    by_project: [],
-    by_model: [],
-    seven_day_net_usd: 0,
-    seven_day_anomaly_count: 0,
-    fourteen_day_counterfactual_usd: 0,
-    fourteen_day_efficiency_ratio: 0,
-    is_empty: false,
-  });
-  const cr = isClaude ? env?.cache_report : sourceCr;
-  // #443 F5 — the modal never computed a composition, so a stale or degraded
-  // source showed a confident verdict here while the panel behind it said
-  // "degraded". Same chip and reason as the panel, from the same helper.
+  // #443 S2 (F3/F4/F10) — the `sourceCr` compatibility fallback is DELETED. It
+  // hard-coded `is_empty: false` so the empty short-circuit could never fire,
+  // forced `baseline_daily_row_count` past the five-sample floor so "Building
+  // baseline" was unreachable, took a one-sample median at two rows, and seeded
+  // the settings popover with `anomaly_threshold_pp: CACHE_REPORT_BAND_PP` — so
+  // Save on that path rewrote the GLOBAL threshold from 15 to 5 and changed
+  // Claude's verdicts. With `cr` always the server's own report, none of those
+  // values can be invented, which is what closes F10 (the finding dies with the
+  // fallback, not with a re-added provider guard).
+  //
+  // #443 F5 — the modal never computed a composition either, so a stale or
+  // degraded source showed a confident verdict here while the panel behind it
+  // said "degraded". Same section, same chip, same reason as the panel.
   const section = presentationCacheReportComposition(env, source).sections[0];
-  // As in the panel: the chip describes the SECTION's report. On the Codex
-  // compatibility-fallback path `sourceCr` is not `section.value`, and pairing
-  // a full verdict with a chip denying the report exists would contradict the
-  // screen. S2 (F3/F4) owns that fallback's own presentation.
-  const rendersSectionValue = (cr ?? null) === (section?.value ?? null);
-  const statusChip = section && rendersSectionValue && section.status !== 'available' ? (
+  const cr = section?.value ?? null;
+  // Pinned to the source this modal BOUND its data to, not the live
+  // activeSource — otherwise the two disagree the moment the source
+  // changes while the modal is open, and the guard below has to fall
+  // back to "could not be built" for what is really just empty.
+  const scope = useAccountScope(source);
+  const vocab = cacheVocabulary(source);
+  // The MAP is the authoritative signal, not the value: both fields stay
+  // numeric on the wire through the transition release, so a client inferring
+  // inapplicability from nullness would render a structural zero — and a
+  // structural 1.0 efficiency ratio — as measurements (#443 S2 §3.3).
+  const wastedNotApplicable = cr == null
+    ? null : notApplicableReason(cr, 'wasted_usd');
+  const efficiencyNotApplicable = cr == null
+    ? null : notApplicableReason(cr, 'fourteen_day_efficiency_ratio');
+  const statusChip = section && section.status !== 'available' ? (
     <span className="provider-section-status">{section.status}</span>
   ) : null;
-  const statusReason = section && rendersSectionValue ? section.reason : null;
+  const statusReason = section?.reason ?? null;
+  // The panel's three-way split, which the modal did not have: its null branch
+  // was only hydrating-versus-failure and its empty branch keyed on
+  // `cr.is_empty`, which needs a non-null report. Routing `cr` through the
+  // composition without this would send an ordinary empty Codex source — and
+  // every focused account with no Codex child — to "the snapshot could not be
+  // built", a new false statement shipped by a truthfulness session. See the
+  // panel for why the three routes differ.
+  const accountEmpty = cr == null
+    && scope.source === source  // belt-and-braces: the hook now pins it
+    && scope.accountKey !== null
+    && scope.isEmpty;
+  const isEmpty = section?.status === 'empty' || cr?.is_empty === true || accountEmpty;
   const [showSettings, setShowSettings] = useState(false);
   // CR-2/CR-3 — the 8-column daily table reflows into an unlabeled run-on on
   // mobile, and the long header subtitle crowds the sticky title into "Cache
   // ⋯". A JS branch (JSDOM-testable, matches the Projects mobile-card
   // precedent) renders labeled cards + a short subtitle at ≤640w.
   const isMobile = useIsMobile();
+
+  // Empty state — no activity in the window. The panel renders its own
+  // short-circuit too; here we surface the same posture in the modal body so
+  // the user understands the modal isn't broken. Checked BEFORE the null
+  // branch: after S2 an available-and-empty source arrives with a null value.
+  if (isEmpty) {
+    const bare = section?.status === 'empty' || accountEmpty;
+    return (
+      <Modal
+        title="Cache Report"
+        accentClass="accent-teal"
+        headerExtras={(bare ? null : statusChip) ?? undefined}
+      >
+        <div style={{ color: 'var(--text-dim)', padding: '20px 0' }}>
+          {/*
+            The day count is claimed only where a report survived to state it.
+            `presentationCacheReportComposition` nulls `section.value` for an
+            available-and-empty report but deliberately keeps it on `degraded`,
+            so one of the two empty routes still knows its window and the other
+            does not. Reading a count off the nulled value is impossible, and
+            inventing one would be the same class of error this session removes.
+          */}
+          {cr == null
+            ? `No ${section?.label ?? 'Claude'} activity yet.`
+            : `No ${section?.label ?? 'Claude'} activity in the last ${cr.window_days} days.`}
+        </div>
+        {!bare && statusReason && (
+          <div className="provider-section-reason">{statusReason}</div>
+        )}
+      </Modal>
+    );
+  }
 
   if (!cr) {
     // #443 F8 — the modal had no failure branch at all, printing an
@@ -293,26 +332,6 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
             ? 'Loading…'
             : 'Cache Report unavailable — the snapshot could not be built. Retrying on the next sync.'}
         </div>
-      </Modal>
-    );
-  }
-
-  // Empty state — no Claude activity in the window. The panel renders
-  // its own short-circuit too; here we surface the same posture in
-  // the modal body so the user understands the modal isn't broken.
-  if (cr.is_empty) {
-    return (
-      <Modal
-        title="Cache Report"
-        accentClass="accent-teal"
-        headerExtras={statusChip ?? undefined}
-      >
-        <div style={{ color: 'var(--text-dim)', padding: '20px 0' }}>
-          No {source === 'codex' ? 'Codex' : source === 'all' ? 'provider' : 'Claude'} activity in the last {cr.window_days} days.
-        </div>
-        {statusReason && (
-          <div className="provider-section-reason">{statusReason}</div>
-        )}
       </Modal>
     );
   }
@@ -398,12 +417,12 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       )}
 
       {/* 1. Spotlight */}
-      <CacheReportSpotlight cr={cr} />
+      <CacheReportSpotlight cr={cr} source={source} />
 
-      {/* 2. Cache hit % timeline */}
+      {/* 2. Provider percent timeline */}
       <div className="crm-section">
         <div className="crm-section-head crm-sh-timeline">
-          Cache hit % — {cr.window_days}-day timeline
+          {vocab.timelineHeading} — {cr.window_days}-day timeline
           <span className="meta">
             band = {cr.anomaly_window_days}d median ±{CACHE_REPORT_BAND_PP}pp
           </span>
@@ -414,6 +433,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
             baseline_median_percent={cr.today.baseline_median_percent}
             today_marker_color={todayMarker}
             size="large"
+            source={source}
           />
         </div>
       </div>
@@ -422,14 +442,22 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       <CacheNetBars
         days={cr.days}
         size="large"
+        source={source}
       />
 
       {/* 4. Counterfactual callout */}
       <div className="crm-counterfactual">
-          Without caching, you'd have paid{' '}
+          {vocab.counterfactualLead}{' '}
           <strong>+${cr.fourteen_day_counterfactual_usd.toFixed(2)} more</strong>{' '}
-          over the last {cr.window_days} days · cache efficiency{' '}
-          <span title={`saved / (saved + |wasted|) = ${efficiencyPct}%`}>{efficiencyPct}%</span>
+          {/*
+            The figure is a sum over `days`, and the synthetic today row
+            contributes zero — so "over the last {window_days} days" claimed a
+            day it does not cover. It names what it actually summed instead.
+          */}
+          across {observedDayCount(cr.days)} observed days · {vocab.efficiencyLabel}{' '}
+          {efficiencyNotApplicable == null
+            ? <span title={`saved / (saved + |wasted|) = ${efficiencyPct}%`}>{efficiencyPct}%</span>
+            : <CacheNotApplicable reason={efficiencyNotApplicable} />}
       </div>
 
       {/* 5. Daily rows table */}
@@ -438,8 +466,8 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
           Daily rows · {cr.window_days} days
           <span className="meta">{observedDayCount(cr.days)} days observed</span>
         </div>
-        <DailyLegend />
-        {/* hit-bad rule: a row is bad iff its cache_hit_percent sits more than
+        <DailyLegend vocab={vocab} />
+        {/* hit-bad rule: a row is bad iff its percentage sits more than
             CACHE_REPORT_BAND_PP below today's baseline median — i.e. it falls
             below the SAME tinted ±BAND_PP band the sparkline draws around the
             median. Earlier rounds tied hit-bad to `d.anomaly_reasons`
@@ -450,28 +478,28 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
             BAND_PP (via `dailyRowFlags`) keeps the cell color and the sparkline
             band in lock-step. The Flag column (`flag-warn`/`flag-ok`) stays tied
             to each row's own `anomaly_triggered`, so display-band coloring and
-            the per-row anomaly classifier remain independent. `baselineKnown`
-            gates the neutral cell class ('' rather than 'hit-good') when there
-            is nothing to compare against yet. CR-2: the desktop table reflows
+            the per-row anomaly classifier remain independent. `comparable`
+            gates the neutral cell class ('' rather than 'hit-good') when either
+            end of the comparison is missing. CR-2: the desktop table reflows
             into an unlabeled run-on on mobile, so at ≤640w we render labeled
             cards from the same `dailyRowFlags` derivation instead. */}
         {isMobile ? (
           <div className="crm-daily-cards">
             {cr.days.map((d) => {
               const isToday = d.date === cr.today.date;
-              const { baselineKnown, isHitBad, isNetNeg } = dailyRowFlags(
+              const { comparable, isHitBad, isNetNeg } = dailyRowFlags(
                 d,
                 cr.today.baseline_median_percent,
               );
-              const hitClass = baselineKnown
+              const hitClass = comparable
                 ? isHitBad
                   ? 'hit-bad'
                   : 'hit-good'
                 : '';
               const cells: Array<[string, JSX.Element]> = [
                 [
-                  'Cache %',
-                  measured(d, <span className={hitClass}>{fmt.pctFloor(d.cache_hit_percent)}%</span>),
+                  vocab.percentColumnHeader,
+                  measured(d, <span className={hitClass}>{cachePercentText(d) ?? '—'}</span>),
                 ],
                 [
                   'Net',
@@ -482,7 +510,16 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                   )),
                 ],
                 ['Saved', measured(d, <span>{fmt.usd2(d.saved_usd)}</span>)],
-                ['Wasted', measured(d, <span>{fmt.usd2(d.wasted_usd)}</span>)],
+                [
+                  'Wasted',
+                  // Not applicable outranks unmeasured: an em dash here would
+                  // read as "not captured today" for a figure that does not
+                  // exist on this provider at all, and would carry none of the
+                  // reason the wire supplies.
+                  wastedNotApplicable == null
+                    ? measured(d, <span>{fmt.usd2(d.wasted_usd)}</span>)
+                    : <CacheNotApplicable reason={wastedNotApplicable} />,
+                ],
                 ['Tok In', measured(d, <span>{fmt.compact(d.input_tokens, { upper: true })}</span>)],
                 ['Tok Out', measured(d, <span>{fmt.compact(d.output_tokens, { upper: true })}</span>)],
               ];
@@ -495,8 +532,12 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                 >
                   <div className="crm-daily-card-head">
                     <span className="cd-date">{fmt.calDate(d.date)}</span>
-                    <span className={`cd-flag ${dailyFlagClass(d)}`}>
-                      <DailyFlagGlyph d={d} />
+                    <span className={`cd-flag ${dailyFlagClass(d, cr.anomaly_predicates)}`}>
+                      <DailyFlagGlyph
+                        d={d}
+                        predicates={cr.anomaly_predicates}
+                        reasonLabel={vocab.reasonLabel}
+                      />
                     </span>
                   </div>
                   <div className="crm-daily-card-grid">
@@ -516,7 +557,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
             <thead>
               <tr>
                 <th className="c-date">Date</th>
-                <th className="c-hit num">Cache %</th>
+                <th className="c-hit num">{vocab.percentColumnHeader}</th>
                 <th className="c-tokens num">Tok In</th>
                 <th className="c-tokens num">Tok Out</th>
                 <th className="c-saved num">Saved</th>
@@ -528,7 +569,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
             <tbody>
               {cr.days.map((d) => {
                 const isToday = d.date === cr.today.date;
-                const { baselineKnown, isHitBad, isNetNeg } = dailyRowFlags(
+                const { comparable, isHitBad, isNetNeg } = dailyRowFlags(
                   d,
                   cr.today.baseline_median_percent,
                 );
@@ -544,10 +585,10 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                       className={`num ${
                         d.observed === false
                           ? ''
-                          : baselineKnown ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
+                          : comparable ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
                       }`.trim()}
                     >
-                      {measured(d, <>{fmt.pctFloor(d.cache_hit_percent)}%</>)}
+                      {measured(d, <>{cachePercentText(d) ?? '—'}</>)}
                     </td>
                     <td className="num">
                       {measured(d, <>{fmt.compact(d.input_tokens, { upper: true })}</>)}
@@ -556,12 +597,20 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                       {measured(d, <>{fmt.compact(d.output_tokens, { upper: true })}</>)}
                     </td>
                     <td className="num">{measured(d, <>{fmt.usd2(d.saved_usd)}</>)}</td>
-                    <td className="num">{measured(d, <>{fmt.usd2(d.wasted_usd)}</>)}</td>
+                    <td className="num">
+                      {wastedNotApplicable == null
+                        ? measured(d, <>{fmt.usd2(d.wasted_usd)}</>)
+                        : <CacheNotApplicable reason={wastedNotApplicable} />}
+                    </td>
                     <td className={`num ${d.observed === false ? '' : isNetNeg ? 'net-neg' : 'net-pos'}`.trim()}>
                       {measured(d, <>{fmt.usdSigned(d.net_usd)}</>)}
                     </td>
-                    <td className={`num ${dailyFlagClass(d)}`}>
-                      <DailyFlagGlyph d={d} />
+                    <td className={`num ${dailyFlagClass(d, cr.anomaly_predicates)}`}>
+                      <DailyFlagGlyph
+                        d={d}
+                        predicates={cr.anomaly_predicates}
+                        reasonLabel={vocab.reasonLabel}
+                      />
                     </td>
                   </tr>
                 );

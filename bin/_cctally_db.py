@@ -302,6 +302,33 @@ class StatsEpochMismatchError(sqlite3.DatabaseError):
     DB failure; ``main()`` maps it to a staged exit 3."""
 
 
+class StatsEpochRebuildDeferred(BaseException):
+    """A readable wrong-epoch stats index is rebuilding out of process.
+
+    Ordinary callers must not read the schema-incompatible old index or pay
+    whole-journal replay latency inline. ``outcome`` records whether this
+    caller spawned the worker, observed an existing attempt, or could not
+    spawn it; ``main()`` maps every case to prompt retry guidance and exit 3.
+    This deliberately derives directly from ``BaseException``: reporting
+    kernels contain many broad ``Exception`` / ``sqlite3.DatabaseError``
+    fallbacks that turn missing optional data into ``n/a``. Swallowing this
+    control signal there would publish a misleading partial report. The CLI
+    boundary, dashboard, and statusline catch it explicitly; ``finally``
+    cleanup still runs normally.
+    """
+
+    def __init__(self, outcome: str) -> None:
+        self.outcome = str(outcome)
+        message = (
+            "could not start the stats.db index epoch rebuild; retry this "
+            "command shortly"
+            if self.outcome == "failed"
+            else "stats.db index epoch rebuild is running in the background; "
+                 "retry shortly"
+        )
+        super().__init__(message)
+
+
 _SQLITE_CORRUPTION_MESSAGES = (
     "database disk image is malformed",
     "file is not a database",

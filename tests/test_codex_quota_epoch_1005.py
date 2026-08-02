@@ -8,7 +8,9 @@ the schema helper would never run on an upgraded install and the column would
 simply never appear. That is what this module pins — not the constant's value
 (other modules assert that), but the behaviour the constant buys: an index
 stamped at a previous epoch is rebuilt from the journal and comes back carrying
-the new state.
+the new state. Ordinary opens defer that work as of #453, so the two transition
+assertions below invoke the explicit synchronous resolver used by the detached
+worker.
 
 1005 added the reverse map, the per-group digest and the ledger-state row. 1006
 added the periodic verification's ``last_full_pass_at`` deadline, and gets its
@@ -67,6 +69,11 @@ def _columns(conn, table):
     return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
+def _resolve_epoch_transition():
+    import _cctally_store as store
+    return store.resolve_stats_epoch_mismatch()
+
+
 def _downgrade_to_previous_epoch(ns):
     """Turn the live index into the shape a pre-public-#5 binary left behind."""
     conn = ns["open_db"]()
@@ -99,7 +106,7 @@ def test_a_previous_epoch_index_rebuilds_carrying_the_projection_state(ns):
     finally:
         conn.close()
 
-    conn = ns["open_db"]()
+    conn = _resolve_epoch_transition()
     try:
         epoch = conn.execute("PRAGMA user_version").fetchone()[0]
         block_columns = _columns(conn, "quota_window_blocks")
@@ -142,7 +149,7 @@ def test_an_epoch_1005_index_rebuilds_carrying_the_verification_deadline(ns):
     finally:
         conn.close()
 
-    conn = ns["open_db"]()
+    conn = _resolve_epoch_transition()
     try:
         epoch = conn.execute("PRAGMA user_version").fetchone()[0]
         ledger_columns = _columns(conn, NEW_TABLE)

@@ -12,14 +12,24 @@ import { App } from '../App';
 import {
   _resetForTests,
   dispatch,
+  getScopedSnapshot,
   getState,
   updateSnapshot,
 } from '../store/store';
 import type {
+  CacheReportDailyRow,
   CacheReportEnvelope,
+  CodexSourceData,
   Envelope,
 } from '../types/envelope';
 import { stubMobileMedia } from '../test-utils/mobileMedia';
+import envelopeFixture from '../../__tests__/fixtures/envelope.json';
+import {
+  ACCOUNT_A,
+  ACCOUNT_EMPTY,
+  makeDecoratedCodexSourceData,
+  makeSourceEnvelope,
+} from '../test-utils/sourceEnvelope';
 
 beforeEach(() => {
   localStorage.clear();
@@ -605,14 +615,17 @@ describe('<CacheReportModal /> settings popover', () => {
 
 describe('<CacheReportModal /> empty + loading states', () => {
   it('renders empty state when is_empty', () => {
+    // #443 S2 — the composition nulls `section.value` for an
+    // available-and-empty report, so the day count is no longer available to
+    // claim here. The copy drops it rather than inventing one; the degraded
+    // path below keeps its report and so keeps the count.
     updateSnapshot(envelopeWith(makeCacheReport({
       is_empty: true,
       days: [],
     })));
     render(<CacheReportModal />);
-    expect(
-      screen.getByText(/no claude activity in the last 14 days/i),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/no claude activity yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
   });
 
   it('renders loading placeholder when snapshot is null', () => {
@@ -973,6 +986,120 @@ describe('<CacheReportModal /> #443 S1 provider status', () => {
 });
 
 // ---------------------------------------------------------------------------
+// #443 S2 — both fabricating fallbacks are deleted. The single-source modal
+// reads the same composition section the all-mode path already used, so the
+// card and the modal cannot disagree by construction.
+// ---------------------------------------------------------------------------
+
+function codexEnv(cacheReport: CacheReportEnvelope | null): Envelope {
+  const e = {
+    ...(structuredClone(envelopeFixture) as unknown as Envelope),
+    ...makeSourceEnvelope(),
+  };
+  e.sources!.codex.data!.cache_report = cacheReport;
+  return e;
+}
+
+function openCodex(e: Envelope): void {
+  updateSnapshot(e);
+  dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+}
+
+function codexCacheReport(): CacheReportEnvelope {
+  // The S2 wire shape: dual-published percent, the not-applicable map, and the
+  // Codex-only predicate set (bin/_lib_cache_report_wire.py).
+  const base = makeCacheReport();
+  return {
+    ...base,
+    today: { ...base.today, cached_input_percent: base.today.cache_hit_percent },
+    days: base.days.map((d) => ({
+      ...d, cached_input_percent: d.cache_hit_percent,
+    })),
+    not_applicable: {
+      wasted_usd: 'OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.',
+      fourteen_day_efficiency_ratio: 'Efficiency compares saved against wasted, and Codex has no wasted-cache figure.',
+    },
+    anomaly_predicates: ['cache_drop'],
+  };
+}
+
+describe('<CacheReportModal /> #443 S2 fallback deletion', () => {
+  it('renders the unavailable body, not a fabricated verdict, when the native report is absent', () => {
+    openCodex(codexEnv(null));
+    render(<CacheReportModal />);
+    expect(screen.getByText(/could not be built/i)).toBeInTheDocument();
+    // The fabrication is gone: no spotlight, no timeline, no daily table.
+    expect(screen.queryByText(/today's spotlight/i)).toBeNull();
+    expect(document.querySelector('.ch-table')).toBeNull();
+  });
+
+  it('never renders a settings gear seeded with a value the server did not supply', () => {
+    // F10 dies with the fallback. `sourceCr` seeded anomaly_threshold_pp with
+    // CACHE_REPORT_BAND_PP (5) and handed it to the popover as the CURRENT
+    // value, so Save rewrote the global threshold from 15 to 5 and changed
+    // Claude's verdicts. With no report there is now no gear at all.
+    openCodex(codexEnv(null));
+    render(<CacheReportModal />);
+    expect(
+      screen.queryByRole('button', { name: /cache report settings/i }),
+    ).toBeNull();
+  });
+
+  it('seeds the gear from the server report when one exists', () => {
+    // Non-vacuity for the assertion above: the gear is not simply gone.
+    openCodex(codexEnv(codexCacheReport()));
+    render(<CacheReportModal />);
+    fireEvent.click(
+      screen.getByRole('button', { name: /cache report settings/i }),
+    );
+    expect((screen.getByLabelText(/anomaly threshold/i) as HTMLInputElement).value)
+      .toBe('15');
+  });
+
+  it('renders the idle-empty copy, not the build-failure copy, for an empty Codex source', () => {
+    openCodex(codexEnv(makeCacheReport({ is_empty: true, days: [] })));
+    render(<CacheReportModal />);
+    expect(screen.getByText(/No Codex activity/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
+  });
+
+  it('renders empty, not failure, for a focused account with no Codex child', () => {
+    const slice = makeSourceEnvelope() as unknown as {
+      sources: { codex: { data: CodexSourceData } };
+    };
+    slice.sources.codex.data = makeDecoratedCodexSourceData();
+    updateSnapshot(slice as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_EMPTY });
+    render(<CacheReportModal />);
+    expect(screen.getByText(/No Codex activity/i)).toBeInTheDocument();
+    expect(screen.queryByText(/could not be built/i)).toBeNull();
+  });
+
+  it('carries every S2 field through account scoping for a populated child', () => {
+    // The counterpart: scoping passes `child.cache_report ?? null` through, so
+    // a focused account WITH cache activity must still see cached_input_percent,
+    // not_applicable and anomaly_predicates intact. Without this, scoping could
+    // silently strip the new fields and every other test here would pass.
+    const data = makeDecoratedCodexSourceData();
+    data.account_scopes![ACCOUNT_A].cache_report = codexCacheReport();
+    const slice = makeSourceEnvelope() as unknown as {
+      sources: { codex: { data: CodexSourceData } };
+    };
+    slice.sources.codex.data = data;
+    updateSnapshot(slice as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', account: ACCOUNT_A });
+    const scoped = getScopedSnapshot()!.sources!.codex!.data as CodexSourceData;
+    const cr = scoped.cache_report!;
+    expect(cr.anomaly_predicates).toEqual(['cache_drop']);
+    expect(cr.not_applicable!.wasted_usd).toMatch(/cache-write premium/);
+    expect(cr.today.cached_input_percent).toBe(68);
+    expect(cr.days[0].cached_input_percent).toBe(67);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #443 S1 review — the all-mode section gained observedDayCount + measured();
 // nothing exercised either.
 // ---------------------------------------------------------------------------
@@ -1008,5 +1135,68 @@ describe('<CacheReportModal /> #443 S1 all-mode not-measured treatment', () => {
     expect(synthetic.querySelector('.net-neg')).toBeNull();
     // A real row beside it still renders its measurement.
     expect(rows[1].textContent).toMatch(/%/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S2 §4.3 / §4.5 — percent reads and the counterfactual's day claim.
+// ---------------------------------------------------------------------------
+
+describe('<CacheReportModal /> #443 S2 nullable percent in the daily table', () => {
+  function reportWithUnresolvableRow(): CacheReportEnvelope {
+    const base = makeCacheReport();
+    const days = [...base.days];
+    const bare = { ...days[3] } as Partial<CacheReportDailyRow> & { date: string };
+    delete bare.cache_hit_percent;
+    days[3] = bare as CacheReportDailyRow;
+    return { ...base, days };
+  }
+
+  it('does not band-colour a row with no resolvable percent', () => {
+    // dailyRowFlags compares the RAW percentage against the ±BAND_PP band, so
+    // an absent pair of keys previously produced `undefined < 62`, which is
+    // false — the row silently rendered hit-good, a colour claiming it sat
+    // inside the band.
+    const cr = reportWithUnresolvableRow();
+    updateSnapshot(envelopeWith(cr));
+    render(<CacheReportModal />);
+    const row = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${cr.days[3].date}"]`,
+    )!;
+    const hitCell = row.querySelectorAll('td')[1];
+    expect(hitCell.className).not.toContain('hit-good');
+    expect(hitCell.className).not.toContain('hit-bad');
+    expect(hitCell.textContent).not.toContain('NaN');
+    // Non-vacuity: a neighbouring row with a percent IS coloured.
+    const neighbour = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${cr.days[4].date}"]`,
+    )!;
+    expect(neighbour.querySelectorAll('td')[1].className).toMatch(/hit-(good|bad)/);
+  });
+
+  it('reads the Codex authoritative percent in the daily table', () => {
+    const base = makeCacheReport();
+    const days = [...base.days];
+    // Keys that DISAGREE, so equality cannot make this pass either way.
+    days[0] = { ...days[0], cached_input_percent: 12, cache_hit_percent: 88 };
+    updateSnapshot(envelopeWith({ ...base, days }));
+    render(<CacheReportModal />);
+    const row = document.querySelector(
+      `[data-testid="crm-daily-row"][data-date="${days[0].date}"]`,
+    )!;
+    expect(row.querySelectorAll('td')[1].textContent).toBe('12%');
+  });
+});
+
+describe('<CacheReportModal /> #443 S2 counterfactual day claim', () => {
+  it('counts the days it actually summed, not the window length', () => {
+    // `fourteen_day_counterfactual_usd` is a stable sum over `days`, and the
+    // synthetic today row contributes zero — so "over the last 14 days" claimed
+    // a day the figure does not cover. S1's synthetic row makes that visible.
+    updateSnapshot(envelopeWith(unobservedTodayReport()));   // 14 rows, one synthetic
+    render(<CacheReportModal />);
+    const callout = document.querySelector('.crm-counterfactual')!.textContent!;
+    expect(callout).toContain('13 observed days');
+    expect(callout).not.toContain('over the last 14 days');
   });
 });

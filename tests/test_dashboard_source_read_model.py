@@ -175,17 +175,108 @@ def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters
     )
 
     assert report["is_empty"] is False
-    assert report["days"][0]["cache_hit_percent"] == pytest.approx(80.0)
-    assert report["days"][0]["saved_usd"] == pytest.approx(
+    # NOW is midnight UTC, so this entry is dated YESTERDAY and #443 S2
+    # inserts an unobserved synthetic row for today at position 0. The
+    # measured row is therefore the observed one, not days[0].
+    measured = next(row for row in report["days"] if row["observed"])
+    assert measured["cache_hit_percent"] == pytest.approx(80.0)
+    assert measured["cached_input_percent"] == pytest.approx(80.0)
+    assert measured["saved_usd"] == pytest.approx(
         80 * (1.25e-6 - 1.25e-7)
     )
-    assert report["days"][0]["net_usd"] == report["days"][0]["saved_usd"]
-    assert report["days"][0]["wasted_usd"] == 0.0
-    assert report["days"][0]["cache_creation_tokens"] == 0
-    assert report["fourteen_day_counterfactual_usd"] == report["days"][0]["saved_usd"]
+    assert measured["net_usd"] == measured["saved_usd"]
+    assert measured["wasted_usd"] == 0.0
+    assert measured["cache_creation_tokens"] == 0
+    assert report["fourteen_day_counterfactual_usd"] == measured["saved_usd"]
     assert report["fourteen_day_efficiency_ratio"] == 1.0
     assert report["by_project"][0]["key"] == "cctally-dev"
     assert report["by_model"][0]["key"] == "gpt-5"
+
+
+def test_codex_empty_report_carries_codex_vocabulary(tmp_path, monkeypatch):
+    """#443 S2 F18 — the empty early return goes through the shared builder.
+
+    Before S2 it was a hand-built literal that omitted anomaly_unevaluated
+    and observed entirely, so the empty and populated Codex returns had
+    different shapes.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+
+    report = source_module._codex_cache_report_wire(
+        (), metadata={}, now_utc=NOW,
+        display_tz_name="UTC", speed="standard",
+    )
+
+    assert report["is_empty"] is True
+    assert report["today"]["cached_input_percent"] == 0.0
+    assert report["today"]["cache_hit_percent"] == 0.0
+    assert report["anomaly_predicates"] == ["cache_drop"]
+    assert "wasted_usd" in report["not_applicable"]
+    # An empty store measured nothing, so every applicable predicate is
+    # unevaluated and today is unobserved.
+    assert report["today"]["observed"] is False
+    assert report["today"]["anomaly_unevaluated"] == ["cache_drop"]
+
+
+# === #443 S2 — the synthetic unobserved Codex today row ==================
+# NOW is midnight UTC, so day 0 lands exactly on it: dated today, and not
+# after now_utc. Nudging it forward would place the entry outside the
+# qualified reader's half-open window, making the observed-today tests
+# assert a state production cannot produce.
+
+def _codex_entry(days_ago, *, input_tokens=100, cached=80):
+    return SimpleNamespace(
+        timestamp=NOW - dt.timedelta(days=days_ago),
+        source_root_key="root-a", source_path="/private/session.jsonl",
+        project_label="cctally-dev", model="gpt-5",
+        input_tokens=input_tokens, cached_input_tokens=cached,
+        output_tokens=10, reasoning_output_tokens=2,
+        total_tokens=input_tokens + 10, cost_usd=0.01,
+    )
+
+
+def _wire(entries, source_module):
+    return source_module._codex_cache_report_wire(
+        tuple(entries), metadata={}, now_utc=NOW,
+        display_tz_name="UTC", speed="standard",
+    )
+
+
+def test_codex_idle_today_gets_an_unobserved_synthetic_row(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    # Newest real entry is YESTERDAY.
+    report = _wire([_codex_entry(d) for d in range(1, 10)], source_module)
+
+    today_iso = NOW.strftime("%Y-%m-%d")
+    assert report["days"][0]["date"] == today_iso
+    assert report["days"][0]["observed"] is False
+    assert report["days"][0]["cached_input_percent"] == 0.0
+    assert report["today"]["observed"] is False
+    assert sorted(report["days"][0]["anomaly_unevaluated"]) == ["cache_drop"]
+
+
+def test_synthetic_row_does_not_inflate_the_baseline_count(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    report = _wire([_codex_entry(d) for d in range(1, 10)], source_module)
+    # Nine real non-today rows. The synthetic row must not become a tenth,
+    # or it would push a thin history over the five-sample baseline floor.
+    assert report["today"]["baseline_daily_row_count"] == 9
+
+
+def test_codex_active_today_row_is_observed(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    report = _wire([_codex_entry(0), _codex_entry(1)], source_module)
+    assert report["days"][0]["date"] == NOW.strftime("%Y-%m-%d")
+    assert report["days"][0]["observed"] is True
+    assert report["today"]["observed"] is True
 
 
 def test_codex_cycle_selects_the_active_seven_day_boundary_over_five_hour_limit():
@@ -4046,7 +4137,34 @@ def test_one_tick_applies_quota_expiry_and_budget_together(tmp_path, monkeypatch
 _429_PRE_CHANGE_ENVELOPE = (
     REPO_ROOT / "tests" / "golden" / "429-pre-change-source-envelope.json"
 )
-ALLOWED_DELTAS = {"captured_at", "account_key", "source_schema_version"}
+ALLOWED_DELTAS = {
+    "captured_at", "account_key", "source_schema_version",
+}
+# #443 S2 — the Codex cache-report vocabulary additions. Every one is
+# OPTIONAL and CODEX-ONLY: `cached_input_percent` dual-publishes the value
+# the transitional `cache_hit_percent` still carries, `not_applicable` and
+# `anomaly_predicates` are new Codex metadata, and `anomaly_unevaluated` /
+# `observed` reach the Codex today block now that both Codex returns share
+# the Claude serializer's shape. None of them changes an existing published
+# value, which is why `source_schema_version` stays 3.
+#
+# Gated on the PATH, not the leaf name: `observed` and `anomaly_unevaluated`
+# ALSO exist on the Claude cache report, so allowing them by bare name would
+# blind this oracle to a Claude-side change under
+# `sources.all.data.providers.claude.cache_report` — which
+# `test_claude_source_state_is_unchanged` does NOT cover, since it pins only
+# `after["sources"]["claude"]`.
+CODEX_SCOPED_DELTAS = {
+    "cached_input_percent", "not_applicable", "anomaly_predicates",
+    "anomaly_unevaluated", "observed",
+}
+
+
+def _is_allowed_delta(path):
+    segments = path.split(".")
+    if segments[-1] in ALLOWED_DELTAS:
+        return True
+    return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
 # process-global counter that advances as other tests run, so the same envelope
 # built twice in one pytest session carries two different tokens. It is a
@@ -4133,7 +4251,7 @@ def test_undecorated_envelope_changes_only_in_allowed_fields(tmp_path, monkeypat
     ]
     unexpected = [
         (path, old, new) for path, old, new in diffs
-        if path.split(".")[-1] not in ALLOWED_DELTAS
+        if not _is_allowed_delta(path)
     ]
     assert unexpected == [], f"unintended envelope changes: {unexpected}"
     assert any(p.endswith("captured_at") for p, _, _ in diffs), (

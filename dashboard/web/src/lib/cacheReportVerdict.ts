@@ -35,7 +35,23 @@ export interface CacheRowVerdict {
   observed: boolean;
 }
 
-export function cacheRowVerdict(input: CacheVerdictInput): CacheRowVerdict {
+/**
+ * #443 S2 — `predicates` is the set the PROVIDER can evaluate at all.
+ *
+ * "Every predicate unevaluated" is a per-provider question. Codex can only
+ * ever evaluate cache_drop, so a Codex row carrying it alone is fully
+ * unevaluated; resolving it against the Claude pair calls it `partial`, which
+ * is a claim that some other predicate ran — and on Codex no other predicate
+ * exists to run. Not applicable is not unevaluated (spec §2).
+ *
+ * The default is the Claude pair, so a pre-S2 envelope — which publishes no
+ * `anomaly_predicates` — resolves exactly as it does today. That default is
+ * pinned against the Python kernel by tests/test_cache_report_constant_parity.py.
+ */
+export function cacheRowVerdict(
+  input: CacheVerdictInput,
+  predicates: readonly CacheAnomalyReason[] = CACHE_ANOMALY_PREDICATES,
+): CacheRowVerdict {
   const unevaluated = input.anomaly_unevaluated ?? [];
   // Absent means observed — an older envelope must render as it does today.
   const observed = input.observed !== false;
@@ -47,7 +63,7 @@ export function cacheRowVerdict(input: CacheVerdictInput): CacheRowVerdict {
     state = 'anomalous';
   } else if (unevaluated.length === 0) {
     state = 'clean';
-  } else if (unevaluated.length >= CACHE_ANOMALY_PREDICATES.length) {
+  } else if (unevaluated.length >= predicates.length) {
     state = 'unevaluated';
   } else {
     state = 'partial';
@@ -72,15 +88,26 @@ export function cacheRowFlagClass(state: CacheRowVerdictState): string {
   return 'flag-none';
 }
 
+// `reasonLabel` translates a raw predicate name into the provider's wording.
+// It defaults to identity, which is EXACTLY Claude's mapping, so the Claude
+// label is byte-identical whether the caller passes one or not.
+//
+// #443 S2 QA P2: this label is rendered into both `title` and `aria-label` on
+// the daily-row flag, so leaving it untranslated put the raw `cache_drop`
+// identifier on a Codex surface — where the contract says "reuse drop" — and
+// put it somewhere only a screen-reader user or a hovering mouse would find.
+// The vocabulary map already had `reasonLabel` for precisely this; it just
+// had one call site.
 export function cacheRowFlagLabel(
   state: CacheRowVerdictState,
   unevaluated: CacheAnomalyReason[],
   observed = true,
+  reasonLabel: (predicate: CacheAnomalyReason) => string = (p) => p,
 ): string {
   if (state === 'anomalous') return 'anomaly';
   if (state === 'clean') return 'evaluated, no anomaly';
   if (!observed) return 'no activity — nothing measured to evaluate';
-  const names = unevaluated.join(' and ');
+  const names = unevaluated.map(reasonLabel).join(' and ');
   return `not evaluated — ${names} could not be evaluated for this day`;
 }
 
@@ -91,6 +118,13 @@ export interface CacheReportVerdict {
   today: CacheRowVerdict;
 }
 
+/** The report's own applicable predicate set; absent means the Claude pair. */
+export function cacheReportPredicates(
+  cr: CacheReportEnvelope,
+): readonly CacheAnomalyReason[] {
+  return cr.anomaly_predicates ?? CACHE_ANOMALY_PREDICATES;
+}
+
 export function cacheReportVerdict(cr: CacheReportEnvelope): CacheReportVerdict {
   const insufficient =
     cr.today.baseline_daily_row_count < CACHE_REPORT_MIN_BASELINE_DAYS;
@@ -98,6 +132,9 @@ export function cacheReportVerdict(cr: CacheReportEnvelope): CacheReportVerdict 
   // anomaly_triggered, but the watchdog reads as neutral "Building baseline"
   // until the floor exists. This gate is pre-existing deliberate behavior.
   const chromeAmber = cr.today.anomaly_triggered && !insufficient;
-  const today = cacheRowVerdict(cr.today);
+  // Forwarding the report's set is what makes S2 land: deriving today's
+  // verdict here against the module default would leave an ordinary Codex
+  // today reading `partial` no matter what cacheRowVerdict learned.
+  const today = cacheRowVerdict(cr.today, cacheReportPredicates(cr));
   return { insufficient, chromeAmber, todayObserved: today.observed, today };
 }

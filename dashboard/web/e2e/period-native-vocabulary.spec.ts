@@ -43,9 +43,9 @@ for (const viewport of MATRIX) {
       const trigger = page.getByRole('button', { name: `Open ${label}` });
       const dialog = await openPeriod(page, label);
       await dialog.screenshot({ path: screenshotPath(viewport, `codex-${label.toLowerCase()}`) });
-      for (const tokenLabel of ['Input', 'Cached input', 'Output', 'Reasoning', 'Total']) {
-        await expect(dialog.getByText(tokenLabel, { exact: true })).toBeVisible();
-      }
+      await expect(dialog.locator('.tokens-row > .t:not(.cache) > .k')).toHaveText([
+        'Input', 'Cached input', 'Output', 'Reasoning', 'Total',
+      ]);
       await expect(dialog.getByText('Cache+', { exact: true })).toHaveCount(0);
       await expect(dialog.getByText('Cache-read', { exact: true })).toHaveCount(0);
       if (label === 'Daily') {

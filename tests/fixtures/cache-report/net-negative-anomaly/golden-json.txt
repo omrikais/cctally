@@ -16,6 +16,9 @@
         "triggered": true,
         "reasons": [
           "net_negative"
+        ],
+        "unevaluated": [
+          "cache_drop"
         ]
       },
       "modelBreakdowns": [

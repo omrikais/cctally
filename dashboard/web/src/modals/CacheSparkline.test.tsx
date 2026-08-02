@@ -10,6 +10,7 @@ import { render } from '@testing-library/react';
 import { CacheSparkline } from './CacheSparkline';
 import { computeAutoZoomDomain } from '../lib/chartDomain';
 import type { CacheReportDailyRow } from '../types/envelope';
+import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
 
 function row(date: string, pct: number): CacheReportDailyRow {
   return {
@@ -310,7 +311,7 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
     expect(container.querySelector('.cr-spark-axis-bot')!.textContent).not.toBe('0%');
   });
 
-  it('keeps the unobserved row x-slot so Today stays rightmost', () => {
+  it('keeps the unobserved row on the shared large Today slot', () => {
     const days = [
       { ...row('2026-07-31', 0), observed: false },
       row('2026-07-30', 71),
@@ -325,18 +326,15 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
       />,
     );
     const guide = container.querySelector('[data-testid="cr-spark-today-unobserved"]')!;
-    // 800-wide viewBox, three slots -> the last slot is the right edge, inset
-    // by half the guide's stroke width so the WHOLE stroke stays inside the
-    // viewBox. A stroke centred on x=800 is half-clipped by the SVG's overflow
-    // and the surviving sliver reads as the chart frame's border, not a marker.
-    expect(guide.getAttribute('x1')).toBe('799.5');
-    expect(guide.getAttribute('x2')).toBe('799.5');
+    const expected = cacheReportChartSlot('large', 2, 3).center;
+    expect(Number(guide.getAttribute('x1'))).toBeCloseTo(expected, 6);
+    expect(Number(guide.getAttribute('x2'))).toBeCloseTo(expected, 6);
     // The polyline therefore stops short of the right edge.
     const points = container.querySelector('polyline')!.getAttribute('points')!;
-    expect(points).not.toContain('800.0,');
+    expect(points).not.toContain(`${expected.toFixed(1)},`);
   });
 
-  it('insets the mini guide by the same half-stroke', () => {
+  it('keeps the unobserved row on the shared mini Today slot', () => {
     const days = [
       { ...row('2026-07-31', 0), observed: false },
       row('2026-07-30', 71),
@@ -350,13 +348,12 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
         size="mini"
       />,
     );
-    // 272-wide viewBox, same 1-unit stroke.
-    expect(
+    expect(Number(
       container.querySelector('[data-testid="cr-spark-today-unobserved"]')!.getAttribute('x1'),
-    ).toBe('271.5');
+    )).toBeCloseTo(cacheReportChartSlot('mini', 2, 3).center, 6);
   });
 
-  it('leaves the observed today marker on the un-inset data x (no data point moved)', () => {
+  it('puts the observed marker and polyline on the same shared Today slot', () => {
     const days = [row('2026-07-31', 73), row('2026-07-30', 71), row('2026-07-29', 69)];
     const { container } = render(
       <CacheSparkline
@@ -366,12 +363,12 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
         size="large"
       />,
     );
-    // The inset is a guide-only concern: the today circle and the polyline's
-    // last plotted coordinate both stay on the raw x-slot.
-    expect(
+    const expected = cacheReportChartSlot('large', 2, 3).center;
+    expect(Number(
       container.querySelector('[data-testid="cr-spark-today-marker"]')!.getAttribute('cx'),
-    ).toBe('800');
-    expect(container.querySelector('polyline')!.getAttribute('points')!).toContain('800.0,');
+    )).toBeCloseTo(expected, 6);
+    expect(container.querySelector('polyline')!.getAttribute('points')!)
+      .toContain(`${expected.toFixed(1)},`);
   });
 
   it('counts only observed days in the accessible label', () => {
@@ -390,5 +387,84 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
     );
     expect(container.querySelector('svg.cr-spark')!.getAttribute('aria-label'))
       .toBe('Cache hit % timeline, 2 days');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #443 S2 §4.3 — the percentage is read through `cachePercent`, never off
+// `cache_hit_percent` directly. These assert GEOMETRY, not text: the sparkline
+// uses raw percentages for its domain, its `points` string and its marker, so a
+// row publishing neither key yields a NaN domain and a NaN-coordinate polyline
+// while a text assertion elsewhere on the page still finds an em dash and
+// passes over a visibly broken chart.
+// ---------------------------------------------------------------------------
+
+function rowWithoutPercent(date: string): CacheReportDailyRow {
+  // `cache_hit_percent` is REQUIRED on the type, so the shape a future server
+  // emits (once the transitional alias is dropped and a provider publishes
+  // neither key) is only reachable by deleting it off a structural copy.
+  const { cache_hit_percent: _drop, ...rest } = row(date, 0);
+  void _drop;
+  return rest as CacheReportDailyRow;
+}
+
+function codexRow(date: string, pct: number): CacheReportDailyRow {
+  // The transitional wire shape: `cached_input_percent` is authoritative and
+  // `cache_hit_percent` repeats it for one release.
+  return { ...row(date, pct), cached_input_percent: pct };
+}
+
+describe('<CacheSparkline /> #443 S2 nullable percent', () => {
+  it('emits no NaN in the polyline or the domain when a row has no resolvable percent', () => {
+    const { container } = render(
+      <CacheSparkline
+        days={[rowWithoutPercent('2026-05-11'), ...SAMPLE]}
+        baseline_median_percent={70}
+        today_marker_color="var(--accent-green)"
+        size="large"
+      />,
+    );
+    const points = container.querySelector('polyline')!.getAttribute('points')!;
+    expect(points).not.toContain('NaN');
+    expect(points.split(' ')).toHaveLength(SAMPLE.length);
+    const axes = Array.from(container.querySelectorAll('.cr-spark-axis'))
+      .map((n) => n.textContent);
+    expect(axes.join(' ')).not.toContain('NaN');
+  });
+
+  it('marks an unresolvable today without asserting a value', () => {
+    const { container } = render(
+      <CacheSparkline
+        days={[rowWithoutPercent('2026-05-11'), ...SAMPLE]}
+        baseline_median_percent={70}
+        today_marker_color="var(--accent-green)"
+        size="large"
+      />,
+    );
+    // A filled dot would place a measurement where none exists; the guide
+    // marks the slot instead, exactly as it does for an unobserved day.
+    expect(container.querySelector('[data-testid="cr-spark-today-marker"]')).toBeNull();
+    const guide = container.querySelector('[data-testid="cr-spark-today-unobserved"]')!;
+    expect(guide).not.toBeNull();
+    expect(guide.getAttribute('x1')).not.toContain('NaN');
+  });
+
+  it('plots the Codex authoritative percent, not the transitional alias', () => {
+    // Non-vacuity for the accessor: a row whose two keys DISAGREE must follow
+    // `cached_input_percent`. Equal values could not tell the two apart.
+    const disagreeing = { ...codexRow('2026-05-11', 20), cache_hit_percent: 95 };
+    const { container } = render(
+      <CacheSparkline
+        days={[disagreeing]}
+        baseline_median_percent={null}
+        today_marker_color="var(--accent-green)"
+        size="large"
+      />,
+    );
+    const domain = computeAutoZoomDomain([20], null, 5);
+    const axes = Array.from(container.querySelectorAll('.cr-spark-axis'))
+      .map((n) => n.textContent);
+    expect(axes[0]).toBe(`${Math.round(domain.hi)}%`);
+    expect(axes[1]).toBe(`${Math.round(domain.lo)}%`);
   });
 });

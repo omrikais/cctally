@@ -31,9 +31,17 @@ export function useScopedSnapshot(source?: DashboardSelection): Envelope | null 
 // The resolved scope itself, for the handful of surfaces that need to know
 // WHICH account is focused (the hero empty state, the panel account labels, the
 // `?account=` route qualifier) rather than just its data.
-export function useAccountScope(): AccountScopeResult {
+// `forSource` pins the scope to a specific provider instead of whatever is
+// active. A modal's data comes from `useScopedSnapshot(openModalSource ??
+// activeSource)`, so resolving its scope against the LIVE `activeSource`
+// makes the two disagree the moment the source changes while the modal is
+// open — and a caller that guards on the mismatch has to fall back to the
+// harsher "could not be built" rather than the empty state it meant.
+// Passing the same source it bound its data to keeps them in step.
+export function useAccountScope(forSource?: DashboardSelection): AccountScopeResult {
   const env = useSyncExternalStore(subscribeStore, () => getState().snapshot);
-  const source = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const active = useSyncExternalStore(subscribeStore, () => getState().activeSource);
+  const source = forSource ?? active;
   const stored = useSyncExternalStore(
     subscribeStore,
     () => (source === 'all' ? ALL_ACCOUNTS : getState().accountFocus[source] ?? ALL_ACCOUNTS),

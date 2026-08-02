@@ -4766,47 +4766,18 @@ def _codex_lifecycle_roots():
 
 
 def _stats_epoch_rebuild_pending() -> bool:
-    """Would opening stats.db right now trigger a whole-journal rebuild?
-
-    Side-effect-free: a raw read-only ``PRAGMA user_version``, the same probe
-    ``resolve_stats_epoch_mismatch`` re-checks under the maintenance lock.
-
-    Deliberately narrow. A MISSING stats.db is a fresh install, where building
-    the index is cheap and skipping it would leave the hook with nothing to do
-    forever. An UNREADABLE one belongs to the corruption auto-heal path, not
-    here. A LEGACY index (``user_version <= LEGACY_STATS_HEAD``) takes the
-    migration route rather than the epoch rebuild, and predates every epoch
-    this decision is about. Only a readable, post-legacy, wrong-epoch index —
-    exactly what an upgrade across a ``STATS_INDEX_EPOCH`` bump produces —
-    answers True.
-    """
-    path = _cctally_core.DB_PATH
-    try:
-        if not path.exists():
-            return False
-    except OSError:
-        return False
+    """Delegate the side-effect-free epoch probe to the store boundary."""
     try:
         import _cctally_store
-        version = _cctally_store._raw_user_version(path)
+        return _cctally_store.stats_epoch_rebuild_pending()
     except Exception:
         return False
-    if version < 0 or version <= _cctally_core.LEGACY_STATS_HEAD:
-        return False
-    return version != _cctally_core.STATS_INDEX_EPOCH
 
 
 def _defer_stats_epoch_rebuild() -> str:
-    """Hand a pending stats.db epoch rebuild to the detached quota worker.
-
-    Reuses ``_codex-quota-verify`` rather than adding a third worker: its
-    ``force_full`` pass opens stats.db, which is what performs the rebuild, and
-    the whole-history pass it then runs is exactly the one the freshly rebuilt
-    index needs anyway. Sharing the worker also shares its attempt-stamped
-    throttle, so a rebuild that keeps dying cannot spawn one worker per tick.
-    """
-    from _cctally_quota import _defer_codex_quota_verification
-    return _defer_codex_quota_verification()
+    """Hand a pending epoch rebuild to the dedicated store worker."""
+    import _cctally_store
+    return _cctally_store.defer_stats_epoch_rebuild()
 
 
 def _cmd_hook_tick_codex(
@@ -4866,10 +4837,9 @@ def _cmd_hook_tick_codex(
     # journal rebuild — against Codex's 30-second hook timeout. A killed rebuild
     # commits nothing, so the next tick repeats it: a non-converging
     # 30-second-per-turn loop, which is the reported defect delivered by the
-    # fix. Hand it to the same detached worker the periodic verification uses
-    # (its `force_full` pass opens stats.db and therefore performs the rebuild)
-    # and acknowledge this tick as a no-op. No lifecycle marker is stamped, so
-    # the next Codex turn re-checks immediately; the spawn itself is throttled.
+    # fix. Hand it to the dedicated store-owned epoch worker and acknowledge
+    # this tick as a no-op. No lifecycle marker is stamped, so the next Codex
+    # turn re-checks immediately; store admission suppresses duplicate workers.
     if _stats_epoch_rebuild_pending():
         _defer_stats_epoch_rebuild()
         log_outcome(sync="deferred", result="noop")

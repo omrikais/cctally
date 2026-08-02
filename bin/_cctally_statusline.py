@@ -769,7 +769,10 @@ def _read_db_projection_once() -> "_candidates.DbProjection":
 def _read_db_projection_stable(*, attempts: int = 3) -> "_candidates.DbProjection":
     for _ in range(attempts):
         before = _db_file_fingerprint()
-        projection = _read_db_projection_once()
+        try:
+            projection = _read_db_projection_once()
+        except _cctally().StatsEpochRebuildDeferred:
+            return _candidates.DbProjection(None, None, db_files=before)
         after = _db_file_fingerprint()
         if before == after and after["main"] is not None:
             return dataclasses.replace(projection, db_files=after)
@@ -1009,6 +1012,8 @@ def _authoritative_record_usage(
 
     try:
         rc = _cctally().cmd_record_usage(args)
+    except _cctally().StatsEpochRebuildDeferred as exc:
+        return _AuthoritativeRecordResult("record_failed", str(exc))
     except Exception as exc:
         return _AuthoritativeRecordResult("record_failed", str(exc))
     if rc != 0:
@@ -1163,7 +1168,13 @@ def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
     # statusline's AUTHORITATIVE publication step (`_authoritative_record_usage`)
     # keeps the default authoritative mode — it is already try/except-wrapped to
     # "record_failed".
-    if _cctally().cmd_record_usage(args, ingest_mode="opportunistic") != 0:
+    try:
+        record_rc = _cctally().cmd_record_usage(
+            args, ingest_mode="opportunistic"
+        )
+    except _cctally().StatsEpochRebuildDeferred:
+        return decision
+    if record_rc != 0:
         return decision
     after = _read_db_projection_stable()
     if _projection_changed(projection, after):
@@ -1586,6 +1597,10 @@ def _build_statusline_injections(warn_once):
                     range_start - c.BLOCK_DURATION, now + c.BLOCK_DURATION,
                 )
             )
+        except c.StatsEpochRebuildDeferred:
+            recorded_windows, block_start_overrides, canonical_intervals = (
+                [], {}, {},
+            )
         except Exception:
             recorded_windows, block_start_overrides, canonical_intervals = (
                 [], {}, {},
@@ -1622,6 +1637,8 @@ def _build_statusline_injections(warn_once):
         _acct_params = () if _sl_account is None else (_sl_account,)
         try:
             conn = open_db()
+        except c.StatsEpochRebuildDeferred:
+            return (None, None)
         except Exception:
             return (None, None)
         try:
@@ -1707,6 +1724,8 @@ def _build_statusline_injections(warn_once):
     def _db_latest_rate_limits():
         try:
             conn = open_db()
+        except _cctally().StatsEpochRebuildDeferred:
+            return None
         except Exception:
             return None
         try:

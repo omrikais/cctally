@@ -3719,8 +3719,12 @@ def _tui_build_snapshot_once(
         # Cache-report panel + modal envelope block (spec
         # 2026-05-21-cache-report-panel-design.md §5.2). Per-tick build
         # alongside the projects envelope. Threshold is read from
-        # ``config.json:cache_report.anomaly_threshold_pp`` (default
-        # 15); ``anomaly_window_days`` is hardcoded at 14 in v1.
+        # ``config.json:cache_report.anomaly_threshold_pp`` and resolved
+        # by ``_lib_cache_report.resolve_cache_report_threshold`` — the
+        # one definition shared with the Codex read path and the
+        # persistence gate (#443 S3 F17), strict and silent (anything
+        # that is not an in-range int becomes the default 15);
+        # ``anomaly_window_days`` is hardcoded at 14 in v1.
         # display_tz inherits the same resolved zone as every other
         # panel so today-bucketing matches the envelope's ``display``
         # block. Errors record on ``last_sync_error``; ``None`` lands
@@ -3730,13 +3734,11 @@ def _tui_build_snapshot_once(
         with _perf.phase("build.cache_report"):
             try:
                 cfg_cr = load_config().get("cache_report") or {}
-                threshold_raw = cfg_cr.get("anomaly_threshold_pp", 15)
-                try:
-                    threshold_pp = int(threshold_raw)
-                except (TypeError, ValueError):
-                    threshold_pp = 15
-                if threshold_pp < 1 or threshold_pp > 100:
-                    threshold_pp = 15
+                threshold_pp = _cctally()._load_sibling(
+                    "_lib_cache_report"
+                ).resolve_cache_report_threshold(
+                    cfg_cr.get("anomaly_threshold_pp")
+                )
                 _dash_mod = sys.modules["_cctally_dashboard"]
                 _bcr = _dash_mod.build_cache_report_snapshot
                 cache_report_block = _bcr(
@@ -6609,6 +6611,28 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
             ref.set(snap)
             hub.publish(snap)
+        except _cctally().StatsEpochRebuildDeferred as exc:
+            # #453: the first periodic tick runs before HTTP bind. Preserve the
+            # initial hydrating/degraded frame while the dedicated replay owns
+            # stats maintenance; a generic crash frame would clear the latch
+            # before any client could observe it. The loop retries normally on
+            # its next cadence and publishes a full frame after convergence.
+            prev = ref.get()
+            pending = dataclasses.replace(
+                prev,
+                last_sync_error=f"stats-open: {exc}",
+                sync_failures=(
+                    SyncFailureAttribution(
+                        leg="stats-open",
+                        database="stats",
+                        corruption=False,
+                    ),
+                ),
+                generated_at=dt.datetime.now(dt.timezone.utc),
+                hydrating=True,
+            )
+            ref.set(pending)
+            hub.publish(pending)
         except Exception as exc:
             prev = ref.get()
             crashed = dataclasses.replace(

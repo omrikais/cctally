@@ -975,6 +975,9 @@ def seed_codex_session_file(
     mtime_ns: int = 0,
     last_byte_offset: int = 0,
     last_ingested_at: str = FIXED_LAST_INGESTED_AT,
+    source_root_key: Optional[str] = None,
+    last_native_thread_id: Optional[str] = None,
+    last_conversation_key: Optional[str] = None,
 ) -> None:
     """Insert a codex_session_files row.
 
@@ -982,14 +985,53 @@ def seed_codex_session_file(
     pre-lazy-population state (row exists but sessionId / model
     extraction hasn't run). Pass explicit values to simulate a
     fully-ingested file (the normal state after the first sync-cache
-    run)."""
+    run).
+
+    `source_root_key` / `last_native_thread_id` / `last_conversation_key`
+    are the rooted-identity columns the qualified reader's inherited
+    -metadata join reads; leave them None for the pre-#294 shape."""
     conn.execute(
         """INSERT INTO codex_session_files
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
-            last_session_id, last_model, last_total_tokens)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            last_session_id, last_model, last_total_tokens,
+            source_root_key, last_native_thread_id, last_conversation_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
-         last_session_id, last_model, last_total_tokens),
+         last_session_id, last_model, last_total_tokens,
+         source_root_key, last_native_thread_id, last_conversation_key),
+    )
+
+
+def seed_codex_conversation_thread(
+    conn: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    source_root_key: str,
+    native_thread_id: str,
+    source_path: str,
+    cwd: Optional[str],
+    root_thread_id: Optional[str] = None,
+    parent_thread_id: Optional[str] = None,
+    git_json: Optional[str] = None,
+    source_kind: Optional[str] = "user",
+    first_seen_utc: str = FIXED_LAST_INGESTED_AT,
+    last_seen_utc: str = FIXED_LAST_INGESTED_AT,
+) -> None:
+    """Insert a codex_conversation_threads row.
+
+    This is the row the qualified Codex accounting reader joins to resolve
+    a project from `cwd`. Without it every entry counts as a
+    missing-thread-join row and the dashboard degrades to the unqualified
+    accounting fallback instead of publishing project labels."""
+    conn.execute(
+        """INSERT INTO codex_conversation_threads
+           (conversation_key, source_root_key, native_thread_id,
+            root_thread_id, parent_thread_id, source_path, cwd, git_json,
+            source_kind, first_seen_utc, last_seen_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (conversation_key, source_root_key, native_thread_id,
+         root_thread_id or native_thread_id, parent_thread_id, source_path,
+         cwd, git_json, source_kind, first_seen_utc, last_seen_utc),
     )
 
 
@@ -1006,6 +1048,9 @@ def seed_codex_session_entry(
     output_tokens: int = 0,
     reasoning_output_tokens: int = 0,
     total_tokens: int = 0,
+    source_root_key: Optional[str] = None,
+    conversation_key: Optional[str] = None,
+    account_key: Optional[str] = None,
 ) -> None:
     """Insert a codex_session_entries row.
 
@@ -1018,11 +1063,13 @@ def seed_codex_session_entry(
         """INSERT INTO codex_session_entries
            (source_path, line_offset, timestamp_utc, session_id, model,
             input_tokens, cached_input_tokens,
-            output_tokens, reasoning_output_tokens, total_tokens)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            output_tokens, reasoning_output_tokens, total_tokens,
+            source_root_key, conversation_key, account_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (source_path, line_offset, timestamp_utc, session_id, model,
          input_tokens, cached_input_tokens,
-         output_tokens, reasoning_output_tokens, total_tokens),
+         output_tokens, reasoning_output_tokens, total_tokens,
+         source_root_key, conversation_key, account_key),
     )
 
 
@@ -1261,6 +1308,42 @@ def _self_test_codex_seeders() -> None:
                 reasoning_output_tokens=100,
                 total_tokens=500,
             )
+            # #443 S2: the rooted-identity path. A qualified Codex read
+            # needs the root key on BOTH the file and the entry plus a
+            # thread row to join `cwd` through; without all three the
+            # dashboard silently degrades to the unqualified fallback and
+            # publishes no project label.
+            seed_codex_session_file(
+                conn,
+                path="/fake/codex/sess-z.jsonl",
+                last_session_id="codex-sess-zzzz",
+                last_model="gpt-5",
+                last_total_tokens=500,
+                source_root_key="root-self-test",
+            )
+            seed_codex_conversation_thread(
+                conn,
+                conversation_key="v1.self-test",
+                source_root_key="root-self-test",
+                native_thread_id="codex-sess-zzzz",
+                source_path="/fake/codex/sess-z.jsonl",
+                cwd="/fake/projects/cctally-dev",
+            )
+            seed_codex_session_entry(
+                conn,
+                source_path="/fake/codex/sess-z.jsonl",
+                line_offset=0,
+                timestamp_utc="2026-04-15T11:00:00Z",
+                session_id="codex-sess-zzzz",
+                model="gpt-5",
+                input_tokens=200,
+                cached_input_tokens=50,
+                output_tokens=300,
+                reasoning_output_tokens=100,
+                total_tokens=500,
+                source_root_key="root-self-test",
+                conversation_key="v1.self-test",
+            )
             conn.commit()
             files_count = conn.execute("SELECT COUNT(*) FROM codex_session_files").fetchone()[0]
             entries_count = conn.execute("SELECT COUNT(*) FROM codex_session_entries").fetchone()[0]
@@ -1273,12 +1356,27 @@ def _self_test_codex_seeders() -> None:
             # Verify LiteLLM-convention token fields round-trip
             tokens = conn.execute(
                 "SELECT input_tokens, cached_input_tokens, output_tokens, "
-                "reasoning_output_tokens, total_tokens FROM codex_session_entries"
+                "reasoning_output_tokens, total_tokens FROM codex_session_entries "
+                "WHERE source_path='/fake/codex/sess-x.jsonl'"
             ).fetchone()
-        assert files_count == 2, f"expected 2 files, got {files_count}"
-        assert entries_count == 1, f"expected 1 entry, got {entries_count}"
+            # The rooted identity must survive on all three tables, and the
+            # thread must be joinable from the entry.
+            rooted = conn.execute(
+                "SELECT e.source_root_key, e.conversation_key, f.source_root_key, t.cwd "
+                "FROM codex_session_entries e "
+                "JOIN codex_session_files f ON f.path = e.source_path "
+                "JOIN codex_conversation_threads t "
+                "  ON t.conversation_key = e.conversation_key "
+                "WHERE e.source_path='/fake/codex/sess-z.jsonl'"
+            ).fetchone()
+        assert files_count == 3, f"expected 3 files, got {files_count}"
+        assert entries_count == 2, f"expected 2 entries, got {entries_count}"
         assert null_row == (None, None, 0), f"lazy-population row mismatch: {null_row}"
         assert tokens == (200, 50, 300, 100, 500), f"token fields mismatch: {tokens}"
+        assert rooted == (
+            "root-self-test", "v1.self-test", "root-self-test",
+            "/fake/projects/cctally-dev",
+        ), f"rooted-identity round-trip mismatch: {rooted}"
     print("OK: codex seeders")
 
 

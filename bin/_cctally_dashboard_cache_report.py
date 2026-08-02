@@ -90,16 +90,24 @@ def _validate_cache_report_settings(block: dict) -> dict:
     validated: dict = {}
     if "anomaly_threshold_pp" in block:
         threshold = block["anomaly_threshold_pp"]
-        # bool is an int subclass — reject it explicitly (mirrors the
+        # #443 S3 F17: the type-and-range rule is the kernel's
+        # ``cache_report_threshold_is_valid`` — the same predicate the two
+        # read paths resolve through, so the gate and the readers cannot
+        # disagree about what a valid setting is. The two-branch split
+        # survives only to keep the distinct messages: bool is an int
+        # subclass and is rejected explicitly (mirrors the
         # update.check.ttl_hours precedent).
+        crk = _cache_report_load_kernel()
         if isinstance(threshold, bool) or not isinstance(threshold, int):
             raise _CacheReportConfigError(
                 "anomaly_threshold_pp must be an integer",
                 field="anomaly_threshold_pp",
             )
-        if threshold < 1 or threshold > 100:
+        if not crk.cache_report_threshold_is_valid(threshold):
             raise _CacheReportConfigError(
-                "anomaly_threshold_pp must be in [1, 100]",
+                "anomaly_threshold_pp must be in "
+                f"[{crk.CACHE_REPORT_THRESHOLD_MIN_PP}, "
+                f"{crk.CACHE_REPORT_THRESHOLD_MAX_PP}]",
                 field="anomaly_threshold_pp",
             )
         validated["anomaly_threshold_pp"] = threshold
@@ -183,11 +191,13 @@ def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | 
     """
     if cr is None:
         return None
-    return {
-        "window_days": cr.window_days,
-        "anomaly_threshold_pp": cr.anomaly_threshold_pp,
-        "anomaly_window_days": cr.anomaly_window_days,
-        "today": {
+    wire = _cache_report_load_wire()
+    return wire.build_cache_report_wire(
+        provider="claude",
+        window_days=cr.window_days,
+        anomaly_threshold_pp=cr.anomaly_threshold_pp,
+        anomaly_window_days=cr.anomaly_window_days,
+        today={
             "date": cr.today.date,
             "cache_hit_percent": cr.today.cache_hit_percent,
             "baseline_median_percent": cr.today.baseline_median_percent,
@@ -196,51 +206,40 @@ def _cache_report_snapshot_to_dict(cr: "CacheReportSnapshot | None") -> "dict | 
             "saved_usd": cr.today.saved_usd,
             "wasted_usd": cr.today.wasted_usd,
             "anomaly_triggered": cr.today.anomaly_triggered,
-            "anomaly_reasons": list(cr.today.anomaly_reasons),
+            "anomaly_reasons": cr.today.anomaly_reasons,
             "baseline_daily_row_count": cr.today.baseline_daily_row_count,
-            "anomaly_unevaluated": list(cr.today.anomaly_unevaluated),
+            "anomaly_unevaluated": cr.today.anomaly_unevaluated,
             "observed": cr.today.observed,
         },
-        "days": [
+        days=[
             {
-                "date": d.date,
-                "cache_hit_percent": d.cache_hit_percent,
-                "input_tokens": d.input_tokens,
-                "output_tokens": d.output_tokens,
+                "date": d.date, "cache_hit_percent": d.cache_hit_percent,
+                "input_tokens": d.input_tokens, "output_tokens": d.output_tokens,
                 "cache_creation_tokens": d.cache_creation_tokens,
                 "cache_read_tokens": d.cache_read_tokens,
-                "saved_usd": d.saved_usd,
-                "wasted_usd": d.wasted_usd,
+                "saved_usd": d.saved_usd, "wasted_usd": d.wasted_usd,
                 "net_usd": d.net_usd,
                 "anomaly_triggered": d.anomaly_triggered,
-                "anomaly_reasons": list(d.anomaly_reasons),
-                "anomaly_unevaluated": list(d.anomaly_unevaluated),
+                "anomaly_reasons": d.anomaly_reasons,
+                "anomaly_unevaluated": d.anomaly_unevaluated,
                 "observed": d.observed,
             }
             for d in cr.days
         ],
-        "by_project": [
-            {
-                "key": b.key,
-                "cache_hit_percent": b.cache_hit_percent,
-                "net_usd": b.net_usd,
-            }
+        by_project=[
+            {"key": b.key, "cache_hit_percent": b.cache_hit_percent, "net_usd": b.net_usd}
             for b in cr.by_project
         ],
-        "by_model": [
-            {
-                "key": b.key,
-                "cache_hit_percent": b.cache_hit_percent,
-                "net_usd": b.net_usd,
-            }
+        by_model=[
+            {"key": b.key, "cache_hit_percent": b.cache_hit_percent, "net_usd": b.net_usd}
             for b in cr.by_model
         ],
-        "seven_day_net_usd": cr.seven_day_net_usd,
-        "seven_day_anomaly_count": cr.seven_day_anomaly_count,
-        "fourteen_day_counterfactual_usd": cr.fourteen_day_counterfactual_usd,
-        "fourteen_day_efficiency_ratio": cr.fourteen_day_efficiency_ratio,
-        "is_empty": cr.is_empty,
-    }
+        seven_day_net_usd=cr.seven_day_net_usd,
+        seven_day_anomaly_count=cr.seven_day_anomaly_count,
+        fourteen_day_counterfactual_usd=cr.fourteen_day_counterfactual_usd,
+        fourteen_day_efficiency_ratio=cr.fourteen_day_efficiency_ratio,
+        is_empty=cr.is_empty,
+    )
 
 
 @dataclass(frozen=True)
@@ -283,6 +282,14 @@ def _cache_report_load_kernel():
     kernel module instance (matches the late-load pattern used by share /
     doctor helpers in this file)."""
     return sys.modules["cctally"]._load_sibling("_lib_cache_report")
+
+
+def _cache_report_load_wire():
+    """Lazy-load ``_lib_cache_report_wire`` through the same bridge.
+
+    The wire builder is the single serializer shared with the Codex
+    producer in ``_cctally_dashboard_sources.py`` (#443 S2 F18)."""
+    return sys.modules["cctally"]._load_sibling("_lib_cache_report_wire")
 
 
 def _cache_report_needed_closed_dates(since, now_utc, bucket_tz):
@@ -406,16 +413,16 @@ def build_cache_report_snapshot(
     since = now_utc - dt.timedelta(days=window_days)
     pricing = cctally_ns.CLAUDE_MODEL_PRICING
 
-    # Cache mechanics key on the BUCKETING tz (``_resolve_bucket_tz`` — the same
+    # One current day per invocation (#443 S3 F23). Cache mechanics and the
+    # spotlight both key on the BUCKETING tz (``_resolve_bucket_tz`` — the same
     # tz ``_aggregate_cache_by_day`` buckets by), so ``today_key`` / the closed-
-    # day keys line up with ``CacheRow.date``. The spotlight's ``today_iso``
-    # keeps its own UTC-fallback derivation unchanged (byte-identity); the two
-    # agree whenever ``display_tz`` is set — always, on the dashboard.
+    # day keys / ``today_iso`` line up with ``CacheRow.date`` and cannot
+    # disagree. ``today_iso`` previously kept a separate UTC fallback,
+    # justified by the caller-side assumption that ``display_tz`` is always
+    # set on the dashboard rather than by an invariant.
     bucket_tz = crk._resolve_bucket_tz(display_tz)
     today_key = now_utc.astimezone(bucket_tz).strftime("%Y-%m-%d")
-    today_iso = now_utc.astimezone(
-        display_tz if display_tz is not None else dt.timezone.utc
-    ).strftime("%Y-%m-%d")
+    today_iso = today_key
 
     def _wrap_day_entries(raw):
         # Day-mode kernel expects entries with a ``usage`` dict (matches
@@ -550,10 +557,13 @@ def build_cache_report_snapshot(
     # alongside the anomaly classifier so we don't re-walk the same
     # row set here).
     today_row = next((r for r in result.rows if r.date == today_iso), None)
-    other_rows = [r for r in result.rows if r.date != today_iso]
     baseline_median = result.today_baseline_median
 
-    baseline_daily_row_count = len(other_rows)
+    # #443 S3 F22: the rows the median was actually taken over, not every
+    # non-today row. The old count was unbounded by the baseline window,
+    # so the panel could read "baseline sufficient" from it while
+    # `baseline_median_percent` was None.
+    baseline_daily_row_count = result.today_baseline_sample_count
 
     # ``delta_pp`` sign convention (spec §4.2): "signed; negative = today
     # below median" → ``delta = today − baseline``. The empty-day branch

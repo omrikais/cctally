@@ -380,6 +380,131 @@ PYCR
 }
 cache_report_snapshot_invariants
 
+# ── Cache-report display-tz invariant (R-CR5) ──────────────────────────
+# R-CR5 deliberately overrides TZ. R-CR1..R-CR4 run under the suite's
+# pinned TZ=Etc/UTC, which collapses host-local, UTC and display tz into
+# one value and makes them structurally blind to display-tz divergence
+# (#443 S3 F24). This scenario is the one that can see it — do not "fix"
+# it back to the suite's pinned zone.
+#
+# It builds the snapshot with display_tz=None (which MEANS host-local
+# bucketing — preserve-listed) at a near-midnight instant and asserts the
+# focal day is the host-local date the rows were keyed by, not the UTC
+# one. Asia/Tokyo, not a DST-observing zone: the host-local fallback
+# snapshots the offset at real now, so a DST zone would make the fixture
+# depend on the day the suite runs.
+#
+# NON-VACUITY: "run under a non-UTC TZ" is not enough on its own. Every
+# cache-report fixture uses a midday AS_OF (2026-04-15T12:00:00Z), and
+# most non-UTC zones share the UTC calendar date at noon, so the old code
+# would pass. This scenario pins its OWN near-midnight AS_OF and asserts
+# utc_date != host_date before checking anything, so a fixture drifting
+# back to midday fails loudly instead of silently passing.
+#
+# The invariant it can see is FOCAL-ROW IDENTITY end to end: the
+# spotlight's day, the newest day row, and the zone the rows were
+# bucketed by are one value. It observes
+# ``build_cache_report_snapshot``'s own focal-day derivation; the
+# kernel's (``classify_and_summarize``) is covered by the disjoint pytest
+# reproduction in ``tests/test_cache_report_display_tz.py``, which is
+# where it IS observable — no current fixture carries five-plus days with
+# varying hit percentages, so the kernel's focal day cannot move the
+# published median here.
+cache_report_display_tz_invariant () {
+    local name="cache_report_display_tz_invariant"
+    local fixture
+    for fixture in healthy-cache-hit cache-drop-anomaly; do
+    local fixture_home="$FIXTURES/cache-report/$fixture"
+    local result rc_py
+    result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" \
+             HOME="$fixture_home" TZ=Asia/Tokyo \
+             AS_OF="2026-04-15T23:30:00Z" \
+             FIXTURE_LABEL="$fixture" \
+             python3 - <<'PYCR5' 2>&1)
+import os, pathlib, sys, types, datetime as dt
+
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+script_path = repo_root / "bin" / "cctally"
+mod = types.ModuleType("cctally")
+mod.__file__ = str(script_path)
+sys.modules["cctally"] = mod
+code = compile(script_path.read_text(), str(script_path), "exec")
+exec(code, mod.__dict__)
+
+sys.path.insert(0, str(repo_root / "bin"))
+import _cctally_dashboard as D
+import _lib_cache_report as crk
+
+label = os.environ["FIXTURE_LABEL"]
+as_of = os.environ["AS_OF"].rstrip("Z")
+now_utc = dt.datetime.fromisoformat(as_of).replace(tzinfo=dt.timezone.utc)
+
+utc_date = now_utc.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+host_date = now_utc.astimezone().strftime("%Y-%m-%d")
+assert utc_date != host_date, (
+    f"R-CR5 vacuous: instant does not straddle the date boundary "
+    f"(utc={utc_date} host={host_date}) — pick a near-midnight AS_OF"
+)
+
+# display_tz=None MEANS host-local bucketing; this is what the day rows
+# are keyed by, and therefore what the focal day must resolve to.
+bucket_date = now_utc.astimezone(
+    crk._resolve_bucket_tz(None)
+).strftime("%Y-%m-%d")
+assert bucket_date == host_date, (
+    f"R-CR5 ({label}) fail: display_tz=None must bucket host-local, "
+    f"got {bucket_date} against host {host_date}"
+)
+
+snap = D.build_cache_report_snapshot(
+    now_utc=now_utc,
+    anomaly_threshold_pp=15,
+    anomaly_window_days=14,
+    display_tz=None,
+)
+
+assert not snap.is_empty, (
+    f"R-CR5 ({label}) fail: snapshot is empty — fixture has no entries"
+)
+
+# R-CR5: one current day per invocation (#443 S3 F23/F24). The spotlight
+# day and the newest day row both resolve through _resolve_bucket_tz, so
+# they agree with each other and with the zone the rows were bucketed by.
+assert snap.today.date == host_date, (
+    f"R-CR5 ({label}) fail (#443 S3 F23): spotlight day="
+    f"{snap.today.date} but rows are bucketed host-local "
+    f"({host_date}); utc={utc_date}"
+)
+assert snap.days[0].date == snap.today.date, (
+    f"R-CR5 ({label}) fail (#443 S3 F23): newest day row="
+    f"{snap.days[0].date} disagrees with spotlight day={snap.today.date}"
+)
+
+# Every entry in both fixtures sits far enough from midnight that its
+# calendar date is the same in UTC and in Tokyo, so the day rows the
+# builder emits are a fixed set and only the FOCAL day can move. Assert
+# it, so a future fixture edit that put an entry near midnight (making
+# the row set itself tz-dependent) fails loudly rather than muddying
+# what this invariant is measuring.
+assert snap.today.date not in {r.date for r in snap.days if r.observed}, (
+    f"R-CR5 ({label}) fail: the fixture grew an observed row on the focal "
+    f"day ({snap.today.date}); the row set is no longer tz-stable"
+)
+
+print("OK")
+PYCR5
+    rc_py=$?
+    if [ $rc_py -ne 0 ]; then
+        echo "RECONCILE FAIL $name $fixture: $result"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS $name $fixture (R-CR5)"
+        pass_count=$((pass_count + 1))
+    fi
+    done
+}
+cache_report_display_tz_invariant
+
 # Invariant 4: codex-monthly.costUSD == Σ codex-daily.costUSD for entries in
 # the month. codex-daily's date format is "Mar 31, 2026"; codex-monthly's
 # month format is "Mar 2026". Parse both to map daily entries to months.
