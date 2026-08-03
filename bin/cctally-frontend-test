@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# cctally-frontend-test — hooks lint + frontend estate + Codex reader golden.
+#
+# Why this exists (#463 S1, finding F23): before this harness, vitest reached
+# bin/cctally-test-all through exactly one line — cctally-share-v2-test ran
+# src/share/ShareManualSmoke.test.tsx and nothing else. The full estate ran only
+# in CI. So a frontend Codex rendering regression passed the authoritative gate.
+#
+# DELIBERATE DIVERGENCE from cctally-share-v2-test: that harness returns SKIP
+# when vitest is absent. This one FAILS. A silent skip would recreate exactly the
+# gap this harness closes — a green bundle that verified nothing. Node and npm are
+# provisioned by this repository's test wrapper and by `npm ci` in every CI lane
+# that runs the bundle, so failing loudly is safe here.
+#
+# Five legs:
+#   1. hooks-lint — `npm run lint`, so react-hooks/rules-of-hooks is part of the
+#      authoritative local bundle rather than only the separate CI build job.
+#   1b. typecheck — `npx tsc --noEmit`. CI runs `npm run build`, which is
+#      `npm run lint && tsc --noEmit && vite build`, so before this leg the local
+#      and remote gate was strictly WEAKER than CI: a type error failed CI while
+#      the authoritative suite stayed green. Demonstrated on 2026-08-03 by #463
+#      S2, which merged a test whose `cost_usd` access did not type-check against
+#      the `meta` arm of the ConversationItem union; every harness passed and only
+#      CI would have caught it. Kept separate from `npm run build` on purpose:
+#      this harness must not emit a bundle into dashboard/static/, because the
+#      committed bundle is a reviewed artifact and a test run must never rewrite
+#      it. The compiler is invoked directly for the same reason.
+#   2. frontend-estate — `npx vitest run` with NO file arguments, so coverage is
+#      defined by the vitest configuration's own globs rather than by a curated
+#      list that drifts.
+#   3. codex-reader-wire — regenerates the committed Codex reader WIRE fixtures
+#      into a scratch directory via bin/build-codex-reader-fixtures.py and
+#      byte-compares them against the committed files. Without this leg the
+#      harness adapted the committed fixture and never regenerated it, so a
+#      server-side wire change left the fixture stale while the frontend golden
+#      still passed — demonstrated on 2026-08-03 by adding a constant field to
+#      the served detail envelope and watching this harness report 4 passed / 0
+#      failed (#463 S2 §6.4). Regeneration writes to a scratch dir rather than in
+#      place, because regenerating over the committed file would overwrite the
+#      evidence instead of reporting the drift.
+#   4. codex-reader-golden — re-runs src/conversations/readerGolden.test.ts with
+#      CCTALLY_READER_GOLDEN_OUT_DIR set. That test adapts each committed wire
+#      fixture through adaptQualifiedDetail and writes the serialized neutral
+#      models into that directory; this harness diffs them against the committed
+#      goldens via the
+#      _lib-golden-diff.sh chokepoint (#106/#107 — never an inline
+#      `diff -u <(…)`). The test itself owns no golden logic, which is why it can
+#      also run as an ordinary member of the estate above.
+#
+# Parallelism: serial. Both test legs invoke vitest, which runs its own worker pool;
+# a second concurrent vitest would oversubscribe the shared xargs -P pool that
+# bin/cctally-test-all fans the harnesses out through.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$REPO_ROOT/bin/_lib-harness-env.sh"
+# shellcheck source=/dev/null
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
+WEB_DIR="$REPO_ROOT/dashboard/web"
+GOLDEN_DIFF_TMPDIR="$(mktemp -d -t cctally-frontend-test-XXXXXX)"
+export GOLDEN_DIFF_TMPDIR
+trap 'rm -rf "$GOLDEN_DIFF_TMPDIR"' EXIT
+
+pass_count=0
+fail_count=0
+
+if [[ ! -x "$WEB_DIR/node_modules/.bin/vitest" ]]; then
+    echo "FAIL frontend-estate: vitest is not installed at dashboard/web/node_modules/.bin/vitest."
+    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "  This harness fails rather than skipping on purpose — see the header."
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+if [[ ! -x "$WEB_DIR/node_modules/.bin/eslint" ]]; then
+    echo "FAIL hooks-lint: eslint is not installed at dashboard/web/node_modules/.bin/eslint."
+    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "  This harness fails rather than skipping because hooks lint is a required gate."
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+if [[ ! -x "$WEB_DIR/node_modules/.bin/tsc" ]]; then
+    echo "FAIL typecheck: tsc is not installed at dashboard/web/node_modules/.bin/tsc."
+    echo "  Run 'npm ci' in dashboard/web/ and try again."
+    echo "  This harness fails rather than skipping because CI's npm run build typechecks."
+    echo "----"
+    echo "passed: 0   failed: 1"
+    exit 1
+fi
+
+lint_log="$GOLDEN_DIFF_TMPDIR/lint.log"
+if (cd "$WEB_DIR" && npm run lint) >"$lint_log" 2>&1; then
+    pass_count=$((pass_count + 1))
+    echo "ok hooks-lint"
+else
+    fail_count=$((fail_count + 1))
+    echo "FAIL hooks-lint: npm run lint failed"
+    tail -80 "$lint_log"
+fi
+
+# The CI-parity leg. `tsc --noEmit` is exactly the middle step of CI's
+# `npm run build`; running it here makes the authoritative local/remote gate at
+# least as strong as CI on the typing axis.
+typecheck_log="$GOLDEN_DIFF_TMPDIR/typecheck.log"
+if (cd "$WEB_DIR" && npx tsc --noEmit) >"$typecheck_log" 2>&1; then
+    pass_count=$((pass_count + 1))
+    echo "ok typecheck"
+else
+    fail_count=$((fail_count + 1))
+    echo "FAIL typecheck: npx tsc --noEmit reported type errors"
+    echo "  CI runs the same compiler through 'npm run build' — fix these or CI fails."
+    tail -80 "$typecheck_log"
+fi
+
+# --maxWorkers caps vitest's own worker pool at the INNER budget
+# bin/cctally-test-all exports as CCTALLY_TEST_JOBS (:151-153) for exactly this
+# purpose: every harness runs inside a shared `xargs -P` pool, and an uncapped
+# vitest would spawn one worker per core on top of it. dashboard/web's vite
+# config sets no poolOptions, and this repository has a recorded history of
+# shared-runner oversubscription producing nondeterministic OSError cascades in
+# the bundle.
+estate_log="$GOLDEN_DIFF_TMPDIR/estate.log"
+if (cd "$WEB_DIR" && npx vitest run \
+        --maxWorkers="${CCTALLY_TEST_JOBS:-2}") >"$estate_log" 2>&1; then
+    pass_count=$((pass_count + 1))
+    echo "ok frontend-estate"
+else
+    fail_count=$((fail_count + 1))
+    echo "FAIL frontend-estate: vitest run failed"
+    tail -80 "$estate_log"
+fi
+
+# The SERVER side of the two-sided pin. Regenerate the wire fixtures into a
+# scratch directory and byte-compare, so a server wire change that is not
+# reflected in the committed fixture fails here instead of passing silently.
+# The adapted goldens below cannot see this: they adapt whatever the committed
+# fixture holds, so a stale fixture adapts cleanly.
+wire_dir="$GOLDEN_DIFF_TMPDIR/wire"
+wire_log="$GOLDEN_DIFF_TMPDIR/wire.log"
+mkdir -p "$wire_dir"
+
+if python3 "$REPO_ROOT/bin/build-codex-reader-fixtures.py" --out-dir "$wire_dir" \
+        >"$wire_log" 2>&1; then
+    for wire_name in wire-detail.json wire-detail-segmented.json; do
+        produced="$wire_dir/$wire_name"
+        committed="$REPO_ROOT/tests/fixtures/codex-reader/$wire_name"
+        if [[ ! -f "$produced" ]]; then
+            fail_count=$((fail_count + 1))
+            echo "FAIL codex-reader-wire: the builder wrote no $wire_name"
+            tail -60 "$wire_log"
+        elif [[ ! -f "$committed" ]]; then
+            fail_count=$((fail_count + 1))
+            echo "FAIL codex-reader-wire: no committed fixture at"
+            echo "  tests/fixtures/codex-reader/$wire_name"
+            echo "  Run: bin/build-codex-reader-fixtures.py"
+        elif _golden_diff_files "$wire_name" "$committed" "$produced"; then
+            pass_count=$((pass_count + 1))
+            echo "ok codex-reader-wire ($wire_name)"
+        else
+            fail_count=$((fail_count + 1))
+            echo "  The SERVER wire envelope changed without the committed fixture"
+            echo "  being regenerated. Run: bin/build-codex-reader-fixtures.py"
+        fi
+    done
+else
+    fail_count=$((fail_count + 1))
+    echo "FAIL codex-reader-wire: bin/build-codex-reader-fixtures.py failed"
+    tail -60 "$wire_log"
+fi
+
+# Two reader-path goldens, one per wire scenario. modern-full covers every
+# record family but carries no turn near the segment budget, so every item in it
+# has segment_ordinal 0; segmented-turn carries several segments of one turn, so
+# the pin actually moves when segment boundaries or block accounting change.
+adapted_dir="$GOLDEN_DIFF_TMPDIR/adapted"
+golden_log="$GOLDEN_DIFF_TMPDIR/golden.log"
+mkdir -p "$adapted_dir"
+
+if (cd "$WEB_DIR" && CCTALLY_READER_GOLDEN_OUT_DIR="$adapted_dir" \
+        npx vitest run --maxWorkers="${CCTALLY_TEST_JOBS:-2}" \
+        src/conversations/readerGolden.test.ts) >"$golden_log" 2>&1; then
+    for pair in "codex-reader-golden:adapted.json:golden-adapted.json" \
+                "codex-reader-golden-segmented:adapted-segmented.json:golden-adapted-segmented.json"; do
+        name="${pair%%:*}"
+        rest="${pair#*:}"
+        produced="$adapted_dir/${rest%%:*}"
+        golden_file="$REPO_ROOT/tests/fixtures/codex-reader/${rest#*:}"
+        if [[ ! -f "$produced" ]]; then
+            fail_count=$((fail_count + 1))
+            echo "FAIL $name: the golden test ran but wrote no output"
+            echo "  CCTALLY_READER_GOLDEN_OUT_DIR was not honoured — check the test's env plumbing."
+            tail -60 "$golden_log"
+        elif [[ ! -f "$golden_file" ]]; then
+            mkdir -p "$(dirname "$golden_file")"
+            cp "$produced" "$golden_file"
+            echo "MISSING GOLDEN $name: wrote initial golden, re-run to verify"
+            fail_count=$((fail_count + 1))
+        elif _golden_diff_files "$name" "$golden_file" "$produced"; then
+            pass_count=$((pass_count + 1))
+            echo "ok $name"
+        else
+            fail_count=$((fail_count + 1))
+        fi
+    done
+else
+    fail_count=$((fail_count + 1))
+    echo "FAIL codex-reader-golden: the golden vitest file did not run"
+    tail -60 "$golden_log"
+fi
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ] || exit 1

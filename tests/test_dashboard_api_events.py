@@ -119,13 +119,19 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
         }).encode())
         for session_id, percent in (("stale", 20.0), ("fresh", 24.0))
     ]
-    phase = threading.Barrier(2)
+    phase = threading.Condition()
+    arrived = 0
+    abort_phase = False
     statusline = ns["_cctally_statusline"]
     write_candidate = statusline._write_candidate
 
     def phase_locked(candidate):
+        nonlocal arrived
         write_candidate(candidate)
-        phase.wait(timeout=3)
+        with phase:
+            arrived += 1
+            phase.notify_all()
+            phase.wait_for(lambda: arrived == len(parsed) or abort_phase)
 
     monkeypatch.setattr(statusline, "_write_candidate", phase_locked)
     workers = [threading.Thread(
@@ -133,9 +139,17 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
     ) for candidate in parsed]
     for worker in workers:
         worker.start()
+    deadline = time.monotonic() + 30
     for worker in workers:
-        worker.join(timeout=5)
-        assert not worker.is_alive()
+        worker.join(timeout=max(0, deadline - time.monotonic()))
+    workers_stopped = all(not worker.is_alive() for worker in workers)
+    if not workers_stopped:
+        with phase:
+            abort_phase = True
+            phase.notify_all()
+        for worker in workers:
+            worker.join(timeout=1)
+    assert workers_stopped, "statusline workers did not reach the reducer phase"
 
     hub = ns["SSEHub"]()
     initial = ns["_empty_dashboard_snapshot"]()

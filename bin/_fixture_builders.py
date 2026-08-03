@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import datetime as dt
 import json
 import sqlite3
 from pathlib import Path
@@ -37,6 +38,26 @@ from typing import Optional
 # so cache.db rebuilds are byte-deterministic. Arbitrary UTC instant — value
 # doesn't matter; only stability does.
 FIXED_LAST_INGESTED_AT = "2026-04-15T15:00:00Z"
+
+
+def fixture_timestamp_utc(value: str | dt.datetime) -> str:
+    """Return the UTC offset form stored by production cache ingestion.
+
+    Source JSONL and quota records legitimately use ``Z``.  Cache ingestion
+    parses those values to aware datetimes and persists ``isoformat()``, so
+    fixture rows for ``*.timestamp_utc`` must carry ``+00:00`` as well.  The
+    distinction is observable because cache readers compare this TEXT column
+    lexically at window boundaries.
+    """
+    if isinstance(value, str):
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    elif isinstance(value, dt.datetime):
+        parsed = value
+    else:
+        raise TypeError("fixture timestamp must be an ISO string or datetime")
+    if parsed.tzinfo is None:
+        raise ValueError("fixture timestamp must include a UTC offset")
+    return parsed.astimezone(dt.timezone.utc).isoformat()
 
 
 # Bytes 96–99 of the SQLite header carry SQLITE_VERSION_NUMBER for the
@@ -810,7 +831,7 @@ def seed_session_entry(
             input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
             usage_extra_json, speed, cost_usd_raw, account_key)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (source_path, line_offset, timestamp_utc, model,
+        (source_path, line_offset, fixture_timestamp_utc(timestamp_utc), model,
          msg_id, req_id,
          input_tokens, output_tokens, cache_create, cache_read,
          usage_extra_json, speed, cost_usd_raw, account_key),
@@ -1066,7 +1087,7 @@ def seed_codex_session_entry(
             output_tokens, reasoning_output_tokens, total_tokens,
             source_root_key, conversation_key, account_key)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (source_path, line_offset, timestamp_utc, session_id, model,
+        (source_path, line_offset, fixture_timestamp_utc(timestamp_utc), session_id, model,
          input_tokens, cached_input_tokens,
          output_tokens, reasoning_output_tokens, total_tokens,
          source_root_key, conversation_key, account_key),

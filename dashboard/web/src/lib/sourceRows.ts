@@ -18,10 +18,11 @@ import type { SourceView } from '../store/sourceView';
 
 // §6.1 quota label join. Hero `quota.active` rows carry the opaque key,
 // percentages, reset, and freshness — but NO label or duration. Labels and
-// `window_minutes` live in `quota.histories` rows keyed by the same opaque key.
-// This attaches each active window's label + duration by that key; an active row
-// with no matching history renders the generic "Codex quota" label. Joins one
-// provider's own rows and derives nothing.
+// `window_minutes` live in `quota.histories` rows keyed by the same scoped
+// identity: `(account_key, key)` under decoration, bare `key` otherwise. This
+// attaches each active window's label + duration by that identity; an active
+// row with no matching history renders the generic "Codex quota" label. Joins
+// one provider's own rows and derives nothing.
 export interface JoinedCodexQuotaWindow {
   key: string;
   label: string;
@@ -49,12 +50,22 @@ export function joinCodexQuotaLabels(
   hero: CodexHero,
   quota: CodexQuotaDomain,
 ): JoinedCodexQuotaWindow[] {
-  const byKey = new Map(
-    (quota?.histories ?? []).map((h) => [h.key, h] as const),
-  );
+  const byAccount = new Map<string, Map<string, CodexQuotaDomain['histories'][number]>>();
+  const undecoratedByKey = new Map<string, CodexQuotaDomain['histories'][number]>();
+  for (const history of quota?.histories ?? []) {
+    if (history.account_key == null) {
+      undecoratedByKey.set(history.key, history);
+      continue;
+    }
+    const scoped = byAccount.get(history.account_key) ?? new Map();
+    scoped.set(history.key, history);
+    byAccount.set(history.account_key, scoped);
+  }
   const active = hero?.quota?.active ?? [];
   return active.map((row) => {
-    const history = byKey.get(row.key);
+    const history = row.account_key == null
+      ? undecoratedByKey.get(row.key)
+      : byAccount.get(row.account_key)?.get(row.key);
     return {
       key: row.key,
       label: nativeLimitLabel(history?.label, history?.window_minutes),

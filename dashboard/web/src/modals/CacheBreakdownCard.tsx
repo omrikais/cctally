@@ -24,6 +24,7 @@ import { cachePercentText } from '../lib/cacheReportVocabulary';
 export interface CacheBreakdownCardProps {
   kind: 'projects' | 'models';
   rows: CacheReportBreakdownRow[];
+  source?: string;
 }
 
 // Basename of a filesystem path — the last non-empty segment. CR-4:
@@ -36,7 +37,8 @@ function basename(path: string): string {
   return parts.length ? parts[parts.length - 1] : path;
 }
 
-export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
+export function CacheBreakdownCard({ kind, rows, source }: CacheBreakdownCardProps) {
+  const resolvedSource = source ?? 'claude';
   const cls = kind === 'projects' ? 'bd-projects' : 'bd-models';
   const label = kind === 'projects' ? 'By project' : 'By model';
   const emptyText =
@@ -64,7 +66,7 @@ export function CacheBreakdownCard({ kind, rows }: CacheBreakdownCardProps) {
                   >
                     {display}
                   </td>
-                  <td>{cachePercentText(r) ?? <span className="m-unavailable">—</span>}</td>
+                  <td>{cachePercentText(r, resolvedSource) ?? <span className="m-unavailable">—</span>}</td>
                   <td className={r.net_usd >= 0 ? 'net-pos' : 'net-neg'}>
                     {fmt.usdSigned(r.net_usd)}
                   </td>

@@ -39,7 +39,19 @@ export type ConversationItem =
       is_sidechain: boolean;
       subagent_key: string | null; // agent-file hash; null for the main session
       parent_uuid: string | null;  // raw parent uuid (for cross-file nesting)
-      cost_usd: number; // the TURN's cost, counted ONCE (0.0 for null msg_id)
+      // The TURN's cost, counted ONCE (0.0 for null msg_id). NULL means "this
+      // item has no cost of its own", which #463 S1 segmentation introduces: the
+      // turn stays the costing unit, so its carrier segment reports the cost and
+      // every other segment reports null. A zero would be indistinguishable from
+      // a genuinely free turn, so consumers must test `> 0` or `!= null`, never
+      // coerce through a numeric default.
+      cost_usd: number | null;
+      // #463 S1 — turn membership for a segmented item. Equal to segment 0's key,
+      // so grouping on it recovers the turn without recomputing boundaries.
+      // Absent on an envelope from a server that predates segmentation.
+      turn_uuid?: string;
+      // #463 S1 — 0 for a whole item and for a turn's first segment.
+      segment_ordinal?: number;
       // #177 S1 backend / S5 client adoption (Codex F7) — per-turn token usage,
       // stamped when the turn key has a session_entries row. Absent (NOT
       // zero-filled) otherwise; the §6 footer reads it.
@@ -63,7 +75,10 @@ export type ConversationItem =
       subagent_key: string | null;
       parent_uuid: string | null;
       model?: string | null; // present only on the null-msg_id assistant case
-      cost_usd?: number; // present (0.0) only on the null-msg_id assistant case
+      cost_usd?: number | null; // present (0.0) only on the null-msg_id assistant case
+      // #463 S1 — segmentation metadata, threaded onto every adapted item.
+      turn_uuid?: string;
+      segment_ordinal?: number;
       // #188 — a slash-command invocation promoted to a "You" turn (text=args)
       // carries the command name for a compact badge; the kernel derives it from
       // the raw <command-name> block, NOT the scalar text (which holds the args).
@@ -86,6 +101,11 @@ export type ConversationItem =
       kind: 'meta';
       anchor: { session_id: string; uuid: string; id: number };
       member_uuids: string[];
+      // #463 S1 — segmentation metadata, threaded onto every adapted item. A
+      // non-response item is always exactly one segment, so `segment_ordinal`
+      // is 0 here and `turn_uuid` equals the item's own key.
+      turn_uuid?: string;
+      segment_ordinal?: number;
       ts: string;
       text: string;
       blocks: ConversationBlock[];
@@ -125,6 +145,11 @@ export interface OutlineTurn {
   ts: string | null;
   label: string;
   member_uuids: string[];
+  // #463 S1 — the keys of this turn's segments, entry `i` being segment `i`.
+  // DISTINCT from member_uuids on purpose: `loadToTarget` treats a uuid in
+  // member_uuids as already loaded, so folding segment keys in would make the
+  // drain skip an unfetched segment and the jump would land nowhere.
+  segment_uuids?: string[];
   subagent_key: string | null;
   parent_uuid: string | null;
   is_sidechain: boolean;
@@ -226,6 +251,16 @@ export interface ConversationOutline {
   // Present from a current server; optional for back-compat with an older one.
   task_completion?: OutlineTaskCompletion | null;
   turns: OutlineTurn[];
+  // #463 S1 — document position of every addressable key (turn key, folded
+  // member key, segment key) over the FULL wire turn list. `turns` above is the
+  // NAVIGATION subset: the qualified adapter drops meta turns and event-bearing
+  // non-compaction turns, which on real Codex data removes every heavy assistant
+  // response and therefore every multi-segment turn. `loadToTarget` needs a total
+  // order to pick a paging direction, and the navigation subset is not one — a
+  // target inside a dropped turn resolved to no index at all, so the drain
+  // returned before its first page. Absent for providers whose outline carries
+  // no positional wire data; `loadToTarget` then falls back to the skeleton index.
+  positionByKey?: ReadonlyMap<string, number>;
 }
 
 // One row of a checklist card (TodoWrite legacy + the live Task* family). The
@@ -375,7 +410,10 @@ export type NativeToolCard =
     };
 
 export type ConversationBlock =
-  | { kind: 'text'; text: string }
+  // #463 S2 §3.2 — `block_key` is the server's durable per-row anchor, retained
+  // so each separately authored message keeps its identity through adaptation.
+  // Absent on a wire envelope from a server that predates #463 S2 §1.
+  | { kind: 'text'; text: string; block_key?: string }
   | { kind: 'thinking'; text: string }
   | {
       // #334 Task B — provider-native reasoning is deliberately distinct from
@@ -386,6 +424,12 @@ export type ConversationBlock =
       title?: string;
       summary?: string;
       body?: string;
+      // #463 S2 §2.5/§2.6 — the individual authored headings the aggregate holds,
+      // decomposed server-side at read time from the retained summary entries.
+      // `key` is `<block_key>#<zero-based ordinal>`. Absent whenever the server
+      // could not read the retained payload, in which case the reader falls back
+      // to `summary`/`title` exactly as before.
+      headings?: { key: string; text: string }[];
     }
   | {
       kind: 'system_actions';

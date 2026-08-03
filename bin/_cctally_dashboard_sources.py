@@ -2422,9 +2422,29 @@ def _alerts_wire(
     so it stays visible under focus and the client labels it as vendor-wide.
     """
     rows: list[dict[str, object]] = []
+    if decorated:
+        import _cctally_account
+
+        account_labels = _cctally_account.display_label_map(stats_conn, "codex")
+        account_labels.update({"*": "All accounts", "unattributed": "Unattributed"})
+    else:
+        account_labels = {}
 
     def _account(value: object) -> dict[str, object]:
-        return {"account_key": str(value or _CODEX_VENDOR_WIDE_ACCOUNT)} if decorated else {}
+        if not decorated:
+            return {}
+
+        key = str(value or _CODEX_VENDOR_WIDE_ACCOUNT)
+        label = account_labels.get(key)
+        if label is None:
+            label = _cctally_account.account_label(stats_conn, key)
+        return {
+            # Retained as the internal account-scope selector used by the
+            # source-state builder; the camel fields are the public #345 wire.
+            "account_key": key,
+            "accountKey": key,
+            "accountLabel": label,
+        }
 
     try:
         for period, threshold, consumption_pct, crossed_at, account_key in stats_conn.execute(
@@ -2880,6 +2900,12 @@ def _codex_accounts_wire(
         }
         if is_unattributed:
             card["unattributed"] = True
+        elif cyc is not None and cyc.evidence_stale:
+            # #360 / #416 closeout: freshness belongs to the account whose
+            # resolved cycle supplied the card. The aggregate hero marker
+            # cannot speak for a fresh sibling, and staleness is disclosure
+            # only — the retained percentage, reset and spend remain useful.
+            card["cycleFreshness"] = "stale"
         accounts_wire.append(card)
         if cyc is not None and not is_unattributed:
             hero_cycles_wire.append({

@@ -814,7 +814,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 3,
+  "source_schema_version": 4,
   "sources": {
     "all": {
       "availability": "ok",
@@ -1825,7 +1825,7 @@
               "by_project": [],
               "days": [],
               "fourteen_day_counterfactual_usd": 0.0,
-              "fourteen_day_efficiency_ratio": 0.0,
+              "fourteen_day_efficiency_ratio": null,
               "is_empty": true,
               "not_applicable": {
                 "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
@@ -1841,14 +1841,13 @@
                 ],
                 "baseline_daily_row_count": 0,
                 "baseline_median_percent": null,
-                "cache_hit_percent": 0.0,
                 "cached_input_percent": 0.0,
                 "date": "2026-04-16",
                 "delta_pp": null,
                 "net_usd": 0.0,
                 "observed": false,
                 "saved_usd": 0.0,
-                "wasted_usd": 0.0
+                "wasted_usd": null
               },
               "window_days": 14
             },
@@ -2954,7 +2953,7 @@
           "by_project": [],
           "days": [],
           "fourteen_day_counterfactual_usd": 0.0,
-          "fourteen_day_efficiency_ratio": 0.0,
+          "fourteen_day_efficiency_ratio": null,
           "is_empty": true,
           "not_applicable": {
             "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
@@ -2970,14 +2969,13 @@
             ],
             "baseline_daily_row_count": 0,
             "baseline_median_percent": null,
-            "cache_hit_percent": 0.0,
             "cached_input_percent": 0.0,
             "date": "2026-04-16",
             "delta_pp": null,
             "net_usd": 0.0,
             "observed": false,
             "saved_usd": 0.0,
-            "wasted_usd": 0.0
+            "wasted_usd": null
           },
           "window_days": 14
         },

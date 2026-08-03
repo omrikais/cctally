@@ -288,9 +288,12 @@ jobs:
           sqlite3 :memory: '.recover' >/dev/null
       - name: Install Python test deps
         run: python -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
-      # Unlike ci-linux-matrix (which deliberately skips npm ci), this lane
-      # installs dashboard deps: vitest needs them, and the share-v2 smoke
-      # inside cctally-test-all then runs against a real vitest.
+      # Every lane that runs cctally-test-all installs dashboard deps, this one
+      # included: vitest needs them, and both the share-v2 smoke and
+      # bin/cctally-frontend-test inside cctally-test-all then run against a real
+      # vitest. ci-linux-matrix used to skip `npm ci` and now performs the same
+      # step, and tests/test_frontend_estate_bundle_contract.py enforces the rule
+      # across every bundle lane.
       - name: Install dashboard deps (vitest + share smoke)
         working-directory: dashboard/web
         run: npm ci
@@ -298,10 +301,16 @@ jobs:
         # This phase has its own bound so a genuinely wedged harness is named
         # and terminated before consuming the whole 60-minute job timeout,
         # which also covers the later Vitest and Playwright phases.
+        #
+        # The full vitest estate used to run again as a separate step here.
+        # bin/cctally-frontend-test (#463 S1, finding F23) now runs it inside the
+        # bundle, so a second `npx vitest run` on this lane would execute the
+        # whole estate twice in the same job. (A file count used to be quoted
+        # here; it was stale within weeks, so it is deliberately gone — the point
+        # is the duplication, not its size.) The dashboard-build-stability job keeps its
+        # own estate step: that job does NOT run the bundle, so it is not a
+        # duplicate and removing it would reduce coverage.
         run: timeout --kill-after=30s 30m bin/cctally-test-all
-      - name: Run frontend unit tests (full vitest estate)
-        working-directory: dashboard/web
-        run: npx vitest run
 
       # Reader real-browser smoke net (#281 S3) on the PR lane. The self-hosted
       # e2e-reader job above is push-only for fork-PR safety, so external PRs pick

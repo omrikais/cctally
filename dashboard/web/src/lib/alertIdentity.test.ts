@@ -62,6 +62,21 @@ describe('toastAlertId (§6.7)', () => {
     expect(toastAlertId(codexBudgetRow)).toBe(`codex:${codexBudgetRow.key}`);
     expect(toastAlertId(codexQuotaRow)).toBe(`codex:${codexQuotaRow.key}`);
   });
+  it('qualifies otherwise-identical crossings by account when decorated', () => {
+    const work = {
+      ...claudeRow,
+      accountKey: 'a'.repeat(32),
+      accountLabel: 'work',
+    } as SourceAlertRow;
+    const personal = {
+      ...claudeRow,
+      accountKey: 'b'.repeat(32),
+      accountLabel: 'personal',
+    } as SourceAlertRow;
+    expect(toastAlertId(work)).toBe(`claude:${'a'.repeat(32)}:${claudeRow.id}`);
+    expect(toastAlertId(personal)).toBe(`claude:${'b'.repeat(32)}:${claudeRow.id}`);
+    expect(toastAlertId(work)).not.toBe(toastAlertId(personal));
+  });
 });
 
 describe('seedFormsForRow — normalized + legacy bare form for continuity', () => {
@@ -75,6 +90,18 @@ describe('seedFormsForRow — normalized + legacy bare form for continuity', () 
     expect(seedFormsForRow(codexBudgetRow)).toEqual([
       `codex:${codexBudgetRow.key}`,
       codexBudgetRow.key,
+    ]);
+  });
+  it('decorated rows seed account-qualified plus pre-decoration forms', () => {
+    const row = {
+      ...claudeRow,
+      accountKey: 'a'.repeat(32),
+      accountLabel: 'work',
+    } as SourceAlertRow;
+    expect(seedFormsForRow(row)).toEqual([
+      `claude:${'a'.repeat(32)}:${claudeRow.id}`,
+      `claude:${claudeRow.id}`,
+      claudeRow.id,
     ]);
   });
 });

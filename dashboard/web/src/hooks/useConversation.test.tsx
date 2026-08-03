@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversation } from './useConversation';
 import { VIRTUAL_INDEX_BASE } from '../conversations/virtuosoFirstIndex';
+import { adaptQualifiedOutline, buildQualifiedOutlinePositions } from '../lib/conversationAdapters';
 import type { OutlineTurn } from '../types/conversation';
 
 // #278: the per-conversation EventSource was lifted OUT of useConversation into
@@ -75,6 +76,53 @@ describe('useConversation', () => {
     ]);
     expect(result.current.detail?.provider_meta?.source).toBe('claude');
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversation/v1.claude');
+  });
+
+  // #463 S1, finding 15 — the paginator now returns an EMPTY page for an
+  // unresolvable `after` cursor, where the old Codex kernel silently re-served
+  // the head. Spec section 4 sanctions that, and the Claude kernel has always
+  // behaved this way, but the Codex `fetchNext` path has never received one.
+  // Verified here on the qualified Codex envelope rather than assumed to
+  // transfer from the Claude-side handling.
+  it('ends forward paging on an empty stale-cursor page rather than re-serving the head', async () => {
+    const codexItem = (key: string, text: string) => ({
+      item_key: key, kind: 'assistant', timestamp_utc: '2026-07-14T12:00:00Z',
+      model: 'gpt-5.6-codex', blocks: [{ kind: 'assistant', text }],
+      turn_item_key: key, segment_ordinal: 0, cost_usd: 0.1, tokens: null,
+    });
+    mockOnce({
+      status: 'ok', conversation_key: 'v1.codex', title: 'Codex thread',
+      items: [codexItem('civ1.a', 'first'), codexItem('civ1.b', 'second')],
+      page: { total: 9, returned: 2, before: null, after: 'civ1.b', has_before: false, has_after: true },
+      children: [], parent: null, total_cost_usd: 0.2, unattributed_cost_usd: 0,
+    });
+    const ref = { source: 'codex' as const, key: 'v1.codex' };
+    const { result } = renderHook(() => useConversation(ref));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(result.current.hasMore).toBe(true);
+
+    // The stale-cursor page: zero items, both edge flags false, both cursors
+    // null. This is `_stale_codex_page` on the wire.
+    mockOnce({
+      status: 'ok', conversation_key: 'v1.codex', title: 'Codex thread',
+      items: [],
+      page: { total: 9, returned: 0, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0.2, unattributed_cost_usd: 0,
+    });
+    let op: unknown;
+    await act(async () => { op = await result.current.loadMore(); });
+
+    // The window is untouched — no duplicate head re-appended, nothing dropped.
+    await waitFor(() => expect(result.current.detail?.items.map((item) => item.anchor.uuid))
+      .toEqual(['civ1.a', 'civ1.b']));
+    // Forward paging ends rather than looping on a cursor that cannot resolve.
+    expect(result.current.hasMore).toBe(false);
+    // An op is still emitted (addedBottom 0) so a follow-up trim tick fires.
+    expect(op).toMatchObject({ op: 'append', addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
+    // A second call is a no-op: the cursor is null, so no further request goes out.
+    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    await act(async () => { expect(await result.current.loadMore()).toBeNull(); });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(calls);
   });
 
   it('loads page 1 for a session', async () => {
@@ -859,6 +907,121 @@ describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => 
     expect(lastUrl()).toContain('before=');
     // The owning turn u2 is now loaded (its member u2b is reachable).
     expect(result.current.detail?.items.some((i: { member_uuids: string[] }) => i.member_uuids.includes('u2b'))).toBe(true);
+  });
+
+  // #463 S1 P0 — the navigation outline is NOT a positional index. `adaptQualified
+  // Outline` drops every turn that carries a lifecycle `event` row and is not a
+  // compaction, which on real Codex data removes every heavy assistant response —
+  // and those are exactly the turns segmentation splits. A deep link naming one of
+  // their segments resolved to no outline turn, so the drain returned before its
+  // first page and the reader sat on the tail window forever. Measured on the
+  // profiled 128-segment conversation: 13 of 78 wire turns were dropped, and all
+  // 50 segments with ordinal >= 1 belonged to a dropped turn.
+  it('loadToTarget pages toward a target whose owning turn the navigation outline dropped', async () => {
+    const segItem = {
+      kind: 'assistant', anchor: { session_id: 's', uuid: 'x2', id: 2 },
+      member_uuids: ['x2'], ts: 't', text: 'segment 2', blocks: [],
+      model: 'opus', is_sidechain: false, cost_usd: 1,
+    };
+    // Document order over EVERY wire turn, dropped ones included: the three
+    // segments of the dropped turn sit between u2 and u3.
+    const positions = new Map<string, number>([
+      ['u1', 0], ['u2', 1], ['x0', 2], ['x1', 3], ['x2', 4], ['u3', 5], ['u4', 6],
+    ]);
+    mockOnce(pageDetail([it3, it4], { prev_before: 3, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', {
+      outlineTurns, outlinePositions: positions, openIntent: { kind: 'tail' },
+    }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+
+    mockOnce(pageDetail([segItem], { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadToTarget('x2'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(3));
+    // The drain ran, and it ran HEAD-WARD: x2 sits above the tail window.
+    expect(lastUrl()).toContain('before=3');
+    expect(result.current.detail?.items.some((i: { anchor: { uuid: string } }) => i.anchor.uuid === 'x2')).toBe(true);
+  });
+
+  // #463 S1 — the case segment granularity exists for, and the one place where a
+  // turn-granular index looks identical to a correct one until you put the
+  // target and the window edge in the SAME turn. Both `T.s2` and `T.s5` belong
+  // to turn `T`, so a turn-granular position gives them the same number, the
+  // "strictly above the window" test is false, and the drain pages tail-ward —
+  // away from the target — until the bottom cursor exhausts. The positions are
+  // built by the real `buildQualifiedOutlinePositions`, so this pins the builder
+  // and the direction decision together rather than a hand-written map.
+  it('loadToTarget drains head-ward between two segments of ONE turn', async () => {
+    const seg = (uuid: string, id: number) => ({
+      kind: 'assistant', anchor: { session_id: 's', uuid, id },
+      member_uuids: [uuid], ts: 't', text: uuid, blocks: [],
+      model: 'opus', is_sidechain: false, cost_usd: 1,
+    });
+    const positions = buildQualifiedOutlinePositions([
+      { item_key: 'u1' },
+      { item_key: 'T', segment_item_keys: ['T', 'T.s1', 'T.s2', 'T.s3', 'T.s4', 'T.s5'] },
+      { item_key: 'u9' },
+    ]);
+    // The window holds segment 5 of the turn and nothing else.
+    mockOnce(pageDetail([seg('T.s5', 6)], { prev_before: 6, has_prev: true }));
+    const { result } = renderHook(() => useConversation('s', {
+      outlinePositions: positions, openIntent: { kind: 'tail' },
+    }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    mockOnce(pageDetail([seg('T.s2', 3)], { prev_before: null, has_prev: false }));
+    await act(async () => { await result.current.loadToTarget('T.s2'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(lastUrl()).toContain('before=6');
+    expect(lastUrl()).not.toContain('after=');
+    // The premise, stated after the behaviour so a turn-granular index fails on
+    // the DIRECTION rather than short-circuiting here: the two keys carry
+    // different positions, which a turn-granular index would collapse to one.
+    expect(positions.get('T.s2')).toBe(3);
+    expect(positions.get('T.s5')).toBe(6);
+  });
+
+  // #463 S1 — the position index is published for EVERY qualified conversation,
+  // Claude included, and `loadToTarget` uses it there too. `adaptQualifiedOutline`
+  // drops meta turns on Claude exactly as it does on Codex, so a jump into one of
+  // them used to resolve to no turn and return without issuing a page. This is a
+  // deliberate widening of the fix beyond Codex, so it carries its own test.
+  it('loadToTarget drains toward a meta turn the Claude navigation outline dropped', async () => {
+    const claudeRef = { source: 'claude' as const, key: 'v1.claudepos' };
+    const outline = adaptQualifiedOutline(claudeRef, {
+      status: 'ok', conversation_key: claudeRef.key,
+      turns: [
+        { item_key: 'cl_ask', label: 'Ask', timestamp_utc: null, kinds: { user: 1 } },
+        // Dropped from `turns`: a meta turn is never navigation.
+        { item_key: 'cl_meta', label: 'system note', timestamp_utc: null, kinds: { meta: 1 } },
+        { item_key: 'cl_tail', label: 'Tail', timestamp_utc: null, kinds: { assistant: 1 } },
+      ],
+      files: [], children: [],
+    }, {}, new Set(['cl_ask']));
+    expect(outline.turns.map((turn) => turn.uuid)).toEqual(['cl_ask', 'cl_tail']);
+    expect(outline.positionByKey?.get('cl_meta')).toBe(1);
+
+    const qualified = (keys: string[], hasBefore: boolean, before: string | null) => ({
+      status: 'ok', conversation_key: claudeRef.key,
+      items: keys.map((key) => ({
+        item_key: key, kind: 'assistant', timestamp_utc: '2026-07-14T12:00:00Z',
+        model: 'claude-opus-4-8', blocks: [{ kind: 'text', text: key }],
+        cost_usd: null, tokens: null,
+      })),
+      page: { total: 3, returned: keys.length, before, after: null, has_before: hasBefore, has_after: false },
+      children: [], parent: null, total_cost_usd: 0,
+    });
+
+    mockOnce(qualified(['cl_tail'], true, 'cl_tail'));
+    const { result } = renderHook(() => useConversation(claudeRef, {
+      outlineTurns: outline.turns, outlinePositions: outline.positionByKey,
+      openIntent: { kind: 'tail' },
+    }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    mockOnce(qualified(['cl_meta'], false, null));
+    await act(async () => { await result.current.loadToTarget('cl_meta'); });
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(2));
+    expect(lastUrl()).toContain('before=cl_tail');
   });
 
   it('loadToTarget is a no-op when the target is already in the window', async () => {

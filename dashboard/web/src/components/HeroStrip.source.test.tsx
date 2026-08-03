@@ -342,6 +342,32 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     expect(combined).not.toHaveTextContent('unavailable');
   });
 
+  it('keeps stale-cycle combined actuals with a visible mobile-safe marker (#359)', () => {
+    updateSnapshot(envWith((b) => {
+      const codex = b.sources.codex.data!;
+      codex.hero.cycle_freshness = 'stale';
+      b.sources.codex.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
+      b.sources.all.availability = 'partial';
+      b.sources.all.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
+      b.sources.all.warnings = [{
+        code: 'combined_totals_stale',
+        message: 'Codex quota evidence is stale; combined totals use retained actuals.',
+        domain: 'hero',
+      }];
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const combined = screen.getByTestId('shared-hero-spent');
+    expect(combined).toHaveTextContent('$20.70');
+    expect(combined).not.toHaveTextContent('unavailable');
+    expect(combined).toHaveAttribute('title', expect.stringMatching(/retained actuals/i));
+    expect(combined).toHaveAttribute('aria-label', expect.stringMatching(/stale/i));
+    const marker = screen.getByTestId('shared-hero-stale-marker');
+    expect(marker).toHaveTextContent(/stale quota/i);
+    expect(marker).toHaveAttribute('title', expect.stringMatching(/stale/i));
+  });
+
   it('shows an explicit combined-unavailable state when combined is null', () => {
     updateSnapshot(
       envWith((b) => {

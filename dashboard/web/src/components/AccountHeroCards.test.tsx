@@ -70,6 +70,21 @@ describe('AccountHeroCards (unified per-account view)', () => {
     expect(cards[0].className).toContain('is-focused');
   });
 
+  it('discloses stale quota evidence on only the account that owns it', () => {
+    updateSnapshot(decoratedEnv([
+      { ...card({ accountKey: A, label: 'alice', weeklyPercent: 40, spendUsd: 1 }), cycleFreshness: 'stale' as const },
+      card({ accountKey: B, label: 'bob', weeklyPercent: 55, spendUsd: 2 }),
+    ]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<AccountHeroCards />);
+    const cards = screen.getAllByTestId('account-hero-card');
+    const alice = cards.find((item) => item.getAttribute('data-account') === A);
+    const bob = cards.find((item) => item.getAttribute('data-account') === B);
+    expect(alice?.querySelector('[data-testid="account-cycle-stale"]')).toHaveTextContent('stale');
+    expect(bob?.querySelector('[data-testid="account-cycle-stale"]')).toBeNull();
+    expect(alice).toHaveTextContent('$1.00');
+  });
+
   it('the unattributed card is dimmed with no bars (totals only)', () => {
     updateSnapshot(decoratedEnv([
       card({ accountKey: A, label: 'alice', weeklyPercent: 40, spendUsd: 1 }),

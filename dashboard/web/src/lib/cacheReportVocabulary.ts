@@ -3,8 +3,8 @@
 // Two things live here because they answer the same question — "what does this
 // provider call its cache figure?" — from opposite ends:
 //
-//   cachePercent    reads the VALUE, preferring Codex's authoritative
-//                   `cached_input_percent` and tolerating its absence.
+//   cachePercent    reads the provider's authoritative VALUE without
+//                   crossing into another provider's field.
 //   cacheVocabulary reads the LABEL for that value and everything derived
 //                   from it.
 //
@@ -27,16 +27,16 @@ export interface CachePercentRow {
 }
 
 /**
- * The percentage a row publishes, or null when it publishes none.
+ * The provider-authoritative percentage a row publishes, or null.
  *
- * `??` and not `||`: a measured zero-reuse day is a real observation and must
- * not collapse into the missing case. Null is returned only when BOTH keys are
- * absent — the shape a future server emits once the transitional
- * `cache_hit_percent` alias is dropped, and the shape that produced `NaN`
- * geometry in the sparkline before this accessor existed.
+ * The source parameter is load-bearing: Claude and Codex intentionally publish
+ * different keys, and #465 retired the transitional cross-provider fallback.
+ * `??` and not `||` keeps a measured zero as a real observation.
  */
-export function cachePercent(row: CachePercentRow): number | null {
-  return row.cached_input_percent ?? row.cache_hit_percent ?? null;
+export function cachePercent(row: CachePercentRow, source = 'claude'): number | null {
+  return source === 'codex'
+    ? row.cached_input_percent ?? null
+    : row.cache_hit_percent ?? null;
 }
 
 /**
@@ -46,8 +46,8 @@ export function cachePercent(row: CachePercentRow): number | null {
  * textual site: a null percentage is not a zero and must never render as
  * `0%` or `NaN%`. `fmt.pctFloor` stays a FLOOR, per the epic's preserve list.
  */
-export function cachePercentText(row: CachePercentRow): string | null {
-  const pct = cachePercent(row);
+export function cachePercentText(row: CachePercentRow, source = 'claude'): string | null {
+  const pct = cachePercent(row, source);
   return pct === null ? null : `${fmt.pctFloor(pct)}%`;
 }
 
@@ -62,12 +62,9 @@ export interface CacheNotApplicableCarrier {
 /**
  * The provider's own reason a figure is not applicable, or null.
  *
- * The map is the authoritative signal, NOT the value: Codex keeps publishing
- * `wasted_usd` and `fourteen_day_efficiency_ratio` as numbers through the
- * transition release (a pre-S2 tab calls `.toFixed` on the first and
- * `Math.round` on the second), so a client that inferred applicability from
- * nullness would read a structural zero as a measurement. The copy comes from
- * the wire so the reason cannot drift from the provider that owns it.
+ * The map is the authoritative user-facing signal. Codex publishes null for
+ * these values, while the reason copy stays on the wire so it cannot drift
+ * from the provider that owns it.
  */
 export function notApplicableReason(
   carrier: CacheNotApplicableCarrier,

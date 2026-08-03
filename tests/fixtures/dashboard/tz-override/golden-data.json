@@ -50,12 +50,43 @@
   "cache_report": {
     "anomaly_threshold_pp": 15,
     "anomaly_window_days": 14,
-    "by_model": [],
-    "by_project": [],
-    "days": [],
+    "by_model": [
+      {
+        "cache_hit_percent": 0.0,
+        "key": "claude-sonnet-4-6",
+        "net_usd": 0.0
+      }
+    ],
+    "by_project": [
+      {
+        "cache_hit_percent": 0.0,
+        "key": "/fake/repos/fixture-tz-override",
+        "net_usd": 0.0
+      }
+    ],
+    "days": [
+      {
+        "anomaly_reasons": [],
+        "anomaly_triggered": false,
+        "anomaly_unevaluated": [
+          "net_negative",
+          "cache_drop"
+        ],
+        "cache_creation_tokens": 0,
+        "cache_hit_percent": 0.0,
+        "cache_read_tokens": 0,
+        "date": "2026-04-20",
+        "input_tokens": 100000,
+        "net_usd": 0.0,
+        "observed": true,
+        "output_tokens": 12000,
+        "saved_usd": 0.0,
+        "wasted_usd": 0.0
+      }
+    ],
     "fourteen_day_counterfactual_usd": 0.0,
     "fourteen_day_efficiency_ratio": 0.0,
-    "is_empty": true,
+    "is_empty": false,
     "seven_day_anomaly_count": 0,
     "seven_day_net_usd": 0.0,
     "today": {
@@ -71,14 +102,14 @@
       "date": "2026-04-20",
       "delta_pp": null,
       "net_usd": 0.0,
-      "observed": false,
+      "observed": true,
       "saved_usd": 0.0,
       "wasted_usd": 0.0
     },
     "window_days": 14
   },
   "current_week": {
-    "dollar_per_pct": 0.0,
+    "dollar_per_pct": 0.04,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": 22.0,
@@ -92,7 +123,7 @@
     "milestones": [],
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
-    "spent_usd": 0.0,
+    "spent_usd": 0.48,
     "used_pct": 12.0,
     "week_index": [
       {
@@ -109,11 +140,449 @@
     ]
   },
   "daily": {
-    "peak": null,
-    "quantile_thresholds": [],
-    "rows": [],
-    "total_cost_usd": 0.0,
-    "total_tokens": 0
+    "peak": {
+      "cost_usd": 0.48,
+      "date": "2026-04-20"
+    },
+    "quantile_thresholds": [
+      0.48,
+      0.48,
+      0.48,
+      0.48,
+      0.48
+    ],
+    "rows": [
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": 0.0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.48,
+        "date": "2026-04-20",
+        "input_tokens": 100000,
+        "intensity_bucket": 1,
+        "is_today": true,
+        "label": "04-20",
+        "models": [
+          {
+            "chip": "sonnet",
+            "cost_pct": 100.0,
+            "cost_usd": 0.48,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          }
+        ],
+        "output_tokens": 12000,
+        "total_tokens": 112000
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-19",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-19",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-18",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-18",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-17",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-17",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-16",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-16",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-15",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-15",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-14",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-14",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-13",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-13",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-12",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-12",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-11",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-11",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-10",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-10",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-09",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-09",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-08",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-08",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-07",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-07",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-06",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-06",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-05",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-05",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-04",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-04",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-03",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-03",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-02",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-02",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-04-01",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "04-01",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-31",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-31",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-30",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-30",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-29",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-29",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-28",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-28",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-27",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-27",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-26",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-26",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-25",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-25",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-24",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-24",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-23",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-23",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      },
+      {
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": null,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "date": "2026-03-22",
+        "input_tokens": 0,
+        "intensity_bucket": 0,
+        "is_today": false,
+        "label": "03-22",
+        "models": [],
+        "output_tokens": 0,
+        "total_tokens": 0
+      }
+    ],
+    "total_cost_usd": 0.48,
+    "total_tokens": 112000
   },
   "dashboard_prefs": {
     "cache_failure_markers": true,
@@ -131,20 +600,20 @@
   "doctor": "__DOCTOR_BLOCK__",
   "envelope_version": 2,
   "forecast": {
-    "budget_100_per_day_usd": 0.0,
-    "budget_90_per_day_usd": 0.0,
+    "budget_100_per_day_usd": 42.24,
+    "budget_90_per_day_usd": 37.440000000000005,
     "confidence": "low",
     "confidence_score": 2,
     "explain": {
       "budget": [
         {
-          "dollars_per_day": 0.0,
+          "dollars_per_day": 42.24,
           "pct_headroom": 88.0,
           "percent_per_day": 1056.0,
           "target_percent": 100
         },
         {
-          "dollars_per_day": 0.0,
+          "dollars_per_day": 37.44,
           "pct_headroom": 78.0,
           "percent_per_day": 936.0,
           "target_percent": 90
@@ -154,7 +623,7 @@
         "five_hour_percent": 22.0,
         "latest_snapshot_at": "2026-04-20T12:00:00Z",
         "snapshot_count": 1,
-        "spent_usd": 0.0,
+        "spent_usd": 0.48,
         "weekly_percent": 12.0
       },
       "forecast": {
@@ -175,7 +644,7 @@
         "tool_version": "forecast-v1"
       },
       "rates": {
-        "dollars_per_percent": 0.0,
+        "dollars_per_percent": 0.04,
         "dollars_per_percent_source": "this_week",
         "recent_24h_pct_per_hour": null,
         "week_average_pct_per_hour": 0.072289
@@ -195,7 +664,7 @@
   },
   "generated_at": "__NOW__",
   "header": {
-    "dollar_per_pct": 0.0,
+    "dollar_per_pct": 0.04,
     "five_hour_pct": 22.0,
     "forecast_pct": 12.144578313253012,
     "forecast_verdict": "ok",
@@ -207,9 +676,30 @@
   "last_sync_at": null,
   "last_sync_error": null,
   "monthly": {
-    "rows": [],
-    "total_cost_usd": 0.0,
-    "total_tokens": 0
+    "rows": [
+      {
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.48,
+        "delta_cost_pct": null,
+        "input_tokens": 100000,
+        "is_current": true,
+        "label": "2026-04",
+        "models": [
+          {
+            "chip": "sonnet",
+            "cost_pct": 100.0,
+            "cost_usd": 0.48,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          }
+        ],
+        "output_tokens": 12000,
+        "total_tokens": 112000
+      }
+    ],
+    "total_cost_usd": 0.48,
+    "total_tokens": 112000
   },
   "projects": {
     "current_week": {
@@ -233,19 +723,30 @@
     }
   },
   "sessions": {
-    "rows": [],
+    "rows": [
+      {
+        "cache_hit_pct": 0.0,
+        "cost_usd": 0.48,
+        "duration_min": 0,
+        "model": "claude-sonnet-4-6",
+        "project": "fixture-tz-override",
+        "project_key": null,
+        "session_id": "fixture-tz-override-block-0000000000000000",
+        "started_utc": "2026-04-20T12:00:00Z"
+      }
+    ],
     "sort_key": "started_desc",
-    "total": 0
+    "total": 1
   },
   "source_order": [
     "claude",
     "codex",
     "all"
   ],
-  "source_schema_version": 3,
+  "source_schema_version": 4,
   "sources": {
     "all": {
-      "availability": "empty",
+      "availability": "ok",
       "capabilities": {
         "alerts": {
           "semantics": "provider-native-union",
@@ -269,8 +770,8 @@
           "rows": []
         },
         "combined": {
-          "cost_usd": 0.0,
-          "total_tokens": 0
+          "cost_usd": 0.48,
+          "total_tokens": 112000
         },
         "providers": {
           "claude": {
@@ -279,20 +780,20 @@
             },
             "budget": {
               "forecast": {
-                "budget_100_per_day_usd": 0.0,
-                "budget_90_per_day_usd": 0.0,
+                "budget_100_per_day_usd": 42.24,
+                "budget_90_per_day_usd": 37.440000000000005,
                 "confidence": "low",
                 "confidence_score": 2,
                 "explain": {
                   "budget": [
                     {
-                      "dollars_per_day": 0.0,
+                      "dollars_per_day": 42.24,
                       "pct_headroom": 88.0,
                       "percent_per_day": 1056.0,
                       "target_percent": 100
                     },
                     {
-                      "dollars_per_day": 0.0,
+                      "dollars_per_day": 37.44,
                       "pct_headroom": 78.0,
                       "percent_per_day": 936.0,
                       "target_percent": 90
@@ -302,7 +803,7 @@
                     "five_hour_percent": 22.0,
                     "latest_snapshot_at": "2026-04-20T12:00:00Z",
                     "snapshot_count": 1,
-                    "spent_usd": 0.0,
+                    "spent_usd": 0.48,
                     "weekly_percent": 12.0
                   },
                   "forecast": {
@@ -323,7 +824,7 @@
                     "tool_version": "forecast-v1"
                   },
                   "rates": {
-                    "dollars_per_percent": 0.0,
+                    "dollars_per_percent": 0.04,
                     "dollars_per_percent_source": "this_week",
                     "recent_24h_pct_per_hour": null,
                     "week_average_pct_per_hour": 0.072289
@@ -364,9 +865,9 @@
               }
             },
             "hero": {
-              "cost_usd": 0.0,
+              "cost_usd": 0.48,
               "current_week": {
-                "dollar_per_pct": 0.0,
+                "dollar_per_pct": 0.04,
                 "five_hour_block": null,
                 "five_hour_milestones": [],
                 "five_hour_pct": 22.0,
@@ -380,7 +881,7 @@
                 "milestones": [],
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 7200,
-                "spent_usd": 0.0,
+                "spent_usd": 0.48,
                 "used_pct": 12.0,
                 "week_index": [
                   {
@@ -397,20 +898,20 @@
                 ]
               },
               "forecast": {
-                "budget_100_per_day_usd": 0.0,
-                "budget_90_per_day_usd": 0.0,
+                "budget_100_per_day_usd": 42.24,
+                "budget_90_per_day_usd": 37.440000000000005,
                 "confidence": "low",
                 "confidence_score": 2,
                 "explain": {
                   "budget": [
                     {
-                      "dollars_per_day": 0.0,
+                      "dollars_per_day": 42.24,
                       "pct_headroom": 88.0,
                       "percent_per_day": 1056.0,
                       "target_percent": 100
                     },
                     {
-                      "dollars_per_day": 0.0,
+                      "dollars_per_day": 37.44,
                       "pct_headroom": 78.0,
                       "percent_per_day": 936.0,
                       "target_percent": 90
@@ -420,7 +921,7 @@
                     "five_hour_percent": 22.0,
                     "latest_snapshot_at": "2026-04-20T12:00:00Z",
                     "snapshot_count": 1,
-                    "spent_usd": 0.0,
+                    "spent_usd": 0.48,
                     "weekly_percent": 12.0
                   },
                   "forecast": {
@@ -441,7 +942,7 @@
                     "tool_version": "forecast-v1"
                   },
                   "rates": {
-                    "dollars_per_percent": 0.0,
+                    "dollars_per_percent": 0.04,
                     "dollars_per_percent_source": "this_week",
                     "recent_24h_pct_per_hour": null,
                     "week_average_pct_per_hour": 0.072289
@@ -460,7 +961,7 @@
                 "week_avg_projection_pct": 12.144578313253012
               },
               "header": {
-                "dollar_per_pct": 0.0,
+                "dollar_per_pct": 0.04,
                 "five_hour_pct": 22.0,
                 "forecast_pct": 12.144578313253012,
                 "forecast_verdict": "ok",
@@ -468,7 +969,7 @@
                 "vs_last_week_delta": null,
                 "week_label": "Apr 13\u2013Apr 20"
               },
-              "total_tokens": 0,
+              "total_tokens": 112000,
               "trend": {
                 "avg_dollars_per_pct": null,
                 "history": [
@@ -499,21 +1000,505 @@
             },
             "periods": {
               "daily": {
-                "peak": null,
-                "quantile_thresholds": [],
-                "rows": [],
-                "total_cost_usd": 0.0,
-                "total_tokens": 0
+                "peak": {
+                  "cost_usd": 0.48,
+                  "date": "2026-04-20"
+                },
+                "quantile_thresholds": [
+                  0.48,
+                  0.48,
+                  0.48,
+                  0.48,
+                  0.48
+                ],
+                "rows": [
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.48,
+                    "date": "2026-04-20",
+                    "input_tokens": 100000,
+                    "intensity_bucket": 1,
+                    "is_today": true,
+                    "label": "04-20",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 0.48,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 12000,
+                    "total_tokens": 112000
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-19",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-19",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-18",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-18",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-17",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-17",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-16",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-16",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-15",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-15",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-14",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-14",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-13",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-13",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-12",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-12",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-11",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-11",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-10",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-10",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-09",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-09",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-08",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-08",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-07",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-07",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-06",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-06",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-05",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-05",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-04",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-04",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-03",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-03",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-02",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-02",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-01",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-01",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-31",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-31",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-30",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-30",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-29",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-29",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-28",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-28",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-27",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-27",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-26",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-26",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-25",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-25",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-24",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-24",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-23",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-23",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-22",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-22",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  }
+                ],
+                "total_cost_usd": 0.48,
+                "total_tokens": 112000
               },
               "monthly": {
-                "rows": [],
-                "total_cost_usd": 0.0,
-                "total_tokens": 0
+                "rows": [
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.48,
+                    "delta_cost_pct": null,
+                    "input_tokens": 100000,
+                    "is_current": true,
+                    "label": "2026-04",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 0.48,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 12000,
+                    "total_tokens": 112000
+                  }
+                ],
+                "total_cost_usd": 0.48,
+                "total_tokens": 112000
               },
               "weekly": {
-                "rows": [],
-                "total_cost_usd": 0.0,
-                "total_tokens": 0
+                "rows": [
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.48,
+                    "delta_cost_pct": null,
+                    "dollar_per_pct": 0.04,
+                    "input_tokens": 100000,
+                    "is_current": true,
+                    "label": "04-13",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 0.48,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 12000,
+                    "total_tokens": 112000,
+                    "used_pct": 12.0,
+                    "week_end_at": "2026-04-20T14:00:00Z",
+                    "week_start_at": "2026-04-13T14:00:00Z"
+                  }
+                ],
+                "total_cost_usd": 0.48,
+                "total_tokens": 112000
               }
             },
             "projects": {
@@ -561,7 +1546,7 @@
                 }
               ],
               "current_week": {
-                "dollar_per_pct": 0.0,
+                "dollar_per_pct": 0.04,
                 "five_hour_block": null,
                 "five_hour_pct": 22.0,
                 "five_hour_resets_in_sec": 10800,
@@ -573,7 +1558,7 @@
                 "last_snapshot_age_sec": 0,
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 7200,
-                "spent_usd": 0.0,
+                "spent_usd": 0.48,
                 "used_pct": 12.0,
                 "week_index": [
                   {
@@ -593,9 +1578,20 @@
               "milestones": []
             },
             "sessions": {
-              "rows": [],
+              "rows": [
+                {
+                  "cache_hit_pct": 0.0,
+                  "cost_usd": 0.48,
+                  "duration_min": 0,
+                  "key": "session:lCP5hoiuBYw2-HgCKbxYWMejtx8fcC-H87cqxCdzL_8",
+                  "model": "claude-sonnet-4-6",
+                  "project": "fixture-tz-override",
+                  "source": "claude",
+                  "started_utc": "2026-04-20T12:00:00Z"
+                }
+              ],
               "sort_key": "started_desc",
-              "total": 0
+              "total": 1
             }
           },
           "codex": {
@@ -622,7 +1618,7 @@
               "by_project": [],
               "days": [],
               "fourteen_day_counterfactual_usd": 0.0,
-              "fourteen_day_efficiency_ratio": 0.0,
+              "fourteen_day_efficiency_ratio": null,
               "is_empty": true,
               "not_applicable": {
                 "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
@@ -638,14 +1634,13 @@
                 ],
                 "baseline_daily_row_count": 0,
                 "baseline_median_percent": null,
-                "cache_hit_percent": 0.0,
                 "cached_input_percent": 0.0,
                 "date": "2026-04-20",
                 "delta_pp": null,
                 "net_usd": 0.0,
                 "observed": false,
                 "saved_usd": 0.0,
-                "wasted_usd": 0.0
+                "wasted_usd": null
               },
               "window_days": 14
             },
@@ -727,7 +1722,7 @@
       "warnings": []
     },
     "claude": {
-      "availability": "empty",
+      "availability": "ok",
       "capabilities": {
         "alerts": {
           "semantics": "provider-native",
@@ -776,20 +1771,20 @@
         },
         "budget": {
           "forecast": {
-            "budget_100_per_day_usd": 0.0,
-            "budget_90_per_day_usd": 0.0,
+            "budget_100_per_day_usd": 42.24,
+            "budget_90_per_day_usd": 37.440000000000005,
             "confidence": "low",
             "confidence_score": 2,
             "explain": {
               "budget": [
                 {
-                  "dollars_per_day": 0.0,
+                  "dollars_per_day": 42.24,
                   "pct_headroom": 88.0,
                   "percent_per_day": 1056.0,
                   "target_percent": 100
                 },
                 {
-                  "dollars_per_day": 0.0,
+                  "dollars_per_day": 37.44,
                   "pct_headroom": 78.0,
                   "percent_per_day": 936.0,
                   "target_percent": 90
@@ -799,7 +1794,7 @@
                 "five_hour_percent": 22.0,
                 "latest_snapshot_at": "2026-04-20T12:00:00Z",
                 "snapshot_count": 1,
-                "spent_usd": 0.0,
+                "spent_usd": 0.48,
                 "weekly_percent": 12.0
               },
               "forecast": {
@@ -820,7 +1815,7 @@
                 "tool_version": "forecast-v1"
               },
               "rates": {
-                "dollars_per_percent": 0.0,
+                "dollars_per_percent": 0.04,
                 "dollars_per_percent_source": "this_week",
                 "recent_24h_pct_per_hour": null,
                 "week_average_pct_per_hour": 0.072289
@@ -861,9 +1856,9 @@
           }
         },
         "hero": {
-          "cost_usd": 0.0,
+          "cost_usd": 0.48,
           "current_week": {
-            "dollar_per_pct": 0.0,
+            "dollar_per_pct": 0.04,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": 22.0,
@@ -877,7 +1872,7 @@
             "milestones": [],
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 7200,
-            "spent_usd": 0.0,
+            "spent_usd": 0.48,
             "used_pct": 12.0,
             "week_index": [
               {
@@ -894,20 +1889,20 @@
             ]
           },
           "forecast": {
-            "budget_100_per_day_usd": 0.0,
-            "budget_90_per_day_usd": 0.0,
+            "budget_100_per_day_usd": 42.24,
+            "budget_90_per_day_usd": 37.440000000000005,
             "confidence": "low",
             "confidence_score": 2,
             "explain": {
               "budget": [
                 {
-                  "dollars_per_day": 0.0,
+                  "dollars_per_day": 42.24,
                   "pct_headroom": 88.0,
                   "percent_per_day": 1056.0,
                   "target_percent": 100
                 },
                 {
-                  "dollars_per_day": 0.0,
+                  "dollars_per_day": 37.44,
                   "pct_headroom": 78.0,
                   "percent_per_day": 936.0,
                   "target_percent": 90
@@ -917,7 +1912,7 @@
                 "five_hour_percent": 22.0,
                 "latest_snapshot_at": "2026-04-20T12:00:00Z",
                 "snapshot_count": 1,
-                "spent_usd": 0.0,
+                "spent_usd": 0.48,
                 "weekly_percent": 12.0
               },
               "forecast": {
@@ -938,7 +1933,7 @@
                 "tool_version": "forecast-v1"
               },
               "rates": {
-                "dollars_per_percent": 0.0,
+                "dollars_per_percent": 0.04,
                 "dollars_per_percent_source": "this_week",
                 "recent_24h_pct_per_hour": null,
                 "week_average_pct_per_hour": 0.072289
@@ -957,7 +1952,7 @@
             "week_avg_projection_pct": 12.144578313253012
           },
           "header": {
-            "dollar_per_pct": 0.0,
+            "dollar_per_pct": 0.04,
             "five_hour_pct": 22.0,
             "forecast_pct": 12.144578313253012,
             "forecast_verdict": "ok",
@@ -965,7 +1960,7 @@
             "vs_last_week_delta": null,
             "week_label": "Apr 13\u2013Apr 20"
           },
-          "total_tokens": 0,
+          "total_tokens": 112000,
           "trend": {
             "avg_dollars_per_pct": null,
             "history": [
@@ -996,21 +1991,505 @@
         },
         "periods": {
           "daily": {
-            "peak": null,
-            "quantile_thresholds": [],
-            "rows": [],
-            "total_cost_usd": 0.0,
-            "total_tokens": 0
+            "peak": {
+              "cost_usd": 0.48,
+              "date": "2026-04-20"
+            },
+            "quantile_thresholds": [
+              0.48,
+              0.48,
+              0.48,
+              0.48,
+              0.48
+            ],
+            "rows": [
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.48,
+                "date": "2026-04-20",
+                "input_tokens": 100000,
+                "intensity_bucket": 1,
+                "is_today": true,
+                "label": "04-20",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 0.48,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 12000,
+                "total_tokens": 112000
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-19",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-19",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-18",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-18",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-17",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-17",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-16",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-16",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-15",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-15",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-14",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-14",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-13",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-13",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-12",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-12",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-11",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-11",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-10",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-10",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-09",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-09",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-08",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-08",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-07",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-07",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-06",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-06",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-05",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-05",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-04",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-04",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-03",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-03",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-02",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-02",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-01",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-01",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-31",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-31",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-30",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-30",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-29",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-29",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-28",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-28",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-27",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-27",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-26",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-26",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-25",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-25",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-24",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-24",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-23",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-23",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-22",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-22",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              }
+            ],
+            "total_cost_usd": 0.48,
+            "total_tokens": 112000
           },
           "monthly": {
-            "rows": [],
-            "total_cost_usd": 0.0,
-            "total_tokens": 0
+            "rows": [
+              {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.48,
+                "delta_cost_pct": null,
+                "input_tokens": 100000,
+                "is_current": true,
+                "label": "2026-04",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 0.48,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 12000,
+                "total_tokens": 112000
+              }
+            ],
+            "total_cost_usd": 0.48,
+            "total_tokens": 112000
           },
           "weekly": {
-            "rows": [],
-            "total_cost_usd": 0.0,
-            "total_tokens": 0
+            "rows": [
+              {
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.48,
+                "delta_cost_pct": null,
+                "dollar_per_pct": 0.04,
+                "input_tokens": 100000,
+                "is_current": true,
+                "label": "04-13",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 0.48,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 12000,
+                "total_tokens": 112000,
+                "used_pct": 12.0,
+                "week_end_at": "2026-04-20T14:00:00Z",
+                "week_start_at": "2026-04-13T14:00:00Z"
+              }
+            ],
+            "total_cost_usd": 0.48,
+            "total_tokens": 112000
           }
         },
         "projects": {
@@ -1058,7 +2537,7 @@
             }
           ],
           "current_week": {
-            "dollar_per_pct": 0.0,
+            "dollar_per_pct": 0.04,
             "five_hour_block": null,
             "five_hour_pct": 22.0,
             "five_hour_resets_in_sec": 10800,
@@ -1070,7 +2549,7 @@
             "last_snapshot_age_sec": 0,
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 7200,
-            "spent_usd": 0.0,
+            "spent_usd": 0.48,
             "used_pct": 12.0,
             "week_index": [
               {
@@ -1090,9 +2569,20 @@
           "milestones": []
         },
         "sessions": {
-          "rows": [],
+          "rows": [
+            {
+              "cache_hit_pct": 0.0,
+              "cost_usd": 0.48,
+              "duration_min": 0,
+              "key": "session:lCP5hoiuBYw2-HgCKbxYWMejtx8fcC-H87cqxCdzL_8",
+              "model": "claude-sonnet-4-6",
+              "project": "fixture-tz-override",
+              "source": "claude",
+              "started_utc": "2026-04-20T12:00:00Z"
+            }
+          ],
           "sort_key": "started_desc",
-          "total": 0
+          "total": 1
         }
       },
       "data_version": "__VER__",
@@ -1173,7 +2663,7 @@
           "by_project": [],
           "days": [],
           "fourteen_day_counterfactual_usd": 0.0,
-          "fourteen_day_efficiency_ratio": 0.0,
+          "fourteen_day_efficiency_ratio": null,
           "is_empty": true,
           "not_applicable": {
             "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
@@ -1189,14 +2679,13 @@
             ],
             "baseline_daily_row_count": 0,
             "baseline_median_percent": null,
-            "cache_hit_percent": 0.0,
             "cached_input_percent": 0.0,
             "date": "2026-04-20",
             "delta_pp": null,
             "net_usd": 0.0,
             "observed": false,
             "saved_usd": 0.0,
-            "wasted_usd": 0.0
+            "wasted_usd": null
           },
           "window_days": 14
         },
@@ -1308,8 +2797,33 @@
   },
   "update": "__UPDATE_BLOCK__",
   "weekly": {
-    "rows": [],
-    "total_cost_usd": 0.0,
-    "total_tokens": 0
+    "rows": [
+      {
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.48,
+        "delta_cost_pct": null,
+        "dollar_per_pct": 0.04,
+        "input_tokens": 100000,
+        "is_current": true,
+        "label": "04-13",
+        "models": [
+          {
+            "chip": "sonnet",
+            "cost_pct": 100.0,
+            "cost_usd": 0.48,
+            "display": "sonnet-4-6",
+            "model": "claude-sonnet-4-6"
+          }
+        ],
+        "output_tokens": 12000,
+        "total_tokens": 112000,
+        "used_pct": 12.0,
+        "week_end_at": "2026-04-20T14:00:00Z",
+        "week_start_at": "2026-04-13T14:00:00Z"
+      }
+    ],
+    "total_cost_usd": 0.48,
+    "total_tokens": 112000
   }
 }

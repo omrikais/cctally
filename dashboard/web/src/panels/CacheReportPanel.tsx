@@ -89,7 +89,7 @@ function CacheProviderSummary({
               <span className="provider-summary-label">{vocab.percentLabel}</span>
               <strong className="provider-summary-value">
                 {verdict!.todayObserved
-                  ? cachePercentText(report.today) ?? '—'
+                  ? cachePercentText(report.today, section.source) ?? '—'
                   : '—'}
               </strong>
             </div>
@@ -376,7 +376,7 @@ export function CacheReportPanel() {
     headline = <>Building baseline · {n}/{CACHE_REPORT_MIN_BASELINE_DAYS} days</>;
     sublineFirst = todayObserved ? (
       <>
-        Today: {vocab.percentLabelInline} {cachePercentText(cr.today) ?? '—'} · net{' '}
+        Today: {vocab.percentLabelInline} {cachePercentText(cr.today, activeSource) ?? '—'} · net{' '}
         {fmt.usdSigned(cr.today.net_usd)}
       </>
     ) : (
@@ -434,7 +434,7 @@ export function CacheReportPanel() {
     headline = (
       <>
         Today: {vocab.percentLabelInline}{' '}
-        <span className="delta-good">{cachePercentText(cr.today) ?? '—'}</span>
+        <span className="delta-good">{cachePercentText(cr.today, activeSource) ?? '—'}</span>
       </>
     );
     sublineFirst = (

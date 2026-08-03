@@ -8,7 +8,7 @@ import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
-import { warningForDomain } from '../lib/sourceGating';
+import { sourceDomainFreshness, warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { sourceAccounts } from '../store/accountFocus';
@@ -57,6 +57,17 @@ export function codexIngestBacklogLabel(
   if (!backlog || backlog.files <= 0) return null;
   const plural = backlog.files === 1 ? 'session' : 'sessions';
   return `+${backlog.files} ${plural} still loading`;
+}
+
+// #459 — at phone widths the spent zone narrows to roughly 132px (390px
+// viewport) and 62px (320px viewport). The ordinary label wraps into two and
+// four lines respectively. Keep the explanatory sentence in the zone's title
+// and accessible name; this is only the responsive sighted shorthand.
+export function codexIngestBacklogCompactLabel(
+  backlog: { files: number } | null | undefined,
+): string | null {
+  if (!backlog || backlog.files <= 0) return null;
+  return `+${backlog.files} more`;
 }
 
 // Two independent disclosures can apply at once; joining beats picking, because
@@ -210,6 +221,7 @@ function SharedHero({
   const codexCycleStale = codex?.hero?.cycle_freshness === 'stale';
   const codexBacklogNote = codexIngestBacklogNote(codex?.ingest_backlog);
   const codexBacklogLabel = codexIngestBacklogLabel(codex?.ingest_backlog);
+  const codexBacklogCompactLabel = codexIngestBacklogCompactLabel(codex?.ingest_backlog);
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
   const quotaForecast = quota?.histories.find((row) => row.key === weekly?.key)?.forecast;
   const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
@@ -301,6 +313,7 @@ function SharedHero({
           codexBacklogNote,
         )}
         spentNoteLabel={codexBacklogLabel}
+        spentNoteCompactLabel={codexBacklogCompactLabel}
         perAccountNote={perAccount ? 'per account' : null}
       />
     );
@@ -309,9 +322,22 @@ function SharedHero({
   const allEntry = resolveSourceView(env, 'all').entry;
   const all = allEntry?.data as AllSourceData | undefined;
   const combined = all?.combined ?? null;
+  // #456 — Combined contains the same incomplete Codex spend/tokens as the
+  // Codex hero while bounded ingest is catching up. The backlog condition is
+  // store-wide, so crossing the provider boundary does not make the caveat
+  // disappear. Keep it subordinate to the existing unavailable state: with no
+  // combined number on screen there is nothing for the backlog to qualify.
+  const combinedBacklogNote = combined == null ? null : codexBacklogNote;
+  const combinedBacklogLabel = combined == null ? null : codexBacklogLabel;
+  const combinedBacklogCompactLabel = combined == null ? null : codexBacklogCompactLabel;
   const allWarning = warningForDomain(allEntry?.warnings, 'hero');
   const allWarningDetail = allWarning?.message
     ?? 'Combined totals are unavailable while a provider is degraded.';
+  const combinedStale = combined != null
+    && allEntry != null
+    && sourceDomainFreshness(allEntry, 'hero') === 'stale';
+  const combinedStaleNote = combinedStale ? allWarningDetail : null;
+  const combinedDisclosureNote = joinHeroNotes(combinedStaleNote, combinedBacklogNote);
   // #416 QA — the COMBINED tab carries the same defect the Codex tab just shed,
   // one surface further out. `weekly` is joined off the PARENT hero, whose
   // `cycle` is `cycles_all[0]` — one representative account's window — so with
@@ -378,7 +404,15 @@ function SharedHero({
         )}
       </div>
 
-      <div className="hero-zone hero-spent" data-testid="shared-hero-spent">
+      <div
+        className="hero-zone hero-spent"
+        data-testid="shared-hero-spent"
+        title={combinedDisclosureNote ?? undefined}
+        role={combinedDisclosureNote == null ? undefined : 'group'}
+        aria-label={combinedDisclosureNote == null
+          ? undefined
+          : `Combined spend. ${combinedDisclosureNote}`}
+      >
         <div className="hs-label">COMBINED SPEND</div>
         <div className="hs-big">{combined?.cost_usd == null ? '—' : fmt.usd0(combined.cost_usd)}</div>
         <div className="hs-sub">
@@ -395,6 +429,29 @@ function SharedHero({
             )
             : <><span>{fmt.tokens(combined.total_tokens)}</span> total tokens</>}
         </div>
+        {combinedStaleNote != null ? (
+          <div className="hs-sub">
+            <span
+              className="chip chip-stale"
+              data-testid="shared-hero-stale-marker"
+              title={combinedStaleNote}
+              aria-label={combinedStaleNote}
+            >
+              Stale quota
+            </span>
+          </div>
+        ) : null}
+        {combinedBacklogLabel != null ? (
+          <div className="hs-sub" data-testid="hero-spent-note" aria-hidden="true">
+            <span className={combinedBacklogCompactLabel == null
+              ? undefined : 'hero-ingest-backlog-label-full'}>{combinedBacklogLabel}</span>
+            {combinedBacklogCompactLabel == null ? null : (
+              <span className="hero-ingest-backlog-label-compact">
+                {combinedBacklogCompactLabel}
+              </span>
+            )}
+          </div>
+        ) : null}
       </div>
 
       <div className="hero-zone hero-support" data-testid="shared-hero-support">
@@ -448,6 +505,7 @@ function CanonicalHero({
   unavailableReason = null,
   spentNote = null,
   spentNoteLabel = null,
+  spentNoteCompactLabel = null,
   perAccountNote = null,
 }: {
   weekLabel: string | null | undefined;
@@ -475,6 +533,10 @@ function CanonicalHero({
   // store-wide ingest backlog: the account-scoped stale-cycle note keeps its
   // #350 tooltip-only disposition, and widening that is a separate decision.
   spentNoteLabel?: string | null;
+  // #459 — mobile-only shorthand for the same disclosure. The full sentence
+  // remains in `spentNote`, so responsive sighted copy never weakens the
+  // accessible explanation of what is loading or how totals will change.
+  spentNoteCompactLabel?: string | null;
   // #416 D6 — set when the headline percentage/reset are deliberately BLANK
   // because each account owns an independent quota cycle. Replaces the reset
   // countdown AND every other deliberately-blank slot with a pointer to the
@@ -566,17 +628,23 @@ function CanonicalHero({
             : <>$ / 1% used {perAccountValue}</>}
         </div>
         {/* public #5 QA P2 — a second `hs-sub` line: the zone's own dim
-            `--fs-meta` / `--text-dim` vocabulary, no new class and no new CSS.
-            It carries no bright `<span>`, so it renders strictly dimmer than
-            the `$/1%` line above it, which is the emphasis a transient loading
-            state should have. `aria-hidden` because the zone's `aria-label`
-            already reads the full sentence — announcing both would say it
-            twice. Suppressed while `unavailableReason` is showing, so the
-            visible line and the tooltip never disagree about which note wins.
-            Omitted entirely when null: no empty element, no stray separator. */}
+            `--fs-meta` / `--text-dim` vocabulary. The #459 responsive spans
+            explicitly inherit that dim style, so the line stays subordinate
+            to the bright `$/1%` metric above it. `aria-hidden` because the
+            zone's `aria-label` already reads the full sentence — announcing
+            both would say it twice. Suppressed while `unavailableReason` is
+            showing, so the visible line and the tooltip never disagree about
+            which note wins. Omitted entirely when null: no empty element, no
+            stray separator. */}
         {unavailableReason == null && spentNoteLabel != null ? (
           <div className="hs-sub" data-testid="hero-spent-note" aria-hidden="true">
-            {spentNoteLabel}
+            <span className={spentNoteCompactLabel == null
+              ? undefined : 'hero-ingest-backlog-label-full'}>{spentNoteLabel}</span>
+            {spentNoteCompactLabel == null ? null : (
+              <span className="hero-ingest-backlog-label-compact">
+                {spentNoteCompactLabel}
+              </span>
+            )}
           </div>
         ) : null}
       </div>

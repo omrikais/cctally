@@ -400,18 +400,16 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
 // ---------------------------------------------------------------------------
 
 function rowWithoutPercent(date: string): CacheReportDailyRow {
-  // `cache_hit_percent` is REQUIRED on the type, so the shape a future server
-  // emits (once the transitional alias is dropped and a provider publishes
-  // neither key) is only reachable by deleting it off a structural copy.
+  // Remove Claude's authoritative key to exercise the unresolved shape.
   const { cache_hit_percent: _drop, ...rest } = row(date, 0);
   void _drop;
   return rest as CacheReportDailyRow;
 }
 
 function codexRow(date: string, pct: number): CacheReportDailyRow {
-  // The transitional wire shape: `cached_input_percent` is authoritative and
-  // `cache_hit_percent` repeats it for one release.
-  return { ...row(date, pct), cached_input_percent: pct };
+  const { cache_hit_percent: _legacy, ...rest } = row(date, pct);
+  void _legacy;
+  return { ...rest, cached_input_percent: pct };
 }
 
 describe('<CacheSparkline /> #443 S2 nullable percent', () => {
@@ -459,6 +457,7 @@ describe('<CacheSparkline /> #443 S2 nullable percent', () => {
         baseline_median_percent={null}
         today_marker_color="var(--accent-green)"
         size="large"
+        source="codex"
       />,
     );
     const domain = computeAutoZoomDomain([20], null, 5);

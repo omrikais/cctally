@@ -9,6 +9,48 @@ import { makeClaudeSourceData, makeCodexSourceData } from '../test-utils/sourceE
 import type { ClaudeSessionSourceRow } from '../types/envelope';
 
 describe('joinCodexQuotaLabels (§6.1)', () => {
+  it('joins decorated shared-root rows by account_key and opaque key', () => {
+    const data = makeCodexSourceData();
+    const sharedKey = 'quota:shared-root';
+    const accountA = 'a'.repeat(32);
+    const accountB = 'b'.repeat(32);
+    const [fiveHour, weekly] = data.quota.histories;
+    const histories = [
+      {
+        ...fiveHour,
+        key: sharedKey,
+        account_key: accountA,
+        label: 'Account A five-hour',
+        window_minutes: 300,
+      },
+      {
+        ...weekly,
+        key: sharedKey,
+        account_key: accountB,
+        label: 'Account B weekly',
+        window_minutes: 10_080,
+      },
+    ];
+    const active = [
+      { ...data.hero.quota.active[0], key: sharedKey, account_key: accountA },
+      { ...data.hero.quota.active[1], key: sharedKey, account_key: accountB },
+    ];
+
+    const joined = joinCodexQuotaLabels(
+      { ...data.hero, quota: { ...data.hero.quota, active } },
+      { ...data.quota, histories },
+    );
+
+    expect(joined.map(({ label, windowMinutes, current }) => ({
+      accountKey: current.account_key,
+      label,
+      windowMinutes,
+    }))).toEqual([
+      { accountKey: accountA, label: 'Account A five-hour', windowMinutes: 300 },
+      { accountKey: accountB, label: 'Account B weekly', windowMinutes: 10_080 },
+    ]);
+  });
+
   it('attaches label + window_minutes to each active window by opaque key', () => {
     const data = makeCodexSourceData();
     const joined = joinCodexQuotaLabels(data.hero, data.quota);

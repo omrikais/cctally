@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConversationReader, deriveReaderTitle } from './ConversationReader';
-import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, getState, subscribeStore, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
 import {
   installGlobalKeydown,
@@ -13,7 +13,8 @@ import { installIntersectionObserverStub } from '../test-utils/intersectionObser
 import { clearReadingPositions, recordReadingPos } from '../store/readingPosition';
 import { stubResponsiveMedia } from '../test-utils/mobileMedia';
 import { MOBILE_MEDIA_QUERY, WIDE_MEDIA_QUERY, COMPACT_WORKSPACE_MEDIA_QUERY } from '../lib/breakpoints';
-import type { ConversationItem, ConversationOutline, OutlineTurn } from '../types/conversation';
+import type { ConversationItem, ConversationOutline, ConversationRef, OutlineTurn } from '../types/conversation';
+import { adaptQualifiedOutline } from '../lib/conversationAdapters';
 import { VIRTUAL_INDEX_BASE } from './virtuosoFirstIndex';
 import { SUBAGENT_WINDOW_CAP } from './subagentWindow';
 
@@ -37,6 +38,15 @@ import { SUBAGENT_WINDOW_CAP } from './subagentWindow';
 // `scrollToIndex` (mounted-window steps) then writes the scroller's `scrollTop`
 // directly; it no longer calls the library's `scrollIntoView`. So the shared test
 // handle only needs `scrollToIndex` (plus the captured props the reader reads back).
+//
+// #463 S2 — `renderWindow` makes the mock render a WINDOW of the data instead of
+// all of it, which is what real Virtuoso does. Default `null` keeps the render-all
+// behaviour every other test in this file relies on. It exists because the
+// render-all default cannot observe the whole class of defect where an item is
+// LOADED but not MOUNTED: the QA gate measured 18 of 348 reasoning-heading
+// elements mounted on a 99-item conversation, and every JSDOM test passed while
+// heading navigation was dead in the browser. `forceRerender` lets a test move
+// the window the way a real scroll would.
 const virtuosoTestHandle: {
   scrollToIndex: ReturnType<typeof vi.fn>;
   firstItemIndex: number;
@@ -45,6 +55,8 @@ const virtuosoTestHandle: {
   atBottomStateChange: ((atBottom: boolean) => void) | null;
   itemsRendered: ((items: unknown[]) => void) | null;
   followOutput: ((atBottom: boolean) => unknown) | null;
+  renderWindow: { start: number; size: number } | null;
+  forceRerender: (() => void) | null;
 } = {
   scrollToIndex: vi.fn(),
   firstItemIndex: 0,
@@ -53,6 +65,8 @@ const virtuosoTestHandle: {
   atBottomStateChange: null,
   itemsRendered: null,
   followOutput: null,
+  renderWindow: null,
+  forceRerender: null,
 };
 vi.mock('react-virtuoso', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
@@ -68,6 +82,14 @@ vi.mock('react-virtuoso', async () => {
     const List = (components.List ?? 'div') as React.ElementType;
     const Item = (components.Item ?? 'div') as React.ElementType;
     const scroller = React.useRef<HTMLDivElement>(null);
+    const [, force] = React.useState(0);
+    virtuosoTestHandle.forceRerender = () => force((n) => n + 1);
+    // #463 S2 — the mounted slice. `null` (the default) renders everything.
+    const win = virtuosoTestHandle.renderWindow;
+    const windowStart = win
+      ? Math.max(0, Math.min(win.start, Math.max(0, data.length - win.size)))
+      : 0;
+    const shown = win ? data.slice(windowStart, windowStart + win.size) : data;
     // Mirror the live props onto the shared test handle each render.
     virtuosoTestHandle.firstItemIndex = firstItemIndex;
     virtuosoTestHandle.startReached = (props.startReached as (() => void)) ?? null;
@@ -81,21 +103,23 @@ vi.mock('react-virtuoso', async () => {
       // reader's scroll-sync re-registration fires post-mount, mirroring real
       // Virtuoso's first range callback.
       const rendered = props.itemsRendered as ((items: unknown[]) => void) | undefined;
-      rendered?.(data.map((d, i) => ({ index: firstItemIndex + i, data: d })));
+      rendered?.(shown.map((d, i) => ({ index: firstItemIndex + windowStart + i, data: d })));
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [data.length]);
+    }, [data.length, windowStart, shown.length]);
     return React.createElement(
       'div',
       { ref: scroller, className: props.className as string, role: props.role as string, 'data-virtuoso-scroller': true, onScroll: props.onScroll as React.UIEventHandler },
       React.createElement(
         List,
         {},
-        data.map((d, i) =>
-          React.createElement(
+        shown.map((d, i) => {
+          const virtualIndex = firstItemIndex + windowStart + i;
+          return React.createElement(
             Item as React.ElementType,
-            { key: computeItemKey ? computeItemKey(firstItemIndex + i, d) : i, 'data-index': firstItemIndex + i },
-            itemContent(firstItemIndex + i, d),
-          )),
+            { key: computeItemKey ? computeItemKey(virtualIndex, d) : virtualIndex, 'data-index': virtualIndex },
+            itemContent(virtualIndex, d),
+          );
+        }),
       ),
     );
   });
@@ -204,6 +228,8 @@ beforeEach(() => {
   virtuosoTestHandle.atBottomStateChange = null;
   virtuosoTestHandle.itemsRendered = null;
   virtuosoTestHandle.followOutput = null;
+  virtuosoTestHandle.renderWindow = null;
+  virtuosoTestHandle.forceRerender = null;
 });
 afterEach(() => {
   uninstallGlobalKeydown();
@@ -3183,6 +3209,40 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
     clearReadingPositions();
   });
 
+  it('#463 S2 §4.1: a position saved inside a FOLLOWER segment restores to that segment', async () => {
+    // Verification, not construction. The scroll observer reads each rendered
+    // item's uuid, and since #463 S1 made the segment the item, that uuid is the
+    // segment's own key; S1's positional index is what makes a saved position
+    // inside a follower segment resolve on a cold open. This test exists to
+    // prove the property holds, and records the result either way.
+    //
+    // The load-bearing distinction from the slot-2 test above: the saved uuid is
+    // a FOLLOWER segment (segment_ordinal 2, turn_uuid pointing at a DIFFERENT
+    // item), so a restore that resolved to the head of the turn would land on
+    // 'turn-head' instead and this assertion would fail.
+    clearReadingPositions();
+    recordReadingPos('s', 'turn-seg2', 1000);
+    vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const seg = (uuid: string, ordinal: number) => makeItem({
+      uuid, kind: 'assistant', member_uuids: [uuid],
+      turn_uuid: 'turn-head', segment_ordinal: ordinal,
+    } as never);
+    mockFetchOnce(edged([
+      seg('turn-head', 0), seg('turn-seg1', 1), seg('turn-seg2', 2),
+      makeItem({ uuid: 'later' }),
+    ], { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const outline = outlineFor([
+      oTurn({ uuid: 'turn-head', kind: 'assistant' }),
+      oTurn({ uuid: 'later', kind: 'human' }),
+    ]);
+    const { container } = render(<ConversationReader sessionId="s" outline={outline} />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="turn-seg2"]')).not.toBeNull());
+    await waitFor(() => expect(getState().convPinnedUuid).toBe('turn-seg2'));
+    expect(getState().convPinnedUuid).not.toBe('turn-head');
+    clearReadingPositions();
+  });
+
   it('E8: pressing `a` jumps to the LAST prompt; `L` jumps to the LAST error', async () => {
     clearReadingPositions();
     vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
@@ -3582,5 +3642,800 @@ describe('ConversationReader open precedence + reverse pager (#217 S3 E2/E1/E8)'
       expect(badErr ? String(badErr[0]) : null).toBeNull();
       errSpy.mockRestore();
     });
+  });
+});
+
+// #463 S1 (#448) — the in-scroller paging states. The whole-reader shell only
+// covers `loading && !detail`; once detail resolves <Virtuoso> mounts directly
+// and, before #463, a populated header sat beside an empty scroller with no
+// indication that anything was happening. That reads as a failure rather than
+// as slowness, which is what made #448 look like a defect rather than a delay.
+//
+// There is deliberately no test for a `detail && nodes.length === 0` spinner:
+// that state was removed after a real-browser per-frame probe counted zero
+// appearances of it across about fifteen cold opens.
+describe('ConversationReader in-scroller paging states (#463 S1 / #448)', () => {
+  it('shows a paging indicator while a fetch is in flight with rows already mounted', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const utils = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    // Nothing in flight yet.
+    expect(screen.queryByTestId('conv-paging-indicator')).toBeNull();
+
+    // Hold the next page open so the in-flight window is observable.
+    let releasePage: (body: unknown) => void = () => {};
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releasePage = (body) => resolve({ ok: true, status: 200, json: async () => body } as Response);
+      }),
+    );
+    await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // settle → arm paging
+      virtuosoTestHandle.endReached?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByTestId('conv-paging-indicator')).toBeInTheDocument());
+
+    await act(async () => { releasePage(detail([makeItem({ uuid: 'h2' })])); });
+    await waitFor(() => expect(screen.queryByTestId('conv-paging-indicator')).toBeNull());
+  });
+
+  // #463 S1 P1 — a jump the reader abandons must END SOMEWHERE VISIBLE. Sampled
+  // every 250ms through a failing deep link, the paging indicator toggled on and
+  // off and then never returned while no further request was issued: the user saw
+  // a populated header, a transcript positioned nowhere near the requested
+  // message, and nothing to say the jump had failed.
+  it('reports an unreachable jump instead of falling silent', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'never-appears' } });
+    render(<ConversationReader sessionId="s" />);
+    // The pipeline gives up (the store's jump clears) ...
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    // ... and says so.
+    await waitFor(() => expect(screen.getByTestId('conv-jump-unresolved')).toBeInTheDocument());
+    // The message is dismissible, so it never becomes permanent furniture.
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    await waitFor(() => expect(screen.queryByTestId('conv-jump-unresolved')).toBeNull());
+  });
+
+  // #463 S1 — the give-up message belongs to ONE finished jump. Gating its
+  // render on `!fetching` made it vanish and return around every later page the
+  // user's own scrolling triggered, long after the jump had ended. A page
+  // request now RETIRES it instead, so it never comes back on its own.
+  it('retires the give-up message when the next page request starts, and does not bring it back', async () => {
+    // The bottom edge is exhausted, so the jump's forward drain gives up at
+    // once; the TOP edge is armed, so the user still has a page left to fetch.
+    mockFetchOnce({
+      ...detail([makeItem({ uuid: 'h2' })]),
+      page: { next_after: null, has_more: false, prev_before: 1, has_prev: true },
+    });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'never-appears' } });
+    render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(screen.getByTestId('conv-jump-unresolved')).toBeInTheDocument());
+
+    // Hold the user's next page open so the in-flight window is observable.
+    let releasePage: (body: unknown) => void = () => {};
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releasePage = (body) => resolve({ ok: true, status: 200, json: async () => body } as Response);
+      }),
+    );
+    await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);   // settle → arm paging
+      virtuosoTestHandle.startReached?.();
+      await Promise.resolve();
+    });
+    // Retired the moment the request starts, not merely hidden for its duration.
+    await waitFor(() => expect(screen.queryByTestId('conv-jump-unresolved')).toBeNull());
+
+    await act(async () => {
+      releasePage({
+        ...detail([makeItem({ uuid: 'h1' })]),
+        page: { next_after: null, has_more: false, prev_before: null, has_prev: false },
+      });
+    });
+    await waitFor(() => expect(screen.queryByTestId('conv-paging-indicator')).toBeNull());
+    // The finished page must NOT resurrect a message about a jump that ended.
+    expect(screen.queryByTestId('conv-jump-unresolved')).toBeNull();
+  });
+});
+
+// #463 S1 P0 — the ONE line that joins the two halves of the fix.
+// `buildQualifiedOutlinePositions` is proved to build the position map and
+// `useConversation` is proved to use a map it is handed, but neither proves that
+// the reader hands one to the other. Deleting the `outlinePositions:
+// outline?.positionByKey` property from the `useConversation` call would leave
+// every adapter test and every hook test green and would restore the P0 in full:
+// a deep link into a segment of a dropped turn would resolve to no outline turn
+// and `loadToTarget` would return before issuing a single page.
+describe('ConversationReader hands the outline position index to the pager (#463 S1)', () => {
+  const codexRef: ConversationRef = { source: 'codex', key: 'v1.codexsegmented' };
+
+  function wireItem(key: string, text: string) {
+    return {
+      item_key: key, kind: 'assistant' as const, timestamp_utc: '2026-07-15T12:00:00Z',
+      model: 'gpt-5.6-codex',
+      blocks: [{ kind: 'assistant', text, detail: null, call_id: null, timestamp_utc: '2026-07-15T12:00:00Z' }],
+      cost_usd: null, tokens: null, turn_item_key: key, segment_ordinal: 0,
+    };
+  }
+  function qualifiedDetail(items: ReturnType<typeof wireItem>[], hasBefore: boolean, before: string | null) {
+    return {
+      status: 'ok', conversation_key: codexRef.key, title: 'Segmented reply',
+      items,
+      page: { total: 5, returned: items.length, before, after: null, has_before: hasBefore, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, tokens: null,
+    };
+  }
+
+  it('pages head-ward toward a segment of a turn the navigation filter dropped', async () => {
+    // The outline the reader is given is the REAL adapter output over a wire
+    // list whose middle turn carries event rows and is therefore absent from
+    // `turns`, while still holding three segments.
+    const outline = adaptQualifiedOutline(codexRef, {
+      status: 'ok', conversation_key: codexRef.key,
+      turns: [
+        {
+          item_key: 'ask', label: 'Ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['ask'],
+        },
+        {
+          item_key: 'reply', label: 'Long reply', timestamp_utc: null,
+          kinds: { event: 4, assistant: 3, tool_call: 90 },
+          segment_item_keys: ['reply', 'reply.s1', 'reply.s2'],
+        },
+        {
+          item_key: 'tail', label: 'Tail ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['tail'],
+        },
+      ],
+      files: [], children: [],
+    }, {}, new Set(['ask', 'tail']));
+    // Non-vacuity: the target really is invisible to every turn-granular index.
+    expect(outline.turns.map((turn) => turn.uuid)).toEqual(['ask', 'tail']);
+    expect(outline.turns.some((turn) => turn.segment_uuids?.includes('reply.s2'))).toBe(false);
+    expect(outline.positionByKey?.get('reply.s2')).toBe(3);
+
+    // BOTH responses are queued before the render: the reader's jump pipeline
+    // starts the drain the moment the first detail resolves, so a page queued
+    // afterwards would arrive too late. The trailing default matters for the
+    // same reason — the backward drain reads "more pages remain" from the top
+    // cursor, which a failed fetch leaves untouched, so an unmocked call makes
+    // it spin instead of stop.
+    mockFetchOnce(qualifiedDetail([wireItem('tail', 'Tail ask')], true, 'tail'));
+    mockFetchOnce(qualifiedDetail([wireItem('reply.s2', 'Segment two')], false, null));
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true, status: 200, json: async () => qualifiedDetail([], false, null),
+    } as Response);
+
+    dispatch({
+      type: 'OPEN_CONVERSATION', conversationRef: codexRef, sessionId: codexRef.key,
+      jump: { conversation_ref: codexRef, session_id: codexRef.key, uuid: 'reply.s2' },
+    });
+    const { container } = render(<ConversationReader conversationRef={codexRef} outline={outline} />);
+    await waitFor(() => expect(container.querySelector('.conv-reader-body')).not.toBeNull());
+
+    await waitFor(() => {
+      const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[0]));
+      expect(urls.some((url) => url.includes('before='))).toBe(true);
+    });
+    await waitFor(() =>
+      expect(container.querySelector('[data-uuid="reply.s2"]')).not.toBeNull());
+  });
+});
+
+// ── #463 S2 §2.7 — the reasoning reading spine ──────────────────────────────
+//
+// Sequential movement between Codex reasoning headings, resolved in TWO steps:
+// resolve the SEGMENT through the existing jump pipeline (segment keys are
+// always in the outline's positionByKey), then locate the heading inside it.
+// Heading keys are never placed in the outline or in member_uuids.
+describe('#463 S2 reasoning heading navigation (§2.7)', () => {
+  const press = async (key: string) => {
+    await act(async () => {
+      fireEvent.keyDown(document, { key });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+  };
+  function reasoningItem(uuid: string, headings: string[]): ConversationItem {
+    return makeItem({
+      uuid, kind: 'assistant', member_uuids: [uuid],
+      blocks: [{
+        kind: 'codex_reasoning', source: 'response_item', summary: 'S',
+        headings: headings.map((text, i) => ({ key: `${uuid}#${i}`, text })),
+      }],
+    } as never);
+  }
+  const currentKey = (root: ParentNode) =>
+    root.querySelector('.conv-heading--current')?.getAttribute('data-heading-key') ?? null;
+  function headingOutline(turns: OutlineTurn[], positions?: Map<string, number>): ConversationOutline {
+    return {
+      session_id: 's',
+      stats: {
+        turns: { total: turns.length, human: 0, assistant: turns.length, tool_result: 0, meta: 0 },
+        tool_counts: {}, error_count: 0, models: {}, duration_seconds: null,
+        tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+        cache_saved_usd: 0,
+      },
+      turns,
+      ...(positions ? { positionByKey: positions } : {}),
+    } as unknown as ConversationOutline;
+  }
+
+  it('steps forward and back through the headings of the loaded window', async () => {
+    mockFetchOnce(detail([reasoningItem('seg0', ['A', 'B'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([oTurn({ uuid: 'seg0', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#1'));
+    await press('H');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+  });
+
+  it('walks across item boundaries inside the loaded window', async () => {
+    mockFetchOnce(detail([reasoningItem('seg0', ['A']), reasoningItem('seg1', ['B'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'seg1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#0"]')).not.toBeNull());
+    await press('h');
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  it('resolves a heading beyond the loaded window by jumping to its SEGMENT', async () => {
+    // The two-step resolution. The reader must dispatch the SEGMENT key, which
+    // `loadToTarget` can resolve, and never a heading key, which it cannot.
+    mockFetchOnce(detail([reasoningItem('seg0', ['A'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const positions = new Map<string, number>([['seg0', 0], ['seg1', 1]]);
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline(
+        [oTurn({ uuid: 'seg0', kind: 'assistant' })], positions)} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    // Record every jump the reader dispatches. The transient jump is CLEARED by
+    // the pipeline once it lands or gives up, so reading `conversationJump`
+    // after the fact is racy; what this test is about is WHICH identifier the
+    // reader asked for.
+    const jumped: string[] = [];
+    const unsubscribe = subscribeStore(() => {
+      const uuid = getState().conversationJump?.uuid;
+      if (uuid && !jumped.includes(uuid)) jumped.push(uuid);
+    });
+    await press('h');
+    await waitFor(() => expect(jumped).toContain('seg1'));
+    unsubscribe();
+    // It asked for the SEGMENT, never a heading key — `loadToTarget` can resolve
+    // the first and cannot resolve the second.
+    expect(jumped.some((u) => u.includes('#'))).toBe(false);
+  });
+
+  it('stops gracefully at the last heading when no neighbouring segment exists', async () => {
+    mockFetchOnce(detail([reasoningItem('seg0', ['A'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([oTurn({ uuid: 'seg0', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    expect(getState().conversationJump).toBeNull();
+  });
+
+  // ── The "advances if and only if it lands" invariant ──────────────────────
+  //
+  // One defect class, three symptoms, all measured at the 2026-08-03 QA gate:
+  // the cursor consumed a heading whether or not the step reached one. On
+  // conversation 019f5b77 (99 items, 348 headings) 31 consecutive `h` presses
+  // produced zero marks and zero scroll, because Virtuoso mounts roughly 18
+  // heading elements and every step past those mutated the cursor and returned.
+  //
+  // The invariant tested directly here: `currentHeadingRef` moves only when a
+  // heading is actually marked. Everything else — the mounted-window retry, the
+  // walk past heading-less segments, the focus-mode filter — follows from it.
+
+  it('does not advance the cursor when the target heading is loaded but NOT mounted', async () => {
+    mockFetchOnce(detail([
+      reasoningItem('seg0', ['A']), reasoningItem('seg1', ['B']), reasoningItem('seg2', ['C'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    // Only the first item mounts — the JSDOM stand-in for Virtuoso's window.
+    virtuosoTestHandle.renderWindow = { start: 0, size: 1 };
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }),
+        oTurn({ uuid: 'seg1', kind: 'assistant' }),
+        oTurn({ uuid: 'seg2', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    // The window is real: seg1's heading is in `detail.items` and not in the DOM.
+    expect(container.querySelector('[data-heading-key="seg1#0"]')).toBeNull();
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    virtuosoTestHandle.scrollToIndex.mockClear();
+    await press('h');
+    // The step could not land, so the cursor did not move.
+    expect(currentKey(container)).toBe('seg0#0');
+    // And it asked Virtuoso for the OWNING item rather than giving up silently.
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalled();
+    const call = virtuosoTestHandle.scrollToIndex.mock.calls.at(-1)?.[0] as { index: number };
+    expect(call.index).toBe(1);
+    // Mount that window the way a real scroll would; the request then lands.
+    virtuosoTestHandle.renderWindow = { start: call.index, size: 1 };
+    await act(async () => {
+      virtuosoTestHandle.forceRerender?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  it('keeps a repeated press on the same unreached heading — it never runs away', async () => {
+    mockFetchOnce(detail([
+      reasoningItem('seg0', ['A']), reasoningItem('seg1', ['B']), reasoningItem('seg2', ['C'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    virtuosoTestHandle.renderWindow = { start: 0, size: 1 };
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }),
+        oTurn({ uuid: 'seg1', kind: 'assistant' }),
+        oTurn({ uuid: 'seg2', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    // The QA gate's exact input: press until something moves. Before the fix the
+    // cursor ran to the end of the list and no later press could ever mark
+    // anything; after it, the cursor is still one step from where it started.
+    for (let i = 0; i < 6; i++) await press('h');
+    expect(currentKey(container)).toBe('seg0#0');
+    virtuosoTestHandle.renderWindow = { start: 1, size: 1 };
+    await act(async () => {
+      virtuosoTestHandle.forceRerender?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    // Exactly ONE heading of progress, not six.
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  it('walks past heading-less segments instead of dead-ending on the first neighbour', async () => {
+    // Spec §7 measured 82.9% of segments carrying no reasoning, so a neighbour
+    // with no heading is the COMMON case. `segB`/`segC` are loaded and carry no
+    // reasoning; only `segD` is unloaded. The step must ask for `segD`.
+    mockFetchOnce(detail([
+      reasoningItem('segA', ['A0', 'A1']),
+      makeItem({ uuid: 'segB', kind: 'assistant', member_uuids: ['segB'] } as never),
+      makeItem({ uuid: 'segC', kind: 'assistant', member_uuids: ['segC'] } as never),
+    ]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const positions = new Map<string, number>([['segA', 0], ['segB', 1], ['segC', 2], ['segD', 3]]);
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'segA', kind: 'assistant' }),
+        oTurn({ uuid: 'segB', kind: 'assistant' }),
+        oTurn({ uuid: 'segC', kind: 'assistant' })], positions)} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="segA#1"]')).not.toBeNull());
+    await press('h');
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('segA#1'));
+    const jumped: string[] = [];
+    const unsubscribe = subscribeStore(() => {
+      const uuid = getState().conversationJump?.uuid;
+      if (uuid && !jumped.includes(uuid)) jumped.push(uuid);
+    });
+    await press('h');
+    await waitFor(() => expect(jumped).toContain('segD'));
+    unsubscribe();
+    // It skipped the two loaded, heading-less neighbours rather than re-asking
+    // for `segB` on every press.
+    expect(jumped).not.toContain('segB');
+    expect(jumped).not.toContain('segC');
+  });
+
+  it('does not walk headings a non-`all` focus mode hides', async () => {
+    // `prompts` mode drops every assistant node from the render tree, so no
+    // reasoning heading is on screen. Before the fix the cursor still advanced
+    // once per press, so returning to `all` landed somewhere unrelated to where
+    // the reader was reading.
+    mockFetchOnce(detail([
+      makeItem({ uuid: 'ask', kind: 'human', member_uuids: ['ask'] } as never),
+      reasoningItem('seg0', ['A', 'B', 'C']),
+    ]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'ask', kind: 'human' }), oTurn({ uuid: 'seg0', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    await act(async () => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' }); });
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#1"]')).toBeNull());
+    for (let i = 0; i < 5; i++) await press('h');
+    await act(async () => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' }); });
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#1"]')).not.toBeNull());
+    await press('h');
+    // One step from where the reader left off, not six.
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#1'));
+  });
+
+  it('never stops on a heading the duplicate-aggregate rule removed', async () => {
+    // §2.6 suppresses a heading whose text an earlier block of the same turn
+    // already rendered. Those keys have no element, so if the walk still
+    // contained them the invariant above would (correctly) refuse to advance and
+    // `h` would appear stuck. The walk must not contain them at all.
+    const cumulative = makeItem({
+      uuid: 'seg0', kind: 'assistant', member_uuids: ['seg0'],
+      turn_uuid: 'seg0',
+      blocks: [
+        {
+          kind: 'codex_reasoning', source: 'response_item',
+          headings: [{ key: 'seg0.b0#0', text: 'A' }],
+        },
+        {
+          kind: 'codex_reasoning', source: 'response_item',
+          headings: [{ key: 'seg0.b1#0', text: 'A' }, { key: 'seg0.b1#1', text: 'B' }],
+        },
+      ],
+    } as never);
+    mockFetchOnce(detail([cumulative]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0.b0#0"]')).not.toBeNull());
+    // The repeat is not rendered at all.
+    expect(container.querySelector('[data-heading-key="seg0.b1#0"]')).toBeNull();
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0.b0#0'));
+    await press('h');
+    // Straight to the next RENDERED heading, with no stalled press in between.
+    await waitFor(() => expect(currentKey(container)).toBe('seg0.b1#1'));
+  });
+
+  // ── The 2026-08-03 review + QA round ──────────────────────────────────────
+  //
+  // One root pattern behind the group: two lists that must agree were derived
+  // from different sources. The loaded-key set came from `detail.items` PLUS
+  // `turn_uuid`; the suppression set came from `detail.items`; the heading walk
+  // came from the focus-filtered `visible` tree. The tests below pin each
+  // disagreement, and the mark's own durability across a remount.
+
+  function turnItem(uuid: string, turn: string, headings: string[], over: Partial<ConversationItem> = {}) {
+    return makeItem({
+      uuid, kind: 'assistant', member_uuids: [uuid],
+      turn_uuid: turn, segment_ordinal: uuid === turn ? 0 : 1,
+      blocks: headings.length
+        ? [{
+            kind: 'codex_reasoning', source: 'response_item',
+            headings: headings.map((text, i) => ({ key: `${uuid}#${i}`, text })),
+          }]
+        : [],
+      ...over,
+    } as never);
+  }
+  function edged(
+    items: ConversationItem[],
+    edges: { next_after?: number | null; has_more?: boolean; prev_before?: number | null; has_prev?: boolean },
+  ) {
+    const base = detail(items, edges.next_after ?? null);
+    return {
+      ...base,
+      page: {
+        next_after: edges.next_after ?? null,
+        has_more: edges.has_more ?? (edges.next_after != null),
+        prev_before: edges.prev_before ?? null,
+        has_prev: edges.has_prev ?? false,
+      },
+    };
+  }
+
+  it('keeps the mark when the row it lives on remounts under the reader', async () => {
+    // QA, conversation 019f5b77, two independent runs: the press that triggers a
+    // cross-page load leaves `.conv-heading--current` null and mounted headings
+    // drop to zero while the page swaps. The mark is imperative DOM state (a
+    // class on one element) while the cursor is a ref, so ANY remount — a page
+    // swap, a Virtuoso window move — silently drops the first and keeps the
+    // second, and the press reads as dead. The two must agree.
+    mockFetchOnce(detail([reasoningItem('seg0', ['A', 'B']), reasoningItem('seg1', ['C'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    virtuosoTestHandle.renderWindow = { start: 0, size: 2 };
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'seg1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    // Scroll the marked row out of the mounted set and back — the DOM node the
+    // class lived on is destroyed and rebuilt, exactly as a page swap does.
+    const moveWindow = async (start: number, size: number) => {
+      virtuosoTestHandle.renderWindow = { start, size };
+      await act(async () => {
+        virtuosoTestHandle.forceRerender?.();
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+    };
+    await moveWindow(1, 1);
+    expect(container.querySelector('[data-heading-key="seg0#0"]')).toBeNull();
+    await moveWindow(0, 2);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    // The mark is back where the reader left it, and the next press is one step
+    // on from there rather than two.
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#1'));
+  });
+
+  it('asks for an UNLOADED segment 0 whose turn_uuid a later segment carries', async () => {
+    // `turn_uuid` IS segment 0's key. Adding it to the loaded-key set marks an
+    // unloaded segment 0 as loaded whenever any later segment of the turn is in
+    // the window, so the backward walk skips it and every heading inside it
+    // becomes unreachable. Segments 1..3 are loaded; segment 0 is not.
+    mockFetchOnce(detail([
+      turnItem('seg1', 'seg0', ['P']),
+      turnItem('seg2', 'seg0', []),
+      turnItem('seg3', 'seg0', []),
+    ]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    const positions = new Map<string, number>([['seg0', 0], ['seg1', 1], ['seg2', 2], ['seg3', 3]]);
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg1', kind: 'assistant' }),
+        oTurn({ uuid: 'seg2', kind: 'assistant' }),
+        oTurn({ uuid: 'seg3', kind: 'assistant' })], positions)} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#0"]')).not.toBeNull());
+    await press('H');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+    const jumped: string[] = [];
+    const unsubscribe = subscribeStore(() => {
+      const uuid = getState().conversationJump?.uuid;
+      if (uuid && !jumped.includes(uuid)) jumped.push(uuid);
+    });
+    await press('H');
+    await waitFor(() => expect(jumped).toContain('seg0'));
+    unsubscribe();
+  });
+
+  it('suppresses only against blocks the CURRENT focus mode renders', async () => {
+    // Suppression ran over every loaded item while the walk ran over the
+    // focus-filtered tree. Under `errors`, segment 0 is error-free and hidden
+    // while segment 1 carries the error and is visible; segment 1's headings all
+    // repeat segment 0's, so the visible segment rendered no reasoning at all —
+    // content the reader can see under `all` vanished from every visible surface.
+    const failing = { kind: 'tool_call', name: 'Bash', tool_use_id: 'tu1', input_summary: 'x',
+      result: { text: 'boom', truncated: false, is_error: true } };
+    mockFetchOnce(detail([
+      turnItem('seg0', 'seg0', ['A']),
+      turnItem('seg1', 'seg0', ['A'], { blocks: [
+        { kind: 'codex_reasoning', source: 'response_item',
+          headings: [{ key: 'seg1#0', text: 'A' }] },
+        failing,
+      ] } as never),
+    ]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'seg1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    // Non-vacuity: under `all` the repeat really is suppressed.
+    expect(container.querySelector('[data-heading-key="seg1#0"]')).toBeNull();
+    await act(async () => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' }); });
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).toBeNull());
+    // The visible segment must still show its reasoning.
+    await waitFor(() =>
+      expect(container.querySelector('[data-heading-key="seg1#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  it('resumes inside the reader OWN item when its heading leaves the list', async () => {
+    // Suppression is window-relative, so a backward page load can retire a
+    // heading the reader is standing on. Treating "cursor key not found" as "no
+    // cursor" sent the next press to the top of the loaded window — thousands of
+    // pixels from where they were reading.
+    mockFetchOnce(edged([turnItem('seg1', 'seg0', ['P', 'Q', 'R'])],
+      { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'seg1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#1"]')).not.toBeNull());
+    await press('h');
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#1'));
+    // The earlier segment of the SAME turn arrives and renders "Q" first, so the
+    // reader's own heading is now a repeat and drops out of the walk.
+    mockFetchOnce(edged([turnItem('seg0', 'seg0', ['Q'])],
+      { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#1"]')).toBeNull());
+    await press('h');
+    // Back inside the item the reader was reading, not at the top of the window.
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  // The retirement a backward page performs is a PREFIX retirement. Codex
+  // aggregates are cumulative and prefix-extended (§7: 19.8% of adjacent block
+  // pairs repeat exactly and 12.5% extend as a strict prefix), so the earlier
+  // segment that arrives renders the FIRST of the current item's headings, and
+  // the keys that drop out of the walk are a prefix of that item's list. The
+  // recovery must therefore land on the item's FIRST surviving heading in both
+  // directions; the item's LAST is ahead of where the reader was standing.
+  //
+  // `seg1` carries P Q R S. The arriving `seg0` renders P, so `seg1#0` — the
+  // heading the reader is standing on — is retired and `seg1#1` is the first
+  // survivor.
+  const retirePrefix = async (container: HTMLElement) => {
+    mockFetchOnce(edged([turnItem('seg0', 'seg0', ['P'])],
+      { next_after: 99, has_more: true, prev_before: null, has_prev: false }));
+    await act(async () => {
+      virtuosoTestHandle.atBottomStateChange?.(true);
+      virtuosoTestHandle.startReached?.();
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#0"]')).toBeNull());
+  };
+  const renderPrefixRetirementCase = async () => {
+    mockFetchOnce(edged([turnItem('seg1', 'seg0', ['P', 'Q', 'R', 'S'])],
+      { prev_before: 3, has_prev: true }));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'seg1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg1#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+    await retirePrefix(container as HTMLElement);
+    return container;
+  };
+
+  it('a BACKWARD press whose heading was retired lands on the FIRST surviving heading of its own item', async () => {
+    // `lastIndexOf` returned the item's LAST surviving heading going back, which
+    // is ahead of the retired cursor, so the backward press moved the reader
+    // FORWARD to the end of the item they were reading.
+    const container = await renderPrefixRetirementCase();
+    await press('H');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#1'));
+  });
+
+  it('a FORWARD press whose heading was retired lands on the same FIRST surviving heading', async () => {
+    // The direction symmetry: retirement always removes a prefix, so there is
+    // no direction in which the item's last surviving heading is the nearest.
+    const container = await renderPrefixRetirementCase();
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#1'));
+  });
+
+  it('force-opens a collapsed subagent thread instead of marking a hidden heading', async () => {
+    // `querySelectorAll` resolves an element inside a CLOSED <details> because
+    // HTML keeps it in the document, so a step onto one reported success,
+    // advanced the cursor, and produced no mark and no scroll — the invariant
+    // was "in the DOM", not "visible". `nodeIndexForUuid` recurses into a
+    // subagent's items/children, so the nested target always resolved and the
+    // force-open dispatch could never run.
+    mockFetchOnce({
+      ...detail([
+        reasoningItem('seg0', ['A']),
+        makeItem({
+          uuid: 'sub0', kind: 'assistant', is_sidechain: true, subagent_key: 'aaaa1111',
+          member_uuids: ['sub0'], text: 'Audit',
+          blocks: [{ kind: 'codex_reasoning', source: 'response_item',
+                     headings: [{ key: 'sub0#0', text: 'B' }] }],
+        } as never),
+      ]),
+      subagent_meta: { aaaa1111: { kind: 'Explore', total_tokens: 1, status: 'completed' } },
+    });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }), oTurn({ uuid: 'sub0', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    // Non-vacuity: the nested heading IS in the DOM, inside a shut disclosure.
+    const thread = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(thread.open).toBe(false);
+    expect(thread.querySelector('[data-heading-key="sub0#0"]')).not.toBeNull();
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    const jumped: string[] = [];
+    const unsubscribe = subscribeStore(() => {
+      const uuid = getState().conversationJump?.uuid;
+      if (uuid && !jumped.includes(uuid)) jumped.push(uuid);
+    });
+    await press('h');
+    // It handed the request to the jump pipeline rather than reporting a
+    // landing on an element nobody can see. This fixture's heading sits on the
+    // thread's BUCKET ROOT, and a bucket-root jump deliberately flashes the card
+    // without force-opening it (#188 B1), so the thread stays shut and the
+    // cursor stays where it was — which is the invariant, not a landing. The
+    // sibling test below covers a NON-root member, where the force-open runs.
+    await waitFor(() => expect(jumped).toContain('sub0'));
+    unsubscribe();
+    expect(currentKey(container)).toBe('seg0#0');
+  });
+
+  it('completes onto a heading inside a NON-root member once the force-open lands', async () => {
+    // The force-open is a `forcedOpenKeys` STATE change, which was neither of
+    // the two axes the resolution effect watched. Opening a thread that already
+    // sits inside Virtuoso's mounted window moves neither the rendered range nor
+    // the heading list, so the request waited for an unrelated scroll or was
+    // dropped at HEADING_MOUNT_ATTEMPTS, leaving the reader at the thread with
+    // no mark.
+    mockFetchOnce({
+      ...detail([
+        reasoningItem('seg0', ['A']),
+        makeItem({
+          uuid: 'sub0', kind: 'assistant', is_sidechain: true, subagent_key: 'aaaa1111',
+          member_uuids: ['sub0'], text: 'Audit',
+        } as never),
+        makeItem({
+          uuid: 'sub1', kind: 'assistant', is_sidechain: true, subagent_key: 'aaaa1111',
+          member_uuids: ['sub1'], text: 'Findings',
+          blocks: [{ kind: 'codex_reasoning', source: 'response_item',
+                     headings: [{ key: 'sub1#0', text: 'B' }] }],
+        } as never),
+      ]),
+      subagent_meta: { aaaa1111: { kind: 'Explore', total_tokens: 1, status: 'completed' } },
+    });
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }),
+        oTurn({ uuid: 'sub0', kind: 'assistant' }),
+        oTurn({ uuid: 'sub1', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    // Non-vacuity: the nested heading IS in the DOM, inside a shut disclosure.
+    const thread = container.querySelector('details.conv-sidechain') as HTMLDetailsElement;
+    expect(thread.open).toBe(false);
+    expect(thread.querySelector('[data-heading-key="sub1#0"]')).not.toBeNull();
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+    await press('h');
+    // The thread opens and the press COMPLETES onto its heading.
+    await waitFor(() => expect(currentKey(container)).toBe('sub1#0'));
+  });
+
+  it('adds no outline entry and no new jump family', () => {
+    // §2.7 — heading navigation reuses the anchor-scroll and target-loading
+    // machinery. It must not extend `buildOutlineTargets`, which is S4's.
+    const outline = adaptQualifiedOutline(
+      { source: 'codex', key: 'v1.k' } as ConversationRef,
+      {
+        status: 'ok', conversation_key: 'v1.k', title: 't',
+        turns: [{
+          item_key: 'civ1.turn', kind: 'assistant', timestamp_utc: '2026-07-18T10:00:00Z',
+          model: null, preview: 'p', cost_usd: null, tokens: null,
+          segment_item_keys: ['civ1.turn', 'civ1.seg1'], kinds: {},
+        }],
+      } as never,
+    );
+    const serialized = JSON.stringify(outline);
+    expect(serialized).not.toContain('#0');
+    expect(serialized).not.toContain('#1');
   });
 });

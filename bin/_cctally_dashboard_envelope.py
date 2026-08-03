@@ -41,6 +41,7 @@ import bisect
 import datetime as dt
 import importlib.util as _ilu
 import os
+import sqlite3
 import sys
 from collections.abc import Mapping
 from zoneinfo import ZoneInfo
@@ -329,7 +330,40 @@ def _select_current_block_for_envelope(
 # ``FROM`` clause so the table name lives in the registry, not inlined here.
 
 
-def _envelope_rows_weekly(conn, descriptor, limit, severity_for) -> list[dict]:
+def _alert_account_resolver(conn: sqlite3.Connection):
+    """Build one snapshot-scoped #345 resolver without per-row DB reads."""
+    import _cctally_account
+
+    decorated = {
+        provider: _cctally_account.provider_is_decorated(conn, provider)
+        for provider in ("claude", "codex")
+    }
+    labels = {
+        provider: _cctally_account.display_label_map(conn, provider)
+        for provider, enabled in decorated.items()
+        if enabled
+    }
+    for provider_labels in labels.values():
+        provider_labels.update({"*": "All accounts", "unattributed": "Unattributed"})
+
+    def fields(provider: str, account_key: object) -> dict[str, str]:
+        if not decorated.get(provider, False):
+            return {}
+        key = str(account_key or "*")
+        label = labels[provider].get(key)
+        if label is None:
+            label = _cctally_account.account_label(conn, key)
+        return {
+            "accountKey": key,
+            "accountLabel": label,
+        }
+
+    return fields
+
+
+def _envelope_rows_weekly(
+    conn, descriptor, limit, severity_for, account_fields,
+) -> list[dict]:
     # ``reset_event_id`` (v1.7.2) segments the same (week, threshold)
     # across pre-credit (0) and post-credit (event.id) cohorts, both
     # of which can be alerted. The envelope id must include the
@@ -340,7 +374,7 @@ def _envelope_rows_weekly(conn, descriptor, limit, severity_for) -> list[dict]:
     rows = conn.execute(
         f"""
         SELECT week_start_date, percent_threshold, captured_at_utc,
-               alerted_at, cumulative_cost_usd, reset_event_id
+               alerted_at, cumulative_cost_usd, reset_event_id, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
@@ -360,6 +394,7 @@ def _envelope_rows_weekly(conn, descriptor, limit, severity_for) -> list[dict]:
             "severity": severity_for(threshold),
             "crossed_at": r["captured_at_utc"],
             "alerted_at": r["alerted_at"],
+            **account_fields("claude", r["account_key"]),
             "context": {
                 "week_start_date":     r["week_start_date"],
                 "cumulative_cost_usd": cumulative,
@@ -377,7 +412,9 @@ def _envelope_rows_weekly(conn, descriptor, limit, severity_for) -> list[dict]:
     return out
 
 
-def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict]:
+def _envelope_rows_five_hour(
+    conn, descriptor, limit, severity_for, account_fields,
+) -> list[dict]:
     # Site F (spec §3.2 bucket C / §3.3): widen the row identity to
     # include ``reset_event_id`` so post-credit (seg=event.id) crossings
     # of the same (window_key, threshold) don't collide with pre-credit
@@ -387,10 +424,12 @@ def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict
     rows = conn.execute(
         f"""
         SELECT m.five_hour_window_key, m.percent_threshold, m.captured_at_utc,
-               m.alerted_at, m.block_cost_usd, m.reset_event_id,
+               m.alerted_at, m.block_cost_usd, m.reset_event_id, m.account_key,
                b.block_start_at
         FROM {descriptor.milestone_table} m
-        LEFT JOIN five_hour_blocks b ON b.five_hour_window_key = m.five_hour_window_key
+        LEFT JOIN five_hour_blocks b
+          ON b.five_hour_window_key = m.five_hour_window_key
+         AND b.account_key = m.account_key
         WHERE m.alerted_at IS NOT NULL
         ORDER BY m.alerted_at DESC
         LIMIT ?
@@ -410,6 +449,7 @@ def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict
             "severity":    severity_for(threshold),
             "crossed_at":  r["captured_at_utc"],
             "alerted_at":  r["alerted_at"],
+            **account_fields("claude", r["account_key"]),
             "context": {
                 "five_hour_window_key": int(r["five_hour_window_key"]),
                 "block_start_at":       r["block_start_at"] or "",
@@ -420,7 +460,9 @@ def _envelope_rows_five_hour(conn, descriptor, limit, severity_for) -> list[dict
     return out
 
 
-def _envelope_rows_budget_family(conn, descriptor, limit, severity_for) -> list[dict]:
+def _envelope_rows_budget_family(
+    conn, descriptor, limit, severity_for, account_fields,
+) -> list[dict]:
     # Unified vendor-tagged budget axis (#143). ONE mapper backs BOTH the
     # ``budget`` (``vendor='claude'``, issue #19) and ``codex_budget``
     # (``vendor='codex'``, calendar-period-codex-budgets spec §6) axes —
@@ -461,7 +503,7 @@ def _envelope_rows_budget_family(conn, descriptor, limit, severity_for) -> list[
         SELECT period_start_at,
                COALESCE(period, ?) AS period,
                threshold, crossed_at_utc, alerted_at,
-               budget_usd, spent_usd, consumption_pct
+               budget_usd, spent_usd, consumption_pct, account_key
         FROM {descriptor.milestone_table}
         WHERE vendor = ? AND alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
@@ -498,12 +540,15 @@ def _envelope_rows_budget_family(conn, descriptor, limit, severity_for) -> list[
             "severity":   severity_for(threshold),
             "crossed_at": r["crossed_at_utc"],
             "alerted_at": r["alerted_at"],
+            **account_fields(str(vendor), r["account_key"]),
             "context":    ctx,
         })
     return out
 
 
-def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict]:
+def _envelope_rows_projected(
+    conn, descriptor, limit, severity_for, account_fields,
+) -> list[dict]:
     # Fourth axis (issue #121): projected-pace threshold crossings. Like
     # budget, projected alerts re-anchor ``week_start_at`` on a mid-week
     # reset, so there is NO ``reset_event_id`` segment — the new window gets
@@ -524,7 +569,7 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
         SELECT week_start_at,
                COALESCE(period, 'subscription-week') AS period,
                metric, threshold, projected_value,
-               denominator, crossed_at_utc, alerted_at
+               denominator, crossed_at_utc, alerted_at, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
@@ -547,6 +592,10 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
             "severity":   severity_for(threshold),
             "crossed_at": r["crossed_at_utc"],
             "alerted_at": r["alerted_at"],
+            **account_fields(
+                "codex" if metric == "codex_budget_usd" else "claude",
+                r["account_key"],
+            ),
             "context": {
                 "week_start_at":   r["week_start_at"],
                 "metric":          metric,
@@ -557,7 +606,9 @@ def _envelope_rows_projected(conn, descriptor, limit, severity_for) -> list[dict
     return out
 
 
-def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list[dict]:
+def _envelope_rows_project_budget(
+    conn, descriptor, limit, severity_for, account_fields,
+) -> list[dict]:
     # Fifth axis (issue #19 / #121): PER-PROJECT equiv-$ budget threshold
     # crossings. Like the global budget axis, project-budget alerts re-anchor
     # ``week_start_at`` on a mid-week reset, so there is NO ``reset_event_id``
@@ -575,7 +626,7 @@ def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list
     rows = conn.execute(
         f"""
         SELECT week_start_at, project_key, threshold, budget_usd, spent_usd,
-               consumption_pct, crossed_at_utc, alerted_at
+               consumption_pct, crossed_at_utc, alerted_at, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
         ORDER BY alerted_at DESC
@@ -605,6 +656,7 @@ def _envelope_rows_project_budget(conn, descriptor, limit, severity_for) -> list
             "severity":   severity_for(threshold),
             "crossed_at": r["crossed_at_utc"],
             "alerted_at": r["alerted_at"],
+            **account_fields("claude", r["account_key"]),
             "context": {
                 "week_start_at":   r["week_start_at"],
                 "project":         label_by_key.get(project_key, project_key),
@@ -795,12 +847,15 @@ def _build_alerts_envelope_array(
     c = sys.modules["cctally"]
     registry = c.AXIS_REGISTRY
     severity_for = c.severity_for
+    account_fields = _alert_account_resolver(conn)
     out: list[dict] = []
     for descriptor in registry:
         mapper = _ENVELOPE_AXIS_MAPPERS.get(descriptor.id)
         if mapper is None:  # pragma: no cover - registry/mapper drift guard
             continue
-        out.extend(mapper(conn, descriptor, limit, severity_for))
+        out.extend(mapper(
+            conn, descriptor, limit, severity_for, account_fields,
+        ))
 
     # Python's list.sort is stable. When two alerts share the same
     # `alerted_at` ISO string (rare; multiple axes firing within the same

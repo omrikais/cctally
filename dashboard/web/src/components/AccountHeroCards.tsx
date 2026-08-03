@@ -72,6 +72,16 @@ function AccountHeroCard({ card, color, focused }: {
       <div className="account-hero-card-head">
         <span className="account-hero-card-label">{card.label}</span>
         {card.plan != null && <span className="account-hero-card-plan">{card.plan}</span>}
+        {card.cycleFreshness === 'stale' && (
+          <span
+            className="chip chip-stale account-hero-card-freshness"
+            data-testid="account-cycle-stale"
+            title={`Quota evidence for ${card.label} is stale`}
+            aria-label={`Quota evidence for ${card.label} is stale`}
+          >
+            stale
+          </span>
+        )}
         {card.active && <span className="account-hero-card-active" title="Active account">●</span>}
       </div>
       {!dimmed && (

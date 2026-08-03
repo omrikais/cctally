@@ -23,8 +23,10 @@ import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
 import { TranscriptContext } from './TranscriptContext';
 import { loadAnonMode, saveAnonMode } from '../store/anonPrefs';
-import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode } from './applyFocusMode';
+import { applyFocusMode, nodeUuid, nodeVisible, type FocusMode, type FilteredNode } from './applyFocusMode';
 import { insertTimeMarkers, type TimedNode } from './insertTimeMarkers';
+import { suppressedHeadingKeys } from './suppressRepeatedHeadings';
+import { headingIsVisible } from './headingVisibility';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
 import { scrollNodeIntoView, alignScrollTop } from './scrollNodeIntoView';
 import { firstLandableMark, applyCurrentMark } from './findMark';
@@ -84,6 +86,14 @@ const looksLikeCommandPlumbing = (t: string): boolean => CMD_FAMILY_RE.test(t);
 // #237 — convergent re-center bounds for an expand_details disclosure find-jump.
 const REASSERT_STABLE_FRAMES = 4;  // consecutive same-target within-tol frames = settled
 const REASSERT_BUDGET_MS = 800;    // wall-clock fallback ceiling (refresh-rate-independent)
+
+// #463 S2 §2.7 — bounds on the reasoning-heading spine's two unattended loops.
+// `EDGE_WALK_MAX` caps how many heading-less pages one `h`/`H` press will load
+// while walking past segments that carry no reasoning; `MOUNT_ATTEMPTS` caps how
+// many mounted-range changes a single request waits through for its row to
+// render. A press restarts either, so both only stop an unattended walk.
+const HEADING_EDGE_WALK_MAX = 8;
+const HEADING_MOUNT_ATTEMPTS = 6;
 
 // First non-blank line of the first MAIN-session, non-marker human message;
 // fallback project_label → session_id. Mirrors the kernel _session_titles_map
@@ -308,7 +318,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
     return s;
   }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, tailRevision, virtualFirstItemIndex } = useConversation(conversationRef, { outlineTurns: outline?.turns, openIntent, protectedUuids, growthNonce, live });
+  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, fetching, tailRevision, virtualFirstItemIndex } = useConversation(conversationRef, { outlineTurns: outline?.turns, outlinePositions: outline?.positionByKey, openIntent, protectedUuids, growthNonce, live });
   // #232 — the imperative Virtuoso handle (scrollToIndex for jumps / keyboard
   // nav / the "↓ N new" pill) and a live mirror of the firstItemIndex so
   // `itemContent`'s array-index math (`virtualIndex − firstItemIndex`) reads the
@@ -655,6 +665,25 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // scrollToIndex landing (deep-link lands on the target), or the 750ms fallback
   // armed on each session open — whichever fires first.
   const [newCount, setNewCount] = useState(0);
+  // #463 S1 — true once a jump has been abandoned as unreachable, so the reader
+  // can say so instead of falling silent. Reset when a new jump starts and when
+  // the conversation identity changes; the user can also dismiss it.
+  const [jumpUnresolved, setJumpUnresolved] = useState(false);
+  // #463 S1 — a give-up message is about ONE finished jump, so the next page
+  // request retires it. The render used to hide it while `fetching` was true
+  // instead, which made it vanish and return around every later page the user's
+  // own scrolling triggered, long after the jump had ended. Clearing on the
+  // RISING edge retires the message without resurrecting one for a jump that is
+  // no longer running. It does NOT make the two indicators mutually exclusive —
+  // this effect is passive, so it clears after paint, and a request already in
+  // flight when the give-up is set never produces a rising edge at all. A rising
+  // edge in the same commit as the set also retires the message before it
+  // renders. Both windows are narrow and deliberately left alone.
+  const fetchingWasTrueRef = useRef(false);
+  useEffect(() => {
+    if (fetching && !fetchingWasTrueRef.current) setJumpUnresolved(false);
+    fetchingWasTrueRef.current = fetching;
+  }, [fetching]);
 
   // #188 S4/C2 — count only VISIBLE live appends in the "↓ N new" pill (Bug 5).
   // `openKeysRef` tracks which subagent threads are currently expanded (lifted
@@ -907,6 +936,29 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // reader renders + every effect that iterates the rendered thread children
   // keys on `visible`, not `groups`.
   const visible = useMemo(() => applyFocusMode(groups, focusMode), [groups, focusMode]);
+  // #463 S2 — the items the reader is ACTUALLY rendering, flattened into
+  // document order. §2.6's duplicate-heading suppression and §2.7's heading walk
+  // are both derived from this one list, so the two cannot disagree. They were
+  // derived from different sources before: suppression ran over every loaded
+  // item while the walk ran over the focus-filtered tree, so under a non-`all`
+  // mode a heading could be suppressed because a HIDDEN sibling had rendered it
+  // first — and a visible segment whose headings all repeat a hidden one then
+  // showed no reasoning at all.
+  const visibleItems = useMemo(() => {
+    const out: ConversationItem[] = [];
+    const walk = (list: readonly (FilteredNode | RenderNode)[]) => {
+      for (const node of list) {
+        if (node.kind === 'hidden_run') continue;
+        if (node.kind === 'item') { out.push(node.item); continue; }
+        if (node.kind === 'tool_result_run') { out.push(...node.items); continue; }
+        // A subagent card renders its own items and then its nested children.
+        out.push(...node.items);
+        walk(node.children);
+      }
+    };
+    walk(visible);
+    return out;
+  }, [visible]);
   // #177 S5 §6 — interleave gap/day time markers over the VISIBLE sequence (so
   // they recompute per focus mode). Markers carry data-conv-marker (never a
   // keyboard stop) and role="separator". The display-tz context drives the
@@ -968,9 +1020,26 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // #217 S6 F3 — maxTurnCost rides along too so the per-turn cost micro-bar can
   // size itself from context (no per-item store subscription); the provider
   // identity flips when the session's heaviest loaded turn cost changes.
+  // #463 S2 §2.6 — the reasoning heading keys an earlier block of the same TURN
+  // already rendered. Computed here because the decision needs the whole turn,
+  // which one block cannot see, and stabilized to content so the identity (and
+  // therefore the provider identity, and therefore every memoized MessageItem)
+  // only changes when the set actually changes.
+  // Derived from `visibleItems`, not `detail.items`: a heading may only be
+  // suppressed on the strength of a block the reader can actually see.
+  const suppressedHeadingKeysRaw = useMemo(
+    () => suppressedHeadingKeys(visibleItems),
+    [visibleItems],
+  );
+  const suppressedHeadings = useStableSet(suppressedHeadingKeysRaw);
   const transcriptCtx = useMemo(
-    () => ({ sessionId, conversationRef, focusMode, fmtCtx, markersEnabled, maxTurnCost: sessionMaxTurnCost, anonMode }),
-    [identityKey, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode],
+    () => ({
+      sessionId, conversationRef, focusMode, fmtCtx, markersEnabled,
+      maxTurnCost: sessionMaxTurnCost, anonMode,
+      suppressedHeadingKeys: suppressedHeadings,
+    }),
+    [identityKey, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode,
+     suppressedHeadings],
   );
 
   // #232 — the bottom sentinel observer, the top sentinel observer, and the
@@ -1135,6 +1204,9 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
       return;
     }
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
+    // #463 S1 — a fresh jump supersedes any previous give-up message. Setting the
+    // state it already holds is a no-op re-render, so this is safe on a re-fire.
+    setJumpUnresolved(false);
     let cancelled = false;
     // #234 / #281 S5 A2 — this jump owns a fresh programmatic-run token. The walk
     // and the final landing run inside the async block below; `aborted()` after
@@ -1418,7 +1490,19 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
       // a newer run has taken ownership.
       myToken = gates.beginProgrammaticRun();
       try {
-        await runJumpPipeline(runnerDeps);
+        // #463 S1 — 'exhausted-cleared' is the pipeline's ONLY give-up outcome:
+        // the target never reached the window, the drained edge is genuinely
+        // exhausted, and the jump has just been cleared. Surface it.
+        //
+        // Deliberately NOT gated on this effect run's `cancelled` flag. Clearing
+        // the jump is what makes `jump` null, which re-fires the effect and runs
+        // this run's cleanup — so by the time the awaited pipeline resolves,
+        // `cancelled` is already true on the very run that decided to give up,
+        // and the message would never appear. The pipeline's own `aborted()`
+        // check is the correct supersession guard: a superseded or torn-down run
+        // returns 'aborted', never 'exhausted-cleared'.
+        const outcome = await runJumpPipeline(runnerDeps);
+        if (outcome === 'exhausted-cleared') setJumpUnresolved(true);
       } finally {
         // Re-enable edge paging once the whole jump operation has run or bailed, but
         // ONLY if THIS run is still the current owner (a newer run that superseded
@@ -1511,6 +1595,8 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // next conversation starts with the button hidden.
   useEffect(() => {
     setNewCount(0);
+    // #463 S1 — a give-up message belongs to the conversation that produced it.
+    setJumpUnresolved(false);
     // #217 S3 E2 / #281 S5 A3 — the open-precedence fold: an anchor/restore open
     // lands the user on a SPECIFIC turn (not the tail), so it must NOT force
     // atBottom (else a live append would yank the viewport to the bottom). A tail
@@ -2015,6 +2101,347 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // teardown so a recycled DOM node never carries a leftover class).
   useEffect(() => () => { markCurrent(null); }, [markCurrent]);
 
+  // ── #463 S2 §2.7 — the reasoning reading spine ───────────────────────────
+  //
+  // Sequential movement between Codex reasoning headings, resolved in TWO steps
+  // so it works across a page boundary without touching S4's surfaces.
+  //
+  // Every heading lives inside a segment, and segment keys are already
+  // resolvable through the outline's `segment_uuids` channel and
+  // `positionByKey`. So when the next heading is not in the loaded window the
+  // reader resolves the target SEGMENT first, through the existing jump /
+  // `loadToTarget` pipeline — which no-ops only when an identifier is absent
+  // from that map, and a segment key never is — then locates the heading inside
+  // that segment once it has loaded.
+  //
+  // Heading keys are never placed in the outline and never in `member_uuids`:
+  // `loadToTarget` reads `member_uuids` as "already loaded" and would no-op on
+  // content that has not been fetched (§1.3). This adds no outline entry, no new
+  // jump family and no change to `buildOutlineTargets` — those belong to S4.
+  //
+  // THE INVARIANT, and the reason the code below is shaped the way it is: the
+  // heading cursor advances if and only if the step actually lands on a visible
+  // heading. The first implementation advanced it unconditionally, before the
+  // "is the element there?" guard, which made navigation dead in the browser —
+  // Virtuoso mounts a window (measured: 18 of 348 heading elements on a 99-item
+  // conversation), so nearly every step targeted an unmounted element, consumed
+  // a heading and returned with nothing marked and no feedback. The same
+  // unconditional advance also walked headings that a non-`all` focus mode
+  // removes from the render tree, and left the cursor stranded whenever the next
+  // segment carried no reasoning at all (spec §7: 82.9% of them do not).
+  //
+  // `visibleItems` — the flattened focus-mode-filtered render tree — rather than
+  // `detail.items`, so a mode that hides a turn also removes its headings from
+  // the walk instead of leaving invisible stops in it. It is the SAME list the
+  // suppression set above is computed from, which is what keeps the two in
+  // agreement. Under the default `all` mode `visible` IS `groups` (same array
+  // identity), so this is the same list as before.
+  const headingTargets = useMemo(() => {
+    const out: { key: string; uuid: string }[] = [];
+    for (const item of visibleItems) {
+      for (const block of item.blocks) {
+        if (block.kind !== 'codex_reasoning' || !block.headings?.length) continue;
+        for (const heading of block.headings) {
+          // §2.6 — a heading the duplicate-aggregate rule removed has no element,
+          // so leaving it in the walk would make `h` refuse to advance (correctly,
+          // per the invariant above) and read as stuck.
+          if (suppressedHeadings.has(heading.key)) continue;
+          out.push({ key: heading.key, uuid: item.anchor.uuid });
+        }
+      }
+    }
+    return out;
+  }, [visibleItems, suppressedHeadings]);
+  const headingTargetsRef = useRef(headingTargets);
+  headingTargetsRef.current = headingTargets;
+  // Every identifier the loaded window can already resolve. The edge walk uses it
+  // to skip past keys that are loaded and carry no heading, instead of asking the
+  // jump pipeline for a neighbour it already holds (which no-ops, so the walk
+  // would re-request the same neighbour on every press and never progress).
+  //
+  // `turn_uuid` is deliberately NOT added. It is segment 0's KEY (§1.3), so
+  // adding it marked an unloaded segment 0 as loaded whenever any later segment
+  // of that turn was in the window: a deep link landing mid-turn then made every
+  // heading in segment 0 unreachable by backward stepping, because the walk
+  // skipped the key it needed to ask for. `anchor.uuid` and `member_uuids`
+  // already cover exactly what is genuinely loaded — segment 0's own anchor uuid
+  // IS its turn_uuid — so nothing is lost by leaving it out.
+  const loadedKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const item of detail?.items ?? []) {
+      keys.add(item.anchor.uuid);
+      for (const member of item.member_uuids ?? []) keys.add(member);
+    }
+    return keys;
+  }, [detail?.items]);
+  const loadedKeysRef = useRef(loadedKeys);
+  loadedKeysRef.current = loadedKeys;
+  const currentHeadingRef = useRef<string | null>(null);
+  // The item that owns the cursor's heading. Suppression is window-relative
+  // (§2.6 evaluates "first occurrence in the turn" over the LOADED window), so a
+  // backward page load can retire the very heading the reader is standing on.
+  // Remembering the owner lets the next press resume inside the item they were
+  // reading instead of treating the missing key as "no cursor at all" and
+  // jumping to the top of the window.
+  const currentHeadingUuidRef = useRef<string | null>(null);
+  // An unresolved request. `key` = a heading that is loaded but whose row is not
+  // mounted; `edge` = the cross-page continuation past the loaded window.
+  const pendingHeadingRef = useRef<
+    | { kind: 'key'; key: string; uuid: string; attempts: number }
+    | { kind: 'edge'; dir: 1 | -1; afterKey: string | null; afterUuid: string | null;
+        segment: string; steps: number }
+    | null
+  >(null);
+
+  // The VISIBLE element carrying a heading key, or null. Attribute-walk rather
+  // than an interpolated attribute selector: a heading key embeds an opaque hash
+  // and a `#`, so building a selector from it would need escaping to stay valid.
+  // `headingIsVisible` is what makes "landed" mean on screen rather than merely
+  // in the document — see headingVisibility.ts.
+  const findHeadingElement = useCallback((key: string): Element | null => {
+    const root = bodyRef.current;
+    if (!root) return null;
+    const el = [...root.querySelectorAll('[data-heading-key]')]
+      .find((node) => node.getAttribute('data-heading-key') === key);
+    return el != null && headingIsVisible(el) ? el : null;
+  }, []);
+  // Move the `.conv-heading--current` class onto one element. Imperative,
+  // mirroring the jump pipeline's own `.conv-details--jumpopen` handling: the
+  // heading elements are rendered deep inside `MessageBlocks`, and threading a
+  // "current" prop through the whole block walk to style one line would re-render
+  // every block on every step.
+  const paintHeading = useCallback((el: Element) => {
+    bodyRef.current?.querySelectorAll('.conv-heading--current')
+      .forEach((node) => node.classList.remove('conv-heading--current'));
+    el.classList.add('conv-heading--current');
+  }, []);
+
+  // Mark + reveal one heading, and REPORT whether it landed. The lookup happens
+  // BEFORE anything is mutated: a step that cannot land must leave both the
+  // previous mark and the cursor exactly as they were.
+  const focusHeading = useCallback((target: { key: string; uuid: string }): boolean => {
+    const el = findHeadingElement(target.key);
+    if (!el) return false;
+    paintHeading(el);
+    el.scrollIntoView({ block: 'center' });
+    currentHeadingRef.current = target.key;
+    currentHeadingUuidRef.current = target.uuid;
+    return true;
+  }, [findHeadingElement, paintHeading]);
+  const focusHeadingRef = useRef(focusHeading);
+  focusHeadingRef.current = focusHeading;
+
+  // Ask for one heading. It lands immediately when its row is mounted; otherwise
+  // the viewport is moved toward the OWNING item and the request is retried once
+  // the row renders. The cursor is not touched until one of those lands.
+  const requestHeading = useCallback((target: { key: string; uuid: string }) => {
+    if (focusHeadingRef.current(target)) { pendingHeadingRef.current = null; return; }
+    pendingHeadingRef.current = { kind: 'key', key: target.key, uuid: target.uuid, attempts: 0 };
+    // Loaded, and inside the render tree: this is Virtuoso's window, so scroll
+    // the owning row into the mounted set and land on the retry.
+    //
+    // A hit inside a SUBAGENT node does not qualify. `nodeIndexForUuid` recurses
+    // into a subagent's `items` and `children`, so a nested target always
+    // resolves — even when the thread's disclosure is shut, or the member sits
+    // outside the thread's own internal render window (subagentWindow.ts). A raw
+    // scrollToIndex cannot open either, so the fallback below was unreachable
+    // for exactly the targets that needed it.
+    const hit = nodeIndexForUuid(nodesRef.current, target.uuid, firstItemIndexRef.current);
+    if (hit && nodesRef.current[hit.arrayIndex]?.kind !== 'subagent') {
+      virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align: 'center', behavior: 'auto' });
+      return;
+    }
+    // Not reachable by scrolling alone — a collapsed or internally windowed
+    // subagent thread, or a target the current focus mode coalesced away. The
+    // jump pipeline pages, un-hides and force-opens; it is the only path that
+    // can do those things.
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, target.uuid, qualifiedInputRef.current),
+    });
+  }, []);
+  const requestHeadingRef = useRef(requestHeading);
+  requestHeadingRef.current = requestHeading;
+
+  // The nearest key past `fromUuid` in DOCUMENT order that the loaded window does
+  // NOT already hold, from the outline's positional index over the FULL wire turn
+  // list. That map covers segments, which the navigation turn subset does not:
+  // `adaptQualifiedOutline` drops meta and event-bearing turns, and on real Codex
+  // data that is every heavy assistant response and so every multi-segment turn.
+  //
+  // Loaded keys are skipped rather than returned. Past the end of the heading
+  // list every loaded key in that direction carries no heading by construction,
+  // so returning the immediate neighbour would ask the pipeline to load something
+  // it already has — the request no-ops, nothing changes, and the next press
+  // computes the same neighbour again.
+  const nextUnloadedKey = useCallback((fromUuid: string | null, dir: 1 | -1) => {
+    const positions = outlineRef.current?.positionByKey;
+    if (!positions || fromUuid == null) return null;
+    const from = positions.get(fromUuid);
+    if (from == null) return null;
+    const loaded = loadedKeysRef.current;
+    let best: { key: string; pos: number } | null = null;
+    for (const [key, pos] of positions) {
+      if (dir > 0 ? pos <= from : pos >= from) continue;
+      if (loaded.has(key)) continue;
+      if (best == null || (dir > 0 ? pos < best.pos : pos > best.pos)) best = { key, pos };
+    }
+    return best?.key ?? null;
+  }, []);
+
+  // Where the cursor sits in a heading list, tolerant of its key having left it.
+  //
+  // `exact` distinguishes the two cases the step then has to treat differently.
+  // On an exact hit the press moves ONE heading on. When the key is gone but its
+  // owning item survives — suppression is window-relative, so a backward page
+  // load can retire the heading the reader is standing on — the press instead
+  // LANDS on the item's FIRST surviving heading, which keeps the reader inside
+  // the passage they were reading. The fallback to the first (or last) heading
+  // of the whole window covers both remaining cases: the item is gone, and the
+  // item survives with EVERY one of its headings retired (the 19.8% exact-repeat
+  // case, where a follower segment's whole heading list duplicates the arriving
+  // segment 0's).
+  //
+  // The first surviving heading is the right answer in BOTH directions, not an
+  // approximation of "nearest". Retirement removes a PREFIX of the item's list,
+  // because Codex aggregates are cumulative and prefix-extended (§7: 19.8% of
+  // adjacent block pairs repeat exactly, 12.5% extend as a strict prefix, and
+  // 0.06% merely overlap), so the arriving earlier segment renders the item's
+  // LEADING headings and every survivor sits after the retired cursor. Taking
+  // the LAST one going back therefore walked the reader FORWARD, to the end of
+  // the item they were reading. On the 0.06% partial-overlap shape the first
+  // survivor can sit slightly before the cursor instead of after it, which
+  // still leaves the reader inside the passage they were reading.
+  //
+  // The ordinal in the retired key is recoverable — heading keys are
+  // `<block_key>#<zero-based ordinal>` (§1.2) — but it is not used, because the
+  // ordinal is scoped to a BLOCK and says nothing about position among the
+  // item's surviving headings once a whole block has dropped out.
+  const locateHeadingCursor = useCallback((
+    list: readonly { key: string; uuid: string }[],
+    key: string | null,
+    uuid: string | null,
+  ): { index: number; exact: boolean } => {
+    if (key == null) return { index: -1, exact: false };
+    const exact = list.findIndex((t) => t.key === key);
+    if (exact >= 0) return { index: exact, exact: true };
+    if (uuid == null) return { index: -1, exact: false };
+    return { index: list.findIndex((t) => t.uuid === uuid), exact: false };
+  }, []);
+
+  const stepHeading = useCallback((dir: 1 | -1) => {
+    const list = headingTargetsRef.current;
+    const current = currentHeadingRef.current;
+    const { index, exact } = locateHeadingCursor(
+      list, current, currentHeadingUuidRef.current);
+    // No cursor at all: the press lands on the first (or last) heading rather
+    // than skipping it. A surviving-but-moved cursor lands on its own item's
+    // first surviving heading; only an exact hit steps on by one.
+    const next = index < 0
+      ? (dir > 0 ? list[0] : list[list.length - 1])
+      : exact ? list[index + dir] : list[index];
+    if (next) { requestHeadingRef.current(next); return; }
+    if (index < 0) return;   // nothing to step to at all — a graceful no-op
+    // Past the loaded edge. Resolve the nearest UNLOADED key and let the existing
+    // jump pipeline fetch it; the effect below continues from there.
+    const target = nextUnloadedKey(list[index]?.uuid ?? null, dir);
+    if (target == null) return;  // genuinely the end — a graceful no-op
+    pendingHeadingRef.current = {
+      kind: 'edge', dir, afterKey: current, afterUuid: currentHeadingUuidRef.current,
+      segment: target, steps: 0,
+    };
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, target, qualifiedInputRef.current),
+    });
+  }, [nextUnloadedKey, locateHeadingCursor]);
+  const stepHeadingRef = useRef(stepHeading);
+  stepHeadingRef.current = stepHeading;
+
+  // Step two of the two-step resolution, and the mounted-window retry. Runs on
+  // every axis a landing depends on: the loaded heading list, Virtuoso's
+  // rendered range (`renderedRangeRev`) — a heading can become reachable purely
+  // by scrolling, with no data change at all — and `forcedOpenKeys`, because a
+  // heading inside a collapsed subagent thread becomes reachable purely by that
+  // thread opening. Opening a small thread moves neither of the other two, so
+  // without this dep the request waited for an unrelated scroll or was dropped
+  // at `HEADING_MOUNT_ATTEMPTS`, leaving the reader at the thread with no mark.
+  useEffect(() => {
+    const pending = pendingHeadingRef.current;
+    if (!pending) return;
+    if (pending.kind === 'key') {
+      if (focusHeading(pending)) { pendingHeadingRef.current = null; return; }
+      // Drop a request whose heading has left the visible list (a window trim, a
+      // focus-mode change). A stale request must never fire later with no
+      // keypress behind it.
+      if (!headingTargets.some((t) => t.key === pending.key)) {
+        pendingHeadingRef.current = null;
+        return;
+      }
+      if (pending.attempts >= HEADING_MOUNT_ATTEMPTS) { pendingHeadingRef.current = null; return; }
+      pending.attempts += 1;
+      // Still loaded, still not mounted: nudge the window again. Each mounted
+      // range change measures more rows, so a far target converges. A subagent
+      // hit is skipped for the reason `requestHeading` gives — scrolling cannot
+      // open a shut thread, and that request already went to the jump pipeline.
+      const hit = nodeIndexForUuid(nodesRef.current, pending.uuid, firstItemIndexRef.current);
+      if (hit && nodesRef.current[hit.arrayIndex]?.kind !== 'subagent') {
+        virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align: 'center', behavior: 'auto' });
+      }
+      return;
+    }
+    // The edge walk. The cursor has not moved, so continue from it — through the
+    // same tolerant lookup `stepHeading` uses, so a page that arrived and retired
+    // the cursor's own heading resumes inside its item instead of dropping the
+    // request and leaving the press dead.
+    const { index: idx, exact } = locateHeadingCursor(
+      headingTargets, pending.afterKey, pending.afterUuid);
+    if (pending.afterKey != null && idx < 0) { pendingHeadingRef.current = null; return; }
+    const next = idx < 0
+      ? (pending.dir > 0 ? headingTargets[0] : headingTargets[headingTargets.length - 1])
+      : exact ? headingTargets[idx + pending.dir] : headingTargets[idx];
+    if (next) { pendingHeadingRef.current = null; requestHeadingRef.current(next); return; }
+    // What loaded carries no heading in this direction. Walk on rather than
+    // dead-ending here: most segments carry no reasoning, so stopping at the
+    // first neighbour would strand the reader mid-conversation.
+    const further = pending.steps + 1 >= HEADING_EDGE_WALK_MAX
+      ? null
+      : nextUnloadedKey(pending.segment, pending.dir);
+    if (further == null) { pendingHeadingRef.current = null; return; }
+    pendingHeadingRef.current = { ...pending, segment: further, steps: pending.steps + 1 };
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      conversationRef: conversationRefRef.current,
+      jump: readerJump(conversationRefRef.current, further, qualifiedInputRef.current),
+    });
+  }, [headingTargets, renderedRangeRev, forcedOpenKeys, focusHeading, nextUnloadedKey, locateHeadingCursor]);
+
+  // Re-assert the mark from the cursor.
+  //
+  // `.conv-heading--current` is a class on one DOM element while the cursor is a
+  // ref, so any remount — a page swap, a Virtuoso window move — destroys the
+  // first and keeps the second, and the two then disagree. QA measured exactly
+  // that on conversation 019f5b77: the press that triggers a cross-page load
+  // left `.conv-heading--current` null while mounted headings dropped to zero,
+  // so the press read as dead even though the cursor had moved. Re-applying the
+  // class on every pass that can change the DOM is what makes a press either
+  // complete onto its heading once the page arrives or leave the existing mark
+  // where it was until it can.
+  //
+  // Declared AFTER the resolution effect so a landing in the same commit paints
+  // first; this is then a no-op, because the class is already where it belongs.
+  // It never scrolls — restoring a mark is not a navigation.
+  useEffect(() => {
+    const key = currentHeadingRef.current;
+    if (key == null) return;
+    const marked = bodyRef.current?.querySelector('.conv-heading--current');
+    if (marked?.getAttribute('data-heading-key') === key) return;
+    const el = findHeadingElement(key);
+    if (el) paintHeading(el);
+  }, [headingTargets, renderedRangeRev, forcedOpenKeys, findHeadingElement, paintHeading]);
+
   // `v` cycles the focus mode all → chat → prompts → errors → all.
   const cycleFocusMode = useCallback(() => {
     const order: FocusMode[] = ['all', 'chat', 'prompts', 'errors'];
@@ -2093,6 +2520,19 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         // shared guard + the #156 conversations-view scope like every jump key.
         mk('m', () => jumpNextRef.current('compaction', 1)),
         mk('M', () => jumpNextRef.current('compaction', -1)),
+        // #463 S2 §2.7 — `h`/`H` step to the next/previous Codex reasoning
+        // HEADING. Mnemonic, and free: the taken conversations-view set is
+        // j k [ ] g o e E u U b B p P c C v n N End a L m M i I t f / Escape,
+        // and `h` was one of the slots (h w x y z) the #217 S6 F4 audit
+        // confirmed unused. `H` is likewise free — the taken uppercase set is
+        // E U B P C N M I L, plus the dashboard-view-only `S` (share) and `N`.
+        // The dashboard globals `r`/`q`/`v`/`a`/`n`/`N` carry no `view`, so the
+        // keymap dispatcher scopes them to the dashboard and they never reach
+        // the conversations view. Uppercase-is-previous matches every other
+        // jump family here. Gated on the shared `guard` (no open modal, no
+        // input mode, no filter popover) + the #156 conversations-view scope.
+        mk('h', () => stepHeadingRef.current(1)),
+        mk('H', () => stepHeadingRef.current(-1)),
         // #217 S6 F4 — `i`/`I` step to the next/prev bookmark (the ★ jump family),
         // reusing the reader's real jump dispatcher (jumpNextRef) exactly like
         // e/E. `t` toggles a bookmark on the CURRENT turn — the explicit pin (where
@@ -2741,6 +3181,58 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           card reads the find terms + transcript context. */}
       <HighlightContext.Provider value={findTerms}>
       <TranscriptContext.Provider value={transcriptCtx}>
+      {/* #463 S1 (#448) — an in-scroller indicator for a page request in flight
+          with rows already mounted, so a reverse page or a jump drain is visibly
+          in progress rather than silently pending. It is a SIBLING of the
+          scroller, absolutely positioned over it, so mounting it never perturbs
+          Virtuoso's own sizing.
+
+          There is deliberately no companion `detail && nodes.length === 0`
+          spinner. One shipped here and was removed after a requestAnimationFrame
+          probe counted ZERO appearances of it across about fifteen cold opens,
+          spanning the heaviest Codex conversation, a 3,890-turn Claude
+          conversation and both viewports: the first detail response always
+          arrives before React commits an empty-node frame. The same probe saw
+          this indicator 21 times in a single drain, so the instrument was not
+          blind. Do not reintroduce that state without evidence it can render. */}
+      {detail && nodes.length > 0 && fetching && (
+        <div className="conv-paging-indicator" data-testid="conv-paging-indicator" role="status">
+          <span className="conv-paging-glyph" aria-hidden="true"><SpinnerIcon /></span>
+          <span className="conv-paging-label">Loading more…</span>
+        </div>
+      )}
+      {/* #463 S1 — the give-up state. Every path that abandons a jump must end
+          somewhere VISIBLE. Before this, an unreachable deep link left the
+          indicator flickering and then vanishing for good, so the reader showed a
+          populated header, a transcript positioned nowhere near the requested
+          message, and nothing at all to say the jump had failed.
+
+          It is NOT gated on `!fetching`. Hiding it while a request is in flight
+          made the message disappear and reappear around every later page the
+          user's own scrolling triggered, for a jump that had already finished.
+          The next page request CLEARS the state instead (the effect above).
+          That retires the message rather than hiding it, but it does not make
+          the two mutually exclusive: the clear runs in a passive effect, so
+          they stack for the frame in which `fetching` first turns true, and a
+          request already in flight when the give-up is set produces no rising
+          edge and so leaves them stacked until it finishes. Both windows are
+          narrow and neither is worth a layout effect; do not restate this as
+          mutual exclusion.
+
+          `role="status"` sits on the message span rather than on the container,
+          so the live region announces the message alone and the dismiss button
+          is not read as part of it. */}
+      {detail && jumpUnresolved && (
+        <div className="conv-paging-indicator conv-paging-indicator--failed" data-testid="conv-jump-unresolved">
+          <span className="conv-paging-label" role="status">Could not load the linked message.</span>
+          <button
+            type="button"
+            className="conv-paging-dismiss"
+            onClick={() => setJumpUnresolved(false)}
+            aria-label="Dismiss"
+          >×</button>
+        </div>
+      )}
       <Virtuoso
         ref={virtuosoRef}
         className="conv-reader-body"

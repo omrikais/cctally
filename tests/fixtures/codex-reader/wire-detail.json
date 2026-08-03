@@ -1,0 +1,429 @@
+{
+  "children": [],
+  "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "items": [
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_6fd6acaeca97be59cbe94fbdc6fa6a9761fb6e0b",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Synthetic first meaningful user prompt",
+          "timestamp_utc": "2026-07-14T12:03:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:03:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_def77b9b71f9ed7670170de5ce2aea17ad754544",
+          "call_id": null,
+          "detail": null,
+          "kind": "assistant",
+          "text": "Synthetic assistant response",
+          "timestamp_utc": "2026-07-14T12:03:10Z"
+        },
+        {
+          "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+          "call_id": null,
+          "detail": {
+            "reasoning": {
+              "body": "Synthetic reasoning",
+              "headings": [
+                {
+                  "key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+                  "text": "Synthetic summary"
+                }
+              ],
+              "schema_version": 1,
+              "source": "response_item",
+              "summary": "Synthetic summary"
+            }
+          },
+          "kind": "reasoning",
+          "text": "Synthetic summary\nSynthetic reasoning",
+          "timestamp_utc": "2026-07-14T12:03:20Z"
+        },
+        {
+          "block_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "call_id": "fn-1",
+          "detail": {
+            "args": "{}",
+            "name": "fixture_function"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "{\"ok\":true}",
+                    "type": "raw"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output"
+              }
+            },
+            "text": "{\"ok\":true}"
+          },
+          "text": "fixture_function\n{}",
+          "timestamp_utc": "2026-07-14T12:03:30Z"
+        },
+        {
+          "block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "call_id": "custom-1",
+          "detail": {
+            "args": "{\"q\":\"synthetic\"}",
+            "name": "fixture_custom"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "{\"answer\":\"synthetic\"}",
+                    "type": "raw"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output"
+              }
+            },
+            "text": "{\"answer\":\"synthetic\"}"
+          },
+          "text": "fixture_custom\n{\"q\":\"synthetic\"}",
+          "timestamp_utc": "2026-07-14T12:03:50Z"
+        },
+        {
+          "block_key": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "call_id": "search-1",
+          "detail": {
+            "args": "{\"query\":\"synthetic\"}",
+            "name": "tool_search_call"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "{\"name\":\"fixture-search\"}",
+                    "type": "raw"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "completed",
+                "truncated": false,
+                "type": "terminal_output"
+              }
+            },
+            "text": "{\"name\":\"fixture-search\"}"
+          },
+          "text": "tool_search_call\n{\"query\":\"synthetic\"}",
+          "timestamp_utc": "2026-07-14T12:04:10Z"
+        },
+        {
+          "block_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "call_id": null,
+          "detail": {
+            "args": "search",
+            "card": {
+              "action": "search",
+              "call_status": "completed",
+              "schema_version": 1,
+              "source": "web_search_call",
+              "type": "web_search"
+            },
+            "name": "web_search_call"
+          },
+          "kind": "tool_call",
+          "text": "web_search_call\nsearch",
+          "timestamp_utc": "2026-07-14T12:04:30Z"
+        },
+        {
+          "block_key": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+          "call_id": null,
+          "detail": null,
+          "kind": "assistant",
+          "text": "Synthetic agent message",
+          "timestamp_utc": "2026-07-14T12:05:00Z"
+        },
+        {
+          "block_key": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001",
+          "call_id": null,
+          "detail": {
+            "reasoning": {
+              "body": "Synthetic agent reasoning",
+              "schema_version": 1,
+              "source": "agent_reasoning"
+            }
+          },
+          "kind": "reasoning",
+          "text": "Synthetic agent reasoning",
+          "timestamp_utc": "2026-07-14T12:06:00Z"
+        }
+      ],
+      "cost_usd": 0.0051625,
+      "item_key": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+      "kind": "assistant",
+      "lifecycle": {
+        "events": [
+          {
+            "block_key": "cbk1_fb0a485bf58794391b5e1f6e9116f54664843aec",
+            "event": "task_started",
+            "payload_which": "event"
+          }
+        ],
+        "schema_version": 1,
+        "started": {
+          "at": "2026-07-14T12:05:00Z",
+          "collaboration_mode_kind": "parallel",
+          "model_context_window": 272000
+        },
+        "state": "started"
+      },
+      "member_item_keys": [
+        "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e"
+      ],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:03:10Z",
+      "tokens": {
+        "cached_input": 300,
+        "input": 1200,
+        "output": 400,
+        "reasoning_output": 100,
+        "source": "codex"
+      },
+      "turn_item_key": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_e0eefd23adb5226d2b8868fa8e18996b1d2561ce",
+          "call_id": null,
+          "detail": {
+            "event": "task_complete",
+            "lifecycle": {
+              "at": "2026-07-14T12:05:10Z",
+              "duration_ms": 10,
+              "event": "task_complete",
+              "message": "done",
+              "schema_version": 1,
+              "state": "completed"
+            }
+          },
+          "kind": "event",
+          "payload_which": "event",
+          "text": "task_complete done",
+          "timestamp_utc": "2026-07-14T12:08:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:08:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_057462c17ca43c2918526886f6f6a7f0ce5c70b3"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_f335a8740d1142ec42d960880521be2f9614cc14",
+          "call_id": null,
+          "detail": {
+            "event": "context_compacted"
+          },
+          "kind": "event",
+          "text": "context_compacted",
+          "timestamp_utc": "2026-07-14T12:09:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:09:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e",
+          "call_id": "patch-1",
+          "detail": {
+            "card": {
+              "files": [
+                {
+                  "path": "synthetic.txt"
+                }
+              ],
+              "has_diff": false,
+              "schema_version": 1,
+              "source": "patch_apply_end",
+              "status": "completed",
+              "stderr": "",
+              "stdout": "ok",
+              "success": true,
+              "truncated": false,
+              "type": "patch"
+            },
+            "event": "patch_apply_end"
+          },
+          "kind": "event",
+          "payload_which": "event",
+          "text": "patch_apply synthetic.txt",
+          "timestamp_utc": "2026-07-14T12:10:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:10:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29",
+          "call_id": "mcp-1",
+          "detail": {
+            "card": {
+              "arguments": null,
+              "duration": 1,
+              "result": {
+                "ok": true
+              },
+              "schema_version": 1,
+              "server": null,
+              "source": "mcp_tool_call_end",
+              "status": "returned",
+              "tool": "fixture",
+              "type": "mcp_completion"
+            },
+            "event": "mcp_tool_call_end"
+          },
+          "kind": "event",
+          "payload_which": "event",
+          "text": "mcp_tool_call fixture",
+          "timestamp_utc": "2026-07-14T12:11:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:11:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_164fbd4071b1d7940671365b38147480a6ba47c0",
+          "call_id": "search-1",
+          "detail": {
+            "card": {
+              "action": "search",
+              "query": "synthetic",
+              "results": [],
+              "schema_version": 1,
+              "source": "web_search_end",
+              "status": "returned",
+              "type": "web_search_completion"
+            },
+            "event": "web_search_end"
+          },
+          "kind": "event",
+          "payload_which": "event",
+          "text": "web_search synthetic",
+          "timestamp_utc": "2026-07-14T12:12:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:12:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_e3aedf86278c94bcc915af437ee683b8d57d1438",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Synthetic user event",
+          "timestamp_utc": "2026-07-14T12:13:00Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-07-14T12:13:00Z",
+      "tokens": null,
+      "turn_item_key": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+    }
+  ],
+  "page": {
+    "after": null,
+    "before": null,
+    "has_after": false,
+    "has_before": false,
+    "returned": 8,
+    "total": 8
+  },
+  "parent": null,
+  "status": "ok",
+  "title": "Synthetic first meaningful user prompt",
+  "tokens": {
+    "cached_input": 300,
+    "input": 1200,
+    "output": 400,
+    "reasoning_output": 100,
+    "source": "codex"
+  },
+  "total_cost_usd": 0.0051625,
+  "unattributed_cost_usd": 0.0
+}

@@ -46,6 +46,7 @@ export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
   const cfg = SIZES[size];
   const isLarge = size === 'large';
   const ordered = [...days].reverse();
+  const wastedUsd = (day: CacheReportDailyRow): number => day.wasted_usd ?? 0;
 
   if (ordered.length === 0) {
     if (isLarge) {
@@ -88,7 +89,7 @@ export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
     const maxAbsNet = Math.max(
       1e-9,
       ...ordered.map((d) =>
-        Math.max(d.saved_usd + d.wasted_usd, Math.abs(d.net_usd)),
+        Math.max(d.saved_usd + wastedUsd(d), Math.abs(d.net_usd)),
       ),
     );
     const yScale = (cfg.height - cfg.padTop - cfg.padBot) / 2 / maxAbsNet;
@@ -130,7 +131,7 @@ export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
               const { left: x, width: barWidth } = slot(i);
               if (d.net_usd >= 0) {
                 const greenH = d.saved_usd * yScale;
-                const redH = d.wasted_usd * yScale;
+                const redH = wastedUsd(d) * yScale;
                 return (
                   <g key={d.date} data-testid="crm-netbar" data-date={d.date} data-sign="pos">
                     <rect

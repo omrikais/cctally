@@ -72,7 +72,10 @@ def _insert_account_accounting_row(cache, *, root, account_key, timestamp,
     )
 
 
-def _weekly_and_5h(root, account_key, weekly_reset, used_weekly, used_5h):
+def _weekly_and_5h(
+    root, account_key, weekly_reset, used_weekly, used_5h, *, captured_at=None,
+):
+    captured_at = captured_at or NOW - dt.timedelta(minutes=10)
     return (
         QuotaObservation(
             identity=QuotaWindowIdentity(
@@ -80,7 +83,7 @@ def _weekly_and_5h(root, account_key, weekly_reset, used_weekly, used_5h):
                 observed_slot="primary", window_minutes=10_080,
                 account_key=account_key,
             ),
-            captured_at=NOW - dt.timedelta(minutes=10),
+            captured_at=captured_at,
             used_percent=used_weekly, resets_at=weekly_reset,
             source_path=f"/private/{account_key[:4]}.jsonl", line_offset=1,
         ),
@@ -90,7 +93,7 @@ def _weekly_and_5h(root, account_key, weekly_reset, used_weekly, used_5h):
                 observed_slot="primary", window_minutes=300,
                 account_key=account_key,
             ),
-            captured_at=NOW - dt.timedelta(minutes=10),
+            captured_at=captured_at,
             used_percent=used_5h, resets_at=NOW + dt.timedelta(hours=4),
             source_path=f"/private/{account_key[:4]}-5h.jsonl", line_offset=2,
         ),
@@ -205,6 +208,96 @@ def test_decorated_source_emits_per_account_cards_and_cycles(tmp_path, monkeypat
             {"key": f"cycle:{_ACCT_A}"},)
         assert state.data["account_scopes"][_ACCT_B]["quota"]["cycle_index"] == (
             {"key": f"cycle:{_ACCT_B}"},)
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_decorated_cards_disclose_staleness_per_account(tmp_path, monkeypatch):
+    """#360: one stale account cannot borrow another account's fresh marker."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    reset = NOW + dt.timedelta(days=2)
+    observations = (
+        *_weekly_and_5h(
+            root, _ACCT_A, reset, used_weekly=40.0, used_5h=12.0,
+            captured_at=NOW - dt.timedelta(hours=2),
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, reset + dt.timedelta(hours=1),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="decorated-staleness-v1",
+        )
+        by_key = {card["accountKey"]: card for card in state.data["accounts"]}
+        assert by_key[_ACCT_A]["cycleFreshness"] == "stale"
+        assert "cycleFreshness" not in by_key[_ACCT_B]
+        assert by_key[_ACCT_A]["weeklyPercent"] == 40.0
+        assert by_key[_ACCT_A]["resetsAt"] == reset.isoformat()
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_expired_account_clears_cycle_fields_but_keeps_historical_spend(
+    tmp_path, monkeypatch,
+):
+    """#360: a reset account cannot keep its old weekly percentage or reset."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    _seed_codex_accounts(stats, [
+        dict(account_key=_ACCT_A, email="a@x.com", label="alice", plan_type="pro"),
+        dict(account_key=_ACCT_B, email="b@x.com", label="bob", plan_type="team"),
+    ])
+    _insert_account_accounting_row(
+        cache, root=root, account_key=_ACCT_A,
+        timestamp=NOW - dt.timedelta(hours=1), session_id="a-history",
+        line_offset=90_101,
+    )
+    cache.commit()
+    observations = (
+        *_weekly_and_5h(
+            root, _ACCT_A, NOW - dt.timedelta(minutes=1),
+            used_weekly=40.0, used_5h=12.0,
+        ),
+        *_weekly_and_5h(
+            root, _ACCT_B, NOW + dt.timedelta(days=2),
+            used_weekly=55.0, used_5h=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        source_module, "load_codex_quota_observations", lambda **_k: observations)
+    try:
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="decorated-expiry-v1",
+        )
+        by_key = {card["accountKey"]: card for card in state.data["accounts"]}
+        expired = by_key[_ACCT_A]
+        assert expired["weeklyPercent"] is None
+        assert expired["resetsAt"] is None
+        assert expired["spendUsd"] > 0
+        assert _ACCT_A not in {
+            cycle["accountKey"] for cycle in state.data["hero"]["cycles"]
+        }
     finally:
         cache.close()
         stats.close()

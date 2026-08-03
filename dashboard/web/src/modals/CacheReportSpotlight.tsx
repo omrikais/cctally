@@ -26,11 +26,10 @@ export interface CacheReportSpotlightProps {
 }
 
 export function CacheReportSpotlight({ cr, source }: CacheReportSpotlightProps) {
-  const vocab = cacheVocabulary(source ?? 'claude');
-  // Read from the MAP, never from the value: Codex keeps publishing a numeric
-  // `wasted_usd` through the transition release, so a client inferring
-  // applicability from nullness would read its structural zero as a real
-  // break-even measurement (#443 S2 §3.3).
+  const resolvedSource = source ?? 'claude';
+  const vocab = cacheVocabulary(resolvedSource);
+  // Read the reason from the map; the Codex value is null and the map explains
+  // why the figure is structurally absent.
   const wastedNotApplicable = notApplicableReason(cr, 'wasted_usd');
   const verdict = cacheReportVerdict(cr);
   const { insufficient } = verdict;
@@ -90,7 +89,7 @@ export function CacheReportSpotlight({ cr, source }: CacheReportSpotlightProps) 
           <span>
             <span className="k">{vocab.percentLabel}</span>{' '}
             <strong>
-              {unmeasured(cachePercentText(cr.today)
+              {unmeasured(cachePercentText(cr.today, resolvedSource)
                 ?? <span className="m-unavailable">Unavailable</span>)}
             </strong>
           </span>
@@ -111,7 +110,9 @@ export function CacheReportSpotlight({ cr, source }: CacheReportSpotlightProps) 
               // Saved is a real Codex measurement and is kept; only the Wasted
               // half is structurally absent.
               wastedNotApplicable == null
-                ? `$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`
+                ? cr.today.wasted_usd == null
+                  ? `$${cr.today.saved_usd.toFixed(2)} / unavailable`
+                  : `$${cr.today.saved_usd.toFixed(2)} / $${cr.today.wasted_usd.toFixed(2)}`
                 : (
                   <>
                     {`$${cr.today.saved_usd.toFixed(2)} / `}

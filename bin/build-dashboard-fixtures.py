@@ -1517,19 +1517,10 @@ def _seed_codex_history(
     # differ from one another and the baseline median is a real statistic
     # rather than a constant. Deterministic: derived only from the offset.
     for line_offset, offset in enumerate(day_offsets):
-        # 06:00, not the scenario's own 12:00 AS_OF instant. The qualified
-        # Codex reader compares `timestamp_utc` LEXICALLY against a bound
-        # nudged to `AS_OF + 1us`, and `_iso()` here emits a `Z` suffix where
-        # production writes `+00:00` (see #467). `'Z' (0x5A) > '.' (0x2E)`,
-        # so a fixture row stamped exactly at AS_OF sorts AFTER the bound and
-        # is excluded — which would leave `codex-cache-active` publishing the
-        # synthetic today row and make it indistinguishable from
-        # `codex-cache-idle`. Production rows are unaffected: they carry
-        # `+00:00`, and `'+' (0x2B) < '.'`, so they sort before the bound as
-        # intended. Seeding away from the boundary sidesteps the format gap
-        # without encoding it into the scenario.
-        ts = (as_of - dt.timedelta(days=offset)).replace(
-            hour=6, minute=0, second=0, microsecond=0)
+        # Keep offset 0 exactly at AS_OF. The shared fixture seeder stores the
+        # same +00:00 form as production, so the reader's AS_OF + 1us upper
+        # bound includes this row and the scenario pins the boundary contract.
+        ts = as_of - dt.timedelta(days=offset)
         input_tokens = 20_000
         cached = input_tokens * (60 + 4 * (offset % 5)) // 100
         seed_codex_session_entry(

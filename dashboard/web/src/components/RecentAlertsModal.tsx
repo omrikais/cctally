@@ -10,7 +10,13 @@ import {
   budgetPeriodNoun,
   projectedContextText,
 } from '../lib/alertAxis';
-import { alertDisplay, selectSourceAlertRows } from '../lib/alertIdentity';
+import {
+  alertAccount,
+  alertDisplay,
+  filterAlertRowsForAccount,
+  selectSourceAlertRows,
+  toastAlertId,
+} from '../lib/alertIdentity';
 import { resolveSourceView } from '../store/sourceView';
 import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 import type { AlertEntry, CodexAlertRow, SourceAlertRow } from '../types/envelope';
@@ -167,9 +173,9 @@ function CodexCostCell(): JSX.Element {
 }
 
 export function RecentAlertsModal(): JSX.Element {
-  const env = useScopedSnapshot();
-  const scope = useAccountScope();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().openModalSource ?? getState().activeSource);
+  const env = useScopedSnapshot(activeSource);
+  const scope = useAccountScope(activeSource);
   const legacyAlerts = useSyncExternalStore(subscribeStore, () => getState().alerts);
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
@@ -186,6 +192,7 @@ export function RecentAlertsModal(): JSX.Element {
       : activeSource === 'claude' && claudeLegacyRows.length > 0
         ? claudeLegacyRows
         : selectSourceAlertRows(view);
+  const focusedRows = filterAlertRowsForAccount(allRows, scope.requestedKey);
 
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
@@ -212,8 +219,9 @@ export function RecentAlertsModal(): JSX.Element {
     : activeSource === 'codex'
       ? codexThresholds
       : [...new Set([...claudeThresholds, ...codexThresholds])].sort((a, b) => a - b);
-  const rows = allRows.slice(0, ALERTS_MODAL_CAP);
+  const rows = focusedRows.slice(0, ALERTS_MODAL_CAP);
   const showSourceColumn = activeSource === 'all';
+  const showAccountColumn = rows.some((row) => alertAccount(row) != null);
 
   if (rows.length === 0) {
     return (
@@ -232,6 +240,7 @@ export function RecentAlertsModal(): JSX.Element {
               <th scope="col">%</th>
               <th scope="col">Axis</th>
               {showSourceColumn && <th scope="col">Source</th>}
+              {showAccountColumn && <th scope="col">Account</th>}
               <th scope="col">Cost</th>
               <th scope="col">Context</th>
               <th scope="col">Alerted</th>
@@ -242,28 +251,38 @@ export function RecentAlertsModal(): JSX.Element {
               const d = alertDisplay(row);
               const isClaude = row.source === 'claude';
               const severity = isClaude ? alertSeverity(row) : d.severity;
+              const account = alertAccount(row);
               return (
-                <tr key={`${d.source}:${row.key}`} className="alert-modal-row">
-                  <td className={`alert-threshold severity-${severity} ${severity} num`}>
+                <tr key={toastAlertId(row)} className="alert-modal-row">
+                  <td className={`alert-threshold alert-cell-threshold severity-${severity} ${severity} num`}>
                     {d.threshold}%
                   </td>
-                  <td>
+                  <td className="alert-cell-axis">
                     <span className={`chip ${d.chipClass}`}>
                       {isClaude ? AXIS_CHIP_LABEL[row.axis] : d.chipLabel}
                     </span>
                   </td>
                   {showSourceColumn && (
-                    <td>
+                    <td className="alert-cell-source">
                       <span className={`source-chip source-chip--${d.source}`}>{d.sourceLabel}</span>
                     </td>
                   )}
-                  <td className="num">
+                  {showAccountColumn && (
+                    <td className="alert-cell-account">
+                      {account != null && (
+                        <span className="alert-account-chip" title={account.label}>
+                          {account.label}
+                        </span>
+                      )}
+                    </td>
+                  )}
+                  <td className="alert-cell-cost num">
                     {isClaude ? <CostCell alert={row} /> : <CodexCostCell />}
                   </td>
-                  <td>
+                  <td className="alert-cell-context">
                     {isClaude ? <ContextCell alert={row} ctx={ctx} /> : <CodexContextCell row={row} />}
                   </td>
-                  <td className="alert-when">
+                  <td className="alert-cell-when alert-when">
                     {fmt.relativeOrAbsolute(d.whenIso ?? '', ctx)}
                   </td>
                 </tr>
@@ -271,9 +290,9 @@ export function RecentAlertsModal(): JSX.Element {
             })}
           </tbody>
         </table>
-        {allRows.length > ALERTS_MODAL_CAP && (
+        {focusedRows.length > ALERTS_MODAL_CAP && (
           <div className="alerts-modal-foot">
-            Showing {ALERTS_MODAL_CAP} of {allRows.length} most recent
+            Showing {ALERTS_MODAL_CAP} of {focusedRows.length} most recent
           </div>
         )}
       </div>

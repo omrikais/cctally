@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import fcntl
 import json
@@ -102,6 +103,51 @@ def test_live_wrong_epoch_open_defers_without_inline_resolver(
 
     assert type(raised.value).__name__ == "StatsEpochRebuildDeferred"
     assert calls == ["defer"]
+
+
+def test_losing_fresh_open_rechecks_epoch_after_open_time_lock(
+    runtime, monkeypatch,
+):
+    """A waiter must accept the current index completed by the lock winner."""
+    _ns, core, _db, store = runtime
+    real_guard = store.stats_open_time_guard
+    winner_ran = False
+
+    @contextlib.contextmanager
+    def winner_before_loser_guard(*, live):
+        nonlocal winner_ran
+        if not winner_ran:
+            winner_ran = True
+            monkeypatch.setattr(store, "stats_open_time_guard", real_guard)
+            try:
+                winner = core.open_db()
+                winner.close()
+            finally:
+                monkeypatch.setattr(
+                    store,
+                    "stats_open_time_guard",
+                    winner_before_loser_guard,
+                )
+        with real_guard(live=live):
+            yield
+
+    monkeypatch.setattr(
+        store,
+        "stats_open_time_guard",
+        winner_before_loser_guard,
+    )
+
+    loser = core.open_db()
+    try:
+        assert winner_ran is True
+        assert loser.execute("PRAGMA user_version").fetchone()[0] == (
+            core.STATS_INDEX_EPOCH
+        )
+        assert loser.execute(
+            "SELECT 1 FROM weekly_usage_snapshots LIMIT 1"
+        ).fetchone() is None
+    finally:
+        loser.close()
 
 
 def test_scheduler_spawns_once_and_recent_marker_suppresses_duplicates(

@@ -312,3 +312,51 @@ describe('buildOutlineTargets bookmark list (#217 S6 F4)', () => {
     expect(buildOutlineTargets(turns).bookmark).toEqual([]);
   });
 });
+
+// #463 S1 — a turn that segmentation split is still ONE outline entry, and only
+// its segment 0 key appears as that entry's own uuid. A deep link, find hit or
+// saved reading position naming segment 1..N therefore resolves through neither
+// the own-uuid map nor the member map, and `loadToTarget` would no-op: the drain
+// would never run and the jump would land nowhere. `segment_uuids` is the third
+// channel, deliberately separate from `member_uuids`, which the reader must NOT
+// treat as "already loaded".
+describe('resolveTurnIndex — segment key resolution (#463 S1)', () => {
+  const turns = [
+    { uuid: 't0', kind: 'human', member_uuids: ['t0'] },
+    {
+      uuid: 't1', kind: 'assistant', member_uuids: ['t1', 'fragA'],
+      segment_uuids: ['t1', 'seg1', 'seg2'],
+    },
+    { uuid: 't2', kind: 'assistant', member_uuids: ['t2'] },
+  ] as unknown as OutlineTurn[];
+
+  it('resolves a segment key past the first to its owning turn index', () => {
+    const t = buildOutlineTargets(turns);
+    expect(resolveTurnIndex(t, 'seg1')).toBe(1);
+    expect(resolveTurnIndex(t, 'seg2')).toBe(1);
+  });
+
+  it('keeps segment keys out of the member map', () => {
+    const t = buildOutlineTargets(turns);
+    expect(t.memberIndex.has('seg1')).toBe(false);
+    expect(t.memberIndex.has('seg2')).toBe(false);
+    expect(t.segmentIndex.get('seg2')).toBe(1);
+  });
+
+  it('lets the own-uuid and member maps still win over the segment map', () => {
+    const t = buildOutlineTargets([
+      ...turns,
+      // A pathological turn claiming another turn's own uuid as one of its
+      // segments must not shadow the real owner.
+      { uuid: 't3', kind: 'assistant', member_uuids: ['t3'], segment_uuids: ['t3', 't0', 'fragA'] },
+    ] as unknown as OutlineTurn[]);
+    expect(resolveTurnIndex(t, 't0')).toBe(0);
+    expect(resolveTurnIndex(t, 'fragA')).toBe(1);
+  });
+
+  it('is inert for an outline with no segment keys', () => {
+    const t = buildOutlineTargets([{ uuid: 'a', kind: 'human', member_uuids: ['a'] }] as unknown as OutlineTurn[]);
+    expect(t.segmentIndex.size).toBe(0);
+    expect(resolveTurnIndex(t, 'nope')).toBeUndefined();
+  });
+});

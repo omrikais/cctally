@@ -6,7 +6,7 @@ shared key set, which is how the Codex empty return and its populated
 return drifted apart (#443 F18).
 
 Provider parameterization resolves exactly four things and nothing else:
-the percent key(s), whether the not-applicable metadata is emitted, the
+the percent key, whether the not-applicable metadata is emitted, the
 applicable predicate set, and the reason text. Everything else is
 provider-independent by construction.
 
@@ -31,15 +31,8 @@ ALL_PREDICATES = tuple(
 
 # Codex figures that are structurally absent rather than unmeasured.
 # OpenAI charges no cache-write premium, so there is nothing to waste and
-# therefore no ratio of saved to wasted. The VALUES stay numeric through
-# the transition release (a pre-S2 tab calls .toFixed on the first and
-# Math.round on the second); this map is the authoritative signal a
-# current client renders from.
-#
-# Switching these to None, removing the transitional `cache_hit_percent`
-# in _percent, and bumping SOURCE_SCHEMA_VERSION to 4 are ONE release's
-# work, tracked in cctally-dev#465. Doing any of them alone reintroduces
-# the stale-tab crash this retention exists to avoid.
+# therefore no ratio of saved to wasted. Their values are None on the Codex
+# wire; this map remains the authoritative user-facing reason.
 CODEX_NOT_APPLICABLE = {
     "wasted_usd": "OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.",
     "fourteen_day_efficiency_ratio": "Efficiency compares saved against wasted, and Codex has no wasted-cache figure.",
@@ -82,16 +75,10 @@ def filter_inapplicable(provider, row):
 
 
 def _percent(provider, row):
-    """Emit the percent key(s) for one row-shaped mapping.
-
-    Codex dual-publishes: `cached_input_percent` is authoritative and
-    `cache_hit_percent` carries the identical value for one release, so a
-    tab that spans a `cctally update` keeps reading a true number instead
-    of `Math.floor(NaN)`.
-    """
+    """Emit the provider-authoritative percent key for one row mapping."""
     value = row["cache_hit_percent"]
     if provider == "codex":
-        return {"cached_input_percent": value, "cache_hit_percent": value}
+        return {"cached_input_percent": value}
     return {"cache_hit_percent": value}
 
 
@@ -104,7 +91,7 @@ def _today_block(provider, today):
         "delta_pp": today["delta_pp"],
         "net_usd": today["net_usd"],
         "saved_usd": today["saved_usd"],
-        "wasted_usd": today["wasted_usd"],
+        "wasted_usd": None if provider == "codex" else today["wasted_usd"],
         "anomaly_triggered": today["anomaly_triggered"],
         "anomaly_reasons": list(today["anomaly_reasons"]),
         "baseline_daily_row_count": today["baseline_daily_row_count"],
@@ -124,7 +111,7 @@ def _day_block(provider, d):
         "cache_creation_tokens": d["cache_creation_tokens"],
         "cache_read_tokens": d["cache_read_tokens"],
         "saved_usd": d["saved_usd"],
-        "wasted_usd": d["wasted_usd"],
+        "wasted_usd": None if provider == "codex" else d["wasted_usd"],
         "net_usd": d["net_usd"],
         "anomaly_triggered": d["anomaly_triggered"],
         "anomaly_reasons": list(d["anomaly_reasons"]),
@@ -171,6 +158,7 @@ def build_cache_report_wire(
         "is_empty": is_empty,
     }
     if provider == "codex":
+        out["fourteen_day_efficiency_ratio"] = None
         out["not_applicable"] = dict(CODEX_NOT_APPLICABLE)
         out["anomaly_predicates"] = list(CODEX_PREDICATES)
         # The caller counted anomalies BEFORE inapplicable predicates were

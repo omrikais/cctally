@@ -1,6 +1,6 @@
 import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
-import { MessageBlocks } from './MessageBlocks';
+import { MessageBlocks, reasoningBlockIsEmpty } from './MessageBlocks';
 import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
@@ -9,7 +9,12 @@ import { isSystemMarker } from './systemMarkers';
 import { modelChipClass, modelChipStyle } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { costIntensity } from '../lib/cost';
-import { useFmtCtx, useMarkersEnabled, useMaxTurnCost } from './TranscriptContext';
+import {
+  useFmtCtx,
+  useMarkersEnabled,
+  useMaxTurnCost,
+  useSuppressedHeadingKeys,
+} from './TranscriptContext';
 import { segmentContextBody, parseUnifiedDiff } from './contextDiff';
 import { UnifiedDiffView } from './UnifiedDiffView';
 import type { ConversationItem } from '../types/conversation';
@@ -140,6 +145,14 @@ function MessageItemImpl(
   // cache-failure-markers spec §3 — the opt-out, read once from the reader-
   // provided context (NOT a per-item store subscription; keeps memo valid).
   const markersEnabled = useMarkersEnabled();
+  // #217 S6 F3 / #468 — hooks must run before any kind-specific return. The
+  // denominator is consumed only by assistant rows, but keeping the context
+  // read unconditional lets one mounted MessageItem safely change item shape.
+  const maxTurnCost = useMaxTurnCost();
+  // #463 S2 §2.6 — the keys the duplicate-aggregate rule removed. Read here, with
+  // the other context reads, so the "renders nothing" gate below can run before
+  // the assistant branch commits to a card.
+  const suppressedHeadings = useSuppressedHeadingKeys();
   // fmt.timeHHmm returns the "—" sentinel for a null/unparseable ts; suppress the
   // eyebrow in that case (no real instant to show).
   const eyebrowTimeRaw = item.ts
@@ -186,7 +199,6 @@ function MessageItemImpl(
     // heaviest LOADED turn cost, provided once by the reader on the context (no
     // per-item store subscription). costIntensity returns the cost/max ratio
     // clamped to [0,1], or 0 when there is no positive denominator (→ no bar).
-    const maxTurnCost = useMaxTurnCost();
     const costFrac = hasCost ? costIntensity(item.cost_usd as number, maxTurnCost) : 0;
     // #228 S3 B2 — gate the VERBOSE cost text on an absolute floor. A positive
     // cost below the floor hides its noisy `$… · in … · out …` line (the bar +
@@ -194,6 +206,23 @@ function MessageItemImpl(
     // graceful-degradation footer) is NOT a noisy cost line, so the floor never
     // suppresses it — only a positive sub-floor cost is gated.
     const showCostText = !hasCost || (item.cost_usd as number) >= COST_TEXT_FLOOR_USD;
+    // #463 S2 §2.6 — the whole card goes when the turn renders nothing. Dropping
+    // the blocks was not enough: `.conv-item-head` (role dot, "Assistant", model
+    // chip, `· HH:mm`) renders unconditionally and independently of
+    // <MessageBlocks>, so a page-budget split that puts a fully-repeated
+    // reasoning block alone in a follower segment still showed a card with a
+    // model chip, a timestamp and no content. Every part of the card is
+    // enumerated here rather than only the blocks, so a turn that carries a
+    // tokens-only footer (a follower holds cost_usd null, never 0) keeps its
+    // card. An empty `blocks` is excluded — that shape is not this defect and
+    // dropping it would change turns this rule never touched.
+    if (
+      !item.text
+      && !hasCost
+      && !tok
+      && item.blocks.length > 0
+      && item.blocks.every((b) => reasoningBlockIsEmpty(b, suppressedHeadings))
+    ) return null;
     // #228 S3 B2 (Codex P2) — the exact $-figure was previously accessible ONLY
     // as rendered text, so hiding the text would drop cost from accessibility.
     // Always fold the exact `$cost` (when present) — and the token breakdown

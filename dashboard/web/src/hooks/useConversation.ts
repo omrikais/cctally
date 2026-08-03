@@ -117,6 +117,11 @@ export interface UseConversation {
   loadPrev: () => Promise<WindowOp | null>;
   loadToTarget: (uuid: string) => Promise<LoadToTargetResult>;
   jumpToLatest: () => Promise<void>;
+  // #463 S1 (#448) — a page request is in flight with rows already mounted. The
+  // reader shows a paging indicator INSIDE the scroller for it, so a reverse
+  // page or a drain is visibly in progress rather than silently pending.
+  // Distinct from `loading`, which covers only the pre-detail open.
+  fetching: boolean;
   // #217 S4 / I-1.6 — a monotonic counter bumped on each successful pollTail
   // merge (live-tail growth). The open find bar keys its auto-refetch on this
   // (debounced) so tail growth re-runs the query. It is deliberately NOT
@@ -152,12 +157,30 @@ const TAIL_WINDOW = 10;
 // must preserve TAIL_WINDOW=10 (the live-tail overlap) and the server's ≤1000
 // per-request limit. Trimming never crosses a protected uuid (windowedCap.ts).
 const WINDOW_CAP_ITEMS = 2 * PAGE;
+// #463 S1 — the PRIMARY retained-window bound, in blocks. Twice the server's
+// per-page block budget (2,000), which preserves the existing relationship in
+// which the retained window is two pages. At the 40-block segment budget that is
+// about one hundred full-size segments. Blocks, not items, because blocks are
+// what correlate with DOM node count and render work: the item ceiling alone
+// never fired on a Codex conversation, since the corpus maximum of 495 items
+// always fit inside one 500-item page while a single turn could hold 827 blocks.
+const WINDOW_CAP_BLOCKS = 4000;
 
 export interface UseConversationOptions {
   // #217 S3 E2 — the full-session outline turns, for `loadToTarget`'s nearest-edge
   // direction decision + member-uuid resolution. Independent of the loaded
   // page-window, so it always yields a reliable above/below verdict.
   outlineTurns?: OutlineTurn[];
+  // #463 S1 — document position of every addressable key over the FULL wire turn
+  // list (`ConversationOutline.positionByKey`). `outlineTurns` above is the
+  // NAVIGATION subset and is therefore not a total order: the qualified adapter
+  // drops meta and event-bearing turns, which on real Codex data is every heavy
+  // assistant response and so every multi-segment turn. A deep link naming one of
+  // their segments resolved to no turn index at all, and `loadToTarget` returned
+  // before issuing a single page. When this map covers the target, it is the
+  // ordering source for BOTH the target and the window edges; otherwise the
+  // skeleton index stays in charge. The two index spaces are never mixed.
+  outlinePositions?: ReadonlyMap<string, number>;
   // #217 S3 E2 — the precedence-resolved open intent. The hook's FIRST request
   // follows it: 'anchor'/'restore' → loadToTarget(uuid); 'tail' → ?tail=1.
   // Omitted/undefined → the legacy head-fetch (?limit=500).
@@ -193,7 +216,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // Existing paging machinery uses a scalar generation key. Make that scalar
   // the injective qualified tuple, while all network paths use the opaque ref.
   const sessionId = conversationRef ? conversationRefKey(conversationRef) : null;
-  const { outlineTurns, openIntent, protectedUuids, growthNonce = 0, live = false } = opts;
+  const { outlineTurns, outlinePositions, openIntent, protectedUuids, growthNonce = 0, live = false } = opts;
   // Live mirror so the ref-stable trim effect reads the latest protected set
   // without re-creating itself (mirrors outlineTurnsRef).
   const protectedUuidsRef = useRef<Set<string> | undefined>(protectedUuids);
@@ -235,6 +258,21 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   hasPrevRef.current = hasPrev;
   const loadingMoreRef = useRef(false);   // forward (after) overlap guard
   const loadingPrevRef = useRef(false);   // reverse (before) overlap guard
+  // #463 S1 (#448) — "a page request is in flight with rows already mounted", the
+  // signal behind the reader's in-scroller paging indicator. A COUNTER rather
+  // than a boolean, because a reverse page and a forward page can overlap and a
+  // drain fires many pages back to back; a boolean would clear on the first one
+  // to finish and flicker the indicator off mid-drain.
+  const inFlightRef = useRef(0);
+  const [fetching, setFetching] = useState(false);
+  const beginFetch = useCallback(() => {
+    inFlightRef.current += 1;
+    if (inFlightRef.current === 1) setFetching(true);
+  }, []);
+  const endFetch = useCallback(() => {
+    inFlightRef.current = Math.max(0, inFlightRef.current - 1);
+    if (inFlightRef.current === 0) setFetching(false);
+  }, []);
   // #232 — single-in-flight guard for loadToTarget. Holds the running drain's
   // promise so a re-entrant call (the jump effect re-fires on every prepend the
   // drain itself causes) awaits the existing drain instead of starting a rival
@@ -267,6 +305,9 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // latest skeleton without re-creating the callback.
   const outlineTurnsRef = useRef<OutlineTurn[] | undefined>(outlineTurns);
   outlineTurnsRef.current = outlineTurns;
+  // #463 S1 — same live-mirror discipline for the full-document position index.
+  const outlinePositionsRef = useRef<ReadonlyMap<string, number> | undefined>(outlinePositions);
+  outlinePositionsRef.current = outlinePositions;
   // #232 — the detail-only setter. It preserves `firstItemIndex` by default, so
   // every caller that only touches the items (append / tail-poll / detail-only
   // resets) leaves the Virtuoso offset untouched. The head-mutating call sites
@@ -370,6 +411,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const ref = conversationRefRef.current;
     if (after == null || sid == null || ref == null || loadingMoreRef.current) return null;
     loadingMoreRef.current = true;
+    beginFetch();
     try {
       let body: ConversationDetail;
       try {
@@ -390,6 +432,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       return emitOp({ op: 'append', addedTop: 0, addedBottom: body.items.length, droppedTop: 0, droppedBottom: 0 });
     } finally {
       loadingMoreRef.current = false;
+      endFetch();
     }
   }, [setDetailSynced, emitOp]);
 
@@ -407,6 +450,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const ref = conversationRefRef.current;
     if (before == null || sid == null || ref == null || loadingPrevRef.current) return null;
     loadingPrevRef.current = true;
+    beginFetch();
     try {
       let body: ConversationDetail;
       try {
@@ -446,6 +490,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       return emitOp({ op: 'prepend', addedTop: prependItems.length, addedBottom: 0, droppedTop: 0, droppedBottom: 0 });
     } finally {
       loadingPrevRef.current = false;
+      endFetch();
     }
   }, [setDetailSynced, emitOp]);
 
@@ -577,11 +622,12 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       // the trimmed count to keep the surviving data[0]'s virtual index stable.
       setWindowState((ws) => {
         const prev = ws.detail;
-        if (!prev || prev.items.length <= WINDOW_CAP_ITEMS) return ws;
+        if (!prev) return ws;
         const plan = planTrim({
           items: prev.items,
           op: drainOp,
-          cap: WINDOW_CAP_ITEMS,
+          capBlocks: WINDOW_CAP_BLOCKS,
+          capItems: WINDOW_CAP_ITEMS,
           protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
           fetchInFlight: false,
         });
@@ -621,6 +667,15 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       new Promise<void>((resolve) => { setTimeout(resolve, 0); });
 
     const turns = outlineTurnsRef.current ?? [];
+    // #463 S1 — the ordering source. `positions` covers EVERY wire turn, so it
+    // resolves targets the navigation outline dropped (every multi-segment Codex
+    // turn, in practice) and it is segment-granular, so two segments of one turn
+    // compare correctly. Use it only when it actually covers the target, and then
+    // use it for the window edges too: mixing a position with a skeleton index
+    // would compare numbers from two different spaces and pick a direction at
+    // random. With no coverage, the pre-existing skeleton-index path is unchanged.
+    const positions = outlinePositionsRef.current;
+    const usePositions = positions != null && positions.has(uuid);
 
     // Fallback: with NO full-session outline (it hasn't loaded yet, or a caller
     // passed none), we can't decide a nearest-edge direction — drive the legacy
@@ -628,7 +683,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     // edge until the target's member_uuids appear or the cursor exhausts. The
     // overlap-race disambiguation is preserved. This keeps a deep-link arriving
     // before the outline skeleton from no-op'ing.
-    if (turns.length === 0) {
+    if (turns.length === 0 && !usePositions) {
       lastDrainDirectionRef.current = 'forward';  // #286 B3 — no-outline legacy forward drain
       const sidF = sid;
       for (;;) {
@@ -647,9 +702,12 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       }
     }
 
-    const targets = buildOutlineTargets(turns);
-    const targetIdx = resolveTurnIndex(targets, uuid);
-    if (targetIdx === undefined) return;  // not an outline turn → graceful no-op
+    const targets = usePositions ? null : buildOutlineTargets(turns);
+    const indexOfKey = (key: string): number | undefined => (
+      usePositions ? positions.get(key) : resolveTurnIndex(targets!, key)
+    );
+    const targetIdx = indexOfKey(uuid);
+    if (targetIdx === undefined) return;  // no position for the target → graceful no-op
 
     // Decide direction from the loaded window's outline span. Map the window's
     // first/last loaded item to outline indices; if the target is BELOW the last
@@ -658,7 +716,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const windowItems = detailRef.current?.items ?? [];
     const idxOf = (it: ConversationItem): number | undefined => {
       for (const u of it.member_uuids) {
-        const i = resolveTurnIndex(targets, u);
+        const i = indexOfKey(u);
         if (i !== undefined) return i;
       }
       return undefined;
@@ -889,7 +947,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const plan = planTrim({
       items,
       op: op.op,
-      cap: WINDOW_CAP_ITEMS,
+      capBlocks: WINDOW_CAP_BLOCKS,
+      capItems: WINDOW_CAP_ITEMS,
       protectedUuids: protectedUuidsRef.current ?? new Set<string>(),
       fetchInFlight,
     });
@@ -901,10 +960,14 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     // statically false in the committed production bundle, so the whole branch is
     // dead-code-eliminated — zero shipped cost. Must precede the `plan.keep === items`
     // early-out so the all-protected no-op (which is over the cap) is also caught.
-    if (import.meta.env.DEV && !fetchInFlight && plan.keep.length > WINDOW_CAP_ITEMS) {
-      console.warn(
-        `[reader] windowed DOM cap (${WINDOW_CAP_ITEMS}) exceeded: ${plan.keep.length} items kept — protected edges block the trim`,
-      );
+    if (import.meta.env.DEV && !fetchInFlight) {
+      const keptBlocks = plan.keep.reduce((acc, it) => acc + (it.blocks?.length ?? 0), 0);
+      if (plan.keep.length > WINDOW_CAP_ITEMS || keptBlocks > WINDOW_CAP_BLOCKS) {
+        console.warn(
+          `[reader] windowed DOM cap (${WINDOW_CAP_BLOCKS} blocks / ${WINDOW_CAP_ITEMS} items) exceeded: `
+          + `${plan.keep.length} items and ${keptBlocks} blocks kept — protected edges block the trim`,
+        );
+      }
     }
     if (plan.keep === items) return;  // no-op (under cap / in-flight / all-protected)
 
@@ -962,6 +1025,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     hasMore, hasPrev, prevBefore, openScrollIntent,
     lastOp,
     loadMore, loadPrev, loadToTarget, jumpToLatest,
+    fetching,
     tailRevision,
     virtualFirstItemIndex: windowState.firstItemIndex,
   };

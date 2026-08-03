@@ -2,7 +2,8 @@
 // (§6.7). Pure functions only; no store imports beyond the SourceView type.
 //
 // Toast identity uses NORMALIZED, source-qualified ids:
-//   - Claude: `claude:${row.id}` — the preserved legacy `id`, which IS stable
+//   - Claude: `claude:${accountKey}:${row.id}` when decorated, otherwise the
+//     legacy `claude:${row.id}` — the preserved `id` itself IS stable
 //     (the projection's opaque `key` embeds the row ordinal and must NEVER be
 //     used for dedup).
 //   - Codex:  `codex:${row.key}` — the stable native-identity key.
@@ -20,15 +21,55 @@ import { AXIS_CHIP_LABEL, alertSeverity } from './alertAxis';
 
 export type AlertSeverity = 'info' | 'warn' | 'critical';
 
+export interface AlertAccount {
+  key: string;
+  label: string;
+}
+
+export function alertAccount(row: SourceAlertRow): AlertAccount | null {
+  const fields = row as SourceAlertRow & {
+    accountKey?: string;
+    accountLabel?: string;
+    account_key?: string;
+  };
+  const key = fields.accountKey ?? fields.account_key;
+  if (key == null) return null;
+  return { key, label: fields.accountLabel ?? (key === '*' ? 'All accounts' : key) };
+}
+
 export function toastAlertId(row: SourceAlertRow): string {
-  return row.source === 'claude' ? `claude:${row.id}` : `codex:${row.key}`;
+  const base = row.source === 'claude' ? `claude:${row.id}` : `codex:${row.key}`;
+  const account = alertAccount(row);
+  return account == null
+    ? base
+    : `${row.source}:${account.key}:${row.source === 'claude' ? row.id : row.key}`;
 }
 
 // Normalized identity + the bare legacy form (continuity — see header).
 export function seedFormsForRow(row: SourceAlertRow): string[] {
-  return row.source === 'claude'
-    ? [`claude:${row.id}`, row.id]
-    : [`codex:${row.key}`, row.key];
+  const priorNormalized = row.source === 'claude' ? `claude:${row.id}` : `codex:${row.key}`;
+  const bare = row.source === 'claude' ? row.id : row.key;
+  const current = toastAlertId(row);
+  return current === priorNormalized
+    ? [priorNormalized, bare]
+    : [current, priorNormalized, bare];
+}
+
+// Focused alert rows are selected directly from their conditional #345 wire.
+// A vendor-wide `*` crossing remains visible. An old/undecorated envelope with
+// no account fields is returned untouched so compatibility never becomes data
+// loss disguised as filtering.
+export function filterAlertRowsForAccount(
+  rows: SourceAlertRow[],
+  accountKey: string | null,
+): SourceAlertRow[] {
+  if (accountKey == null || !rows.some((row) => alertAccount(row) != null)) {
+    return rows;
+  }
+  return rows.filter((row) => {
+    const key = alertAccount(row)?.key;
+    return key === accountKey || key === '*';
+  });
 }
 
 // The toast-pipeline input: the union of the two PROVIDER projections only

@@ -69,8 +69,9 @@ import { SourceChip } from '../panels/sourcePanel';
 function dailyRowFlags(
   d: CacheReportDailyRow,
   baselineMedian: number | null,
+  source: string,
 ): { comparable: boolean; isHitBad: boolean; isNetNeg: boolean } {
-  const pct = cachePercent(d);
+  const pct = cachePercent(d, source);
   const comparable = baselineMedian !== null && pct !== null;
   const isHitBad =
     comparable && pct! < baselineMedian! - CACHE_REPORT_BAND_PP;
@@ -199,7 +200,7 @@ function AllCacheReportSection({
               {report.days.map((day) => (
                 <div className="provider-daily-summary-row" key={day.date}>
                   <span>{fmt.calDate(day.date)}</span>
-                  <span>{measured(day, <>{cachePercentText(day) ?? '—'}</>)}</span>
+                  <span>{measured(day, <>{cachePercentText(day, section.source) ?? '—'}</>)}</span>
                   <span className={day.observed === false ? '' : day.net_usd < 0 ? 'net-neg' : 'net-pos'}>
                     {measured(day, <>{fmt.usdSigned(day.net_usd)}</>)}
                   </span>
@@ -209,8 +210,8 @@ function AllCacheReportSection({
           </div>
           <div className="crm-section">
             <div className="crm-breakdowns">
-              <CacheBreakdownCard kind="projects" rows={report.by_project} />
-              <CacheBreakdownCard kind="models" rows={report.by_model} />
+              <CacheBreakdownCard kind="projects" rows={report.by_project} source={section.source} />
+              <CacheBreakdownCard kind="models" rows={report.by_model} source={section.source} />
             </div>
           </div>
           {section.reason && <div className="provider-section-reason">{section.reason}</div>}
@@ -258,10 +259,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
   // back to "could not be built" for what is really just empty.
   const scope = useAccountScope(source);
   const vocab = cacheVocabulary(source);
-  // The MAP is the authoritative signal, not the value: both fields stay
-  // numeric on the wire through the transition release, so a client inferring
-  // inapplicability from nullness would render a structural zero — and a
-  // structural 1.0 efficiency ratio — as measurements (#443 S2 §3.3).
+  // The map is the authoritative user-facing reason for the null Codex values.
   const wastedNotApplicable = cr == null
     ? null : notApplicableReason(cr, 'wasted_usd');
   const efficiencyNotApplicable = cr == null
@@ -401,7 +399,8 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
 
   // Counterfactual efficiency ratio for the callout (already
   // computed server-side; we just format).
-  const efficiencyPct = Math.round(cr.fourteen_day_efficiency_ratio * 100);
+  const efficiencyPct = cr.fourteen_day_efficiency_ratio == null
+    ? null : Math.round(cr.fourteen_day_efficiency_ratio * 100);
 
   return (
     <Modal title="Cache Report" accentClass={accentClass} headerExtras={headerExtras}>
@@ -456,7 +455,9 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
           */}
           across {observedDayCount(cr.days)} observed days · {vocab.efficiencyLabel}{' '}
           {efficiencyNotApplicable == null
-            ? <span title={`saved / (saved + |wasted|) = ${efficiencyPct}%`}>{efficiencyPct}%</span>
+            ? efficiencyPct == null
+              ? <span className="m-unavailable">Unavailable</span>
+              : <span title={`saved / (saved + |wasted|) = ${efficiencyPct}%`}>{efficiencyPct}%</span>
             : <CacheNotApplicable reason={efficiencyNotApplicable} />}
       </div>
 
@@ -490,6 +491,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
               const { comparable, isHitBad, isNetNeg } = dailyRowFlags(
                 d,
                 cr.today.baseline_median_percent,
+                source,
               );
               const hitClass = comparable
                 ? isHitBad
@@ -499,7 +501,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
               const cells: Array<[string, JSX.Element]> = [
                 [
                   vocab.percentColumnHeader,
-                  measured(d, <span className={hitClass}>{cachePercentText(d) ?? '—'}</span>),
+                  measured(d, <span className={hitClass}>{cachePercentText(d, source) ?? '—'}</span>),
                 ],
                 [
                   'Net',
@@ -517,7 +519,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                   // exist on this provider at all, and would carry none of the
                   // reason the wire supplies.
                   wastedNotApplicable == null
-                    ? measured(d, <span>{fmt.usd2(d.wasted_usd)}</span>)
+                    ? measured(d, <span>{d.wasted_usd == null ? '—' : fmt.usd2(d.wasted_usd)}</span>)
                     : <CacheNotApplicable reason={wastedNotApplicable} />,
                 ],
                 ['Tok In', measured(d, <span>{fmt.compact(d.input_tokens, { upper: true })}</span>)],
@@ -572,6 +574,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                 const { comparable, isHitBad, isNetNeg } = dailyRowFlags(
                   d,
                   cr.today.baseline_median_percent,
+                  source,
                 );
                 return (
                   <tr
@@ -588,7 +591,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                           : comparable ? (isHitBad ? 'hit-bad' : 'hit-good') : ''
                       }`.trim()}
                     >
-                      {measured(d, <>{cachePercentText(d) ?? '—'}</>)}
+                      {measured(d, <>{cachePercentText(d, source) ?? '—'}</>)}
                     </td>
                     <td className="num">
                       {measured(d, <>{fmt.compact(d.input_tokens, { upper: true })}</>)}
@@ -599,7 +602,7 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
                     <td className="num">{measured(d, <>{fmt.usd2(d.saved_usd)}</>)}</td>
                     <td className="num">
                       {wastedNotApplicable == null
-                        ? measured(d, <>{fmt.usd2(d.wasted_usd)}</>)
+                        ? measured(d, <>{d.wasted_usd == null ? '—' : fmt.usd2(d.wasted_usd)}</>)
                         : <CacheNotApplicable reason={wastedNotApplicable} />}
                     </td>
                     <td className={`num ${d.observed === false ? '' : isNetNeg ? 'net-neg' : 'net-pos'}`.trim()}>
@@ -623,8 +626,8 @@ function CanonicalCacheReportModal({ source }: { source: DashboardSelection }) {
       {/* 6. Breakdowns row */}
       <div className="crm-section">
         <div className="crm-breakdowns">
-          <CacheBreakdownCard kind="projects" rows={cr.by_project} />
-          <CacheBreakdownCard kind="models" rows={cr.by_model} />
+          <CacheBreakdownCard kind="projects" rows={cr.by_project} source={source} />
+          <CacheBreakdownCard kind="models" rows={cr.by_model} source={source} />
         </div>
       </div>
     </Modal>

@@ -21,7 +21,11 @@ from pathlib import Path
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _fixture_builders import create_cache_db, create_stats_db  # noqa: E402
+from _fixture_builders import (  # noqa: E402
+    create_cache_db,
+    create_stats_db,
+    fixture_timestamp_utc,
+)
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/forecast"
 
@@ -30,7 +34,7 @@ FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/forecast
 
 
 def _iso(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fixture_timestamp_utc(d)
 
 
 def _insert_snapshots(stats_conn, week_start: dt.datetime, week_end: dt.datetime,

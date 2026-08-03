@@ -33,7 +33,10 @@ CapabilityStatus = Literal[
 # field. Additive and omitted-when-zero, so the normal payload is byte-identical
 # — but the same `execvp` transition applies, so the bump ships as the signal it
 # has always been rather than as a mechanism the client branches on.
-SOURCE_SCHEMA_VERSION = 3
+# 3 -> 4 (#465): the Codex cache report retired its transitional
+# `cache_hit_percent` alias and changed structurally inapplicable figures from
+# numeric placeholders to null.
+SOURCE_SCHEMA_VERSION = 4
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -392,13 +395,11 @@ def _combined_metrics(
 ) -> Mapping[str, object] | None:
     if not (_coherent_provider(claude) and _coherent_provider(codex)):
         return None
-    # #350 spec §3.5: a stale-cycle hero is NOT combinable. Retaining it would
-    # let a sum over stale evidence be published while `compose_all_state` marks
-    # the result fresh — and the All hero carries no Snapshot row or staleness
-    # marker at all, so the staleness would be silently undisclosed. The
-    # combined NUMBER therefore behaves exactly as it does today.
-    if _stale_cycle_providers(claude, codex):
-        return None
+    # #359: the hero counters are backward-looking accounting actuals. A stale
+    # but still-live quota boundary pauses projections; it does not invalidate
+    # the retained cost/token sums that each provider already keeps visible.
+    # Composition therefore retains the compatible number and discloses the
+    # stale boundary through All's hero-domain freshness + local warning.
     for state in (claude, codex):
         hero_capability = state.capabilities.get("hero")
         if hero_capability is None or hero_capability.status not in {"supported", "derived"}:
@@ -462,33 +463,33 @@ def compose_all_state(
         raise ValueError("all composition requires Claude and Codex provider states")
     combined = _combined_metrics(claude, codex)
     providers_coherent = _coherent_provider(claude) and _coherent_provider(codex)
-    # #350 spec §3.5: "All behaves exactly as today" is true only of the combined
-    # NUMBER. Under §3.4 both providers stay coherent, so All now publishes
-    # partial/fresh with no provider warning to explain it — the status chip
-    # would fall through to a generic `degraded` and the All hero fallback would
-    # claim a provider is degraded while both provider envelopes say otherwise.
-    # This All-LOCAL warning states the real reason without touching either
-    # provider envelope. It is emitted only when the providers are otherwise
-    # coherent; an incoherent provider already publishes its own reason.
+    stale_cycle_providers = (
+        _stale_cycle_providers(claude, codex) if providers_coherent else ()
+    )
+    # #359: the warning qualifies a retained combined actual. It stays
+    # All-local and keeps the composed source partial so the header status also
+    # names the caveat; provider envelopes remain independently coherent.
     all_local_warnings: tuple[SourceDashboardWarning, ...] = ()
+    if stale_cycle_providers:
+        all_local_warnings = (SourceDashboardWarning(
+            "combined_totals_stale",
+            f"{' and '.join(stale_cycle_providers)} quota evidence is stale; "
+            "combined totals use retained actuals.",
+            "hero",
+        ),)
     if providers_coherent:
-        stale_cycle_providers = _stale_cycle_providers(claude, codex)
         if stale_cycle_providers:
-            all_local_warnings = (SourceDashboardWarning(
-                "combined_totals_withheld",
-                f"{' and '.join(stale_cycle_providers)} quota evidence is stale, "
-                "so combined totals are withheld.",
-                "hero",
-            ),)
-        availability: Availability = (
-            "partial"
-            if combined is None or "partial" in (claude.availability, codex.availability)
-            else (
-                "empty"
-                if claude.availability == "empty" and codex.availability == "empty"
-                else "ok"
+            availability: Availability = "partial"
+        else:
+            availability = (
+                "partial"
+                if combined is None or "partial" in (claude.availability, codex.availability)
+                else (
+                    "empty"
+                    if claude.availability == "empty" and codex.availability == "empty"
+                    else "ok"
+                )
             )
-        )
         freshness: Freshness = "fresh"
     else:
         availability = "partial"
@@ -519,7 +520,7 @@ def compose_all_state(
         # All-LOCAL warnings lead: `warningForSource` on the client falls back to
         # the FIRST warning, so a merely-partial provider warning (e.g.
         # `codex_metadata_incomplete`) would otherwise pre-empt the chip label
-        # and hide the real reason combined totals are withheld.
+        # and hide the stale qualification on the combined actual.
         warnings=tuple((*all_local_warnings, *claude.warnings, *codex.warnings)),
         data_version=data_version,
         last_success_at=last_success_at,

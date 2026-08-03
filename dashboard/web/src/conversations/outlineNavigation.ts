@@ -99,6 +99,14 @@ export interface OutlineTargets {
   // turns the FIRST occurrence wins (document order). The own-uuid map is
   // authoritative — `resolveTurnIndex` checks it first.
   memberIndex: Map<string, number>;
+  // #463 S1 — every SEGMENT key → its owning turn's skeleton index. A turn that
+  // segmentation split is still one outline entry, and only its segment 0 key
+  // appears as that entry's own uuid, so a deep link, find hit or reading
+  // position naming segment 1..N would resolve to no turn at all and
+  // `loadToTarget` would no-op. This map is deliberately SEPARATE from
+  // `memberIndex`: a segment key must never enter `member_uuids`, because
+  // `loadToTarget` reads that as "already loaded".
+  segmentIndex: Map<string, number>;
 }
 
 export function buildOutlineTargets(
@@ -117,6 +125,7 @@ export function buildOutlineTargets(
   const bookmark: number[] = [];
   const indexByUuid = new Map<string, number>();
   const memberIndex = new Map<string, number>();
+  const segmentIndex = new Map<string, number>();
   const seenSub = new Set<string>();
   turns.forEach((t, i) => {
     indexByUuid.set(t.uuid, i);
@@ -125,6 +134,9 @@ export function buildOutlineTargets(
     // wins so a duplicate member uuid never re-points a later turn.
     for (const u of (t.member_uuids?.length ? t.member_uuids : [t.uuid])) {
       if (!memberIndex.has(u)) memberIndex.set(u, i);
+    }
+    for (const u of (t.segment_uuids ?? [])) {
+      if (!segmentIndex.has(u)) segmentIndex.set(u, i);
     }
     if (t.tools?.some((x) => x.is_error)) error.push(i);
     if (t.kind === 'human') prompt.push(i);
@@ -139,7 +151,10 @@ export function buildOutlineTargets(
     // #217 S6 F4 — a turn whose own uuid is a bookmark key (client-only).
     if (bookmarks && t.uuid in bookmarks) bookmark.push(i);
   });
-  return { error, prompt, subagent, plan, cache, compaction, bookmark, indexByUuid, memberIndex };
+  return {
+    error, prompt, subagent, plan, cache, compaction, bookmark,
+    indexByUuid, memberIndex, segmentIndex,
+  };
 }
 
 // #217 S3 E2 (Codex P1) — resolve a (possibly folded-fragment) uuid to its
@@ -152,7 +167,13 @@ export function buildOutlineTargets(
 export function resolveTurnIndex(targets: OutlineTargets, uuid: string): number | undefined {
   const own = targets.indexByUuid.get(uuid);
   if (own !== undefined) return own;
-  return targets.memberIndex.get(uuid);
+  const member = targets.memberIndex.get(uuid);
+  if (member !== undefined) return member;
+  // #463 S1 — last, a segment key. The outline stays turn-granular, so a
+  // segment past the first resolves to its turn's skeleton index, which is all
+  // `loadToTarget` needs to choose a paging direction; the drain then stops
+  // once the segment's own key appears in a loaded item's `member_uuids`.
+  return targets.segmentIndex.get(uuid);
 }
 
 // #177 S5 §4 — jump-to-next cursor math, shared by the reader's e/u/b/p keys and

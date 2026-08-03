@@ -25,9 +25,14 @@ import type { ConversationItem } from '../types/conversation';
 export interface PlanTrimInput {
   items: ConversationItem[];
   op: 'prepend' | 'append' | 'reset';
-  // Soft cap in ITEMS (page-alignment is the caller's concern). When the loaded
-  // window exceeds this, the far edge is trimmed back toward it.
-  cap: number;
+  // #463 S1 — the PRIMARY soft cap, in BLOCKS. Blocks are what correlate with
+  // DOM node count and render work, and until segmentation the cap was item-count
+  // arithmetic with no concept of size, so one 827-block Codex turn counted as a
+  // single item and the trim had never fired on a Codex conversation at all.
+  capBlocks: number;
+  // The SECONDARY soft cap, in ITEMS (page-alignment is the caller's concern).
+  // It binds for the many-tiny-items case, where the block budget never would.
+  capItems: number;
   // uuids that must survive the trim — matched against each item's anchor.uuid
   // AND its member_uuids (a protected uuid can be a folded fragment).
   protectedUuids: Set<string>;
@@ -53,6 +58,12 @@ export interface TrimPlan {
   resetBottomCursorTo: number | null;
 }
 
+// An item with no `blocks` array costs no blocks — the item ceiling still binds
+// for it. Some legacy Claude fixtures build items that way.
+function blockCount(it: ConversationItem): number {
+  return it.blocks?.length ?? 0;
+}
+
 function isProtected(it: ConversationItem, protectedUuids: Set<string>): boolean {
   if (protectedUuids.size === 0) return false;
   if (protectedUuids.has(it.anchor.uuid)) return true;
@@ -68,16 +79,40 @@ const NO_TRIM = (items: ConversationItem[]): TrimPlan => ({
   resetBottomCursorTo: null,
 });
 
+// How many items fit within BOTH budgets, counted from one end.
+//
+// `fromTop` walks forward from index 0 (what a prepend keeps); otherwise it
+// walks backward from the last item (what an append keeps). At least one item
+// is always kept, however large it is, so an oversized single turn is still
+// rendered rather than trimmed to nothing.
+function fitCount(items: ConversationItem[], input: PlanTrimInput, fromTop: boolean): number {
+  const { capBlocks, capItems } = input;
+  let blocks = 0;
+  let kept = 0;
+  for (let step = 0; step < items.length; step++) {
+    const item = items[fromTop ? step : items.length - 1 - step];
+    const next = blocks + blockCount(item);
+    if (kept > 0 && (next > capBlocks || kept + 1 > capItems)) break;
+    blocks = next;
+    kept += 1;
+  }
+  return kept;
+}
+
 export function planTrim(input: PlanTrimInput): TrimPlan {
-  const { items, op, cap, protectedUuids, fetchInFlight } = input;
-  // Never trim mid-fetch, on a window reset, or when already within the cap.
-  if (fetchInFlight || op === 'reset' || items.length <= cap) return NO_TRIM(items);
+  const { items, op, capBlocks, capItems, protectedUuids, fetchInFlight } = input;
+  // Never trim mid-fetch, on a window reset, or when already within BOTH budgets.
+  if (fetchInFlight || op === 'reset') return NO_TRIM(items);
+  let totalBlocks = 0;
+  for (const item of items) totalBlocks += blockCount(item);
+  if (items.length <= capItems && totalBlocks <= capBlocks) return NO_TRIM(items);
 
   if (op === 'prepend') {
-    // Scrolling UP — drop the far BOTTOM. Keep the top `cap` items, but extend the
-    // kept region downward past `cap` if a protected item sits in the drop zone
-    // (we must keep through the LAST protected item at/after `cap`).
-    let keepCount = cap;
+    // Scrolling UP — drop the far BOTTOM. Keep as much of the top as fits both
+    // budgets, but extend the kept region downward past that point if a
+    // protected item sits in the drop zone (we must keep through the LAST
+    // protected item at or after the fit boundary).
+    let keepCount = fitCount(items, input, true);
     for (let i = items.length - 1; i >= keepCount; i--) {
       if (isProtected(items[i], protectedUuids)) { keepCount = i + 1; break; }
     }
@@ -94,8 +129,8 @@ export function planTrim(input: PlanTrimInput): TrimPlan {
 
   // op === 'append' — scrolling DOWN, drop the far TOP. The largest droppable
   // prefix is up to (but not including) the first protected item, capped at the
-  // amount needed to reach `cap` (keep the bottom `cap`).
-  const want = items.length - cap;
+  // amount needed to bring the kept BOTTOM within both budgets.
+  const want = items.length - fitCount(items, input, false);
   let dropTop = want;
   for (let i = 0; i < want; i++) {
     if (isProtected(items[i], protectedUuids)) { dropTop = i; break; }

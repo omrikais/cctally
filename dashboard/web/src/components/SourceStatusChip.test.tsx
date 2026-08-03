@@ -54,6 +54,30 @@ describe('SourceStatusChip (§6.8)', () => {
     expect(chip).not.toHaveClass('is-stale');
   });
 
+  it('names retained All-source actuals when a provider hero is stale (#359)', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.all = {
+          ...b.sources.all,
+          availability: 'partial',
+          domain_freshness: { hero: 'stale', quota: 'stale', sessions: 'fresh' },
+          warnings: [{
+            code: 'combined_totals_stale',
+            message: 'Codex quota evidence is stale; combined totals use retained actuals.',
+            domain: 'hero',
+          }],
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<SourceStatusChip />);
+
+    const chip = screen.getByTestId('source-status-chip');
+    expect(chip.querySelector('.source-status-label--full')).toHaveTextContent('Combined stale');
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Combined');
+    expect(chip).toHaveAttribute('title', expect.stringMatching(/retained actuals/i));
+  });
+
   it('shows generic concise copy + degraded style for an unscoped partial/stale warning', () => {
     updateSnapshot(
       envWith((b) => {

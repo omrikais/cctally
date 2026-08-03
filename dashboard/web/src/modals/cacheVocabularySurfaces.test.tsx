@@ -63,16 +63,38 @@ function report(over: Partial<CacheReportEnvelope> = {}): CacheReportEnvelope {
   };
 }
 
-/** The S2 Codex wire shape: the not-applicable map and the Codex predicate set. */
+/** The v4 Codex wire shape: one percent key plus null inapplicable figures. */
 function codexReport(over: Partial<CacheReportEnvelope> = {}): CacheReportEnvelope {
-  return report({
+  const base = report();
+  const { cache_hit_percent: todayPercent, ...today } = base.today;
+  return {
+    ...base,
+    today: {
+      ...today,
+      cached_input_percent: todayPercent,
+      wasted_usd: null,
+    },
+    days: base.days.map(({ cache_hit_percent: percent, ...day }) => ({
+      ...day,
+      cached_input_percent: percent,
+      wasted_usd: null,
+    })),
+    by_project: base.by_project.map(({ cache_hit_percent: percent, ...row }) => ({
+      ...row,
+      cached_input_percent: percent,
+    })),
+    by_model: base.by_model.map(({ cache_hit_percent: percent, ...row }) => ({
+      ...row,
+      cached_input_percent: percent,
+    })),
+    fourteen_day_efficiency_ratio: null,
     not_applicable: {
       wasted_usd: 'OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.',
       fourteen_day_efficiency_ratio: 'Efficiency compares saved against wasted, and Codex has no wasted-cache figure.',
     },
     anomaly_predicates: ['cache_drop'],
     ...over,
-  });
+  };
 }
 
 /** One envelope publishing BOTH providers' reports, so `all` composes two. */
@@ -209,12 +231,10 @@ describe('#443 S2 vocabulary — modal', () => {
   });
 });
 
-// #443 S2 §3.3 / §4.4 — a Codex figure that does not exist must say so, and say
-// why. `wasted_usd` and `fourteen_day_efficiency_ratio` stay NUMERIC on the wire
-// through the transition release (a pre-S2 tab calls `.toFixed` on the first and
-// `Math.round` on the second), so the `not_applicable` map is the authoritative
-// signal and the values cannot be used to detect inapplicability. Every
-// assertion below therefore reads the map's own copy, not a client literal.
+// #443 S2 §3.3 / §4.4 + #465 — a Codex figure that does not exist must say so,
+// and say why. The v4 wire publishes null values while the `not_applicable` map
+// remains the authoritative source for the user-facing reason. Every assertion
+// below therefore reads the map's own copy, not a client literal.
 describe('#443 S2 not-applicable figures', () => {
   const MARKED = {
     wasted_usd: 'DISTINCT-WASTED-REASON',

@@ -12,19 +12,23 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { Modal } from './Modal';
 import { ShareIcon } from '../components/ShareIcon';
-import { CODEX_STALE_CYCLE_NOTE } from '../components/HeroStrip';
+import {
+  CODEX_STALE_CYCLE_NOTE,
+  codexIngestBacklogNote,
+} from '../components/HeroStrip';
 import { fmt, type FmtCtx } from '../lib/fmt';
 import { dispatch, getState, subscribeStore, topmostStoreFocusLayer } from '../store/store';
 import type { Binding } from '../store/keymap';
 import { openShareModal } from '../store/shareSlice';
 import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
 import { codexLiveQuotaKeys } from '../lib/dashboardPresentation';
-import { warningForDomain } from '../lib/sourceGating';
+import { sourceDomainFreshness, warningForDomain } from '../lib/sourceGating';
 import { SourceChip } from '../panels/sourcePanel';
 import { fetchWeekDetail, stepWeek } from './milestoneHistory';
 import type {
   CodexQuotaMilestoneRow,
   CodexSourceData,
+  AllSourceData,
   Envelope,
   Milestone,
   FiveHourMilestone,
@@ -565,6 +569,15 @@ function CodexPerAccountCycleTable({
   );
 }
 
+function CodexIngestBacklogDisclosure({ note }: { note: string | null }) {
+  if (note == null) return null;
+  return (
+    <p className="mcw-ms-sub" data-testid="codex-ingest-backlog-note">
+      {note}
+    </p>
+  );
+}
+
 function CodexCurrentCycleModal({
   env,
   ctx,
@@ -577,6 +590,10 @@ function CodexCurrentCycleModal({
   const codex = env?.sources?.codex?.data as CodexSourceData | undefined;
   const hero = codex?.hero;
   const cycle = hero?.cycle;
+  // #456 — unlike the stale-cycle note below, ingest backlog has no account or
+  // source-tab scope. It qualifies every current Codex total derived from this
+  // store, including the per-account landing table and the embedded All modal.
+  const ingestBacklogNote = codexIngestBacklogNote(codex?.ingest_backlog);
   const accountKey = useAccountScope().accountKey;
   // #416 QA P0-B — "All accounts" on a decorated Codex provider. `accounts` is
   // emitted ONLY above one real account (R8), so a single-account install can
@@ -802,6 +819,7 @@ function CodexCurrentCycleModal({
             <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>All accounts</span>
             <span className="m-pill accent-orange">Codex · native 7-day quota</span>
           </div>
+          <CodexIngestBacklogDisclosure note={ingestBacklogNote} />
           <CodexPerAccountCycleTable accounts={codex!.accounts!} codex={codex!} ctx={ctx} />
         </section>
       </CurrentWeekShell>
@@ -836,6 +854,9 @@ function CodexCurrentCycleModal({
           <p className="mcw-ms-sub" data-testid="codex-cycle-stale-note">
             {CODEX_STALE_CYCLE_NOTE}
           </p>
+        ) : null}
+        {!isHistoric ? (
+          <CodexIngestBacklogDisclosure note={ingestBacklogNote} />
         ) : null}
 
         <div className="mcw-herobar">
@@ -1409,11 +1430,16 @@ function AllCurrentWeekModal({
 }) {
   const claudeReason = providerReason(env, 'claude');
   const codexReason = providerReason(env, 'codex');
-  // #350 §3.7: the All-local reason (e.g. `combined_totals_withheld`) lives on
+  // #359: the All-local reason qualifying the retained combined actual lives on
   // the `all` source, NOT on either provider — `providerReason` reads only
   // provider warnings and would leave this modal the one fully silent surface
   // when a provider's cycle evidence is stale.
-  const allReason = warningForDomain(env?.sources?.all?.warnings, 'hero')?.message ?? null;
+  const allEntry = env?.sources?.all;
+  const allReason = warningForDomain(allEntry?.warnings, 'hero')?.message ?? null;
+  const allCombined = (allEntry?.data as AllSourceData | null | undefined)?.combined;
+  const allCombinedStale = allEntry != null
+    && allCombined != null
+    && sourceDomainFreshness(allEntry, 'hero') === 'stale';
   return (
     <Modal
       title="Current Usage — provider cycles"
@@ -1429,7 +1455,22 @@ function AllCurrentWeekModal({
       }
     >
       {allReason && (
-        <p className="provider-section-reason" data-testid="all-current-week-reason">{allReason}</p>
+        <p
+          className={`provider-section-reason${allCombinedStale ? ' all-stale-disclosure' : ''}`}
+          data-testid="all-current-week-reason"
+        >
+          {allCombinedStale ? (
+            <span
+              className="chip chip-stale"
+              data-testid="all-current-week-stale-marker"
+              title={allReason}
+              aria-label={allReason}
+            >
+              Stale quota
+            </span>
+          ) : null}
+          <span>{allReason}</span>
+        </p>
       )}
       <div className="provider-composition provider-composition--modal current-week-provider-composition">
         <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="claude">

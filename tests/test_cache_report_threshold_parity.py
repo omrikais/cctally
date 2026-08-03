@@ -1,8 +1,8 @@
 """One config value must yield one threshold on every read path (#443 S3 F17).
 
-Today `_cctally_tui.py` coerces with `int(raw)` and accepts the string
-"20" as 20, while `resolve_dashboard_source_semantics` requires an int
-instance and falls back to 15 — so one setting renders different verdicts
+The original defect had `_cctally_tui.py` coerce with `int(raw)` and accept
+the string "20" as 20, while `resolve_dashboard_source_semantics` required an
+int instance and fell back to 15 — so one setting rendered different verdicts
 on the Claude and Codex panels.
 """
 import pathlib
@@ -80,3 +80,45 @@ def test_the_tui_read_path_uses_the_resolver():
         "the TUI's own int()/range coercion of anomaly_threshold_pp must "
         "be gone — it is the site that read '20' as 20"
     )
+
+
+def test_tui_snapshot_build_resolves_threshold_before_cache_report_builder(
+    monkeypatch, tmp_path,
+):
+    """Observe the resolved config value at the real TUI call boundary."""
+    import datetime as dt
+
+    ns = conftest.load_script()
+    conftest.redirect_paths(ns, monkeypatch, tmp_path)
+    tui = sys.modules["_cctally_tui"]
+    dashboard = sys.modules["_cctally_dashboard"]
+
+    monkeypatch.setitem(
+        ns,
+        "load_config",
+        lambda: {"cache_report": {"anomaly_threshold_pp": "20"}},
+    )
+    observed = {}
+    cache_report = object()
+
+    def capture_cache_report_build(**kwargs):
+        observed.update(kwargs)
+        return cache_report
+
+    monkeypatch.setattr(
+        dashboard,
+        "build_cache_report_snapshot",
+        capture_cache_report_build,
+    )
+
+    snapshot = tui._tui_build_snapshot_once(
+        now_utc=dt.datetime(2026, 8, 3, 12, 0, tzinfo=dt.timezone.utc),
+        skip_sync=True,
+        display_tz_pref_override="utc",
+        precompute_envelope=False,
+        runtime_bind=None,
+        stats_heal_attempted=False,
+    )
+
+    assert observed["anomaly_threshold_pp"] == 15
+    assert snapshot.cache_report is cache_report

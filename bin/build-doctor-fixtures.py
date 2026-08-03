@@ -722,7 +722,7 @@ def _emit_pricing_cache(db_path: pathlib.Path) -> None:
         "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
         "model, input_tokens, output_tokens, cache_create_tokens, "
         "cache_read_tokens) VALUES (?, 0, ?, ?, ?, ?, ?, ?)",
-        ("/fixture/unpriced.jsonl", now.isoformat().replace("+00:00", "Z"),
+        ("/fixture/unpriced.jsonl", now.isoformat(),
          "claude-fixture-unpriced-9000", 1000, 200, 50, 10),
     )
     _ensure_empty_codex_project_metadata_schema(conn)
@@ -782,7 +782,7 @@ def _emit_codex_cache(db_path: pathlib.Path) -> None:
         "input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, "
         "source_root_key, conversation_key) "
         "VALUES (?, 's1', 'gpt-5', 100, 50, 80, 30, 'fixture-root', 'fixture-key')",
-        (now.isoformat().replace("+00:00", "Z"),),
+        (now.isoformat(),),
     )
     conn.execute(
         "INSERT INTO codex_conversation_threads(conversation_key, source_root_key) "

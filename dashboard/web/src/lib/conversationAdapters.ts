@@ -44,6 +44,15 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+// #463 S1 — a per-item cost that may legitimately be ABSENT. The turn remains
+// the costing unit under segmentation, so the carrier segment reports the
+// turn's cost and every other segment reports null rather than 0. Routing that
+// null through `num()` would render $0.00, which is indistinguishable from a
+// genuinely free turn.
+function costOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 export function adaptQualifiedTokens(tokens: NativeTokens): TokenUsage | undefined {
   if (!tokens) return undefined;
   if (tokens.source === 'codex' || 'cached_input' in tokens || 'reasoning_output' in tokens) {
@@ -104,6 +113,21 @@ function nonBlank(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
 }
 
+// #463 S2 §2.5 — the additive `headings` array. Returns undefined for anything
+// that is not a fully-formed array of {key, text}, so a malformed field degrades
+// to today's title/summary rendering rather than reaching the reader half-built.
+// All-or-nothing, matching the server's own rule for a malformed payload.
+function reasoningHeadings(value: unknown): { key: string; text: string }[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const out: { key: string; text: string }[] = [];
+  for (const raw of value) {
+    const entry = record(raw);
+    if (!entry || typeof entry.key !== 'string' || typeof entry.text !== 'string') return undefined;
+    out.push({ key: entry.key, text: entry.text });
+  }
+  return out;
+}
+
 function codexReasoning(block: QualifiedBlock): Extract<ConversationBlock, { kind: 'codex_reasoning' }> | null {
   const detail = record(block.detail?.reasoning);
   if (detail?.schema_version === 1) {
@@ -111,9 +135,11 @@ function codexReasoning(block: QualifiedBlock): Extract<ConversationBlock, { kin
     const summary = nonBlank(detail.summary);
     const body = nonBlank(detail.body);
     if (!title && !summary && !body) return null;
+    const headings = reasoningHeadings(detail.headings);
     return {
       kind: 'codex_reasoning', source: nonBlank(detail.source) ?? 'codex',
       title, summary, body,
+      ...(headings ? { headings } : {}),
     };
   }
   const body = nonBlank(block.text);
@@ -365,7 +391,13 @@ function adaptBlocks(blocks: QualifiedBlock[], source: ConversationSource): Conv
   const out: ConversationBlock[] = [];
   for (const block of blocks) {
     if (block.kind === 'assistant' || block.kind === 'user' || block.kind === 'text') {
-      if (block.text) out.push({ kind: 'text', text: block.text });
+      // #463 S2 §3.2 — retain the server's per-row anchor so a separately
+      // authored message keeps its identity through adaptation. `MessageBlocks`
+      // then renders one container per source block instead of coalescing a run.
+      if (block.text) out.push({
+        kind: 'text', text: block.text,
+        ...(block.block_key ? { block_key: block.block_key } : {}),
+      });
       const actions = systemActions(block.detail?.markers);
       if (actions) out.push({
         kind: 'system_actions', actions,
@@ -481,6 +513,15 @@ type QualifiedItem = {
   blocks: QualifiedBlock[];
   cost_usd: number | null;
   tokens: NativeTokens;
+  // #294 S6 — every item key this item subsumes (folded completion events and
+  // the like). The server has always emitted it and `_paginate_items` has
+  // always resolved a cursor through it; the client used to discard it.
+  member_item_keys?: string[];
+  // #463 S1 — segmentation. `turn_item_key` equals segment 0's key, so grouping
+  // on it recovers the turn; `segment_ordinal` is 0 for a whole item and for a
+  // turn's first segment.
+  turn_item_key?: string;
+  segment_ordinal?: number;
   meta_kind?: string | null;
   meta_label?: string | null;
   meta_sections?: string[] | null;
@@ -550,8 +591,18 @@ function adaptItem(ref: ConversationRef, item: QualifiedItem): ConversationItem 
     .filter((b) => b.kind === 'user' || b.kind === 'assistant' || b.kind === 'text')
     .map((b) => b.text ?? '').filter(Boolean).join('\n\n');
   const common = {
-    anchor, member_uuids: [item.item_key], ts: item.timestamp_utc ?? '',
+    anchor,
+    // Thread the server's aliases rather than a singleton. The own key stays
+    // FIRST so `resolveJumpOwner` and `nodeIndexForUuid` keep resolving the item
+    // by its own uuid; the folded fragment keys follow.
+    member_uuids: [item.item_key, ...(item.member_item_keys ?? [])],
+    ts: item.timestamp_utc ?? '',
     text, blocks, is_sidechain: false, subagent_key: null, parent_uuid: null,
+    // #463 S1 — turn membership, so a consumer recovers the turn by grouping on
+    // `turn_uuid` without recomputing boundaries. Both are absent on a wire
+    // envelope from a server that predates segmentation.
+    ...(item.turn_item_key !== undefined ? { turn_uuid: item.turn_item_key } : {}),
+    ...(item.segment_ordinal !== undefined ? { segment_ordinal: item.segment_ordinal } : {}),
   };
   const assistantLike = item.kind === 'assistant' || item.kind === 'reasoning' || item.kind === 'tool_call'
     || blocks.some((block) => block.kind === 'tool_call');
@@ -559,7 +610,10 @@ function adaptItem(ref: ConversationRef, item: QualifiedItem): ConversationItem 
     const lifecycle = foldedLifecycle(item.lifecycle);
     return {
       ...common, kind: 'assistant' as const, model: item.model,
-      cost_usd: num(item.cost_usd), tokens: adaptQualifiedTokens(item.tokens),
+      // NOT `num()`: `num(null)` is 0, and a non-carrier segment's null cost
+      // would then render as $0.00 — indistinguishable from a genuinely free
+      // turn, which is exactly what the server's null exists to prevent.
+      cost_usd: costOrNull(item.cost_usd), tokens: adaptQualifiedTokens(item.tokens),
       ...(lifecycle ? { lifecycle } : {}),
     };
   }
@@ -678,6 +732,12 @@ type QualifiedOutlineEnvelope = {
     label: string;
     timestamp_utc: string | null;
     kinds: Record<string, number>;
+    // Item keys this turn SUBSUMES (folded fragments).
+    member_item_keys?: string[];
+    // #463 S1 — the keys of this turn's segments, entry `i` being segment `i`.
+    // A channel deliberately DISTINCT from member_item_keys: see the note in
+    // the mapping below.
+    segment_item_keys?: string[];
     meta_kind?: string | null;
     meta_label?: string | null;
     meta_sections?: string[] | null;
@@ -727,7 +787,15 @@ export function adaptQualifiedOutline(
       kind: isCompaction ? 'meta' : isHuman ? 'human' : 'assistant',
       ts: turn.timestamp_utc,
       label: cleanQualifiedTitle(turn.label) ?? turn.label,
-      member_uuids: [turn.item_key], subagent_key: null, parent_uuid: null, is_sidechain: false,
+      member_uuids: [turn.item_key, ...(turn.member_item_keys ?? [])],
+      // #463 S1 — segment keys go on their OWN channel, never into
+      // member_uuids. `loadToTarget` treats a uuid present in an item's
+      // member_uuids as already loaded, so folding segment keys in would make
+      // the drain skip a segment that has not been fetched and the jump would
+      // land nowhere. Membership for navigation and membership for "this item
+      // subsumes that key" are different relations.
+      ...(turn.segment_item_keys ? { segment_uuids: turn.segment_item_keys } : {}),
+      subagent_key: null, parent_uuid: null, is_sidechain: false,
       ...(isCompaction ? { meta_kind: 'compaction' as const } : {}),
     }];
   });
@@ -756,7 +824,56 @@ export function adaptQualifiedOutline(
       path: file.file_path, tool: file.tool, count: file.count,
     })),
     turns,
+    positionByKey: buildQualifiedOutlinePositions(body.turns ?? []),
   };
+}
+
+// #463 S1 — document position of every addressable key, built over the FULL wire
+// turn list BEFORE the navigation filter above removes meta and event-bearing
+// turns. Positions are segment-granular, so they match detail order exactly: a
+// turn contributes one position per segment, in wire order. A turn's own key and
+// each of its folded member keys map to its HEAD segment's position, which is the
+// position they already resolved to through the turn-granular outline index.
+//
+// Segment granularity is essential to the direction decision, not tidiness. A
+// turn-granular position would give every segment of one turn the same number,
+// so a drain toward segment 2 of a turn whose segment 5 is already the window's
+// first item would compute "not above the window" and page the WRONG WAY, away
+// from the target.
+//
+// The index is PROVIDER-NEUTRAL and is published for every qualified
+// conversation, Claude included, even though segmentation itself is Codex-only.
+// A Claude turn carries no `segment_item_keys`, so it contributes exactly one
+// position and the ordering is plain wire order. The navigation filter drops
+// meta and event-bearing turns on Claude too, so a Claude jump into one of them
+// previously resolved to no turn and `loadToTarget` returned without issuing a
+// page; it now drains toward the target like any other. That is a deliberate
+// widening of the fix rather than an accident of where the call sits.
+export function buildQualifiedOutlinePositions(
+  turns: { item_key: string; member_item_keys?: string[]; segment_item_keys?: string[] }[],
+): ReadonlyMap<string, number> {
+  const positions = new Map<string, number>();
+  let position = 0;
+  for (const turn of turns) {
+    const head = position;
+    // A turn with no segment list occupies exactly one position (its own key).
+    for (const key of (turn.segment_item_keys?.length ? turn.segment_item_keys : [turn.item_key])) {
+      if (!positions.has(key)) positions.set(key, position);
+      position += 1;  // advance even on a duplicate key so document order holds
+    }
+    // A turn's OWN key is set unconditionally, overwriting any entry an earlier
+    // turn contributed by naming this key as one of its members. That mirrors
+    // `resolveTurnIndex`, which checks the own-key map before the member map for
+    // exactly this reason: a turn that lists another turn's key as a member must
+    // not shadow the real owner. It is not reachable with today's key
+    // derivation, and it is kept because the same defence is pinned on the
+    // skeleton index and the two must not disagree.
+    positions.set(turn.item_key, head);
+    for (const key of turn.member_item_keys ?? []) {
+      if (!positions.has(key)) positions.set(key, head);
+    }
+  }
+  return positions;
 }
 
 export function adaptQualifiedFind(body: {

@@ -128,19 +128,16 @@ export type CacheAnomalyReason = 'net_negative' | 'cache_drop';
 
 export interface CacheReportDailyRow {
   date: string;                       // YYYY-MM-DD in display tz
-  // #443 S2 — Codex publishes `cached_input_percent` as authoritative and
-  // repeats the value on `cache_hit_percent` for one transitional release, so a
-  // tab spanning a `cctally update` keeps reading a number. Claude publishes
-  // only the legacy key. Read BOTH through `lib/cacheReportVocabulary`'s
-  // `cachePercent`, never either field directly.
-  cached_input_percent?: number;
-  cache_hit_percent: number;
+  // #465 — each provider publishes only its authoritative key. Read through
+  // the source-aware `lib/cacheReportVocabulary` accessor.
+  cached_input_percent?: number | null;
+  cache_hit_percent?: number | null;
   input_tokens: number;
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
   saved_usd: number;
-  wasted_usd: number;
+  wasted_usd: number | null;
   net_usd: number;
   anomaly_triggered: boolean;
   anomaly_reasons: CacheAnomalyReason[];
@@ -154,20 +151,20 @@ export interface CacheReportDailyRow {
 
 export interface CacheReportBreakdownRow {
   key: string;
-  cached_input_percent?: number;      // #443 S2 — see CacheReportDailyRow.
-  cache_hit_percent: number;
+  cached_input_percent?: number | null; // #465 — see CacheReportDailyRow.
+  cache_hit_percent?: number | null;
   net_usd: number;
 }
 
 export interface CacheReportTodaySpotlight {
   date: string;
-  cached_input_percent?: number;      // #443 S2 — see CacheReportDailyRow.
-  cache_hit_percent: number;
+  cached_input_percent?: number | null; // #465 — see CacheReportDailyRow.
+  cache_hit_percent?: number | null;
   baseline_median_percent: number | null;
   delta_pp: number | null;
   net_usd: number;
   saved_usd: number;
-  wasted_usd: number;
+  wasted_usd: number | null;
   anomaly_triggered: boolean;
   anomaly_reasons: CacheAnomalyReason[];
   baseline_daily_row_count: number;
@@ -187,14 +184,13 @@ export interface CacheReportEnvelope {
   seven_day_net_usd: number;
   seven_day_anomaly_count: number;
   fourteen_day_counterfactual_usd: number;
-  fourteen_day_efficiency_ratio: number;
+  fourteen_day_efficiency_ratio: number | null;
   is_empty: boolean;
   // #443 S2 — Codex-only, both optional; absence carries the Claude
   // meaning. `not_applicable` maps a field name to the reason it can never
   // hold a measurement on this provider. It is the AUTHORITATIVE signal
   // that `wasted_usd` / `fourteen_day_efficiency_ratio` are meaningless
-  // here: those keys stay numeric through the transition release, so their
-  // VALUES cannot be used to detect inapplicability (cctally-dev#465).
+  // here. Their Codex values are null; this map carries the reason.
   not_applicable?: Record<string, string>;
   // Which anomaly predicates the provider can evaluate at all. Absent
   // means the full Claude set. A predicate outside this list is NOT
@@ -257,6 +253,9 @@ export interface AlertEntry {
   // a pre-Phase-B backend might still emit. See lib/alertAxis.ts
   // `alertSeverity`.
   severity?: 'info' | 'warn' | 'critical';
+  // #345 / R8: present only when this provider has >1 real account.
+  accountKey?: string;
+  accountLabel?: string;
   crossed_at: string;            // ISO-8601 UTC
   alerted_at: string;            // ISO-8601 UTC
   // Projected axis (issue #121): top-level metric discriminator. Absent on
@@ -931,7 +930,7 @@ export interface CodexQuotaForecast {
 // A currently-active quota window (`quota.summary.active` + also surfaced in
 // `hero.quota.active`). Carries the opaque `key`, percentages, reset, and
 // freshness — but NO label/duration (those live on the matching history row,
-// joined by key per §6.1).
+// joined by `(account_key, key)` when decorated and bare `key` otherwise).
 export interface CodexQuotaActiveRow {
   key: string;
   current_percent: number;
@@ -962,7 +961,8 @@ export interface CodexQuotaSummary {
 }
 
 // A retained quota history row — carries the `label` + `window_minutes` that the
-// §6.1 join attaches to the active rows by matching `key`.
+// §6.1 join attaches to active rows by scoped identity under decoration and by
+// bare `key` otherwise.
 export interface CodexQuotaHistoryRow {
   key: string;
   source: 'codex';
@@ -1118,6 +1118,9 @@ export interface AccountCard {
   outputTokens: number;
   reasoningOutputTokens: number;
   totalTokens: number;
+  // Additive and omitted while fresh. This is per-account evidence; the
+  // aggregate hero's cycle_freshness cannot describe a stale sibling.
+  cycleFreshness?: 'stale';
   // Present + true only for the reserved unattributed bucket (renders dimmed,
   // totals only, no live bars).
   unattributed?: boolean;
@@ -1255,6 +1258,8 @@ export interface CodexBudgetAlertRow {
   value: number;
   created_at: string;
   account_key?: string;
+  accountKey?: string;
+  accountLabel?: string;
 }
 export interface CodexProjectedAlertRow {
   key: string;
@@ -1265,6 +1270,8 @@ export interface CodexProjectedAlertRow {
   value: number;
   created_at: string;
   account_key?: string;
+  accountKey?: string;
+  accountLabel?: string;
 }
 export interface CodexQuotaAlertRow {
   key: string;
@@ -1274,6 +1281,8 @@ export interface CodexQuotaAlertRow {
   severity: string;
   created_at: string;
   account_key?: string;
+  accountKey?: string;
+  accountLabel?: string;
 }
 export type CodexAlertRow =
   | CodexBudgetAlertRow

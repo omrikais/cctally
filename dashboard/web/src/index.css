@@ -477,6 +477,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 }
 .hs-sub { font-size: var(--fs-meta); color: var(--text-dim); margin-top: var(--space-1); }
 .hs-sub span { color: var(--text); font-weight: 600; }
+/* #459 — both responsive labels are spans only so CSS can switch them without
+   changing the visible disclosure's DOM position. They retain the parent
+   sub-line's deliberately dim weight rather than inheriting the bright metric
+   span treatment above. */
+.hs-sub .hero-ingest-backlog-label-full,
+.hs-sub .hero-ingest-backlog-label-compact {
+  color: inherit;
+  font-weight: inherit;
+}
+.hero-ingest-backlog-label-compact { display: none; }
 
 /* support zone — Forecast @ reset · $/1% vs last week · Snapshot age. */
 .hero-support {
@@ -1455,19 +1465,21 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   }
 }
 
-/* #416 §5.4 — a vendor-wide crossing stays visible under account focus and is
-   labelled as such. It is deliberately NOT a severity chip: the severity glyph
-   beside it already carries the 3-tier vocabulary, and this only says the row
-   is not attributable to the focused account. */
-.alert-vendor-wide {
+/* #345 — quiet, readable account attribution on every decorated alert row.
+   `All accounts` is the vendor-wide sentinel; severity remains visually
+   dominant, so this chip deliberately uses the neutral account vocabulary. */
+.alert-account-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 20ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: 10.5px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
   color: var(--text-dim);
   border: 1px solid var(--border-soft);
-  border-radius: var(--radius-xs);
-  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  padding: 1px 7px;
   white-space: nowrap;
 }
 
@@ -5170,9 +5182,8 @@ mark.current {
     margin-top: 2px;
   }
 
-  /* RecentAlertsModal table (.alerts-table) — 5 cols (%, Axis, Cost,
-     Context, Alerted). 3-line dense rows: top = % + chip + cost;
-     middle = Context; bottom = Alerted-at. */
+  /* RecentAlertsModal table — optional Source/Account columns use semantic
+     cell classes so the mobile anatomy cannot drift with column count. */
   .alerts-table { width: 100%; }
   .alerts-table thead { display: none; }
   .alerts-table tbody,
@@ -5188,29 +5199,31 @@ mark.current {
     border-bottom: 1px solid var(--border-soft);
   }
   .alerts-table td { padding: 0; border: none; }
-  .alerts-table td:nth-child(1) {                /* % threshold */
+  .alerts-table .alert-cell-threshold {
     order: 1;
     flex: 0 0 auto;
     font-weight: 700;
   }
-  .alerts-table td:nth-child(2) {                /* Axis chip */
+  .alerts-table .alert-cell-axis,
+  .alerts-table .alert-cell-source,
+  .alerts-table .alert-cell-account {
     order: 2;
     flex: 0 0 auto;
   }
-  .alerts-table td:nth-child(3) {                /* Cost */
+  .alerts-table .alert-cell-cost {
     order: 3;
     flex: 1 1 auto;
     margin-left: auto;
     text-align: right;
     font-weight: 700;
   }
-  .alerts-table td:nth-child(4) {                /* Context — full row 2 */
+  .alerts-table .alert-cell-context {
     order: 4;
     flex: 1 1 100%;
     color: var(--text-dim); font-size: var(--fs-meta);
     margin-top: 2px;
   }
-  .alerts-table td:nth-child(5) {                /* Alerted-at */
+  .alerts-table .alert-cell-when {
     order: 5;
     flex: 1 1 100%;
     color: var(--text-faint); font-size: var(--fs-eyebrow);
@@ -7282,6 +7295,12 @@ mark.current {
   color: var(--text-dim);
   font-size: var(--fs-meta);
   line-height: 1.45;
+}
+.all-stale-disclosure {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 .provider-summary-kpis {
   display: grid;
@@ -9496,6 +9515,79 @@ mark.current {
 .conv-state-title { font-family: var(--font-prose); font-size: 17px; color: var(--text); }
 .conv-state-hint { margin-top: 6px; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); }
 .conv-reader--error .conv-state-title { color: var(--accent-red); }
+/* ---- In-scroller paging states (#463 S1 / #448) --------------------
+   The whole-reader shells above only cover `loading && !detail`. Once detail
+   resolves the scroller mounts, so a page request in flight (a reverse page or a
+   jump drain) needs its own indicator. These are SIBLINGS of the scroller,
+   absolutely positioned over it, so mounting one never perturbs Virtuoso's own
+   sizing or scroll position.
+
+   A `.conv-body-state` centred spinner for `detail && nodes.length === 0` used to
+   live here and was removed with its markup: a per-animation-frame probe counted
+   zero appearances across about fifteen cold opens, because the first detail
+   response always beats React's first empty-node commit. */
+.conv-paging-indicator {
+  position: absolute;
+  left: 50%; transform: translateX(-50%);
+  /* Above the "↓ N new" pill (bottom: 18px) so the two never overlap. */
+  bottom: 60px;
+  z-index: 3;
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  /* `--border-soft` and `--panel-bg-2`, matching the sibling floating control
+     `.conv-jump-top`. An earlier draft named `--border` and `--panel`, neither
+     of which this project defines: both declarations were then invalid at
+     computed-value time, so the shorthand reverted the border to `none` and the
+     background to transparent, and the pill rendered as bare text floating over
+     the transcript. Measured in a real browser before the fix:
+     `border-style: none`, `border-width: 0px`, `background: rgba(0,0,0,0)`.
+     Four other rules in this file still name `--border` and are broken the
+     same way; issue #481 tracks them and proposes a build-time check for
+     undefined custom properties, which no JSDOM test can catch. */
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--panel-bg-2);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim);
+  pointer-events: none;
+}
+.conv-paging-glyph { line-height: 0; }
+.conv-paging-glyph .conv-ico {
+  width: 12px; height: 12px; vertical-align: 0;
+  animation: conv-spin 0.8s linear infinite; transform-origin: 50% 50%;
+}
+/* #463 S1 — the give-up state occupies the same slot as the paging indicator and
+   is rarely shown at the same time (they can stack for a frame; see the comment
+   beside the clearing effect in ConversationReader.tsx), so it inherits the
+   indicator's geometry and only restates colour. The border uses the project's warning token
+   `--accent-amber`; an earlier draft named a `--warn-border` variable that is
+   defined nowhere, so the fallback always won and the failure pill's border was
+   byte-identical to the loading indicator's.
+
+   Pointer events stay OFF on the pill and are re-enabled only on the dismiss
+   button. The pill is a SIBLING of <Virtuoso>, not a descendant, so making the
+   whole pill interactive stops a wheel gesture over its area from reaching
+   `.conv-reader-body`. */
+.conv-paging-indicator--failed {
+  color: var(--text);
+  border-color: var(--accent-amber);
+}
+.conv-paging-dismiss {
+  border: 0; background: none; cursor: pointer;
+  padding: 0 2px; margin-left: 2px;
+  font-family: var(--font-mono); font-size: 13px; line-height: 1;
+  color: var(--text-dim);
+  pointer-events: auto;
+}
+.conv-paging-dismiss:hover { color: var(--text); }
+.conv-paging-dismiss:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-xs);
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-paging-glyph .conv-ico { animation: none; }
+}
 .conv-reader-head {
   flex: 0 0 auto;
   padding: var(--space-3) var(--space-4);
@@ -10057,6 +10149,11 @@ mark.current {
   margin-top: var(--space-2);
   min-width: 0;   /* #228 S3 C1 — flex column must floor at 0 so inner code can't widen it */
 }
+/* #463 S2 §3.2 — one container per source text block. It is a flex child of
+   `.conv-blocks`, so it needs the same explicit floor as `.conv-chip` above:
+   without it a wide code fence inside the prose sets the child's min-content
+   width and widens the whole column (the documented #228 S3 C1 chain). */
+.conv-block { min-width: 0; }
 .conv-chip {
   border: 1px solid var(--border-soft);
   border-radius: 6px;
@@ -10139,9 +10236,24 @@ mark.current {
   letter-spacing: 0.3px;
   text-transform: uppercase;
 }
+/* #463 S2 §2.8 / F19 — the heading WRAPS instead of clipping.
+   Before this, three rules combined into a clip with no ellipsis: the element
+   set `overflow: hidden` without `text-overflow`, and the rule that did set
+   `ellipsis` targeted an inner paragraph a preceding rule made `display: inline`,
+   where overflow does not apply to a non-replaced inline box. So a 731-character
+   summary rendered as roughly its first thirty characters with nothing to open.
+   That `white-space: nowrap; overflow: hidden; text-overflow: ellipsis` rule on
+   `.md p` is DELETED rather than left in place: it never had any effect, and
+   keeping it implies a behavior that does not exist.
+
+   `overflow-wrap: break-word`, deliberately NOT `anywhere`: `anywhere`
+   participates in intrinsic min-content sizing and is the identified cause of
+   the mobile meta-label shatter that #463 S5 owns. Headings are ordinary prose
+   of at most 92 characters and the undecomposed fallback reaches 731, both of
+   which `break-word` handles. */
 .conv-codex-reasoning-title {
   min-width: 0;
-  overflow: hidden;
+  overflow-wrap: break-word;
   color: var(--text-dim);
 }
 .conv-codex-reasoning-title .md,
@@ -10149,10 +10261,43 @@ mark.current {
   display: inline;
   margin: 0;
 }
-.conv-codex-reasoning-title .md p {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* §2.6 — the decomposed heading list. Each authored heading is its own line, so
+   the container stacks them and the summary row aligns to the top rather than
+   centering a multi-line block against the single-line label. */
+.conv-codex-reasoning-headings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* §2.8 — keep two headings separable once either of them WRAPS. At 390px the
+   heading column is about 210px wide (it starts after the REASONING label's
+   indent), so a 92-character heading takes four lines; with the previous 2px gap
+   and no other separator, consecutive headings read as one paragraph. At 1440px
+   each heading fits on one line, so the boundary was implicit there and the
+   defect did not appear.
+   Two separators, both viewport-independent: a wider gap, and a hanging indent
+   so a heading's FIRST line starts at the column edge while its continuation
+   lines are inset. The heading spans are flex items and therefore blockified,
+   which is what makes `text-indent` apply to them. Scoped with `>` so the
+   single-headline `.conv-codex-reasoning-title` (the undecomposed fallback) is
+   untouched. */
+.conv-codex-reasoning-headings > .conv-codex-reasoning-title {
+  padding-inline-start: 12px;
+  text-indent: -12px;
+}
+.conv-codex-reasoning--line:has(.conv-codex-reasoning-headings),
+.conv-codex-reasoning > summary:has(.conv-codex-reasoning-headings) {
+  align-items: flex-start;
+}
+/* §2.7 — the heading the h/H spine currently sits on. Applied imperatively by
+   the reader, like the jump pipeline's own `.conv-details--jumpopen`, because
+   threading a "current" prop through the whole block walk would re-render every
+   block on every step. */
+.conv-heading--current {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .conv-codex-reasoning-content {
   display: grid;
@@ -11819,6 +11964,11 @@ mark.current {
   /* §4F transcript body controls */
   #root .conv-jump-top { width: 44px; height: 44px; }   /* round FAB; 34→44 */
   #root .conv-new-pill { min-height: 44px; }
+  /* #463 S1 — the rule above grows the pill from 24px to 44px, so it occupies
+     18px..62px from the reader's bottom while the indicator's desktop offset is
+     60px: a 2px overlap, and the pill's z-index 5 paints over the indicator's 3.
+     Raise the indicator here so the gap at 390px matches the desktop one. */
+  #root .conv-paging-indicator { bottom: 70px; }
   #root .conv-hidden-run { min-height: 44px; }
   #root .conv-loadfull-btn { min-height: 44px; }
   #root .conv-native-raw-btn,
@@ -12700,4 +12850,12 @@ mark.current {
    only on the dashboard branch), so the conversations view is unaffected. */
 @media (max-width: 360px) {
   .hero-zone { padding-block: var(--space-1); }
+}
+
+/* #459 — the full `+N sessions still loading` line is two lines at 390px and
+   four at 320px. Below the measured failure band, show the 50px compact form;
+   the full explanation remains the hero zone's title and accessible name. */
+@media (max-width: 480px) {
+  .hero-ingest-backlog-label-full { display: none; }
+  .hero-ingest-backlog-label-compact { display: inline; }
 }

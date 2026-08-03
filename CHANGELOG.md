@@ -5,6 +5,41 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.91.0] - 2026-08-03
+
+### Added
+- The Codex conversation reader now shows an indicator inside the transcript while a further page is loading, so a scroll-up or a jump that has to fetch is visibly in progress rather than silently pending. When a jump cannot reach its target the reader now says so instead of falling silent (#463).
+- Internal (maintainer-only): the whole frontend test estate now runs inside `bin/cctally-test-all` through a new `bin/cctally-frontend-test` harness, with a two-sided golden pinning the Codex reader path on both the server envelope and the adapted client model. Every CI lane that runs the bundle now provisions it (#463).
+- Internal (maintainer-only): the React client now runs ESLint's hook-order rule in both its normal build and the authoritative test bundle, so a conditional hook fails statically instead of surviving until a mounted component changes branches at runtime (#468).
+- Codex reasoning now lists every heading the model actually wrote, one readable line each, instead of a single clipped line that hid the rest. Press `h` and `H` to step forward and back through them, including into a part of the conversation that has not loaded yet. Codex re-states earlier headings as a turn goes on, so a heading a turn has already shown is listed once rather than again each time (#463).
+- Internal (maintainer-only): `bin/cctally-frontend-test` now typechecks the React client, so a TypeScript error fails the authoritative local and remote suite instead of only the CI build (#463).
+
+### Changed
+- A long Codex conversation now opens without downloading the whole thing: the server serves a bounded page and the reader loads the rest as you scroll. The heaviest conversation in a real store went from 13.2 MB in a single response to 2.5 MB (#463).
+- A very long Codex turn is now split into several bounded reading units instead of one enormous message, so the reader can scroll it smoothly. Deep links, bookmarks and saved reading positions issued before this change still resolve (#463).
+- A Codex message that is not the one its turn's cost is attributed to now reports no cost at all rather than a zero, so a consumer of the JSON can tell "this message carries no cost of its own" apart from "this cost nothing". No displayed figure changes: every rendering site already showed a cost only when there was a positive one (#463).
+- Consecutive Codex messages now read as the separate messages they were, instead of being run together into one block of prose (#463).
+- The dashboard's Codex Cache Report wire now publishes only `cached_input_percent`, reports structurally inapplicable wasted-cost and efficiency values as `null`, and identifies the coordinated contract change as source schema version 4 (#465).
+
+### Fixed
+- Internal (maintainer-only): generated cache fixtures now store UTC timestamps in the same `+00:00` form as production, so rows exactly at a reader's upper boundary are exercised instead of being silently excluded by lexical ordering (#467).
+- Internal (maintainer-only): the remote-test harness's synthetic lock holders now acknowledge that their lock path is gone before a fixture continues, and wrapper cleanup no longer strands an owned lock when its secondary process-start probe is transiently unavailable under load (#464).
+- The Codex hero's transient ingest-backlog note now stays to one compact line on phone-width screens instead of wrapping into two to four lines. The full `+N sessions still loading` wording remains on wider screens, and the complete explanation remains available to assistive technology at every width (#459).
+- Multi-account Codex quota labels now stay attached to the account they came from when two accounts share one `$CODEX_HOME` root. The dashboard no longer borrows another account's label or window duration from an otherwise-identical active quota key, while single-account dashboards keep their existing undecorated join (#437).
+- The dashboard's All tab now keeps its combined spend and token total when one provider's quota evidence is stale. The retained actuals carry a visible `Stale quota` marker in both the hero and current-usage modal, while forward-looking projections remain paused (#359).
+- Multi-account Codex dashboard cards now mark stale quota evidence on the account it belongs to. A fresh sibling no longer hides another account's staleness, and the stale card keeps showing its retained percentage, reset, and spend; after reset its quota fields still clear while historical spend remains (#416, #360).
+- The dashboard's Recent Alerts card and modal now identify which account each alert belongs to and honor the selected account filter, while retaining vendor-wide crossings as `All accounts`. Simultaneous same-threshold alerts from different accounts no longer collapse into one toast, and single-account dashboards keep their previous undecorated shape (#345).
+- The dashboard now marks incomplete Codex totals everywhere they are shown: the Combined spend hero carries the same visible `+N sessions still loading` caveat as the Codex hero, and the Codex current-cycle modal explains that its totals will rise as bounded ingest finishes. The disclosure also reaches the Codex section embedded in the All-sources modal, while account-scoped stale-cycle notes keep their existing scope (#456).
+- A deep link, bookmark or saved reading position pointing into a long Codex turn now loads the message it names. Because the reader's outline omits some turns from its navigation list, any position inside one of those turns resolved to nothing at all and the reader stayed on the last page it had, showing no error. On the heaviest conversation in a real store this affected every position inside a split turn. The same omission applies to Claude conversations for a position inside a system or lifecycle turn, and those now load as well (#463).
+- Find in a Codex conversation now reports and reaches every match. Matches inside a long turn, past its first reading unit, were dropped from the result list — on the heaviest conversation in a real store one query reported 2 matches where there are 16 — and none of the dropped ones could be navigated to (#463).
+- Paging up through a Codex conversation now returns the page immediately before your cursor. It previously returned the conversation's opening messages instead, which made scrolling up appear to jump to the beginning (#463).
+- `cctally transcript export` and the dashboard export no longer repeat each Codex reasoning heading, so an exported Codex transcript reads once through rather than twice (#463).
+- The transcript paging indicator no longer sits under the "↓ N new" pill on a narrow screen (#463).
+- A long Codex reasoning heading is now readable in full: it wraps instead of being cut off mid-sentence with no way to see the rest (#463).
+- A Codex message that opened a code block and never closed it no longer swallows the messages that follow it into that code block (#463).
+- Internal (maintainer-only): the issue-triage tracker now keeps its reconciler ledger in a collapsed disclosure, matching the managed issue comments instead of rendering raw machine-state JSON below the human execution plan (#475).
+- Concurrent first-time commands no longer misclassify a freshly initialized `stats.db` as a database written by a newer cctally. A waiting opener now rechecks the index epoch after acquiring the initialization lock, so it accepts the winner's completed index instead of sending epoch `1006` through the frozen legacy migration dispatcher.
+
 ## [1.90.1] - 2026-08-02
 
 ### Fixed

@@ -329,16 +329,13 @@ def test_all_composition_keeps_fresh_provider_sections_when_codex_hero_is_unavai
 
 
 _STALE_CYCLE_REASON = (
-    "Codex quota evidence is stale, so combined totals are withheld."
+    "Codex quota evidence is stale; combined totals use retained actuals."
 )
 
 
-def test_all_withholds_combined_totals_when_a_provider_cycle_is_stale():
-    """#350 spec §3.5. The combined NUMBER is unchanged from today (still
-    withheld), because §3.4 keeps both providers coherent and `compose_all_state`
-    would otherwise mark a sum over stale evidence `fresh` — and the All hero has
-    no Snapshot row or staleness marker at all, which would be a silent
-    disclosure bug."""
+def test_all_retains_combined_actuals_when_a_provider_cycle_is_stale():
+    """#359: backward-looking actuals remain compatible, but the composed
+    number must carry an All-local stale disclosure."""
     claude = _provider_state("claude", cost_usd=2.5, total_tokens=30)
     codex = _provider_state(
         "codex",
@@ -350,13 +347,13 @@ def test_all_withholds_combined_totals_when_a_provider_cycle_is_stale():
 
     combined = source_kernel.compose_all_state(claude, codex)
 
-    assert combined.data["combined"] is None
+    assert combined.data["combined"] == {"cost_usd": 6.25, "total_tokens": 100}
     assert combined.availability == "partial"
     assert combined.freshness == "fresh"
     # The All status must state the REAL reason instead of falling through to a
     # generic `degraded` while both provider envelopes claim health.
     assert [(w.code, w.domain, w.message) for w in combined.warnings] == [
-        ("combined_totals_withheld", "hero", _STALE_CYCLE_REASON),
+        ("combined_totals_stale", "hero", _STALE_CYCLE_REASON),
     ]
     # The Codex envelope itself is NOT degraded by All composition.
     assert (codex.availability, codex.freshness, codex.warnings) == ("ok", "fresh", ())
@@ -385,10 +382,10 @@ def test_all_stale_cycle_reason_is_emitted_once_and_names_every_provider():
 
     combined = source_kernel.compose_all_state(claude, codex)
 
-    assert combined.data["combined"] is None
-    assert [w.code for w in combined.warnings] == ["combined_totals_withheld"]
+    assert combined.data["combined"] == {"cost_usd": 6.25, "total_tokens": 100}
+    assert [w.code for w in combined.warnings] == ["combined_totals_stale"]
     assert combined.warnings[0].message == (
-        "Claude and Codex quota evidence is stale, so combined totals are withheld."
+        "Claude and Codex quota evidence is stale; combined totals use retained actuals."
     )
 
 

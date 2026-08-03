@@ -6,6 +6,7 @@ import {
   adaptQualifiedOutline,
   adaptQualifiedPrompts,
   adaptQualifiedSearch,
+  buildQualifiedOutlinePositions,
 } from './conversationAdapters';
 
 const ref = { source: 'codex' as const, key: 'v1.root-a' };
@@ -358,7 +359,8 @@ describe('qualified Codex conversation adapters', () => {
       }],
     });
     expect(detail.items[3].blocks).toEqual([
-      { kind: 'text', text: 'Synthetic closeout prose remains visible.' },
+      // #463 S2 §3.2 — the adapter now retains the server's per-row anchor.
+      { kind: 'text', text: 'Synthetic closeout prose remains visible.', block_key: 'cbk.markers' },
       {
         kind: 'system_actions',
         actions: [
@@ -481,5 +483,286 @@ describe('qualified Codex conversation adapters', () => {
       tokens: { source: 'claude', cache_creation: 3, cache_read: 4 },
       duration_seconds: 5,
     });
+  });
+
+  // #463 S1 — segmentation additions to the wire, consumed by the client.
+  const block = (text: string) => ({
+    kind: 'assistant', text, detail: null, call_id: null,
+    timestamp_utc: '2026-07-14T12:03:10Z',
+  });
+  const page = { total: 2, returned: 2, before: null, after: null, has_before: false, has_after: false };
+
+  it('threads the server member_item_keys instead of a singleton', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key,
+      items: [{
+        item_key: 'civ1.turn', kind: 'assistant', timestamp_utc: '2026-07-14T12:03:10Z',
+        model: 'gpt-5.6-codex', blocks: [block('Answer')],
+        member_item_keys: ['civ1.folded-a', 'civ1.folded-b'],
+        turn_item_key: 'civ1.turn', segment_ordinal: 0,
+        cost_usd: 0.42, tokens: null,
+      }],
+      page: { ...page, total: 1, returned: 1 },
+      children: [], parent: null, total_cost_usd: 0.42, unattributed_cost_usd: 0,
+    });
+    expect(detail.items[0].member_uuids).toEqual(['civ1.turn', 'civ1.folded-a', 'civ1.folded-b']);
+  });
+
+  it('keeps a null segment cost distinct from a zero cost', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key,
+      items: [
+        {
+          item_key: 'civ1.turn', kind: 'assistant', timestamp_utc: '2026-07-14T12:03:10Z',
+          model: 'gpt-5.6-codex', blocks: [block('Carrier')],
+          turn_item_key: 'civ1.turn', segment_ordinal: 0, cost_usd: 0.42, tokens: null,
+        },
+        {
+          item_key: 'civ1.seg1', kind: 'assistant', timestamp_utc: '2026-07-14T12:04:10Z',
+          model: 'gpt-5.6-codex', blocks: [block('Follower')],
+          turn_item_key: 'civ1.turn', segment_ordinal: 1, cost_usd: null, tokens: null,
+        },
+      ],
+      page, children: [], parent: null, total_cost_usd: 0.42, unattributed_cost_usd: 0,
+    });
+    const [carrier, follower] = detail.items;
+    expect(carrier.kind).toBe('assistant');
+    expect(follower.kind).toBe('assistant');
+    if (carrier.kind !== 'assistant' || follower.kind !== 'assistant') return;
+    expect(carrier.cost_usd).toBe(0.42);
+    // NOT 0: a non-carrier segment has no cost of its own, and a zero is
+    // indistinguishable from a genuinely free turn.
+    expect(follower.cost_usd).toBeNull();
+  });
+
+  it('threads turn membership and the segment ordinal onto the neutral item', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key,
+      items: [
+        {
+          item_key: 'civ1.turn', kind: 'assistant', timestamp_utc: '2026-07-14T12:03:10Z',
+          model: null, blocks: [block('One')],
+          turn_item_key: 'civ1.turn', segment_ordinal: 0, cost_usd: 0.1, tokens: null,
+        },
+        {
+          item_key: 'civ1.seg1', kind: 'assistant', timestamp_utc: '2026-07-14T12:04:10Z',
+          model: null, blocks: [block('Two')],
+          turn_item_key: 'civ1.turn', segment_ordinal: 1, cost_usd: null, tokens: null,
+        },
+      ],
+      page, children: [], parent: null, total_cost_usd: 0.1, unattributed_cost_usd: 0,
+    });
+    expect(detail.items.map((item) => item.turn_uuid)).toEqual(['civ1.turn', 'civ1.turn']);
+    expect(detail.items.map((item) => item.segment_ordinal)).toEqual([0, 1]);
+  });
+
+  it('carries the outline segment keys on a channel distinct from member_uuids', () => {
+    const outline = adaptQualifiedOutline(ref, {
+      status: 'ok', conversation_key: ref.key,
+      turns: [{
+        item_key: 'civ1.turn', label: 'Reply',
+        timestamp_utc: '2026-07-14T12:03:10Z', kinds: { assistant: 1 },
+        member_item_keys: ['civ1.folded'],
+        segment_item_keys: ['civ1.turn', 'civ1.seg1', 'civ1.seg2'],
+      }],
+      files: [], children: [],
+    });
+    expect(outline.turns[0].member_uuids).toEqual(['civ1.turn', 'civ1.folded']);
+    // Placing segment keys in member_uuids would make loadToTarget's
+    // "already loaded" test report true for an unfetched segment, so the drain
+    // would never run and the jump would land nowhere.
+    expect(outline.turns[0].segment_uuids).toEqual(['civ1.turn', 'civ1.seg1', 'civ1.seg2']);
+    expect(outline.turns[0].member_uuids).not.toContain('civ1.seg1');
+  });
+
+  // #463 S1 P0 — `turns` is the NAVIGATION subset: the filter above drops every
+  // event-bearing non-compaction turn, which on real Codex data is every heavy
+  // assistant response and therefore every multi-segment turn. `loadToTarget`
+  // needs a total document order to choose a paging direction, so the adapter
+  // publishes one over the FULL wire list, dropped turns included.
+  it('indexes document position over every wire turn, including ones the navigation filter drops', () => {
+    const outline = adaptQualifiedOutline(ref, {
+      status: 'ok', conversation_key: ref.key,
+      turns: [
+        {
+          item_key: 'civ1.prompt', label: 'Ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['civ1.prompt'],
+        },
+        {
+          // Dropped from `turns`: it carries event rows and is not a compaction.
+          item_key: 'civ1.reply', label: 'Long reply', timestamp_utc: null,
+          kinds: { event: 22, assistant: 15, tool_call: 142 },
+          member_item_keys: ['civ1.folded'],
+          segment_item_keys: ['civ1.reply', 'civ1.reply.s1', 'civ1.reply.s2'],
+        },
+        {
+          item_key: 'civ1.after', label: 'Next ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['civ1.after'],
+        },
+      ],
+      files: [], children: [],
+    } as Parameters<typeof adaptQualifiedOutline>[1], {}, new Set(['civ1.prompt', 'civ1.after']));
+
+    // The navigation subset genuinely excludes the reply turn ...
+    expect(outline.turns.map((turn) => turn.uuid)).toEqual(['civ1.prompt', 'civ1.after']);
+    // ... but its segments still have a position, in document order.
+    expect(outline.positionByKey?.get('civ1.prompt')).toBe(0);
+    expect(outline.positionByKey?.get('civ1.reply')).toBe(1);
+    expect(outline.positionByKey?.get('civ1.reply.s1')).toBe(2);
+    expect(outline.positionByKey?.get('civ1.reply.s2')).toBe(3);
+    expect(outline.positionByKey?.get('civ1.after')).toBe(4);
+    // A folded member key resolves to the head segment of its owning turn.
+    expect(outline.positionByKey?.get('civ1.folded')).toBe(1);
+  });
+
+  // #463 S1 — the OTHER shape, and the reason it is a unit test rather than a
+  // fixture assertion. A sweep of all 730 conversations in a real store on
+  // 2026-08-02 found 589 multi-segment turns in the Codex corpus and no
+  // multi-segment turn at all in the Claude corpus; every one of the 589 carries
+  // `event > 0`, none is a `context_compacted` turn and none carries `meta > 0`,
+  // so the navigation filter drops all of them. A multi-segment turn that
+  // SURVIVES the filter therefore exists only in fixtures and in this test, and
+  // it is the sub-path where a kept turn contributes several positions.
+  it('gives a KEPT multi-segment turn one position per segment', () => {
+    const outline = adaptQualifiedOutline(ref, {
+      status: 'ok', conversation_key: ref.key,
+      turns: [
+        {
+          item_key: 'civ1.ask', label: 'Ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['civ1.ask'],
+        },
+        {
+          // No event rows and no meta rows, so the navigation filter keeps this
+          // turn while it still holds three segments.
+          item_key: 'civ1.reply', label: 'Long reply', timestamp_utc: null,
+          kinds: { assistant: 9 },
+          member_item_keys: ['civ1.folded'],
+          segment_item_keys: ['civ1.reply', 'civ1.reply.s1', 'civ1.reply.s2'],
+        },
+        {
+          item_key: 'civ1.after', label: 'Next ask', timestamp_utc: null, kinds: { user: 1 },
+          segment_item_keys: ['civ1.after'],
+        },
+      ],
+      files: [], children: [],
+    } as Parameters<typeof adaptQualifiedOutline>[1], {}, new Set(['civ1.ask', 'civ1.after']));
+
+    // The turn is genuinely present in the navigation subset ...
+    expect(outline.turns.map((turn) => turn.uuid)).toEqual(['civ1.ask', 'civ1.reply', 'civ1.after']);
+    // ... and its followers still advance the document position, so the turn
+    // after it is not mis-numbered.
+    expect(outline.positionByKey?.get('civ1.reply')).toBe(1);
+    expect(outline.positionByKey?.get('civ1.reply.s1')).toBe(2);
+    expect(outline.positionByKey?.get('civ1.reply.s2')).toBe(3);
+    expect(outline.positionByKey?.get('civ1.after')).toBe(4);
+    expect(outline.positionByKey?.get('civ1.folded')).toBe(1);
+  });
+
+  // #463 S1 — `resolveTurnIndex` checks the own-key map before the member map so
+  // that a turn listing another turn's key as a member cannot shadow the real
+  // owner, and `outlineNavigation.test.ts` pins that. The position index must not
+  // disagree with the skeleton index it replaces.
+  it('lets a turn own its key even when an earlier turn claimed it as a member', () => {
+    const positions = buildQualifiedOutlinePositions([
+      { item_key: 'civ1.first', member_item_keys: ['civ1.second'] },
+      { item_key: 'civ1.second' },
+    ]);
+    expect(positions.get('civ1.first')).toBe(0);
+    expect(positions.get('civ1.second')).toBe(1);
+  });
+});
+
+// ── #463 S2 — block identity survives adaptation ────────────────────────────
+
+describe('#463 S2 adapters', () => {
+  it('adapts headings onto the neutral reasoning block', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      items: [{
+        item_key: 'civ1.r', kind: 'assistant', timestamp_utc: '2026-07-22T06:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null,
+        blocks: [{
+          kind: 'reasoning', text: 'x', block_key: 'bk',
+          detail: { reasoning: {
+            schema_version: 1, source: 'response_item', summary: '**A**\n**B**',
+            headings: [{ key: 'bk#0', text: 'A' }, { key: 'bk#1', text: 'B' }],
+          } },
+        }],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.items[0].blocks[0]).toMatchObject({
+      kind: 'codex_reasoning',
+      headings: [{ key: 'bk#0', text: 'A' }, { key: 'bk#1', text: 'B' }],
+    });
+  });
+
+  it('drops a malformed headings array rather than passing it through', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      items: [{
+        item_key: 'civ1.r', kind: 'assistant', timestamp_utc: '2026-07-22T06:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null,
+        blocks: [{
+          kind: 'reasoning', text: 'x', block_key: 'bk',
+          detail: { reasoning: {
+            schema_version: 1, source: 'response_item', summary: 'S',
+            headings: [{ key: 'bk#0' }, 'nope'],
+          } },
+        }],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.items[0].blocks[0]).not.toHaveProperty('headings');
+    expect(detail.items[0].blocks[0]).toMatchObject({ summary: 'S' });
+  });
+
+  it('retains the block key on an adapted text block', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      items: [{
+        item_key: 'civ1.a', kind: 'assistant', timestamp_utc: '2026-07-22T06:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null,
+        blocks: [
+          { kind: 'assistant', text: 'hi', block_key: 'bk0', detail: null },
+          { kind: 'assistant', text: 'there', block_key: 'bk1', detail: null },
+        ],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.items[0].blocks).toEqual([
+      { kind: 'text', text: 'hi', block_key: 'bk0' },
+      { kind: 'text', text: 'there', block_key: 'bk1' },
+    ]);
+    // §3.1 — the JOINED item.text stays as it is. Its consumers depend on the
+    // joined form: the human turn renders it directly, both CopyButtons copy
+    // it, `isSystemMarker(item.text)` folds on it, and `applyFocusMode` tests
+    // it for non-emptiness.
+    expect(detail.items[0].text).toBe('hi\n\nthere');
+  });
+
+  it('never places a heading key in member_uuids', () => {
+    // §1.3 — `loadToTarget` reads member_uuids as "already loaded" and would
+    // no-op on content that has not been fetched.
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      items: [{
+        item_key: 'civ1.r', kind: 'assistant', timestamp_utc: '2026-07-22T06:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null, member_item_keys: [],
+        blocks: [{
+          kind: 'reasoning', text: 'x', block_key: 'bk',
+          detail: { reasoning: {
+            schema_version: 1, source: 'response_item', summary: '**A**',
+            headings: [{ key: 'bk#0', text: 'A' }],
+          } },
+        }],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.items[0].member_uuids.some((u) => u.includes('#'))).toBe(false);
   });
 });

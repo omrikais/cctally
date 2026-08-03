@@ -956,3 +956,60 @@ def test_codex_export_golden_and_no_staling_trigger_leak(tmp_path, monkeypatch):
     assert "cache_read" not in md and "cache_creation" not in md
     # Golden compare (pricing/key masked).
     assert _mask_export(md) == _EXPORT_GOLDEN.read_text(encoding="utf-8")
+
+
+# ── #463 S1 — Phase C hydration is a hard failure, and the route reports it ───
+
+
+def test_page_hydration_miss_raises_and_the_route_answers_500(tmp_path, monkeypatch):
+    """Phase C raises instead of degrading, and the raise reaches the client as a
+    500 rather than an unhandled traceback.
+
+    The narrow index pass and the wide hydrating read select from the SAME table
+    on the same conversation key, so a position present in one and absent from
+    the other means the two reads disagree. Degrading to the narrow row would
+    render an EMPTY block, because the narrow row carries no ``text`` — a silent
+    wrong answer. Raising converts that into a loud one, and this test pins both
+    the message (it must name the count and the first missing positions, so an
+    operator can act on it) and the transport.
+    """
+    import pytest
+
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch, claude_sids=())
+    key = keys["modern-full"]
+    q = ns["_load_sibling"]("_lib_codex_conversation_query")
+    real_load = q._load_rows_at_positions
+    dropped = {}
+
+    def _drop_one(conn, conversation_key, positions):
+        hydrated = real_load(conn, conversation_key, positions)
+        if hydrated:
+            victim = sorted(hydrated)[0]
+            dropped["position"] = victim
+            hydrated.pop(victim)
+        return hydrated
+
+    monkeypatch.setattr(q, "_load_rows_at_positions", _drop_one)
+    try:
+        conn = ns["open_conversations_db"]()
+        try:
+            with pytest.raises(RuntimeError) as excinfo:
+                q.get_codex_conversation(conn, key, effective_speed="standard")
+        finally:
+            conn.close()
+        message = str(excinfo.value)
+        # The count of misses, not just "something went wrong".
+        assert "missed 1 of " in message, message
+        # The first missing positions, so the miss is locatable.
+        assert "first missing positions:" in message, message
+        assert repr(dropped["position"][0]) in message, message
+
+        # The same failure over real HTTP: a 500, with a body, not a traceback.
+        port = srv.server_address[1]
+        status, body, ctype = _get(port, _entity_path(key))
+        assert status == 500, (status, body)
+        assert "application/json" in (ctype or ""), ctype
+        assert json.loads(body).get("error"), body
+    finally:
+        srv.shutdown()

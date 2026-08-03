@@ -4,10 +4,13 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useScopedSnapshot } from '../hooks/useScopedSnapshot';
 import { fmt } from '../lib/fmt';
 import {
+  alertAccount,
   alertDisplay,
+  filterAlertRowsForAccount,
   selectSourceAlertRows,
+  toastAlertId,
 } from '../lib/alertIdentity';
-import { VENDOR_WIDE_ACCOUNT, type SourceAlertRow } from '../types/envelope';
+import { VENDOR_WIDE_ACCOUNT, type AccountCard, type SourceAlertRow } from '../types/envelope';
 import { resolveSourceView } from '../store/sourceView';
 import { shortAccountLabel } from '../store/accountFocus';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
@@ -39,19 +42,7 @@ export function RecentAlertsPanel(): JSX.Element {
   const hasBundle = env?.sources != null;
   const view = resolveSourceView(env ?? null, activeSource);
 
-  // #416 Task 15 — alert rows now carry `account_key` and the panel reads the
-  // FOCUSED account's own rows through the scope chokepoint, so #341's
-  // "all accounts (unfiltered)" disclaimer is retired for Codex. Claude keeps
-  // it: it ships `accounts[]` but no `account_scopes`, so its chip really is
-  // unfiltered and dropping the badge there would be a false claim.
-  //
-  // Vendor-wide rows (`account_key === '*'`) arrive INSIDE the focused child by
-  // design: a vendor-wide budget crossing is not attributable to one account,
-  // so it stays visible and is LABELLED vendor-wide rather than hidden or
-  // silently credited to the focused account.
   const scope = useAccountScope();
-  const accountScoped = scope.accountKey != null;
-  const accountUnfiltered = scope.requestedKey != null && !scope.scopesSupported;
   const claudeLegacyRows: SourceAlertRow[] = legacyAlerts.map((a) => ({
     ...a,
     source: 'claude' as const,
@@ -68,6 +59,19 @@ export function RecentAlertsPanel(): JSX.Element {
       : activeSource === 'claude' && claudeLegacyRows.length > 0
         ? claudeLegacyRows
         : selectSourceAlertRows(view);
+  const rowsCarryAccounts = allRows.some((row) => alertAccount(row) != null);
+  const accountScoped = scope.accountKey != null
+    || (scope.requestedKey != null && rowsCarryAccounts);
+  const accountUnfiltered = scope.requestedKey != null
+    && !scope.scopesSupported
+    && !rowsCarryAccounts;
+  const focusedRows = filterAlertRowsForAccount(allRows, scope.requestedKey);
+  const sourceAccounts = activeSource === 'all'
+    ? []
+    : ((env?.sources?.[activeSource]?.data as { accounts?: AccountCard[] } | undefined)?.accounts ?? []);
+  const focusedCard = scope.card
+    ?? sourceAccounts.find((card) => card.accountKey === scope.requestedKey)
+    ?? null;
 
   // #248 §5 / #264 S1 / #265 A — the Claude empty state reads the current Used %
   // (header) + the configured weekly fire thresholds (default [90, 95]) and
@@ -106,8 +110,8 @@ export function RecentAlertsPanel(): JSX.Element {
   // Slice newest-first to last 10 for the panel; the modal renders the
   // full list (up to 100). Panel slice is a UI policy, not a data
   // truncation — the footer's `total` continues to reflect the full count.
-  const alerts = allRows.slice(0, 10);
-  const total = allRows.length;
+  const alerts = focusedRows.slice(0, 10);
+  const total = focusedRows.length;
 
   // Open-modal handler routes through panelRegistry.alerts.openAction
   // so the keyboard ('9' in T13) and click paths share one source of
@@ -142,9 +146,9 @@ export function RecentAlertsPanel(): JSX.Element {
             <span
               className="alerts-account-note"
               data-testid="alerts-account-note"
-              title={`Showing only ${scope.card?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
+              title={`Showing only ${focusedCard?.label ?? 'this account'}'s alerts, plus vendor-wide crossings.`}
             >
-              {shortAccountLabel(scope.card?.label ?? 'focused account')} only
+              {shortAccountLabel(focusedCard?.label ?? 'focused account')} only
             </span>
           )}
           {accountUnfiltered && (
@@ -195,8 +199,9 @@ export function RecentAlertsPanel(): JSX.Element {
           <ul className="alerts-list">
             {alerts.map((row) => {
               const d = alertDisplay(row);
+              const account = alertAccount(row);
               return (
-                <li key={`${d.source}:${(row as { key: string }).key}`} className="alert-row">
+                <li key={toastAlertId(row)} className="alert-row">
                   <span
                     className={`alert-threshold severity-${d.severity} ${d.severity}`}
                   >
@@ -210,14 +215,15 @@ export function RecentAlertsPanel(): JSX.Element {
                       {d.sourceLabel}
                     </span>
                   )}
-                  {accountScoped
-                    && (row as { account_key?: string }).account_key === VENDOR_WIDE_ACCOUNT && (
+                  {account != null && (
                     <span
-                      className="alert-vendor-wide"
-                      data-testid="alert-vendor-wide"
-                      title="A vendor-wide crossing — not attributable to one account."
+                      className="alert-account-chip"
+                      data-testid={account.key === VENDOR_WIDE_ACCOUNT ? 'alert-vendor-wide' : 'alert-account-chip'}
+                      title={account.key === VENDOR_WIDE_ACCOUNT
+                        ? 'A vendor-wide crossing — not attributable to one account.'
+                        : account.label}
                     >
-                      vendor-wide
+                      {account.label}
                     </span>
                   )}
                   <span className="alert-when">

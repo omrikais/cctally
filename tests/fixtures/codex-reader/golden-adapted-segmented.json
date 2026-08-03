@@ -1,0 +1,4344 @@
+{
+  "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "title": "Synthetic segmented prompt",
+  "project_label": "—",
+  "git_branch": null,
+  "started_utc": "2026-07-15T12:00:02Z",
+  "last_activity_utc": "2026-07-15T12:07:38Z",
+  "cost_usd": 0.0078000000000000005,
+  "models": [
+    "gpt-synthetic-codex"
+  ],
+  "items": [
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "id": 3955054124
+      },
+      "member_uuids": [
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+      ],
+      "ts": "2026-07-15T12:00:02Z",
+      "text": "Synthetic segmented prompt",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Synthetic segmented prompt",
+          "block_key": "cbk1_6fd6acaeca97be59cbe94fbdc6fa6a9761fb6e0b"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "id": 3920575189
+      },
+      "member_uuids": [
+        "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "civ1_717959a783d69296276efe45118e7e076b863654",
+        "civ1_b791442bcceaf808b034b85eb738a8eec6cbeaaf",
+        "civ1_004c5ce72825e8fa20e7a9df7b0df1a28a363b6b",
+        "civ1_84cbbf1f9246b109fab1b888b0907142f942c80d"
+      ],
+      "ts": "2026-07-15T12:00:04Z",
+      "text": "Synthetic segmented assistant opening",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Synthetic segmented assistant opening",
+          "block_key": "cbk1_def77b9b71f9ed7670170de5ce2aea17ad754544"
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "title": "Planning synthetic sweep 0",
+          "body": "Synthetic reasoning body 0",
+          "headings": [
+            {
+              "key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+              "text": "Planning synthetic sweep 0"
+            }
+          ]
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 0}",
+          "input": {
+            "step": 0
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":0}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 1}",
+          "input": {
+            "step": 1
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":1}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 2}",
+          "input": {
+            "step": 2
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":2}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 3}",
+          "input": {
+            "step": 3
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":3}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 4}",
+          "input": {
+            "step": 4
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":4}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 5}",
+          "input": {
+            "step": 5
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":5}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 6}",
+          "input": {
+            "step": 6
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":6}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 7}",
+          "input": {
+            "step": 7
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_fb0a485bf58794391b5e1f6e9116f54664843aec",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":7}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 8}",
+          "input": {
+            "step": 8
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":8}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 9}",
+          "input": {
+            "step": 9
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e0eefd23adb5226d2b8868fa8e18996b1d2561ce",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":9}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 10}",
+          "input": {
+            "step": 10
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":10}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 11}",
+          "input": {
+            "step": 11
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f335a8740d1142ec42d960880521be2f9614cc14",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":11}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 12}",
+          "input": {
+            "step": 12
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":12}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 13}",
+          "input": {
+            "step": 13
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":13}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 14}",
+          "input": {
+            "step": 14
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":14}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 15}",
+          "input": {
+            "step": 15
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":15}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 16}",
+          "input": {
+            "step": 16
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":16}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 17}",
+          "input": {
+            "step": 17
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_164fbd4071b1d7940671365b38147480a6ba47c0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":17}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 18}",
+          "input": {
+            "step": 18
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":18}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 19}",
+          "input": {
+            "step": 19
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e3aedf86278c94bcc915af437ee683b8d57d1438",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":19}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 20}",
+          "input": {
+            "step": 20
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":20}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 21}",
+          "input": {
+            "step": 21
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":21}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 22}",
+          "input": {
+            "step": 22
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_743bc02e8c6710f2b8d5ee4839f30e322e5d9711",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":22}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 23}",
+          "input": {
+            "step": 23
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5828d46684c5d6412acc7e3f30af2e8f7333e6da",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":23}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 24}",
+          "input": {
+            "step": 24
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":24}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 25}",
+          "input": {
+            "step": 25
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":25}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 26}",
+          "input": {
+            "step": 26
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_63f70b2dc603eb0d6b243220298bb3cfbff5b2cc",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":26}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 27}",
+          "input": {
+            "step": 27
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":27}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 28}",
+          "input": {
+            "step": 28
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b5ffdfd26c634e1a9777d4c1b1f71f64be8ebad2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":28}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 29}",
+          "input": {
+            "step": 29
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_68cae44e514148dca3824072d3b60557eda366a6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":29}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 30}",
+          "input": {
+            "step": 30
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d86da189d8427c7e457808cdc573aeb805a0bade",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":30}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 31}",
+          "input": {
+            "step": 31
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":31}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 32}",
+          "input": {
+            "step": 32
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d65bb7183d300c8d414060ee9c76daaf21e1ea95",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":32}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 33}",
+          "input": {
+            "step": 33
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c9026148ef3ce53783fe6fdac80416ba761af4f5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":33}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 34}",
+          "input": {
+            "step": 34
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8de32df5953787934489a50d1040093cc577ec52",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":34}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 35}",
+          "input": {
+            "step": 35
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8c9a8f8bdc859449141c96307a101fb23420adb9",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":35}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 36}",
+          "input": {
+            "step": 36
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_29d87e86008a0e690805551f0f22ca426dda170e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":36}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 37}",
+          "input": {
+            "step": 37
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_543722efc4a636fc606440a4d1068789166ddc95",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":37}",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": 0.0051625,
+      "tokens": {
+        "source": "codex",
+        "input": 1200,
+        "output": 400,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "cached_input": 300,
+        "reasoning_output": 100
+      }
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_6c9d1c06fc1169199a07169917277530c21cf151",
+        "id": 465253775
+      },
+      "member_uuids": [
+        "civ1_6c9d1c06fc1169199a07169917277530c21cf151"
+      ],
+      "ts": "2026-07-15T12:01:22Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 38}",
+          "input": {
+            "step": 38
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f7a499ee972abdad56b5faf3470a3098e7e0a5cc",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":38}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 39}",
+          "input": {
+            "step": 39
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_fe8baa612d1812f821ddbaf092de0926fef5da7d",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":39}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 40}",
+          "input": {
+            "step": 40
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_0fcb4f701cd635b680ef729075a51b29569966df",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":40}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 41}",
+          "input": {
+            "step": 41
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8bce9d8bdf94547beebde00251a1d2171bbd2f3e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":41}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 42}",
+          "input": {
+            "step": 42
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4338f5516f459f8fbfad336b2c5eb19809553594",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":42}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 43}",
+          "input": {
+            "step": 43
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_24f5d9248efb9d29912b1841bcf1dc745591a0e1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":43}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 44}",
+          "input": {
+            "step": 44
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_938e899988df9e89d517f909b7db84989b205da5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":44}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "apply_patch",
+          "input_summary": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 0\n+new 0\n*** End Patch",
+          "input": {
+            "raw": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 0\n+new 0\n*** End Patch"
+          },
+          "preview": "synthetic-fixture.txt",
+          "tool_use_id": "cbk1_c630533eb942923b62d19aa65148ac2d3d688478",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "apply_patch",
+            "status": "completed",
+            "files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified",
+                "unified_diff": "--- a/synthetic-fixture.txt\n+++ b/synthetic-fixture.txt\n@@ -1 +1 @@\n-old 0\n+new 0\n"
+              }
+            ],
+            "request_files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified"
+              }
+            ],
+            "patch": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 0\n+new 0\n*** End Patch",
+            "success": true,
+            "stdout": "Done!",
+            "stderr": "",
+            "has_diff": true,
+            "truncated": false,
+            "event_payload_key": "cbk1_0778212379c10f160c122650a18030b468e67626"
+          },
+          "result": null
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "title": "Planning synthetic sweep 1",
+          "body": "Synthetic reasoning body 1",
+          "headings": [
+            {
+              "key": "cbk1_76ea67a7cfdea21002568837490850723b4dbf8c#0",
+              "text": "Planning synthetic sweep 1"
+            }
+          ]
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 0}",
+          "input": {
+            "step": 0
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_03a0d666b8fb827ac4952f89752aec64cfdc8834",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":0}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 1}",
+          "input": {
+            "step": 1
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b4e4bce14b5fbdf3a9e551a0bedf1f869f96361e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":1}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 2}",
+          "input": {
+            "step": 2
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_73c9cb4e4fca1b3974b2c7b5bd8c7c292da96334",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":2}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 3}",
+          "input": {
+            "step": 3
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8cea6d13bb02ad4c057fe1626b8bba8b709938e0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":3}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 4}",
+          "input": {
+            "step": 4
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f904c328e5dee0f559721aafb4e9ab5fc7cd8a99",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":4}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 5}",
+          "input": {
+            "step": 5
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d46bc69a6deee977cb1993c7cab45d0557ff2c41",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":5}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 6}",
+          "input": {
+            "step": 6
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8c3fc198c67b999ecec998344b9baeea9d65e8cb",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":6}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 7}",
+          "input": {
+            "step": 7
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2007f2df842a9ee250feb02080b70fa54d946bdf",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":7}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 8}",
+          "input": {
+            "step": 8
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_6c670894aa513edce8c6789d59379ba9f13d3c05",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":8}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 9}",
+          "input": {
+            "step": 9
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_ef11237dad5f1f980d470de80b3fb503db852830",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":9}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 10}",
+          "input": {
+            "step": 10
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8905ef121e7189be9a56951e41e723b172f4562e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":10}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 11}",
+          "input": {
+            "step": 11
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_06a931c052daeb52cb7dd647163bbf01def01f67",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":11}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 12}",
+          "input": {
+            "step": 12
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4afa60ebc38135b771e78120624342c05c76ec1c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":12}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 13}",
+          "input": {
+            "step": 13
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_bcaff6afdaf581c28762af1cf8a902c61583b5d5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":13}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 14}",
+          "input": {
+            "step": 14
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_86aa14b41d0b240156837a17e669129d7d7f8727",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":14}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 15}",
+          "input": {
+            "step": 15
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e8b87dd80a7f8d547aceaf5fcba42822e958be00",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":15}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 16}",
+          "input": {
+            "step": 16
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_07bdf2c18363abbc8e28b294237c2d4fe43d7549",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":16}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 17}",
+          "input": {
+            "step": 17
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b23ad9fa85edead139a461cc75f3c16e04cbd89f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":17}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 18}",
+          "input": {
+            "step": 18
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4c9a5da81e2f743c9a065d7b5a9d42014ced0482",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":18}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 19}",
+          "input": {
+            "step": 19
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4eeb6216683a910bb00bb2460c7cdb6c3c90d08d",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":19}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 20}",
+          "input": {
+            "step": 20
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3dba1f47c1a983a68b623aedafe2b383333e66eb",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":20}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 21}",
+          "input": {
+            "step": 21
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f0d5c8b03dd2b0165f795e072205d8670ccf8e07",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":21}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 22}",
+          "input": {
+            "step": 22
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4ee0ebba4a47bb52bd391ed40b7351a54d09447c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":22}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 23}",
+          "input": {
+            "step": 23
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a6b5cb447da925b5a8f8216b08da903d446c0063",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":23}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 24}",
+          "input": {
+            "step": 24
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5e7327c86d6ebe55643074f20780906a2b6fbba5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":24}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 25}",
+          "input": {
+            "step": 25
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8e9d5b9fbfd60025cf55ca683dd0154c32f700fc",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":25}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 26}",
+          "input": {
+            "step": 26
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c07f5e3e113db34eaa8aafc494c70ed7bc141331",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":26}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 27}",
+          "input": {
+            "step": 27
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f775d4425a6fc9fc155cce3ef93b3dfea1674ae0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":27}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 28}",
+          "input": {
+            "step": 28
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_7ac5a6bae15f7f431040aa13850b9e5c68e1996f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":28}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 29}",
+          "input": {
+            "step": 29
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5a905cf6b665c1f523dc8d0df0f341a0b16d51e2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":29}",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+      "segment_ordinal": 1,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728",
+        "id": 2601962479
+      },
+      "member_uuids": [
+        "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728"
+      ],
+      "ts": "2026-07-15T12:02:39Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 30}",
+          "input": {
+            "step": 30
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_02aa113482476b262f2cd385304a5cd53cc46d1a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":30}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 31}",
+          "input": {
+            "step": 31
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_61d57e209cdb3d6acf964424190f1886b51746fd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":31}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 32}",
+          "input": {
+            "step": 32
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_74ba46796964f420d0cf6c0294d3a38254a0fb64",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":32}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 33}",
+          "input": {
+            "step": 33
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_122f2ba7e4c6cfd4e7d7ec64f7576fb1915aaadc",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":33}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 34}",
+          "input": {
+            "step": 34
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_14405e2e51c69c59c05f75c25475015873d3dd9e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":34}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 35}",
+          "input": {
+            "step": 35
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_96b25d6e7a60ae5bb776d5eecbc6ad7c8906a18d",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":35}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 36}",
+          "input": {
+            "step": 36
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_1a3947523491f15fa26f39a2d8ff60e793afccd6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":36}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 37}",
+          "input": {
+            "step": 37
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a3ade063bc16d853f65372e1f8011c54084fae9e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":37}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 38}",
+          "input": {
+            "step": 38
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5b6726baf261482d631975280a5003ef6c3ccf96",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":38}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 39}",
+          "input": {
+            "step": 39
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_33bae2990c3f480b8879b36ab7e343c8f5ea57d9",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":39}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 40}",
+          "input": {
+            "step": 40
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_65638d58bc28a99744249432bece75c6f4d2eef2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":40}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 41}",
+          "input": {
+            "step": 41
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f03159bed761cffb88fcf3eb0737ff0029251ff1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":41}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 42}",
+          "input": {
+            "step": 42
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c6fb499c0760959729182df0d8116c171ba7dd17",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":42}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 43}",
+          "input": {
+            "step": 43
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c4ac18eb9d009fa50e4250069f1b3bc02d2be921",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":43}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 44}",
+          "input": {
+            "step": 44
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a7cd80ca15354f4ccdf3ff91a78293e21486eadd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":44}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "apply_patch",
+          "input_summary": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 1\n+new 1\n*** End Patch",
+          "input": {
+            "raw": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 1\n+new 1\n*** End Patch"
+          },
+          "preview": "synthetic-fixture.txt",
+          "tool_use_id": "cbk1_490732bd7b071cbba208ed4f25ffb8551337ffde",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "apply_patch",
+            "status": "completed",
+            "files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified",
+                "unified_diff": "--- a/synthetic-fixture.txt\n+++ b/synthetic-fixture.txt\n@@ -1 +1 @@\n-old 1\n+new 1\n"
+              }
+            ],
+            "request_files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified"
+              }
+            ],
+            "patch": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 1\n+new 1\n*** End Patch",
+            "success": true,
+            "stdout": "Done!",
+            "stderr": "",
+            "has_diff": true,
+            "truncated": false,
+            "event_payload_key": "cbk1_db7dd2bb433560e44b43c947738b5a4d87b2fc9e"
+          },
+          "result": null
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "title": "Planning synthetic sweep 2",
+          "body": "Synthetic reasoning body 2",
+          "headings": [
+            {
+              "key": "cbk1_e7b38bbcaf120444ea32fa09a937749873dd28d9#0",
+              "text": "Planning synthetic sweep 2"
+            }
+          ]
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 0}",
+          "input": {
+            "step": 0
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_392a643dfd4a3166a477dda6aad1f85e4fdec19e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":0}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 1}",
+          "input": {
+            "step": 1
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_73b075b18f5525ad6c3a9f6d59c89536de11225f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":1}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 2}",
+          "input": {
+            "step": 2
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_207a344d192a6bf893d4d23d13ef8c57edb4b51c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":2}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 3}",
+          "input": {
+            "step": 3
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_668671a8382366dd1aef77cf850389b190c77070",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":3}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 4}",
+          "input": {
+            "step": 4
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_37cebb8b3cd5937d74be361555ba6f1915c52854",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":4}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 5}",
+          "input": {
+            "step": 5
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b19c736dea39e2a6dc55cdd463c020c26b80849a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":5}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 6}",
+          "input": {
+            "step": 6
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8425ac9ed5d208839af1a35c021f44d363c3a429",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":6}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 7}",
+          "input": {
+            "step": 7
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_72bd98570e973ffd56260cbdf53de1dcac94a9a9",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":7}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 8}",
+          "input": {
+            "step": 8
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_6cdaa7039bd078febd9e4c893005ec3cc0e55c91",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":8}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 9}",
+          "input": {
+            "step": 9
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c2ed9c1be59ba009fa162508b7f66746100019dd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":9}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 10}",
+          "input": {
+            "step": 10
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e5b348c78bf302e27175c43f53d2319ff64f572e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":10}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 11}",
+          "input": {
+            "step": 11
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_cbcba22cfdddb2c305bd79f02f8c06f1625985e4",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":11}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 12}",
+          "input": {
+            "step": 12
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2added5cf9eab961cef199835c7c9ee6e9f68356",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":12}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 13}",
+          "input": {
+            "step": 13
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d7d8d8284a1b13a061fc78b0a2004af0cfe371a0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":13}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 14}",
+          "input": {
+            "step": 14
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4eb066ab6e656c41990bee396099813769eb4ecd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":14}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 15}",
+          "input": {
+            "step": 15
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4072299a98f490df37e56e2c396ceba4c532edee",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":15}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 16}",
+          "input": {
+            "step": 16
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d91f8d37d90d0dbd3098bf89883d8344b5c67e52",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":16}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 17}",
+          "input": {
+            "step": 17
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_cd8257d643612eee6694b68095bab3a934b79c8f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":17}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 18}",
+          "input": {
+            "step": 18
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_87361021b39f4d0ccbd193c83586340286f95d77",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":18}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 19}",
+          "input": {
+            "step": 19
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5a4b4b446626b28636615bd202c51a20d3a39139",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":19}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 20}",
+          "input": {
+            "step": 20
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8638658d2c6e4e92446d68507c59faae48a71f6f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":20}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 21}",
+          "input": {
+            "step": 21
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b450c77bf902b32301b6a2a8a8b09a71e3f31c57",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":21}",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+      "segment_ordinal": 2,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_7597b54afea5b08945e28f91d29440889d9b1123",
+        "id": 1066586741
+      },
+      "member_uuids": [
+        "civ1_7597b54afea5b08945e28f91d29440889d9b1123"
+      ],
+      "ts": "2026-07-15T12:03:56Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 22}",
+          "input": {
+            "step": 22
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_7926c50ea95ae6a93fc75853ce9731776f4f6b1b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":22}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 23}",
+          "input": {
+            "step": 23
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_58a98ae4c51ab2cf0e4d12e88df6fe1afe86a83e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":23}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 24}",
+          "input": {
+            "step": 24
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a3084208274555c39e89d99e11fa35f07ff0e76a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":24}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 25}",
+          "input": {
+            "step": 25
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_6ccf37154e3eb4a106fa4142e1231407f9070f02",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":25}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 26}",
+          "input": {
+            "step": 26
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c57215a3426675c128e437856b479ee21884c060",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":26}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 27}",
+          "input": {
+            "step": 27
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d921996b40fcb81621c954d55b1bfcb752eb1d35",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":27}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 28}",
+          "input": {
+            "step": 28
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_10a70fca66e266708006113ceb7b355b03ccd5f0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":28}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 29}",
+          "input": {
+            "step": 29
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_1e43a20e72709dd5452d3e35f95900b744ef84b1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":29}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 30}",
+          "input": {
+            "step": 30
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_cbc615772488a2105b1498861343957e6e6b3b46",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":30}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 31}",
+          "input": {
+            "step": 31
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f807f4e7c9e22602c98c785bd6982801218cae91",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":31}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 32}",
+          "input": {
+            "step": 32
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_7ab415d84454d5aa1675cda195f5abbabaaca709",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":32}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 33}",
+          "input": {
+            "step": 33
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c340c78278a284bdf9c6283f1e78edebf9eab833",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":33}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 34}",
+          "input": {
+            "step": 34
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b89f0b1211cd84bac5bf021ba863b3fdfb83fed6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":34}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 35}",
+          "input": {
+            "step": 35
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_fd2812cdffc9fb05571a01ed82f73969c539e10c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":35}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 36}",
+          "input": {
+            "step": 36
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5bb96aa72be7de3421c2102dfe28c2f6102e15e5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":36}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 37}",
+          "input": {
+            "step": 37
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_9dfab4038d18b6b0b19d1e0e0bdf833f4ec2f494",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":37}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 38}",
+          "input": {
+            "step": 38
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4daded02a47350f135b971fb5964c4aff2fac902",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":38}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 39}",
+          "input": {
+            "step": 39
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_879b5435c2b02435390bc32fb271e7ff1f3b0cc2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":39}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 40}",
+          "input": {
+            "step": 40
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3c5aee0b911fc9e04462ce2660c03fa67cca60b0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":40}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 41}",
+          "input": {
+            "step": 41
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_55de197fc5529422e4f2edd2b2e526f6128eb710",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":41}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 42}",
+          "input": {
+            "step": 42
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8a92611bde7d2dfbe221a9db036ebbc2684b87ac",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":42}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 43}",
+          "input": {
+            "step": 43
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_12a82cb233db2ecaccc53747318bef91b187ab88",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":43}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 44}",
+          "input": {
+            "step": 44
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_0d8b0161db8a6350e0e8816bb932634364ddb26f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":44}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "apply_patch",
+          "input_summary": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 2\n+new 2\n*** End Patch",
+          "input": {
+            "raw": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 2\n+new 2\n*** End Patch"
+          },
+          "preview": "synthetic-fixture.txt",
+          "tool_use_id": "cbk1_be05943a8efc965d493257ed0ec0581827b2cf8f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "apply_patch",
+            "status": "completed",
+            "files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified",
+                "unified_diff": "--- a/synthetic-fixture.txt\n+++ b/synthetic-fixture.txt\n@@ -1 +1 @@\n-old 2\n+new 2\n"
+              }
+            ],
+            "request_files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified"
+              }
+            ],
+            "patch": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 2\n+new 2\n*** End Patch",
+            "success": true,
+            "stdout": "Done!",
+            "stderr": "",
+            "has_diff": true,
+            "truncated": false,
+            "event_payload_key": "cbk1_c6dfc7e328a837378c9d528b3e311be13e6d9d92"
+          },
+          "result": null
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "title": "Planning synthetic sweep 3",
+          "body": "Synthetic reasoning body 3",
+          "headings": [
+            {
+              "key": "cbk1_ed64160ddfbca871bc15505437553dc7ad58a6e1#0",
+              "text": "Planning synthetic sweep 3"
+            }
+          ]
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 0}",
+          "input": {
+            "step": 0
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2dad4da4e4bc058d1e4969dc7ef88c4f265bd62b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":0}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 1}",
+          "input": {
+            "step": 1
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_fad8d4c603567f874ec2877ca4e7952b9320b92e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":1}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 2}",
+          "input": {
+            "step": 2
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5b066fbdba16ebabcfac4425ecf93a0d4c6afb6b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":2}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 3}",
+          "input": {
+            "step": 3
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e19dd942a14820b6ff6175d89dbea22f6ccc8e9a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":3}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 4}",
+          "input": {
+            "step": 4
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e05f27103b9b7ee33b9422ce76013d71ea56505b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":4}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 5}",
+          "input": {
+            "step": 5
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_23400a2b14380c3c69e8318c65061a7a60a93de8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":5}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 6}",
+          "input": {
+            "step": 6
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d454bb152bed840231689533437cbd06d4def895",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":6}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 7}",
+          "input": {
+            "step": 7
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8140e19c487880c446193136da19258357fd6bad",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":7}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 8}",
+          "input": {
+            "step": 8
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2c21ba822a5fac95bec65821e8f6b6be1b03bf52",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":8}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 9}",
+          "input": {
+            "step": 9
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_7284499ffc2f21442857960736ed820866cd9e32",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":9}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 10}",
+          "input": {
+            "step": 10
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f304911c1b96b82e6f5c205679a83aba4b75cb32",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":10}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 11}",
+          "input": {
+            "step": 11
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_428e0c9f5588695136bff1b812447b997b5165d1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":11}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 12}",
+          "input": {
+            "step": 12
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_fa3fd199697935979ede0ceeb53614ad23c52e58",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":12}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 13}",
+          "input": {
+            "step": 13
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_162162f3d8615af7db6b5e2dbf6fa9b8eb86643b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":13}",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+      "segment_ordinal": 3,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2",
+        "id": 51187190
+      },
+      "member_uuids": [
+        "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2"
+      ],
+      "ts": "2026-07-15T12:05:13Z",
+      "text": "Synthetic segmented assistant closing",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 14}",
+          "input": {
+            "step": 14
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_30223456959aa0127e6aad03fadef6eaf1041f09",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":14}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 15}",
+          "input": {
+            "step": 15
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_dfd44c48382d99eff72f5f666b77dfab1ece3652",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":15}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 16}",
+          "input": {
+            "step": 16
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_48ab8a482ab2466fea522bff55d958be18c24318",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":16}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 17}",
+          "input": {
+            "step": 17
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f92bb2639c246eddab685269b17a14cd3d12bb8f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":17}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 18}",
+          "input": {
+            "step": 18
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e1e1dad7178b666a6179ed8705ab55d0109a0ed0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":18}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 19}",
+          "input": {
+            "step": 19
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3b903deedf509bb1b42777852a0841546034b08a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":19}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 20}",
+          "input": {
+            "step": 20
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4189f51508f29b760f5fda88c7273345a260aed0",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":20}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 21}",
+          "input": {
+            "step": 21
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_65ebff88b1f7954f37d2528e191d3b72fc8dce1b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":21}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 22}",
+          "input": {
+            "step": 22
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f478f2dec306960e5e3247225df1d9e70d3ec79f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":22}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 23}",
+          "input": {
+            "step": 23
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d32518f43d13a474906ba84360eecc09080be13b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":23}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 24}",
+          "input": {
+            "step": 24
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2530fa5bb660aa98b204cf87e79ce8a5ca3ec287",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":24}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 25}",
+          "input": {
+            "step": 25
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8a10920e5db798675969a2ae55bf552456a09a40",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":25}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 26}",
+          "input": {
+            "step": 26
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_ecd460fba416638cb11399b911da37ad3aa9c9b8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":26}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 27}",
+          "input": {
+            "step": 27
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_0d6c6263189535f1886119cb34876fadcea8be91",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":27}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 28}",
+          "input": {
+            "step": 28
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8e5f7b914f9f9bd647bc48184e9204e960f7b439",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":28}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 29}",
+          "input": {
+            "step": 29
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_81812b5e7e5ca9edd816f4aad67d94dfcdcd52fd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":29}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 30}",
+          "input": {
+            "step": 30
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_dd2d50f90500aac4cbd7ad874f8a61885ad65d06",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":30}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 31}",
+          "input": {
+            "step": 31
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c0e39cf18f5af60199e491681f70de0d0864d3fe",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":31}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 32}",
+          "input": {
+            "step": 32
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_68f54090c04da996bdcf49589e4b7670c0e3287a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":32}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 33}",
+          "input": {
+            "step": 33
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8860ec7a074f9ffc65cc0c4f42e2e4021353be0b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":33}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 34}",
+          "input": {
+            "step": 34
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d92da58f2fe1c5e7e39d998cf189c25d0b2b1a33",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":34}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 35}",
+          "input": {
+            "step": 35
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b578579e1449ccaacf9f8fb7e339d458ebba53f8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":35}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 36}",
+          "input": {
+            "step": 36
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e5fa465a725a44bc820c7de2aafe029a31aefccf",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":36}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 37}",
+          "input": {
+            "step": 37
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_64d211f1dd5285ddddbc6ae4dc3a7aa6ef4b1d55",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":37}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 38}",
+          "input": {
+            "step": 38
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a4287eb72cfa0ee1bf46344483bfbb71bd7fdb85",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":38}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 39}",
+          "input": {
+            "step": 39
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_9f022dc49175fe0245cfe7f3bc48341fbf48fca2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":39}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 40}",
+          "input": {
+            "step": 40
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_68db935dfe6cb8b03f74246476490095000a940d",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":40}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 41}",
+          "input": {
+            "step": 41
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b79c72805422805226cb74a1d5e3891bf88ca6a2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":41}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 42}",
+          "input": {
+            "step": 42
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5c5d5e39857edbc2e7a1f2f1b7464b6e6245a100",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":42}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 43}",
+          "input": {
+            "step": 43
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a2c289eac4e697ea9557bd9b2780cff1bd2215e5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":43}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 44}",
+          "input": {
+            "step": 44
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4d9d07b6efe2aec2157a6d523fe4923637ef2e91",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":44}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "apply_patch",
+          "input_summary": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 3\n+new 3\n*** End Patch",
+          "input": {
+            "raw": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 3\n+new 3\n*** End Patch"
+          },
+          "preview": "synthetic-fixture.txt",
+          "tool_use_id": "cbk1_15ebae7b46453f2e93e943a434e63a37347a1480",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "apply_patch",
+            "status": "completed",
+            "files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified",
+                "unified_diff": "--- a/synthetic-fixture.txt\n+++ b/synthetic-fixture.txt\n@@ -1 +1 @@\n-old 3\n+new 3\n"
+              }
+            ],
+            "request_files": [
+              {
+                "path": "synthetic-fixture.txt",
+                "status": "modified"
+              }
+            ],
+            "patch": "*** Begin Patch\n*** Update File: synthetic-fixture.txt\n@@\n-old 3\n+new 3\n*** End Patch",
+            "success": true,
+            "stdout": "Done!",
+            "stderr": "",
+            "has_diff": true,
+            "truncated": false,
+            "event_payload_key": "cbk1_6d7e4ce2aaf2973a7e2344ff93f5b6250b2f7363"
+          },
+          "result": null
+        },
+        {
+          "kind": "text",
+          "text": "Synthetic segmented assistant closing",
+          "block_key": "cbk1_1e49a707f2288a651ca51b13a5b658b9cce4fed0"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+      "segment_ordinal": 4,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+        "id": 1213171691
+      },
+      "member_uuids": [
+        "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4"
+      ],
+      "ts": "2026-07-15T12:06:19Z",
+      "text": "Synthetic plain prompt",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Synthetic plain prompt",
+          "block_key": "cbk1_a24272c4c3e9b2940d54d0583688bff9a97d7983"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "id": 2258258572
+      },
+      "member_uuids": [
+        "civ1_d7470541e417bdfd5c96127354539ff5b321170a"
+      ],
+      "ts": "2026-07-15T12:06:21Z",
+      "text": "Synthetic plain assistant opening",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Synthetic plain assistant opening",
+          "block_key": "cbk1_e07ed5f12cf04e3031c41305ba8346cab6b673ae"
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "title": "Planning the synthetic plain turn",
+          "body": "Synthetic plain reasoning body",
+          "headings": [
+            {
+              "key": "cbk1_d45dab10725d67a96607514faf1c394ab9afa5bd#0",
+              "text": "Planning the synthetic plain turn"
+            }
+          ]
+        },
+        {
+          "kind": "codex_reasoning",
+          "source": "response_item",
+          "summary": "**Checking the synthetic plain inputs**\n**Writing the synthetic plain result**",
+          "body": "Synthetic plain multi-heading body",
+          "headings": [
+            {
+              "key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#0",
+              "text": "Checking the synthetic plain inputs"
+            },
+            {
+              "key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#1",
+              "text": "Writing the synthetic plain result"
+            }
+          ]
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 0}",
+          "input": {
+            "step": 0
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_517e7593e6e6be9a867003344370b37edc7ce297",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":0}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 1}",
+          "input": {
+            "step": 1
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_2ef8f7e5d18f966db105a730bfc7f934d6a4e818",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":1}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 2}",
+          "input": {
+            "step": 2
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_4775ae58ba87a08efd2ae3f9d4fd23773fa47868",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":2}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 3}",
+          "input": {
+            "step": 3
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d1f0b7d231f4eef6358c86b9ab43ec353c7937c1",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":3}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 4}",
+          "input": {
+            "step": 4
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_0b12c75c47b3704e08735f3068daec24eab4c9f4",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":4}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 5}",
+          "input": {
+            "step": 5
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_909d572c8a579484f3fb5f584166235f24fbe747",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":5}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 6}",
+          "input": {
+            "step": 6
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_9b9bffcb894310cc33e9e2fe49b4b2ce72d130cb",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":6}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 7}",
+          "input": {
+            "step": 7
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_74469f5947e4d3c3c2179ce7954f5de8cbce2eef",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":7}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 8}",
+          "input": {
+            "step": 8
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_331477bcac335e1e6046b983a34f98aa12b39ae3",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":8}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 9}",
+          "input": {
+            "step": 9
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5e06d0d8f0d751bc524cade7d455d1588e032f7b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":9}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 10}",
+          "input": {
+            "step": 10
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_80a8d76bfae999a465653842e0c8348b0d034c5c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":10}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 11}",
+          "input": {
+            "step": 11
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b9a4268ff8ac33c15b582d003b74da28c9fc6a96",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":11}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 12}",
+          "input": {
+            "step": 12
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_9862dd8f4a8b970f5f5efaa1880bf35bd03ea7b6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":12}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 13}",
+          "input": {
+            "step": 13
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_15b23215183f84477f36b56188b257ebd3a63f9e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":13}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 14}",
+          "input": {
+            "step": 14
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_97627c8850020b3d484210f4376b51faa3962931",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":14}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 15}",
+          "input": {
+            "step": 15
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_c1bcd9c8a840b33ecba74a9932cad9c132714540",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":15}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 16}",
+          "input": {
+            "step": 16
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_013cc69dd27565c2318d34281ddea71cc1dcbc98",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":16}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 17}",
+          "input": {
+            "step": 17
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_22efa1954d6c488f08504ab590856285bacab8ed",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":17}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 18}",
+          "input": {
+            "step": 18
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_6068e9aa66fec5132b4b70c693b2bdc4a12e5e56",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":18}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 19}",
+          "input": {
+            "step": 19
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f694159b7f4b576c43642c0979b337206664c845",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":19}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 20}",
+          "input": {
+            "step": 20
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_33898da26e3ad8fe1ad2e3b81dd713b39856eabb",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":20}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 21}",
+          "input": {
+            "step": 21
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_30b5d95cb1bf4635eaa074b1b8d1a9b8f4feb762",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":21}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 22}",
+          "input": {
+            "step": 22
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_94e704701e2baf36ed803de6f52afb569ae5aee9",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":22}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 23}",
+          "input": {
+            "step": 23
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_82aaead2febb73f643032ea2214f1acb1d93efdc",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":23}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 24}",
+          "input": {
+            "step": 24
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_5c88b77724970ec8f2a70ff7401ae0ba93359856",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":24}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 25}",
+          "input": {
+            "step": 25
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_bb911be1649a409758f3f091a4229ea13e5456eb",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":25}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 26}",
+          "input": {
+            "step": 26
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_d29c35a328bc2ec7801cf29fe523a9b940d96f3c",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":26}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 27}",
+          "input": {
+            "step": 27
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a562e4b630d9652a2d04901dca41fb9e629af5fd",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":27}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 28}",
+          "input": {
+            "step": 28
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b8f423773df3bae59cc4867bfd409aec967559a9",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":28}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 29}",
+          "input": {
+            "step": 29
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_cc8bfe9c8499863aedab8286d055a172abb3fcf5",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":29}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 30}",
+          "input": {
+            "step": 30
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_b9a7d1236991e9f666be67813be49c44ca01553b",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":30}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 31}",
+          "input": {
+            "step": 31
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_cd5ef5bcae8ad97f0fb5144b381dda1ce0d650bf",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":31}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 32}",
+          "input": {
+            "step": 32
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_454b4afb80d16687260b57ed3dbfd833d4a43435",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":32}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 33}",
+          "input": {
+            "step": 33
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_214a7810d1f81f25064d388023c11cf8b8fffab8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":33}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 34}",
+          "input": {
+            "step": 34
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_8cfe9e8536aaee4444a64febcaa411b3b5d6a126",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":34}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 35}",
+          "input": {
+            "step": 35
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_792e426e586a217adcb8e9a0fb8ef01948f2279a",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":35}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 36}",
+          "input": {
+            "step": 36
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_31a115e8898d2e809225b649e004e1fd6eb48917",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":36}",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": 0.0026375,
+      "tokens": {
+        "source": "codex",
+        "input": 600,
+        "output": 200,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "cached_input": 100,
+        "reasoning_output": 50
+      }
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7",
+        "id": 1613390204
+      },
+      "member_uuids": [
+        "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7"
+      ],
+      "ts": "2026-07-15T12:07:38Z",
+      "text": "Synthetic plain assistant closing",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 37}",
+          "input": {
+            "step": 37
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_a948e884977d48a98d13c43d4eeb446012f39e10",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":37}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 38}",
+          "input": {
+            "step": 38
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_0a979cd84c88bc79735f38946e3cb5e2d7261fac",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":38}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 39}",
+          "input": {
+            "step": 39
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_3dafe16eadbe421a630003c8b3adbdc32a52e2fa",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":39}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 40}",
+          "input": {
+            "step": 40
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_49950aa86d3e25507cf03d4a4fb3f1fa456a6741",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":40}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 41}",
+          "input": {
+            "step": 41
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_ceec9aa13cdbd289abb5addee675da436ad66332",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":41}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 42}",
+          "input": {
+            "step": 42
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_74a2bc00d881cc7098bd20a6df25f640cd7eabda",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":42}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 43}",
+          "input": {
+            "step": 43
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_e24ab470a8ab7f6eba066b72a39c8e60c0efbe3e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":43}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_function",
+          "input_summary": "{\"step\": 44}",
+          "input": {
+            "step": 44
+          },
+          "preview": "fixture_function",
+          "tool_use_id": "cbk1_f6a61a13725c8c8414ae6027e1ed52bcf102f481",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "result": {
+            "text": "{\"ok\":true,\"step\":44}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "text",
+          "text": "Synthetic plain assistant closing",
+          "block_key": "cbk1_c4de248861b877d40dfe345238e4a77cc5fed1fa"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+      "segment_ordinal": 1,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    }
+  ],
+  "page": {
+    "next_after": null,
+    "has_more": false,
+    "prev_before": null,
+    "has_prev": false
+  },
+  "last_anchor": {
+    "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "uuid": "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7",
+    "id": 1613390204
+  },
+  "provider_meta": {
+    "source": "codex",
+    "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "tokens": {
+      "source": "codex",
+      "input": 1800,
+      "output": 600,
+      "cache_creation": 0,
+      "cache_read": 0,
+      "cached_input": 400,
+      "reasoning_output": 150
+    },
+    "unattributed_cost_usd": 0,
+    "parent": null,
+    "children": []
+  }
+}

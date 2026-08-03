@@ -74,20 +74,20 @@ def test_claude_branch_emits_no_s2_fields():
     assert out["today"]["cache_hit_percent"] == 71.0
 
 
-def test_codex_branch_dual_publishes_percent_everywhere():
+def test_codex_branch_publishes_only_authoritative_percent_everywhere():
     out = _call("codex")
     for block in (out["today"], out["days"][0], out["by_project"][0], out["by_model"][0]):
         assert block["cached_input_percent"] == 71.0
-        assert block["cache_hit_percent"] == 71.0
+        assert "cache_hit_percent" not in block
 
 
-def test_codex_branch_publishes_metadata_with_numeric_values():
+def test_codex_branch_publishes_metadata_with_null_values():
     out = _call("codex")
     assert set(out["not_applicable"]) == {"wasted_usd", "fourteen_day_efficiency_ratio"}
     assert out["anomaly_predicates"] == ["cache_drop"]
-    # The VALUES stay numeric: a pre-S2 tab calls .toFixed / Math.round on them.
-    assert isinstance(out["today"]["wasted_usd"], float)
-    assert isinstance(out["fourteen_day_efficiency_ratio"], float)
+    assert out["today"]["wasted_usd"] is None
+    assert out["days"][0]["wasted_usd"] is None
+    assert out["fourteen_day_efficiency_ratio"] is None
 
 
 def test_unknown_provider_is_rejected():

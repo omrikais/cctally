@@ -14,10 +14,27 @@ function env(): Envelope {
     ...makeSourceEnvelope(),
   };
   const codexReport = structuredClone(result.cache_report!);
-  codexReport.today.cache_hit_percent = 42;
+  for (const row of [
+    codexReport.today,
+    ...codexReport.days,
+    ...codexReport.by_project,
+    ...codexReport.by_model,
+  ]) {
+    row.cached_input_percent = row.cache_hit_percent;
+    delete row.cache_hit_percent;
+  }
+  codexReport.today.cached_input_percent = 42;
   codexReport.today.net_usd = 12.5;
+  codexReport.today.wasted_usd = null;
   codexReport.fourteen_day_counterfactual_usd = 99;
-  codexReport.days[0].cache_hit_percent = 42;
+  codexReport.fourteen_day_efficiency_ratio = null;
+  for (const day of codexReport.days) day.wasted_usd = null;
+  codexReport.not_applicable = {
+    wasted_usd: 'OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.',
+    fourteen_day_efficiency_ratio: 'Efficiency compares saved against wasted, and Codex has no wasted-cache figure.',
+  };
+  codexReport.anomaly_predicates = ['cache_drop'];
+  codexReport.days[0].cached_input_percent = 42;
   codexReport.days[0].net_usd = 12.5;
   result.sources!.codex.data!.cache_report = codexReport;
   result.sources!.all.data!.providers.codex = result.sources!.codex.data;

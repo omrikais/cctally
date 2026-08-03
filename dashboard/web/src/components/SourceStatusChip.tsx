@@ -69,11 +69,11 @@ const WARNING_DOMAIN_LABELS: Record<string, string> = {
 
 function conciseWarningLabel(domain: string | undefined, code?: string): string {
   if (domain === 'projects' && code === 'codex_metadata_incomplete') return 'Projects partial';
-  // #350 — the All-local reason for a withheld combined total. Without this the
+  // #359 — the All-local reason qualifying retained combined actuals. Without this the
   // `hero` domain would map to "Hero unavailable", which misreads a populated
   // provider hero; the untouched `title`/`aria-label` still carry the full
   // sentence naming which provider's evidence is stale.
-  if (code === 'combined_totals_withheld') return 'Combined withheld';
+  if (code === 'combined_totals_stale') return 'Combined stale';
   return domain != null ? (WARNING_DOMAIN_LABELS[domain] ?? 'Source degraded') : 'Source degraded';
 }
 
@@ -81,6 +81,6 @@ function compactStatusLabel(label: string): string {
   if (label === 'no successful snapshot yet') return 'No snapshot';
   if (label === 'Source degraded' || label === 'degraded') return 'Degraded';
   if (label === 'Projects partial') return 'Projects';
-  if (label === 'Combined withheld') return 'Combined';
+  if (label === 'Combined stale') return 'Combined';
   return label.replace(/ unavailable$/, '');
 }

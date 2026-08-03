@@ -24,6 +24,8 @@ import re
 import sqlite3
 
 import _lib_codex_conversation as kern
+import _lib_codex_segments as segkern
+from _lib_codex_reasoning_headings import decompose_reasoning_headings
 from _lib_conversation import _strip_ansi
 from _lib_conversation_query import _FULL_PAYLOAD_CEILING, _first_nonblank_line
 from _lib_pricing import _calculate_codex_entry_cost
@@ -167,9 +169,30 @@ def codex_item_key(
     line_offset, content_digest)`` — no population-relative ordinals, so
     deleting an earlier duplicate or an out-of-order multi-file append never
     moves an existing key, and a same-offset content replacement changes it.
+
+    Segments 1..N of a split turn use a third shape, ``(conversation_key, "seg",
+    fingerprint(source_path), line_offset, content_digest)``, computed from the
+    segment's anchor row (#463 S1). ``turn_id`` is deliberately NOT an input:
+    hashing the row alone is ordinal-free, so the key never changes while that
+    row's content stays at the same offset. Segment 0 does NOT take this shape —
+    it inherits its turn's ``"response"`` key unchanged, which is why every deep
+    link, permalink, bookmark, reading position and outline entry issued before
+    segmentation still resolves to the head of its turn by construction, with no
+    alias table and no migration.
+
+    The ``"seg"`` domain separator is what keeps a segment key from colliding
+    with the ``"row"`` key of the same anchor row.
     """
     if klass == "response":
         parts = ("turn", conversation_key or "", turn_id or "")
+    elif klass == "segment":
+        parts = (
+            "seg",
+            conversation_key or "",
+            _source_path_fingerprint(source_path),
+            "" if line_offset is None else str(line_offset),
+            content_digest or "",
+        )
     else:
         parts = (
             "row",
@@ -209,13 +232,24 @@ def codex_block_key(
     line_offset: int | None,
     content_digest: str | None,
 ) -> str:
-    """Opaque, ordinal-free payload-block anchor over a tool_call row's row-class
-    identity (§3.4). Same domain-separated hash family as ``codex_item_key``'s row
-    class — ``(conversation_key, fingerprint(source_path), line_offset,
-    content_digest)`` — with a DISTINCT domain, so a block key never collides with
-    an item key. Stable per block, unique per tool_call physical row: a same-offset
-    content replacement changes it (content_digest moves), an out-of-order append
-    elsewhere leaves it (no population-relative ordinals)."""
+    """Opaque, ordinal-free anchor over a physical row's row-class identity (§3.4).
+
+    Carried by EVERY row-backed block since #463 S2. Stable identity and
+    payload-capability are DIFFERENT properties: a prose block has a key and no
+    retained payload, so a consumer must never infer payload availability from
+    the presence of a key. Payload readback is unchanged and gains no surface —
+    ``_locate_payload_block`` still resolves only tool_call rows and the marker
+    and lifecycle event families, and refuses everything else.
+
+    Same domain-separated hash family as ``codex_item_key``'s row class —
+    ``(conversation_key, fingerprint(source_path), line_offset,
+    content_digest)`` — with a DISTINCT domain, so a block key never collides
+    with an item key. Stable per block, unique per physical row: a same-offset
+    content replacement changes it (content_digest moves), an out-of-order
+    append elsewhere leaves it (no population-relative ordinals). Segment
+    boundaries never affect it, because nothing in the inputs is
+    population-relative.
+    """
     parts = (
         conversation_key or "",
         _source_path_fingerprint(source_path),
@@ -250,21 +284,145 @@ def _load_conversation_rows(conn: sqlite3.Connection, conversation_key: str) -> 
     ]
 
 
-def _load_row_payloads(
+# Narrow index columns (#463 S1, spec section 3, Phase A). Everything except
+# ``text`` — and the event payloads are not touched at all. ``detail_json`` is
+# REQUIRED, not optional: all three fold passes inside ``canonical_items`` parse
+# it, and the reasoning title boundary comes from the stored projection, which
+# ``search_thinking`` cannot supply (it is capped at 16,000 characters and stores
+# ``summary + "\n" + body`` for a response item, so a title and a title-plus-body
+# are indistinguishable there).
+#
+# ``length(CAST(detail_json AS BLOB))`` rather than ``length(detail_json)``:
+# SQLite's ``length()`` on TEXT counts CHARACTERS, and the stored JSON is emitted
+# with ``ensure_ascii=False``, so a character count understates a non-ASCII
+# detail and would let a segment exceed its stated ceiling.
+_NARROW_ROW_COLS = (
+    "source_path, line_offset, timestamp_utc, turn_id, call_id, kind, "
+    "event_type, record_family, model, content_digest, content_len, "
+    "detail_json, length(CAST(detail_json AS BLOB))"
+)
+
+# Bound on the ``line_offset`` list bound into one hydration query. SQLite's
+# default host-parameter limit is 999 on older builds, and a full page can carry
+# more positions than that, so the reads are chunked per source file.
+_HYDRATE_CHUNK = 400
+
+
+def _load_conversation_index_rows(
     conn: sqlite3.Connection, conversation_key: str,
+) -> tuple[list, dict[tuple[str, int], int]]:
+    """Phase A's narrow read: ``(rows, detail_bytes_by_position)``.
+
+    Rows come back as ordinary ``CodexNormalizedRow`` objects with ``text``,
+    ``search_tool`` and ``search_thinking`` blanked, so ``pair_mirrors`` and
+    ``canonical_items`` run unchanged — both key on ``turn_id``, ``kind``,
+    ``content_digest``, ``content_len``, ``record_family`` and the physical
+    position, none of which lives in the excluded columns.
+
+    Excluding ``text`` defers the bulk: on the heaviest conversation in the
+    corpus ``content_len`` totals 84.6 MB against 7.1 MB of ``detail_json``.
+    """
+    rows: list = []
+    detail_bytes: dict[tuple[str, int], int] = {}
+    for (source_path, line_offset, timestamp_utc, turn_id, call_id, kind,
+         event_type, record_family, model, content_digest, content_len,
+         detail_json, detail_len) in conn.execute(
+        "SELECT " + _NARROW_ROW_COLS + " FROM codex_conversation_messages "
+        "WHERE conversation_key = ? "
+        "ORDER BY timestamp_utc, source_path, line_offset",
+        (conversation_key,),
+    ):
+        rows.append(kern.CodexNormalizedRow(
+            conversation_key=conversation_key, source_root_key="",
+            source_path=source_path, line_offset=line_offset,
+            timestamp_utc=timestamp_utc, turn_id=turn_id, call_id=call_id,
+            kind=kind, event_type=event_type, record_family=record_family,
+            model=model, text="", content_digest=content_digest,
+            content_len=content_len, detail_json=detail_json,
+            search_tool="", search_thinking=""))
+        detail_bytes[(source_path, line_offset)] = detail_len or 0
+    return rows, detail_bytes
+
+
+def _detail_bytes_of(rows) -> dict[tuple[str, int], int]:
+    """``detail_json`` byte sizes for callers that already hold WIDE rows.
+
+    The same quantity ``_load_conversation_index_rows`` gets from
+    ``length(CAST(detail_json AS BLOB))`` — BYTES, not characters, because the
+    stored JSON is emitted with ``ensure_ascii=False``.
+    """
+    return {
+        (row.source_path, row.line_offset):
+            len((row.detail_json or "").encode("utf-8"))
+        for row in rows
+    }
+
+
+def _chunk_positions(positions) -> dict[str, list[list[int]]]:
+    """Group physical positions by source file, chunked for a bound IN clause."""
+    by_path: dict[str, list[int]] = {}
+    for source_path, line_offset in positions:
+        by_path.setdefault(source_path, []).append(line_offset)
+    return {
+        path: [offsets[i:i + _HYDRATE_CHUNK]
+               for i in range(0, len(offsets), _HYDRATE_CHUNK)]
+        for path, offsets in by_path.items()
+    }
+
+
+def _load_rows_at_positions(
+    conn: sqlite3.Connection, conversation_key: str, positions,
+) -> dict[tuple[str, int], object]:
+    """Phase C's wide read, scoped to one page's physical positions."""
+    hydrated: dict[tuple[str, int], object] = {}
+    for path, chunks in _chunk_positions(positions).items():
+        for chunk in chunks:
+            marks = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT " + _ROW_COLS + " FROM codex_conversation_messages "
+                f"WHERE conversation_key = ? AND source_path = ? "
+                f"AND line_offset IN ({marks})",
+                (conversation_key, path, *chunk),
+            ):
+                built = kern.CodexNormalizedRow(*row)
+                hydrated[(built.source_path, built.line_offset)] = built
+    return hydrated
+
+
+def _load_row_payloads(
+    conn: sqlite3.Connection, conversation_key: str, positions=None,
 ) -> dict[tuple[str, int], tuple[str | None, dict]]:
     """Retained physical payloads for query-time card shaping.
 
     The retained payload remains the authoritative source used for full-payload
     readback and a defensive read-time re-shape; contract v3 also persists the
     same bounded card so replay-derived rollups and logical item counts converge.
+
+    ``positions`` scopes the read to one page (#463 S1, Phase C). Passing None
+    keeps the whole-conversation behaviour, which the export path still wants.
     """
     result: dict[tuple[str, int], tuple[str | None, dict]] = {}
-    for source_path, line_offset, record_type, payload_json in conn.execute(
-        "SELECT source_path,line_offset,record_type,payload_json "
-        "FROM codex_conversation_events WHERE conversation_key = ?",
-        (conversation_key,),
-    ):
+    if positions is None:
+        cursor = conn.execute(
+            "SELECT source_path,line_offset,record_type,payload_json "
+            "FROM codex_conversation_events WHERE conversation_key = ?",
+            (conversation_key,))
+        rows = list(cursor)
+    else:
+        wanted = set(positions)
+        rows = []
+        for path, chunks in _chunk_positions(wanted).items():
+            for chunk in chunks:
+                marks = ",".join("?" for _ in chunk)
+                rows.extend(
+                    row for row in conn.execute(
+                        "SELECT source_path,line_offset,record_type,payload_json "
+                        "FROM codex_conversation_events "
+                        "WHERE conversation_key = ? AND source_path = ? "
+                        f"AND line_offset IN ({marks})",
+                        (conversation_key, path, *chunk))
+                    if (row[0], row[1]) in wanted)
+    for source_path, line_offset, record_type, payload_json in rows:
         try:
             obj = json.loads(payload_json or "{}")
         except (json.JSONDecodeError, TypeError):
@@ -329,8 +487,68 @@ def _item_meta(item: dict) -> dict | None:
     return meta
 
 
+def _turn_scoped_call_owner_count(rows: list) -> dict[str, int]:
+    """How many ``tool_call`` rows own each call id, counted over the WHOLE turn.
+
+    This must stay turn-scoped (#463 S1, spec section 1). Recomputing it over a
+    page-local segment would make a call id that appears twice in a turn but once
+    in the page look uniquely owned, and a ``tool_output`` would then fold into
+    the wrong call.
+    """
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row.kind == "tool_call" and row.call_id:
+            counts[row.call_id] = counts.get(row.call_id, 0) + 1
+    return counts
+
+
+def _reasoning_headings(detail, payload, block_key: str):
+    """The additive ``headings`` array for one reasoning block, or ``None``.
+
+    #463 S2 §2.3/§2.5. Read-time decomposition of the retained payload's
+    ``summary`` entries into the individual authored headings, each addressed by
+    ``<block_key>#<zero-based ordinal>``. The stored projection is NOT consulted
+    and NOT modified: it feeds ``_row_is_reasoning_title``, which is a
+    segmentation-boundary input.
+
+    Headings come from ``payload["summary"]`` ONLY. ``payload["content"]`` is the
+    body, which stays disclosure content and is never decomposed.
+
+    All-or-nothing. When the payload is absent, unreadable or malformed, this
+    returns ``None`` and the caller omits the field entirely, so the client falls
+    back to today's ``title``/``summary`` rendering. Decomposition never fails the
+    request and never partially populates.
+    """
+    if not isinstance(detail, dict) or not isinstance(detail.get("reasoning"), dict):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    summary = payload.get("summary")
+    if not isinstance(summary, list) or not summary:
+        return None
+    entries = []
+    for entry in summary:
+        if not isinstance(entry, dict):
+            return None
+        text = entry.get("text")
+        # Mirror `_join_content_texts`, which is what produced the stored
+        # summary: it keeps non-empty string `text` leaves and ignores the rest.
+        if text is None:
+            continue
+        if not isinstance(text, str):
+            return None
+        if text:
+            entries.append(text)
+    headings = decompose_reasoning_headings(entries)
+    if not headings:
+        return None
+    return [{"key": f"{block_key}#{ordinal}", "text": text}
+            for ordinal, text in enumerate(headings)]
+
+
 def _item_blocks_with_rows(
     item: dict, payloads: dict | None = None, *, preserve_marker_text: bool = False,
+    call_owner_count: dict | None = None, decompose_headings: bool = False,
 ) -> list[list]:
     """Assemble an item's blocks (the historical ``_build_item_blocks`` behaviour)
     AND expose each block's underlying rows, so the detail renderer and the payload
@@ -340,8 +558,17 @@ def _item_blocks_with_rows(
     exactly one tool_call, and that call was already seen (call precedes output).
     Physical order within the item is preserved.
 
-    Every ``tool_call`` block additionally carries an opaque ``block_key`` (§3.4) —
-    the payload-capable anchor. Non-tool blocks carry no ``block_key``."""
+    EVERY block backed by a physical row carries an opaque ``block_key`` (§3.4)
+    since #463 S2 §1; before it, only ``tool_call`` and a few event families did.
+    The far smaller payload-readable set is marked separately by
+    ``payload_which``, because a stable anchor and a retained payload are
+    different properties (§1.1).
+
+    ``decompose_headings`` adds the additive ``detail.reasoning.headings`` array
+    (#463 S2 §2.5). It is OFF by default and off on the export path, because
+    ``legacy_export`` loads only marker-bearing payloads and populating the field
+    there would force a whole-conversation payload read to fill something the
+    exporter never reads."""
     rows = item["rows"]
     payloads = payloads or {}
     lifecycle_positions = {
@@ -349,10 +576,11 @@ def _item_blocks_with_rows(
     }
     row_order = {(row.source_path, row.line_offset): index
                  for index, row in enumerate(rows)}
-    call_owner_count: dict[str, int] = {}
-    for r in rows:
-        if r.kind == "tool_call" and r.call_id:
-            call_owner_count[r.call_id] = call_owner_count.get(r.call_id, 0) + 1
+    # Turn-scoped when the caller supplies it (#463 S1 Phase C); otherwise
+    # computed over this item's own rows, which is the same thing for an
+    # unsegmented item.
+    if call_owner_count is None:
+        call_owner_count = _turn_scoped_call_owner_count(rows)
     entries: list[list] = []
     tool_entry_by_call: dict[str, int] = {}
     for r in rows:
@@ -411,17 +639,26 @@ def _item_blocks_with_rows(
                     owner_card["result"] = result
             owner[2] = r
             continue
+        block_key = _block_key_for_row(r)
+        if decompose_headings and r.kind == "reasoning":
+            headings = _reasoning_headings(detail, payload, block_key)
+            if headings is not None:
+                detail = dict(detail)
+                detail["reasoning"] = dict(detail["reasoning"])
+                detail["reasoning"]["headings"] = headings
         block = {
             "kind": r.kind, "text": text, "detail": detail,
             "call_id": r.call_id, "timestamp_utc": r.timestamp_utc,
+            # #463 S2 §1 — EVERY row-backed block carries the anchor, not only
+            # tool_call. `payload_which` below still marks the far smaller set
+            # that is payload-readable, because those are different properties.
+            "block_key": block_key,
         }
         if (r.kind == "event" and r.event_type in {
                 "web_search_end", "mcp_tool_call_end", "task_started", "task_complete"}
                 or isinstance(stored_detail, dict) and stored_detail.get("markers")):
-            block["block_key"] = _block_key_for_row(r)
             block["payload_which"] = "event"
         if r.kind == "tool_call":
-            block["block_key"] = _block_key_for_row(r)
             if r.call_id and call_owner_count.get(r.call_id, 0) == 1:
                 tool_entry_by_call[r.call_id] = len(entries)
         entries.append([block, r, None])
@@ -445,8 +682,7 @@ def _item_blocks_with_rows(
         if not (event_row.kind == "event" and isinstance(event_card, dict)
                 and event_card.get("source") == "patch_apply_end"):
             continue
-        event_key = _block_key_for_row(event_row)
-        event_block["block_key"] = event_key
+        event_key = event_block["block_key"]
         event_block["payload_which"] = "event"
         same_id = [
             index for index, owner_count in patch_calls
@@ -514,7 +750,6 @@ def _item_blocks_with_rows(
                     == "web_search_call")
             ]
         if len(candidates) != 1:
-            event_block["block_key"] = _block_key_for_row(event_row)
             event_block["payload_which"] = "event"
             continue
         owner_index = candidates[0]
@@ -539,14 +774,13 @@ def _item_blocks_with_rows(
                     owner_card["call_status"] = owner_payload["status"]
                 owner_detail["card"] = owner_card
         if not isinstance(owner_card, dict):
-            event_block["block_key"] = _block_key_for_row(event_row)
             event_block["payload_which"] = "event"
             continue
         owner_card["completion"] = {
             key: value for key, value in event_card.items()
             if key not in {"schema_version", "type", "source"}
         }
-        owner_card["completion"]["event_block_key"] = _block_key_for_row(event_row)
+        owner_card["completion"]["event_block_key"] = event_block["block_key"]
         matched_secondary.add(owner_index)
         suppress_secondary.add(event_index)
     if suppress_secondary:
@@ -557,13 +791,16 @@ def _item_blocks_with_rows(
 
 def _build_item_blocks(
     item: dict, payloads: dict | None = None, *, preserve_marker_text: bool = False,
+    call_owner_count: dict | None = None, decompose_headings: bool = False,
 ) -> list[dict]:
     """Assemble an item's blocks, folding each ``tool_output`` into its
     ``tool_call`` block via ``call_id`` when that call_id has exactly one owner
     (§5.2). Physical order within the item is preserved. Thin projection of
     ``_item_blocks_with_rows`` — the single source of truth for the folding rule."""
     return [entry[0] for entry in _item_blocks_with_rows(
-        item, payloads, preserve_marker_text=preserve_marker_text)]
+        item, payloads, preserve_marker_text=preserve_marker_text,
+        call_owner_count=call_owner_count,
+        decompose_headings=decompose_headings)]
 
 
 def _item_lifecycle(item: dict) -> dict | None:
@@ -1005,40 +1242,376 @@ def codex_conversation_source_paths(
 # ── detail assembly (§5.2 / §5.4 / §5.6) ──────────────────────────────────────
 
 
-def _paginate_items(items: list[dict], *, after, before, tail: bool, limit: int):
-    # ``tail`` is the flag the HTTP layer parses out of ``?tail=1`` — which page
-    # of ``limit`` to cut, never how many items to return. Treating it as a count
-    # made ``min(True, limit)`` serve a one-item tail page, and ``tail=False``
-    # (the shape every non-tail request arrives in) skip ``limit`` altogether.
-    keys = [it["item_key"] for it in items]
-    aliases = {
-        alias: index
-        for index, item in enumerate(items)
-        for alias in item.get("member_item_keys", [])
-    }
-    lo, hi = 0, len(items)
-    if after is not None and after in keys:
-        lo = keys.index(after) + 1
-    elif after is not None and after in aliases:
-        lo = aliases[after] + 1
-    if before is not None and before in keys:
-        hi = keys.index(before)
-    elif before is not None and before in aliases:
-        hi = aliases[before]
-    window = items[lo:hi]
-    if limit:
-        window = window[-limit:] if tail else window[:limit]
-    first_key = window[0]["item_key"] if window else None
-    last_key = window[-1]["item_key"] if window else None
-    has_before = bool(window) and keys.index(first_key) > 0
-    has_after = bool(window) and keys.index(last_key) < len(items) - 1
+def _stale_codex_page(total: int) -> dict:
+    """The page a cursor resolving to nothing returns (#463 S1 / F4).
+
+    Mirrors the Claude kernel's ``_stale_empty_page`` contract: a stale or
+    deleted cursor yields an EMPTY page, never a silent re-serve of the head or
+    the tail. The old Codex kernel left the bound at the edge of the list, which
+    is the second path by which ``before`` returned the wrong window.
+    """
+    return {"total": total, "returned": 0, "before": None, "after": None,
+            "has_before": False, "has_after": False}
+
+
+def _paginate_items(items: list[dict], *, after, before, tail: bool, limit: int,
+                    block_budget: int | None = None,
+                    byte_budget: int | None = None):
+    """Cut one page from the assembled item list (#463 S1 / F4).
+
+    ``tail`` is the flag the HTTP layer parses out of ``?tail=1`` — which page
+    of ``limit`` to cut, never how many items to return.
+
+    The four cursor branches mirror the Claude kernel's structure
+    (``_lib_conversation_query.py`` :2372-2391) so the two can be read against
+    each other, which is what stops them diverging again. TWO deliberate
+    Codex-only differences, both pinned by ``tests/test_codex_pagination.py``:
+
+      * ``limit == 0`` means UNBOUNDED, and the export path depends on that
+        sentinel (``get_codex_conversation_export`` passes ``limit=0``). Claude's
+        default branch computes ``end = min(limit, N)``, which for zero yields an
+        empty page — ported literally, every Codex export would contain no
+        conversation items. The unbounded case is therefore explicit, ahead of
+        the four branches.
+      * Cursor resolution covers BOTH primary item keys and ``member_item_keys``
+        aliases, so a cursor naming an item folded by a later contract version
+        still resolves. Claude's ``_idx`` checks only its primary anchor id, and
+        taking its resolver along with its branch arithmetic would make every
+        folded-item cursor stale. The branch arithmetic is what is ported; the
+        resolver is not.
+
+    The prior implementation computed ``lo``/``hi`` and then sliced, so a
+    ``before`` request returned ``items[0:hi][:limit]`` — the conversation's
+    OPENING items — with ``has_before`` False.
+
+    TWO per-page budgets apply alongside ``limit``, and the first of them to be
+    reached closes the page (spec section 2). They bound different costs and
+    neither substitutes for the other:
+
+      * ``block_budget`` bounds DOM construction cost, which the F2 profile
+        shows dominates mounting.
+      * ``byte_budget`` bounds transfer and parse cost, which is a byte cost a
+        block count does not express, because a Codex block is far heavier than
+        a Claude block.
+
+    Neither is optional in production. The profiled response was
+    ``total: 78, returned: 78, has_after: false`` — 13.3 MB served in one page,
+    because 78 is fewer than the requested 500 — so a change that capped items
+    alone would not have bounded that conversation at all. And after
+    segmentation that same conversation serves 1,713 blocks, BELOW
+    ``PAGE_BLOCK_BUDGET``, so the block bound never fires on it either and the
+    response is still 13.24 MB: the byte budget is what actually closes it.
+
+    Both are deliberately NOT applied to the unbounded ``limit == 0`` export
+    case, which must stay whole. The trim comes off whichever end is not
+    anchored to the cursor, so a reverse page still ends where the caller asked
+    it to, and a page never shrinks below one item however large that item is.
+    """
+    index_by_key: dict[str, int] = {}
+    for index, item in enumerate(items):
+        index_by_key.setdefault(item["item_key"], index)
+    for index, item in enumerate(items):
+        for alias in item.get("member_item_keys", []):
+            index_by_key.setdefault(alias, index)
+
+    n = len(items)
+
+    if not limit:
+        start, end = 0, n
+    elif tail:
+        end = n
+        start = max(0, n - limit)
+    elif before is not None:
+        b = index_by_key.get(before)
+        if b is None:
+            return [], _stale_codex_page(n)
+        end = b
+        start = max(0, end - limit)
+    elif after is not None:
+        a = index_by_key.get(after)
+        if a is None:
+            return [], _stale_codex_page(n)
+        start = a + 1
+        end = min(start + limit, n)
+    else:
+        start = 0
+        end = min(limit, n)
+
+    if limit and end > start and (block_budget or byte_budget):
+        blocks = sum(item.get("block_count", 0) for item in items[start:end])
+        source = sum(item.get("source_bytes", 0) for item in items[start:end])
+
+        def _over() -> bool:
+            return ((bool(block_budget) and blocks > block_budget)
+                    or (bool(byte_budget) and source > byte_budget))
+
+        anchored_at_end = tail or before is not None
+        while end - start > 1 and _over():
+            drop = items[start] if anchored_at_end else items[end - 1]
+            blocks -= drop.get("block_count", 0)
+            source -= drop.get("source_bytes", 0)
+            if anchored_at_end:
+                start += 1
+            else:
+                end -= 1
+
+    window = items[start:end]
+    has_before = start > 0
+    has_after = end < n
     page = {
-        "total": len(items), "returned": len(window),
-        "before": first_key if has_before else None,
-        "after": last_key if has_after else None,
+        "total": n, "returned": len(window),
+        "before": window[0]["item_key"] if (window and has_before) else None,
+        "after": window[-1]["item_key"] if (window and has_after) else None,
         "has_before": has_before, "has_after": has_after,
     }
     return window, page
+
+
+def _row_source_bytes(row, detail_bytes: dict) -> int:
+    """One row's source size: its content length plus its stored detail's BYTES.
+
+    Source bytes deliberately overstate wire bytes. The server clips block
+    payloads, so the measured ratio is roughly six to eight times — a
+    conversation holding 14.6 MB of ``content_len`` serves 1.8 MB, and one
+    holding 84.6 MB serves 13.3 MB. Any byte threshold must therefore be stated
+    in source bytes and derived from a wire target through that ratio; S1
+    computes the figure and exposes it, and gates only on block count.
+    """
+    return (row.content_len or 0) + detail_bytes.get(
+        (row.source_path, row.line_offset), 0)
+
+
+_UNSET = object()
+
+
+def _row_is_reasoning_title(row, detail=_UNSET) -> bool:
+    """True when this row's stored reasoning projection produces a ``title``.
+
+    The first of the two semantic boundaries. Read from ``detail_json``, because
+    ``search_thinking`` stores ``summary + "\\n" + body`` for a response item and
+    so cannot tell ``summary="**T**", body="x"`` (a title) from
+    ``summary="**T**\\nx", body=""`` (not one).
+
+    ``detail`` lets a caller that has already parsed the row's ``detail_json``
+    pass it in. Phase A runs over every row of the conversation, so parsing the
+    same JSON twice per row is worth avoiding.
+    """
+    if row.kind != "reasoning":
+        return False
+    if detail is _UNSET:
+        detail = _parse_detail(row.detail_json)
+    reasoning = detail.get("reasoning") if isinstance(detail, dict) else None
+    return isinstance(reasoning, dict) and bool(reasoning.get("title"))
+
+
+def _fold_groups_for_item(item: dict, call_owner_count: dict,
+                          detail_bytes: dict) -> list:
+    """Derive one item's atomic fold groups (#463 S1, spec section 1).
+
+    A group is a row together with every later row in the item that could fold
+    into it. Membership is decided from ``call_id`` and the STORED card in
+    ``detail_json``, deliberately without reading the retained event payloads —
+    Phase A must not touch them. That makes the grouping a conservative SUPERSET
+    of what the block builder will actually fold: a completion event whose card
+    turns out not to fold stays grouped with its call anyway. A superset is the
+    safe direction, because the only thing a group guarantees is that no boundary
+    is drawn between a call and something that might fold into it.
+
+    ``_item_blocks_with_rows`` performs THREE folds, not one, and grouping covers
+    all three:
+
+      * the id-matched fold — a ``tool_output`` or completion event whose
+        ``call_id`` is owned by exactly one ``tool_call`` in the turn;
+      * the bracketed native patch completion — a patch completion event may
+        carry an INNER call id distinct from the outer custom-tool call, which
+        the block builder folds by positional bracketing
+        (``call_pos < event_pos < output_pos``) rather than by id. This is the
+        common shape: 3,441 of the production corpus's 4,690 patch completion
+        events carry a call id no ``tool_call`` in their turn owns. Such an event
+        joins the most recent patch call whose output has not yet arrived;
+      * the ``web_search_completion`` narrowing — that path filters its
+        candidates by ``detail.name == "web_search_call"`` BEFORE requiring a
+        unique candidate, and it bounds nothing about how many calls share the
+        id, so it folds at ANY owner count. The registration below therefore
+        imposes no owner ceiling either: it registers the web-search arm at
+        ``owners >= 1``. Naming a fixed count leaves the pair ungrouped at every
+        other count — an ``== 1`` gate never covers a two-owner id, and an
+        ``== 2`` gate never covers a call id owned by three calls of which one
+        is the web search.
+
+    A boundary that split any of the three would make the page-local builder emit
+    a standalone event card where the whole-turn builder emits a folded
+    ``completion`` — the structural divergence spec section 1 forbids.
+
+    Block counts are overestimated for the same reason. A ``tool_output`` whose
+    call id is uniquely owned provably folds and contributes nothing; every other
+    grouped row is counted as its own block even though it may fold. Over-
+    counting shrinks segments slightly, which keeps the budget an upper bound.
+
+    Each group also carries ``first_pos``/``last_pos``, its physical row range
+    inside the item, which ``plan_segments`` uses to keep a segment contiguous.
+
+    Lifecycle rows are excluded entirely: they never produce a block, and they
+    are carried on segment 0 instead, where ``_item_lifecycle`` renders them from
+    the narrow row alone.
+    """
+    lifecycle_positions = {
+        (row.source_path, row.line_offset) for row in item.get("lifecycle_rows", [])
+    }
+    groups: list[dict] = []
+    open_group_by_call: dict[str, dict] = {}
+    open_patch_groups: list[dict] = []
+    previous_kind = None
+    position = 0
+    for row in item["rows"]:
+        if (row.source_path, row.line_offset) in lifecycle_positions:
+            continue
+        detail = _parse_detail(row.detail_json)
+        card = detail.get("card") if isinstance(detail, dict) else None
+        if not isinstance(card, dict):
+            card = None
+        owner = (open_group_by_call.get(row.call_id)
+                 if row.call_id and row.kind in {"tool_output", "event"} else None)
+        if (owner is None and row.kind == "event" and card is not None
+                and card.get("source") == "patch_apply_end" and open_patch_groups):
+            # The most RECENT still-open patch call is the one the block
+            # builder's bracket resolves to in the single-patch case; taking an
+            # older one would leave the true owner ungrouped.
+            owner = open_patch_groups.pop()
+        if owner is not None:
+            owner["rows"].append(row)
+            owner["last_pos"] = position
+            owner["source_bytes"] += _row_source_bytes(row, detail_bytes)
+            folds = (row.kind == "tool_output"
+                     and call_owner_count.get(row.call_id, 0) == 1)
+            if not folds:
+                owner["block_count"] += 1
+            # Identity, not equality. ``in`` and ``list.remove`` compare with
+            # ``==``, so they would match — and delete — the FIRST group whose
+            # dict merely compares equal to this one. That is correct today only
+            # because two distinct groups can never hold equal contents, which is
+            # an accident of the data rather than a property of this loop.
+            if row.kind == "tool_output" and any(g is owner for g in open_patch_groups):
+                open_patch_groups[:] = [g for g in open_patch_groups if g is not owner]
+            position += 1
+            continue
+        group = {
+            "rows": [row],
+            "block_count": 1,
+            "source_bytes": _row_source_bytes(row, detail_bytes),
+            "is_title_boundary": _row_is_reasoning_title(row, detail),
+            "is_tool_transition": (row.kind == "tool_call"
+                                   and previous_kind in {"assistant", "reasoning"}),
+            "first_pos": position,
+            "last_pos": position,
+        }
+        groups.append(group)
+        if row.kind == "tool_call" and row.call_id:
+            owners = call_owner_count.get(row.call_id, 0)
+            name = detail.get("name") if isinstance(detail, dict) else None
+            # The web-search arm must not impose an owner ceiling the block
+            # builder does not. `_pair_web_search_completions` filters the
+            # candidates by `detail.name == "web_search_call"` and then requires a
+            # unique survivor, with no bound on how many calls share the id — so a
+            # call id owned by three calls of which exactly one is a web search
+            # folds there while `owners == 2` refused to group it here, and a
+            # segment boundary could fall between the call and its completion.
+            # `owners >= 1` matches the builder and stays a conservative superset:
+            # grouping only ever keeps rows together that the builder folds.
+            if owners == 1 or (owners >= 1 and name == "web_search_call"):
+                open_group_by_call.setdefault(row.call_id, group)
+        if row.kind == "tool_call" and card is not None and card.get("type") == "patch":
+            open_patch_groups.append(group)
+        previous_kind = row.kind
+        position += 1
+    return [
+        segkern.FoldGroup(
+            rows=group["rows"], block_count=group["block_count"],
+            source_bytes=group["source_bytes"],
+            is_title_boundary=group["is_title_boundary"],
+            is_tool_transition=group["is_tool_transition"],
+            first_pos=group["first_pos"], last_pos=group["last_pos"])
+        for group in groups
+    ]
+
+
+def _build_segment_index(
+    conversation_key: str, items: list[dict], detail_bytes: dict, *,
+    segmented: bool, block_budget: int | None = None,
+) -> list[dict]:
+    """Phase A's output: an ordered index of segments, with no block content.
+
+    Each entry carries its keys, turn membership, ordinal, the physical rows it
+    covers, its sizes, and the two structural facts Phase C requires and cannot
+    recompute correctly on its own — the fold-group membership that makes a
+    boundary legal, and the TURN-scoped ``call_owner_count``.
+
+    ``segmented=False`` gives each item exactly one segment holding all of its
+    groups, which is what the export path uses so its item grouping stays
+    byte-identical.
+
+    ``block_budget`` resolves to ``segkern.SEGMENT_BLOCK_BUDGET`` at CALL time
+    when omitted, never as a default argument value: a default argument binds
+    once at import, so a test that lowered the budget would silently keep the
+    imported figure and pass vacuously.
+    """
+    index: list[dict] = []
+    for item_index, item in enumerate(items):
+        turn_key = _item_key_for_item(conversation_key, item)
+        call_owner_count = _turn_scoped_call_owner_count(item["rows"])
+        groups = _fold_groups_for_item(item, call_owner_count, detail_bytes)
+        if not groups:
+            segments = [segkern.Segment(
+                ordinal=0, groups=[], block_count=0, source_bytes=0,
+                anchor_row=item["anchor_row"])]
+        elif segmented and item["klass"] == "response":
+            segments = segkern.plan_segments(groups, block_budget=block_budget)
+        else:
+            segments = [segkern.Segment(
+                ordinal=0, groups=groups,
+                block_count=sum(group.block_count for group in groups),
+                source_bytes=sum(group.source_bytes for group in groups),
+                anchor_row=groups[0].rows[0])]
+        for segment in segments:
+            head = segment.ordinal == 0
+            anchor = item["anchor_row"] if head else segment.anchor_row
+            # PHYSICAL order, not group-flatten order. A folded row is appended
+            # to an earlier group, so flattening the groups would move it next to
+            # its call — and the patch-completion fold decides ambiguous cases by
+            # positional bracketing (call < event < its output) over the item's
+            # row order, which that reordering silently breaks.
+            member = {(row.source_path, row.line_offset)
+                      for group in segment.groups for row in group.rows}
+            segment_rows = [row for row in item["rows"]
+                            if (row.source_path, row.line_offset) in member]
+            entry = {
+                "item_key": turn_key if head else codex_item_key(
+                    conversation_key, klass="segment", turn_id=item["turn_id"],
+                    source_path=segment.anchor_row.source_path,
+                    line_offset=segment.anchor_row.line_offset,
+                    content_digest=segment.anchor_row.content_digest),
+                "member_item_keys": (
+                    _member_item_keys(conversation_key, item) if head else []),
+                "turn_item_key": turn_key,
+                "segment_ordinal": segment.ordinal,
+                "kind": _item_kind(item),
+                "timestamp_utc": anchor.timestamp_utc,
+                "model": anchor.model,
+                "block_count": segment.block_count,
+                "source_bytes": segment.source_bytes,
+                # Phase C inputs — never serialized.
+                "_item_index": item_index,
+                "_klass": item["klass"],
+                "_turn_id": item["turn_id"],
+                "_anchor_row": anchor,
+                "_rows": segment_rows,
+                "_call_owner_count": call_owner_count,
+                "_meta": _item_meta(item) if head else None,
+                "_lifecycle": _item_lifecycle(item) if head else None,
+                "_lifecycle_rows": item.get("lifecycle_rows", []) if head else [],
+            }
+            index.append(entry)
+    return index
 
 
 def get_codex_conversation(
@@ -1055,35 +1628,51 @@ def get_codex_conversation(
     """Detail envelope (§5.6): status ``ok`` | ``normalization_pending`` |
     ``not_found``. ``ok`` carries canonical items (mirror-paired, tool-folded),
     per-turn cost with an explicit unattributed bucket, threading, and a page
-    over ``item_key``."""
+    over ``item_key``.
+
+    Assembly runs in three phases (#463 S1, finding F3). Before this change every
+    step from row loading through block building processed the WHOLE
+    conversation, and ``_paginate_items`` ran last, so pagination reduced
+    serialization and transfer but bounded no work.
+
+      * **Phase A** reads every row narrowly — everything except ``text``, and no
+        event payloads at all — pairs mirrors, groups canonical items, derives
+        fold groups and segment boundaries, and emits a segment index.
+      * **Phase B** paginates that index. It is arithmetic over a narrow list.
+      * **Phase C** hydrates ONLY the requested page: the wide ``text`` read and
+        the events-table payload scan are scoped to the page's physical
+        positions, and blocks are built per segment.
+
+    What stays proportional to the conversation is the narrow index pass, because
+    segment boundaries and the ``has_before``/``has_after`` flags are global
+    facts. What becomes proportional to the page is everything expensive.
+
+    Cost attribution deliberately stays whole-conversation: ``_attribute_costs``
+    reconciles per-turn costs against an unattributed bucket and the envelope
+    reports conversation-level totals, so scoping it to a page would change the
+    reported total. It reads ``codex_session_entries``, not the large message
+    table.
+
+    ``page.total`` is now a count of SEGMENTS rather than of items.
+    """
     if not codex_normalization_authoritative(conn):
         return {"status": "normalization_pending", "conversation_key": conversation_key,
                 "items": [], "children": []}
-    rows = _load_conversation_rows(conn, conversation_key)
+    # ── Phase A: the narrow index pass ───────────────────────────────────────
+    rows, detail_bytes = _load_conversation_index_rows(conn, conversation_key)
     if not rows:
         return {"status": "not_found", "conversation_key": conversation_key}
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(
         kept, fold_patch_completions=not legacy_export)
-    # Detail/API callers receive the exact card display projection from retained
-    # provider payloads. Export deliberately renders the byte-frozen legacy text
-    # while retaining the same additive card metadata.
-    payloads = _load_row_payloads(conn, conversation_key)
-    if legacy_export:
-        marker_positions = {
-            (row.source_path, row.line_offset)
-            for row in rows
-            if isinstance(_parse_detail(row.detail_json), dict)
-            and bool(_parse_detail(row.detail_json).get("markers"))
-        }
-        payloads = {
-            position: retained for position, retained in payloads.items()
-            if position in marker_positions
-        }
     turn_cost, turn_tokens, unattr_cost, unattr_tokens, total, conv_tokens = _attribute_costs(
         conn, conversation_key, effective_speed)
     # Carrier item per turn: prefer the response item, else the first item of the
     # turn — so every priced turn's cost lands on exactly one item (§5.4 reconcile).
+    # Segmentation must not move the carrier, so the selection stays keyed on the
+    # ITEM index and the cost lands on that item's segment 0. Every other segment
+    # carries null rather than zero, because a zero is indistinguishable from a
+    # genuinely free turn.
     carriers: dict[str, int] = {}
     for idx, it in enumerate(items):
         if it["klass"] == "response" and it["turn_id"] is not None and it["turn_id"] not in carriers:
@@ -1097,38 +1686,100 @@ def get_codex_conversation(
         if turn not in carriers:
             leftover_cost += cost
     unattributed_cost = unattr_cost + leftover_cost
+    # Segmentation is disabled under legacy_export, so item grouping there stays
+    # byte-identical to what the export golden already pins.
+    index = _build_segment_index(
+        conversation_key, items, detail_bytes, segmented=not legacy_export)
+
+    # ── Phase B: paginate the index ──────────────────────────────────────────
+    page_index, page = _paginate_items(
+        index, after=after, before=before, tail=tail, limit=limit,
+        block_budget=None if legacy_export else segkern.PAGE_BLOCK_BUDGET,
+        byte_budget=None if legacy_export else segkern.PAGE_SOURCE_BYTE_BUDGET)
+
+    # ── Phase C: hydrate only the page ───────────────────────────────────────
+    page_positions = {
+        (row.source_path, row.line_offset)
+        for entry in page_index for row in entry["_rows"]
+    }
+    hydrated = _load_rows_at_positions(conn, conversation_key, page_positions)
+    if len(hydrated) != len(page_positions):
+        # A miss here is a bug, not a degradation. The narrow index pass and this
+        # wide read select from the SAME table on the same conversation key, so a
+        # position that appears in one and not the other means the two reads
+        # disagree. Falling back to the narrow row would silently render an empty
+        # block, because the narrow row carries no ``text``.
+        missing = sorted(page_positions - set(hydrated))[:5]
+        raise RuntimeError(
+            f"codex detail hydration missed {len(page_positions) - len(hydrated)} "
+            f"of {len(page_positions)} page rows for {conversation_key}; "
+            f"first missing positions: {missing}")
+    # Detail/API callers receive the exact card display projection from retained
+    # provider payloads. Export deliberately renders the byte-frozen legacy text
+    # while retaining the same additive card metadata, so it scopes the payload
+    # read to marker-bearing rows across the WHOLE conversation rather than to
+    # the page — a different set from page_positions, hence a different name.
+    if legacy_export:
+        marker_positions = {
+            (row.source_path, row.line_offset)
+            for row in rows
+            if isinstance(_parse_detail(row.detail_json), dict)
+            and bool(_parse_detail(row.detail_json).get("markers"))
+        }
+        payloads = _load_row_payloads(conn, conversation_key, marker_positions)
+    else:
+        payloads = _load_row_payloads(conn, conversation_key, page_positions)
     built: list[dict] = []
-    for idx, it in enumerate(items):
-        turn = it["turn_id"]
-        cost = None
-        tokens = None
-        if turn is not None and carriers.get(turn) == idx and turn in turn_cost:
+    for entry in page_index:
+        page_rows = [
+            hydrated[(row.source_path, row.line_offset)]
+            for row in entry["_rows"]
+        ]
+        page_item = {
+            "klass": entry["_klass"], "rows": page_rows,
+            "turn_id": entry["_turn_id"], "anchor_row": entry["_anchor_row"],
+        }
+        item_index = entry["_item_index"]
+        turn = entry["_turn_id"]
+        cost = tokens = None
+        if (entry["segment_ordinal"] == 0 and turn is not None
+                and carriers.get(turn) == item_index and turn in turn_cost):
             cost = turn_cost[turn]
             tokens = _tokens_union(turn_tokens[turn])
         item = {
-            "item_key": _item_key_for_item(conversation_key, it),
-            "member_item_keys": _member_item_keys(conversation_key, it),
-            "kind": _item_kind(it),
-            "timestamp_utc": it["anchor_row"].timestamp_utc,
-            "model": it["anchor_row"].model,
+            "item_key": entry["item_key"],
+            "member_item_keys": entry["member_item_keys"],
+            "turn_item_key": entry["turn_item_key"],
+            "segment_ordinal": entry["segment_ordinal"],
+            "kind": entry["kind"],
+            "timestamp_utc": entry["timestamp_utc"],
+            "model": entry["model"],
             "blocks": _build_item_blocks(
-                it, payloads, preserve_marker_text=legacy_export),
+                page_item, payloads, preserve_marker_text=legacy_export,
+                call_owner_count=entry["_call_owner_count"],
+                # #463 S2 §2.5 — never under legacy_export: that path loads only
+                # marker-bearing payloads, so populating `headings` there would
+                # force a whole-conversation payload read for a field the
+                # exporter never reads.
+                decompose_headings=not legacy_export),
             "cost_usd": cost,
             "tokens": tokens,
         }
-        meta = _item_meta(it)
-        if meta is not None:
-            item.update(meta)
-        lifecycle = _item_lifecycle(it)
-        if lifecycle is not None:
-            item["lifecycle"] = lifecycle
+        if entry["_meta"] is not None:
+            item.update(entry["_meta"])
+        if entry["_lifecycle"] is not None:
+            item["lifecycle"] = entry["_lifecycle"]
         built.append(item)
     _attach_spawn_child_links(conn, conversation_key, built)
-    page_items, page = _paginate_items(built, after=after, before=before, tail=tail, limit=limit)
+    page_items = built
     return {
         "status": "ok",
         "conversation_key": conversation_key,
-        "title": _conversation_display_title(conn, conversation_key, rows),
+        # NOT the Phase A rows: those carry no ``text``, and the live-recompute
+        # fallback inside _rollup_fields derives the title from it. Passing None
+        # keeps the stored fast path unchanged and lets the rare no-rollup case
+        # do its own wide read rather than titling the conversation "".
+        "title": _conversation_display_title(conn, conversation_key),
         "items": page_items,
         "page": page,
         "children": _children_of(conn, conversation_key, effective_speed),
@@ -1158,18 +1809,49 @@ def get_codex_conversation_outline(
 ) -> dict:
     """Outline envelope (§5.6): one ``turns[]`` entry per canonical item (label
     via the shared first-non-blank-line helper), plus stats, file touches, and
-    child summaries."""
+    child summaries.
+
+    The outline stays TURN-granular: ``turns[].item_key`` remains a turn key,
+    which is still valid because it is segment 0's key.
+
+    Turn-granular keys alone are not sufficient, though (#463 S1). On a cold
+    jump ``loadToTarget`` resolves the target through the outline and does
+    nothing when the identifier is absent, and outline membership carried only
+    folded-item aliases — no segment keys at all — so a deep link into any
+    segment but a turn's first would silently fail to navigate. Each turn
+    therefore also carries ``segment_item_keys``, where entry ``i`` is the key of
+    segment ``i``.
+
+    That channel is deliberately DISTINCT from ``member_item_keys``. Putting
+    segment keys there would make ``loadToTarget``'s "is it already loaded" test
+    report true for a segment that has not been fetched, so the drain would never
+    run and the jump would land nowhere. Membership for navigation and membership
+    for "this item subsumes that key" are different relations.
+    """
     if not codex_normalization_authoritative(conn):
         return {"status": "normalization_pending", "conversation_key": conversation_key,
                 "turns": [], "files": [], "children": []}
+    # Deliberately the WIDE read: an outline label is the first non-blank line of
+    # its anchor row's display text, which the narrow index pass does not carry.
+    # The outline is not the route F3 bounds, and it stays turn-granular.
     rows = _load_conversation_rows(conn, conversation_key)
     if not rows:
         return {"status": "not_found", "conversation_key": conversation_key}
+    detail_bytes = _detail_bytes_of(rows)
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(kept)
+    segment_keys: dict[int, list[str]] = {}
+    for entry in _build_segment_index(
+            conversation_key, items, detail_bytes, segmented=True):
+        segment_keys.setdefault(entry["_item_index"], []).append(entry["item_key"])
     turns: list[dict] = []
     kind_totals: dict[str, int] = {}
-    for it in items:
+    # Keyed on the ITEM index, which is what _build_segment_index records. Using
+    # ``len(turns)`` would be correct only for as long as this loop appends a
+    # turn for every item without exception; a later ``continue`` would misalign
+    # every subsequent turn's segment keys, and the plausible-looking
+    # ``[item_key]`` fallback would hide it by returning a well-formed answer.
+    for index, it in enumerate(items):
         meta = _item_meta(it)
         anchor_text = _row_display(it["anchor_row"])
         if meta is not None:
@@ -1180,9 +1862,11 @@ def get_codex_conversation_outline(
         for r in it["rows"]:
             kinds[r.kind] = kinds.get(r.kind, 0) + 1
             kind_totals[r.kind] = kind_totals.get(r.kind, 0) + 1
+        item_key = _item_key_for_item(conversation_key, it)
         turn = {
-            "item_key": _item_key_for_item(conversation_key, it),
+            "item_key": item_key,
             "member_item_keys": _member_item_keys(conversation_key, it),
+            "segment_item_keys": segment_keys.get(index, [item_key]),
             "label": label,
             "timestamp_utc": it["anchor_row"].timestamp_utc,
             "kinds": kinds,
@@ -1321,27 +2005,56 @@ def _search_mode(conn: sqlite3.Connection) -> str:
     return "fts"
 
 
-def _pos_to_item_key(conn: sqlite3.Connection, conversation_key: str) -> dict:
-    """Map every physical row ``(source_path, line_offset)`` of a conversation to
-    its canonical ``item_key`` (§6.2). Suppressed mirror members fold to their
-    canonical partner's key, so both members of a pair share one item_key and can
-    never double-count."""
-    rows = _load_conversation_rows(conn, conversation_key)
+def _pos_to_item_key_and_order(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> tuple[dict, list[str]]:
+    """``_pos_to_item_key``'s map, plus the segment keys in detail document order.
+
+    Any caller that turns matched POSITIONS back into an ordered anchor list needs
+    both halves, and it must take the order from the SAME segment index the map
+    came from. Rebuilding the order from ``kern.canonical_items`` instead yields
+    turn keys, which agree with the map only for segment 0 — so every hit past the
+    first segment of a turn silently disappears.
+
+    Suppressed mirror members fold to their canonical partner's key, so both
+    members of a pair share one key and can never double-count.
+
+    Resolving to the turn rather than to the segment is the defect that most
+    nearly shipped: search and find derive their anchors here, so a find hit
+    would jump to the head of a turn instead of to the matching content.
+
+    The narrow index read is enough — the map needs positions and keys, not
+    ``text``.
+    """
+    rows, detail_bytes = _load_conversation_index_rows(conn, conversation_key)
     partners = kern.pair_mirror_partners(rows)
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(kept)
     pos_map: dict[tuple, str] = {}
-    for item in items:
-        item_key = _item_key_for_item(conversation_key, item)
-        for r in item["rows"]:
-            pos_map[(r.source_path, r.line_offset)] = item_key
+    order: list[str] = []
+    for entry in _build_segment_index(
+            conversation_key, items, detail_bytes, segmented=True):
+        order.append(entry["item_key"])
+        for r in entry["_rows"]:
+            pos_map[(r.source_path, r.line_offset)] = entry["item_key"]
+        # Lifecycle rows produce no block and so belong to no fold group, but
+        # they are still physical rows a search hit can name. They resolve to
+        # their turn's head segment.
+        for r in entry["_lifecycle_rows"]:
+            pos_map.setdefault((r.source_path, r.line_offset), entry["item_key"])
     for sup_idx, canon_idx in partners.items():
         sup = rows[sup_idx]
         canon = rows[canon_idx]
         canon_key = pos_map.get((canon.source_path, canon.line_offset))
         if canon_key is not None:
             pos_map[(sup.source_path, sup.line_offset)] = canon_key
-    return pos_map
+    return pos_map, order
+
+
+def _pos_to_item_key(conn: sqlite3.Connection, conversation_key: str) -> dict:
+    """Map every physical row ``(source_path, line_offset)`` of a conversation to
+    the ``item_key`` of the SEGMENT that contains it (§6.2, #463 S1)."""
+    return _pos_to_item_key_and_order(conn, conversation_key)[0]
 
 
 def _fts_query(query: str, column: str | None) -> str:
@@ -1685,22 +2398,24 @@ def find_in_codex_conversation(
         return base
     # Collapse matched physical positions to canonical item_key (mirror-safe), then
     # emit anchors in detail document order.
-    pos_map = _pos_to_item_key(conn, conversation_key)
+    # The ORDER must come from the same segment index as the map (#463 S1). It
+    # used to be rebuilt by walking `kern.canonical_items` and keying each entry
+    # with `_item_key_for_item`, which produces a TURN key; a follower segment's
+    # key can never equal one, so every hit past segment 0 of a turn was dropped
+    # from the anchor list and from `total`. The FindBar then reported fewer
+    # matches than exist and could navigate to none of the missing ones.
+    pos_map, order = _pos_to_item_key_and_order(conn, conversation_key)
     by_item: dict[str, set] = {}
     for pos, labels in matched.items():
         item_key = pos_map.get(pos)
         if item_key is None:
             continue
         by_item.setdefault(item_key, set()).update(labels)
-    kept, _suppressed = kern.pair_mirrors(rows)
-    items = kern.canonical_items(kept)
-    anchors = []
-    for it in items:
-        item_key = _item_key_for_item(conversation_key, it)
-        if item_key in by_item:
-            anchors.append({
-                "item_key": item_key,
-                "match_kinds": sorted(l for l in by_item[item_key] if l != "prose")})
+    anchors = [
+        {"item_key": item_key,
+         "match_kinds": sorted(l for l in by_item[item_key] if l != "prose")}
+        for item_key in order if item_key in by_item
+    ]
     total = len(anchors)
     return {**base, "total": total, "anchors": anchors[:cap],
             "anchors_truncated": total > cap}

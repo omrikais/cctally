@@ -847,18 +847,10 @@ def test_claude_serializer_output_is_byte_stable(monkeypatch):
     assert json.dumps(got) == json.dumps(CLAUDE_WIRE_EXPECTED)
 
 
-def test_source_schema_version_is_unchanged_by_s2():
-    """#443 S2 is a purely additive wire change, so the version stays 3.
-
-    Every field S2 adds is optional and Codex-only, and no published value
-    changes meaning — the transitional percent key and the numeric
-    wasted/efficiency figures are both retained. The bump to 4 belongs to
-    the follow-up release that removes them, together with the note in
-    docs/dashboard-gotchas.md. This pin exists so the value reads as
-    considered rather than forgotten.
-    """
+def test_source_schema_version_moves_with_the_retired_s2_transition():
+    """#465 changes published values and retires a field, so the version is 4."""
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 3
+    assert SOURCE_SCHEMA_VERSION == 4
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

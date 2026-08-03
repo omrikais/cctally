@@ -17,7 +17,7 @@ import { TaskChecklistCard } from './TaskChecklistCard';
 import { parseMcpName } from './parseMcpName';
 import { MediaFigure } from './MediaFigure';
 import { LoadFull } from './LoadFull';
-import { useFocusMode } from './TranscriptContext';
+import { useFocusMode, useSuppressedHeadingKeys } from './TranscriptContext';
 import { NativePayloadDisclosure } from './NativePayloadDisclosure';
 import type { ConversationBlock } from '../types/conversation';
 
@@ -57,6 +57,21 @@ const TASK_TRIO = new Set(['TaskCreate', 'TaskUpdate', 'TaskList']);
 // task_snapshot array. The kernel stamps the snapshot on the run's first call
 // only, so checking the first call is sufficient and avoids mis-collapsing a
 // run that merely interleaves a Task* call after other tools.
+// #463 S2 §2.6 — a reasoning block that will render NOTHING: every heading it
+// carries is a repeat an earlier block of the same turn already rendered, and it
+// retains no body to disclose. The walk below has to make this call itself
+// rather than leave it to the block component, because `out.length` counts React
+// ELEMENTS and an element that renders null still produces the `.conv-blocks`
+// container (which carries a margin) and the MessageItem header row around it —
+// an assistant card with a model chip and no content.
+export function reasoningBlockIsEmpty(
+  block: ConversationBlock, suppressed: ReadonlySet<string>,
+): boolean {
+  if (block.kind !== 'codex_reasoning') return false;
+  if (!block.headings?.length || block.body != null) return false;
+  return block.headings.every((heading) => suppressed.has(heading.key));
+}
+
 function isTaskChecklistRun(calls: ToolCall[]): boolean {
   const first = calls[0];
   return (
@@ -96,25 +111,44 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKin
   // as prose-only conversation. text + thinking render unchanged; tool_call /
   // tool_use runs and orphan tool_result chips are dropped from the walk.
   const chat = useFocusMode() === 'chat';
+  const suppressedHeadings = useSuppressedHeadingKeys();
   const out: ReactNode[] = [];
   let i = 0;
-  let textRun: string[] = [];
-  const flushText = () => {
-    if (textRun.length) {
-      // Coalesced text fragments rejoin with a blank line so adjacent prose
-      // paragraphs stay distinct in the rendered Markdown.
-      out.push(<Markdown key={`t${out.length}`}>{textRun.join('\n\n')}</Markdown>);
-      textRun = [];
-    }
-  };
   while (i < blocks.length) {
     const b = blocks[i];
-    if (b.kind === 'text') {
-      textRun.push(b.text);
+    // §2.6 — drop a block that renders nothing HERE, so the container and the
+    // turn's header row go with it.
+    if (reasoningBlockIsEmpty(b, suppressedHeadings)) {
       i++;
       continue;
     }
-    flushText();
+    if (b.kind === 'text') {
+      // #463 S2 §3.2 — one container per SOURCE text block. Before this, a
+      // maximal run of consecutive text blocks was joined with "\n\n" into one
+      // <Markdown>, so separately authored messages read as a single message.
+      // Measured on a real store: 939 of 13,072 served segments hold such a run,
+      // the longest 40 messages deep.
+      //
+      // The treatment is separation and nothing else — no per-message timestamp,
+      // model chip, cost or header. The timestamps exist on the wire, but the
+      // measured elapsed time inside a welded run is a median of 0.002s, so
+      // rendering them would present noise as signal. Cost stays on the turn.
+      //
+      // §3.3, measured with the real renderer rather than a heuristic: joined
+      // and split rendering differ on exactly 4 of those 939 runs, and on every
+      // one of them a non-last block ends with an unterminated ``` fence. Joined,
+      // that fence swallowed every later message into a code block — up to 22
+      // whole messages. Splitting is therefore the corrected rendering on all
+      // four, which is why the split is unconditional.
+      out.push(
+        <div className="conv-block" key={`t${out.length}`}
+             {...(b.block_key ? { 'data-block-key': b.block_key } : {})}>
+          <Markdown>{b.text}</Markdown>
+        </div>,
+      );
+      i++;
+      continue;
+    }
     if (b.kind === 'tool_call') {
       let run: Extract<ConversationBlock, { kind: 'tool_call' }>[] = [];
       const flushRun = () => {
@@ -153,7 +187,6 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKin
     out.push(<BlockChip key={`c${out.length}`} block={b} anchorUuid={anchorUuid} />);
     i++;
   }
-  flushText();
   if (out.length === 0) return null;
   return <div className="conv-blocks">{out}</div>;
 }
@@ -352,13 +385,52 @@ function CodexReasoningBlock({ block }: {
   block: Extract<ConversationBlock, { kind: 'codex_reasoning' }>;
 }) {
   const headline = block.title ?? block.summary ?? block.body ?? '';
+  // #463 S2 §2.6 — body is null for every reasoning block in the measured
+  // corpus (0 of 10,471 post-dedup), so `expandable` is always false TODAY and
+  // every block renders as a plain line. The wire can still carry a body, so
+  // this is a fact about current data and NOT an unreachable code path: do not
+  // delete the disclosure branch below and do not "fix" the always-false gate.
   const expandable = block.body != null;
+  // §2.6 — prefer the decomposed headings when the server supplied them, so each
+  // authored heading is its own readable, individually addressable line. Falls
+  // back to the single headline when absent, which is what a pre-#463-S2 server
+  // and an unreadable retained payload both produce.
+  //
+  // A heading an earlier block of the same TURN already rendered is dropped:
+  // Codex writes cumulative summaries, so consecutive blocks re-state each
+  // other's headings, which cost one clipped line before S2 and cost a full line
+  // each after it. The reader computes the set (it needs the whole turn, which
+  // one block cannot see); see suppressRepeatedHeadings.ts for the measurement.
+  const suppressed = useSuppressedHeadingKeys();
+  const kept = block.headings?.filter((heading) => !suppressed.has(heading.key));
+  const headings = kept?.length ? kept : null;
+  // Every heading this block decomposed into was a repeat. With no body to
+  // disclose the block would render as an empty REASONING label, so it is
+  // dropped (MessageBlocks drops it a step earlier so the container goes too;
+  // this guard keeps the component correct on its own). A retained body still
+  // earns its disclosure — but NOT the headline fallback: for a cumulative
+  // aggregate the stored projection IS the summary blob, so falling through to
+  // `title ?? summary ?? body` printed every heading the rule had just
+  // suppressed, undecomposed and unclipped.
+  const allHeadingsSuppressed = Boolean(block.headings?.length) && !headings;
+  if (allHeadingsSuppressed && block.body == null) return null;
   const summary = (
     <>
       {expandable && <span className="conv-chev" aria-hidden="true" />}
       <ThinkingIcon />
       <span className="conv-codex-reasoning-label">Reasoning</span>
-      <span className="conv-codex-reasoning-title"><Markdown>{headline}</Markdown></span>
+      {headings ? (
+        <span className="conv-codex-reasoning-headings">
+          {headings.map((heading) => (
+            <span className="conv-codex-reasoning-title" key={heading.key}
+                  data-heading-key={heading.key}>
+              {heading.text}
+            </span>
+          ))}
+        </span>
+      ) : allHeadingsSuppressed ? null : (
+        <span className="conv-codex-reasoning-title"><Markdown>{headline}</Markdown></span>
+      )}
     </>
   );
   if (!expandable) {

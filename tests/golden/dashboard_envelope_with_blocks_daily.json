@@ -6,23 +6,23 @@
       90,
       100
     ],
+    "codex_budget_alerts_enabled": false,
+    "codex_budget_configured": false,
+    "codex_projected_enabled": false,
+    "command_configured": false,
     "enabled": false,
     "five_hour_thresholds": [
       90,
       95
     ],
+    "notifier": "auto",
+    "project_alerts_enabled": false,
     "projected_budget_enabled": false,
     "projected_weekly_enabled": false,
-    "project_alerts_enabled": false,
-    "codex_budget_configured": false,
-    "codex_budget_alerts_enabled": false,
-    "codex_projected_enabled": false,
     "weekly_thresholds": [
       90,
       95
-    ],
-    "notifier": "auto",
-    "command_configured": false
+    ]
   },
   "blocks": {
     "rows": [
@@ -47,6 +47,7 @@
     "total_cost_usd": 0.0,
     "total_tokens": 0
   },
+  "cache_report": null,
   "current_week": null,
   "daily": {
     "peak": {
@@ -105,6 +106,8 @@
     "cache_failure_markers": true,
     "live_tail": true
   },
+  "data_version": "",
+  "default_source": "claude",
   "display": {
     "offset_label": "UTC",
     "offset_seconds": 0,
@@ -125,8 +128,6 @@
   "envelope_version": 2,
   "forecast": null,
   "generated_at": "2026-04-26T12:00:00Z",
-  "data_version": "",
-  "default_source": "claude",
   "header": {
     "dollar_per_pct": null,
     "five_hour_pct": null,
@@ -145,7 +146,6 @@
     "total_tokens": 0
   },
   "projects": null,
-  "cache_report": null,
   "sessions": {
     "rows": [],
     "sort_key": "started_desc",
@@ -156,7 +156,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 3,
+  "source_schema_version": 4,
   "sources": {
     "all": {
       "availability": "unavailable",
@@ -223,12 +223,12 @@
   "sync_failure": null,
   "trend": null,
   "update": {
+    "configured_channel": "stable",
     "state": null,
     "suppress": {
       "remind_after": null,
       "skipped_versions": []
-    },
-    "configured_channel": "stable"
+    }
   },
   "weekly": {
     "rows": [],

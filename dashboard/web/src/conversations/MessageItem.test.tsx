@@ -1177,3 +1177,62 @@ describe('MessageItem per-turn cost gating (#228 S3 B2)', () => {
     expect(cost.textContent).toContain('out 10');
   });
 });
+
+// #463 S2 §2.6 — the empty assistant card.
+//
+// `MessageBlocks` returning null removes `.conv-blocks`, but the assistant
+// branch renders `.conv-item-head` — role dot, "Assistant" label, model chip,
+// `· HH:mm` eyebrow — unconditionally and independently of `<MessageBlocks>`.
+// So a page-budget split that puts a fully-repeated reasoning block alone in a
+// follower segment still showed a card: a model chip, a timestamp, no content.
+// The whole item is gated on rendering nothing, not just its body.
+describe('#463 S2 — an assistant turn that renders nothing renders NO card', () => {
+  const repeatOnly = {
+    kind: 'assistant',
+    anchor: { session_id: 's', uuid: 'seg1', id: 91 },
+    member_uuids: ['seg1'],
+    turn_uuid: 'seg0',
+    segment_ordinal: 1,
+    ts: '2026-07-18T10:00:00Z',
+    text: '',
+    model: 'gpt-5.3-codex',
+    // Followers hold `cost_usd: null`, never 0 (the S1 segment contract).
+    cost_usd: null,
+    blocks: [{
+      kind: 'codex_reasoning', source: 'response_item',
+      headings: [{ key: 'seg1#0', text: 'A' }, { key: 'seg1#1', text: 'B' }],
+    }],
+    is_sidechain: false,
+    subagent_key: null,
+    parent_uuid: null,
+  } as unknown as ConversationItem;
+
+  const renderSuppressed = (suppressed: string[]) =>
+    render(
+      <TranscriptContext.Provider
+        value={{ sessionId: 's', fmtCtx, suppressedHeadingKeys: new Set(suppressed) }}>
+        <MessageItem item={repeatOnly} />
+      </TranscriptContext.Provider>,
+    );
+
+  it('drops the card entirely when every heading of its only block is a repeat', () => {
+    const { container } = renderSuppressed(['seg1#0', 'seg1#1']);
+    expect(container.querySelector('.conv-item')).toBeNull();
+    expect(container.querySelector('.conv-item-head')).toBeNull();
+    expect(container.querySelector('.chip')).toBeNull();
+    expect(container.textContent).toBe('');
+  });
+
+  it('non-vacuity: the same turn renders its card when the headings survive', () => {
+    const { container } = renderSuppressed([]);
+    expect(container.querySelector('.conv-item')).not.toBeNull();
+    expect(container.querySelector('.conv-item-head')).not.toBeNull();
+    expect(container.querySelectorAll('[data-heading-key]')).toHaveLength(2);
+  });
+
+  it('keeps the card when one heading of the block survives', () => {
+    const { container } = renderSuppressed(['seg1#0']);
+    expect(container.querySelector('.conv-item')).not.toBeNull();
+    expect(container.querySelectorAll('[data-heading-key]')).toHaveLength(1);
+  });
+});

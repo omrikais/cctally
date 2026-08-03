@@ -18,7 +18,11 @@ from pathlib import Path
 # Make _fixture_builders importable when run directly (bin/ is not on sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _fixture_builders import create_cache_db, create_stats_db  # noqa: E402
+from _fixture_builders import (  # noqa: E402
+    create_cache_db,
+    create_stats_db,
+    fixture_timestamp_utc,
+)
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/project"
 
@@ -33,7 +37,7 @@ _FIXED_LAST_INGESTED_AT = "2026-04-15T15:00:00Z"
 # -- Helpers -----------------------------------------------------------------
 
 def _iso(ts: dt.datetime) -> str:
-    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fixture_timestamp_utc(ts)
 
 def _insert_entry(conn, *, source_path, ts, model, input_t, output_t,
                   cache_create=0, cache_read=0, session_id="s0", project_path):

@@ -48,7 +48,11 @@ describe('MessageBlocks (ordered walk + tool-run grouping)', () => {
     expect(screen.getByText('/spec.md')).toBeInTheDocument();
   });
 
-  it('coalesces consecutive text blocks into one Markdown render', () => {
+  it('renders consecutive text blocks as SEPARATE Markdown containers', () => {
+    // #463 S2 §3.2 reversed this test. It previously asserted ONE coalesced
+    // <Markdown> wrapper for a run of text blocks, which is the F16 defect:
+    // separately authored messages read as a single message. Each source block
+    // now renders in its own container.
     const { container } = render(
       <MessageBlocks
         blocks={[
@@ -57,8 +61,7 @@ describe('MessageBlocks (ordered walk + tool-run grouping)', () => {
         ]}
       />,
     );
-    // One coalesced <Markdown> wrapper, not two.
-    expect(container.querySelectorAll('.md')).toHaveLength(1);
+    expect(container.querySelectorAll('.md')).toHaveLength(2);
     expect(container.textContent).toContain('para one');
     expect(container.textContent).toContain('para two');
   });
@@ -999,5 +1002,212 @@ describe('MessageBlocks find highlighting (#236)', () => {
       <MessageBlocks blocks={[{ kind: 'tool_result', text: 'flock acquired', truncated: false, is_error: false }]} />,
     );
     expect(container.querySelector('.conv-chip--result pre mark')?.textContent).toBe('flock');
+  });
+});
+
+// ── #463 S2 §2.6 / §3.2 — intra-turn reading ────────────────────────────────
+
+describe('#463 S2 — Codex reasoning headings', () => {
+  it('renders one line per heading, each individually addressable', () => {
+    const blocks = [{
+      kind: 'codex_reasoning', source: 'response_item', summary: '**A**\n**B**',
+      headings: [{ key: 'bk#0', text: 'A' }, { key: 'bk#1', text: 'B' }],
+    }] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    const lines = container.querySelectorAll('[data-heading-key]');
+    expect([...lines].map((n) => n.getAttribute('data-heading-key')))
+      .toEqual(['bk#0', 'bk#1']);
+    expect([...lines].map((n) => n.textContent)).toEqual(['A', 'B']);
+  });
+
+  it('falls back to summary when headings are absent', () => {
+    const blocks = [{
+      kind: 'codex_reasoning', source: 'response_item', summary: '**A**\n**B**',
+    }] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelectorAll('[data-heading-key]')).toHaveLength(0);
+    expect(container.textContent).toContain('A');
+  });
+
+  it('keeps the disclosure branch when a body is retained', () => {
+    // §2.6 — body is null for every reasoning block in the measured corpus, so
+    // `expandable` is always false TODAY. The wire can still carry a body, so
+    // this is a fact about current data, not an unreachable code path. Do not
+    // delete the <details> branch and do not "fix" the always-false gate.
+    const blocks = [{
+      kind: 'codex_reasoning', source: 'response_item', summary: '**A**\n**B**',
+      body: 'Retained body.',
+      headings: [{ key: 'bk#0', text: 'A' }, { key: 'bk#1', text: 'B' }],
+    }] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelector('details.conv-codex-reasoning')).not.toBeNull();
+    expect(container.querySelectorAll('[data-heading-key]')).toHaveLength(2);
+    expect(container.querySelector('.conv-codex-reasoning-body')?.textContent)
+      .toContain('Retained body.');
+  });
+});
+
+describe('#463 S2 — duplicate cumulative aggregates are not re-rendered', () => {
+  // §2.6. Consecutive reasoning blocks in one turn carry cumulative summaries,
+  // so the same headings re-render several times. The reader computes which
+  // KEYS are repeats (suppressRepeatedHeadings, turn-scoped) and provides the
+  // set here; the block renders only the rest.
+  const cumulative = [
+    {
+      kind: 'codex_reasoning', source: 'response_item',
+      headings: [{ key: 'b0#0', text: 'A' }, { key: 'b0#1', text: 'B' }],
+    },
+    {
+      kind: 'codex_reasoning', source: 'response_item',
+      headings: [{ key: 'b1#0', text: 'A' }, { key: 'b1#1', text: 'B' },
+                 { key: 'b1#2', text: 'C' }],
+    },
+  ] as unknown as ConversationBlock[];
+
+  it('renders each heading text once, in document order', () => {
+    const { container } = render(
+      <TranscriptContext.Provider
+        value={{ sessionId: 's', suppressedHeadingKeys: new Set(['b1#0', 'b1#1']) }}>
+        <MessageBlocks blocks={cumulative} />
+      </TranscriptContext.Provider>);
+    expect([...container.querySelectorAll('[data-heading-key]')]
+      .map((n) => n.textContent)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('drops a block whose every heading is a repeat and which has no body', () => {
+    const allRepeated = [
+      cumulative[0],
+      {
+        kind: 'codex_reasoning', source: 'response_item',
+        headings: [{ key: 'b1#0', text: 'A' }, { key: 'b1#1', text: 'B' }],
+      },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(
+      <TranscriptContext.Provider
+        value={{ sessionId: 's', suppressedHeadingKeys: new Set(['b1#0', 'b1#1']) }}>
+        <MessageBlocks blocks={allRepeated} />
+      </TranscriptContext.Provider>);
+    expect(container.querySelectorAll('.conv-codex-reasoning')).toHaveLength(1);
+  });
+
+  it('keeps a fully-repeated block that retains a body', () => {
+    // The disclosure is the only place the body can be read, so the block must
+    // survive even when it contributes no new heading line.
+    const withBody = [
+      cumulative[0],
+      {
+        // The shape `tests/fixtures/codex-reader/golden-adapted-segmented.json`
+        // holds: the stored projection of a cumulative aggregate IS the summary
+        // blob, alongside a retained body.
+        kind: 'codex_reasoning', source: 'response_item', body: 'Retained body.',
+        summary: '**A**\n**B**',
+        headings: [{ key: 'b1#0', text: 'A' }, { key: 'b1#1', text: 'B' }],
+      },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(
+      <TranscriptContext.Provider
+        value={{ sessionId: 's', suppressedHeadingKeys: new Set(['b1#0', 'b1#1']) }}>
+        <MessageBlocks blocks={withBody} />
+      </TranscriptContext.Provider>);
+    expect(container.querySelectorAll('.conv-codex-reasoning')).toHaveLength(2);
+    const disclosure = container.querySelector('details.conv-codex-reasoning')!;
+    expect(disclosure).not.toBeNull();
+    // …but it must not re-print what the rule just suppressed. With every
+    // heading dropped the block fell through to the `title ?? summary ?? body`
+    // headline, and for a cumulative aggregate the stored projection IS the
+    // summary blob — so the disclosure printed the whole suppressed list back,
+    // undecomposed and unclipped.
+    expect(disclosure.querySelector('summary')!.textContent).not.toContain('A');
+    expect(disclosure.querySelectorAll('[data-heading-key]')).toHaveLength(0);
+    expect(disclosure.querySelector('.conv-codex-reasoning-body')?.textContent)
+      .toContain('Retained body.');
+  });
+
+  it('renders no block container for a turn whose only block is fully repeated', () => {
+    // `out.length === 0` counts React ELEMENTS, not rendered DOM, so a block
+    // component that returns null still produced an empty `.conv-blocks` div
+    // (which carries a margin) and the MessageItem header row around it — an
+    // assistant card with a model chip and no content. A page-budget split that
+    // puts a fully-repeated reasoning block alone in a segment shows exactly that.
+    const onlyRepeat = [
+      {
+        kind: 'codex_reasoning', source: 'response_item',
+        headings: [{ key: 'b1#0', text: 'A' }, { key: 'b1#1', text: 'B' }],
+      },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(
+      <TranscriptContext.Provider
+        value={{ sessionId: 's', suppressedHeadingKeys: new Set(['b1#0', 'b1#1']) }}>
+        <MessageBlocks blocks={onlyRepeat} />
+      </TranscriptContext.Provider>);
+    expect(container.querySelectorAll('.conv-codex-reasoning')).toHaveLength(0);
+    expect(container.querySelector('.conv-blocks')).toBeNull();
+  });
+
+  it('renders everything when no suppression set is provided', () => {
+    const { container } = render(<MessageBlocks blocks={cumulative} />);
+    expect(container.querySelectorAll('[data-heading-key]')).toHaveLength(5);
+  });
+});
+
+describe('#463 S2 — separately authored messages render separately', () => {
+  it('renders each source text block as its own container', () => {
+    const blocks = [
+      { kind: 'text', text: 'first message', block_key: 'bk0' },
+      { kind: 'text', text: 'second message', block_key: 'bk1' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    const keyed = container.querySelectorAll('[data-block-key]');
+    expect([...keyed].map((n) => n.getAttribute('data-block-key')))
+      .toEqual(['bk0', 'bk1']);
+    expect(container.querySelectorAll('.md')).toHaveLength(2);
+  });
+
+  it('renders no per-message timestamp, model chip, cost or header', () => {
+    // §3.2 — the treatment is separation and nothing else. Measured elapsed
+    // inside a welded run is a median of 0.002s, so a per-message timestamp
+    // would present noise as signal. Cost stays on the turn.
+    const blocks = [
+      { kind: 'text', text: 'a', block_key: 'bk0' },
+      { kind: 'text', text: 'b', block_key: 'bk1' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelector('.conv-block-timestamp')).toBeNull();
+    expect(container.textContent).toBe('ab');
+  });
+
+  it('keeps a keyless text block rendering, for a pre-#463-S2 server', () => {
+    const blocks = [
+      { kind: 'text', text: 'first' }, { kind: 'text', text: 'second' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelectorAll('.md')).toHaveLength(2);
+    expect(container.textContent).toBe('firstsecond');
+  });
+
+  it('does not weld across a non-text block', () => {
+    const blocks = [
+      { kind: 'text', text: 'a', block_key: 'bk0' },
+      { kind: 'thinking', text: 'pondering' },
+      { kind: 'text', text: 'b', block_key: 'bk1' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    expect(container.querySelectorAll('[data-block-key]')).toHaveLength(2);
+  });
+
+  it('renders an unterminated code fence without swallowing the next message', () => {
+    // §3.3, the ONE measured divergent shape. Across all 939 welded runs in the
+    // real store, joined and split rendering differ on exactly 4, and on every
+    // one of them a non-last block ends with an unterminated ``` fence. Joined,
+    // that fence swallowed every later message into a code block — in the worst
+    // case 22 whole messages. Split, each message renders as authored.
+    const blocks = [
+      { kind: 'text', text: 'Body:\n\n```markdown\nParent: #308', block_key: 'bk0' },
+      { kind: 'text', text: 'The preview is complete.', block_key: 'bk1' },
+    ] as unknown as ConversationBlock[];
+    const { container } = render(<MessageBlocks blocks={blocks} />);
+    const second = container.querySelectorAll('[data-block-key]')[1];
+    expect(second.querySelector('pre, code')).toBeNull();
+    expect(second.textContent).toContain('The preview is complete.');
   });
 });

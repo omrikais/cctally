@@ -18,6 +18,7 @@ import { cleanup, render } from '@testing-library/react';
 import {
   CODEX_STALE_CYCLE_NOTE,
   HeroStrip,
+  codexIngestBacklogCompactLabel,
   codexIngestBacklogLabel,
   codexIngestBacklogNote,
   joinHeroNotes,
@@ -72,6 +73,12 @@ describe('codexIngestBacklogLabel', () => {
 
   it('agrees with itself on the singular', () => {
     expect(codexIngestBacklogLabel({ files: 1 })).toContain('1 session');
+  });
+
+  it('has a phone-width form that fits the narrow spent zone', () => {
+    expect(codexIngestBacklogCompactLabel({ files: 3 })).toBe('+3 more');
+    expect(codexIngestBacklogCompactLabel({ files: 1 })).toBe('+1 more');
+    expect(codexIngestBacklogCompactLabel({ files: 0 })).toBeNull();
   });
 });
 
@@ -161,6 +168,18 @@ function renderCodex(codexData: CodexSourceData, focus?: string): HTMLElement {
   }
   const { container } = render(<HeroStrip />);
   return container.querySelector('.hero-spent') as HTMLElement;
+}
+
+function renderAll(codexData: CodexSourceData, combinedAvailable = true) {
+  const env = envWith(codexData);
+  if (!combinedAvailable) env.sources!.all.data!.combined = null;
+  updateSnapshot(env);
+  dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  const rendered = render(<HeroStrip />);
+  return {
+    ...rendered,
+    spent: rendered.getByTestId('shared-hero-spent'),
+  };
 }
 
 function noteIn(spent: HTMLElement): HTMLElement | null {
@@ -259,6 +278,15 @@ describe('<HeroStrip /> ingest-backlog disclosure — visibility', () => {
     expect(note!.className).toContain('hs-sub');
   });
 
+  it('renders distinct full and compact labels for the responsive CSS gate', () => {
+    const spent = renderCodex(withBacklog(makeCodexSourceData()));
+    const note = noteIn(spent)!;
+    expect(note.querySelector('.hero-ingest-backlog-label-full'))
+      .toHaveTextContent('+3 sessions still loading');
+    expect(note.querySelector('.hero-ingest-backlog-label-compact'))
+      .toHaveTextContent('+3 more');
+  });
+
   it('does not double-announce — the zone aria-label is the single reading', () => {
     const spent = renderCodex(withBacklog(makeCodexSourceData()));
     expect(noteIn(spent)!.getAttribute('aria-hidden')).toBe('true');
@@ -301,5 +329,59 @@ describe('<HeroStrip /> ingest-backlog disclosure — visibility', () => {
     expect((spent.querySelector('.hs-big') as HTMLElement).textContent)
       .toBe('$12.30');
     expect(spent.textContent).toContain('/ 1% used');
+  });
+});
+
+describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#456)', () => {
+  it('qualifies the Combined spend with the same visible short note', () => {
+    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()));
+    const note = noteIn(spent);
+
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain('+3 sessions still loading');
+    expect(note!.className).toContain('hs-sub');
+    expect(note!.getAttribute('aria-hidden')).toBe('true');
+    expect(spent.textContent).toContain('$20.70');
+  });
+
+  it('exposes the full disclosure as a title and accessible group name', () => {
+    const { spent, getByRole } = renderAll(
+      withBacklog(makeDecoratedCodexSourceData()),
+    );
+
+    expect(spent.getAttribute('title')).toMatch(/still loading/i);
+    expect(spent.getAttribute('aria-label')).toMatch(/still loading/i);
+    expect(getByRole('group', { name: /still loading/i })).toBe(spent);
+  });
+
+  it('does not widen the account-scoped stale-cycle note to Combined', () => {
+    const { spent } = renderAll(withBacklog(
+      withStaleParentCycle(makeDecoratedCodexSourceData()),
+    ));
+
+    expect(spent.getAttribute('aria-label')).toMatch(/still loading/i);
+    expect(spent.getAttribute('aria-label')).not.toMatch(/forecast is paused/i);
+    expect(spent.getAttribute('title')).not.toMatch(/forecast is paused/i);
+  });
+
+  it('omits every backlog channel when no work is owed', () => {
+    const { spent } = renderAll(makeDecoratedCodexSourceData());
+
+    expect(noteIn(spent)).toBeNull();
+    expect(spent.getAttribute('title')).toBeNull();
+    expect(spent.getAttribute('aria-label')).toBeNull();
+    expect(spent.getAttribute('role')).toBeNull();
+  });
+
+  it('lets the existing unavailable warning win when Combined has no number', () => {
+    const { spent } = renderAll(
+      withBacklog(makeDecoratedCodexSourceData()),
+      false,
+    );
+
+    expect(noteIn(spent)).toBeNull();
+    expect(spent.getAttribute('title')).toBeNull();
+    expect(spent.getAttribute('aria-label')).toBeNull();
+    expect(spent.textContent).toContain('Combined unavailable');
   });
 });

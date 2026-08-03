@@ -1648,6 +1648,20 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # at `_uv == STATS_INDEX_EPOCH` above and never reaches here, so the hot
     # path takes no exclusive lock at all.
     with _cctally_store.stats_open_time_guard(live=_target_path is None):
+        # Another opener can win the exclusive guard after this connection's
+        # pre-lock epoch read, initialize/cut over the index, and stamp the
+        # current epoch while this opener waits. Recheck under the guard before
+        # acting on that stale legacy/fresh decision; otherwise the loser enters
+        # the frozen migration dispatcher with user_version=1006 and reports a
+        # false downgrade against legacy head 13.
+        if _epoch_engaged and conn.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0] == STATS_INDEX_EPOCH:
+            if _target_path is None:
+                _reconcile_durable_applied_migration_errors(
+                    conn, _STATS_MIGRATIONS, "stats.db"
+                )
+            return conn
         _fixups_current = _cctally_store.stats_open_fixups_current(conn)
         conn.execute(
             """

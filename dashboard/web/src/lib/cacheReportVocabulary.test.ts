@@ -11,29 +11,32 @@ import {
 } from './cacheReportVocabulary';
 
 describe('cachePercent', () => {
-  it('prefers the Codex authoritative key', () => {
-    expect(cachePercent({ cached_input_percent: 61, cache_hit_percent: 61 })).toBe(61);
+  it('reads only the Codex authoritative key for Codex', () => {
+    expect(cachePercent({ cached_input_percent: 61, cache_hit_percent: 99 }, 'codex')).toBe(61);
+    expect(cachePercent({ cache_hit_percent: 42 }, 'codex')).toBeNull();
   });
 
-  it('falls back to the legacy key for a pre-S2 server', () => {
-    expect(cachePercent({ cache_hit_percent: 42 })).toBe(42);
+  it('reads only the Claude authoritative key for Claude', () => {
+    expect(cachePercent({ cache_hit_percent: 42, cached_input_percent: 99 }, 'claude')).toBe(42);
+    expect(cachePercent({ cached_input_percent: 61 }, 'claude')).toBeNull();
   });
 
   it('returns null when neither key is present', () => {
-    expect(cachePercent({})).toBeNull();
+    expect(cachePercent({}, 'codex')).toBeNull();
+    expect(cachePercent({}, 'claude')).toBeNull();
   });
 
   it('does not treat 0 as missing', () => {
     // `||` here would erase a genuinely measured zero-reuse day, which is
     // exactly the fabricated-versus-measured distinction this session exists
     // to keep.
-    expect(cachePercent({ cache_hit_percent: 0 })).toBe(0);
-    expect(cachePercent({ cached_input_percent: 0, cache_hit_percent: 71 })).toBe(0);
+    expect(cachePercent({ cache_hit_percent: 0 }, 'claude')).toBe(0);
+    expect(cachePercent({ cached_input_percent: 0, cache_hit_percent: 71 }, 'codex')).toBe(0);
   });
 
-  it('treats an explicit null as absent rather than as a value', () => {
-    expect(cachePercent({ cached_input_percent: null, cache_hit_percent: 12 })).toBe(12);
-    expect(cachePercent({ cached_input_percent: null, cache_hit_percent: null })).toBeNull();
+  it('treats an explicit null as absent without crossing provider fields', () => {
+    expect(cachePercent({ cached_input_percent: null, cache_hit_percent: 12 }, 'codex')).toBeNull();
+    expect(cachePercent({ cached_input_percent: 12, cache_hit_percent: null }, 'claude')).toBeNull();
   });
 });
 
@@ -111,27 +114,26 @@ describe('notApplicableReason', () => {
 // percent from reaching a template literal, so it earns direct coverage.
 describe('cachePercentText', () => {
   it('renders a measured value, including a genuine zero', () => {
-    expect(cachePercentText({ cached_input_percent: 87.4 })).toBe('87%');
-    expect(cachePercentText({ cached_input_percent: 0 })).toBe('0%');
+    expect(cachePercentText({ cached_input_percent: 87.4 }, 'codex')).toBe('87%');
+    expect(cachePercentText({ cached_input_percent: 0 }, 'codex')).toBe('0%');
+    expect(cachePercentText({ cache_hit_percent: 42.9 }, 'claude')).toBe('42%');
   });
 
   it('returns null — never "0%" or "NaN%" — when nothing was measured', () => {
     // The whole point: a template literal on a missing value produced
     // `NaN%`, and a `?? 0` produced a confident `0%`. Both are lies.
-    expect(cachePercentText({})).toBeNull();
-    expect(cachePercentText({ cached_input_percent: null })).toBeNull();
-    expect(cachePercentText({ cache_hit_percent: null })).toBeNull();
+    expect(cachePercentText({}, 'codex')).toBeNull();
+    expect(cachePercentText({ cached_input_percent: null }, 'codex')).toBeNull();
+    expect(cachePercentText({ cache_hit_percent: null }, 'claude')).toBeNull();
   });
 
-  it('prefers the authoritative key and falls back to the transitional one', () => {
-    expect(cachePercentText({ cache_hit_percent: 40 })).toBe('40%');
-    expect(cachePercentText({
-      cached_input_percent: 61, cache_hit_percent: 61,
-    })).toBe('61%');
+  it('never falls back across provider fields', () => {
+    expect(cachePercentText({ cache_hit_percent: 40 }, 'codex')).toBeNull();
+    expect(cachePercentText({ cached_input_percent: 61 }, 'claude')).toBeNull();
   });
 
   it('floors rather than rounds, matching fmt.pctFloor', () => {
-    expect(cachePercentText({ cached_input_percent: 87.9 })).toBe('87%');
+    expect(cachePercentText({ cached_input_percent: 87.9 }, 'codex')).toBe('87%');
   });
 });
 

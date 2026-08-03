@@ -48,6 +48,14 @@ export interface TranscriptCtxValue {
   // for the Export menu + every per-card CopyButton). Optional + default FALSE
   // for provider-less card tests (which assert today's raw-copy behavior).
   anonMode?: boolean;
+  // #463 S2 §2.6 — reasoning heading keys the reader must not render, because an
+  // earlier block of the SAME TURN already rendered that text (Codex writes
+  // cumulative reasoning summaries). Computed once by the reader over the loaded
+  // window, for the same memo economics as fmtCtx: the decision needs the whole
+  // turn, which one block cannot see, and per-item recomputation would defeat
+  // the MessageItem memo. Optional + default empty, so a provider-less card test
+  // renders every heading exactly as before.
+  suppressedHeadingKeys?: ReadonlySet<string>;
 }
 
 export const TranscriptContext = createContext<TranscriptCtxValue>({
@@ -76,3 +84,7 @@ export const useMaxTurnCost = (): number =>
 // isolated card tests copy raw exactly as before.
 export const useAnonMode = (): boolean =>
   useContext(TranscriptContext).anonMode ?? false;
+// #463 S2 §2.6 — empty by default: no provider value means suppress nothing.
+const NO_SUPPRESSED_HEADINGS: ReadonlySet<string> = new Set<string>();
+export const useSuppressedHeadingKeys = (): ReadonlySet<string> =>
+  useContext(TranscriptContext).suppressedHeadingKeys ?? NO_SUPPRESSED_HEADINGS;

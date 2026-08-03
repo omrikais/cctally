@@ -80,7 +80,8 @@ export function CacheSparkline({
   size,
   source,
 }: CacheSparklineProps) {
-  const vocab = cacheVocabulary(source ?? 'claude');
+  const resolvedSource = source ?? 'claude';
+  const vocab = cacheVocabulary(resolvedSource);
   const cfg = SIZES[size];
   const isLarge = size === 'large';
   // Reverse newest-first envelope so the polyline renders oldest -> newest.
@@ -94,7 +95,7 @@ export function CacheSparkline({
   // an `undefined` that propagated into a NaN domain and a NaN-coordinate
   // polyline — invisible to any text assertion, and a visibly broken chart.
   const plottable = ordered
-    .map((d, i) => ({ d, i, pct: cachePercent(d) }))
+    .map((d, i) => ({ d, i, pct: cachePercent(d, resolvedSource) }))
     .filter(({ d, pct }) => d.observed !== false && pct !== null) as
       Array<{ d: CacheReportDailyRow; i: number; pct: number }>;
 
@@ -165,7 +166,7 @@ export function CacheSparkline({
 
   const todayIdx = ordered.length - 1;
   const todayRow = ordered[todayIdx];
-  const todayPct = cachePercent(todayRow);
+  const todayPct = cachePercent(todayRow, resolvedSource);
   const todayObserved = todayRow.observed !== false;
   const todayPlottable = todayObserved && todayPct !== null;
   const todayCx = xFor(todayIdx);

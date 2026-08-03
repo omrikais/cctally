@@ -190,3 +190,77 @@ describe('insertTimeMarkers', () => {
     expect(new Set(keys).size).toBe(2); // unique despite the repeated instant
   });
 });
+
+// ── #463 S2 §4.2 — markers fire INSIDE a turn ───────────────────────────────
+
+describe('#463 S2 intra-turn time markers', () => {
+  // A segment carries a turn_uuid distinct from its own uuid when it is a
+  // follower (segment_ordinal > 0). Markers key only on adjacent ITEM
+  // timestamps, and since #463 S1 made the segment the item, two segments of
+  // ONE turn are adjacent items and can therefore carry a marker between them.
+  function segment(uuid: string, turn: string, ordinal: number, ts: string): FilteredNode {
+    const item = {
+      kind: 'assistant',
+      anchor: { session_id: 's', uuid, id: 0 },
+      member_uuids: [uuid], ts, text: uuid, blocks: [],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      turn_uuid: turn, segment_ordinal: ordinal, cost_usd: null,
+    } as unknown as ConversationItem;
+    return { kind: 'item', item };
+  }
+
+  it('inserts a time marker between two segments of ONE turn', () => {
+    // 31 minutes, past the 600s threshold. Measured on a real store: 204 of the
+    // 590 multi-segment turns hold an adjacent-segment gap over that threshold
+    // and get a marker where before S1 they could not.
+    const out = insertTimeMarkers([
+      segment('s0', 't', 0, '2026-07-18T10:00:00Z'),
+      segment('s1', 't', 1, '2026-07-18T10:31:00Z'),
+    ], UTC);
+    expect(out.map((n) => n.kind)).toEqual(['item', 'time_marker', 'item']);
+    expect(markers(out)[0].gapSeconds).toBe(1860);
+  });
+
+  it('does not insert one when the intra-turn gap is under the threshold', () => {
+    const out = insertTimeMarkers([
+      segment('s0', 't', 0, '2026-07-18T10:00:00Z'),
+      segment('s1', 't', 1, '2026-07-18T10:05:00Z'),
+    ], UTC);
+    expect(out.map((n) => n.kind)).toEqual(['item', 'item']);
+  });
+
+  it('cannot show a gap INSIDE one segment — the recorded residual', () => {
+    // §4.2. `insertTimeMarkers` inspects ITEM timestamps only, so a gap between
+    // two rows of the SAME segment is invisible. Measured: 54 segments across
+    // 19 conversations hold an internal gap over the threshold — 0.41% of all
+    // segments, worst case 27.8 hours. Fixing it would mean inserting markers
+    // BETWEEN BLOCKS inside an item, changing the render structure for four
+    // segments in a thousand. This test pins the limitation so a later reader
+    // finds it stated rather than rediscovering it.
+    //
+    // The two halves together are what observe the property. A bare "one item in,
+    // one node out" assertion would also hold for a function that returned its
+    // input unchanged, so it could not see the limitation it names. The positive
+    // control puts the SAME 27-hour span between two items and requires a marker;
+    // the negative half puts it between two BLOCKS of one item and requires none.
+    const early = '2026-07-18T10:00:00Z';
+    const late = '2026-07-19T13:00:00Z';   // +27h — the measured worst case
+    const across = insertTimeMarkers([
+      segment('s0', 't', 0, early), segment('s1', 't', 1, late),
+    ], UTC);
+    expect(across.map((n) => n.kind)).toEqual(['item', 'time_marker', 'item']);
+    expect(markers(across)[0].gapSeconds).toBe(27 * 3600);
+
+    // One segment whose BLOCKS carry the same 27-hour span. `timestamp_utc` is
+    // the per-row field the server holds; the neutral block type does not declare
+    // it, which is itself the reason the client cannot act on it today.
+    const inner = segment('s0', 't', 0, early) as { kind: 'item'; item: ConversationItem };
+    inner.item.blocks = [
+      { kind: 'text', text: 'first row', block_key: 'bk0', timestamp_utc: early },
+      { kind: 'text', text: 'row 27 hours later', block_key: 'bk1', timestamp_utc: late },
+    ] as unknown as ConversationItem['blocks'];
+    const inside = insertTimeMarkers([inner], UTC);
+    expect(inside.map((n) => n.kind)).toEqual(['item']);
+    expect(markers(inside)).toHaveLength(0);
+  });
+});

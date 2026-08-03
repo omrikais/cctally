@@ -614,6 +614,222 @@ def test_unturned_adjacency_pairing():
     assert kept_texts.count("Coincidence") == 2
 
 
+# ── #463 S1 (F5): reasoning containment beside exact-digest pairing ───────────
+#
+# Exact-digest pairing structurally cannot collapse the general reasoning case,
+# because the two extraction paths build the identity differently: a
+# response_item reasoning row's text is `"\n".join([summary, body])` (:1225) and
+# an event_msg agent_reasoning row's is the raw single string (:1268). They
+# coincide only when the body is empty and the raw text equals the summary
+# exactly. The real relation is containment — one aggregate carries the parts
+# that each arrived earlier as their own event.
+#
+# Measured 2026-08-02 against a read-only copy of the production store
+# (conversations.db, 5.02 GB, 27,357 reasoning rows). Of the 17,149 turned
+# event_msg reasoning rows, 4,883 are already suppressed by exact-digest
+# pairing; ALL 12,266 that survive it are contained in exactly one same-turn
+# aggregate, with 0 orphans and 0 present-but-not-contained. Rendered reasoning
+# rows drop from 22,474 to 10,208, a 2.20x reduction (2.68x measured against the
+# raw 27,357-row population, versus the 2.73x the epic predicted).
+
+
+def _reasoning_row(*, family, turn, title=None, summary=None, body=None,
+                   digest=None, offset=None):
+    """One normalized reasoning row carrying the stored projection.
+
+    The projection is written into ``detail_json`` — the same place
+    ``_reasoning_projection`` puts it and the only place the containment pass is
+    allowed to read. ``search_thinking`` is deliberately NOT the source: it is
+    capped at 16,000 characters (:1444) and stores `summary + "\\n" + body` for a
+    response item (:1225), so it cannot tell a title from a title-plus-body.
+    """
+    reasoning = {"schema_version": 1,
+                 "source": "response_item" if family == "response_item" else "agent_reasoning"}
+    if title is not None:
+        reasoning["title"] = title
+    if summary is not None:
+        reasoning["summary"] = summary
+    if body is not None:
+        reasoning["body"] = body
+    text = "\n".join(p for p in (title or summary or "", body or "") if p)
+    _reasoning_row.counter = getattr(_reasoning_row, "counter", 0) + 1
+    line = _reasoning_row.counter if offset is None else offset
+    return kern.CodexNormalizedRow(
+        conversation_key="ck", source_root_key="srk",
+        source_path="/synthetic/root-a/rollout.jsonl", line_offset=line,
+        timestamp_utc=f"2026-07-14T12:00:{line:02d}Z", turn_id=turn,
+        call_id=None, kind="reasoning", event_type=None, record_family=family,
+        model=MODEL, text="",
+        content_digest=digest if digest is not None else kern.content_digest(
+            f"{family}:{line}:{text}"),
+        content_len=len(text),
+        detail_json=json.dumps({"reasoning": reasoning}),
+        search_tool="", search_thinking=text)
+
+
+def test_event_msg_reasoning_contained_in_an_aggregate_is_suppressed():
+    rows = [
+        _reasoning_row(family="response_item", turn="t1",
+                       title="Inspecting git worktree usage",
+                       body="checked five roots"),
+        _reasoning_row(family="event_msg", turn="t1",
+                       title="Inspecting git worktree usage"),
+    ]
+    kept, suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 1
+    assert kept[0].record_family == "response_item"
+    assert 1 in suppressed
+    # The partner map is the contract search and find use to fold a suppressed
+    # row onto its survivor, so a containment match must name its aggregate.
+    assert kern.pair_mirror_partners(rows)[1] == 0
+
+
+def test_orphan_event_msg_reasoning_is_never_suppressed():
+    rows = [_reasoning_row(family="event_msg", turn="t1", title="Solo thought")]
+    kept, suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 1
+    assert suppressed == set()
+
+
+def test_reasoning_containment_never_crosses_a_turn():
+    rows = [
+        _reasoning_row(family="response_item", turn="t1", title="Shared heading"),
+        _reasoning_row(family="event_msg", turn="t2", title="Shared heading"),
+    ]
+    kept, suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 2 and suppressed == set()
+
+
+def test_two_identical_event_rows_consume_the_aggregate_only_once():
+    rows = [
+        _reasoning_row(family="response_item", turn="t1", title="Same"),
+        _reasoning_row(family="event_msg", turn="t1", title="Same"),
+        _reasoning_row(family="event_msg", turn="t1", title="Same"),
+    ]
+    kept, _suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 2, "multiset semantics: the aggregate covers ONE occurrence"
+
+
+def test_an_aggregate_already_consumed_by_exact_digest_pairing_is_not_reused():
+    """The two passes share one budget.
+
+    Identical digests make the existing exact-digest pass claim the aggregate
+    for the first event. The containment pass must treat that occurrence as
+    spent rather than suppressing the second event as well.
+    """
+    rows = [
+        _reasoning_row(family="response_item", turn="t1", title="Echo", digest="d"),
+        _reasoning_row(family="event_msg", turn="t1", title="Echo", digest="d"),
+        _reasoning_row(family="event_msg", turn="t1", title="Echo", digest="d"),
+    ]
+    kept, _suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 2
+
+
+def test_containment_never_spans_two_aggregates():
+    """A concatenated match must not suppress a part no aggregate contains.
+
+    Non-vacuity was demonstrated, not assumed. The event text is chosen so that
+    joining the turn's aggregates contains it while neither aggregate alone
+    does: because projected texts are already whitespace-normalized, the natural
+    naive form is `" ".join(projected)`, which yields "Alpha Beta" and swallows
+    this event. A probe implementation written that way was run against this
+    test and it failed (`assert 2 == 3`) before the per-aggregate version
+    replaced it.
+    """
+    rows = [
+        _reasoning_row(family="response_item", turn="t1", title="Alpha"),
+        _reasoning_row(family="response_item", turn="t1", title="Beta"),
+        _reasoning_row(family="event_msg", turn="t1", body="Alpha\nBeta"),
+    ]
+    kept, _suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 3
+
+
+def test_containment_matches_the_production_multi_part_summary_shape():
+    """The shape the production store actually holds (measured 2026-08-02).
+
+    An aggregate's ``summary`` concatenates its bold-wrapped parts; each part
+    arrived earlier as its own ``event_msg`` whose projection kept the wrapper.
+    Both must fold onto that one aggregate.
+    """
+    rows = [
+        _reasoning_row(family="event_msg", turn="t1",
+                       body="**Inspecting git worktree usage**\n\n<!-- -->"),
+        _reasoning_row(family="event_msg", turn="t1",
+                       body="**Verifying complete output reads**\n\n<!-- -->"),
+        _reasoning_row(
+            family="response_item", turn="t1",
+            summary=("**Inspecting git worktree usage**\n\n<!-- -->\n"
+                     "**Verifying complete output reads**\n\n<!-- -->")),
+    ]
+    kept, suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 1
+    assert kept[0].record_family == "response_item"
+    assert suppressed == {0, 1}
+
+
+def test_non_reasoning_mirror_kinds_are_untouched_by_containment():
+    """Containment is reasoning-specific; an assistant part inside a longer
+    assistant row must still survive, because prose is not an aggregate."""
+    def _assistant(family, text, line):
+        return kern.CodexNormalizedRow(
+            conversation_key="ck", source_root_key="srk",
+            source_path="/synthetic/root-a/rollout.jsonl", line_offset=line,
+            timestamp_utc=f"2026-07-14T13:00:{line:02d}Z", turn_id="t1",
+            call_id=None, kind="assistant", event_type=None,
+            record_family=family, model=MODEL, text=text,
+            content_digest=kern.content_digest(text), content_len=len(text),
+            detail_json=None, search_tool="", search_thinking="")
+
+    rows = [_assistant("response_item", "hello world and more", 1),
+            _assistant("event_msg", "hello world", 2)]
+    kept, suppressed = kern.pair_mirrors(rows)
+    assert len(kept) == 2 and suppressed == set()
+
+
+def test_export_stops_repeating_a_reasoning_heading(tmp_path, monkeypatch):
+    """End-to-end proof of the user-facing claim (#463 S1 / F5).
+
+    The committed export golden does NOT move under this change, because no
+    scenario in tests/fixtures/codex-parity/v1/rollouts/ carries the containment
+    shape — its two reasoning rows hold unrelated text. That absence is why this
+    test exists: without it the CHANGELOG's "the export stops repeating
+    reasoning" would rest on kernel tests alone, with nothing exercising the
+    rendered markdown.
+    """
+    records = _codex_turn_records([]) + [
+        {"payload": {"text": "**Inspecting git worktree usage**",
+                     "type": "agent_reasoning"},
+         "timestamp": "2026-07-14T12:02:00Z", "type": "event_msg"},
+        {"payload": {"text": "**Verifying complete output reads**",
+                     "type": "agent_reasoning"},
+         "timestamp": "2026-07-14T12:03:00Z", "type": "event_msg"},
+        {"payload": {"type": "reasoning", "content": [],
+                     "summary": [{"type": "summary_text",
+                                  "text": "**Inspecting git worktree usage**"},
+                                 {"type": "summary_text",
+                                  "text": "**Verifying complete output reads**"}]},
+         "timestamp": "2026-07-14T12:04:00Z", "type": "response_item"},
+        {"payload": {"content": [{"text": "done", "type": "output_text"}],
+                     "role": "assistant", "type": "message"},
+         "timestamp": "2026-07-14T12:05:00Z", "type": "response_item"},
+    ]
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=0, legacy_export=True)
+        assert detail["status"] == "ok"
+        markdown = cexport.render_codex_conversation_markdown(detail)
+    finally:
+        conn.close()
+    assert markdown.count("Inspecting git worktree usage") == 1
+    assert markdown.count("Verifying complete output reads") == 1
+
+
 def test_rollup_item_count_over_mirror_and_wrapper_scenarios():
     mirror_rows = _normalize("mirror-pairing").rows
     # turn-m response item + 2 repeated prompts + turn-n response item = 4.
@@ -1199,6 +1415,597 @@ def test_threading_parent_children_from_metadata(tmp_path, monkeypatch):
 
 def _detail_keys(detail) -> list[str]:
     return [it["item_key"] for it in detail["items"]]
+
+
+# ── #463 S1: three-phase assembly + segmentation, end to end ─────────────────
+
+
+def _big_turn_records(tool_calls: int = 120, *, turn_id="turn-a"):
+    """A single turn far past the 40-block segment budget.
+
+    Each call/output pair folds into ONE block, so the turn's block count is
+    about ``tool_calls`` plus the surrounding prose — enough to force several
+    segments while staying small enough to read in a failure message.
+    """
+    records = _codex_turn_records([], turn_id=turn_id)
+    minute = 2
+    for i in range(tool_calls):
+        records.append({
+            "payload": {"arguments": "{}", "call_id": f"fn-{i}",
+                        "name": "fixture_function", "type": "function_call"},
+            "timestamp": f"2026-07-14T12:{minute:02d}:{i % 60:02d}Z",
+            "type": "response_item"})
+        records.append({
+            "payload": {"call_id": f"fn-{i}", "output": {"ok": True},
+                        "type": "function_call_output"},
+            "timestamp": f"2026-07-14T12:{minute + 1:02d}:{i % 60:02d}Z",
+            "type": "response_item"})
+        minute += 2
+    return records
+
+
+def _detail_of(conn, ck, **kwargs):
+    return q.get_codex_conversation(conn, ck, effective_speed="standard", **kwargs)
+
+
+def test_a_large_turn_is_served_as_several_bounded_segments(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    responses = [it for it in detail["items"] if it["kind"] == "assistant"]
+    assert len(responses) > 1, "the oversized turn must split into segments"
+    # One turn, so every segment shares one turn_item_key and the ordinals run
+    # from zero without a gap.
+    turn_keys = {it["turn_item_key"] for it in responses}
+    assert len(turn_keys) == 1
+    assert [it["segment_ordinal"] for it in responses] == list(range(len(responses)))
+    # Segment 0 inherits the turn key unchanged; later segments do not.
+    assert responses[0]["item_key"] == responses[0]["turn_item_key"]
+    assert all(it["item_key"] != it["turn_item_key"] for it in responses[1:])
+    assert len({it["item_key"] for it in detail["items"]}) == len(detail["items"])
+    # The ceiling is the budget plus at most one maximal fold group; with
+    # single-block groups that is just the budget.
+    for item in responses:
+        assert len(item["blocks"]) <= 40
+
+
+def test_segmentation_does_not_move_a_turns_cost_carrier(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    responses = [it for it in detail["items"] if it["kind"] == "assistant"]
+    # Every non-carrier segment reports null, never zero: a zero is
+    # indistinguishable from a genuinely free turn.
+    assert all(it["cost_usd"] is None and it["tokens"] is None
+               for it in responses[1:])
+
+
+_APPLY_PATCH_INPUT = (
+    "*** Begin Patch\n"
+    "*** Update File: synthetic.txt\n"
+    "@@\n"
+    "-old line\n"
+    "+new line\n"
+    "*** End Patch"
+)
+
+
+def _fold_shape_records(*, turn_id="turn-a", filler=0, web_owners=2):
+    """One turn carrying BOTH fold shapes that id-matching alone does not cover.
+
+    Shape 1 is a native patch completion whose INNER call id differs from the
+    outer custom-tool call, which ``_item_blocks_with_rows`` folds by positional
+    bracketing — call < event < that call's output — rather than by id. It is the
+    common shape in real rollouts: 3,441 of the 4,690 patch completion events in
+    the production corpus carry a call id no ``tool_call`` in their turn owns.
+
+    Shape 2 is a ``web_search_completion`` whose call id is owned by
+    ``web_owners`` calls, exactly ONE of which is the ``web_search_call``. That
+    path narrows its candidates by ``detail.name == "web_search_call"`` BEFORE
+    requiring a unique candidate, and imposes no bound on how many calls share
+    the id, so it folds at ANY owner count. A registration gate that names a
+    fixed count — ``== 1``, or the ``== 2`` this fixture used to be the only
+    witness for — leaves the pair ungrouped at every other count, and a segment
+    boundary can then fall between the call and its completion.
+    """
+    recs = _codex_turn_records([], turn_id=turn_id)
+    clock = [2]
+
+    def add(record_type, payload):
+        minute = clock[0]
+        recs.append({
+            "payload": payload,
+            "timestamp": f"2026-07-14T{12 + minute // 60:02d}:{minute % 60:02d}:00Z",
+            "type": record_type,
+        })
+        clock[0] += 1
+
+    for index in range(filler):
+        add("response_item", {"type": "function_call", "call_id": f"pad-{index}",
+                              "name": "fixture_function", "arguments": "{}"})
+        add("response_item", {"type": "function_call_output",
+                              "call_id": f"pad-{index}", "output": {"ok": True}})
+    add("response_item", {"type": "custom_tool_call", "call_id": "patch-call-1",
+                          "name": "apply_patch", "input": _APPLY_PATCH_INPUT,
+                          "status": "completed"})
+    add("event_msg", {"type": "patch_apply_end", "call_id": "exec-inner-1",
+                      "turn_id": turn_id, "status": "completed",
+                      "changes": [{"path": "synthetic.txt"}],
+                      "stdout": "ok", "stderr": "", "success": True})
+    add("response_item", {"type": "custom_tool_call_output",
+                          "call_id": "patch-call-1", "output": {"ok": True}})
+    # ``web_owners - 1`` plain function calls share the web search's id, so the
+    # turn-scoped owner count is exactly ``web_owners`` and exactly one of those
+    # owners is the ``web_search_call`` the completion narrows to.
+    for extra in range(web_owners - 1):
+        name = "fixture_function" if extra == 0 else f"fixture_function_{extra}"
+        add("response_item", {"type": "function_call", "call_id": "web-1",
+                              "name": name, "arguments": "{}"})
+        add("response_item", {"type": "function_call_output", "call_id": "web-1",
+                              "output": {"ok": True}})
+    add("response_item", {"type": "web_search_call", "id": "web-1",
+                          "status": "completed",
+                          "action": {"type": "search", "query": "synthetic query",
+                                     "queries": ["synthetic query"]}})
+    add("event_msg", {"type": "web_search_end", "call_id": "web-1",
+                      "query": "synthetic query",
+                      "action": {"type": "search", "query": "synthetic query"},
+                      "results": [{"type": "computer_initialize_state",
+                                   "domain": "example.test",
+                                   "ref_id": "turn0search0",
+                                   "snippet": "Synthetic result",
+                                   "title": "Synthetic title",
+                                   "url": "https://example.test/result"}]})
+    return recs
+
+
+def _block_signature(env):
+    """Per-turn block signature, concatenated across that turn's segments."""
+    by_turn: dict[str, list] = {}
+    for item in env["items"]:
+        by_turn.setdefault(item["turn_item_key"], [])
+        for block in item["blocks"]:
+            detail = block.get("detail") or {}
+            card = detail.get("card") if isinstance(detail, dict) else None
+            by_turn[item["turn_item_key"]].append((
+                block["kind"],
+                block.get("call_id"),
+                card.get("type") if isinstance(card, dict) else None,
+                isinstance(card, dict) and "completion" in card,
+                (block.get("output") or {}).get("text"),
+            ))
+    return by_turn
+
+
+def test_the_whole_turn_and_the_segments_emit_the_same_blocks(tmp_path, monkeypatch):
+    """The page-local builder must agree with the whole-turn builder.
+
+    This is what fold-group atomicity, physical contiguity and the turn-scoped
+    ``call_owner_count`` buy: concatenating the segments' blocks reproduces
+    exactly what the unsegmented path emits for the same turn.
+
+    The reference is the SAME code path with a large ``SEGMENT_BLOCK_BUDGET``,
+    not ``legacy_export=True``. That flag also changes ``fold_patch_completions``,
+    ``preserve_marker_text`` and the payload filter, so a comparison against it
+    is not single-variable and could pass or fail for a reason unrelated to
+    segmentation.
+
+    The fixture carries both fold shapes id-matching alone misses, and the
+    budget is swept across every value that produces a boundary, so a boundary
+    lands at the tightest possible point rather than at one hand-picked place.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=6))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", 10 ** 6)
+        whole = _block_signature(_detail_of(conn, ck, limit=0))
+        assert any(len(sig) > 4 for sig in whole.values()), (
+            "the unsegmented reference must hold enough blocks to be split")
+        for budget in range(1, 24):
+            monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", budget)
+            split = _block_signature(_detail_of(conn, ck, limit=0))
+            assert split == whole, f"segment budget {budget} changed the blocks"
+    finally:
+        conn.close()
+
+
+def test_a_boundary_never_splits_a_bracketed_patch_completion(tmp_path, monkeypatch):
+    """A patch completion carrying an inner call id must stay with its call.
+
+    ``_item_blocks_with_rows`` folds it by positional bracketing rather than by
+    id, so an id-only fold group leaves the event in a group of its own and a
+    boundary between the two makes the page-local builder emit a standalone
+    event card where the whole-turn builder emits a folded ``completion``.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=6))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        for budget in range(1, 24):
+            monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", budget)
+            detail = _detail_of(conn, ck, limit=0)
+            blocks = [b for it in detail["items"] for b in it["blocks"]]
+            patch = [b for b in blocks
+                     if isinstance((b.get("detail") or {}).get("card"), dict)
+                     and b["detail"]["card"].get("type") == "patch"
+                     and b["kind"] == "tool_call"]
+            assert len(patch) == 1, f"budget {budget}: {len(patch)} patch calls"
+            assert "completion" in patch[0]["detail"]["card"], (
+                f"budget {budget}: the patch completion did not fold")
+            assert not any(
+                b["kind"] == "event"
+                and isinstance((b.get("detail") or {}).get("card"), dict)
+                and b["detail"]["card"].get("source") == "patch_apply_end"
+                for b in blocks), f"budget {budget}: a standalone patch event"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("web_owners", [2, 3])
+def test_a_boundary_never_splits_a_web_search_completion(
+        tmp_path, monkeypatch, web_owners):
+    """``web_search_completion`` folds at ANY owner count, so grouping must too.
+
+    The completion path narrows its candidates by ``detail.name ==
+    "web_search_call"`` BEFORE requiring a unique candidate, and it bounds
+    nothing about how many calls share the id. A call id owned by two calls of
+    which one is the web search folds there, and so does a call id owned by
+    three. The registration gate in ``_fold_groups_for_item`` therefore
+    registers the web-search arm at ``owners >= 1``: an ``== 1`` gate never
+    groups the two-owner pair and an ``== 2`` gate never groups the three-owner
+    one, and in each ungrouped case a segment boundary can fall between the call
+    and its completion, which makes the page-local builder emit a standalone
+    event card where the whole-turn builder emits a folded ``completion``.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=6, web_owners=web_owners))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        # Non-vacuity: the fixture really carries the owner count under test.
+        rows = q._load_conversation_rows(conn, ck)
+        owners = q._turn_scoped_call_owner_count(rows)
+        assert owners.get("web-1") == web_owners, (
+            f"expected {web_owners} owners of web-1, got {owners.get('web-1')}")
+        for budget in range(1, 26):
+            monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", budget)
+            detail = _detail_of(conn, ck, limit=0)
+            blocks = [b for it in detail["items"] for b in it["blocks"]]
+            web = [b for b in blocks
+                   if isinstance((b.get("detail") or {}).get("card"), dict)
+                   and b["detail"]["card"].get("type") == "web_search"]
+            assert len(web) == 1, f"budget {budget}: {len(web)} web search cards"
+            assert "completion" in web[0]["detail"]["card"], (
+                f"budget {budget}: the web search completion did not fold")
+            assert not any(
+                b["kind"] == "event"
+                and (b.get("detail") or {}).get("event") == "web_search_end"
+                for b in blocks), f"budget {budget}: a standalone web search event"
+    finally:
+        conn.close()
+
+
+def test_a_segments_rows_are_a_contiguous_physical_range(tmp_path, monkeypatch):
+    """No segment interleaves with another.
+
+    Fold-group atomicity alone does not give this. Because folds are
+    non-adjacent, a group's rows can bracket a later group's rows, so a boundary
+    drawn between the two groups produces segments whose physical row ranges
+    overlap. Spec section 1 requires each segment to cover a contiguous physical
+    row range instead.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=6))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        for budget in (1, 2, 3, 4, 6, 8):
+            monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", budget)
+            rows, detail_bytes = q._load_conversation_index_rows(conn, ck)
+            kept, _suppressed = kern.pair_mirrors(rows)
+            items = kern.canonical_items(kept, fold_patch_completions=True)
+            index = q._build_segment_index(ck, items, detail_bytes, segmented=True)
+            by_item: dict[int, list] = {}
+            for entry in index:
+                by_item.setdefault(entry["_item_index"], []).append(entry)
+            for item_index, entries in by_item.items():
+                item = items[item_index]
+                lifecycle = {(r.source_path, r.line_offset)
+                             for r in item.get("lifecycle_rows", [])}
+                # Position within the ITEM's own non-lifecycle rows: a turn's
+                # rows need not be contiguous in the conversation, because its
+                # user, event and meta rows become separate items.
+                order = {
+                    (r.source_path, r.line_offset): i
+                    for i, r in enumerate(
+                        r for r in item["rows"]
+                        if (r.source_path, r.line_offset) not in lifecycle)
+                }
+                covered = []
+                for entry in entries:
+                    positions = [order[(r.source_path, r.line_offset)]
+                                 for r in entry["_rows"]]
+                    assert positions == sorted(positions), (
+                        f"budget {budget}: segment {entry['segment_ordinal']} "
+                        "rows are out of physical order")
+                    if positions:
+                        assert positions == list(
+                            range(positions[0], positions[-1] + 1)), (
+                            f"budget {budget}: segment "
+                            f"{entry['segment_ordinal']} of "
+                            f"{entry['turn_item_key'][:16]} is not contiguous — "
+                            f"{positions}")
+                    covered.extend(positions)
+                assert covered == list(range(len(order))), (
+                    f"budget {budget}: the segments of item {item_index} are not "
+                    "a partition of its rows into consecutive ranges")
+    finally:
+        conn.close()
+
+
+def test_segment_timestamps_are_non_decreasing_across_a_turn(tmp_path, monkeypatch):
+    """S2 through S5 are told they may rely on this.
+
+    It follows from physical contiguity: rows are ordered by
+    ``(timestamp_utc, source_path, line_offset)``, so consecutive physical
+    ranges carry non-decreasing timestamps.
+
+    The published wire property — non-decreasing segment ``timestamp_utc`` —
+    is asserted first, but on its own it is NOT falsifiable by interleaving,
+    because a segment anchors on its first row and first rows increase whether
+    or not the ranges overlap. The falsifiable statement is that a segment's
+    LAST row never comes after the next segment's first row, so both are
+    asserted.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=6))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        for budget in (1, 2, 3, 4, 6, 8):
+            monkeypatch.setattr(q.segkern, "SEGMENT_BLOCK_BUDGET", budget)
+            detail = _detail_of(conn, ck, limit=0)
+            by_turn: dict[str, list] = {}
+            for item in detail["items"]:
+                by_turn.setdefault(item["turn_item_key"], []).append(item)
+            for turn, segments in by_turn.items():
+                stamps = [it["timestamp_utc"] for it in segments]
+                assert stamps == sorted(stamps), (
+                    f"budget {budget}: {turn[:16]} segment timestamps {stamps}")
+
+            rows, detail_bytes = q._load_conversation_index_rows(conn, ck)
+            kept, _suppressed = kern.pair_mirrors(rows)
+            items = kern.canonical_items(kept, fold_patch_completions=True)
+            index = q._build_segment_index(ck, items, detail_bytes, segmented=True)
+            spans: dict[str, list] = {}
+            for entry in index:
+                stamps = [r.timestamp_utc for r in entry["_rows"]]
+                if stamps:
+                    spans.setdefault(entry["turn_item_key"], []).append(
+                        (min(stamps), max(stamps)))
+            for turn, ranges in spans.items():
+                for (_lo, hi), (lo_next, _hi_next) in zip(ranges, ranges[1:]):
+                    assert hi <= lo_next, (
+                        f"budget {budget}: {turn[:16]} segments overlap in time "
+                        f"— one ends at {hi}, the next starts at {lo_next}")
+    finally:
+        conn.close()
+
+
+def test_legacy_export_emits_exactly_one_segment_per_item(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        whole = _detail_of(conn, ck, limit=0, legacy_export=True)
+    finally:
+        conn.close()
+    assert all(it["segment_ordinal"] == 0 for it in whole["items"])
+    assert len([it for it in whole["items"] if it["kind"] == "assistant"]) == 1
+
+
+def test_a_page_is_bounded_by_blocks_even_when_the_item_count_is_not(
+        tmp_path, monkeypatch):
+    """The page budget is wired into assembly, not just into the paginator.
+
+    The budget is lowered for the fixture rather than staged at production
+    scale: reproducing the profiled 78-item, 3,120-block page honestly would
+    need a rollout of several thousand records, and the arithmetic at the real
+    2,000-block figure is already pinned in
+    tests/test_codex_pagination.py::test_the_page_budget_bounds_a_page_the_
+    item_count_does_not. What is under test here is that the served page obeys
+    the budget while the requested item limit does not bind — the exact shape of
+    the profiled conversation, whose response was
+    ``total: 78, returned: 78, has_after: false``.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records(tool_calls=200))
+    monkeypatch.setattr(q.segkern, "PAGE_BLOCK_BUDGET", 120)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        every = _detail_of(conn, ck, limit=0)
+        page = _detail_of(conn, ck, limit=500, tail=True)
+    finally:
+        conn.close()
+    total_segments = page["page"]["total"]
+    assert total_segments == len(every["items"])
+    assert total_segments < 500, "the item count alone must not bound this page"
+    served = sum(len(it["blocks"]) for it in page["items"])
+    assert served <= 120
+    assert page["page"]["returned"] < total_segments
+    assert page["page"]["has_before"] is True
+
+
+def test_page_total_counts_segments_not_items(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+        rows = q._load_conversation_rows(conn, ck)
+        kept, _sup = kern.pair_mirrors(rows)
+        item_count = len(kern.canonical_items(kept))
+    finally:
+        conn.close()
+    assert detail["page"]["total"] == len(detail["items"])
+    assert detail["page"]["total"] > item_count
+
+
+def test_reverse_paging_walks_a_segmented_turn_back_to_its_head(
+        tmp_path, monkeypatch):
+    """F4 and segmentation together: has_before is now true on Codex."""
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        every = _detail_keys(_detail_of(conn, ck, limit=0))
+        seen: list[str] = []
+        cursor = None
+        for _ in range(50):
+            detail = _detail_of(conn, ck, limit=3, tail=(cursor is None),
+                                before=cursor)
+            seen = _detail_keys(detail) + seen
+            if not detail["page"]["has_before"]:
+                break
+            cursor = detail["page"]["before"]
+        else:
+            raise AssertionError("reverse paging did not terminate")
+    finally:
+        conn.close()
+    assert seen == every
+
+
+def test_pos_to_item_key_resolves_to_the_containing_segment(tmp_path, monkeypatch):
+    """Search and find derive their anchors here (#463 S1).
+
+    After segmentation this must resolve a physical row to the SEGMENT that
+    contains it. Resolving to the turn would land every find hit on the head of
+    a turn instead of on the matching content.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ck = None
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        pos_map = q._pos_to_item_key(conn, ck)
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    keys = set(pos_map.values())
+    responses = [it for it in detail["items"] if it["kind"] == "assistant"]
+    assert len(responses) > 1
+    # Every segment of the split turn is reachable, not just its head.
+    assert {it["item_key"] for it in responses} <= keys
+    assert len(keys) == len(detail["items"])
+
+
+def test_outline_turns_expose_their_segment_keys(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    big = max(outline["turns"], key=lambda t: sum(t["kinds"].values()))
+    assert len(big["segment_item_keys"]) > 1
+    # segment_item_keys[i] is the key of segment i, so the first entry is the
+    # turn's own key.
+    assert big["segment_item_keys"][0] == big["item_key"]
+    served = [it["item_key"] for it in detail["items"]
+              if it["turn_item_key"] == big["item_key"]]
+    assert big["segment_item_keys"] == served
+    # The outline itself stays turn-granular.
+    assert outline["stats"]["items"] == len(outline["turns"])
+    assert len(outline["turns"]) < len(detail["items"])
+
+
+def test_segment_keys_are_not_added_to_member_item_keys(tmp_path, monkeypatch):
+    """The two memberships are different relations and must stay different.
+
+    loadToTarget treats a uuid present in an item's member_uuids as already
+    loaded, so putting segment keys there would make the drain skip a segment
+    that has not been fetched, and the jump would land nowhere.
+
+    The fixture must contain a FOLDED item, or the second assertion holds
+    whatever the code does: `_big_turn_records` produces no folded item, so
+    every `member_item_keys` there is empty and "the item key is not in it" is
+    true by construction. `_fold_shape_records` folds a patch completion and a
+    web search completion into its response item, and the guards below fail if
+    that ever stops being so.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=60))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    assert any(turn["member_item_keys"] for turn in outline["turns"]), (
+        "non-vacuity: the fixture must contain a folded item")
+    assert any(len(turn["segment_item_keys"]) > 1 for turn in outline["turns"]), (
+        "non-vacuity: the fixture must contain a turn that splits into segments")
+    assert any(item["member_item_keys"] for item in detail["items"]), (
+        "non-vacuity: a detail item must carry folded-item aliases")
+    for turn in outline["turns"]:
+        assert not set(turn["segment_item_keys"]) & set(turn["member_item_keys"])
+    for item in detail["items"]:
+        assert item["item_key"] not in item["member_item_keys"]
+
+
+def test_every_non_response_item_is_exactly_one_segment(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["modern-full"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+    finally:
+        conn.close()
+    # modern-full holds no turn anywhere near the budget, so every item stays a
+    # single segment and its key is unchanged.
+    for turn in outline["turns"]:
+        assert turn["segment_item_keys"] == [turn["item_key"]]
 
 
 def test_detail_limit_bounds_the_head_page(tmp_path, monkeypatch):
@@ -2108,12 +2915,24 @@ def test_session_d_reasoning_lifecycle_and_marker_wire_contract(
         assert detail["status"] == "ok"
         blocks = [block for item in detail["items"] for block in item["blocks"]]
         reasoning = [block for block in blocks if block["kind"] == "reasoning"]
+        # #463 S2 §2.5 added the additive `headings` array. `title`, `summary`
+        # and `body` keep exactly their pre-S2 values — they feed
+        # `_row_is_reasoning_title` and are a segmentation-boundary input.
+        # WHICH rows gain headings is the contract this pins: a decomposable
+        # summary decomposes, a prose summary falls back to the entry verbatim,
+        # and a row whose retained payload carries no summary entries gets no
+        # field at all rather than an empty array.
+        keys = [block["block_key"] for block in reasoning]
         assert [block["detail"]["reasoning"] for block in reasoning] == [
             {"schema_version": 1, "source": "response_item",
-             "title": "Inspecting synthetic state"},
+             "title": "Inspecting synthetic state",
+             "headings": [{"key": f"{keys[0]}#0",
+                           "text": "Inspecting synthetic state"}]},
             {"schema_version": 1, "source": "response_item",
              "summary": "Synthetic provider summary.",
-             "body": "Detailed synthetic reasoning body."},
+             "body": "Detailed synthetic reasoning body.",
+             "headings": [{"key": f"{keys[1]}#0",
+                           "text": "Synthetic provider summary."}]},
             {"schema_version": 1, "source": "response_item",
              "body": "Body-only synthetic reasoning."},
             {"schema_version": 1, "source": "agent_reasoning",
@@ -3278,16 +4097,21 @@ def test_block_key_on_payload_blocks_distinct_and_absent_on_prose(
         keys = [b["block_key"] for b in tool_blocks]
         assert all(k and k.startswith("cbk1_") for k in keys)
         assert len(keys) == len(set(keys))  # unique per tool_call physical row
-        # Native patch events are additively payload-capable. Ordinary prose
-        # and every other non-tool block remain keyless.
-        for it in d["items"]:
-            for b in it["blocks"]:
-                card = (b.get("detail") or {}).get("card")
-                if b["kind"] == "event" and b.get("payload_which") == "event":
-                    assert b["block_key"].startswith("cbk1_")
-                    assert b["payload_which"] == "event"
-                elif b["kind"] != "tool_call":
-                    assert "block_key" not in b
+        # #463 S2 §1 reversed the second half of this test. EVERY row-backed
+        # block now carries the anchor, prose included; what stays narrow is
+        # PAYLOAD-capability, which `payload_which` marks and a prose block
+        # never gets. Before S2 this asserted `"block_key" not in b` for every
+        # non-tool block, which conflated the two properties (§1.1).
+        every_key = [b["block_key"] for it in d["items"] for b in it["blocks"]]
+        assert all(k.startswith("cbk1_") for k in every_key)
+        assert len(every_key) == len(set(every_key))
+        prose = [b for it in d["items"] for b in it["blocks"]
+                 if b["kind"] in {"user", "assistant", "reasoning"}]
+        assert prose, "non-vacuity: modern-full must carry prose blocks"
+        assert all("payload_which" not in b for b in prose)
+        for b in prose:
+            assert q._locate_payload_block(conn, _single_ck(conn),
+                                           b["block_key"]) is None
         # block keys are a DISTINCT family from item keys (different domain/prefix).
         assert not any(k in {it["item_key"] for it in d["items"]} for k in keys)
     finally:
@@ -3895,3 +4719,407 @@ def test_neutral_payload_dispatch_codex_and_claude(tmp_path, monkeypatch):
         assert disp.neutral_payload(conn, "garbage", which="call")["status"] == "not_found"
     finally:
         conn.close()
+
+
+def test_a_find_hit_inside_a_follower_segment_anchors_to_that_segment(
+        tmp_path, monkeypatch):
+    """A find hit deep inside a segmented turn must anchor to ITS segment.
+
+    ``_pos_to_item_key`` maps a physical row to the segment that contains it, but
+    the anchor emission used to walk ``kern.canonical_items`` and key each entry
+    by ``_item_key_for_item`` — a TURN key. A follower segment's key can never
+    equal a turn key, so every hit landing past segment 0 was silently dropped
+    from the anchor list: the FindBar reported fewer matches than exist and could
+    not navigate to any of them. Measured on the profiled conversation before the
+    fix: a token present only in the segment at detail index 30 (ordinal 24)
+    produced an anchor for that turn's HEAD and none for the segment.
+    """
+    records = _big_turn_records()
+    # A distinctive token in the LAST tool call of the turn, so it can only fall
+    # in a follower segment.
+    records.append({
+        "payload": {"arguments": '{"needle": "zzsentinelzz"}',
+                    "call_id": "fn-sentinel", "name": "fixture_function",
+                    "type": "function_call"},
+        "timestamp": "2026-07-14T13:00:00Z", "type": "response_item"})
+    records.append({
+        "payload": {"call_id": "fn-sentinel", "output": {"ok": True},
+                    "type": "function_call_output"},
+        "timestamp": "2026-07-14T13:00:01Z", "type": "response_item"})
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+        found = q.find_in_codex_conversation(conn, ck, "zzsentinelzz")
+    finally:
+        conn.close()
+
+    segments = [it for it in detail["items"] if it["kind"] == "assistant"]
+    assert len(segments) > 1, "the turn must split, or this proves nothing"
+    # The sentinel is in the turn's last rows, so the LAST segment owns it.
+    owner = segments[-1]
+    assert owner["segment_ordinal"] > 0, owner["segment_ordinal"]
+
+    assert found["status"] == "ok", found
+    anchors = [a["item_key"] for a in found["anchors"]]
+    assert anchors == [owner["item_key"]], (
+        f"expected the follower segment {owner['item_key']!r}, got {anchors!r}")
+    # And the count agrees with the anchor list rather than over-reporting.
+    assert found["total"] == 1, found["total"]
+
+
+# ── #463 S2 §1: every row-backed block carries an anchor ─────────────────────
+
+
+def _prose_reasoning_and_tools_records(*, turn_id="turn-a"):
+    """A single turn holding prose, reasoning and a tool call/output pair.
+
+    The three block families #463 S2 §1 is about: `tool_call` already carried a
+    `block_key`, prose and reasoning carried none.
+    """
+    records = [
+        {"payload": {"context_window": 272000,
+                     "cwd": "/synthetic/root-a/project-red",
+                     "git": {"branch": "b", "repository": "r"},
+                     "id": "root-thread-s2", "instructions": "x",
+                     "model": "gpt-x", "model_context_window": 272000,
+                     "model_provider": "p",
+                     "session_id": "44444444-4444-4444-8444-444444444444",
+                     "source": "codex", "thread_source": "root-thread-s2",
+                     "tools": [{"name": "t"}], "user": "u"},
+         "timestamp": "2026-07-14T12:00:00Z", "type": "session_meta"},
+        {"payload": {"model": "gpt-x", "model_context_window": 272000,
+                     "turn_id": turn_id},
+         "timestamp": "2026-07-14T12:01:00Z", "type": "turn_context"},
+        {"payload": {"content": [{"text": "Synthetic S2 prompt",
+                                  "type": "input_text"}],
+                     "phase": "input", "role": "user", "type": "message"},
+         "timestamp": "2026-07-14T12:02:00Z", "type": "response_item"},
+        {"payload": {"content": [{"text": "First assistant paragraph",
+                                  "type": "output_text"}],
+                     "phase": "output", "role": "assistant", "type": "message"},
+         "timestamp": "2026-07-14T12:03:00Z", "type": "response_item"},
+        {"payload": {"content": [{"text": "Second assistant paragraph",
+                                  "type": "output_text"}],
+                     "phase": "output", "role": "assistant", "type": "message"},
+         "timestamp": "2026-07-14T12:04:00Z", "type": "response_item"},
+        {"payload": {"content": [{"text": "Reasoning body", "type": "reasoning_text"}],
+                     "encrypted_content": "enc",
+                     "summary": [{"text": "**Planning the synthetic turn**",
+                                  "type": "summary_text"}],
+                     "type": "reasoning"},
+         "timestamp": "2026-07-14T12:05:00Z", "type": "response_item"},
+        {"payload": {"arguments": "{}", "call_id": "fn-s2",
+                     "name": "fixture_function", "type": "function_call"},
+         "timestamp": "2026-07-14T12:06:00Z", "type": "response_item"},
+        {"payload": {"call_id": "fn-s2", "output": {"ok": True},
+                     "type": "function_call_output"},
+         "timestamp": "2026-07-14T12:07:00Z", "type": "response_item"},
+    ]
+    return records
+
+
+def _all_blocks(page):
+    return [(item["item_key"], block)
+            for item in page["items"] for block in item["blocks"]]
+
+
+def test_every_row_backed_block_carries_a_block_key(tmp_path, monkeypatch):
+    """#463 S2 §1. Prose, reasoning and event blocks were keyless; only
+    tool_call blocks carried an anchor. A finer reading unit has to anchor on a
+    block key, because it is one of only two identities S1 declares
+    unconditionally durable."""
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _prose_reasoning_and_tools_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        page = _detail_of(conn, _single_ck(conn), limit=0)
+    finally:
+        conn.close()
+    keyless = [(item_key, block["kind"])
+               for item_key, block in _all_blocks(page)
+               if block.get("block_key") is None]
+    assert keyless == [], f"blocks without an anchor: {keyless}"
+
+
+def test_block_keys_are_unique_within_a_conversation(tmp_path, monkeypatch):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _prose_reasoning_and_tools_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        page = _detail_of(conn, _single_ck(conn), limit=0)
+    finally:
+        conn.close()
+    keys = [block["block_key"] for _item_key, block in _all_blocks(page)
+            if block.get("block_key")]
+    assert keys, "non-vacuity: the fixture must produce keyed blocks"
+    assert len(keys) == len(set(keys))
+
+
+def test_a_block_key_is_unchanged_by_segmentation(tmp_path, monkeypatch):
+    """Block keys are derived per physical row and must be unaffected by where
+    segment boundaries fall (#463 S1 contract)."""
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _big_turn_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        segmented = _detail_of(conn, ck, limit=0)
+        unsegmented = _detail_of(conn, ck, limit=0, legacy_export=True)
+    finally:
+        conn.close()
+    ordinals = {item["segment_ordinal"] for item in segmented["items"]}
+    assert max(ordinals) > 0, "the turn must split, or this proves nothing"
+    assert sorted(block["block_key"] for _k, block in _all_blocks(segmented)
+                  if block.get("block_key")) == sorted(
+        block["block_key"] for _k, block in _all_blocks(unsegmented)
+        if block.get("block_key"))
+
+
+def test_a_prose_block_key_does_not_become_payload_readable(tmp_path, monkeypatch):
+    """#463 S2 §1.1. Generalizing the anchor must not widen the payload route.
+
+    Stable identity and payload-capability are different properties: a prose
+    block has a key and no retained payload, so a consumer must never infer
+    payload availability from the presence of a key.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _prose_reasoning_and_tools_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        page = _detail_of(conn, ck, limit=0)
+        prose_key = next(
+            block["block_key"] for _k, block in _all_blocks(page)
+            if block["kind"] == "assistant")
+        read = q.read_codex_payload(conn, ck, prose_key, "call")
+        located = q._locate_payload_block(conn, ck, prose_key)
+    finally:
+        conn.close()
+    assert located is None, located
+    assert read["status"] == "not_found", read
+
+
+# ── #463 S2 §2.5: reasoning headings on the detail wire ──────────────────────
+
+
+_MULTI_HEADING_SUMMARY = [
+    {"text": "**Planning concurrency test**\n**Designing monkeypatch**",
+     "type": "summary_text"},
+]
+
+
+def _multi_heading_records(*, turn_id="turn-a", summary=None):
+    """One turn whose reasoning aggregate holds several authored headings."""
+    records = _prose_reasoning_and_tools_records(turn_id=turn_id)
+    for record in records:
+        if record["type"] == "response_item" and \
+                record["payload"].get("type") == "reasoning":
+            record["payload"]["summary"] = summary or list(_MULTI_HEADING_SUMMARY)
+            record["payload"].pop("content", None)
+    return records
+
+
+def _first_reasoning_block(page):
+    return next(block for item in page["items"] for block in item["blocks"]
+                if block["kind"] == "reasoning")
+
+
+def _stored_reasoning_projections(conn, ck):
+    return sorted(
+        row[0] for row in conn.execute(
+            "SELECT detail_json FROM codex_conversation_messages "
+            "WHERE conversation_key = ? AND kind = 'reasoning' "
+            "ORDER BY source_path, line_offset", (ck,)))
+
+
+def _heading_page(tmp_path, monkeypatch, records=None):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, records or _multi_heading_records())
+    conn = ns["open_cache_db"]()
+    ns["sync_codex_cache"](conn)
+    return conn, _single_ck(conn)
+
+
+def test_a_multi_heading_aggregate_publishes_one_heading_per_authored_heading(
+    tmp_path, monkeypatch,
+):
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    block = _first_reasoning_block(page)
+    assert [h["text"] for h in block["detail"]["reasoning"]["headings"]] == [
+        "Planning concurrency test", "Designing monkeypatch"]
+
+
+def test_heading_keys_are_the_block_key_plus_a_zero_based_ordinal(
+    tmp_path, monkeypatch,
+):
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    block = _first_reasoning_block(page)
+    bk = block["block_key"]
+    assert [h["key"] for h in block["detail"]["reasoning"]["headings"]] == [
+        f"{bk}#0", f"{bk}#1"]
+
+
+def test_the_nested_schema_version_does_not_move(tmp_path, monkeypatch):
+    """§2.5. Bumping it makes `codexReasoning` fall back to block.text for every
+    existing client, so the field is additive precisely to avoid that."""
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    assert _first_reasoning_block(page)["detail"]["reasoning"]["schema_version"] == 1
+
+
+def test_stored_title_summary_and_body_are_untouched(tmp_path, monkeypatch):
+    """§2.2. These feed `_row_is_reasoning_title`, which is a segmentation
+    boundary input. Moving them moves segment boundaries."""
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        before = _stored_reasoning_projections(conn, ck)
+        page = _detail_of(conn, ck, limit=0)
+        after = _stored_reasoning_projections(conn, ck)
+    finally:
+        conn.close()
+    assert before == after
+    # And the stored projection carries NO headings — decomposition is read-time.
+    assert all("headings" not in (row or "") for row in after)
+    # Non-vacuity: the served block DID gain them, so this is not passing
+    # because nothing was decomposed at all.
+    assert _first_reasoning_block(page)["detail"]["reasoning"]["headings"]
+
+
+def test_headings_are_absent_under_legacy_export(tmp_path, monkeypatch):
+    """§2.5. legacy_export loads only marker-bearing payloads; populating
+    headings there would force a whole-conversation payload read for a field the
+    exporter never reads."""
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        page = _detail_of(conn, ck, limit=0, legacy_export=True)
+    finally:
+        conn.close()
+    assert "headings" not in _first_reasoning_block(page)["detail"]["reasoning"]
+
+
+def test_headings_are_omitted_when_the_retained_payload_is_missing(
+    tmp_path, monkeypatch,
+):
+    """§2.3. Decomposition never fails the request and never partially
+    populates."""
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        conn.execute("DELETE FROM codex_conversation_events "
+                     "WHERE conversation_key = ?", (ck,))
+        conn.commit()
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    reasoning = _first_reasoning_block(page)["detail"]["reasoning"]
+    assert "headings" not in reasoning
+    assert reasoning.get("summary") or reasoning.get("title")
+
+
+def test_headings_are_omitted_when_the_retained_payload_is_malformed(
+    tmp_path, monkeypatch,
+):
+    """§2.3 again, on the OTHER degradation: a payload that is present but whose
+    `summary` is not a list of text-bearing entries. All-or-nothing — the field
+    is omitted entirely rather than partially populated."""
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        conn.execute(
+            "UPDATE codex_conversation_events "
+            "SET payload_json = json_set(payload_json, '$.payload.summary', "
+            "  json('\"not-a-list\"')) "
+            "WHERE conversation_key = ? AND record_type = 'response_item' "
+            "AND json_extract(payload_json, '$.payload.type') = 'reasoning'",
+            (ck,))
+        conn.commit()
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    assert "headings" not in _first_reasoning_block(page)["detail"]["reasoning"]
+
+
+def test_headings_come_from_summary_entries_not_from_body(tmp_path, monkeypatch):
+    """§2.3. Body remains disclosure content and is never decomposed."""
+    records = _multi_heading_records()
+    for record in records:
+        if record["type"] == "response_item" and \
+                record["payload"].get("type") == "reasoning":
+            record["payload"]["content"] = [
+                {"text": "**Body heading that must not appear**",
+                 "type": "reasoning_text"}]
+    conn, ck = _heading_page(tmp_path, monkeypatch, records)
+    try:
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    texts = [h["text"] for h in
+             _first_reasoning_block(page)["detail"]["reasoning"]["headings"]]
+    assert texts == ["Planning concurrency test", "Designing monkeypatch"]
+
+
+def test_each_summary_entry_contributes_in_order(tmp_path, monkeypatch):
+    """The aggregate's heading list is the per-entry results concatenated in
+    entry order, not a re-split of the joined string."""
+    records = _multi_heading_records(summary=[
+        {"text": "**A**", "type": "summary_text"},
+        {"text": "**B**\n**C**", "type": "summary_text"},
+    ])
+    conn, ck = _heading_page(tmp_path, monkeypatch, records)
+    try:
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    reasoning = _first_reasoning_block(page)["detail"]["reasoning"]
+    assert [h["text"] for h in reasoning["headings"]] == ["A", "B", "C"]
+    bk = _first_reasoning_block(page)["block_key"]
+    assert [h["key"] for h in reasoning["headings"]] == [
+        f"{bk}#0", f"{bk}#1", f"{bk}#2"]
+
+
+def test_reasoning_title_boundaries_are_computed_from_the_stored_projection(
+    tmp_path, monkeypatch,
+):
+    """§2.2's real risk, stated as a test.
+
+    `_row_is_reasoning_title` decides a segmentation boundary by reading the
+    STORED reasoning projection, so it must see exactly what it saw before S2. A
+    multi-heading aggregate has never produced a stored `title` — the whole
+    reason its headings were unreachable — and publishing `headings` at read time
+    must not change that, or the boundary would move.
+
+    The cross-branch pin for segment boundaries themselves is the committed
+    `wire-detail-segmented.json`, whose reasoning rows sit inside boundary
+    windows and which `bin/cctally-frontend-test` byte-compares against a fresh
+    regeneration.
+    """
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        rows = [kern.CodexNormalizedRow(*row) for row in conn.execute(
+            "SELECT " + q._ROW_COLS + " FROM codex_conversation_messages "
+            "WHERE conversation_key = ? AND kind = 'reasoning'", (ck,))]
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    assert rows, "non-vacuity: the fixture must carry a reasoning row"
+    # Multi-heading aggregate: no stored title, therefore no title boundary.
+    assert all(not q._row_is_reasoning_title(row) for row in rows)
+    # And it DID decompose, so the two facts are being asserted about the same
+    # row rather than about an aggregate that produced nothing.
+    assert len(_first_reasoning_block(page)["detail"]["reasoning"]["headings"]) == 2

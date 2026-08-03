@@ -1006,15 +1006,32 @@ function openCodex(e: Envelope): void {
 }
 
 function codexCacheReport(): CacheReportEnvelope {
-  // The S2 wire shape: dual-published percent, the not-applicable map, and the
-  // Codex-only predicate set (bin/_lib_cache_report_wire.py).
+  // The #465 wire shape: one authoritative percent key, null inapplicable
+  // values, reasons, and the Codex-only predicate set.
   const base = makeCacheReport();
+  const codexToday = {
+    ...base.today,
+    cached_input_percent: base.today.cache_hit_percent,
+    wasted_usd: null,
+  };
+  delete codexToday.cache_hit_percent;
+  const codexDays = base.days.map((d) => {
+    const row = { ...d, cached_input_percent: d.cache_hit_percent, wasted_usd: null };
+    delete row.cache_hit_percent;
+    return row;
+  });
+  const codexBreakdown = (rows: CacheReportEnvelope['by_project']) => rows.map((r) => {
+    const row = { ...r, cached_input_percent: r.cache_hit_percent };
+    delete row.cache_hit_percent;
+    return row;
+  });
   return {
     ...base,
-    today: { ...base.today, cached_input_percent: base.today.cache_hit_percent },
-    days: base.days.map((d) => ({
-      ...d, cached_input_percent: d.cache_hit_percent,
-    })),
+    today: codexToday,
+    days: codexDays,
+    by_project: codexBreakdown(base.by_project),
+    by_model: codexBreakdown(base.by_model),
+    fourteen_day_efficiency_ratio: null,
     not_applicable: {
       wasted_usd: 'OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.',
       fourteen_day_efficiency_ratio: 'Efficiency compares saved against wasted, and Codex has no wasted-cache figure.',
@@ -1175,11 +1192,11 @@ describe('<CacheReportModal /> #443 S2 nullable percent in the daily table', () 
   });
 
   it('reads the Codex authoritative percent in the daily table', () => {
-    const base = makeCacheReport();
+    const base = codexCacheReport();
     const days = [...base.days];
     // Keys that DISAGREE, so equality cannot make this pass either way.
     days[0] = { ...days[0], cached_input_percent: 12, cache_hit_percent: 88 };
-    updateSnapshot(envelopeWith({ ...base, days }));
+    openCodex(codexEnv({ ...base, days }));
     render(<CacheReportModal />);
     const row = document.querySelector(
       `[data-testid="crm-daily-row"][data-date="${days[0].date}"]`,

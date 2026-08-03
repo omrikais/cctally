@@ -179,16 +179,16 @@ def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters
     # inserts an unobserved synthetic row for today at position 0. The
     # measured row is therefore the observed one, not days[0].
     measured = next(row for row in report["days"] if row["observed"])
-    assert measured["cache_hit_percent"] == pytest.approx(80.0)
+    assert "cache_hit_percent" not in measured
     assert measured["cached_input_percent"] == pytest.approx(80.0)
     assert measured["saved_usd"] == pytest.approx(
         80 * (1.25e-6 - 1.25e-7)
     )
     assert measured["net_usd"] == measured["saved_usd"]
-    assert measured["wasted_usd"] == 0.0
+    assert measured["wasted_usd"] is None
     assert measured["cache_creation_tokens"] == 0
     assert report["fourteen_day_counterfactual_usd"] == measured["saved_usd"]
-    assert report["fourteen_day_efficiency_ratio"] == 1.0
+    assert report["fourteen_day_efficiency_ratio"] is None
     assert report["by_project"][0]["key"] == "cctally-dev"
     assert report["by_model"][0]["key"] == "gpt-5"
 
@@ -211,7 +211,9 @@ def test_codex_empty_report_carries_codex_vocabulary(tmp_path, monkeypatch):
 
     assert report["is_empty"] is True
     assert report["today"]["cached_input_percent"] == 0.0
-    assert report["today"]["cache_hit_percent"] == 0.0
+    assert "cache_hit_percent" not in report["today"]
+    assert report["today"]["wasted_usd"] is None
+    assert report["fourteen_day_efficiency_ratio"] is None
     assert report["anomaly_predicates"] == ["cache_drop"]
     assert "wasted_usd" in report["not_applicable"]
     # An empty store measured nothing, so every applicable predicate is
@@ -3600,16 +3602,16 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
             "sessions": "fresh",
         }
 
-        # #350 §3.5: All stops combining and states the real reason, without
-        # degrading the Codex envelope.
+        # #359: All retains the compatible backward-looking actuals and states
+        # that their quota boundary is stale, without degrading Codex itself.
         all_after = after_bundle.sources["all"]
-        assert all_after.data["combined"] is None
+        assert all_after.data["combined"] is not None
         assert [warning.code for warning in all_after.warnings] == [
-            "combined_totals_withheld",
+            "combined_totals_stale",
         ]
         assert all_after.warnings[0].domain == "hero"
         assert all_after.warnings[0].message == (
-            "Codex quota evidence is stale, so combined totals are withheld."
+            "Codex quota evidence is stale; combined totals use retained actuals."
         )
         assert (all_after.availability, all_after.freshness) == ("partial", "fresh")
         assert dict(all_after.domain_freshness) == {
@@ -3624,7 +3626,7 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
             "quota": "stale",
             "sessions": "fresh",
         }
-        assert after_envelope["sources"]["all"]["data"]["combined"] is None
+        assert after_envelope["sources"]["all"]["data"]["combined"] is not None
         assert set(
             after_envelope["sources"]["all"]["data"]["providers"]
         ) == {"claude", "codex"}
@@ -4140,13 +4142,9 @@ _429_PRE_CHANGE_ENVELOPE = (
 ALLOWED_DELTAS = {
     "captured_at", "account_key", "source_schema_version",
 }
-# #443 S2 — the Codex cache-report vocabulary additions. Every one is
-# OPTIONAL and CODEX-ONLY: `cached_input_percent` dual-publishes the value
-# the transitional `cache_hit_percent` still carries, `not_applicable` and
-# `anomaly_predicates` are new Codex metadata, and `anomaly_unevaluated` /
-# `observed` reach the Codex today block now that both Codex returns share
-# the Claude serializer's shape. None of them changes an existing published
-# value, which is why `source_schema_version` stays 3.
+# #443 S2 and #465 Codex cache-report vocabulary changes. These deltas are
+# CODEX-ONLY: the authoritative percent key, retired alias, null inapplicable
+# values, metadata, and row-observation fields. Claude remains pinned.
 #
 # Gated on the PATH, not the leaf name: `observed` and `anomaly_unevaluated`
 # ALSO exist on the Claude cache report, so allowing them by bare name would
@@ -4155,7 +4153,8 @@ ALLOWED_DELTAS = {
 # `test_claude_source_state_is_unchanged` does NOT cover, since it pins only
 # `after["sources"]["claude"]`.
 CODEX_SCOPED_DELTAS = {
-    "cached_input_percent", "not_applicable", "anomaly_predicates",
+    "cached_input_percent", "cache_hit_percent", "wasted_usd",
+    "fourteen_day_efficiency_ratio", "not_applicable", "anomaly_predicates",
     "anomaly_unevaluated", "observed",
 }
 

@@ -41,11 +41,31 @@ jobs:
           python-version: '${{ matrix.python-version }}'
       # Required (NOT dead weight): cctally-test-all glob-runs every bin/cctally-*-test,
       # and cctally-npm-shim-test / cctally-npm-postinstall-test hard-fail (exit 1) without
-      # the `node` binary. We do NOT run `npm ci` — the vitest share smoke is OS-agnostic and
-      # covered on the macOS push gate; this matrix's value is the Python-interpreter axis.
+      # the `node` binary.
+      #
+      # This lane also runs `npm ci` (#463 S1). It deliberately did not, on the
+      # reasoning that the vitest share smoke is OS-agnostic and covered on the
+      # macOS push gate. That reasoning no longer holds: bin/cctally-frontend-test
+      # puts the whole frontend estate INSIDE bin/cctally-test-all, the aggregator
+      # discovers it by its bin/cctally-*-test glob, and the harness fails loudly
+      # (never skips) when dashboard/web/node_modules/.bin/vitest is absent. The
+      # frontend estate is part of the authoritative bundle, so every lane that
+      # runs the bundle must provision it — "the bundle passed" has to mean one
+      # thing on every lane. Without this step the lane fails on every tag push,
+      # on the weekly cron and on the private manual pre-cut gate, across all
+      # three Python versions, and this workflow is published to the public
+      # mirror, so it would break the public repository's CI too.
       - uses: actions/setup-node@v5
         with:
           node-version-file: 'dashboard/web/.nvmrc'
+          # Hosted ubuntu runners start cold on every job, so the npm cache pays
+          # for itself here — the same reason the ephemeral `test-pr` lane in
+          # ci.yml keeps it and the persistent self-hosted lanes do not.
+          cache: npm
+          cache-dependency-path: dashboard/web/package-lock.json
+      - name: Install dashboard deps (vitest for the frontend estate)
+        working-directory: dashboard/web
+        run: npm ci
       - name: Install recovery-capable SQLite CLI
         run: .github/scripts/install-recovery-sqlite.sh "$RUNNER_TEMP/cctally-sqlite"
       - name: Assert required CLI tools present

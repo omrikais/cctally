@@ -105,6 +105,9 @@ function ConversationsKeyTable() {
         <tr><td><kbd>p</kbd> / <kbd>P</kbd></td><td>next / prev plan / question</td></tr>
         <tr><td><kbd>c</kbd> / <kbd>C</kbd></td><td>next / prev cache rebuild</td></tr>
         <tr><td><kbd>m</kbd> / <kbd>M</kbd></td><td>next / prev compaction</td></tr>
+        {/* #463 S2 §2.7 — the reasoning reading spine. Listed here because every
+            other jump family is, and the CHANGELOG advertises h/H by name. */}
+        <tr><td><kbd>h</kbd> / <kbd>H</kbd></td><td>next / prev reasoning heading</td></tr>
         <tr><td><kbd>a</kbd></td><td>jump to last prompt</td></tr>
         <tr><td><kbd>L</kbd></td><td>jump to last error</td></tr>
         <tr><td><kbd>o</kbd></td><td>toggle outline</td></tr>

@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fixture from '../../__tests__/fixtures/envelope.json';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
-import type { DashboardSelection, Envelope } from '../types/envelope';
+import type { CacheReportEnvelope, DashboardSelection, Envelope } from '../types/envelope';
 import { TrendModal } from './TrendModal';
 import { ProjectsModal } from './ProjectsModal';
 import { CacheReportModal } from './CacheReportModal';
@@ -11,6 +11,23 @@ import { CurrentWeekModal } from './CurrentWeekModal';
 import { WeeklyModal } from './WeeklyModal';
 
 const envelope = fixture as unknown as Envelope;
+
+function asCodexCacheReport(report: CacheReportEnvelope): CacheReportEnvelope {
+  const codex = structuredClone(report);
+  for (const row of [codex.today, ...codex.days, ...codex.by_project, ...codex.by_model]) {
+    row.cached_input_percent = row.cache_hit_percent;
+    delete row.cache_hit_percent;
+  }
+  codex.today.wasted_usd = null;
+  for (const day of codex.days) day.wasted_usd = null;
+  codex.fourteen_day_efficiency_ratio = null;
+  codex.not_applicable = {
+    wasted_usd: 'OpenAI charges no cache-write premium, so Codex has no wasted-cache figure.',
+    fourteen_day_efficiency_ratio: 'Efficiency compares saved against wasted, and Codex has no wasted-cache figure.',
+  };
+  codex.anomaly_predicates = ['cache_drop'];
+  return codex;
+}
 
 function renderFor(source: DashboardSelection, node: React.ReactElement) {
   act(() => {
@@ -58,7 +75,7 @@ describe.each(['claude', 'codex', 'all'] as const)(
       // absent one, which would only pin the unavailable body.
       const composed = structuredClone(envelope);
       composed.sources!.codex.data!.cache_report =
-        structuredClone(composed.cache_report!);
+        asCodexCacheReport(composed.cache_report!);
       composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
       act(() => {
         updateSnapshot(composed);
@@ -121,8 +138,8 @@ it('All Cache modal labels and preserves both provider-native reports', () => {
     ...composed.cache_report!.days[0],
     date: `2026-04-${String(index + 1).padStart(2, '0')}`,
   }));
-  const codexReport = structuredClone(composed.cache_report!);
-  codexReport.today.cache_hit_percent = 42;
+  const codexReport = asCodexCacheReport(composed.cache_report!);
+  codexReport.today.cached_input_percent = 42;
   codexReport.today.net_usd = 12.5;
   codexReport.fourteen_day_counterfactual_usd = 99;
   composed.sources!.codex.data!.cache_report = codexReport;

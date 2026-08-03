@@ -100,7 +100,8 @@ def _seed_cache(db_path: pathlib.Path, *, unpriced: bool) -> None:
                 "timestamp_utc, model, input_tokens, output_tokens, "
                 "cache_create_tokens, cache_read_tokens) "
                 "VALUES (?, 0, ?, ?, ?, ?, ?, ?)",
-                ("/fixture/unpriced.jsonl", "2026-05-01T00:00:00Z",
+                ("/fixture/unpriced.jsonl",
+                 _fixture_builders.fixture_timestamp_utc("2026-05-01T00:00:00Z"),
                  _UNPRICED_CLAUDE, 1000, 200, 50, 10),
             )
         conn.commit()

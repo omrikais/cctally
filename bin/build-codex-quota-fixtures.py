@@ -13,7 +13,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _fixture_builders import create_cache_db, create_stats_db, seed_account  # noqa: E402
+from _fixture_builders import (  # noqa: E402
+    create_cache_db,
+    create_stats_db,
+    fixture_timestamp_utc,
+    seed_account,
+)
 
 
 UTC_DAY = "2026-07-15"
@@ -83,9 +88,12 @@ def _seed_entries(
             reasoning_output_tokens, total_tokens, source_root_key, account_key)
            VALUES (?, ?, ?, 'quota-fixture', 'gpt-5', ?, ?, ?, ?, ?, ?, ?)""",
         [
-            (source_path, 20, _iso(10), 1000, 0, 100, 0, 1100, root, account_key),
-            (source_path, 30, _iso(11), 2000, 0, 200, 0, 2200, root, account_key),
-            (source_path, 35, _iso(11, 30), 500, 100, 80, 0, 580, root, account_key),
+            (source_path, 20, fixture_timestamp_utc(_iso(10)),
+             1000, 0, 100, 0, 1100, root, account_key),
+            (source_path, 30, fixture_timestamp_utc(_iso(11)),
+             2000, 0, 200, 0, 2200, root, account_key),
+            (source_path, 35, fixture_timestamp_utc(_iso(11, 30)),
+             500, 100, 80, 0, 580, root, account_key),
         ],
     )
 

@@ -1498,6 +1498,38 @@ def normalize_codex_events(
 # ── mirror pairing + canonical items (§5.3 / §5.2) ────────────────────────────
 
 
+_REASONING_WS_RE = re.compile(r"\s+")
+
+
+def _reasoning_projected_text(row: CodexNormalizedRow) -> str:
+    """Normalized projected text of one reasoning row, or ``""``.
+
+    Read from the STORED projection in ``detail_json``, never from
+    ``search_thinking``: that column is capped at 16,000 characters and a
+    response item stores ``summary + "\\n" + body`` in it, so it cannot
+    distinguish a title from a title-plus-body.
+
+    Normalization drops the bold wrapper and collapses whitespace, because the
+    two extraction paths disagree about both. A ``response_item`` aggregate
+    keeps its parts' ``**`` wrappers inside one ``summary`` string, while an
+    ``event_msg`` part whose text matches the title pattern has already had its
+    wrapper stripped into ``title``.
+    """
+    if not row.detail_json:
+        return ""
+    try:
+        detail = json.loads(row.detail_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    reasoning = detail.get("reasoning") if isinstance(detail, dict) else None
+    if not isinstance(reasoning, dict):
+        return ""
+    head = reasoning.get("title") or reasoning.get("summary") or ""
+    body = reasoning.get("body") or ""
+    joined = "\n".join(part for part in (head, body) if part)
+    return _REASONING_WS_RE.sub(" ", joined.replace("**", "")).strip()
+
+
 def _pair_mirrors_impl(
     rows: list[CodexNormalizedRow],
 ) -> tuple[set[int], dict[int, int]]:
@@ -1543,6 +1575,82 @@ def _pair_mirrors_impl(
                 partners[j] = prev_idx
                 paired_response.add(prev_idx)
         last_prose_by_kind[row.kind] = j
+
+    # Reasoning containment (#463 S1 / F5). Exact-digest pairing structurally
+    # cannot collapse the general reasoning case: a response_item reasoning
+    # row's identity is `"\n".join([summary, body])` while an event_msg
+    # agent_reasoning row's is the raw single string, and the two coincide only
+    # when the body is empty and the raw text equals the summary exactly. The
+    # real relation is containment — one aggregate carries the parts that each
+    # arrived earlier as their own event.
+    #
+    # Measured against the production store on 2026-08-02: of 17,149 turned
+    # event_msg reasoning rows, 4,883 already pair by exact digest and ALL
+    # 12,266 that survive are contained in exactly one same-turn aggregate, with
+    # no orphans and nothing present-but-not-contained.
+    #
+    # This runs BESIDE the exact-digest passes rather than replacing them, so no
+    # other mirror kind's behaviour changes. Three properties make it safe, and
+    # each answers a concrete way a simpler rule would delete real content:
+    #
+    #   * Per-aggregate, never concatenated. Concatenating a turn's aggregates
+    #     admits a match spanning the boundary between two unrelated ones, which
+    #     would suppress a part no aggregate actually contains.
+    #   * Multiset, not set. An aggregate covers each occurrence of a part once.
+    #     Two identical events must not both fold onto an aggregate that carries
+    #     that text once — and an aggregate already claimed by the exact-digest
+    #     pass above has that occurrence spent, which is why `used` is seeded
+    #     from `partners`.
+    #   * An explicit partner. `pair_mirror_partners` is the contract search and
+    #     find rely on to map a suppressed row to its canonical survivor, so a
+    #     containment match names WHICH aggregate owns it — something a
+    #     concatenated match could not do.
+    #
+    # A turn with no aggregate loses nothing, and a part genuinely contained in
+    # none is retained.
+    reasoning_turns: dict[str, dict[str, list[int]]] = {}
+    for i, row in enumerate(rows):
+        if row.kind != "reasoning" or row.turn_id is None:
+            continue
+        group = reasoning_turns.setdefault(row.turn_id, {"R": [], "E": []})
+        group["E" if row.record_family == "event_msg" else "R"].append(i)
+    for group in reasoning_turns.values():
+        if not group["R"]:
+            continue
+        aggregates = [(index, _reasoning_projected_text(rows[index]), {})
+                      for index in group["R"]]
+        # An aggregate the exact-digest pass already paired has spent one
+        # occurrence of its own text; seed that so the two passes share one
+        # budget instead of each spending it independently.
+        spent = {index for index in partners.values()}
+        for index, text, used in aggregates:
+            if index in spent and text:
+                used[text] = used.get(text, 0) + 1
+        for event_index in group["E"]:
+            if event_index in suppressed:
+                continue
+            part = _reasoning_projected_text(rows[event_index])
+            if not part:
+                continue
+            # Physical order decides, so the earliest aggregate that still has
+            # capacity for this part owns it. An aggregate whose whole text IS
+            # the part is preferred over one that merely contains it, because it
+            # is the more accurate survivor for a search hit to land on.
+            owner = None
+            for index, text, used in aggregates:
+                if text.count(part) <= used.get(part, 0):
+                    continue
+                if owner is None:
+                    owner = (index, text, used)
+                if text == part:
+                    owner = (index, text, used)
+                    break
+            if owner is None:
+                continue
+            index, _text, used = owner
+            used[part] = used.get(part, 0) + 1
+            suppressed.add(event_index)
+            partners[event_index] = index
 
     return suppressed, partners
 

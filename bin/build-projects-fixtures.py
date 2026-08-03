@@ -57,7 +57,7 @@ PLANNER_STATS_POLICY = "absent"
 
 
 def _iso(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fb.fixture_timestamp_utc(d)
 
 
 def _week_starts_back(n: int, *, anchor: dt.datetime) -> list[dt.datetime]:
