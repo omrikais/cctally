@@ -30,9 +30,9 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.87.1** (2026-07-30)
+**Latest stable: v1.90.1** (2026-08-02)
 
-- Codex session names now remain visible in Recent Sessions when an individual account is selected, whenever transcript visibility is enabled. Selecting an account no longer replaces every session name with an em dash; disabling transcript visibility still hides names in both the all-accounts and focused-account views.
+- Internal (maintainer-only): the public release snapshot no longer ships the issue-triage pytest modules without the private workflow implementation they import. Those tests now stay behind the same mirror boundary as their `.agent-workflows` dependencies, preventing collection failures across the public Python matrix.
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
