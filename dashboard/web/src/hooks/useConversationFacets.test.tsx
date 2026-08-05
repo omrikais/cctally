@@ -17,6 +17,29 @@ it('fetches and exposes projects', async () => {
   expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversations/facets');
 });
 
+it('clears prior-account facets while the next account request is pending', async () => {
+  const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+  fetchMock
+    .mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({
+        projects: [{ project_label: 'account-a-project', count: 1 }],
+        models: [{ family: 'account-a-model', count: 1 }],
+      }),
+    } as Response)
+    .mockImplementationOnce(() => new Promise(() => {}));
+  const { result, rerender } = renderHook(
+    ({ accountKey }) => useConversationFacets('claude', accountKey),
+    { initialProps: { accountKey: 'account-a' } },
+  );
+  await waitFor(() => expect(result.current.projects).toHaveLength(1));
+
+  rerender({ accountKey: 'account-b' });
+  await waitFor(() => expect(result.current.projects).toEqual([]));
+  expect(result.current.models).toEqual([]);
+  expect(fetchMock.mock.calls[1][0]).toContain('account=account-b');
+});
+
 it('falls back to an empty list on a fetch error', async () => {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('boom'));
   const { result } = renderHook(() => useConversationFacets());

@@ -779,6 +779,7 @@ def apply_db_rederive(
             try:
                 _call_crash_hook("after-batch-commit")
                 result = _journal.rebuild_stats_index(
+                    context=_journal.RebuildContext(trigger="rederive-apply"),
                     high_water=batch_high_water,
                     update_quota_cache=False,
                     before_swap=lambda: _call_crash_hook(
@@ -810,6 +811,9 @@ def apply_db_rederive(
                 )
             try:
                 result = _journal.rebuild_stats_index(
+                    context=_journal.RebuildContext(
+                        trigger="rederive-recovery"
+                    ),
                     high_water=preview.latest_completed_high_water,
                     update_quota_cache=False,
                     before_swap=lambda: _call_crash_hook(

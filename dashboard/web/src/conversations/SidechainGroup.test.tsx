@@ -139,6 +139,23 @@ describe('SidechainGroup', () => {
     expect(err.textContent).toContain('error');
   });
 
+  // #463 S4 remediation round 5 — `statusBadge` recognised the bare literal
+  // `'error'` and nothing else, so a subagent whose terminal status is the OTHER
+  // half of the shared failure vocabulary rendered in the neutral ⚠ warn
+  // treatment beside a failure the rest of the client calls an error. The badge
+  // now reads `FAILED_STATUSES`, so both members of that set take the ✕ error
+  // treatment and the ⚠ branch keeps its real job: a genuinely non-failure
+  // terminal state such as `aborted` or `async_launched`.
+  it('gives BOTH members of the shared failure vocabulary the error class', () => {
+    const items = [member('r', { kind: 'assistant', text: 'Audit module C', cost_usd: 0.30 } as Partial<ConversationItem>)];
+    render(<SidechainGroup subagentKey="cccc3333" items={items}
+             meta={{ kind: 'code-reviewer', status: 'failed' }} />);
+    const err = document.querySelector('.conv-subagent-err')!;
+    expect(err).toBeTruthy();
+    expect(err.textContent).toContain('error');
+    expect(document.querySelector('.conv-subagent-warn')).toBeNull();
+  });
+
   it('spells out a non-completed terminal status (⚠ <status>) with the warn class', () => {
     const items = [member('r', { kind: 'assistant', text: 'Audit module D', cost_usd: 0.30 } as Partial<ConversationItem>)];
     render(<SidechainGroup subagentKey="dddd4444" items={items}

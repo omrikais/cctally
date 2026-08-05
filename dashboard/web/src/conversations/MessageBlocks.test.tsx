@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageBlocks } from './MessageBlocks';
 import { AskUserQuestionCard } from './AskUserQuestionCard'; // ensure import resolves
 import { TranscriptContext } from './TranscriptContext';
-import { HighlightContext } from './HighlightContext';
+import { ExactFindContext, HighlightContext } from './HighlightContext';
+import { resolveJumpAnchor } from './resolveJumpAnchor';
 import type { ConversationBlock } from '../types/conversation';
 
 // #177 S4: MediaFigure reads the session id from TranscriptContext; the media
@@ -1020,6 +1021,26 @@ describe('#463 S2 — Codex reasoning headings', () => {
     expect([...lines].map((n) => n.textContent)).toEqual(['A', 'B']);
   });
 
+  it('marks the exact server-selected heading leaf', () => {
+    const blocks = [{
+      kind: 'codex_reasoning', source: 'response_item', block_key: 'bk',
+      summary: '**Alpha**\n**Beta**',
+      headings: [{ key: 'bk#0', text: 'Alpha' }, { key: 'bk#1', text: 'Beta' }],
+    }] as unknown as ConversationBlock[];
+    const occurrence = {
+      occurrence_id: 'o1.heading', item_key: 'item', uuid: 'item', block_key: 'bk',
+      container_block_key: 'bk', surface: 'body' as const, match_kinds: ['thinking' as const],
+      disclosure: ['bk'], fragments: [{ leaf_key: 'headings.1', start: 0, end: 4 }],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{ occurrences: [occurrence], selectedOccurrenceId: 'o1.heading' }}>
+        <MessageBlocks blocks={blocks} />
+      </ExactFindContext.Provider>,
+    );
+    expect(container.querySelector('mark[data-find-occurrence-id="o1.heading"]')?.textContent)
+      .toBe('Beta');
+  });
+
   it('falls back to summary when headings are absent', () => {
     const blocks = [{
       kind: 'codex_reasoning', source: 'response_item', summary: '**A**\n**B**',
@@ -1209,5 +1230,238 @@ describe('#463 S2 — separately authored messages render separately', () => {
     const second = container.querySelectorAll('[data-block-key]')[1];
     expect(second.querySelector('pre, code')).toBeNull();
     expect(second.textContent).toContain('The preview is complete.');
+  });
+});
+
+// #463 S3 §5.5 — the external-agent marker block. It is not a tool call, so it
+// renders in document order as its own labelled disclosure and never joins a
+// tool run.
+describe('MessageBlocks — the external-agent marker (#463 S3)', () => {
+  const marker = (): ConversationBlock => ({
+    kind: 'external_call', name: 'ToolSearch',
+    input: { query: 'select:SyntheticAlpha' }, truncated: false, block_key: 'bk9',
+  });
+
+  it('renders the marker as its own block, in document order', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[
+        { kind: 'text', text: 'Delegating to the search tool.' },
+        marker(),
+        { kind: 'text', text: 'Back to prose.' },
+      ]} />,
+    );
+    const rendered = Array.from(container.querySelectorAll('.conv-block, .conv-external-call'));
+    expect(rendered).toHaveLength(3);
+    expect(rendered[1].className).toContain('conv-external-call');
+    expect(rendered[1].textContent).toContain('ToolSearch');
+  });
+
+  it('never joins a tool run', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ tool_use_id: 'a' }), marker(), call({ tool_use_id: 'b' })]} />,
+    );
+    // Two separate runs of one call each, so neither gets a run head.
+    expect(container.querySelectorAll('.conv-toolrun')).toHaveLength(2);
+    expect(container.querySelector('.conv-toolrun-head')).toBeNull();
+  });
+
+  it('survives chat focus mode as prose-adjacent structure', () => {
+    // Chat mode strips tool texture. The marker is the assistant's own prose
+    // turned into structure, not a tool chip, so it stays.
+    const { container } = withChat(<MessageBlocks blocks={[marker()]} />);
+    expect(container.querySelector('.conv-external-call')).toBeTruthy();
+  });
+});
+
+// #463 S3 §5.3/§5.4 — session grouping on the run head, and the outcome badge.
+describe('MessageBlocks — session grouping and outcome (#463 S3)', () => {
+  // A deterministic block key per call: React needs distinct keys within a run,
+  // and a random one makes a failure impossible to reproduce from its output.
+  let sessionCallSeq = 0;
+  const sessionCall = (ref: string | null, over: Partial<Extract<ConversationBlock, { kind: 'tool_call' }>> = {}) =>
+    call({
+      name: 'write_stdin', tool_use_id: `t-${ref}-${(sessionCallSeq += 1)}`,
+      native_card: {
+        schema_version: 1, type: 'session_ref', scope: 'shell', ref,
+        operation: 'write', chars: 'y', truncated: false,
+      },
+      ...over,
+    });
+
+  it('names the session on the run head when every session-bearing call shares one', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[sessionCall('2'), sessionCall('2'), sessionCall('2')]} />,
+    );
+    expect(container.querySelector('.conv-toolrun-head')?.textContent).toContain('session 2');
+  });
+
+  it('keeps a generic run head when the run mixes sessions', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[sessionCall('1'), sessionCall('2')]} />,
+    );
+    const head = container.querySelector('.conv-toolrun-head')?.textContent ?? '';
+    expect(head).toContain('tool run · 2 actions');
+    expect(head).not.toContain('session');
+  });
+
+  it('keeps a generic run head when no call in the run names a session', () => {
+    const { container } = render(<MessageBlocks blocks={[call(), call()]} />);
+    expect(container.querySelector('.conv-toolrun-head')?.textContent).toBe('tool run · 2 actions');
+  });
+
+  it('does not name a session for a run whose only references are unresolved', () => {
+    // §3.2 — `ref: null` renders no badge, so it can never make a run
+    // homogeneous either.
+    const { container } = render(
+      <MessageBlocks blocks={[sessionCall(null), sessionCall(null)]} />,
+    );
+    expect(container.querySelector('.conv-toolrun-head')?.textContent).not.toContain('session');
+  });
+
+  const cellCall = (ref: string, id: string) => call({
+    name: 'wait', tool_use_id: id,
+    native_card: {
+      schema_version: 1, type: 'session_ref', scope: 'cell', ref,
+      operation: 'poll', chars: null, truncated: false,
+    },
+  });
+
+  it('never treats a run of cell polls as a shell session', () => {
+    const { container } = render(<MessageBlocks blocks={[cellCall('3', 'tw1'), cellCall('3', 'tw2')]} />);
+    expect(container.querySelector('.conv-toolrun-head')?.textContent).toBe('tool run · 2 actions');
+  });
+
+  it('excludes a cell reference from the run\'s session set', () => {
+    // The two namespaces have zero overlapping values. If cell 7 contributed,
+    // the set would be {7, 3} and the head would fall back to generic — so a
+    // head that still names session 3 proves the cell was excluded.
+    const { container } = render(<MessageBlocks blocks={[cellCall('7', 'tw1'), sessionCall('3')]} />);
+    expect(container.querySelector('.conv-toolrun-head')?.textContent).toContain('session 3');
+  });
+
+  it('renders an unknown outcome on the generic chip as an explicit state', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({
+        name: 'browser_click',
+        outcome: { status: 'unknown', exit_code: null, wall_time_seconds: null },
+      })]} />,
+    );
+    const badge = container.querySelector('.conv-outcome');
+    expect(badge).toBeTruthy();
+    expect(badge?.querySelector('.conv-status-wide')?.textContent).toContain('outcome unknown');
+  });
+
+  it('leaves a chip with no outcome exactly as it renders today', () => {
+    const { container } = render(<MessageBlocks blocks={[call({ result: { text: 'x', truncated: true, is_error: false } })]} />);
+    expect(container.querySelector('.conv-outcome')).toBeNull();
+    expect(container.querySelector('.conv-chip-status')?.textContent).toContain('truncated');
+  });
+});
+
+
+// #463 S4 F-A — a tier-2 jump aligns the failing CALL, not the segment that
+// holds it, so the rendered card has to be addressable by the key the landmark
+// publishes. JSDOM cannot evaluate the scroll; what it pins here is that the
+// address exists and names the card rather than the wrapper carrying it.
+describe('#463 S4 F-A — per-block jump anchors', () => {
+  it('addresses a Codex tool card by its block key', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[call({ name: 'exec', block_key: 'cbk1.e1' })]} />,
+    );
+    const anchor = container.querySelector('[data-block-key="cbk1.e1"]')!;
+    expect(anchor).not.toBeNull();
+    expect(anchor.className).toContain('conv-block-anchor');
+    // The wrapper is `display: contents` — it holds the card rather than being
+    // it, which is why resolveJumpAnchor descends one level.
+    expect(anchor.firstElementChild!.className).toContain('conv-chip');
+  });
+
+  it('leaves a Claude tool card unwrapped, so its markup is unchanged', () => {
+    const { container } = render(<MessageBlocks blocks={[call({ name: 'Read' })]} />);
+    expect(container.querySelector('.conv-block-anchor')).toBeNull();
+  });
+
+  it('addresses a Codex reasoning block by its block key', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[{
+        kind: 'codex_reasoning', source: 'codex', title: 'Checking the failure',
+        block_key: 'cbk1.r',
+      }]} />,
+    );
+    const anchor = container.querySelector('[data-block-key="cbk1.r"]')!;
+    expect(anchor.className).toContain('conv-codex-reasoning');
+  });
+});
+
+// C-4 — the DOM half of the same defect: with no `data-block-key` on the chip,
+// `resolveJumpAnchor` had nothing to find and the landmark fell back to the top
+// of a segment that can be thousands of pixels tall.
+describe('#463 S4 remediation — an orphan tool result is addressable', () => {
+  it('addresses an orphan tool_result chip by its block key', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[{
+        kind: 'tool_result', text: 'boom', truncated: false, is_error: true,
+        tool_use_id: 'call-shared', block_key: 'cbk1.o',
+      }]} />,
+    );
+    const anchor = container.querySelector('[data-block-key="cbk1.o"]')!;
+    expect(anchor).not.toBeNull();
+    expect(anchor.className).toContain('conv-chip--result');
+  });
+
+  it('is reachable through the same resolver a landmark jump uses', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[{
+        kind: 'tool_result', text: 'boom', truncated: false, is_error: true,
+        tool_use_id: 'call-shared', block_key: 'cbk1.o',
+      }]} />,
+    );
+    expect(resolveJumpAnchor(container, 'cbk1.o')!.className).toContain('conv-chip--result');
+  });
+
+  it('emits no address when the block carries no key', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[{
+        kind: 'tool_result', text: 'boom', truncated: false, is_error: true,
+      }]} />,
+    );
+    expect(container.querySelector('[data-block-key]')).toBeNull();
+  });
+});
+
+// #463 S4 remediation round 4 (P3-4) — the stated exception to §2.6.
+//
+// §2.6 drops a block that renders nothing, so the container and the turn's
+// header row go with it. The C-4/F12 round deliberately took the opposite
+// decision for ONE case: an event row with no display text that carries a
+// `block_key`, because a `tool_error` landmark anchored on that key needs an
+// element to align on and dropping the block leaves the jump degrading to the
+// top of a segment. `adaptBlocks` emits `{kind:'text', text:'', block_key}` and
+// this walk renders it as an empty `.conv-block` carrying `data-block-key`.
+//
+// The measurement behind that decision was that the case does not occur — 0 of
+// 219,503 normalized rows have an empty display text on a kind reaching that
+// branch — and `.conv-block` carries no margin, so the container is visually
+// inert. This test pins the rendering rather than the measurement: if the row
+// shapes ever change, the failure mode becomes an empty box the jump aligns on,
+// and a deliberate change of policy should have to move this assertion.
+describe('#463 S4 — the keyed empty text block renders an inert anchor', () => {
+  it('renders a container carrying the block key and no text', () => {
+    const { container } = render(
+      <MessageBlocks blocks={[{ kind: 'text', text: '', block_key: 'cbk1.silent' }] as ConversationBlock[]} />,
+    );
+    const anchors = container.querySelectorAll('.conv-block[data-block-key="cbk1.silent"]');
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0].textContent).toBe('');
+  });
+
+  it('an unkeyed empty text block still renders a container — the key is not what creates it', () => {
+    // The adapter never emits this shape (it drops a text-less block with no
+    // key), so this documents that the walk itself applies no emptiness gate to
+    // the text family: the drop happens upstream, in `adaptBlocks`.
+    const { container } = render(
+      <MessageBlocks blocks={[{ kind: 'text', text: '' }] as ConversationBlock[]} />,
+    );
+    expect(container.querySelectorAll('.conv-block')).toHaveLength(1);
   });
 });

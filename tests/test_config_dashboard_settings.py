@@ -95,7 +95,8 @@ def test_http_dashboard_cache_failure_markers_round_trip(monkeypatch, tmp_path):
         # same block); only cache_failure_markers was sent here so live_tail
         # echoes its default true.
         assert body["dashboard"] == {
-            "cache_failure_markers": False, "live_tail": True}
+            "cache_failure_markers": False, "live_tail": True,
+            "lan_auth": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is False
     finally:
@@ -114,7 +115,8 @@ def test_http_dashboard_cache_failure_markers_true_round_trip(monkeypatch, tmp_p
         )
         assert status == 200, body
         assert body["dashboard"] == {
-            "cache_failure_markers": True, "live_tail": True}
+            "cache_failure_markers": True, "live_tail": True,
+            "lan_auth": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("cache_failure_markers") is True
     finally:
@@ -227,7 +229,8 @@ def test_http_dashboard_combined_save_with_display(monkeypatch, tmp_path):
         )
         assert status == 200, body
         assert body["dashboard"] == {
-            "cache_failure_markers": False, "live_tail": True}
+            "cache_failure_markers": False, "live_tail": True,
+            "lan_auth": True}
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
         srv.shutdown()
@@ -253,6 +256,63 @@ def test_http_dashboard_preserves_sibling_keys(monkeypatch, tmp_path):
         assert cfg["cache_failure_markers"] is False
         assert cfg["bind"] == "lan"                 # sibling preserved
         assert cfg["expose_transcripts"] is True    # sibling preserved
+    finally:
+        srv.shutdown()
+
+
+def test_http_dashboard_lan_auth_round_trip_requires_restart(monkeypatch, tmp_path):
+    """The opt-out persists, but the response marks it as restart-only."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"dashboard": {"lan_auth": False}},
+        )
+        assert status == 200, body
+        assert body["dashboard"] == {
+            "cache_failure_markers": True,
+            "live_tail": True,
+            "lan_auth": False,
+        }
+        assert body["restart_required"] == ["dashboard.lan_auth"]
+        cfg = json.loads(ns["CONFIG_PATH"].read_text())
+        assert cfg["dashboard"]["lan_auth"] is False
+    finally:
+        srv.shutdown()
+
+
+def test_http_dashboard_lan_auth_non_bool_returns_400(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        for bad in ("false", 0, 1, None):
+            status, body = _post_json(
+                "127.0.0.1", port, "/api/settings",
+                {"dashboard": {"lan_auth": bad}},
+            )
+            assert status == 400, (bad, body)
+            assert body.get("field") == "dashboard.lan_auth"
+    finally:
+        srv.shutdown()
+
+
+def test_http_unrelated_dashboard_save_has_no_restart_marker(monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    _wire_handlers(ns)
+    srv, t, port = _serve(ns)
+    try:
+        status, body = _post_json(
+            "127.0.0.1", port, "/api/settings",
+            {"dashboard": {"live_tail": False}},
+        )
+        assert status == 200, body
+        assert "restart_required" not in body
     finally:
         srv.shutdown()
 
@@ -315,7 +375,8 @@ def test_http_dashboard_live_tail_round_trip(monkeypatch, tmp_path):
         )
         assert status == 200, body
         assert body["dashboard"] == {
-            "cache_failure_markers": True, "live_tail": False}
+            "cache_failure_markers": True, "live_tail": False,
+            "lan_auth": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg.get("dashboard", {}).get("live_tail") is False
     finally:
@@ -379,7 +440,8 @@ def test_http_dashboard_both_leaves_in_one_save(monkeypatch, tmp_path):
         )
         assert status == 200, body
         assert body["dashboard"] == {
-            "cache_failure_markers": False, "live_tail": False}
+            "cache_failure_markers": False, "live_tail": False,
+            "lan_auth": True}
         cfg = json.loads(ns["CONFIG_PATH"].read_text())["dashboard"]
         assert cfg["cache_failure_markers"] is False
         assert cfg["live_tail"] is False
@@ -411,3 +473,21 @@ def test_envelope_dashboard_prefs_live_tail_reflects_persisted_false(
     snap = ns["_empty_dashboard_snapshot"]()
     env = ns["snapshot_to_envelope"](snap, now_utc=now)
     assert env["dashboard_prefs"]["live_tail"] is False
+
+
+def test_envelope_dashboard_prefs_lan_auth_default_and_persisted_false(
+        monkeypatch, tmp_path):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    now = dt.datetime(2026, 6, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    snap = ns["_empty_dashboard_snapshot"]()
+    assert ns["snapshot_to_envelope"](
+        snap, now_utc=now
+    )["dashboard_prefs"]["lan_auth"] is True
+
+    ns["CONFIG_PATH"].write_text(json.dumps(
+        {"dashboard": {"lan_auth": False}}
+    ))
+    assert ns["snapshot_to_envelope"](
+        snap, now_utc=now
+    )["dashboard_prefs"]["lan_auth"] is False

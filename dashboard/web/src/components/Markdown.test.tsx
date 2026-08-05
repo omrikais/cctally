@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { Markdown, MdLink } from './Markdown';
-import { HighlightContext } from '../conversations/HighlightContext';
+import { ExactFindContext, HighlightContext } from '../conversations/HighlightContext';
 
 describe('Markdown', () => {
   it('renders gfm tables', () => {
@@ -28,6 +28,61 @@ describe('Markdown', () => {
     const a = container.querySelector('a')!;
     expect(a.getAttribute('target')).toBe('_blank');
     expect(a.getAttribute('rel')).toBe('noopener noreferrer');
+  });
+
+  it('renders one server occurrence across plain, bold, and plain leaves', () => {
+    const occurrence = {
+      occurrence_id: 'o1.abc', item_key: 'item', uuid: 'item', block_key: 'block',
+      container_block_key: 'block', surface: 'body' as const, match_kinds: [],
+      disclosure: [],
+      fragments: [
+        { leaf_key: 't0', start: 0, end: 1 },
+        { leaf_key: 't1', start: 0, end: 1 },
+        { leaf_key: 't2', start: 0, end: 1 },
+      ],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{ occurrences: [occurrence], selectedOccurrenceId: 'o1.abc' }}>
+        <Markdown findBlockKey="block" findSurface="body">{'a**b**c'}</Markdown>
+      </ExactFindContext.Provider>,
+    );
+    const marks = container.querySelectorAll('mark[data-find-occurrence-id="o1.abc"]');
+    expect(marks).toHaveLength(3);
+    expect(Array.from(marks).map((mark) => mark.textContent)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('lands exact targets in a registered fence after syntax tokenization', () => {
+    const occurrence = {
+      occurrence_id: 'o1.fence', item_key: 'item', uuid: 'item', block_key: 'block',
+      container_block_key: 'block', surface: 'body' as const, match_kinds: [],
+      disclosure: [], fragments: [{ leaf_key: 't0', start: 6, end: 9 }],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{ occurrences: [occurrence], selectedOccurrenceId: 'o1.fence' }}>
+        <Markdown findBlockKey="block" findSurface="body">{'```ts\nconst hit = 1;\n```'}</Markdown>
+      </ExactFindContext.Provider>,
+    );
+    const mark = container.querySelector('mark[data-find-occurrence-id="o1.fence"]');
+    expect(mark?.textContent).toBe('hit');
+    expect(container.querySelector('.codeblock')).not.toBeNull();
+  });
+
+  it('lands exact targets through GFM task, entity, autolink, and hard-break DOM leaves', () => {
+    const occurrence = {
+      occurrence_id: 'o1.gfm', item_key: 'item', uuid: 'item', block_key: 'block',
+      container_block_key: 'block', surface: 'body' as const, match_kinds: [],
+      disclosure: [], fragments: [{ leaf_key: 't1', start: 8, end: 12 }],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{ occurrences: [occurrence], selectedOccurrenceId: 'o1.gfm' }}>
+        <Markdown findBlockKey="block" findSurface="body">
+          {'- [x] done &amp; <https://example.test>  \nnext'}
+        </Markdown>
+      </ExactFindContext.Provider>,
+    );
+    expect(container.querySelector('input[type="checkbox"]')).not.toBeNull();
+    expect(container.querySelector('mark[data-find-occurrence-id="o1.gfm"]')?.textContent)
+      .toBe('exam');
   });
 
   it('degrades local and placeholder image targets without mounting an image request', () => {
@@ -198,6 +253,62 @@ describe('Markdown', () => {
     const { container } = renderWithTerms(['cache', 'cache.db'], 'open cache.db now');
     const marks = Array.from(container.querySelectorAll('mark')).map((m) => m.textContent);
     expect(marks).toEqual(['cache.db']);
+  });
+});
+
+describe('#463 S5 — non-http(s) targets are inert', () => {
+  const inertLinks = [
+    ['an absolute filesystem path', '/srv/example-project/SKILL.md'],
+    ['a bare relative target', 'url'],
+    ['a relative document path', 'docs/commands/dashboard.md'],
+    ['a custom scheme', 'app://open/thing'],
+    ['an in-page anchor', '#section-two'],
+  ] as const;
+
+  for (const [label, target] of inertLinks) {
+    it(`renders no anchor for ${label}`, () => {
+      const { container } = render(<Markdown>{`see [the doc](${target})`}</Markdown>);
+      expect(container.querySelector('a')).toBeNull();
+      expect(container.textContent).toContain('the doc');
+    });
+
+    it(`serializes ${label} into no attribute`, () => {
+      const { container } = render(<Markdown>{`see [the doc](${target})`}</Markdown>);
+      // Non-vacuity floor: the loop below asserts nothing at all if the render
+      // produced no elements, so a Markdown component that silently rendered
+      // nothing would pass this case.
+      const elements = container.querySelectorAll('*');
+      expect(elements.length, 'nothing rendered — this case cannot observe the defect').toBeGreaterThan(0);
+      for (const el of elements) {
+        for (const attr of Array.from(el.attributes)) {
+          expect(attr.value, `${el.tagName}[${attr.name}] carries the destination`).not.toContain(target);
+        }
+      }
+    });
+  }
+
+  it('still renders an anchor for https', () => {
+    const { container } = render(<Markdown>{'see [the doc](https://example.com/x)'}</Markdown>);
+    const a = container.querySelector('a');
+    expect(a?.getAttribute('href')).toBe('https://example.com/x');
+    expect(a?.getAttribute('target')).toBe('_blank');
+    expect(a?.getAttribute('rel')).toBe('noopener noreferrer');
+  });
+
+  it('still renders an anchor for mailto', () => {
+    const { container } = render(<Markdown>{'write to [us](mailto:a@example.com)'}</Markdown>);
+    expect(container.querySelector('a')?.getAttribute('href')).toBe('mailto:a@example.com');
+  });
+
+  it('renders the unavailable note for a bare relative image target', () => {
+    const { container } = render(<Markdown>{'![shot](url)'}</Markdown>);
+    expect(container.querySelector('img')).toBeNull();
+    expect(container.querySelector('.conv-local-media-unavailable')).not.toBeNull();
+  });
+
+  it('still renders a remote image', () => {
+    const { container } = render(<Markdown>{'![shot](https://example.com/a.png)'}</Markdown>);
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('https://example.com/a.png');
   });
 });
 

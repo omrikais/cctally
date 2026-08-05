@@ -63,7 +63,8 @@
               "key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
               "text": "Synthetic summary"
             }
-          ]
+          ],
+          "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4"
         },
         {
           "kind": "tool_call",
@@ -72,8 +73,14 @@
           "input": {},
           "preview": "fixture_function",
           "tool_use_id": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "block_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
           "payload_capable": true,
           "payload_kind": "call",
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
           "result": {
             "text": "{\"ok\":true}",
             "truncated": false,
@@ -89,8 +96,14 @@
           },
           "preview": "fixture_custom",
           "tool_use_id": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
           "payload_capable": true,
           "payload_kind": "call",
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
           "result": {
             "text": "{\"answer\":\"synthetic\"}",
             "truncated": false,
@@ -106,8 +119,14 @@
           },
           "preview": "tool_search_call",
           "tool_use_id": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "block_key": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
           "payload_capable": true,
           "payload_kind": "call",
+          "outcome": {
+            "status": "completed",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
           "result": {
             "text": "{\"name\":\"fixture-search\"}",
             "truncated": false,
@@ -123,6 +142,7 @@
           },
           "preview": "web_search_call",
           "tool_use_id": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "block_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
           "payload_capable": true,
           "payload_kind": "call",
           "result": null
@@ -135,7 +155,8 @@
         {
           "kind": "codex_reasoning",
           "source": "agent_reasoning",
-          "body": "Synthetic agent reasoning"
+          "body": "Synthetic agent reasoning",
+          "block_key": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001"
         }
       ],
       "is_sidechain": false,
@@ -216,7 +237,8 @@
       "blocks": [
         {
           "kind": "text",
-          "text": "context_compacted"
+          "text": "context_compacted",
+          "block_key": "cbk1_f335a8740d1142ec42d960880521be2f9614cc14"
         }
       ],
       "is_sidechain": false,
@@ -248,6 +270,7 @@
           "input": null,
           "preview": "synthetic.txt",
           "tool_use_id": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e",
+          "block_key": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e",
           "payload_capable": true,
           "payload_kind": "event",
           "native_card": {
@@ -257,7 +280,8 @@
             "status": "completed",
             "files": [
               {
-                "path": "synthetic.txt"
+                "path": "synthetic.txt",
+                "truncated": false
               }
             ],
             "success": true,
@@ -296,7 +320,8 @@
       "blocks": [
         {
           "kind": "text",
-          "text": "mcp_tool_call fixture"
+          "text": "mcp_tool_call fixture",
+          "block_key": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29"
         }
       ],
       "is_sidechain": false,
@@ -323,7 +348,8 @@
       "blocks": [
         {
           "kind": "text",
-          "text": "web_search synthetic"
+          "text": "web_search synthetic",
+          "block_key": "cbk1_164fbd4071b1d7940671365b38147480a6ba47c0"
         }
       ],
       "is_sidechain": false,
@@ -372,6 +398,10 @@
     "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
     "uuid": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
     "id": 969399338
+  },
+  "session_index": {
+    "sessions": {},
+    "truncated": false
   },
   "provider_meta": {
     "source": "codex",

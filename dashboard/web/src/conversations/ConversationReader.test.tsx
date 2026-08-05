@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ConversationReader, deriveReaderTitle } from './ConversationReader';
+import { ConversationReader, ProviderThreadNav, deriveReaderTitle } from './ConversationReader';
+import { OutlinePanel } from './OutlinePanel';
 import { _resetForTests, dispatch, getState, subscribeStore, updateSnapshot } from '../store/store';
 import type { Envelope } from '../types/envelope';
 import {
@@ -358,6 +359,46 @@ describe('ConversationReader', () => {
     await waitFor(() => expect(target.classList.contains('conv-item--jumped')).toBe(true));
     // The jump landed: it cleared and pinned the target (the user-facing outcome).
     await waitFor(() => expect(getState().convPinnedUuid).toBe('targetFrag'));
+  });
+
+  it('#479 — a warm deep link aligns the requested message start, not the middle of a tall row', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'target' })], null));
+    const scrollToSpy = spyScrollTo();
+    const { container } = render(<ConversationReader sessionId="s" />);
+
+    const body = await waitFor(() => {
+      const el = container.querySelector('.conv-reader-body') as HTMLElement | null;
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    const target = container.querySelector('[data-uuid="target"]') as HTMLElement;
+    expect(target).not.toBeNull();
+
+    // Hand-derived geometry: target top relative to the scroll content is
+    // 500 - 100 + 100 = 500. A start landing therefore writes 500. Centering
+    // this 1,000px-tall row in a 600px viewport would instead write 700 — the
+    // production defect that parked known deep links thousands of pixels into
+    // their message once real row heights replaced estimates.
+    setScroll(body, { scrollTop: 100, clientHeight: 600, scrollHeight: 2_000 });
+    vi.spyOn(body, 'getBoundingClientRect').mockReturnValue({
+      top: 100, bottom: 700, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 100, toJSON: () => ({}),
+    } as DOMRect);
+    vi.spyOn(target, 'getBoundingClientRect').mockReturnValue({
+      top: 500, bottom: 1_500, left: 0, right: 800, width: 800, height: 1_000,
+      x: 0, y: 500, toJSON: () => ({}),
+    } as DOMRect);
+
+    await act(async () => {
+      dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'target' } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(scrollToSpy).toHaveBeenCalled());
+
+    const requestedTops = scrollToSpy.mock.calls.map((call) =>
+      (call[0] as unknown as ScrollToOptions).top);
+    expect(requestedTops.length).toBeGreaterThan(0);
+    expect(requestedTops.every((top) => top === 500)).toBe(true);
   });
 
   it('jump landing never passes scrollToIndex the firstItemIndex-offset virtual index (#232 P1-A / #234 array-index regression)', async () => {
@@ -3699,6 +3740,39 @@ describe('ConversationReader in-scroller paging states (#463 S1 / #448)', () => 
     await waitFor(() => expect(screen.queryByTestId('conv-jump-unresolved')).toBeNull());
   });
 
+  it('#479 — reports a loaded target that the virtualized mount walk cannot bring into view', async () => {
+    virtuosoTestHandle.renderWindow = { start: 0, size: 1 };
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'target' })]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'target' } });
+    render(<ConversationReader sessionId="s" />);
+
+    await waitFor(() => expect(getState().conversationJump).toBeNull(), { timeout: 3_000 });
+    const failure = await waitFor(
+      () => screen.getByTestId('conv-jump-unresolved'),
+      { timeout: 3_000 },
+    );
+    expect(failure).toHaveTextContent('could not be brought into view');
+    expect(getState().convPinnedUuid).not.toBe('target');
+  });
+
+  it('reports a persistent paging failure separately from an unreachable target (#480)', async () => {
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })], 2));
+    // The rescue response bounds the RED run: current main hot-loops through all
+    // six failures and eventually exhausts, while the fixed reader stops after
+    // three attempts and never consumes the rescue response.
+    for (let i = 0; i < 6; i++) {
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error(`page failure ${i}`));
+    }
+    mockFetchOnce(detail([], null));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's', jump: { session_id: 's', uuid: 'never-appears' } });
+    render(<ConversationReader sessionId="s" />);
+
+    await waitFor(() => expect(screen.getByTestId('conv-jump-load-failed')).toBeInTheDocument(), { timeout: 2_000 });
+    expect(screen.getByRole('status')).toHaveTextContent('Could not finish loading the linked message.');
+    expect(screen.queryByTestId('conv-jump-unresolved')).toBeNull();
+    expect(getState().conversationJump).toBeNull();
+  });
+
   // #463 S1 — the give-up message belongs to ONE finished jump. Gating its
   // render on `!fetching` made it vanish and return around every later page the
   // user's own scrolling triggered, long after the jump had ended. A page
@@ -3979,6 +4053,45 @@ describe('#463 S2 reasoning heading navigation (§2.7)', () => {
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+  });
+
+  it('#486: retries an unmounted heading without waiting for a rendered-range change', async () => {
+    mockFetchOnce(detail([
+      reasoningItem('seg0', ['A']), reasoningItem('seg1', ['B']), reasoningItem('seg2', ['C'])]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    virtuosoTestHandle.renderWindow = { start: 0, size: 1 };
+    const { container } = render(
+      <ConversationReader sessionId="s" outline={headingOutline([
+        oTurn({ uuid: 'seg0', kind: 'assistant' }),
+        oTurn({ uuid: 'seg1', kind: 'assistant' }),
+        oTurn({ uuid: 'seg2', kind: 'assistant' })])} />);
+    await waitFor(() => expect(container.querySelector('[data-heading-key="seg0#0"]')).not.toBeNull());
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
+
+    // The real-browser failure leaves exactly one giant tail row mounted. Its
+    // first estimate-based hop changes no rendered range, so replaying the same
+    // request is ignored. Model the real fix: the first item-level request is a
+    // no-op, then two physical hops through the giant mounted row expose the
+    // neighbour without any synthetic itemsRendered nudge from the test.
+    const body = container.querySelector('.conv-reader-body') as HTMLElement;
+    let scrollTop = 0;
+    let pixelHops = 0;
+    Object.defineProperty(body, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+        if (++pixelHops !== 2) return;
+        virtuosoTestHandle.renderWindow = { start: 1, size: 1 };
+        virtuosoTestHandle.forceRerender?.();
+      },
+    });
+    await press('h');
+    await waitFor(() => expect(currentKey(container)).toBe('seg1#0'));
+    expect(virtuosoTestHandle.scrollToIndex).toHaveBeenCalledTimes(2);
+    expect(pixelHops).toBe(2);
   });
 
   it('keeps a repeated press on the same unreached heading — it never runs away', async () => {
@@ -4330,7 +4443,7 @@ describe('#463 S2 reasoning heading navigation (§2.7)', () => {
     await waitFor(() => expect(currentKey(container)).toBe('seg1#1'));
   });
 
-  it('force-opens a collapsed subagent thread instead of marking a hidden heading', async () => {
+  it('#486: force-opens a collapsed bucket-root and lands its heading', async () => {
     // `querySelectorAll` resolves an element inside a CLOSED <details> because
     // HTML keeps it in the document, so a step onto one reported success,
     // advanced the cursor, and produced no mark and no scroll — the invariant
@@ -4361,21 +4474,13 @@ describe('#463 S2 reasoning heading navigation (§2.7)', () => {
     expect(thread.querySelector('[data-heading-key="sub0#0"]')).not.toBeNull();
     await press('h');
     await waitFor(() => expect(currentKey(container)).toBe('seg0#0'));
-    const jumped: string[] = [];
-    const unsubscribe = subscribeStore(() => {
-      const uuid = getState().conversationJump?.uuid;
-      if (uuid && !jumped.includes(uuid)) jumped.push(uuid);
-    });
     await press('h');
-    // It handed the request to the jump pipeline rather than reporting a
-    // landing on an element nobody can see. This fixture's heading sits on the
-    // thread's BUCKET ROOT, and a bucket-root jump deliberately flashes the card
-    // without force-opening it (#188 B1), so the thread stays shut and the
-    // cursor stays where it was — which is the invariant, not a landing. The
-    // sibling test below covers a NON-root member, where the force-open runs.
-    await waitFor(() => expect(jumped).toContain('sub0'));
-    unsubscribe();
-    expect(currentKey(container)).toBe('seg0#0');
+    // Heading navigation differs from an outline card-flash: a heading on the
+    // bucket root must force-open its full ancestor chain before it can count as
+    // a landing. Keeping this in the direct walk also avoids a clear-without-
+    // land handoff through the generic conversation-jump pipeline.
+    await waitFor(() => expect(currentKey(container)).toBe('sub0#0'));
+    expect(thread.open).toBe(true);
   });
 
   it('completes onto a heading inside a NON-root member once the force-open lands', async () => {
@@ -4437,5 +4542,323 @@ describe('#463 S2 reasoning heading navigation (§2.7)', () => {
     const serialized = JSON.stringify(outline);
     expect(serialized).not.toContain('#0');
     expect(serialized).not.toContain('#1');
+  });
+});
+
+// ---- #463 S4 remediation round 2 — one landmark jump pipeline -------------
+//
+// The browser gate found landmark stepping dead while every unit gate here was
+// green, because the three entry points into the jump pipeline — a rail row, a
+// cluster chip, a reader key — had each been tested on its first jump only.
+// These tests exercise the state the browser reached, and they compare the
+// three entry points against each other rather than each against itself.
+describe('#463 S4 landmark navigation entry points agree (remediation round 2)', () => {
+  const press = (key: string) => fireEvent.keyDown(document, { key });
+
+  const landmarkOutline = (): ConversationOutline => ({
+    session_id: 's',
+    stats: {
+      turns: { total: 4, human: 2, assistant: 2, tool_result: 0, meta: 0 },
+      tool_counts: {}, error_count: 2, models: {}, duration_seconds: null,
+      tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      cache_saved_usd: 0,
+    },
+    turns: [
+      oTurn({ uuid: 'h1', kind: 'human' }),
+      oTurn({ uuid: 'a1', kind: 'assistant', segment_uuids: ['a1', 'seg-a'],
+              tools: [{ name: 'exec', is_error: true }] }),
+      oTurn({ uuid: 'h2', kind: 'human' }),
+      oTurn({ uuid: 'a2', kind: 'assistant', segment_uuids: ['a2', 'seg-b'],
+              tools: [{ name: 'exec', is_error: true }] }),
+    ],
+    landmarks: [
+      { landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'seg-a',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null },
+      { landmark_key: 'cbk.e2#tool_error', block_key: 'cbk.e2', uuid: 'seg-b',
+        parent_uuid: 'a2', kind: 'tool_error', label: 'exec', ts: null },
+    ],
+  });
+
+  // A segmented Codex turn is several ITEMS sharing one outline entry, which is
+  // why a landmark's anchor is a segment key and not a turn uuid.
+  const items = () => [
+    makeItem({ uuid: 'h1', kind: 'human', text: 'go' }),
+    makeItem({ uuid: 'a1', kind: 'assistant', text: 'first' }),
+    makeItem({ uuid: 'seg-a', kind: 'assistant', text: 'first, continued' }),
+    makeItem({ uuid: 'h2', kind: 'human', text: 'again' }),
+    makeItem({ uuid: 'a2', kind: 'assistant', text: 'second' }),
+    makeItem({ uuid: 'seg-b', kind: 'assistant', text: 'second, continued' }),
+  ];
+
+  async function renderReader() {
+    mockFetchOnce(detail(items()));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={landmarkOutline()} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-thread')).not.toBeNull());
+    return utils;
+  }
+
+  // C-2 — `readerJump` took no inner-anchor parameter, so a keyboard jump to the
+  // same landmark the rail and the chip reach carried a strictly smaller
+  // payload: the segment, without the failing call inside it.
+  it('the keyboard direct jump carries the same payload as the rail and the chip', async () => {
+    const rail = render(<OutlinePanel sessionId="s" outline={landmarkOutline()} />);
+    const rows = rail.container.querySelectorAll('.conv-outline-entry--landmark');
+    act(() => { fireEvent.click(rows[rows.length - 1]); });
+    const fromRail = getState().conversationJump;
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    const chip = rail.container.querySelector<HTMLElement>('[data-jump-kind="error"]')!;
+    act(() => { fireEvent.click(chip); });
+    const fromChip = getState().conversationJump;
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    rail.unmount();
+
+    await renderReader();
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    press('L');  // the keyboard twin of the chip's primary click
+    const fromKeyboard = getState().conversationJump;
+
+    expect(fromRail).toEqual({ session_id: 's', uuid: 'seg-b', inner_anchor_key: 'cbk.e2' });
+    expect(fromChip).toEqual(fromRail);
+    expect(fromKeyboard).toEqual(fromRail);
+  });
+
+  // C-1 — the pin a landmark jump leaves is a SEGMENT key, which the own-uuid
+  // map does not hold, so the cursor fell back to -1 and every forward press
+  // re-found the FIRST target. The control group was the prompt family, whose
+  // anchors are turn uuids and which stepped correctly throughout.
+  //
+  // Round 3 (F13) — the assertion below is only meaningful if a cursor-less
+  // forward press really does land on the FIRST landmark, because the broken
+  // code reached seg-a by falling through to `cursorUuidRef`, which happens to
+  // be unset in `renderReader`. That default is unrelated to this fix, so the
+  // press with no pin is made HERE, in the same test: it states what the
+  // fallback cursor answers, and it fails first if some later edit seeds a
+  // cursor past turn 0 and makes the second half pass against broken code.
+  it('a forward press after a landmark jump advances instead of re-landing', async () => {
+    await renderReader();
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    press('e');
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's', uuid: 'seg-a', inner_anchor_key: 'cbk.e1' });
+
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    expect(getState().convPinnedUuid).toBe('seg-a');
+    press('e');
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's', uuid: 'seg-b', inner_anchor_key: 'cbk.e2' });
+  });
+
+  it('and a backward press from the second landmark reaches the first', async () => {
+    await renderReader();
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-b', anchorKey: 'cbk.e2' }); });
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    press('E');
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's', uuid: 'seg-a', inner_anchor_key: 'cbk.e1' });
+  });
+
+  // The prompt family is the control: it stepped correctly before this change
+  // and must still.
+  it('leaves the prompt family, which never regressed, stepping as before', async () => {
+    await renderReader();
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'h1' }); });
+    press('u');
+    expect(getState().conversationJump).toEqual({ session_id: 's', uuid: 'h2' });
+  });
+
+  // C-3 — one pin mechanism for all three entry points: the landing writes the
+  // inner anchor it actually used, and the rail derives its highlight from that.
+  it('records the inner anchor the landing used on the pin', async () => {
+    const { container } = await renderReader();
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    press('L');
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    expect(container.querySelector('[data-uuid="a2"]')).not.toBeNull();
+    expect(getState().convPinnedUuid).toBe('seg-b');
+    expect(getState().convPinnedAnchorKey).toBe('cbk.e2');
+  });
+
+  it('clears the inner anchor when a jump without one lands', async () => {
+    await renderReader();
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-b', anchorKey: 'cbk.e2' }); });
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    press('a');  // jump to the last PROMPT — a bare turn uuid, no inner anchor
+    await waitFor(() => expect(getState().conversationJump).toBeNull());
+    expect(getState().convPinnedUuid).toBe('h2');
+    expect(getState().convPinnedAnchorKey).toBeNull();
+  });
+
+  // Round 3 (F10) — `cursorIndex` resolves a SEGMENT key, and the reader reads
+  // the cursor from `convPinnedUuid ?? convCurrentTurnUuid`. The second of those
+  // is written by scroll-sync, and for a segmented Codex item it is a segment
+  // key, so the fix widened stepping beyond the pin the reported defect named:
+  // a scroll cursor that previously missed and fell through to `cursorUuidRef`
+  // now resolves to its owning turn. This test states that widening, so it is
+  // covered rather than incidental.
+  it('steps from a scroll cursor that is a Codex SEGMENT key, with no pin at all', async () => {
+    await renderReader();
+    act(() => { dispatch({ type: 'SET_CONV_CURRENT_TURN', uuid: 'seg-a' }); });
+    act(() => { dispatch({ type: 'CLEAR_CONVERSATION_JUMP' }); });
+    expect(getState().convPinnedUuid).toBeNull();
+    press('e');
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's', uuid: 'seg-b', inner_anchor_key: 'cbk.e2' });
+  });
+});
+
+// ---- #463 S4 remediation round 3 — the Errors badge counts TURNS -----------
+//
+// F2. The badge read `targetLists.error.length`, which under landmark awareness
+// is one entry per failing CALL, while the comment directly above it said the
+// number is the error-TURN count and the jump chip beside it already showed
+// turns. The browser gate saw a badge of 27 next to a chip of 14 on a filter
+// that navigates 14 turns. The tests that existed could not see it: they used
+// Claude-shaped outlines with no `landmarks`, where one target IS one turn by
+// construction, so the two numbers coincide. This outline separates them.
+describe('#463 S4 — the Errors badge counts error turns, not failing calls', () => {
+  // THREE failing calls in TWO turns: turn `a1` holds two of them. The Claude
+  // path cannot produce this shape at all, which is why the older tests missed
+  // the defect.
+  const threeCallsTwoTurns = (): ConversationOutline => ({
+    session_id: 's',
+    stats: {
+      turns: { total: 4, human: 2, assistant: 2, tool_result: 0, meta: 0 },
+      tool_counts: {}, error_count: 3, models: {}, duration_seconds: null,
+      tokens: { input: 0, output: 0, cache_creation: 0, cache_read: 0 }, cost_usd: 0,
+      cache_saved_usd: 0,
+    },
+    turns: [
+      oTurn({ uuid: 'h1', kind: 'human' }),
+      oTurn({ uuid: 'a1', kind: 'assistant', segment_uuids: ['a1', 'seg-a'],
+              tools: [{ name: 'exec', is_error: true }] }),
+      oTurn({ uuid: 'h2', kind: 'human' }),
+      oTurn({ uuid: 'a2', kind: 'assistant', segment_uuids: ['a2', 'seg-b'],
+              tools: [{ name: 'exec', is_error: true }] }),
+    ],
+    landmarks: [
+      { landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'seg-a',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null },
+      { landmark_key: 'cbk.e1b#tool_error', block_key: 'cbk.e1b', uuid: 'seg-a',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null },
+      { landmark_key: 'cbk.e2#tool_error', block_key: 'cbk.e2', uuid: 'seg-b',
+        parent_uuid: 'a2', kind: 'tool_error', label: 'exec', ts: null },
+    ],
+  });
+
+  async function renderAt(band: 'mobile' | 'wide') {
+    stubResponsiveMedia((q: string) => {
+      if (q === MOBILE_MEDIA_QUERY) return band === 'mobile';
+      if (q === WIDE_MEDIA_QUERY) return band === 'wide';
+      return false;
+    });
+    _resetForTests();
+    mockFetchOnce(detail([makeItem({ uuid: 'h1' })]));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const utils = render(<ConversationReader sessionId="s" outline={threeCallsTwoTurns()} />);
+    await waitFor(() => expect(utils.container.querySelector('.conv-reader-head')).not.toBeNull());
+    return utils;
+  }
+
+  it('the desktop segmented badge reads 2, the turn count, not 3', async () => {
+    const { container } = await renderAt('wide');
+    expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('2');
+  });
+
+  it('the compact menu badge — the mobile twin of the same number — agrees', async () => {
+    const { container } = await renderAt('mobile');
+    fireEvent.click(container.querySelector('.conv-focus-compact-toggle') as HTMLButtonElement);
+    const errors = screen.getByRole('menuitemradio', { name: /Errors/ });
+    expect(within(errors).getByText('2')).not.toBeNull();
+    expect(within(errors).queryByText('3')).toBeNull();
+  });
+
+  // Round 4 (P3-5) — the THIRD mount. `errorTurnCount` feeds three badges: the
+  // desktop segmented control, the mobile compact menu, and the folded-desktop
+  // compact menu (wide viewport, reader element under 720px — in practice the
+  // outline column open between 1101px and ~1400px). The first two had tests
+  // and the third had only the browser gate, so the estate did not match the
+  // three sites the code has and a regression there would ship silently.
+  it('the folded-desktop compact menu — the third mount of the same number — agrees', async () => {
+    densityMock.value = 'compact';
+    const { container } = await renderAt('wide');
+    // The folded desktop head, not the mobile one.
+    expect(container.querySelector('.conv-reader-head--folded')).not.toBeNull();
+    expect(container.querySelector('.conv-reader-head--mobile')).toBeNull();
+    fireEvent.click(container.querySelector('.conv-focus-compact-toggle') as HTMLButtonElement);
+    const errors = screen.getByRole('menuitemradio', { name: /Errors/ });
+    expect(within(errors).getByText('2')).not.toBeNull();
+    expect(within(errors).queryByText('3')).toBeNull();
+  });
+
+  it('agrees with the outline rail chip, which is the number it was always meant to equal', async () => {
+    const rail = render(<OutlinePanel sessionId="s" outline={threeCallsTwoTurns()} />);
+    const chip = rail.container.querySelector('[data-jump-kind="error"]')!;
+    expect(chip.querySelector('.conv-jump-cluster-count')!.textContent).toBe('2');
+    rail.unmount();
+
+    const { container } = await renderAt('wide');
+    expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('2');
+  });
+});
+
+// #463 S5 (F24d, spec §4.6) — parent-and-child thread navigation rebuilt its ref
+// without `account_key`. Conversation identity INCLUDES the account, so under an
+// account focus the chip named one account while the reader opened an accountless
+// identity and no rail row compared as current — the same identity-loss class as
+// the deep-link defect Task 4 closes.
+describe('#463 S5 — ProviderThreadNav carries the account through thread navigation', () => {
+  beforeEach(() => _resetForTests());
+
+  const detailWith = (source: 'claude' | 'codex') => ({
+    items: [],
+    provider_meta: {
+      source,
+      conversation_key: 'v1.self',
+      parent: { conversation_key: 'v1.parent', title: 'Parent thread' },
+      children: [{ conversation_key: 'v1.child', title: 'Child thread', cost_usd: 0 }],
+    },
+  }) as unknown as Parameters<typeof ProviderThreadNav>[0]['detail'];
+
+  it('carries account_key into the parent ref', () => {
+    render(<ProviderThreadNav
+      detail={detailWith('codex')}
+      conversationRef={{ source: 'codex', key: 'v1.self', account_key: 'acct-1' }}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /parent thread/i }));
+    expect(getState().selectedConversationRef).toEqual({
+      source: 'codex', key: 'v1.parent', account_key: 'acct-1',
+    });
+  });
+
+  it('carries account_key into a child ref', () => {
+    render(<ProviderThreadNav
+      detail={detailWith('codex')}
+      conversationRef={{ source: 'codex', key: 'v1.self', account_key: 'acct-1' }}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /child thread/i }));
+    expect(getState().selectedConversationRef).toEqual({
+      source: 'codex', key: 'v1.child', account_key: 'acct-1',
+    });
+  });
+
+  it('omits account_key when the current ref carries none', () => {
+    render(<ProviderThreadNav
+      detail={detailWith('codex')}
+      conversationRef={{ source: 'codex', key: 'v1.self' }}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /parent thread/i }));
+    expect(getState().selectedConversationRef).toEqual({ source: 'codex', key: 'v1.parent' });
+  });
+
+  it('does not carry an account across a source boundary', () => {
+    render(<ProviderThreadNav
+      detail={detailWith('codex')}
+      conversationRef={{ source: 'claude', key: 'SID-A', account_key: 'claude-acct' }}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /parent thread/i }));
+    expect(getState().selectedConversationRef).toEqual({ source: 'codex', key: 'v1.parent' });
   });
 });

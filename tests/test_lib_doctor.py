@@ -114,6 +114,8 @@ def test_doctor_state_has_required_fields():
         # the replay outright — the only stall signal a hook-only install
         # produces, since that decline never reaches the walk.
         "codex_replay_pending", "codex_replay_blocked", "codex_replay_deferred",
+        # #485: privacy-safe unsafe-orphan-prune refusal records.
+        "codex_prune_refusals",
     }
     assert fields == expected, fields ^ expected
 

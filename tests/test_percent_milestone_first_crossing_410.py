@@ -373,6 +373,7 @@ def test_cursor_only_checkpoint_replays_first_crossing_instead_of_reharvesting(
         }
         rebuilt_path = tmp_path / "stats-rebuilt.db"
         rebuild = journal_runtime.rebuild_stats_index(
+            context=journal_runtime.RebuildContext(trigger="test-fixture"),
             target_path=str(rebuilt_path),
             high_water=high_water,
             update_quota_cache=False,

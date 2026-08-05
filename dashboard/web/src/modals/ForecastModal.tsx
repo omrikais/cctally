@@ -19,6 +19,7 @@ import {
 } from '../lib/dashboardPresentation';
 import type { Envelope, ForecastEnvelope, SourceName } from '../types/envelope';
 import { SourceChip } from '../panels/sourcePanel';
+import { providerAccentClass } from '../lib/providerAccent';
 
 // The range bar (pills + leaders + 3-zone track + bounds) is built via
 // DOM-mutating layout in a ref effect; React manages only the container
@@ -687,7 +688,7 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
         >
           <div className="m-chipstrip" id="mfc-chips">
             <span className="m-pill accent-purple">All accounts</span>
-            <span className="m-pill accent-blue">Codex native quota</span>
+            <span className={`m-pill ${providerAccentClass('codex')}`}>Codex native quota</span>
           </div>
           <CodexPerAccountForecastTable rows={perAccountRows} />
         </section>
@@ -710,7 +711,7 @@ function CanonicalForecastModal({ source }: { source: SourceName }) {
             {confText}
           </span>
           {!isClaude && (
-            <span className="m-pill accent-blue">
+            <span className={`m-pill ${providerAccentClass('codex')}`}>
               Codex native quota
             </span>
           )}

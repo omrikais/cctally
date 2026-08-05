@@ -123,6 +123,14 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
   never creates, prunes, repairs, or otherwise changes pipeline files.
 - `data.cache_sync_state` — WARN when the cache is empty despite JSONL files, or last entry > 24h old.
 - `data.codex_cache` — same shape for `codex_session_entries`; OK with summary "none" when no Codex sessions exist.
+- `data.codex_prune_safety` — WARN when a whole-tree Codex sync refused to
+  treat a missing, empty, unrecognizable, or unreadable configured root as
+  evidence that retained rollout files were deleted. The cache and transcript
+  rows remain intact. Details contain only reason/count fields and affected
+  store names, never configured paths or provider identifiers. Verify that
+  every `$CODEX_HOME` root is mounted and contains rollout JSONL, then run
+  `cctally cache-sync --source codex`; a recognized clean walk clears the
+  warning.
 - `data.codex_replay` — WARN when a byte-zero Codex transcript replay is
   *stalled* rather than merely pending. Codex transcript ingest defers on the
   cache-side replay marker (running ahead of the replayed thread rows would

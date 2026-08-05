@@ -1,6 +1,7 @@
 import { Fragment, useContext, useMemo } from 'react';
 import type { Element, Root, RootContent, Text } from 'hast';
-import { HighlightContext, type HighlightTerms } from './HighlightContext';
+import { ExactFindContext, HighlightContext, type HighlightTerms } from './HighlightContext';
+import { projectMarkdown } from './findProjection';
 
 // #223 — mirror the server find-scan caps in bin/_lib_conversation_query.py.
 export const FIND_REGEX_MAX_LEN = 1000;
@@ -92,6 +93,43 @@ export function useFindSplit(): SplitFn | null {
   }, [kind, key, caseSensitive]);
 }
 
+export function useExactSurfaceTargets(
+  containerBlockKey: string | null | undefined,
+  surface: 'body' | 'call' | 'output' | 'completion',
+): ReadonlyMap<string, ExactLeafTarget[]> {
+  const exact = useContext(ExactFindContext);
+  return useMemo(() => {
+    const byLeaf = new Map<string, ExactLeafTarget[]>();
+    if (!exact || !containerBlockKey) return byLeaf;
+    for (const occurrence of exact.occurrences) {
+      if (
+        occurrence.container_block_key !== containerBlockKey
+        || occurrence.surface !== surface
+      ) continue;
+      for (const fragment of occurrence.fragments) {
+        const targets = byLeaf.get(fragment.leaf_key) ?? [];
+        targets.push({
+          occurrenceId: occurrence.occurrence_id,
+          leafKey: fragment.leaf_key,
+          start: fragment.start,
+          end: fragment.end,
+          current: occurrence.occurrence_id === exact.selectedOccurrenceId,
+        });
+        byLeaf.set(fragment.leaf_key, targets);
+      }
+    }
+    return byLeaf;
+  }, [exact, containerBlockKey, surface]);
+}
+
+export function useExactLeafTargets(
+  containerBlockKey: string | null | undefined,
+  surface: 'body' | 'call' | 'output' | 'completion',
+  leafKey = 't0',
+): ExactLeafTarget[] {
+  return useExactSurfaceTargets(containerBlockKey, surface).get(leafKey) ?? [];
+}
+
 // #177 S6 / #223 — the shared rehype tree-walk. Wraps each `hit` segment in
 // <mark>. `skipCode: true` skips {code,pre} subtrees (prose — inline code +
 // fenced blocks are handled elsewhere); `skipCode: false` marks everywhere
@@ -148,6 +186,181 @@ export function splitToReactNodes(value: string, split: SplitFn): React.ReactNod
     p.hit ? <mark key={i}>{p.s}</mark> : <Fragment key={i}>{p.s}</Fragment>);
 }
 
+export interface ExactLeafTarget {
+  occurrenceId: string;
+  leafKey: string;
+  sourceLeafKey?: string;
+  start: number;
+  end: number;
+  current: boolean;
+}
+
+type ExactPart = {
+  text: string;
+  target: ExactLeafTarget | null;
+};
+
+function exactParts(value: string, targets: ExactLeafTarget[]): ExactPart[] {
+  const sorted = [...targets]
+    .filter((target) => target.start >= 0 && target.end > target.start && target.end <= [...value].length)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  if (!sorted.length) return [{ text: value, target: null }];
+  const scalars = [...value];
+  const parts: ExactPart[] = [];
+  let cursor = 0;
+  for (const target of sorted) {
+    if (target.start < cursor) continue;
+    if (target.start > cursor) parts.push({ text: scalars.slice(cursor, target.start).join(''), target: null });
+    parts.push({ text: scalars.slice(target.start, target.end).join(''), target });
+    cursor = target.end;
+  }
+  if (cursor < scalars.length) parts.push({ text: scalars.slice(cursor).join(''), target: null });
+  return parts;
+}
+
+export function splitToExactNodes(value: string, targets: ExactLeafTarget[]): React.ReactNode {
+  const parts = exactParts(value, targets);
+  if (parts.every((part) => part.target == null)) return value;
+  return parts.map((part, index) => part.target ? (
+    <mark
+      key={`${part.target.occurrenceId}-${index}`}
+      data-find-occurrence-id={part.target.occurrenceId}
+      data-find-leaf-key={part.target.sourceLeafKey ?? part.target.leafKey}
+      data-find-current={part.target.current ? 'true' : undefined}
+      className={part.target.current ? CURRENT_MARK_CLASS : undefined}
+    >{part.text}</mark>
+  ) : <Fragment key={`plain-${index}`}>{part.text}</Fragment>);
+}
+
+function exactHastNodes(value: string, targets: ExactLeafTarget[]): RootContent[] {
+  return exactParts(value, targets).map((part) => {
+    if (!part.target) return { type: 'text', value: part.text } as Text;
+    return {
+      type: 'element',
+      tagName: 'mark',
+      properties: {
+        'data-find-occurrence-id': part.target.occurrenceId,
+        'data-find-leaf-key': part.target.sourceLeafKey ?? part.target.leafKey,
+        ...(part.target.current ? {
+          'data-find-current': 'true',
+          className: [CURRENT_MARK_CLASS],
+        } : {}),
+      },
+      children: [{ type: 'text', value: part.text } as Text],
+    } as Element;
+  });
+}
+
+export function applyExactMarksToHast(
+  tree: Root,
+  source: string,
+  targets: ExactLeafTarget[],
+): void {
+  const { text: projectedText, leaves } = projectMarkdown(source);
+  const byLeaf = new Map<string, ExactLeafTarget[]>();
+  for (const target of targets) {
+    const list = byLeaf.get(target.leafKey) ?? [];
+    list.push(target);
+    byLeaf.set(target.leafKey, list);
+  }
+  const textNodes: Text[] = [];
+  const collect = (children: RootContent[]) => {
+    for (const child of children) {
+      if (child.type === 'element') collect(child.children);
+      else if (child.type === 'text' && child.value) textNodes.push(child);
+    }
+  };
+  collect(tree.children);
+  const domText = textNodes.map((node) => node.value).join('');
+  const domStartByLeaf = new Map<string, number>();
+  let searchAt = 0;
+  for (const leaf of leaves) {
+    const expected = [...projectedText].slice(leaf.start, leaf.end).join('');
+    const found = domText.indexOf(expected, searchAt);
+    if (found < 0) continue;
+    domStartByLeaf.set(leaf.key, [...domText.slice(0, found)].length);
+    searchAt = found + expected.length;
+  }
+  const globalTargets: ExactLeafTarget[] = [];
+  for (const [leafKey, targetsForLeaf] of byLeaf) {
+    const leafStart = domStartByLeaf.get(leafKey);
+    if (leafStart == null) continue;
+    for (const target of targetsForLeaf) {
+      globalTargets.push({
+        ...target,
+        sourceLeafKey: target.sourceLeafKey ?? target.leafKey,
+        leafKey,
+        start: leafStart + target.start,
+        end: leafStart + target.end,
+      });
+    }
+  }
+  let domCursor = 0;
+  const walk = (children: RootContent[]): RootContent[] => {
+    const out: RootContent[] = [];
+    for (const child of children) {
+      if (child.type === 'element') {
+        child.children = walk(child.children) as Element['children'];
+        out.push(child);
+        continue;
+      }
+      if (child.type !== 'text' || !child.value) {
+        out.push(child);
+        continue;
+      }
+      const length = [...child.value].length;
+      const local = globalTargets
+        .filter((target) => target.start < domCursor + length && target.end > domCursor)
+        .map((target) => ({
+          ...target,
+          start: Math.max(0, target.start - domCursor),
+          end: Math.min(length, target.end - domCursor),
+        }));
+      out.push(...exactHastNodes(child.value, local));
+      domCursor += length;
+    }
+    return out;
+  };
+  tree.children = walk(tree.children) as Root['children'];
+}
+
+export function applyGlobalExactMarksToHast(
+  tree: Root,
+  targets: ExactLeafTarget[],
+): void {
+  let cursor = 0;
+  const walk = (children: RootContent[]): RootContent[] => {
+    const out: RootContent[] = [];
+    for (const child of children) {
+      if (child.type === 'element') {
+        child.children = walk(child.children) as Element['children'];
+        out.push(child);
+        continue;
+      }
+      if (child.type !== 'text' || !child.value) {
+        out.push(child);
+        continue;
+      }
+      const length = [...child.value].length;
+      const local = targets
+        .filter((target) => target.start < cursor + length && target.end > cursor)
+        .map((target) => ({
+          ...target,
+          start: Math.max(0, target.start - cursor),
+          end: Math.min(length, target.end - cursor),
+        }));
+      out.push(...exactHastNodes(child.value, local));
+      cursor += length;
+    }
+    return out;
+  };
+  tree.children = walk(tree.children) as Root['children'];
+}
+
+export function applyExactMarksPlugin(source: string, targets: ExactLeafTarget[]) {
+  return (tree: Root) => applyExactMarksToHast(tree, source, targets);
+}
+
 // ---- Part 1: landable-mark selection (#236) --------------------------------
 
 type RectLike = { top: number; bottom: number; left: number; right: number };
@@ -199,4 +412,34 @@ export function applyCurrentMark(
   prev?.classList.remove(CURRENT_MARK_CLASS);
   next?.classList.add(CURRENT_MARK_CLASS);
   return next;
+}
+
+export function applyCurrentOccurrence(
+  root: ParentNode,
+  occurrenceId: string | null,
+): HTMLElement[] {
+  const marks = Array.from(
+    root.querySelectorAll<HTMLElement>('mark[data-find-occurrence-id]'),
+  );
+  for (const mark of marks) {
+    const current = occurrenceId != null && mark.dataset.findOccurrenceId === occurrenceId;
+    mark.toggleAttribute('data-find-current', current);
+    mark.classList.toggle(CURRENT_MARK_CLASS, current);
+  }
+  return marks.filter((mark) => mark.dataset.findOccurrenceId === occurrenceId);
+}
+
+export function firstLandableOccurrenceFragment(
+  turnEl: HTMLElement,
+  occurrenceId: string,
+): HTMLElement | null {
+  const marks = turnEl.querySelectorAll<HTMLElement>(
+    `mark[data-find-occurrence-id="${CSS.escape(occurrenceId)}"]`,
+  );
+  for (const mark of marks) {
+    const rect = mark.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    if (!markRectClipped(rect, collectClipRects(mark, turnEl))) return mark;
+  }
+  return null;
 }

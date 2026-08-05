@@ -4,6 +4,10 @@ import { useConversationOutline } from '../hooks/useConversationOutline';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { ctxFromEnvelope } from '../store/selectors';
 import { fmt } from '../lib/fmt';
+import {
+  buildOutlineTargets, outlineTurnVisible, resolveTurnIndex,
+} from '../conversations/outlineNavigation';
+import { buildConversationJump, legacyClaudeConversationRef } from '../types/conversation';
 
 const CAP = 3;
 
@@ -32,6 +36,32 @@ export function CacheRebuildsSection({ sessionId }: { sessionId: string | null }
   const rebuilds = cf?.rebuilds ?? [];
   const shown = expanded ? rebuilds : rebuilds.slice(0, CAP);
   const sid = sessionId;
+
+  // #463 S4 remediation round 3 (F8) — the SAME jump every outline rail row
+  // performs, on the sibling that lives outside the rail. A same-session
+  // OPEN_CONVERSATION preserves `convFocusMode` by design (the caller is the
+  // authority), so without this reset a click here while the viewer held that
+  // session under `prompts` or `errors` loaded a turn the filter had unmounted.
+  // The mode is read at click time from the store rather than subscribed to,
+  // because nothing in this section's rendering depends on it.
+  const jumpTo = (uuid: string) => {
+    const turns = outline.turns ?? [];
+    const ownerIndex = resolveTurnIndex(
+      buildOutlineTargets(turns, undefined, outline.landmarks), uuid);
+    const turn = ownerIndex !== undefined ? turns[ownerIndex] : undefined;
+    const mode = getState().convFocusMode;
+    if (turn && mode !== 'all' && !outlineTurnVisible(turn, mode)) {
+      dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
+    }
+    dispatch({
+      type: 'OPEN_CONVERSATION',
+      sessionId: sid,
+      // The bare Claude session id this modal is given is the unqualified form,
+      // so the payload is `{session_id, uuid}` — byte-identical to the literal
+      // this replaced, now built by the one shared builder.
+      jump: buildConversationJump(legacyClaudeConversationRef(sid), uuid, false),
+    });
+  };
 
   return (
     <>
@@ -69,11 +99,7 @@ export function CacheRebuildsSection({ sessionId }: { sessionId: string | null }
                 <button
                   type="button"
                   className="rebuild-jump"
-                  onClick={() => dispatch({
-                    type: 'OPEN_CONVERSATION',
-                    sessionId: sid,
-                    jump: { session_id: sid, uuid: r.uuid },
-                  })}
+                  onClick={() => jumpTo(r.uuid)}
                 >
                   <span className="rb-cost">{fmt.usd2(r.est_wasted_usd)}</span>
                   <span className="rb-tok">

@@ -1,4 +1,4 @@
-"""Epochs 1004 -> 1005 -> 1006: the incremental Codex quota projection state.
+"""Epochs 1004 -> 1005 -> 1006 -> 1007: Codex quota projection state.
 
 Public issue omrikais/cctally#5, Tasks 6 and 10a. The stats migration registry
 is FROZEN, so a stats schema change is an ``STATS_INDEX_EPOCH`` bump and never a
@@ -13,9 +13,9 @@ assertions below invoke the explicit synchronous resolver used by the detached
 worker.
 
 1005 added the reverse map, the per-group digest and the ledger-state row. 1006
-added the periodic verification's ``last_full_pass_at`` deadline, and gets its
-own test because the 1004 case cannot observe it: that arm drops the whole table
-and so passes for a binary that only ever re-created it in the old shape.
+added the periodic verification deadline; 1007 adds scheduled ownership. Each
+gets its own test because the 1004 case drops the whole table and cannot observe
+later column-only deltas.
 """
 from __future__ import annotations
 
@@ -31,15 +31,17 @@ from conftest import load_script, redirect_paths
 FIXED = dt.datetime(2026, 7, 31, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1004
 EPOCH_1005 = 1005
+EPOCH_1006 = 1006
 
 #: The columns and table epoch 1005 adds, and the reason each exists.
 NEW_BLOCK_COLUMNS = ("physical_group_key", "physical_group_digest")
 NEW_TABLE = "quota_projection_ledger_state"
 #: The periodic verification's deadline — epoch 1006's whole delta.
 VERIFICATION_COLUMN = "last_full_pass_at"
+SCHEDULE_COLUMN = "next_evaluation_by_root_json"
 NEW_LEDGER_STATE_COLUMNS = (
     "source", "watermark_seq", "interpretation_version", "alerts_enabled",
-    "next_evaluation_at_utc", VERIFICATION_COLUMN,
+    "next_evaluation_at_utc", VERIFICATION_COLUMN, SCHEDULE_COLUMN,
 )
 
 
@@ -163,6 +165,35 @@ def test_an_epoch_1005_index_rebuilds_carrying_the_verification_deadline(ns):
     assert VERIFICATION_COLUMN in ledger_columns
 
 
+def test_an_epoch_1006_index_rebuilds_carrying_boundary_ownership(ns):
+    _seed_journal()
+    conn = ns["open_db"]()
+    try:
+        conn.execute(f"ALTER TABLE {NEW_TABLE} DROP COLUMN {SCHEDULE_COLUMN}")
+        conn.execute(f"PRAGMA user_version = {EPOCH_1006}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(_cctally_core.DB_PATH)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == EPOCH_1006
+        assert SCHEDULE_COLUMN not in _columns(conn, NEW_TABLE)
+    finally:
+        conn.close()
+
+    conn = _resolve_epoch_transition()
+    try:
+        epoch = conn.execute("PRAGMA user_version").fetchone()[0]
+        ledger_columns = _columns(conn, NEW_TABLE)
+    finally:
+        conn.close()
+
+    assert epoch == _cctally_core.STATS_INDEX_EPOCH
+    assert epoch != EPOCH_1006
+    assert SCHEDULE_COLUMN in ledger_columns
+
+
 def test_the_ledger_state_is_keyed_by_source_and_starts_empty(ns):
     """It is a change-log cursor, not a snapshot of existing state.
 
@@ -183,7 +214,7 @@ def test_the_ledger_state_is_keyed_by_source_and_starts_empty(ns):
         conn.close()
 
 
-@pytest.mark.parametrize("stamped_fixups_version", [1, 2])
+@pytest.mark.parametrize("stamped_fixups_version", [1, 2, 3])
 def test_a_legacy_index_cuts_over_carrying_the_projection_schema(
     ns, stamped_fixups_version,
 ):
@@ -250,9 +281,10 @@ def test_a_legacy_index_cuts_over_carrying_the_projection_schema(
     for column in NEW_BLOCK_COLUMNS:
         assert column in block_columns
     assert VERIFICATION_COLUMN in ledger_columns
+    assert SCHEDULE_COLUMN in ledger_columns
 
 
-@pytest.mark.parametrize("stamped_fixups_version", [1, 2])
+@pytest.mark.parametrize("stamped_fixups_version", [1, 2, 3])
 def test_a_legacy_cutover_adds_the_deadline_to_an_existing_state_table(
     ns, stamped_fixups_version,
 ):
@@ -303,6 +335,34 @@ def test_a_legacy_cutover_adds_the_deadline_to_an_existing_state_table(
     assert VERIFICATION_COLUMN in ledger_columns, (
         "the legacy cutover left the state table without the deadline column, "
         "so every reconcile after it fails on `no such column`")
+
+
+@pytest.mark.parametrize("stamped_fixups_version", [1, 2, 3])
+def test_a_legacy_cutover_adds_boundary_ownership_to_existing_state_table(
+    ns, stamped_fixups_version,
+):
+    conn = ns["open_db"]()
+    try:
+        conn.execute(f"ALTER TABLE {NEW_TABLE} DROP COLUMN {SCHEDULE_COLUMN}")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stats_open_fixups ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)")
+        conn.execute(
+            "INSERT INTO stats_open_fixups (id, version) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+            (stamped_fixups_version,))
+        conn.execute(f"PRAGMA user_version = {_cctally_core.LEGACY_STATS_HEAD}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = ns["open_db"]()
+    try:
+        ledger_columns = _columns(conn, NEW_TABLE)
+    finally:
+        conn.close()
+
+    assert SCHEDULE_COLUMN in ledger_columns
 
 
 def test_the_block_reverse_map_is_nullable_for_a_journal_replayed_row(ns):

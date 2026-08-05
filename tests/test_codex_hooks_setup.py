@@ -152,6 +152,36 @@ def test_status_rejects_mixed_owned_handlers_and_install_uninstall_reconcile_all
         assert _handlers(uninstalled, event) == [user]
 
 
+def test_npm_shim_reinstall_reconciles_duplicate_owned_handlers(runtime):
+    ns, home = runtime
+    binary = "/opt/homebrew/lib/node_modules/cctally/bin/cctally-npm-shim.js"
+    command = _owned_command(binary)
+    user = {"type": "command", "command": "/usr/bin/user-stop", "timeout": 7}
+    duplicate = {"type": "command", "command": command, "timeout": 30}
+    hooks_path = home / "hooks.json"
+    hooks_path.write_text(json.dumps({
+        "hooks": {
+            event: [
+                {"hooks": [user]},
+                {"hooks": [duplicate]},
+                {"hooks": [duplicate]},
+            ]
+            for event in ("Stop", "SubagentStop")
+        }
+    }))
+
+    first = ns["_setup_manage_codex_hooks"]("install", binary)
+    first_document = json.loads(hooks_path.read_text())
+    assert first["roots"][0]["changes"] == {"Stop": 0, "SubagentStop": 0}
+    for event in ("Stop", "SubagentStop"):
+        assert _handlers(first_document, event) == [user, duplicate]
+
+    first_bytes = hooks_path.read_bytes()
+    second = ns["_setup_manage_codex_hooks"]("install", binary)
+    assert second["roots"][0]["changes"] == {"Stop": 0, "SubagentStop": 0}
+    assert hooks_path.read_bytes() == first_bytes
+
+
 def test_codex_hook_write_uses_backup_atomic_permissions_and_status_json(runtime, capsys):
     ns, home = runtime
     binary = str(ns["_setup_resolve_hook_target"](ns["_setup_resolve_repo_root"]()))

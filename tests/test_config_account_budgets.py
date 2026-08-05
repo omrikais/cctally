@@ -35,7 +35,7 @@ def _seed(observes):
     import _lib_journal as lj
     for kw in observes:
         jr.append_record(lj.make_account_observe(**kw))
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
 
 def _set(cc, key, value):

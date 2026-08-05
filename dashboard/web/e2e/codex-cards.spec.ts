@@ -17,6 +17,7 @@ test('Codex shell and patch wires render as native cards without harness noise',
   await expect(terminals.first().locator('.conv-chip-name')).toHaveText('exec');
   await expect(terminals.first()).toContainText("printf 'alpha\\n'");
   await expect(terminals.first()).toContainText('/synthetic/root-a/project-red');
+  await expect(terminals.filter({ hasText: '/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy' })).toHaveCount(1);
   await expect(terminals.first()).toContainText('alpha');
   await expect(page.locator('.conv-term-badge--err')).toHaveCount(1);
   await expect(page.locator('.conv-term').filter({ hasText: 'seq 1 25' })).not.toHaveAttribute('open', '');
@@ -36,7 +37,7 @@ test('Codex shell and patch wires render as native cards without harness noise',
   // The tool run is intentionally tall; navigate to the standalone final event
   // before asserting it so the virtualized reader mounts that retained item.
   await page.getByRole('button', { name: 'Jump to latest message' }).click();
-  await expect(page.locator('.conv-native-patch').filter({ hasText: 'synthetic-summary.txt' })).toContainText('No diff retained');
+  await expect(page.locator('.conv-native-patch').filter({ hasText: 'synthetic-summary.txt' })).toContainText('This change carries no line-level diff');
   const diffLess = page.locator('.conv-native-patch').filter({ hasText: 'synthetic-summary.txt' });
   await expect(diffLess).toContainText('synthetic failure');
   await diffLess.getByRole('button', { name: 'Load raw event payload' }).click();
@@ -62,6 +63,15 @@ test.describe('compact Codex cards', () => {
     await openCardCorpus(page);
     await expect(page.locator('.conv-term').first()).toBeVisible();
     await expect(page.locator('.conv-native-patch').first()).toBeVisible();
+    const terminal = page.locator('.conv-term').filter({
+      hasText: '/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy',
+    });
+    const workdirBox = await terminal.locator('.conv-term-workdir').boundingBox();
+    const copyBox = await terminal.locator('.conv-term-copy').boundingBox();
+    expect(workdirBox).not.toBeNull();
+    expect(copyBox).not.toBeNull();
+    expect(workdirBox!.x + workdirBox!.width <= copyBox!.x
+      || workdirBox!.y >= copyBox!.y + copyBox!.height).toBe(true);
     await expect.poll(() => page.evaluate(
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
     )).toBe(true);

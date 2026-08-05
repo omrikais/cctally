@@ -1030,7 +1030,26 @@ describe('MessageItem token footer (#177 S5 §6)', () => {
     expect(container.querySelector('details.conv-meta--notification')).not.toBeNull();
     expect(container.textContent).toContain('Background task');
     expect(container.textContent).toContain('Run tests completed (exit code 0)');
-    expect(container.querySelector('.conv-meta-label')).toHaveAttribute('title', 'Background task');
+    // #463 S5 — the `title` is deliberately gone. It was the disclosure for a
+    // truncation that no longer happens, and a `title` on a non-focusable span is
+    // not invokable by a sighted touch user, so it was never a usable disclosure
+    // on the viewport #335 targeted.
+    expect(container.querySelector('.conv-meta-label')).not.toHaveAttribute('title');
+  });
+
+  it('#463 S5 — a context meta row renders label and sections through the owned components', () => {
+    const item: ConversationItem = {
+      kind: 'meta',
+      anchor: { session_id: 's', uuid: 'ctx-bundle', id: 31 },
+      member_uuids: ['ctx-bundle'], ts: '2026-06-01T00:00:00Z',
+      text: '# AGENTS.md instructions', blocks: [{ kind: 'text', text: '# AGENTS.md instructions' }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'context', skill_name: null,
+      meta_label: 'context_bundle', meta_sections: ['agents', 'environment'],
+    };
+    const { container } = render(<MessageItem item={item} />);
+    expect(container.querySelector('.conv-meta-label')?.textContent).toBe('Session context');
+    expect(container.querySelector('.conv-meta-name')?.textContent).toBe('· agents, environment');
   });
 });
 

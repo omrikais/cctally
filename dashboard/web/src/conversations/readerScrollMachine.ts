@@ -402,7 +402,7 @@ export function createFollowController(): FollowController {
 // captured render list can no longer fire a premature exhaustion-clear.
 // ---------------------------------------------------------------------------
 
-export type JumpOutcome = 'landed' | 'exhausted-cleared' | 'deferred' | 'aborted';
+export type JumpOutcome = 'landed' | 'landing-failed' | 'exhausted-cleared' | 'load-failed' | 'deferred' | 'aborted';
 
 /** #286 B3 — the loadToTarget drain result (spec §4-B3 / §7 carve-out). The
  *  committed-window-epoch signals the exhaustion decision acks against, so a
@@ -415,9 +415,12 @@ export interface JumpDrainResult {
   found: boolean;
   /** The DRAINED edge is genuinely exhausted — directional: `hasPrev` for a
    *  backward drain, `hasMore` for forward (spec F8: never the bottom edge for a
-   *  backward jump). A non-exhaustion exit (session change / fetch failure) leaves
-   *  this false ⇒ stay pending for a retry re-fire (never a genuine absence). */
+   *  backward jump). A session-change exit leaves this false and `failed` false ⇒
+   *  stay pending for a retry re-fire (never a genuine absence). */
   exhausted: boolean;
+  /** Every bounded request attempt failed while the drained edge remained
+   *  retryable. This is a transport failure, never evidence of target absence. */
+  failed: boolean;
   /** The rev of the drain's TERMINAL WindowOp — the committed-window epoch the
    *  captured rev must have caught up to before a clear can fire. While
    *  `committedRev < terminalOpRev` a drained page is still in flight to commit, so
@@ -473,15 +476,17 @@ export interface JumpRunnerDeps {
     quiesce(): Promise<void>;
     /** The expand_details querySelectorAll force-open (runs before quiesce). */
     openDisclosures(): void;
-    /** The #204 card-root landing (scrollNodeIntoView start ×2 + quiesce + mark). */
-    landCard(): Promise<void>;
+    /** The #204 card-root landing. False means the target recycled before the
+     *  start-aligned landing could settle. */
+    landCard(): Promise<boolean>;
     /** The convergent find-landing reassert (#237 machinery), used for EVERY find
      *  landing so the center survives virtuoso's deferred ResizeObserver re-measure
      *  (#291): reassertCenter re-resolves + re-centers the mark/turn every frame
-     *  until stable, then re-marks. */
-    landFindReassert(): Promise<void>;
-    /** The #236 center landing (center ×2 + quiesce + mark). */
-    landCenter(): Promise<void>;
+     *  until stable, then re-marks. False means no live target survived. */
+    landFindReassert(): Promise<boolean>;
+    /** The ordinary deep-link landing. Re-resolves and start-aligns the requested
+     *  message through deferred Virtuoso re-measure; false means it could not hold. */
+    landStartReassert(): Promise<boolean>;
     /** cardRefs.current.has(targetUuid) — picks landCard. */
     hasCardRef(): boolean;
     /** body && el resolvable — the current `result === 'mounted' && body && el`
@@ -511,6 +516,10 @@ export async function runJumpPipeline(deps: JumpRunnerDeps): Promise<JumpOutcome
   // ── draining ──────────────────────────────────────────────────────────────
   const drain = await deps.loadToTarget();
   if (deps.aborted()) return 'aborted';
+  if (drain.failed) {
+    live.clearJump();
+    return 'load-failed';
+  }
 
   // ── captured mode-check (reset + defer at most once) ────────────────────────
   // A non-`all` focus mode coalesces the target into a hidden_run marker; reset
@@ -536,22 +545,30 @@ export async function runJumpPipeline(deps: JumpRunnerDeps): Promise<JumpOutcome
     // toward the target in mounted-window steps so the path rows measure.
     const result = live.isTargetMounted() ? 'mounted' : await live.walk();
     if (deps.aborted()) return 'aborted';
-    // Landing runs only when the walk mounted the target AND its element is
-    // resolvable (the current `result === 'mounted' && body && el` guard). An
-    // 'exhausted' walk falls through: the flash still identifies the target.
-    if (result === 'mounted' && live.hasLandableElement()) {
-      if (deps.expandDetails) live.openDisclosures();
-      await live.quiesce();
-      if (deps.aborted()) return 'aborted';
-      if (live.hasCardRef()) {
-        await live.landCard();                                  // #204 card root → align top
-      } else if (live.findOpen()) {
-        await live.landFindReassert();                          // #237 convergent find reassert — survives virtuoso's deferred re-measure (#291)
-      } else {
-        await live.landCenter();                                // #236 center the turn / mark
-      }
+    // #479 — a data hit is not a successful jump until the target is mounted and
+    // the final alignment survives Virtuoso's deferred re-measure. The old path
+    // booked success after an exhausted walk or a transient range hit, clearing
+    // the jump while no target remained on screen and leaving no failure state.
+    if (result !== 'mounted' || !live.hasLandableElement()) {
+      live.clearJump();
+      return 'landing-failed';
+    }
+    if (deps.expandDetails) live.openDisclosures();
+    await live.quiesce();
+    if (deps.aborted()) return 'aborted';
+    let landingSucceeded: boolean;
+    if (live.hasCardRef()) {
+      landingSucceeded = await live.landCard();                 // card root → convergent start
+    } else if (live.findOpen()) {
+      landingSucceeded = await live.landFindReassert();         // find mark → convergent center
+    } else {
+      landingSucceeded = await live.landStartReassert();        // ordinary deep link → convergent start
     }
     if (deps.aborted()) return 'aborted';
+    if (!landingSucceeded) {
+      live.clearJump();
+      return 'landing-failed';
+    }
     // Post-landing bookkeeping runs ONLY after the verified final center, on the
     // non-aborted path (arm paging, flash, pin, cursor, clear jump).
     live.landedBookkeeping(hit.arrayIndex);

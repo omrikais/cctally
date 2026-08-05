@@ -45,6 +45,7 @@ import sys
 
 from _cctally_cache import (
     open_cache_db,
+    scope_conversations_db_to_account,
     sync_codex_cache,
     sync_claude_conversations,
     sync_codex_conversations,
@@ -222,13 +223,15 @@ def _conversation_query_impl():
 # are deliberately absent — they are meaningless on a collection route, so they
 # fall to "genuinely unknown → ignored".
 _RECOGNIZED_CONVERSATION_PARAMS = (
-    "source", "project_key", "model", "limit", "cursor", "q", "kind",
+    "source", "account", "project_key", "model", "limit", "cursor", "q", "kind",
     "sort", "offset", "date_from", "date_to", "projects",
     "cost_min", "cost_max", "rebuild_min", "models",
 )
-_QUALIFIED_BROWSE_ACCEPTED = ("source", "project_key", "model", "limit", "cursor")
-_QUALIFIED_SEARCH_ACCEPTED = ("source", "q", "kind", "limit", "cursor")
-_QUALIFIED_FACETS_ACCEPTED = ("source",)
+_QUALIFIED_BROWSE_ACCEPTED = (
+    "source", "account", "project_key", "model", "limit", "cursor")
+_QUALIFIED_SEARCH_ACCEPTED = (
+    "source", "account", "q", "kind", "limit", "cursor")
+_QUALIFIED_FACETS_ACCEPTED = ("source", "account")
 # A raw browse cursor is a conversation key — printable + URL-safe by construction
 # (§2.2). Syntactic-only validation: reject whitespace/control/empty; echo raw.
 _BROWSE_CURSOR_RE = re.compile(r"\A[!-~]+\Z")
@@ -321,8 +324,12 @@ def _respond_qualified_json(handler, env):
     ``ok`` / ``normalization_pending`` → 200; ``gone`` → 410; ``validation_error``
     → 400; anything else (``not_found`` + unknown) → 404. Body is the envelope."""
     status = (env or {}).get("status")
-    if status in ("ok", "normalization_pending"):
+    if status in ("ok", "normalization_pending", "ready", "indexing"):
         handler._respond_json(200, env)
+    elif status == "invalid_find_cursor":
+        handler._respond_json(400, {"error": "invalid find cursor"})
+    elif status == "stale_find_cursor":
+        handler._respond_json(409, {"error": "stale find cursor"})
     elif status == "gone":
         handler._respond_json(410, env)
     elif status == "validation_error":
@@ -378,7 +385,7 @@ def _handle_qualified_facets(handler, qs_raw, source):
     speed = _resolve_effective_speed()
     disp = _conversation_dispatch()
     ok, body = handler._run_conversation_query(
-        lambda conn: disp.neutral_browse(
+        lambda conn: disp.neutral_facets(
             conn, source=source, effective_speed=speed),
         "/api/conversations/facets")
     if not ok:
@@ -469,6 +476,15 @@ def _run_conversation_query_impl(handler, kernel_call, log_label):
         )
         return False, None
     try:
+        import urllib.parse as _u
+        account_vals = _u.parse_qs(
+            handler.path.partition("?")[2], keep_blank_values=True
+        ).get("account")
+        if account_vals is not None:
+            if len(account_vals) != 1 or not account_vals[0]:
+                handler._respond_json(400, {"error": "invalid account"})
+                return False, None
+            scope_conversations_db_to_account(conn, account_vals[0])
         body = kernel_call(conn)
     except Exception as exc:  # noqa: BLE001
         handler.log_error("%s failed: %r", log_label, exc)
@@ -794,25 +810,59 @@ def _run_conversation_events_stream(
                     idle = 0.0
 
 
-def _bare_conversation_events(handler, session_id: str) -> None:
+def _bare_conversation_events(
+    handler, session_id: str, account_key: str | None = None,
+) -> None:
     """Bare legacy Claude live-tail — today's no-preflight, ``sessionId``-framed
     behavior, byte-identical (spec §5.2 reserves this for bare streams)."""
     cq = handler._conversation_query()
-    _send_sse_headers(handler)
     passive = bool(type(handler).no_sync)
     try:
         conn = sys.modules["_cctally_dashboard"].open_conversations_db()
     except (sqlite3.DatabaseError, OSError):
-        # Cache unavailable — degrade to keep-alive only; client backstop
-        # tick still surfaces turns. (Headers already sent; can't 500.)
+        if account_key is not None:
+            # A qualified account boundary must be established before any SSE
+            # bytes.  If it cannot be proven, fail closed as JSON.
+            handler._respond_json(500, {"error": "internal error"})
+            return
+        # Unqualified legacy behavior: degrade to keep-alive only; the client
+        # backstop tick still surfaces turns.
         passive = True
         conn = None
+    if conn is not None and account_key is not None:
+        scope_conversations_db_to_account(conn, account_key)
+        if conn.execute(
+            "SELECT 1 FROM conversation_messages WHERE session_id=? LIMIT 1",
+            (session_id,),
+        ).fetchone() is None:
+            conn.close()
+            handler._respond_json(404, {"error": "conversation not found"})
+            return
+    _send_sse_headers(handler)
 
     def _resolve():
         return cq.session_source_paths(conn, session_id) if conn else []
 
     def _ingest(changed):
-        return sync_claude_conversations(conn, only_paths=set(changed))
+        if account_key is None:
+            return sync_claude_conversations(conn, only_paths=set(changed))
+        before = conn.execute(
+            "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+            "WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        writer = sys.modules["_cctally_dashboard"].open_conversations_db()
+        try:
+            stats = sync_claude_conversations(writer, only_paths=set(changed))
+        finally:
+            writer.close()
+        after = conn.execute(
+            "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+            "WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        stats.targeted_visible = after != before
+        return stats
 
     try:
         _run_conversation_events_stream(
@@ -895,7 +945,9 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
     return _discovery
 
 
-def _qualified_conversation_events(handler, key: str) -> None:
+def _qualified_conversation_events(
+    handler, key: str, account_key: str | None = None,
+) -> None:
     """Qualified (``v1.``) live-tail (spec §5.2): a neutral preflight — resolve →
     normalization authority (Codex) → existence — answered as plain JSON per
     §2.3 BEFORE any SSE bytes; only on ``ok`` are SSE headers committed and the
@@ -924,6 +976,8 @@ def _qualified_conversation_events(handler, key: str) -> None:
         except Exception as exc:  # noqa: BLE001
             handler.log_error("api/conversation/events stream failed: %r", exc)
         return
+    if account_key is not None:
+        scope_conversations_db_to_account(conn, account_key)
 
     try:
         preflight = disp.neutral_events_preflight(conn, key)
@@ -959,10 +1013,43 @@ def _qualified_conversation_events(handler, key: str) -> None:
             return cq_codex.codex_conversation_source_paths(conn, key)
 
         def _ingest(changed):
-            return sync_codex_conversations(conn, only_paths=set(changed))
+            if account_key is None:
+                return sync_codex_conversations(conn, only_paths=set(changed))
+            before = conn.execute(
+                "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
+                "WHERE conversation_key=?",
+                (key,),
+            ).fetchone()
+            # The accounting cache owns the durable physical account-range
+            # decision. Advance it first so transcript ingest never treats the
+            # previous range as open-ended across an account switch.
+            accounting = open_cache_db()
+            try:
+                accounting_stats = sync_codex_cache(
+                    accounting, only_paths=set(changed)
+                )
+            finally:
+                accounting.close()
+            if not accounting_stats.targeted_clean:
+                return accounting_stats
+            writer = sys.modules["_cctally_dashboard"].open_conversations_db()
+            try:
+                stats = sync_codex_conversations(writer, only_paths=set(changed))
+            finally:
+                writer.close()
+            after = conn.execute(
+                "SELECT COUNT(*),MAX(id) FROM codex_conversation_messages "
+                "WHERE conversation_key=?",
+                (key,),
+            ).fetchone()
+            stats.targeted_visible = after != before
+            return stats
 
         cached = lambda paths: _codex_cached_file_sigs(conn, paths)
-        discovery = _make_codex_discovery_step(handler, conn, key, cq_codex)
+        discovery = (
+            None if account_key is not None
+            else _make_codex_discovery_step(handler, conn, key, cq_codex)
+        )
     else:  # claude — reuse the Claude mechanics, speak qualified frames.
         cq = handler._conversation_query()
 
@@ -970,7 +1057,25 @@ def _qualified_conversation_events(handler, key: str) -> None:
             return cq.session_source_paths(conn, native)
 
         def _ingest(changed):
-            return sync_claude_conversations(conn, only_paths=set(changed))
+            if account_key is None:
+                return sync_claude_conversations(conn, only_paths=set(changed))
+            before = conn.execute(
+                "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+                "WHERE session_id=?",
+                (native,),
+            ).fetchone()
+            writer = sys.modules["_cctally_dashboard"].open_conversations_db()
+            try:
+                stats = sync_claude_conversations(writer, only_paths=set(changed))
+            finally:
+                writer.close()
+            after = conn.execute(
+                "SELECT COUNT(*),MAX(id) FROM conversation_messages "
+                "WHERE session_id=?",
+                (native,),
+            ).fetchone()
+            stats.targeted_visible = after != before
+            return stats
 
         cached = lambda paths: _cached_file_sigs(conn, paths)
         discovery = None
@@ -999,14 +1104,23 @@ def _handle_get_conversation_events_impl(handler, path: str) -> None:
     if not handler._require_transcripts_allowed():
         return
     import urllib.parse as _u
+    account_vals = _u.parse_qs(
+        handler.path.partition("?")[2], keep_blank_values=True
+    ).get("account")
+    if account_vals is not None and (
+        len(account_vals) != 1 or not account_vals[0]
+    ):
+        handler._respond_json(400, {"error": "invalid account"})
+        return
+    account_key = account_vals[0] if account_vals else None
     key = _u.unquote(path[len("/api/conversation/"):-len("/events")])
     if not key:
         handler.send_error(404, "conversation not found")
         return
     if key.startswith("v1."):
-        _qualified_conversation_events(handler, key)
+        _qualified_conversation_events(handler, key, account_key)
     else:
-        _bare_conversation_events(handler, key)
+        _bare_conversation_events(handler, key, account_key)
 
 
 def _handle_get_conversation_search_impl(handler) -> None:
@@ -1407,10 +1521,42 @@ def _handle_get_conversation_find_impl(handler, path: str) -> None:
             return
     if session_id.startswith("v1."):
         disp = _conversation_dispatch()
+        cref = disp.resolve_conversation_ref(session_id)
+        paging = {}
+        if cref is not None and cref.source == "codex":
+            raw_limit = _qs_str(q, "limit", None)
+            if raw_limit is None:
+                limit = 100
+            else:
+                try:
+                    limit = int(raw_limit)
+                except (TypeError, ValueError):
+                    handler._respond_json(400, {"error": "invalid find limit"})
+                    return
+                if not 1 <= limit <= 200:
+                    handler._respond_json(400, {"error": "invalid find limit"})
+                    return
+            cursor = _qs_str(q, "cursor", None)
+            around = _qs_str(q, "around", None)
+            direction = _qs_str(q, "direction", "next")
+            if direction not in ("next", "previous"):
+                handler._respond_json(400, {"error": "invalid find direction"})
+                return
+            if cursor is not None and around is not None:
+                handler._respond_json(
+                    400, {"error": "find cursor and around are mutually exclusive"})
+                return
+            paging = {
+                "limit": limit,
+                "cursor": cursor,
+                "direction": direction,
+                "around": around,
+            }
         _serve_qualified_entity(
             handler,
             lambda conn: disp.neutral_find(
-                conn, session_id, query, kind=kind, regex=regex, case=case),
+                conn, session_id, query, kind=kind, regex=regex, case=case,
+                **paging),
             "/api/conversation/find")
         return
     ok, body = handler._run_conversation_query(

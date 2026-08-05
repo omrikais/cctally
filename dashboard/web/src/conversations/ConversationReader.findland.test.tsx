@@ -32,7 +32,13 @@ vi.mock('./scrollNodeIntoView', () => ({
 const sentinelMark = document.createElement('mark');
 vi.mock('./findMark', async (orig) => ({
   ...(await orig<typeof import('./findMark')>()),
-  firstLandableMark: vi.fn(() => sentinelMark),
+  firstLandableMark: vi.fn((root: HTMLElement) => {
+    // Production marks are descendants of the connected turn. Keep this test
+    // sentinel production-shaped so the #479 landing guard can distinguish a
+    // live mark from one recycled out of the DOM.
+    if (!sentinelMark.isConnected) root.appendChild(sentinelMark);
+    return sentinelMark;
+  }),
 }));
 
 // Render-all react-virtuoso mock (mirrors ConversationReader.test.tsx): mounts

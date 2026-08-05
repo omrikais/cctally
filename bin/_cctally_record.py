@@ -4915,8 +4915,20 @@ def _cmd_hook_tick_codex(
                     {}, conn=ictx.conn, alert_sink=ictx.pending_alerts,
                     raise_errors=True) or 0)
 
-            _jr_codex.run_stats_ingest(
+            budget_ingest = _jr_codex.run_stats_ingest(
                 mode="authoritative", codex_apply=_codex_budget_leg)
+            if not budget_ingest.ran:
+                # A detached quota-verification worker can own the ingest lock
+                # while applying its projection.  Authoritative ingest reports
+                # that bounded timeout as `ran=False`; acknowledging the root
+                # here would throttle away the skipped budget evaluation.  Keep
+                # the lifecycle markers due so the first uncontended tick
+                # retries the forward-only budget crossing.
+                log_outcome(
+                    sync="contended", result="noop", projection=projection,
+                    backlog=int(getattr(stats, "backlog_files", 0) or 0),
+                )
+                return 0
             budget_alerts = _budget_holder["n"]
         if getattr(stats, "deferred_reason", None) == "replay_pending":
             # public #5: the budgeted tick declined a byte-zero replay, and on

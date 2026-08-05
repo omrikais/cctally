@@ -545,3 +545,33 @@ def cctally_module():
     indexing. Reuses the cached compiled code object so this is cheap.
     """
     return types.SimpleNamespace(**load_script())
+
+
+@pytest.fixture(autouse=True)
+def _reset_outline_derivation_cache():
+    """Isolate the #463 S4 outline derivation cache between tests.
+
+    ``_lib_codex_conversation_query`` retains up to four ``EventDerivation``
+    objects keyed by conversation key for the process lifetime. Nothing has
+    collided yet only because the key embeds a per-test ``tmp_path`` hash, so
+    two tests that staged the same conversation under one root would cross-
+    contaminate — which is a property of the fixtures, not of the cache.
+    Mirrors ``_reset_perf_state``: a no-op for every test that never loads the
+    module.
+    """
+    try:
+        import _lib_codex_conversation_query as _q  # bin/ is on sys.path
+    except Exception:
+        _q = None
+
+    def _reset():
+        if _q is None:
+            return
+        try:
+            _q.reset_outline_derivation_cache()
+        except Exception:
+            pass
+
+    _reset()
+    yield
+    _reset()

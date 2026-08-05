@@ -80,7 +80,7 @@ def test_rebuild_over_conflicted_journal_completes_and_reports(ns):
 
     _install_conflict_fixture()
 
-    result = jr.rebuild_stats_index()
+    result = jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     assert {c.event_id for c in result.conflicts} == _EXPECTED_IDS
     assert len(result.conflicts) == 14
@@ -100,7 +100,7 @@ def test_rebuild_materializes_the_lowest_sequence_provisional_winner(ns):
     import _cctally_journal as jr
 
     _install_conflict_fixture()
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     conn = _cctally_core.open_db()
     try:
@@ -143,8 +143,14 @@ def test_rebuild_over_conflicted_journal_is_deterministic(ns, tmp_path):
     import _cctally_journal as jr
 
     _install_conflict_fixture()
-    first = jr.rebuild_stats_index(target_path=str(tmp_path / "a.db"))
-    second = jr.rebuild_stats_index(target_path=str(tmp_path / "b.db"))
+    first = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "a.db"),
+    )
+    second = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "b.db"),
+    )
 
     assert [c.to_dict() for c in first.conflicts] == [
         c.to_dict() for c in second.conflicts]

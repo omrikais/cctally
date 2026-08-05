@@ -46,6 +46,10 @@ REQUIRED_SCENARIOS = (
     "thread-source-absent-mcp", "thread-source-absent-subagent",
     "thread-source-mixed-explicit-first", "thread-source-mixed-missing-first",
     "thread-source-mixed-changed-native", "thread-source-mixed-continuity",
+    # #463 S3 Codex tool legibility: dict-shaped patch changes, the uncarded
+    # shell/program families, every output preamble grammar, an announced and an
+    # unannounced shell session, and the external-agent marker.
+    "tool-legibility",
 )
 
 class _Omit:
@@ -94,6 +98,26 @@ TS_SUBAGENT_SESSION = "77777777-7777-4777-8777-777777777777"
 # bytes; nothing in the pre-existing corpus mixes the two shapes.
 TS_MIXED_SESSION = "88888888-8888-4888-8888-888888888888"
 TS_MIXED_SECOND_SESSION = "99999999-9999-4999-8999-999999999999"
+# #463 S3. Its own thread id so the tool-legibility rollout ingests as its own
+# conversation. The two SHELL session ids below are the provider's own namespace,
+# not a rollout identity: they are what `Process running with session ID <id>`
+# announces and what `write_stdin` names. They are synthetic and deliberately
+# distinctive, because the S3 privacy assertion is that NEITHER ever reaches the
+# served card, the adapted model or an export — the reader sees a conversation-
+# local ordinal instead (spec §4.3).
+S3_TOOL_SESSION = "f1111111-1111-4111-8111-111111111111"
+S3_SHELL_SESSION_ANNOUNCED = "70001"
+S3_SHELL_SESSION_UNANNOUNCED = "70002"
+# A session whose OWN `write_stdin` row is the one that announced it, so the
+# index binds the opener to a row the reader renders as a `session_ref` card.
+# The 80.2% production case binds the opener to an `exec_command` call, which
+# renders as a `terminal` card, so no browser check of this fixture could reach
+# the "started this session" state without it.
+S3_SHELL_SESSION_SELF_OPENED = "70003"
+# Named ONLY inside a program body. The index registers a session from a
+# standalone `write_stdin` row and nowhere else, so this one has no ordinal and
+# the card must render no badge at all (wire contract §5).
+S3_SHELL_SESSION_PROGRAM_ONLY = "70004"
 # The Claude-side seed reuses SHARED_ID as its sessionId so the collision proof
 # can show Codex/Claude assemblies share ZERO rows on content, not just key
 # inequality. A known-priced model keeps the sync-time cost pass warning-free.
@@ -1187,6 +1211,323 @@ def _mixed_thread_source_records(
     ]
 
 
+_S3_WHOLE_EXEC = (
+    'const r = await tools.exec_command({cmd: "printf ok", '
+    'workdir: "/synthetic/root-a/project-red", yield_time_ms: 10000}); '
+    'text(r.output);'
+)
+
+# A program the current grammar refuses whole-source: it declares a constant,
+# filters a collection and then invokes TWO different tool families. This is the
+# 51% of uncarded `exec` calls the epic mis-describes as shell vocabulary, and it
+# is why one `terminal` card cannot express it (spec §3.3).
+_S3_MIXED_PROGRAM = (
+    'const names = ALL_TOOLS.filter(x => /gh/.test(x.name));\n'
+    '// tools.exec_command({cmd: "this one is a comment"})\n'
+    'const r = await tools.exec_command({cmd: "ls -1", '
+    'workdir: "/synthetic/root-a/project-red"});\n'
+    'const w = await tools.write_stdin({session_id: '
+    f'{S3_SHELL_SESSION_ANNOUNCED}, chars: "yes\\n"}});\n'
+    # Named only here, so the server resolves no ordinal for it and the
+    # invocation row renders no session badge (wire contract §5).
+    'const u = await tools.write_stdin({session_id: '
+    f'{S3_SHELL_SESSION_PROGRAM_ONLY}, chars: "maybe\\n"}});\n'
+    'text(r.output);\n'
+)
+
+# ~3,800 characters. A five-file allocation of the 16,000-character card budget
+# leaves the first file a share of about 3,150, so this entry publishes a diff
+# clipped at a line boundary and its own `truncated: true` — the per-file
+# `clipped` badge, which neither QA dataset could reach.
+_S3_CLIPPED_FILE_CONTENT = "".join(
+    f"value_{index:03d} = "
+    f"'synthetic filler row {index:03d} for the per-file clip fixture'\n"
+    for index in range(55)
+)
+
+_S3_JS_PROGRAM = (
+    'const r = await tools.exec_command({cmd: "ls -1 /synthetic"});\n'
+    'text(r.output);\n'
+)
+
+# #463 S4 remediation round 3 — the two calls of the AMBIGUOUS-id turn. They
+# differ in body so a reader can tell them apart, and the ambiguity is in the
+# call_id they share, not in either program: both parse whole-source, so the
+# fixture isolates the id collision rather than compounding it with an uncarded
+# program.
+_S3_AMBIGUOUS_EXEC_A = (
+    'const r = await tools.exec_command({cmd: "printf first", '
+    'workdir: "/synthetic/root-a/project-red", yield_time_ms: 10000}); '
+    'text(r.output);'
+)
+_S3_AMBIGUOUS_EXEC_B = (
+    'const r = await tools.exec_command({cmd: "printf second", '
+    'workdir: "/synthetic/root-a/project-red", yield_time_ms: 10000}); '
+    'text(r.output);'
+)
+
+
+def _tool_legibility_records() -> list[dict]:
+    """#463 S3 — every shape the tool-legibility session decodes.
+
+    Wholly synthetic. The shell session ids are provider-namespace values, not
+    rollout identities, and the S3 privacy assertion is that they never reach the
+    wire (spec §4.3), so they are deliberately distinctive enough for a leak test
+    to find them.
+
+    The output preambles are written in the PRODUCTION shape the census measured
+    — a single newline before ``Output:`` and a trailing newline after it — not
+    in the blank-line shape ``_HARNESS_STATUS_RE`` was written against and which
+    zero of 39,942 real outputs carry (spec §1).
+    """
+    def rec(timestamp: str, record_type: str, payload: dict) -> dict:
+        return {"timestamp": timestamp, "type": record_type, "payload": payload}
+
+    def custom_call(ts: str, call_id: str, name: str, value: str) -> dict:
+        return rec(ts, "response_item", {
+            "call_id": call_id, "input": value, "name": name,
+            "status": "completed", "type": "custom_tool_call"})
+
+    def custom_output(ts: str, call_id: str, value) -> dict:
+        return rec(ts, "response_item", {
+            "call_id": call_id, "output": value,
+            "type": "custom_tool_call_output"})
+
+    def fn_call(ts: str, call_id: str, name: str, arguments: dict) -> dict:
+        return rec(ts, "response_item", {
+            "call_id": call_id, "name": name,
+            "arguments": _canonical_json(arguments),
+            "status": "completed", "type": "function_call"})
+
+    def fn_output(ts: str, call_id: str, value) -> dict:
+        return rec(ts, "response_item", {
+            "call_id": call_id, "output": value,
+            "type": "function_call_output"})
+
+    meta = _session_meta(
+        session_id=S3_TOOL_SESSION, record_id="tool-legibility-thread",
+        thread_source="tool-legibility-thread",
+        forked_from_id="tool-legibility-thread",
+        timestamp="2026-08-02T09:00:00Z")
+    return [
+        meta,
+        _turn_context("2026-08-02T09:00:01Z", "turn-tools"),
+        _response_message("2026-08-02T09:00:02Z", "user",
+                          "Exercise the synthetic tool-legibility shapes"),
+        rec("2026-08-02T09:00:03Z", "event_msg", {
+            "info": {
+                "last_token_usage": {
+                    "cached_input_tokens": 200, "input_tokens": 900,
+                    "output_tokens": 300, "reasoning_output_tokens": 80,
+                    "total_tokens": 1200},
+                "model_context_window": 272000,
+                "total_token_usage": {"total_tokens": 1200}},
+            "type": "token_count"}),
+        _response_message("2026-08-02T09:00:04Z", "assistant",
+                          "Running the synthetic tool families."),
+
+        # 1 — a wholly recognized exec chain. Its `terminal` card must stay
+        # byte-identical to what ships today (spec §3.3).
+        custom_call("2026-08-02T09:00:05Z", "s3-exec-whole", "exec", _S3_WHOLE_EXEC),
+        custom_output("2026-08-02T09:00:06Z", "s3-exec-whole", [
+            {"type": "input_text",
+             "text": "Script completed\nWall time 0.5 seconds\nOutput:\n"},
+            {"type": "input_text", "text": "ok\n"}]),
+
+        # 2 — a mixed program, and the `Script failed` grammar.
+        custom_call("2026-08-02T09:00:07Z", "s3-exec-program", "exec",
+                    _S3_MIXED_PROGRAM),
+        custom_output("2026-08-02T09:00:08Z", "s3-exec-program", [
+            {"type": "input_text",
+             "text": "Script failed\nWall time 2 seconds\nOutput:\n"},
+            {"type": "input_text", "text": "boom\n"}]),
+
+        # 3 — the `exec_command` function family, and the `Chunk ID` +
+        # `Process running with session ID` grammar that ANNOUNCES a shell
+        # session. This row is the opener the session index binds (spec §4.5).
+        fn_call("2026-08-02T09:00:09Z", "s3-fc-exec", "exec_command", {
+            "cmd": "bash -i", "workdir": "/synthetic/root-a/project-red",
+            "tty": True, "yield_time_ms": 5000}),
+        fn_output("2026-08-02T09:00:10Z", "s3-fc-exec",
+                  "Chunk ID: aa11bb\nWall time: 1.0034 seconds\n"
+                  "Process running with session ID "
+                  f"{S3_SHELL_SESSION_ANNOUNCED}\n"
+                  "Original token count: 12\nOutput:\nsession opened\n"),
+
+        # 4 — `write_stdin` into the ANNOUNCED session, and the `Chunk ID` +
+        # `Process exited with code 0` third-line variant.
+        # The argument carries the session id as an INTEGER, which is the
+        # production shape, while the announcement above carries it as text —
+        # so the index has to normalize before it can bind the two.
+        fn_call("2026-08-02T09:00:11Z", "s3-fc-stdin-a", "write_stdin", {
+            "session_id": int(S3_SHELL_SESSION_ANNOUNCED), "chars": "yes\n"}),
+        fn_output("2026-08-02T09:00:12Z", "s3-fc-stdin-a",
+                  "Chunk ID: cc22dd\nWall time: 0.5 seconds\n"
+                  "Process exited with code 0\n"
+                  "Original token count: 4\nOutput:\nok\n"),
+
+        # 5 — `write_stdin` into a session NOTHING announced, and a NON-ZERO
+        # exit, so the fixture carries a genuinely failed call.
+        fn_call("2026-08-02T09:00:13Z", "s3-fc-stdin-b", "write_stdin", {
+            "session_id": int(S3_SHELL_SESSION_UNANNOUNCED), "chars": "no\n"}),
+        fn_output("2026-08-02T09:00:14Z", "s3-fc-stdin-b",
+                  "Chunk ID: ee33ff\nWall time: 0.5 seconds\n"
+                  "Process exited with code 3\n"
+                  "Original token count: 4\nOutput:\nrefused\n"),
+
+        # 5b — a `write_stdin` whose OWN output announces a session, so the
+        # index binds this row as that session's opener and the card renders
+        # "started this session". Synthetic on purpose: in production the
+        # opener is almost always an `exec_command`, whose `terminal` card does
+        # not render the note, so this state was unreachable in either dataset.
+        fn_call("2026-08-02T09:00:14Z", "s3-fc-stdin-c", "write_stdin", {
+            "session_id": int(S3_SHELL_SESSION_SELF_OPENED), "chars": "start\n"}),
+        fn_output("2026-08-02T09:00:15Z", "s3-fc-stdin-c",
+                  "Chunk ID: 4400aa\nWall time: 0.2 seconds\n"
+                  "Process running with session ID "
+                  f"{S3_SHELL_SESSION_SELF_OPENED}\n"
+                  "Original token count: 6\nOutput:\nstarted\n"),
+
+        # 6 — `wait` polls a sandbox CELL, never a shell session, and this output
+        # carries NO preamble at all (10,177 of the corpus).
+        fn_call("2026-08-02T09:00:15Z", "s3-fc-wait", "wait", {"cell_id": "12"}),
+        fn_output("2026-08-02T09:00:16Z", "s3-fc-wait", "still waiting\n"),
+
+        # 7 — the `js` program family with its authored title, and the
+        # `Wall time` only grammar.
+        fn_call("2026-08-02T09:00:17Z", "s3-fc-js", "js", {
+            "code": _S3_JS_PROGRAM, "title": "list the synthetic tree"}),
+        fn_output("2026-08-02T09:00:18Z", "s3-fc-js",
+                  "Wall time: 0.73 seconds\nOutput:\n{}"),
+
+        # 8 — the tool-search family.
+        fn_call("2026-08-02T09:00:19Z", "s3-fc-search", "tool_search_call", {
+            "query": "synthetic", "limit": 5}),
+        fn_output("2026-08-02T09:00:20Z", "s3-fc-search", "[]"),
+
+        # 9 — a transport-successful MCP completion whose protocol payload
+        # reports failure (#494). This is the real provider shape: `Ok` is the
+        # transport envelope and its exact boolean `isError` is the tool verdict.
+        fn_call("2026-08-02T09:00:21Z", "s3-fc-mcp-protocol-error",
+                "fixture_get_issue", {"number": 999}),
+        rec("2026-08-02T09:00:22Z", "event_msg", {
+            "call_id": "s3-fc-mcp-protocol-error",
+            "duration": {"secs": 0, "nanos": 250000000},
+            "invocation": {
+                "server": "fixture", "tool": "get_issue",
+                "arguments": {"number": 999},
+            },
+            "result": {"Ok": {
+                "content": [{"type": "text", "text": "synthetic failure"}],
+                "isError": True,
+            }},
+            "type": "mcp_tool_call_end"}),
+        fn_output("2026-08-02T09:00:23Z", "s3-fc-mcp-protocol-error",
+                  "synthetic MCP protocol failure"),
+
+        # 10 — an `apply_patch` call whose output carries the `Exit code:`
+        # grammar, the only grammar apply_patch produces.
+        custom_call("2026-08-02T09:00:24Z", "s3-apply-patch", "apply_patch",
+                    "*** Begin Patch\n*** Update File: synthetic-legible.txt\n"
+                    "@@\n-old\n+new\n*** End Patch"),
+        custom_output("2026-08-02T09:00:25Z", "s3-apply-patch",
+                      "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess\n"),
+
+        # A second turn carrying the DICT-shaped `patch_apply_end` with no patch
+        # call to fold into, so the event card is visible on the wire in its own
+        # right. One update (retained diff), one add and one delete (both
+        # synthesized from `content`), and one empty file.
+        _turn_context("2026-08-02T09:01:00Z", "turn-patch"),
+        _response_message("2026-08-02T09:01:01Z", "user",
+                          "Apply the synthetic dict-shaped patch"),
+        rec("2026-08-02T09:01:02Z", "event_msg", {
+            "call_id": "s3-orphan-patch",
+            "changes": {
+                # Sorts FIRST in the canonical-JSON rollout, which matters:
+                # the per-file diff allocation divides what is left of the one
+                # shared budget by the number of files still pending, so only
+                # an early file can be given a share smaller than its own diff.
+                # This is the only shape that reaches the per-file `clipped`
+                # badge, which neither dataset carried.
+                "/synthetic/root-a/project-red/a-generated-clipped.py": {
+                    "type": "add", "content": _S3_CLIPPED_FILE_CONTENT},
+                "/synthetic/root-a/project-red/updated.py": {
+                    "move_path": None, "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"},
+                "/synthetic/root-a/project-red/added.py": {
+                    "type": "add", "content": "one\ntwo\n"},
+                "/synthetic/root-a/project-red/removed.py": {
+                    "type": "delete", "content": "gone\n"},
+                "/synthetic/root-a/project-red/empty.py": {
+                    "type": "add", "content": ""},
+            },
+            "status": "completed", "stderr": "", "stdout": "patch ok\n",
+            "success": True, "turn_id": "turn-patch",
+            "type": "patch_apply_end"}),
+
+        # A third turn carrying the external-agent marker (F9) and an authored
+        # LOOKALIKE inside a fenced code block, which must stay ordinary prose.
+        _turn_context("2026-08-02T09:02:00Z", "turn-external"),
+        _response_message("2026-08-02T09:02:01Z", "user",
+                          "Delegate the synthetic search"),
+        _response_message(
+            "2026-08-02T09:02:02Z", "assistant",
+            "Delegating to the search tool.\n\n"
+            "[external_agent_tool_call: ToolSearch]\n"
+            'input: {"query": "select:SyntheticAlpha,SyntheticBeta"}'),
+        _response_message(
+            "2026-08-02T09:02:03Z", "assistant",
+            "Here is how that marker is written:\n\n"
+            "```\n"
+            "[external_agent_tool_call: NotACall]\n"
+            'input: {"query": "authored"}\n'
+            "```\n"),
+
+        # A fourth turn carrying `update_plan` (#463 S4 §3.2). It is the only
+        # shape the `plan` landmark family can come from, and it appears ZERO
+        # times in every rollout under this corpus — so without it the S4
+        # mapping would ship byte-invisible to every golden, which is precisely
+        # the silent no-op that mapping exists to prevent: the client's plan
+        # predicates recognise only Claude's `ExitPlanMode` and
+        # `AskUserQuestion`, so nothing would have failed if it never worked.
+        _turn_context("2026-08-02T09:03:00Z", "turn-plan"),
+        _response_message("2026-08-02T09:03:01Z", "user",
+                          "Record the synthetic plan"),
+        fn_call("2026-08-02T09:03:02Z", "s3-fc-plan", "update_plan", {
+            "explanation": "Recording the synthetic plan",
+            "plan": [
+                {"step": "Decode the synthetic tool families",
+                 "status": "completed"},
+                {"step": "Apply the synthetic patch", "status": "in_progress"},
+            ]}),
+        fn_output("2026-08-02T09:03:03Z", "s3-fc-plan", "Plan updated"),
+
+        # A fifth turn whose TWO `exec` calls share ONE call_id, with a single
+        # failing output for that id (#463 S4 remediation round 3). Nothing can
+        # say which of the two calls that output belongs to, so it folds into
+        # neither: it stays its own block, becomes its own fold-group head, and
+        # carries a `tool_error` landmark anchored on its own block key with the
+        # `_landmark_label` KIND fallback for a label. That is the primary C-4
+        # case, and before this it appeared in no rollout under this corpus at
+        # all — so the branch `_landmark_label` documents as reachable, the
+        # `tool_output` block family in `adaptBlocks`, and the outcome of
+        # `fold_owner_by_position` for an unowned position were all uncovered by
+        # any committed golden. The failing preamble is the same `Script failed`
+        # grammar turn one already uses, so no new output grammar enters here.
+        _turn_context("2026-08-02T09:04:00Z", "turn-ambiguous"),
+        _response_message("2026-08-02T09:04:01Z", "user",
+                          "Run the synthetic command twice under one id"),
+        custom_call("2026-08-02T09:04:02Z", "s3-ambiguous", "exec",
+                    _S3_AMBIGUOUS_EXEC_A),
+        custom_call("2026-08-02T09:04:03Z", "s3-ambiguous", "exec",
+                    _S3_AMBIGUOUS_EXEC_B),
+        custom_output("2026-08-02T09:04:04Z", "s3-ambiguous", [
+            {"type": "input_text",
+             "text": "Script failed\nWall time 2 seconds\nOutput:\n"},
+            {"type": "input_text", "text": "which call was this\n"}]),
+    ]
+
+
 def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
     full = [_session_meta(), {"timestamp": "2026-07-14T12:01:00Z", "type": "turn_context", "payload": {"turn_id": "turn-a", "model": MODEL, "model_context_window": 272000}}, _token_event(), *_response_items(), *_lifecycle_events()]
     duplicate = [_session_meta()]
@@ -1294,6 +1635,7 @@ def _scenarios() -> dict[str, tuple[list[dict], str | None]]:
             _session_d_reasoning_lifecycle_marker_records(), None),
         "session-e-native-families": (
             _session_e_native_family_records(), None),
+        "tool-legibility": (_tool_legibility_records(), None),
         "claude-collision": ([_session_meta(source="claude", record_id="claude-root", thread_source="claude-root", forked_from_id="claude-root"), {"timestamp": "2026-07-14T12:02:00Z", "type": "assistant", "payload": {"session_id": SHARED_ID}}], None),
         "secret-canary": (_secret_canary_records(), None),
         "empty-source": ([], None),
@@ -1520,6 +1862,7 @@ def _manifest() -> dict:
                 {"version": 6, "date": "2026-07-22", "change": "#334 Task A conversation reasoning title/body/absence, lifecycle correlation/rejection, and closed trailing Git/memory marker fixture family."},
                 {"version": 7, "date": "2026-07-22", "change": "#335 Session E conversation fixtures for retained world-state, inter-agent metadata, turn-context, unknown-family, and compact reader privacy/presentation coverage."},
                 {"version": 8, "date": "2026-07-31", "change": "thread_source inference: conversation-identity rollouts whose session_meta OMITS thread_source (string and single-key-object source forms) plus four mixed-shape files pinning the per-record stateless rule across explicit/absent transitions, a changed native id, a delta-resume boundary, and the same-category continuity case."},
+                {"version": 9, "date": "2026-08-03", "change": "#463 S3 conversation tool legibility: a dict-shaped patch_apply_end holding update/add/delete/empty entries, a wholly recognized and a mixed exec program, the exec_command/write_stdin/wait/js/tool_search_call function families, every output preamble grammar in its production shape including both Chunk ID third-line variants, an announced, an unannounced and a self-announcing shell session, a session named only inside a program body, a patch file whose diff the per-file budget clips, and the external-agent marker beside an authored fenced lookalike."},
             ]}
 
 

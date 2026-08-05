@@ -25,6 +25,8 @@ from typing import Any, Iterable
 # _lib_conversation_query. These modules are stdlib-only pure kernels.
 from _lib_conversation import _strip_ansi
 from _lib_conversation_query import _TITLE_MAX, _first_nonblank_line
+from _lib_codex_harness_preamble import parse_harness_preamble
+from _lib_codex_js_scan import scan_tool_invocations
 
 
 # ── digest contract (§3.1) ────────────────────────────────────────────────────
@@ -252,6 +254,17 @@ _EXEC_METADATA_KEYS = frozenset({
     "justification", "login", "max_output_tokens", "prefix_rule",
     "sandbox_permissions", "shell", "tty", "yield_time_ms",
 })
+# The FROZEN v1 ingest projection, kept deliberately rather than deleted.
+#
+# Live decoding moved to `_lib_codex_harness_preamble.parse_harness_preamble`
+# (#463 S3, spec section 4.1), which this regex could never do: it requires a
+# blank line before `Output:` and end-of-string after it, and 0 of the 39,942
+# production outputs carrying the preamble it targets match it. But `_extract`
+# must keep storing byte-identical `detail_json` (spec section 3.0), because
+# `_row_source_bytes` feeds `PAGE_SOURCE_BYTE_BUDGET` and a richer stored card
+# would move page boundaries for newly ingested rows only. So this stays as the
+# stored contract until `CODEX_CONVERSATION_CONTRACT_VERSION` is bumped and the
+# history is replayed. It is reached ONLY through `for_storage=True`.
 _HARNESS_STATUS_RE = re.compile(
     r"\A(Script completed|Script failed)\nWall time ([^\n]+)\n\nOutput:\Z")
 
@@ -451,14 +464,85 @@ def _json_object(value: Any) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def decode_secondary_tool_call_card(
-    payload: dict, *, text_cap: int = CODEX_TEXT_CAP,
+def _decode_shell_family_card(
+    payload: dict, name: Any, budget: _TextBudget, text_cap: int,
 ) -> dict | None:
-    """Bounded additive wire for plans, web actions, and agent operations.
+    """The four uncarded `function_call` families (spec section 3.2).
+
+    `exec_command` maps onto the EXISTING `terminal` card rather than a new type,
+    so `BashCard` renders it unchanged. `write_stdin` and `wait` produce
+    `session_ref`; grouping happens only at `shell` scope, and a cell reference
+    is never presented as a shell session. `js` produces the `program` card of
+    section 3.3 carrying its authored `title`, which is the only authored
+    description of a program available anywhere in the payload.
+    """
+    if name == "exec_command":
+        arguments = _json_object(payload.get("arguments"))
+        command = _command_invocation(arguments, budget)
+        if command is None:
+            return None
+        card = {
+            "schema_version": CODEX_CARD_SCHEMA_VERSION,
+            "type": "terminal",
+            "status": (payload.get("status")
+                       if isinstance(payload.get("status"), str) else "unknown"),
+            "commands": [command],
+        }
+        if budget.truncated:
+            card["truncated"] = True
+        return card
+    if name in _SESSION_TOOLS:
+        arguments = _json_object(payload.get("arguments"))
+        session = _session_invocation(name, arguments, budget)
+        if session is None:
+            return None
+        return {
+            "schema_version": CODEX_CARD_SCHEMA_VERSION,
+            "type": "session_ref", **session, "truncated": budget.truncated,
+        }
+    if name == "js":
+        arguments = _json_object(payload.get("arguments"))
+        if arguments is None:
+            return None
+        title = arguments.get("title")
+        if title is not None and not isinstance(title, str):
+            return None
+        return _program_card(
+            arguments.get("code"),
+            title=budget.take(title) if isinstance(title, str) else None,
+            text_cap=text_cap)
+    if name == "tool_search_call":
+        arguments = _json_object(payload.get("arguments"))
+        if arguments is None or not isinstance(arguments.get("query"), str):
+            return None
+        limit = arguments.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)):
+            return None
+        card = {
+            "schema_version": CODEX_CARD_SCHEMA_VERSION,
+            "type": "tool_search", "query": budget.take(arguments["query"]),
+            "limit": limit,
+        }
+        if budget.truncated:
+            card["truncated"] = True
+        return card
+    return None
+
+
+def decode_secondary_tool_call_card(
+    payload: dict, *, text_cap: int = CODEX_TEXT_CAP, for_storage: bool = False,
+) -> dict | None:
+    """Bounded additive wire for plans, web actions, agent operations, and the
+    shell/program families #463 S3 adds.
 
     Unknown or malformed shapes deliberately return ``None`` so the existing
     provider-name + raw-argument fallback remains visible and payload readback
     stays authoritative.
+
+    ``for_storage=True`` produces the FROZEN v1 projection ``_extract`` persists
+    (spec section 3.0), which means the five S3 families decode to nothing: they
+    reach 34,935 rows, more than any other S3 change, and persisting them would
+    move `PAGE_SOURCE_BYTE_BUDGET` boundaries for newly ingested rows only.
     """
     if not isinstance(payload, dict):
         return None
@@ -466,6 +550,10 @@ def decode_secondary_tool_call_card(
     name = payload.get("name")
     status = payload.get("status") if isinstance(payload.get("status"), str) else "requested"
     budget = _TextBudget(text_cap)
+    if not for_storage and ptype == "function_call":
+        s3_card = _decode_shell_family_card(payload, name, budget, text_cap)
+        if s3_card is not None:
+            return s3_card
     if ptype == "function_call" and name == "update_plan":
         arguments = _json_object(payload.get("arguments"))
         plan = arguments.get("plan") if isinstance(arguments, dict) else None
@@ -590,7 +678,12 @@ def decode_secondary_event_card(
             return None
         result = payload.get("result")
         if isinstance(result, dict) and "Ok" in result:
-            status = "ok"
+            ok_result = result.get("Ok")
+            status = (
+                "error"
+                if isinstance(ok_result, dict) and ok_result.get("isError") is True
+                else "ok"
+            )
         elif isinstance(result, dict) and any(key in result for key in ("Err", "Error")):
             status = "error"
         else:
@@ -612,8 +705,77 @@ def decode_secondary_event_card(
     return None
 
 
-def _exec_invocations(source: str, *, budget: _TextBudget) -> list[dict] | None:
-    """Decode only the complete current exec harness statement grammar."""
+# The two tools that name a session rather than run a command, and what each
+# names. `session_id` and `cell_id` are NOT two spellings of one thing: the
+# namespaces have zero overlapping values, and a `cell_id` is a per-conversation
+# sandbox-cell ordinal. `wait` polls a cell; it does not poll a shell session.
+_SESSION_TOOLS = {
+    "write_stdin": ("shell", "write"),
+    "wait": ("cell", "poll"),
+}
+
+# `_exec_chain` outcomes. The distinction matters: a source that is not the
+# strict chain grammar at all may still be a legible PROGRAM, while one that has
+# the chain's shape and was refused by the literal parser or the command cap must
+# keep producing no card, which is what the shipped closed-parser regression
+# requires for `process.env.SECRET`, a template argument and nine invocations.
+_EXEC_OK = "ok"
+_EXEC_SHAPE = "shape"
+_EXEC_REFUSED = "refused"
+
+
+def _command_invocation(value: Any, budget: _TextBudget) -> dict | None:
+    """One `exec_command` argument object as the shared `terminal` command."""
+    if not isinstance(value, dict) or not isinstance(value.get("cmd"), str):
+        return None
+    workdir = value.get("workdir")
+    if workdir is not None and not isinstance(workdir, str):
+        return None
+    command = {
+        "workdir": budget.take(workdir) if isinstance(workdir, str) else None,
+        "command": "",
+        "metadata": {},
+    }
+    command["command"] = budget.take(value["cmd"])
+    for key in sorted(_EXEC_METADATA_KEYS):
+        if key not in value:
+            continue
+        bounded = _bounded_metadata(value[key], budget)
+        if bounded is not None:
+            command["metadata"][key] = bounded
+    return command
+
+
+def _session_invocation(name: str, value: Any, budget: _TextBudget) -> dict | None:
+    """One `write_stdin`/`wait` argument object as a session reference.
+
+    ``ref`` carries the provider's own identifier here, because the kernel has no
+    conversation context. The query layer replaces a ``shell`` ref with the
+    conversation-local ordinal before publishing, so no raw provider session id
+    ever reaches a reader (spec section 4.3).
+    """
+    if not isinstance(value, dict):
+        return None
+    scope, operation = _SESSION_TOOLS[name]
+    raw = value.get("session_id") if scope == "shell" else value.get("cell_id")
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return None
+    chars = value.get("chars")
+    if chars is not None and not isinstance(chars, str):
+        return None
+    return {
+        "scope": scope, "ref": budget.take(str(raw)), "operation": operation,
+        "chars": budget.take(chars) if isinstance(chars, str) else None,
+    }
+
+
+def _exec_chain(source: str, *, budget: _TextBudget) -> tuple[str, list[dict] | None]:
+    """Decode only the complete current exec harness statement grammar.
+
+    Returns ``(_EXEC_OK, commands)``, ``(_EXEC_SHAPE, None)`` when the source is
+    not that grammar, or ``(_EXEC_REFUSED, None)`` when it HAS the grammar's
+    shape but a literal or the command cap refused it.
+    """
     commands: list[dict] = []
     pos = 0
     while True:
@@ -622,8 +784,10 @@ def _exec_invocations(source: str, *, budget: _TextBudget) -> list[dict] | None:
             r"await\s+tools\.exec_command",
             source[pos:],
         )
-        if prefix is None or len(commands) >= _CARD_MAX_COMMANDS:
-            return None
+        if prefix is None:
+            return _EXEC_SHAPE, None
+        if len(commands) >= _CARD_MAX_COMMANDS:
+            return _EXEC_REFUSED, None
         variable = prefix.group(1)
         parser = _HarnessLiteralParser(source, pos + prefix.end())
         try:
@@ -631,24 +795,10 @@ def _exec_invocations(source: str, *, budget: _TextBudget) -> list[dict] | None:
             value = parser.value()
             parser._consume(")")
         except _LiteralError:
-            return None
-        if not isinstance(value, dict) or not isinstance(value.get("cmd"), str):
-            return None
-        workdir = value.get("workdir")
-        if workdir is not None and not isinstance(workdir, str):
-            return None
-        command = {
-            "workdir": budget.take(workdir) if isinstance(workdir, str) else None,
-            "command": "",
-            "metadata": {},
-        }
-        command["command"] = budget.take(value["cmd"])
-        for key in sorted(_EXEC_METADATA_KEYS):
-            if key not in value:
-                continue
-            bounded = _bounded_metadata(value[key], budget)
-            if bounded is not None:
-                command["metadata"][key] = bounded
+            return _EXEC_REFUSED, None
+        command = _command_invocation(value, budget)
+        if command is None:
+            return _EXEC_REFUSED, None
         commands.append(command)
         suffix = re.match(
             r"\s*;\s*text\s*\(\s*" + re.escape(variable)
@@ -656,10 +806,92 @@ def _exec_invocations(source: str, *, budget: _TextBudget) -> list[dict] | None:
             source[parser.pos:],
         )
         if suffix is None:
-            return None
+            return _EXEC_SHAPE, None
         pos = parser.pos + suffix.end()
         if not source[pos:].strip():
-            return commands
+            return _EXEC_OK, commands
+
+
+def _scanned_invocations(
+    source: str, *, budget: _TextBudget,
+) -> tuple[list[dict], bool] | None:
+    """``(invocations, over_cap)`` for a program, or ``None`` if it cannot be lexed.
+
+    Arguments are read by the existing ``_HarnessLiteralParser``, so a non-literal
+    such as ``process.env.SECRET`` is still refused — the entry degrades to
+    ``other``, which names the tool and claims nothing about what it was given.
+    """
+    located = scan_tool_invocations(source, limit=_CARD_MAX_COMMANDS + 1)
+    if located is None:
+        return None
+    invocations: list[dict] = []
+    for name, paren in located[:_CARD_MAX_COMMANDS]:
+        parser = _HarnessLiteralParser(source, paren)
+        try:
+            parser._consume("(")
+            value = parser.value()
+        except _LiteralError:
+            value = None
+        entry: dict | None = None
+        if name == "exec_command":
+            command = _command_invocation(value, budget)
+            if command is not None:
+                entry = {"kind": "command", **command}
+        elif name in _SESSION_TOOLS:
+            session = _session_invocation(name, value, budget)
+            if session is not None:
+                entry = {"kind": "session", **session}
+        if entry is None:
+            entry = {"kind": "other", "name": budget.take(name)}
+        invocations.append(entry)
+    return invocations, len(located) > _CARD_MAX_COMMANDS
+
+
+def _program_card_from_scan(
+    source: str, *, title: str | None, budget: _TextBudget,
+) -> dict | None:
+    """A `program` card for a source the strict chain grammar did not match."""
+    scanned = _scanned_invocations(source, budget=budget)
+    if scanned is None:
+        return None
+    invocations, over_cap = scanned
+    if not invocations:
+        return None
+    return {
+        "schema_version": CODEX_CARD_SCHEMA_VERSION,
+        "type": "program", "title": title,
+        # Never claim the program did only what is listed: the scanner models
+        # `tools.<name>(` and nothing else, so anything reaching here contains
+        # statements it did not read.
+        "complete": False,
+        "invocations": invocations,
+        "truncated": over_cap or budget.truncated,
+    }
+
+
+def _program_card(
+    source: Any, *, title: str | None, text_cap: int,
+) -> dict | None:
+    """A `program` card for an arbitrary authored program body.
+
+    A body that IS the complete recognized chain is still a program card — the
+    `js` family always renders as one — but it is marked `complete`.
+    """
+    if not isinstance(source, str) or len(source) > _CARD_HARNESS_PARSE_CAP:
+        return None
+    budget = _TextBudget(text_cap)
+    outcome, commands = _exec_chain(source, budget=budget)
+    if outcome == _EXEC_REFUSED:
+        return None
+    if outcome == _EXEC_OK:
+        return {
+            "schema_version": CODEX_CARD_SCHEMA_VERSION,
+            "type": "program", "title": title, "complete": True,
+            "invocations": [{"kind": "command", **command} for command in commands],
+            "truncated": budget.truncated,
+        }
+    return _program_card_from_scan(
+        source, title=title, budget=_TextBudget(text_cap))
 
 
 def _decode_apply_patch_program(source: str) -> str | None:
@@ -694,23 +926,141 @@ def _apply_patch_heredoc(command: str) -> str | None:
     return None
 
 
-def _patch_files_from_apply_patch(
-    patch: str, budget: _TextBudget | None = None,
-) -> list[dict]:
-    files: list[dict] = []
-    for line in patch.splitlines():
-        match = re.match(r"\*\*\* (Add|Update|Delete) File: (.+)\Z", line)
-        if match is not None and len(files) < _CARD_MAX_FILES:
-            status = {"Add": "added", "Update": "modified", "Delete": "deleted"}[
-                match.group(1)]
-            path = budget.take(match.group(2)) if budget is not None else match.group(2)
-            files.append({"path": path, "status": status})
+_APPLY_PATCH_ACTION_RE = re.compile(r"\*\*\* (Add|Update|Delete) File: (.+)\Z")
+_APPLY_PATCH_MOVE_RE = re.compile(r"\*\*\* Move to: (.+)\Z")
+
+
+def _apply_patch_row_kind(line: str) -> str:
+    """Classify one V4A body row the way the client's diff parser does."""
+    head = line[:1]
+    if head == "+":
+        return "add"
+    if head == "-":
+        return "del"
+    if head == "\\":
+        return "marker"
+    return "context"
+
+
+def _apply_patch_unified_diff(
+    old_path: str, new_path: str, body: list[str],
+) -> str | None:
+    """One section of a proven ``apply_patch`` envelope as a unified diff.
+
+    The V4A envelope states no line offsets — its ``@@`` markers carry context
+    TEXT, not numbers — so each hunk header counts the rows it contains and
+    numbers them relative to the file's first hunk. That is the same relative
+    numbering the edit-diff card has always rendered under, and the running
+    counts continue across a file's hunks so two hunks never show one gutter
+    number twice.
+
+    A section with no body row at all — a V4A ``*** Delete File:`` names the
+    file and carries nothing — yields ``None``, so the card claims no diff
+    rather than publishing an empty one.
+    """
+    hunks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in body:
+        if line.startswith("@@"):
+            current = []
+            hunks.append(current)
             continue
-        move = re.match(r"\*\*\* Move to: (.+)\Z", line)
-        if move is not None and files:
+        if current is None:
+            current = []
+            hunks.append(current)
+        current.append(line)
+    hunks = [hunk for hunk in hunks if hunk]
+    if not hunks:
+        return None
+    out = [f"--- {old_path}\n", f"+++ {new_path}\n"]
+    old_at = new_at = 1
+    for hunk in hunks:
+        kinds = [_apply_patch_row_kind(line) for line in hunk]
+        old_count = sum(1 for kind in kinds if kind in ("context", "del"))
+        new_count = sum(1 for kind in kinds if kind in ("context", "add"))
+        out.append(
+            f"@@ -{old_at if old_count else 0},{old_count} "
+            f"+{new_at if new_count else 0},{new_count} @@\n")
+        out.extend(f"{line}\n" for line in hunk)
+        old_at += old_count
+        new_at += new_count
+    return "".join(out)
+
+
+def _patch_files_from_apply_patch(
+    patch: str, budget: _TextBudget | None = None, *, with_diffs: bool = False,
+) -> list[dict]:
+    """The file entries of a proven ``apply_patch`` envelope.
+
+    ``with_diffs`` is READ TIME only. The stored v1 projection is the file LIST
+    it has always been, because `detail_json` bytes feed `_row_source_bytes` and
+    therefore page boundaries; publishing the diffs there would paginate a newly
+    ingested conversation differently from an identical historical one.
+
+    At read time the entries gain the same field vocabulary the
+    ``patch_apply_end`` card publishes — ``unified_diff``, ``diff_source`` and
+    per-file ``truncated`` — through the same `_allocate_diff_budget`
+    allocation, so one patch does not read two ways depending on which side of
+    it the reader is looking at.
+    """
+    files: list[dict] = []
+    raw_paths: list[str] = []
+    bodies: list[list[str]] = []
+    # Past the file cap a section is dropped whole, so its body must not be
+    # attributed to the previous file's diff.
+    collecting = False
+    for line in patch.splitlines():
+        match = _APPLY_PATCH_ACTION_RE.match(line)
+        if match is not None:
+            collecting = len(files) < _CARD_MAX_FILES
+            if collecting:
+                status = {"Add": "added", "Update": "modified", "Delete": "deleted"}[
+                    match.group(1)]
+                path = (budget.take(match.group(2)) if budget is not None
+                        else match.group(2))
+                files.append({"path": path, "status": status})
+                raw_paths.append(match.group(2))
+                bodies.append([])
+            continue
+        move = _APPLY_PATCH_MOVE_RE.match(line)
+        if move is not None and collecting and files:
             files[-1]["move_path"] = (
                 budget.take(move.group(1)) if budget is not None else move.group(1))
             files[-1]["status"] = "moved"
+            continue
+        if line.startswith("*** "):
+            continue
+        if collecting and bodies:
+            bodies[-1].append(line)
+    if not with_diffs:
+        return files
+    diffs: list[str | None] = []
+    for entry, raw_path, body in zip(files, raw_paths, bodies):
+        # The header names the PROVIDER's own path, which can differ from the
+        # entry's when the budget clipped the latter — the same rule the
+        # synthesized event-side diff follows.
+        move_path = entry.get("move_path")
+        if entry["status"] == "added":
+            old_path, new_path = "/dev/null", raw_path
+        elif entry["status"] == "deleted":
+            old_path, new_path = raw_path, "/dev/null"
+        else:
+            old_path, new_path = raw_path, move_path or raw_path
+        diff = _apply_patch_unified_diff(old_path, new_path, body)
+        # `truncated` on EVERY entry, so a client never has to read an absent
+        # key as false; `_allocate_diff_budget` overwrites it where a diff runs.
+        entry["truncated"] = False
+        if diff is not None:
+            # The provider transmitted a patch envelope, not a unified diff, so
+            # this is a rendering of retained content — never `retained`.
+            entry["diff_source"] = "derived"
+        diffs.append(diff)
+    if budget is not None:
+        _allocate_diff_budget(files, diffs, budget)
+    else:
+        for entry, diff in zip(files, diffs):
+            if diff is not None:
+                entry["unified_diff"] = diff
     return files
 
 
@@ -726,8 +1076,16 @@ def _complete_apply_patch(patch: str) -> bool:
                for line in lines[1:-1])
 
 
-def decode_tool_call_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> dict | None:
-    """Return the additive card contract for a structurally proven call."""
+def decode_tool_call_card(
+    payload: dict, *, text_cap: int = CODEX_TEXT_CAP, for_storage: bool = False,
+) -> dict | None:
+    """Return the additive card contract for a structurally proven call.
+
+    ``for_storage=True`` produces the FROZEN v1 projection ``_extract`` persists
+    (spec section 3.0): the `program` card is a read-time addition and is not
+    stored, because it would newly appear on 17,777 rows and move
+    `PAGE_SOURCE_BYTE_BUDGET` boundaries for whichever binary ingested them.
+    """
     if not isinstance(payload, dict) or payload.get("type") != "custom_tool_call":
         return None
     name = payload.get("name")
@@ -739,7 +1097,11 @@ def decode_tool_call_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> d
     budget = _TextBudget(text_cap)
     status = payload.get("status") if isinstance(payload.get("status"), str) else "unknown"
     if name == "apply_patch" and _complete_apply_patch(value):
-        files = _patch_files_from_apply_patch(value, budget)
+        # The derived diffs are taken from the shared budget BEFORE the raw
+        # `patch`: `patch` is the payload disclosure's copy and no card renders
+        # it, while the diffs are the only thing on this card a reader reads.
+        files = _patch_files_from_apply_patch(
+            value, budget, with_diffs=not for_storage)
         patch = budget.take(value)
         return {
             "schema_version": CODEX_CARD_SCHEMA_VERSION,
@@ -751,7 +1113,8 @@ def decode_tool_call_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> d
         return None
     patch_value = _decode_apply_patch_program(value)
     if patch_value is not None and _complete_apply_patch(patch_value):
-        files = _patch_files_from_apply_patch(patch_value, budget)
+        files = _patch_files_from_apply_patch(
+            patch_value, budget, with_diffs=not for_storage)
         patch = budget.take(patch_value)
         return {
             "schema_version": CODEX_CARD_SCHEMA_VERSION,
@@ -759,13 +1122,26 @@ def decode_tool_call_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> d
             "patch": patch, "files": files,
             "truncated": budget.truncated,
         }
-    commands = _exec_invocations(value, budget=budget)
-    if commands is None:
+    outcome, commands = _exec_chain(value, budget=budget)
+    if outcome == _EXEC_REFUSED:
+        # The chain's SHAPE with a literal or the command cap refusing it. This
+        # is the arm the shipped closed-parser regression pins: a
+        # `process.env.SECRET` argument, a template argument and nine
+        # invocations must all keep producing no card at all.
         return None
+    if outcome == _EXEC_SHAPE:
+        # Not the chain grammar — but 17,777 uncarded `exec` calls are programs
+        # that declare constants, filter collections and invoke two different
+        # tool families, and one `terminal` card cannot express that.
+        if for_storage:
+            return None
+        return _program_card_from_scan(
+            value, title=None, budget=_TextBudget(text_cap))
     if len(commands) == 1:
         heredoc = _apply_patch_heredoc(commands[0]["command"])
         if heredoc is not None and _complete_apply_patch(heredoc):
-            files = _patch_files_from_apply_patch(heredoc, budget)
+            files = _patch_files_from_apply_patch(
+                heredoc, budget, with_diffs=not for_storage)
             return {
                 "schema_version": CODEX_CARD_SCHEMA_VERSION,
                 "type": "patch", "source": "exec_apply_patch", "status": status,
@@ -781,10 +1157,33 @@ def decode_tool_call_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> d
     return card
 
 
+def _output_head_text(value: Any) -> str | None:
+    """The text of an output's FIRST part, for the two shapes that carry one.
+
+    Both the array and the bare-string envelope occur for both record types, and
+    the preamble is positionally guaranteed to be at the head of whichever one
+    arrives, so this is the only place it may be looked for (spec section 4.1).
+    """
+    if isinstance(value, str):
+        return value
+    if (isinstance(value, dict) and value.get("type") == "input_text"
+            and isinstance(value.get("text"), str)):
+        return value["text"]
+    return None
+
+
 def decode_tool_output_card(
-    payload: dict, *, text_cap: int = CODEX_TEXT_CAP,
+    payload: dict, *, text_cap: int = CODEX_TEXT_CAP, for_storage: bool = False,
 ) -> tuple[dict, str] | None:
-    """Unwrap supported output envelopes without losing malformed parts."""
+    """Unwrap supported output envelopes without losing malformed parts.
+
+    ``for_storage=True`` produces the FROZEN v1 projection ``_extract`` persists
+    (spec section 3.0): no ``exit_code``, no ``wall_time_seconds``, the status
+    resolved only by ``_HARNESS_STATUS_RE``, and the preamble left in the part.
+    Every reader path takes the default, which resolves the status from the five
+    real grammars and removes the consumed lines from the rendered parts (spec
+    sections 4.3 and 4.4).
+    """
     if not isinstance(payload, dict) or payload.get("type") not in _RESPONSE_TOOL_OUTPUTS:
         return None
     value = payload["output"] if "output" in payload else payload.get("tools")
@@ -792,23 +1191,41 @@ def decode_tool_output_card(
     budget = _TextBudget(text_cap)
     parts: list[dict] = []
     status = payload.get("status") if isinstance(payload.get("status"), str) else "unknown"
+    fields: dict = {}
+    preamble = None
+    drop_head = False
+    head = _output_head_text(values[0]) if values else None
+    if head is not None:
+        if for_storage:
+            match = _HARNESS_STATUS_RE.fullmatch(head)
+            if match is not None:
+                status = ("completed" if match.group(1) == "Script completed"
+                          else "failed")
+                drop_head = True
+        else:
+            preamble = parse_harness_preamble(head)
+            if preamble is not None:
+                fields = preamble[0]
+                # A resolved state is evidence and wins. `unknown` adds nothing,
+                # so it leaves `status` alone — which is what keeps the query
+                # layer's unknown-gated backfill covering the remainder (4.6).
+                if fields["status"] != "unknown":
+                    status = fields["status"]
+                drop_head = not preamble[1]
+
     for index, part in enumerate(values[:_CARD_MAX_PARTS]):
-        if isinstance(part, str):
-            text = part
-            match = _HARNESS_STATUS_RE.fullmatch(text) if index == 0 else None
-            if match is not None:
-                status = "completed" if match.group(1) == "Script completed" else "failed"
-                continue
-            parts.append({"type": "text", "stream": "output", "text": budget.take(text)})
-            continue
-        if isinstance(part, dict) and part.get("type") == "input_text" \
-                and isinstance(part.get("text"), str):
-            text = part["text"]
-            match = _HARNESS_STATUS_RE.fullmatch(text) if index == 0 else None
-            if match is not None:
-                status = "completed" if match.group(1) == "Script completed" else "failed"
-                continue
-            stream = part.get("stream") if part.get("stream") in {"stdout", "stderr"} else "output"
+        if isinstance(part, str) or (
+                isinstance(part, dict) and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)):
+            text = part if isinstance(part, str) else part["text"]
+            if index == 0 and head is not None:
+                if drop_head:
+                    continue
+                if preamble is not None:
+                    text = preamble[1]
+            stream = "output"
+            if isinstance(part, dict) and part.get("stream") in {"stdout", "stderr"}:
+                stream = part["stream"]
             parts.append({"type": "text", "stream": stream, "text": budget.take(text)})
             continue
         raw = _canonical_json(part)
@@ -821,48 +1238,371 @@ def decode_tool_output_card(
         "is_error": status in {"failed", "error"},
         "parts": parts, "truncated": budget.truncated,
     }
+    if not for_storage:
+        # Null when the grammar did not supply it. No `chunk_id` and no
+        # `session_id`: a per-call hash has no reading value, and the session
+        # identity a reader sees is the conversation-local ordinal from the
+        # detail envelope's index, never the provider's own id (section 4.3).
+        card["exit_code"] = fields.get("exit_code")
+        card["wall_time_seconds"] = fields.get("wall_time_seconds")
     return card, "".join(part["text"] for part in parts)
 
 
-def decode_patch_event_card(payload: dict, *, text_cap: int = CODEX_TEXT_CAP) -> dict | None:
-    """Bounded, provider-truthful ``patch_apply_end`` projection."""
+# The keys the dict-shaped `changes` entry is known to carry. Anything else goes
+# to `raw_extra`, so a provider addition is preserved rather than dropped.
+_PATCH_CHANGE_KEYS = frozenset({"type", "unified_diff", "content", "move_path"})
+
+
+def _synthesized_unified_diff(path: str, kind: str, content: str) -> str:
+    """A unified diff for an ``add`` or ``delete`` entry, from its `content`.
+
+    The bytes are specified exactly because ``NativePatchCard`` does not render
+    prefixed lines — it requires a parseable hunk. An empty file emits a
+    zero-length hunk rather than a malformed one, and content that does not end
+    in a newline gets the ``\\ No newline at end of file`` marker so the stated
+    line count and the rendered result agree.
+
+    This is a rendering of retained content, not something the provider sent,
+    which is why every entry built from it is marked ``diff_source: derived``.
+    """
+    lines = content.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+        complete = True
+    else:
+        complete = False
+    count = len(lines)
+    if kind == "add":
+        header = f"--- /dev/null\n+++ {path}\n"
+        hunk = "@@ -0,0 +0,0 @@\n" if count == 0 else f"@@ -0,0 +1,{count} @@\n"
+        body = "".join(f"+{line}\n" for line in lines)
+    else:
+        header = f"--- {path}\n+++ /dev/null\n"
+        hunk = "@@ -0,0 +0,0 @@\n" if count == 0 else f"@@ -1,{count} +0,0 @@\n"
+        body = "".join(f"-{line}\n" for line in lines)
+    marker = "" if complete or count == 0 else "\\ No newline at end of file\n"
+    return header + hunk + body + marker
+
+
+def _clip_to_line_boundary(text: str, limit: int) -> tuple[str, bool]:
+    """``(text, was_cut)``, cut at a line boundary so the result still parses."""
+    if len(text) <= limit:
+        return text, False
+    cut = text.rfind("\n", 0, limit)
+    return (text[:cut + 1] if cut >= 0 else ""), True
+
+
+def _diff_body_survived(diff: str) -> bool:
+    """True iff ``diff`` still carries a line a hunk can render.
+
+    `has_diff` means a diff is RENDERABLE (spec section 3.1), and a clip that
+    keeps only the `---`/`+++`/`@@` headers renders nothing at all — the very
+    shape a minified single-line file produces, because the whole file body is
+    one physical line and the clip cuts at a line boundary. The same clip can
+    also keep nothing at all, when the first line is already longer than the
+    share.
+
+    A diff that was NOT cut is never tested against this, so the deliberate
+    zero-length hunk an empty file emits (`@@ -0,0 +0,0 @@` with no body, spec
+    section 3.1) keeps its diff.
+    """
+    seen_hunk = False
+    for line in diff.split("\n"):
+        if line.startswith("@@"):
+            seen_hunk = True
+        elif seen_hunk and line[:1] in ("+", "-", " ", "\\"):
+            return True
+    return False
+
+
+def _allocate_diff_budget(entries: list[dict], diffs: list[str | None],
+                          budget: _TextBudget) -> None:
+    """Divide what is left of the shared budget equally among the files.
+
+    The single 16,000-character budget covers every file plus stdout and stderr,
+    so a per-file cap is an ALLOCATION of that budget rather than an addition to
+    it. A file needing less returns the remainder to the pool for later files; a
+    file exceeding its share is cut at a line boundary and sets its own
+    `truncated`. This is what stops the average 20,859-character deletion from
+    consuming the budget belonging to the other files in the 487 events that
+    touch two or more files.
+
+    A cut that leaves nothing renderable publishes NO ``unified_diff`` at all,
+    only `truncated` and `diff_source`, so the client never receives a key it
+    cannot render while `has_diff` claims it can.
+    """
+    pending = sum(1 for diff in diffs if diff is not None)
+    for entry, diff in zip(entries, diffs):
+        if diff is None:
+            continue
+        share = budget.remaining // pending if pending else 0
+        kept, was_cut = _clip_to_line_boundary(diff, share)
+        pending -= 1
+        entry["truncated"] = was_cut
+        if was_cut:
+            budget.truncated = True
+            if not _diff_body_survived(kept):
+                continue
+        entry["unified_diff"] = budget.take(kept)
+
+
+def _patch_files_from_changes_map(changes: dict, budget: _TextBudget) -> list[dict]:
+    """The dict-shaped ``changes`` branch (spec section 3.1).
+
+    The path comes from the dict KEY and the status from the entry's ``type``,
+    not from ``path``/``status`` — the two shapes disagree on both, which is why
+    a direct port of the list loop would yield `(unknown file)` and a null status
+    on every entry.
+    """
+    entries: list[dict] = []
+    diffs: list[str | None] = []
+    for path, change in list(changes.items())[:_CARD_MAX_FILES]:
+        if not isinstance(path, str):
+            continue
+        # Per-file `truncated` is a wire field on EVERY entry (spec section 3.1),
+        # so it is set here rather than only where a diff exists. Without it a
+        # client would have to treat absent as false on the entries that carry no
+        # diff, which is not what the spec describes.
+        entry: dict[str, Any] = {"path": budget.take(path), "truncated": False}
+        if not isinstance(change, dict):
+            entry["raw"] = budget.take(_canonical_json(change))
+            entries.append(entry)
+            diffs.append(None)
+            continue
+        kind = change.get("type")
+        if isinstance(kind, str):
+            entry["status"] = budget.take(kind)
+        if isinstance(change.get("move_path"), str):
+            entry["move_path"] = budget.take(change["move_path"])
+        diff: str | None = None
+        if isinstance(change.get("unified_diff"), str):
+            diff = change["unified_diff"]
+            entry["diff_source"] = "retained"
+        elif kind in {"add", "delete"} and isinstance(change.get("content"), str):
+            # The PROVIDER's path, never `entry["path"]`, which the shared budget
+            # may have clipped. A `---`/`+++` header naming a truncated path
+            # would make the one card family whose purpose is provider-truth
+            # assert a file that does not exist; the synthesized diff is clipped
+            # by the shared allocation below, exactly as a retained one is.
+            diff = _synthesized_unified_diff(path, kind, change["content"])
+            entry["diff_source"] = "derived"
+        unknown = {key: value for key, value in change.items()
+                   if key not in _PATCH_CHANGE_KEYS}
+        if unknown:
+            entry["raw_extra"] = budget.take(_canonical_json(unknown))
+        entries.append(entry)
+        diffs.append(diff)
+    _allocate_diff_budget(entries, diffs, budget)
+    return entries
+
+
+def decode_patch_event_card(
+    payload: dict, *, text_cap: int = CODEX_TEXT_CAP, for_storage: bool = False,
+) -> dict | None:
+    """Bounded, provider-truthful ``patch_apply_end`` projection.
+
+    ``for_storage=True`` produces the FROZEN v1 projection ``_extract``
+    persists (spec section 3.0): a dict-shaped ``changes`` object becomes one
+    ``{"raw": …}`` entry, as it does today. Persisting the decoded per-file
+    diffs would be the largest `detail_json` growth in S3 and would move
+    `PAGE_SOURCE_BYTE_BUDGET` boundaries for newly ingested rows only.
+    """
     if not isinstance(payload, dict) or payload.get("type") != "patch_apply_end":
         return None
     budget = _TextBudget(text_cap)
     files: list[dict] = []
     changes = payload.get("changes")
-    if isinstance(changes, list):
+    stdout: str | None = None
+    stderr: str | None = None
+    streams_taken = False
+    if not for_storage and isinstance(changes, dict):
+        # stdout and stderr come off the shared budget FIRST here, because what
+        # is left is what the per-file allocation divides.
+        stdout = (budget.take(payload["stdout"])
+                  if isinstance(payload.get("stdout"), str) else None)
+        stderr = (budget.take(payload["stderr"])
+                  if isinstance(payload.get("stderr"), str) else None)
+        streams_taken = True
+        files = _patch_files_from_changes_map(changes, budget)
+        if len(changes) > _CARD_MAX_FILES:
+            budget.truncated = True
+    elif isinstance(changes, list):
         for change in changes[:_CARD_MAX_FILES]:
             if not isinstance(change, dict):
-                files.append({"raw": budget.take(_canonical_json(change))})
+                blob = _canonical_json(change)
+                entry = {"raw": budget.take(blob)}
+                if not for_storage:
+                    entry["truncated"] = len(entry["raw"]) != len(blob)
+                files.append(entry)
                 continue
             entry: dict[str, Any] = {}
+            entry_cut = False
             for key in ("path", "move_path", "status"):
                 if isinstance(change.get(key), str):
                     entry[key] = budget.take(change[key])
+                    entry_cut = entry_cut or len(entry[key]) != len(change[key])
             if isinstance(change.get("unified_diff"), str):
                 entry["unified_diff"] = budget.take(change["unified_diff"])
+                entry_cut = entry_cut or (
+                    len(entry["unified_diff"]) != len(change["unified_diff"]))
+                # The provider transmitted this one; the card must not claim a
+                # synthesized diff and a retained diff are the same thing.
+                # Read time ONLY: this is an added field, and adding it to the
+                # stored card would grow `detail_json` for newly ingested rows
+                # while historical rows kept their old estimates, which is
+                # precisely the page-boundary drift spec section 3.0 forbids.
+                if not for_storage:
+                    entry["diff_source"] = "retained"
             unknown = {key: value for key, value in change.items()
                        if key not in {"path", "move_path", "status", "unified_diff"}}
             if unknown:
-                entry["raw_extra"] = budget.take(_canonical_json(unknown))
+                blob = _canonical_json(unknown)
+                entry["raw_extra"] = budget.take(blob)
+                entry_cut = entry_cut or len(entry["raw_extra"]) != len(blob)
+            # Per-file `truncated` on EVERY entry (spec section 3.1), read time
+            # only for the same reason `diff_source` is.
+            if not for_storage:
+                entry["truncated"] = entry_cut
             files.append(entry)
         if len(changes) > _CARD_MAX_FILES:
             budget.truncated = True
     elif "changes" in payload:
-        files.append({"raw": budget.take(_canonical_json(changes))})
-    stdout = budget.take(payload["stdout"]) if isinstance(payload.get("stdout"), str) else None
-    stderr = budget.take(payload["stderr"]) if isinstance(payload.get("stderr"), str) else None
+        blob = _canonical_json(changes)
+        entry = {"raw": budget.take(blob)}
+        if not for_storage:
+            entry["truncated"] = len(entry["raw"]) != len(blob)
+        files.append(entry)
+    if not streams_taken:
+        stdout = (budget.take(payload["stdout"])
+                  if isinstance(payload.get("stdout"), str) else None)
+        stderr = (budget.take(payload["stderr"])
+                  if isinstance(payload.get("stderr"), str) else None)
     status = payload.get("status") if isinstance(payload.get("status"), str) else "unknown"
     success = payload.get("success") if isinstance(payload.get("success"), bool) else None
     return {
         "schema_version": CODEX_CARD_SCHEMA_VERSION,
         "type": "patch", "source": "patch_apply_end",
         "files": files,
-        "has_diff": any(isinstance(entry.get("unified_diff"), str) for entry in files),
+        # RENDERABLE, not merely present (spec section 3.1). An entry whose clip
+        # kept nothing a hunk can render publishes no `unified_diff` at all, and
+        # a provider that transmits an empty one must not flip this to true.
+        "has_diff": any(entry.get("unified_diff") for entry in files),
         "status": status, "success": success, "stdout": stdout, "stderr": stderr,
         "truncated": budget.truncated,
     }
+
+
+# ── the external-agent marker (F9, spec section 5.5) ─────────────────────────
+#
+# Anchored at the start of a line. The name is 1-128 characters excluding `]` and
+# newline; the next line must open with `input: ` and carry a JSON value.
+# Validation is all-or-nothing: a name that does not match, an absent `input:`
+# line, or JSON that does not parse leaves the block as ordinary prose.
+_EXTERNAL_CALL_RE = re.compile(
+    r"^\[external_agent_tool_call: ([^\]\n]{1,128})\]\n", re.MULTILINE)
+_EXTERNAL_CALL_INPUT = "input: "
+
+
+def _inside_fenced_block(text: str, position: int) -> bool:
+    """True when ``position`` falls inside an open Markdown fence.
+
+    A marker inside a fenced code block is authored content — someone writing
+    ABOUT the grammar — rather than a serialized call, so it must stay prose.
+    Same toggle rule `_segment_harness_markers` already uses.
+    """
+    fence: str | None = None
+    for line in text[:position].splitlines():
+        opened = re.match(r"\s*(`{3,}|~{3,})", line)
+        if opened is None:
+            continue
+        char = opened.group(1)[0]
+        if fence is None:
+            fence = char
+        elif fence == char:
+            fence = None
+    return fence is not None
+
+
+def _external_call_from_text(
+    text: str, *, text_cap: int = CODEX_TEXT_CAP,
+) -> dict | None:
+    """The `external_agent_tool_call` marker on an assistant row, or ``None``.
+
+    This runs at READ time over the row's stored text and needs no payload load,
+    which is the only way it can reach the data it targets: all 3,789 markers are
+    historical, dated 2026-07-11 across 46 conversations, and the grammar has not
+    recurred — so an ingest-time implementation would detect nothing at all and
+    would ship as a no-op against the only rows it exists for.
+
+    The caller writes this to ``detail.external_call`` and must NEVER write it to
+    ``detail.markers``, because that key selects which rows the export path
+    hydrates and 729 assistant rows already carry it.
+
+    ``span`` is the half-open ``[start, end)`` character range of the marker run
+    the card consumed, measured in the SAME string this was handed — which is the
+    string the caller serves as ``block["text"]``. The export keeps that prose
+    verbatim and its bytes are frozen, so the client has no other way to locate
+    what the card already renders, and without the span the viewer would show the
+    marker twice. The range covers the ``[external_agent_tool_call: …]`` line,
+    the ``input:`` line and the JSON value, plus one immediately following
+    newline when there is one, so removing it leaves no orphaned blank line.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    if len(text) > _CARD_HARNESS_PARSE_CAP:
+        return None
+    match = _EXTERNAL_CALL_RE.search(text)
+    if match is None:
+        return None
+    if _inside_fenced_block(text, match.start()):
+        return None
+    rest = text[match.end():]
+    if not rest.startswith(_EXTERNAL_CALL_INPUT):
+        return None
+    try:
+        value, end = json.JSONDecoder().raw_decode(rest, len(_EXTERNAL_CALL_INPUT))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    start = match.start()
+    end += match.end()
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    if not 0 <= start < end <= len(text):
+        # Fail closed. A span that does not resolve is worse than no card: the
+        # client would hide the wrong run of text, or none at all.
+        return None
+    budget = _TextBudget(text_cap)
+    return {
+        "schema_version": CODEX_CARD_SCHEMA_VERSION,
+        "name": budget.take(match.group(1)),
+        "input": _bounded_json(value, budget),
+        "truncated": budget.truncated,
+        "span": [start, end],
+    }
+
+
+def external_call_span_resolves(text: Any, external: Any) -> bool:
+    """True iff ``external``'s span addresses its own marker inside ``text``.
+
+    The assembler calls this against the exact string it is about to serve as
+    ``block["text"]``, and withholds the card when it returns False. That is the
+    fail-closed half of the span contract: a marker the served text does not
+    wholly contain — because the row's text was capped at ingest, or because a
+    later stage replaced it — yields no ``external_call`` at all rather than a
+    span pointing at the wrong characters.
+    """
+    if not isinstance(text, str) or not isinstance(external, dict):
+        return False
+    span = external.get("span")
+    if not isinstance(span, list) or len(span) != 2:
+        return False
+    start, end = span
+    for bound in (start, end):
+        if not isinstance(bound, int) or isinstance(bound, bool):
+            return False
+    if not 0 <= start < end <= len(text):
+        return False
+    return text[start:end].startswith("[external_agent_tool_call: ")
 
 
 @dataclasses.dataclass
@@ -1242,15 +1982,22 @@ def _extract(record_type: str | None, payload: dict) -> _Extracted | None:
                 args = _stringify(payload.get("input") or payload.get("arguments"))
             text = f"{name}\n{args}" if args else str(name)
             detail = {"name": name, "args": args[:CODEX_TEXT_CAP]}
-            card = decode_tool_call_card(payload)
+            # Frozen v1 projection at ingest (spec section 3.0) — see the
+            # `for_storage` note on `decode_tool_output_card` above.
+            card = decode_tool_call_card(payload, for_storage=True)
             if card is None:
-                card = decode_secondary_tool_call_card(payload)
+                card = decode_secondary_tool_call_card(payload, for_storage=True)
             if card is not None:
                 detail["card"] = card
             return _Extracted("tool_call", text, "search_tool", detail, [])
         if ptype in _RESPONSE_TOOL_OUTPUTS:
             value = payload["output"] if "output" in payload else payload.get("tools")
-            shaped = decode_tool_output_card(payload)
+            # `for_storage=True`: the stored card is the FROZEN v1 projection
+            # (spec section 3.0). Every S3 enrichment is computed at read time,
+            # because `detail_json` bytes feed `_row_source_bytes` and therefore
+            # page boundaries, and a richer stored card would paginate a newly
+            # ingested conversation differently from an identical historical one.
+            shaped = decode_tool_output_card(payload, for_storage=True)
             if shaped is not None:
                 card, _display_body = shaped
                 return _Extracted(
@@ -1287,7 +2034,9 @@ def _extract(record_type: str | None, payload: dict) -> _Extracted | None:
             detail = {"event": ptype}
             if ptype in {"task_started", "task_complete"}:
                 detail.update(_lifecycle_projection(payload))
-            patch_card = decode_patch_event_card(payload)
+            # Frozen v1 projection at ingest (spec section 3.0) — see the
+            # `for_storage` note on `decode_tool_output_card` above.
+            patch_card = decode_patch_event_card(payload, for_storage=True)
             card = patch_card or decode_secondary_event_card(payload)
             if card is not None:
                 detail["card"] = card
@@ -1304,13 +2053,8 @@ def _event_card(ptype: str, payload: dict) -> tuple[str, list[tuple[str, str]]]:
         text = " ".join(p for p in ("task_complete", _stringify(
             payload.get("last_agent_message"))) if p)
     elif ptype == "patch_apply_end":
-        paths = []
-        changes = payload.get("changes")
-        if isinstance(changes, list):
-            for change in changes:
-                if isinstance(change, dict) and isinstance(change.get("path"), str):
-                    paths.append(change["path"])
-                    touches.append((change["path"], "apply_patch"))
+        paths = codex_patch_file_paths(payload)
+        touches.extend((path, "apply_patch") for path in paths)
         text = " ".join(["patch_apply", *paths]) if paths else "patch_apply"
     elif ptype == "mcp_tool_call_end":
         invocation = payload.get("invocation")
@@ -1326,6 +2070,32 @@ def _event_card(ptype: str, payload: dict) -> tuple[str, list[tuple[str, str]]]:
     else:  # task_started, context_compacted
         text = ptype
     return text, touches
+
+
+def codex_patch_file_paths(payload: Any) -> list[str]:
+    """Return provider-ordered file paths from one patch completion.
+
+    Current Codex emits ``changes`` as an object keyed by path; the legacy list
+    shape carries the path on each entry. Only object-valued change entries are
+    touches in either shape, matching the read-time patch derivation contract.
+    """
+    if not isinstance(payload, dict) or payload.get("type") != "patch_apply_end":
+        return []
+    changes = payload.get("changes")
+    if isinstance(changes, dict):
+        items = changes.items()
+    elif isinstance(changes, list):
+        items = (
+            (change.get("path"), change)
+            for change in changes
+            if isinstance(change, dict)
+        )
+    else:
+        return []
+    return [
+        path for path, change in items
+        if isinstance(path, str) and isinstance(change, dict)
+    ]
 
 
 def infer_codex_event_turns(

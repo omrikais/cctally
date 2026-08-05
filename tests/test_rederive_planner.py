@@ -426,8 +426,14 @@ def test_wrong_snapshot_is_superseded_and_applied_plan_is_noop(
         journal_runtime.append_record(record, now_utc=fixed)
     live_path = tmp_path / "live-rebuilt.db"
     independent_path = tmp_path / "independent-rebuilt.db"
-    journal_runtime.rebuild_stats_index(target_path=str(live_path))
-    journal_runtime.rebuild_stats_index(target_path=str(independent_path))
+    journal_runtime.rebuild_stats_index(
+        context=journal_runtime.RebuildContext(trigger="test-fixture"),
+        target_path=str(live_path),
+    )
+    journal_runtime.rebuild_stats_index(
+        context=journal_runtime.RebuildContext(trigger="test-fixture"),
+        target_path=str(independent_path),
+    )
     live = mod.open_db(_target_path=str(live_path))
     independent = mod.open_db(_target_path=str(independent_path))
     try:

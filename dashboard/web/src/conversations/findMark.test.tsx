@@ -3,6 +3,7 @@ import { render } from '@testing-library/react';
 import {
   splitByTerms, splitByRegex, buildSplit, applyMarksToHast,
   splitToReactNodes, markRectClipped, firstLandableMark, applyCurrentMark,
+  splitToExactNodes, applyCurrentOccurrence,
 } from './findMark';
 import type { Root } from 'hast';
 
@@ -88,6 +89,32 @@ describe('splitToReactNodes', () => {
     const { container } = render(<>{splitToReactNodes('hello', split)}</>);
     expect(container.querySelector('mark')?.textContent).toBe('ell');
     expect(container.textContent).toBe('hello');
+  });
+});
+
+describe('occurrence-exact fragments', () => {
+  it('groups coordinated leaf fragments under one occurrence identity', () => {
+    const fragment = (leafKey: string) => [{
+      occurrenceId: 'o1.abc', leafKey, start: 0, end: 1, current: true,
+    }];
+    const { container } = render(<>{
+      splitToExactNodes('a', fragment('t0'))
+    }<strong>{splitToExactNodes('b', fragment('t1'))}</strong>{
+      splitToExactNodes('c', fragment('t2'))
+    }</>);
+    const marks = container.querySelectorAll('mark[data-find-occurrence-id="o1.abc"]');
+    expect(marks).toHaveLength(3);
+    expect(Array.from(marks).map((mark) => mark.textContent)).toEqual(['a', 'b', 'c']);
+    expect(Array.from(marks).every((mark) => mark.hasAttribute('data-find-current'))).toBe(true);
+  });
+
+  it('moves current state for the whole occurrence group', () => {
+    const root = document.createElement('div');
+    root.innerHTML = '<mark data-find-occurrence-id="a"></mark><mark data-find-occurrence-id="b"></mark><mark data-find-occurrence-id="b"></mark>';
+    const current = applyCurrentOccurrence(root, 'b');
+    expect(current).toHaveLength(2);
+    expect(current.every((mark) => mark.hasAttribute('data-find-current'))).toBe(true);
+    expect(root.querySelector('[data-find-occurrence-id="a"]')?.hasAttribute('data-find-current')).toBe(false);
   });
 });
 

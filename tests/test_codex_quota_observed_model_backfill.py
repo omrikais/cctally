@@ -218,10 +218,14 @@ def test_backfill_is_idempotent(tmp_path, monkeypatch):
     try:
         _seed_mixed_store(conn)
         handler = _handler(db)
+        seq_before = _mutation_seq(conn)
         handler(conn)
         once = _stored_models(conn)
+        seq_after_change = _mutation_seq(conn)
+        assert seq_after_change == seq_before + 1
         handler(conn)
         assert _stored_models(conn) == once
+        assert _mutation_seq(conn) == seq_after_change
     finally:
         conn.close()
 

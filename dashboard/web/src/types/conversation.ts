@@ -156,6 +156,13 @@ export interface OutlineTurn {
   model?: string;
   tokens?: TokenUsage;
   tools?: OutlineToolRef[];
+  // #463 S4 §4.4 — the two facts dedupe destroys. `tools` is deduplicated by
+  // name because a Codex turn can carry 523 calls, which makes `tools.length`
+  // no longer the call count and moves the first entry carrying `is_error` away
+  // from the first call that actually failed. Consumers that need either read
+  // these instead. Absent on a turn with no calls.
+  tool_call_count?: number;
+  first_failure_name?: string | null;
   thinking?: string[];
   meta_kind?: 'skill' | 'command' | 'context' | 'compaction' | 'notification';
   skill_name?: string | null;
@@ -173,10 +180,37 @@ export interface CacheRebuild {
   tokens_recreated: number;
   est_wasted_usd: number;  // display-only marginal cost
 }
+// #463 S4 §3.2 — tier 2. A landmark is a place inside a turn worth reaching:
+// an authored reasoning heading, a failing tool call, or a plan call. It is
+// deliberately NOT one entry per tool call, because a 523-call turn would
+// contribute 523 rows, which is noise rather than navigation.
+export type OutlineLandmarkKind = 'reasoning' | 'tool_error' | 'plan';
+export interface OutlineLandmark {
+  // Stable identity, `<block_key>#<discriminator>` — a heading's zero-based
+  // ordinal, or the kind. `block_key` alone collides: one reasoning block
+  // yields several headings, and one failing plan call is two landmarks.
+  landmark_key: string;
+  block_key: string;
+  // The SEGMENT that contains the landmark, which is what a jump loads. A turn
+  // key would land on segment 0, and S1 defined that as the start of a turn
+  // whose failure may be fifteen segments later.
+  uuid: string;
+  // The owning tier-1 turn, which drives both the indentation and the §1.3
+  // retention rule. `segmentIndex` cannot supply it — it is built from
+  // SURVIVING turns' segment keys and is empty on real Codex data.
+  parent_uuid: string;
+  kind: OutlineLandmarkKind;
+  label: string;
+  ts: string | null;
+}
 export interface OutlineStats {
   turns: { total: number; human: number; assistant: number; tool_result: number; meta: number };
   tool_counts: Record<string, number>;
-  error_count: number;
+  // #463 S4 D3 — NULLABLE, following `duration_seconds` on this same object. A
+  // conversation whose retained event payloads are gone has outcome-bearing
+  // rows and no verdict on any of them, and rendering 0 there would assert an
+  // absence nobody proved.
+  error_count: number | null;
   models: Record<string, number>;
   duration_seconds: number | null;
   tokens: TokenUsage;
@@ -198,10 +232,19 @@ export interface OutlineStats {
 // `del` are integers when the stat is known (stamped edit_stat or recomputed),
 // else null — the touch is STILL listed (Codex P1-7). `tool_use_id` is carried
 // for a future precise-diff scroll; `uuid` is the turn anchor (the jump target).
+// #463 S4 §6.6 — the op vocabulary spans two providers. Claude touches carry
+// the edit-family TOOL (`edit`/`multiedit`/`write`); a Codex touch carries the
+// raw CHANGE KIND the patch payload stated — `add`/`delete`/`update` from the
+// dict shape and `modified` from the list one — and `null` when the provider
+// stated neither, which the server publishes rather than guessing.
+export type OutlineFileOp =
+  | 'edit' | 'multiedit' | 'write'
+  | 'add' | 'delete' | 'update' | 'modified'
+  | null;
 export interface OutlineFileTouch {
   uuid: string;
   tool_use_id: string | null;
-  op: 'edit' | 'multiedit' | 'write';
+  op: OutlineFileOp;
   add: number | null;
   del: number | null;
 }
@@ -251,6 +294,11 @@ export interface ConversationOutline {
   // Present from a current server; optional for back-compat with an older one.
   task_completion?: OutlineTaskCompletion | null;
   turns: OutlineTurn[];
+  // #463 S4 §3.3 — tier 2, deliberately a SEPARATE array. `stats.turns.*` is
+  // derived by filtering `turns` on kind, so folding landmarks in would inflate
+  // counts meant to describe the conversation's structure. Codex-only; the
+  // client tolerates its absence, which is what keeps Claude unchanged.
+  landmarks?: OutlineLandmark[];
   // #463 S1 — document position of every addressable key (turn key, folded
   // member key, segment key) over the FULL wire turn list. `turns` above is the
   // NAVIGATION subset: the qualified adapter drops meta turns and event-bearing
@@ -296,13 +344,37 @@ export interface NativeTerminalOutput {
   is_error: boolean;
   parts: { type: 'text' | 'raw'; stream: 'stdout' | 'stderr' | 'output'; text: string }[];
   truncated: boolean;
+  // #463 S3 §4.3 — recovered from the harness preamble. Optional here rather
+  // than required: a server that predates S3 publishes neither, and absence
+  // must degrade to today's rendering instead of asserting a null value the
+  // server never claimed.
+  exit_code?: number | null;
+  wall_time_seconds?: number | null;
 }
 
-export interface NativePatchFile {
+// #463 S3 — a call-side `apply_patch` entry is a file LIST, not a diff. The
+// wire contract (§3.5) states it carries no `unified_diff`, no `diff_source`
+// and no per-file `truncated`, so it gets its own narrower type: sharing one
+// type with the event family would let a renderer read a diff key off an entry
+// that structurally cannot have one.
+export interface NativePatchRequestFile {
   path?: string;
   move_path?: string;
   status?: string;
+}
+
+// The event-side (`patch_apply_end`) entry family. `truncated` means THIS
+// FILE's own text was cut, independently of the card-level `truncated`; it may
+// be absent on an entry from a pre-S3 server and reads as false. `truncated`
+// true with no `unified_diff` is a real state and means "there is a diff and
+// none of it survived the budget" (wire contract §4).
+export interface NativePatchFile extends NativePatchRequestFile {
+  truncated?: boolean;
   unified_diff?: string;
+  // 'retained' = the provider transmitted the diff; 'derived' = the server
+  // synthesized it from retained file content. A derived diff must never be
+  // presented as provider-supplied.
+  diff_source?: 'retained' | 'derived';
   raw?: string;
   raw_extra?: string;
 }
@@ -330,6 +402,39 @@ export type NativeAgentOperation =
   | 'followup_task'
   | 'interrupt_agent';
 
+// #463 S3 §3.3 — one `program` card entry, discriminated on `kind`. `session`
+// repeats a `session_ref` card's fields minus the envelope; `other` names a
+// tool the scanner located but whose arguments the closed literal parser
+// declined, so the card claims nothing about what it was given.
+export type NativeProgramInvocation =
+  | { kind: 'command'; command: string; workdir: string | null; metadata: Record<string, unknown> }
+  | { kind: 'session'; scope: 'shell' | 'cell'; ref: string | null; operation: 'write' | 'poll'; chars: string | null }
+  | { kind: 'other'; name: string };
+
+// #463 S3 §3.2 — the conversation-scoped shell-session index published beside
+// `items`. Keyed by the ordinal in decimal, which is exactly what a
+// `session_ref` card's `ref` carries at `shell` scope, so a reference resolves
+// by direct lookup and never by a scan. Ordinals are assigned server-side over
+// the whole conversation: the client never computes uniqueness, ordering or
+// shortening from a loaded window.
+export interface ConversationSessionIndex {
+  sessions: Record<string, { ordinal: number; opener_block_key: string | null }>;
+  // true when the conversation held more sessions than the server's index cap.
+  // A missing entry then means "not loaded", NOT "absent" — the two must stay
+  // distinguishable in the UI.
+  truncated: boolean;
+}
+
+// #463 S3 §5.1 — evidence-based result state for a Codex tool call, derived
+// client-side from the result-side `terminal_output` card and published
+// independently of whether the CALL side validated as a native card. There is
+// no `outcome` object on the wire.
+export interface ToolOutcome {
+  status: 'completed' | 'failed' | 'running' | 'unknown';
+  exit_code: number | null;
+  wall_time_seconds: number | null;
+}
+
 export type NativeToolCard =
   | {
       schema_version: 1;
@@ -346,7 +451,7 @@ export type NativeToolCard =
       status: string;
       files: NativePatchFile[];
       patch?: string;
-      request_files?: NativePatchFile[];
+      request_files?: NativePatchRequestFile[];
       success?: boolean | null;
       stdout?: string | null;
       stderr?: string | null;
@@ -407,6 +512,39 @@ export type NativeToolCard =
         role?: string;
         nickname?: string;
       };
+    }
+  // #463 S3 §3.3 — a JavaScript program rather than the strict command chain.
+  // `complete: false` means the scanner located these invocations and the body
+  // also contains statements it did not read, so the listed invocations are
+  // NEVER the whole program.
+  | {
+      schema_version: 1;
+      type: 'program';
+      title: string | null;
+      complete: boolean;
+      invocations: NativeProgramInvocation[];
+      truncated: boolean;
+    }
+  // #463 S3 §3.2 — a `write_stdin` (shell) or `wait` (cell) reference. The two
+  // namespaces have zero overlapping values: a cell reference is never a shell
+  // session, is never rendered with the session badge, and is never grouped by.
+  // `ref` null at `shell` scope renders NO badge — the server has no ordinal to
+  // publish and the client must never invent one.
+  | {
+      schema_version: 1;
+      type: 'session_ref';
+      scope: 'shell' | 'cell';
+      ref: string | null;
+      operation: 'write' | 'poll';
+      chars: string | null;
+      truncated: boolean;
+    }
+  | {
+      schema_version: 1;
+      type: 'tool_search';
+      query: string;
+      limit: number | null;
+      truncated?: boolean;
     };
 
 export type ConversationBlock =
@@ -430,6 +568,11 @@ export type ConversationBlock =
       // could not read the retained payload, in which case the reader falls back
       // to `summary`/`title` exactly as before.
       headings?: { key: string; text: string }[];
+      // #463 S4 F-A — the physical row's own key, retained so a tier-2 jump can
+      // address this block in the DOM, and so occurrence-exact find can name the
+      // container a fragment lives in. Codex only: the Claude projection
+      // publishes no block keys, so the anchor wrapper is never rendered there.
+      block_key?: string;
     }
   | {
       kind: 'system_actions';
@@ -475,6 +618,12 @@ export type ConversationBlock =
       edit_stat?: { add: number; del: number };
       preview: string;
       tool_use_id: string | null;
+      // #463 S4 F-A — the physical row's own key, retained so a tier-2 jump can
+      // address this block in the DOM, and so occurrence-exact find can name the
+      // container a fragment lives in. Codex only: the Claude projection
+      // publishes no block keys, so the anchor wrapper is never rendered there.
+      block_key?: string;
+
       // Qualified Codex blocks can always re-read their call/output through the
       // opaque block_key payload route, even when the bounded detail projection
       // does not claim truncation.
@@ -483,6 +632,13 @@ export type ConversationBlock =
       // name remains unchanged (`exec`, `apply_patch`, `patch_apply_end`); this
       // additive shape selects presentation without relabelling the record.
       native_card?: NativeToolCard;
+      // #463 S3 §5.1 — the result-side structure, published INDEPENDENTLY of
+      // whether the call side validated as a native card, and gated on
+      // `source === 'codex'`. `native_card` keeps its meaning as a validated
+      // CALL-side structure; this is a separate additive channel, so nothing
+      // reading `native_card` changes behavior. Absent for Claude and for a
+      // Codex call whose result carried no readable `terminal_output` card.
+      outcome?: ToolOutcome;
       payload_kind?: 'call' | 'event';
       // #177 S4 — `media` (tool-result media placeholders, render-ready) folds
       // into the result object on owned calls; absent when the result carried
@@ -532,11 +688,23 @@ export type ConversationBlock =
   // tool_result ITEM (a result the kernel could not fold into a request).
   // #177 S4 — orphan results keep `tool_use_id` + `media` so their screenshots
   // still render (the kernel surfaces media on the standalone result block).
-  | { kind: 'tool_result'; text: string; truncated: boolean; is_error: boolean; tool_use_id?: string | null; media?: MediaRef[] }
+  // #463 S4 remediation C-4 — `block_key` is the row's own jump address. An
+  // unfolded failing `tool_output` is its own group head and therefore its own
+  // `tool_error` landmark, so the outline publishes that key as the address a
+  // jump aligns; without it on the block the chip rendered no `data-block-key`
+  // and the landmark named nothing in the DOM.
+  | { kind: 'tool_result'; text: string; truncated: boolean; is_error: boolean; tool_use_id?: string | null; media?: MediaRef[]; block_key?: string }
   // #177 S4 — `index` is the ingest-stamped media ordinal (the uuid-mode route
   // address); absent on pre-reingest rows → the figure degrades to the badge.
   | { kind: 'image'; media_type: string | null; bytes: number; index?: number }
   | { kind: 'document'; media_type: string | null; bytes: number; index?: number }
+  // #463 S3 §5.5 — the external-agent marker, detected server-side at read time
+  // over an assistant row's stored text. It is NOT a tool_call: it never enters
+  // chips, filters, the Files tab or the outline. The raw marker prose stays in
+  // the row's `text` (the export bytes are frozen), so the adapter removes the
+  // server-published span from the prose block it emits alongside this one —
+  // otherwise the reader would see the marker twice.
+  | { kind: 'external_call'; name: string; input: unknown; truncated: boolean; block_key?: string }
   | { kind: 'tool_reference'; name: string | null };
 
 export interface ConversationSummary {
@@ -648,6 +816,10 @@ export interface ConversationDetail {
   // bin/_lib_conversation_query.py::get_conversation.
   page: { next_after: number | string | null; has_more: boolean; prev_before?: number | string | null; has_prev?: boolean };
   subagent_meta?: Record<string, SubagentMeta>;  // keyed by subagent_key (#166)
+  // #463 S3 §3.2 — whole-conversation shell-session index, re-sent on every
+  // page like `subagent_meta`. Absent from a server that predates S3 and from
+  // every Claude response, in which case no session badge renders at all.
+  session_index?: ConversationSessionIndex;
   // jump-to-latest spec §3 — the conversation's final RENDERED turn (the last
   // grouped/deduped item, not the last raw JSONL row). Constructed explicitly by
   // the server with the request session_id (the assembled item's anchor carries a
@@ -725,10 +897,101 @@ export interface ConversationJump {
   // other jump (search-hit click, outline jump, jump-to-next): the reader's
   // jump effect only expands when this is truthy.
   expand_details?: boolean;
+  // #463 S4 F-A — the addressable element INSIDE the loaded item that this jump
+  // is really about: a landmark's rendered block (`data-block-key`) or one
+  // decomposed reasoning heading (`data-heading-key`). Absent on every jump
+  // whose target is a whole turn, and a key that resolves to nothing degrades to
+  // aligning the item, which is the pre-S4 landing.
+  inner_anchor_key?: string;
+  find_occurrence?: FindOccurrence;
 }
 
 export function conversationJumpRef(jump: ConversationJump): ConversationRef {
   return jump.conversation_ref ?? legacyClaudeConversationRef(jump.session_id);
+}
+
+// #463 S4 remediation round 3 — the ONE place a jump payload is constructed.
+//
+// The rule this work established is that the rail row, the cluster chip and the
+// reader key must send an IDENTICAL payload for the same target, and until now
+// three literal object constructions held that rule up with a three-way equality
+// test as the only guard. A fourth field would have had to be threaded to three
+// places again, and the round that added `inner_anchor_key` reached two of them
+// and left the third — which is the defect the browser gate found.
+//
+// Round 4 completed the sweep: the rail's search-hit row, the comparison view's
+// open-in-reader action and the find bar were still writing their own literals,
+// so the guarantee this builder exists to provide did not hold and both the
+// comment here and `docs/dashboard-gotchas.md` asserted an absolute that was
+// false. `jumpConstruction.test.ts` is the static scan that now backs it: no
+// production source file outside this one may write a jump object literal.
+//
+// Round 5 — the scan's exact reach is documented in its own header, and it is
+// not total. It catches a `jump:` literal (including one whose brace is on a
+// later line), a typed `: ConversationJump = {` local, any `as`/`satisfies
+// ConversationJump` assertion, and a local named `jump` holding an object
+// literal, all after stripping comments. It cannot catch a literal bound to a
+// differently-named variable and passed as `jump: thatName`. Payload assertions
+// at the dispatch sites (`ConversationRail.test.tsx`, `ComparisonView.test.tsx`)
+// pin what this builder actually produces, so changing a default below reddens
+// a test rather than silently changing a jump.
+//
+// The builder lives beside the interface so the field list and the construction
+// of it cannot drift. `qualified` stays a caller decision rather than being
+// derived from the ref: a bare Claude session id opened through the legacy path
+// must keep sending `session_id` alone, and only the caller knows which form its
+// own input took.
+//
+// Round 7 — the three optional inputs are ONE OPTIONS OBJECT rather than
+// positional parameters 4-6, because they do not share an omission rule and the
+// positional form hid that. `innerAnchorKey` and `findOccurrence` are gated on
+// being TRUTHY; `expandDetails` is gated on being SUPPLIED. Positionally, a
+// caller wanting only an occurrence had to write
+// `(ref, uuid, qualified, null, undefined, occ)`, and writing `false` in that
+// fifth slot instead of `undefined` silently added `expand_details: false` to
+// the payload — TypeScript accepts both, and the two spellings differ only in a
+// key the reader reads for truthiness. Named, each rule is visible where it is
+// used and an absent option is written by being absent. The three gates
+// themselves are unchanged, so every payload is byte-identical to the positional
+// form; `conversationJump.test.ts` proves that against a verbatim copy of the
+// pre-round-7 builder for all fifteen production call-site shapes, and asserts
+// the exact KEY SET each option combination produces so a future divergence
+// reddens a test.
+//
+// Why the two gates differ: an anchor key is an address, so an empty one is an
+// absent one, and an occurrence is a whole object. `expand_details` is a boolean
+// the find bar has always written on every jump it issues, including as `false`,
+// and omitting the key there would change a payload three tests assert
+// byte-for-byte while changing no behavior. Supplying no option at all still
+// omits every key, so a caller that passes nothing is unchanged.
+//
+// `findOccurrence` arrived on `main` with occurrence-exact find (#463 S4 merge).
+// It was introduced as a literal `jump: { … find_occurrence }` in the find bar,
+// written before this builder existed on that branch; routing it through the
+// builder here is what keeps `jumpConstruction.test.ts` true rather than making
+// the find bar the one production exception to it.
+export interface ConversationJumpOptions {
+  /** Omitted from the payload when falsy — an empty address is no address. */
+  innerAnchorKey?: string | null;
+  /** Omitted only when NOT SUPPLIED; an explicit `false` IS emitted. */
+  expandDetails?: boolean;
+  /** Omitted from the payload when falsy. */
+  findOccurrence?: FindOccurrence | null;
+}
+
+export function buildConversationJump(
+  ref: ConversationRef, uuid: string, qualified: boolean,
+  options: ConversationJumpOptions = {},
+): ConversationJump {
+  const { innerAnchorKey, expandDetails, findOccurrence } = options;
+  return {
+    ...(qualified ? { conversation_ref: ref } : {}),
+    session_id: ref.key,
+    uuid,
+    ...(innerAnchorKey ? { inner_anchor_key: innerAnchorKey } : {}),
+    ...(expandDetails === undefined ? {} : { expand_details: expandDetails }),
+    ...(findOccurrence ? { find_occurrence: findOccurrence } : {}),
+  };
 }
 
 // #177 S6 — one rendered-turn anchor for the in-conversation find bar.
@@ -747,7 +1010,7 @@ export interface FindAnchor {
 // caps at 500 with `anchors_truncated: true`). `search_depth` mirrors the
 // rail search interim signal (tools/thinking facets return empty anchors
 // while 'prose-only').
-export interface ConversationFindResult {
+export interface LegacyConversationFindResult {
   anchors: FindAnchor[];
   total: number;
   anchors_truncated: boolean;
@@ -756,6 +1019,44 @@ export interface ConversationFindResult {
   mode: 'fts' | 'like' | 'regex';
   search_depth: 'prose-only' | 'full';
 }
+
+export interface FindFragment {
+  leaf_key: string;
+  start: number;
+  end: number;
+}
+
+export interface FindOccurrence {
+  occurrence_id: string;
+  item_key: string;
+  uuid: string;
+  block_key: string;
+  container_block_key: string;
+  surface: 'body' | 'call' | 'output' | 'completion';
+  match_kinds: ('tool' | 'thinking')[];
+  disclosure: string[];
+  fragments: FindFragment[];
+}
+
+export interface OccurrenceFindResult {
+  schema_version: 2;
+  semantics: 'occurrence';
+  status: 'ready' | 'indexing';
+  query_id: string;
+  total?: number;
+  selection_stale: boolean;
+  mode: 'literal' | 'regex';
+  kind: string;
+  search_depth: 'prose-only' | 'full';
+  page: {
+    start_index: number;
+    previous_cursor: string | null;
+    next_cursor: string | null;
+    occurrences: FindOccurrence[];
+  };
+}
+
+export type ConversationFindResult = LegacyConversationFindResult | OccurrenceFindResult;
 
 // #178 on-demand "load full" route response, discriminated on `which` (spec
 // §4.4 / §4.6). Bound field-for-field to read_full_payload in
@@ -819,6 +1120,7 @@ export type ConversationSource = 'claude' | 'codex';
 export interface ConversationRef {
   source: ConversationSource;
   key: string;
+  account_key?: string;
 }
 export type ConversationRefInput = ConversationRef | string;
 
@@ -827,7 +1129,9 @@ export function isConversationRef(value: unknown): value is ConversationRef {
   const ref = value as Record<string, unknown>;
   return (ref.source === 'claude' || ref.source === 'codex')
     && typeof ref.key === 'string'
-    && ref.key.length > 0;
+    && ref.key.length > 0
+    && (ref.account_key === undefined
+      || (typeof ref.account_key === 'string' && ref.account_key.length > 0));
 }
 
 export function legacyClaudeConversationRef(sessionId: string): ConversationRef {
@@ -849,14 +1153,18 @@ export function isQualifiedConversationRef(ref: ConversationRefInput): boolean {
 // that would collide under delimiter concatenation.
 export function conversationRefKey(ref: ConversationRefInput): string {
   const normalized = normalizeConversationRef(ref);
-  return JSON.stringify([normalized.source, normalized.key]);
+  return normalized.account_key === undefined
+    ? JSON.stringify([normalized.source, normalized.key])
+    : JSON.stringify([normalized.source, normalized.key, normalized.account_key]);
 }
 
 export function parseConversationRefKey(value: string): ConversationRef | null {
   try {
     const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed) || parsed.length !== 2) return null;
-    const ref = { source: parsed[0], key: parsed[1] };
+    if (!Array.isArray(parsed) || (parsed.length !== 2 && parsed.length !== 3)) return null;
+    const ref = parsed.length === 2
+      ? { source: parsed[0], key: parsed[1] }
+      : { source: parsed[0], key: parsed[1], account_key: parsed[2] };
     return isConversationRef(ref) ? ref : null;
   } catch {
     return null;

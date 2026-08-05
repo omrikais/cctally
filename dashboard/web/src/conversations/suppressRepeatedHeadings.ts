@@ -43,28 +43,57 @@ import type { ConversationItem } from '../types/conversation';
 // the corpus carries a body at all, so two occurrences of one heading text are
 // indistinguishable in the rendered output.
 //
-// This is a RENDER-LAYER rule. The server still publishes every heading, so
-// #482's exact-find addressing continues to see them all and the wire stays
-// additive.
+// This is a RENDER-LAYER rule for the conversation envelope. The #482 find
+// projector independently applies the same turn-scoped rule so it cannot
+// return an occurrence the reader deliberately omits. The wire stays additive:
+// the envelope still publishes every heading for legacy and outline consumers.
 export function suppressedHeadingKeys(items: readonly ConversationItem[]): Set<string> {
-  const suppressed = new Set<string>();
-  const seenByTurn = new Map<string, Set<string>>();
+  const occurrences: HeadingOccurrence[] = [];
   for (const item of items) {
     const turn = item.turn_uuid ?? item.anchor.uuid;
-    let seen = seenByTurn.get(turn);
-    if (!seen) {
-      seen = new Set<string>();
-      seenByTurn.set(turn, seen);
-    }
     for (const block of item.blocks) {
       if (block.kind !== 'codex_reasoning' || !block.headings?.length) continue;
       for (const heading of block.headings) {
-        // Document order decides: the FIRST rendering of a text keeps its place,
-        // and every later one in the same turn is dropped.
-        if (seen.has(heading.text)) suppressed.add(heading.key);
-        else seen.add(heading.text);
+        occurrences.push({ turn, key: heading.key, text: heading.text });
       }
     }
+  }
+  return suppressedFromOccurrences(occurrences);
+}
+
+// #463 S4 §4.6 — the outline needs the SAME rule over a different input. It
+// holds landmarks, not `ConversationItem`s, and a second copy of the rule is
+// exactly how the reader and the rail would drift apart, so the rule itself
+// lives here over a shape both sides can produce.
+//
+// RECORDED DIVERGENCE, accepted rather than engineered away: the reader applies
+// this to the currently loaded, focus-visible items while the outline applies it
+// to the whole conversation, so the same function on different inputs can
+// suppress different occurrences. An outline row can therefore be absent while
+// the corresponding duplicate heading is visible in a partially loaded reader.
+// Making the reader suppress from a full-session basis would require it to
+// reason about headings it has not loaded.
+export interface HeadingOccurrence {
+  turn: string;
+  key: string;
+  text: string;
+}
+
+export function suppressedFromOccurrences(
+  occurrences: readonly HeadingOccurrence[],
+): Set<string> {
+  const suppressed = new Set<string>();
+  const seenByTurn = new Map<string, Set<string>>();
+  for (const occurrence of occurrences) {
+    let seen = seenByTurn.get(occurrence.turn);
+    if (!seen) {
+      seen = new Set<string>();
+      seenByTurn.set(occurrence.turn, seen);
+    }
+    // Document order decides: the FIRST rendering of a text keeps its place,
+    // and every later one in the same turn is dropped.
+    if (seen.has(occurrence.text)) suppressed.add(occurrence.key);
+    else seen.add(occurrence.text);
   }
   return suppressed;
 }

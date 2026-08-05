@@ -81,8 +81,12 @@ export interface LoadToTargetResult {
   // The DRAINED edge is genuinely exhausted (directional: `prevBefore == null` for
   // a backward drain, `next_after == null` for forward; `none` → treated exhausted
   // so a truly-unreachable target still clears). A non-exhaustion exit (session
-  // change mid-drain) leaves this false so the jump stays pending for a re-fire.
+  // change mid-drain) leaves both false so the jump stays pending for a re-fire.
   exhausted: boolean;
+  // True only when the drained edge still had a cursor but every bounded page
+  // attempt failed. This is distinct from exhaustion/absence so the reader can
+  // terminate the jump with an honest request-failure state.
+  failed: boolean;
   // The rev of the drain's TERMINAL WindowOp (`opRevRef` after the drain). The
   // reader clears only once its captured `lastOp.rev` has caught up to this, so a
   // still-in-flight bringing-prepend defers the clear to its own commit re-fire.
@@ -137,6 +141,9 @@ export interface UseConversation {
 }
 
 const PAGE = 500;
+const DRAIN_RETRY_DELAYS_MS = [100, 250] as const;
+const PAGE_FETCH_FAILED = Symbol('page-fetch-failed');
+type PageFetchResult = WindowOp | typeof PAGE_FETCH_FAILED | null;
 // §6 (Bug 1) — the live-tail overlap window. Each tail tick re-fetches the last
 // TAIL_WINDOW local items (cursor = the item just BEFORE the window) so a later
 // fold/update into an already-delivered item reaches the live client (the strict
@@ -289,8 +296,9 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // wrapper (and a re-entrant awaiter) can return the actual `{found, direction,
   // exhausted, terminalOpRev}` without restructuring the freeze-sensitive drain.
   const lastDrainDirectionRef = useRef<'backward' | 'forward' | 'none'>('none');
+  const lastDrainFailedRef = useRef(false);
   const drainResultRef = useRef<LoadToTargetResult>({
-    found: false, direction: 'none', exhausted: true, terminalOpRev: 0,
+    found: false, direction: 'none', exhausted: true, failed: false, terminalOpRev: 0,
   });
   const sessionRef = useRef<string | null>(null);
   const conversationRefRef = useRef<ConversationRef | null>(conversationRef);
@@ -403,9 +411,10 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
 
   // ── Forward paging (bottom edge) ───────────────────────────────────────────
   // #228 S3 B3 — resolves to the append's WindowOp (addedBottom = the count this
-  // page appended) or null for a no-op (null/stale cursor, session change, or a
-  // fetch error). `fetchNext` is also driven by the jump pager; loadMore wraps it.
-  const fetchNext = useCallback(async (): Promise<WindowOp | null> => {
+  // page appended), null for a genuine no-op (null/stale cursor or session
+  // change), or PAGE_FETCH_FAILED for a request failure. `fetchNext` is also
+  // driven by the jump pager; loadMore preserves its public null-on-error contract.
+  const fetchNext = useCallback(async (): Promise<PageFetchResult> => {
     const after = nextAfterRef.current;
     const sid = sessionRef.current;
     const ref = conversationRefRef.current;
@@ -417,7 +426,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       try {
         body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, after }));
       } catch {
-        return null;
+        return PAGE_FETCH_FAILED;
       }
       if (sessionRef.current !== sid) return null;  // session changed mid-fetch — drop this stale page
       // #166: keep the whole-session subagent_meta map across paged appends.
@@ -425,7 +434,11 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       // (prevBeforeRef / hasPrev) is left untouched.
       setDetailSynced((prev) => (prev ? { ...prev, items: [...prev.items, ...body.items],
         page: { ...prev.page, next_after: body.page.next_after, has_more: body.page.has_more },
-        subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body));
+        subagent_meta: body.subagent_meta ?? prev.subagent_meta,
+        // #463 S3 §3.2 — the session index is conversation-scoped and re-sent
+        // on every page, exactly like subagent_meta. Keep the last one seen so
+        // a page that predates it (or omits it) cannot blank the badges.
+        session_index: body.session_index ?? prev.session_index } : body));
       nextAfterRef.current = body.page.next_after;
       // Emit even for an empty page (addedBottom 0) so a follow-up trim tick still
       // fires; the reader's stick/newCount paths gate on addedBottom themselves.
@@ -436,7 +449,10 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     }
   }, [setDetailSynced, emitOp]);
 
-  const loadMore = useCallback(async (): Promise<WindowOp | null> => fetchNext(), [fetchNext]);
+  const loadMore = useCallback(async (): Promise<WindowOp | null> => {
+    const result = await fetchNext();
+    return result === PAGE_FETCH_FAILED ? null : result;
+  }, [fetchNext]);
 
   // ── Reverse paging (top edge) — Codex P1: NEVER touches the bottom edge ─────
   // #228 S3 B3 — resolves to the prepend's WindowOp (addedTop = the count this
@@ -444,7 +460,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // fetch error). The drain loops below read `prevBeforeRef.current` for the
   // "more reverse pages remain" signal, NOT the op (an op is emitted even on the
   // last page, when the cursor goes null).
-  const fetchPrev = useCallback(async (): Promise<WindowOp | null> => {
+  const fetchPrev = useCallback(async (): Promise<PageFetchResult> => {
     const before = prevBeforeRef.current;
     const sid = sessionRef.current;
     const ref = conversationRefRef.current;
@@ -456,7 +472,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       try {
         body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, before }));
       } catch {
-        return null;
+        return PAGE_FETCH_FAILED;
       }
       if (sessionRef.current !== sid) return null;
       // Qualified before pages are cursor-exclusive in the steady state, but a
@@ -481,7 +497,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
         const prev = ws.detail;
         const next = prev ? { ...prev, items: [...prependItems, ...prev.items],
           page: { ...prev.page, prev_before: body.page.prev_before ?? null, has_prev: body.page.has_prev ?? false },
-          subagent_meta: body.subagent_meta ?? prev.subagent_meta } : body;
+          subagent_meta: body.subagent_meta ?? prev.subagent_meta,
+          session_index: body.session_index ?? prev.session_index } : body;
         detailRef.current = next;
         return { detail: next, firstItemIndex: applyFirstItemDelta(ws.firstItemIndex, { addedTop: prependItems.length, droppedTop: 0 }) };
       });
@@ -500,7 +517,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // synchronous detailRef mirror is updated inside fetchPrev BEFORE this resolves,
   // and the emitted op carries the true addedTop regardless of any trailing trim.
   const loadPrev = useCallback(async (): Promise<WindowOp | null> => {
-    const op = await fetchPrev();
+    const result = await fetchPrev();
+    const op = result === PAGE_FETCH_FAILED ? null : result;
     return op && op.addedTop > 0 ? op : null;
   }, [fetchPrev]);
 
@@ -516,7 +534,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const sid = sessionRef.current;
     // Session gone — no drain, no absence claim (defer, never clear): exhausted
     // false so the reader stays pending for the re-open re-fire (#286 B3).
-    if (sid == null) return { found: false, direction: 'none', exhausted: false, terminalOpRev: opRevRef.current };
+    if (sid == null) return { found: false, direction: 'none', exhausted: false, failed: false, terminalOpRev: opRevRef.current };
     // #232 — RE-ENTRANCY GUARD (the cold-deep-link freeze fix). The jump effect
     // re-fires on every prepend THIS drain itself causes (its deps include
     // `nodes` / `virtualFirstItemIndex` / `detail.items.length`), and each re-fire
@@ -560,7 +578,13 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       : direction === 'forward'
         ? nextAfterRef.current == null
         : true;
-    drainResultRef.current = { found, direction, exhausted, terminalOpRev: opRevRef.current };
+    drainResultRef.current = {
+      found,
+      direction,
+      exhausted,
+      failed: lastDrainFailedRef.current,
+      terminalOpRev: opRevRef.current,
+    };
     return drainResultRef.current;
     // runDrainToTargetRef is a stable ref, so this callback's identity never churns.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -579,6 +603,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // note there). `sid` is captured by the wrapper at entry.
   const runDrainImpl = useCallback(async (uuid: string, sid: string) => {
     lastDrainDirectionRef.current = 'none';  // #286 B3 — reset; set once a loop is picked
+    lastDrainFailedRef.current = false;
     // Already loaded? (read the synchronous mirror, not React state.)
     const has = () => {
       const s = detailRef.current;
@@ -666,6 +691,28 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     const yieldPaint = (): Promise<void> =>
       new Promise<void>((resolve) => { setTimeout(resolve, 0); });
 
+    // #480 — a page fetch failure is not cursor exhaustion. Retry the same edge
+    // at most twice, with increasing delay, then report a terminal drain failure
+    // while leaving the cursor untouched for a later user-initiated attempt.
+    // Genuine no-ops (overlap, stale session, null cursor) remain null and keep
+    // their pre-existing overlap/exhaustion handling below.
+    const fetchPageForDrain = async (
+      fetchPage: () => Promise<PageFetchResult>,
+    ): Promise<WindowOp | null> => {
+      for (let attempt = 0; ; attempt++) {
+        const result = await fetchPage();
+        if (result !== PAGE_FETCH_FAILED) return result;
+        if (attempt === DRAIN_RETRY_DELAYS_MS.length) {
+          lastDrainFailedRef.current = true;
+          return null;
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, DRAIN_RETRY_DELAYS_MS[attempt]);
+        });
+        if (sessionRef.current !== sid) return null;
+      }
+    };
+
     const turns = outlineTurnsRef.current ?? [];
     // #463 S1 — the ordering source. `positions` covers EVERY wire turn, so it
     // resolves targets the navigation outline dropped (every multi-segment Codex
@@ -691,7 +738,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
         // #228 S3 B3 — fetchNext now returns the append WindowOp (or null on a
         // no-op); "more pages remain" is read from the bottom-edge cursor, not the
         // op (an op is emitted even on the last page when the cursor goes null).
-        const op = await fetchNext();
+        const op = await fetchPageForDrain(fetchNext);
+        if (lastDrainFailedRef.current) return;
         if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sidF) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sidF) return;
         // #232 — macrotask yield (see the directional drains' note) instead of an
@@ -736,13 +784,15 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
 
     if (backward) {
       // Page head-ward via the top edge until the target loads or the head is
-      // reached. fetchPrev returns null for a genuine exhaustion (cursor null /
-      // session change / error) OR a transient overlap early-return; disambiguate
-      // via the synchronous cursor mirror (same discipline as the forward path).
+      // reached. fetchPrev returns null for a genuine no-op (cursor null / session
+      // change) OR a transient overlap early-return; request failures are handled
+      // separately by fetchPageForDrain. Disambiguate null via the synchronous
+      // cursor mirror (same discipline as the forward path).
       // "More remain" is read from prevBeforeRef, not the op (#228 S3 B3).
       for (;;) {
         if (has()) return;
-        const op = await fetchPrev();
+        const op = await fetchPageForDrain(fetchPrev);
+        if (lastDrainFailedRef.current) return;
         if (op && prevBeforeRef.current != null) { capWindowDuringDrain('prepend'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (prevBeforeRef.current == null || sessionRef.current !== sid) return;
         // #232 — wait for an overlapping fetchPrev to finish via a MACROTASK
@@ -759,7 +809,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       // Page tail-ward via the bottom edge (the ported overlap-race-safe drain).
       for (;;) {
         if (has()) return;
-        const op = await fetchNext();
+        const op = await fetchPageForDrain(fetchNext);
+        if (lastDrainFailedRef.current) return;
         if (op && nextAfterRef.current != null) { capWindowDuringDrain('append'); await yieldPaint(); if (sessionRef.current !== sid) return; continue; }
         if (nextAfterRef.current == null || sessionRef.current !== sid) return;
         // #232 — macrotask yield (see the backward branch's note) instead of an
@@ -864,6 +915,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
           last_anchor: body.last_anchor ?? prev.last_anchor,
           last_activity_utc: body.last_activity_utc ?? prev.last_activity_utc,
           subagent_meta: body.subagent_meta ?? prev.subagent_meta,
+          // A live-tail append can add a session, so the freshest index wins.
+          session_index: body.session_index ?? prev.session_index,
           provider_meta: body.provider_meta ?? prev.provider_meta,
           page: prev.page,                                             // stays fully-paged at the bottom; top edge preserved
         } : prev));

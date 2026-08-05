@@ -39,6 +39,11 @@ export interface ReassertDeps {
   tol: number;
   /** consecutive same-target within-tol frames that declare a settle. */
   stableNeeded: number;
+  /** Optional minimum wall-clock observation window. A virtualizer may report a
+   *  stable target for several frames before a deferred height correction; this
+   *  floor keeps measuring and applying until that late correction can surface.
+   *  Stability is still required after the floor. Default 0. */
+  minimumDurationMs?: number;
   /** wall-clock fallback ceiling in ms. */
   budgetMs: number;
   /** #291 — opt-in tolerance (ms) for a TRANSIENT null `measure()`. Virtuoso's
@@ -59,6 +64,7 @@ export type ReassertResult = 'settled' | 'aborted' | 'exhausted' | 'gone';
 /** Re-center every frame until the center offset stabilizes (spec §2). */
 export async function reassertCenter(d: ReassertDeps): Promise<ReassertResult> {
   const start = d.now();
+  const minimumDurationMs = Math.max(0, d.minimumDurationMs ?? 0);
   const goneGraceMs = Math.max(0, d.transientGoneGraceMs ?? 0);
   let goneSince: number | null = null;   // #291 — per-outage null clock (reset on every successful measure)
   let last: ReassertFrame | null = null;
@@ -90,7 +96,7 @@ export async function reassertCenter(d: ReassertDeps): Promise<ReassertResult> {
     d.apply(cur);
     const prev = last; // narrow once so the same-target/within-tol test needs no non-null assertion
     if (prev && Object.is(prev.target, cur.target) && Math.abs(cur.desired - prev.desired) <= d.tol) {
-      if (++stable >= d.stableNeeded) return 'settled';
+      if (++stable >= d.stableNeeded && d.now() - start >= minimumDurationMs) return 'settled';
     } else {
       stable = 0;
     }

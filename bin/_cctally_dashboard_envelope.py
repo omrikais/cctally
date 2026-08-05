@@ -1418,9 +1418,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         _cfg_for_alerts.get("dashboard"), dict) else {}
     _cfm = _dash_cfg.get("cache_failure_markers", True)
     _lt = _dash_cfg.get("live_tail", True)
+    _lan_auth = _dash_cfg.get("lan_auth", True)
     dashboard_prefs = {
         "cache_failure_markers": _cfm if isinstance(_cfm, bool) else True,
         "live_tail": _lt if isinstance(_lt, bool) else True,
+        "lan_auth": _lan_auth if isinstance(_lan_auth, bool) else True,
     }
 
     # Mirror update-state.json + update-suppress.json into the envelope

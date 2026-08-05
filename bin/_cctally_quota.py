@@ -333,7 +333,8 @@ def _ledger_state(stats_conn: sqlite3.Connection) -> dict | None:
     try:
         row = stats_conn.execute(
             "SELECT watermark_seq, interpretation_version, alerts_enabled, "
-            "       next_evaluation_at_utc, last_full_pass_at "
+            "       next_evaluation_at_utc, last_full_pass_at, "
+            "       next_evaluation_by_root_json "
             "  FROM quota_projection_ledger_state WHERE source='codex'"
         ).fetchone()
     except sqlite3.Error:
@@ -341,17 +342,35 @@ def _ledger_state(stats_conn: sqlite3.Connection) -> dict | None:
     if row is None:
         return None
     try:
+        schedule_wire = json.loads(str(row[5]))
+        if not isinstance(schedule_wire, dict):
+            return None
+        schedule: dict[str, str] = {}
+        for root_key, captured_at in schedule_wire.items():
+            if not isinstance(root_key, str) or not root_key:
+                return None
+            parsed = _parse_utc(str(captured_at), "next_evaluation_by_root_json")
+            schedule[root_key] = _utc_iso(parsed)
+        scalar_boundary = None if row[3] is None else str(row[3])
+        if schedule:
+            if scalar_boundary is None:
+                return None
+            parsed_scalar = _utc_iso(_parse_utc(
+                scalar_boundary, "next_evaluation_at_utc"))
+            if parsed_scalar != min(schedule.values()):
+                return None
         return {
             "watermark": int(row[0]),
             "interpretation_version": int(row[1]),
             "alerts_enabled": (
                 None if row[2] is None else bool(int(row[2]))),
             "next_evaluation_at": (
-                None if row[3] is None else str(row[3])),
+                scalar_boundary),
             "last_full_pass_at": (
                 None if row[4] is None else str(row[4])),
+            "next_evaluation_by_root": schedule,
         }
-    except (TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
 
 
@@ -514,6 +533,7 @@ def _store_ledger_state(
     conn: sqlite3.Connection, *, watermark: int,
     alerts_enabled: "bool | None", next_evaluation_at: "str | None",
     last_full_pass_at: "str | None",
+    next_evaluation_by_root: Mapping[str, str],
 ) -> None:
     """Stamp the consumed range, the non-dirtiness alert axes and the deadline.
 
@@ -524,18 +544,23 @@ def _store_ledger_state(
     conn.execute(
         """INSERT INTO quota_projection_ledger_state
              (source, watermark_seq, interpretation_version, alerts_enabled,
-              next_evaluation_at_utc, last_full_pass_at)
-           VALUES ('codex',?,?,?,?,?)
+              next_evaluation_at_utc, last_full_pass_at,
+              next_evaluation_by_root_json)
+           VALUES ('codex',?,?,?,?,?,?)
            ON CONFLICT(source) DO UPDATE SET
              watermark_seq=excluded.watermark_seq,
              interpretation_version=excluded.interpretation_version,
              alerts_enabled=excluded.alerts_enabled,
              next_evaluation_at_utc=excluded.next_evaluation_at_utc,
-             last_full_pass_at=excluded.last_full_pass_at""",
+             last_full_pass_at=excluded.last_full_pass_at,
+             next_evaluation_by_root_json=excluded.next_evaluation_by_root_json""",
         (
             int(watermark), _CODEX_QUOTA_INTERPRETATION_VERSION,
             None if alerts_enabled is None else int(bool(alerts_enabled)),
             next_evaluation_at, last_full_pass_at,
+            json.dumps(
+                dict(sorted(next_evaluation_by_root.items())),
+                sort_keys=True, separators=(",", ":")),
         ),
     )
 
@@ -639,7 +664,7 @@ def _armed_identities(
 def _resolve_alert_scope(
     stats_conn: sqlite3.Connection, *, ledger_scope: str, now: dt.datetime,
     ledger_state: "dict | None", global_enabled: bool, quota_enabled: bool,
-    rules, config, defer_scheduled: bool = False,
+    rules, config, eligible_roots: set[str], defer_scheduled: bool = False,
 ) -> _axes.AlertDirtyScope:
     """Feed the five-axis kernel from stats.db and the resolved configuration."""
     armed = _armed_identities(stats_conn)
@@ -657,12 +682,22 @@ def _resolve_alert_scope(
             quota_enabled=quota_enabled,
         )
     boundary = None
+    scheduled_roots: "frozenset[str] | None" = None
     if ledger_state is not None and ledger_state["next_evaluation_at"]:
         try:
             boundary = _parse_utc(
                 ledger_state["next_evaluation_at"], "next_evaluation_at_utc")
         except (TypeError, ValueError):
             boundary = None
+    if ledger_state is not None:
+        schedule = ledger_state["next_evaluation_by_root"]
+        if schedule:
+            scheduled_roots = frozenset(
+                root_key for root_key, captured_at in schedule.items()
+                if root_key in eligible_roots
+                and now >= _parse_utc(
+                    captured_at, "next_evaluation_by_root_json")
+            )
     return _axes.alert_dirty_scope(
         ledger_groups=(1,) if ledger_scope == _axes.SCOPE_GROUPS else (),
         stored_fingerprints=stored,
@@ -672,6 +707,7 @@ def _resolve_alert_scope(
         gate_after=bool(global_enabled and quota_enabled),
         now=now,
         next_evaluation_at=boundary,
+        scheduled_roots=scheduled_roots,
         defer_scheduled=defer_scheduled,
     )
 
@@ -681,7 +717,7 @@ def _blocks_missing_reverse_map(stats_conn: sqlite3.Connection) -> bool:
 
     A scoped sweep matches on ``physical_group_key``, so a NULL there would
     silently escape it and the stale block would survive indefinitely. The
-    epoch rebuild (1005 for the column, 1006 as shipped) stamps every row, and
+    epoch rebuild (1005 introduced the column; current epoch 1007) stamps every row, and
     this is the guard that turns the
     one shape it cannot reach — a block written by an older binary against an
     already-current index — into a full pass rather than a missed one.
@@ -1909,7 +1945,10 @@ def _apply_quota_projection_rows(
     journal_terminal=None, holder=None, dirty_units=None,
     ledger_watermark=None, alerts_enabled=None,
     stored_next_evaluation_at=None, stored_last_full_pass_at=None,
-    stored_alerts_enabled=None, consume_alert_axes=True,
+    stored_alerts_enabled=None, stored_next_evaluation_by_root=None,
+    consume_alert_axes=True, reconcile_roots=None,
+    schedule_evaluated_roots=frozenset(),
+    prune_inactive_schedule=False,
 ):
     """Transaction-neutral quota projection apply (spec §5.3 "projection").
 
@@ -1924,17 +1963,16 @@ def _apply_quota_projection_rows(
     live caller; rebuild passes ``None``.
 
     ``dirty_units`` (public #5) is the BOUNDED pass: a set of serialized loading
-    units whose complete current membership ``observations`` carries. ``None`` is
-    the whole-history pass — every other caller, the rebuild, an
-    interpretation-version bump and ``force_full``. It changes exactly two
+    units whose complete current membership ``observations`` carries.
+    ``reconcile_roots`` distinguishes a complete root-scoped pass from the
+    genuine whole-history ``None``/``None`` shape. It changes exactly two
     things: the sweep is scoped to those units, and the root signature is
     composed from the stored per-group digests rather than recomputed from
     scratch. Everything else runs identically, which is what keeps the two paths
     from drifting.
 
-    ``consume_alert_axes`` says whether this pass may ADVANCE the two
-    non-dirtiness alert axes it stores (``alerts_enabled``,
-    ``next_evaluation_at``) or must carry the stored values through untouched,
+    ``consume_alert_axes`` says whether this pass may advance the global
+    non-dirtiness axes or must carry the stored values through untouched,
     the way ``last_full_pass_at`` is carried through by a bounded pass. False
     means "this pass did not do the work those axes exist to trigger", and there
     are two such passes. A REPORTING-ONLY pass (no alert-eligible roots — the
@@ -1944,8 +1982,9 @@ def _apply_quota_projection_rows(
     stamping the gate would retire a delivery-gate ENABLE with no arming row and
     no ``suppressed_backfill`` written, and the axis could never re-fire because
     ``gate_before`` now reads True. A hook tick that DEFERRED axis 4 is the
-    other. ``stored_alerts_enabled`` / ``stored_next_evaluation_at`` are what it
-    carries through.
+    other. Scheduled ownership is narrower: ``schedule_evaluated_roots`` names
+    only complete root histories this alert-eligible pass may replace. Group
+    passes and reporting-only passes can merge new minima but retire none.
 
     ``ledger_watermark`` is stamped INSIDE this transaction. That is deliberate:
     ``run_stats_ingest`` is the sole stats writer, so advancing it after the
@@ -1954,7 +1993,10 @@ def _apply_quota_projection_rows(
     group is idempotent.
     """
     historic_roots = _historic_root_keys(conn)
-    roots_to_reconcile = active_roots | historic_roots
+    roots_to_reconcile = (
+        active_roots | historic_roots
+        if reconcile_roots is None else set(reconcile_roots)
+    )
     if not roots_to_reconcile:
         return
     generation = secrets.token_hex(16)
@@ -1995,12 +2037,11 @@ def _apply_quota_projection_rows(
     # retires the right rows — and the DELETE below removes what it no longer
     # names. A root with no blocks at all still stamps one `unattributed` row,
     # byte-stable with the prior behaviour.
-    signatures: dict[str, str] = {}
-    for root_key in sorted(active_roots):
+    roots_to_stamp = active_roots & roots_to_reconcile
+    for root_key in sorted(roots_to_stamp):
         accounts = _root_accounts(conn, root_key) or {_lib_accounts.UNATTRIBUTED}
         root_signature = _ledger.compose_root_signature(
             _root_group_pairs(conn, root_key))
-        signatures[root_key] = root_signature
         placeholders = ",".join("?" for _ in accounts)
         conn.execute(
             "DELETE FROM quota_projection_state WHERE source_root_key=? "
@@ -2019,6 +2060,15 @@ def _apply_quota_projection_rows(
                      completed_at_utc=excluded.completed_at_utc""",
                 (root_key, account_key, generation, root_signature, now_iso),
             )
+    # The cache-side certificate remains whole-store even when this pass was
+    # root-scoped. Root signatures are composable from the stored group digests,
+    # so collecting every active root here is O(groups), not O(observations),
+    # and prevents a scoped pass from erasing untouched roots from the proof.
+    signatures = {
+        root_key: _ledger.compose_root_signature(
+            _root_group_pairs(conn, root_key))
+        for root_key in sorted(active_roots)
+    }
     # The state row is stamped even when ``ledger_watermark`` is ``None`` — a
     # cache too old to carry the change log, where ``_ledger_max_seq`` cannot
     # report a sequence. Guarding this whole block on it left such a store with
@@ -2045,16 +2095,61 @@ def _apply_quota_projection_rows(
     # Recording a NEWLY seen future capture is safe from any pass, so that side
     # stays unconditional; only RETIRING a matured instant is gated, because
     # that is the half that claims an evaluation happened.
-    boundary = _axes.next_evaluation_boundary(
-        capture_times=[
-            observation.captured_at for observation in observations],
-        now=now, stored=stored_boundary, retain_due=not consume_alert_axes,
+    stored_schedule = dict(stored_next_evaluation_by_root or {})
+    # Retire only roots whose COMPLETE history this alert-eligible pass
+    # evaluated. A group-bounded pass may discover an earlier future capture,
+    # but it cannot prove the absence of another capture in a clean group, so
+    # it only merges minima and never removes a stored root deadline.
+    for root_key in schedule_evaluated_roots:
+        stored_schedule.pop(root_key, None)
+    future_by_root: dict[str, dt.datetime] = {}
+    for observation in observations:
+        if observation.captured_at <= now:
+            continue
+        root_key = observation.identity.source_root_key
+        current = future_by_root.get(root_key)
+        if current is None or observation.captured_at < current:
+            future_by_root[root_key] = observation.captured_at
+    for root_key, captured_at in future_by_root.items():
+        current_wire = stored_schedule.get(root_key)
+        current = (
+            None if current_wire is None
+            else _parse_utc(current_wire, "next_evaluation_by_root_json")
+        )
+        if root_key in schedule_evaluated_roots or current is None or captured_at < current:
+            stored_schedule[root_key] = _utc_iso(captured_at)
+    # Inactive roots have no lifecycle owner and cannot dispatch. Keeping their
+    # deadlines would create an unretirable scheduled axis.
+    if prune_inactive_schedule:
+        stored_schedule = {
+            root_key: captured_at
+            for root_key, captured_at in stored_schedule.items()
+            if root_key in active_roots
+        }
+    schedule_boundary = min(stored_schedule.values(), default=None)
+    # A scalar-only boundary is a legacy/fail-safe state with unknown ownership.
+    # Keep the prior behavior until a qualifying whole-history pass can retire
+    # it; epoch-1007 indexes normally never enter this branch.
+    legacy_boundary = stored_boundary if not stored_next_evaluation_by_root else None
+    boundary = (
+        None if schedule_boundary is None
+        else _parse_utc(schedule_boundary, "next_evaluation_by_root_json")
     )
+    if legacy_boundary is not None:
+        retained_legacy = _axes.next_evaluation_boundary(
+            capture_times=(), now=now, stored=legacy_boundary,
+            retain_due=not consume_alert_axes,
+        )
+        if retained_legacy is not None and (
+            boundary is None or retained_legacy < boundary
+        ):
+            boundary = retained_legacy
     _store_ledger_state(
         conn, watermark=0 if ledger_watermark is None else ledger_watermark,
         alerts_enabled=(
             alerts_enabled if consume_alert_axes else stored_alerts_enabled),
         next_evaluation_at=None if boundary is None else _utc_iso(boundary),
+        next_evaluation_by_root=stored_schedule,
         # Spec §2: EVERY full pass stamps the verification deadline,
         # whatever triggered it — the interval itself, a rebuild, an
         # interpretation bump, `force_full`, or a dirty-unit burst
@@ -2064,7 +2159,9 @@ def _apply_quota_projection_rows(
         # untouched; overwriting it would let an install that never
         # bursts postpone verification forever.
         last_full_pass_at=(
-            now_iso if dirty_units is None else stored_last_full_pass_at),
+            now_iso
+            if dirty_units is None and reconcile_roots is None
+            else stored_last_full_pass_at),
     )
     if sink is not None:
         # Set-then-dispatch: all claims committed with the cycle before the
@@ -2078,7 +2175,7 @@ def _apply_quota_projection_rows(
             milestones_upserted=sum(len(percent_milestones(b)) for b in blocks),
             blocks_orphaned=blocks_orphaned,
             milestones_orphaned=milestones_orphaned,
-            roots_stamped=len(active_roots),
+            roots_stamped=len(roots_to_stamp),
             alerts_dispatched=len(queued),
         )
 
@@ -2130,6 +2227,7 @@ def rematerialize_quota_projection_for_rebuild(stats_conn, *, now=None) -> None:
         # value — `gate_before is not True` makes the next alert-eligible pass
         # widen and do the activation.
         consume_alert_axes=True,
+        prune_inactive_schedule=True,
     )
 
 
@@ -2260,12 +2358,10 @@ def reconcile_codex_quota_projection(
     delay it. Both fire on a config change the user just made, so the cost is
     bounded and attributable.
 
-    Axis 4 is the exception and is DEFERRED under ``"defer"``. It fires on wall
-    clock, not on a config change: a capture stamped in the future (clock skew
-    across a sleep/resume, an NTP correction) sets the boundary, and the first
-    tick after wall time passes it would otherwise run the whole-history load
-    and apply on the blocking path with nothing to have predicted it. A BOUNDED
-    tick carries the stored boundary through untouched instead.
+    Axis 4 fires on wall clock. Epoch 1007 persists its owning roots, so a due
+    hook tick performs complete passes only for the matured roots. A legacy or
+    inconsistent scalar-only boundary still defers under ``"defer"`` because
+    its only honest fallback is whole history.
 
     A tick that widened to whole-history for axis 2 or 3 anyway does retire it,
     because it did look: at every observation of every active root. Withholding
@@ -2274,11 +2370,8 @@ def reconcile_codex_quota_projection(
     declining both left the same scope standing and repeated the whole-history
     pass inline on every subsequent tick.
 
-    What is NOT closed: a hook-only install with a steady enabled gate,
-    unchanged rules and a quiet ledger never produces a qualifying pass, so a
-    matured boundary is retained indefinitely. Bounded in cost (the tick stays
-    bounded and fast; the window is re-evaluated the moment it goes
-    ledger-dirty) and under-alerting in direction, but open.
+    A quiet owned boundary is therefore consumed without broadening the hook to
+    unrelated roots; the following quiet tick returns to the zero-group path.
     """
     if full_pass not in ("inline", "defer"):
         raise ValueError(
@@ -2341,6 +2434,7 @@ def reconcile_codex_quota_projection(
                     global_enabled=global_alerts_enabled,
                     quota_enabled=quota_alerts_enabled,
                     rules=_rules, config=_config,
+                    eligible_roots=alert_eligible_roots,
                     defer_scheduled=(full_pass == "defer"),
                 )
         finally:
@@ -2430,6 +2524,10 @@ def reconcile_codex_quota_projection(
             stale_reverse_map=stale_reverse_map,
             verification_due=verification_due,
         )
+        # ``None`` means the genuine whole-history path. A set means complete
+        # histories for only those roots — axis 2 and epoch-1007 axis 4 can both
+        # be satisfied without scanning unrelated roots.
+        reconcile_roots: "set[str] | None" = None
         if dirty_units is None and full_pass == "defer" and not force_full:
             # The rule, for every OTHER route into a whole-history pass: an
             # absent or freshly rebuilt projector state, an interpretation-
@@ -2465,25 +2563,28 @@ def reconcile_codex_quota_projection(
         # just made, so the widening is bounded and expected, and it stays
         # inline even under `defer`.
         #
-        # Axis 4 does NOT, and the honest statement about it is "reachable from
-        # the hook, and therefore deferred" rather than "unreachable". Every
-        # tick that clears the 15s lifecycle throttle carries eligible roots, so
-        # this branch is live on all of them; a future-clocked capture (clock
-        # skew across a sleep/resume, an NTP correction) would then put one
-        # unannounced whole-history load and apply on the blocking path the
-        # first time wall time passed the boundary. `_resolve_alert_scope`
-        # records it as `REASON_SCHEDULED_DEFERRED` instead, and the boundary is
-        # carried through below so the next pass that CAN afford the widening
-        # still sees it.
-        if (
-            dirty_units is not None
-            and alert_scope is not None
-            and alert_scope.widens(_axes.SCOPE_GROUPS)
-        ):
-            dirty_units = None
+        # Axis 4 is root-scoped when epoch-1007 ownership is available. A
+        # scalar-only legacy boundary still records `REASON_SCHEDULED_DEFERRED`
+        # under `full_pass="defer"`, because whole history remains its only
+        # honest fallback.
+        if dirty_units is not None and alert_scope is not None:
+            if alert_scope.scope == _axes.SCOPE_ALL:
+                dirty_units = None
+            elif alert_scope.scope == _axes.SCOPE_ROOTS:
+                # Reconcile every alert-invalidated root in full. If physical
+                # ledger work landed on the same tick, promote its roots too so
+                # the watermark can advance without skipping those mutations.
+                reconcile_roots = set(alert_scope.roots)
+                reconcile_roots.update(
+                    str(group[0]) for group in dirty_units["raw_groups"])
+                dirty_units = None
         if dirty_units is None:
             observations = load_codex_quota_observations(
-                source_root_keys=active_roots, cache_conn=cache,
+                source_root_keys=(
+                    active_roots if reconcile_roots is None
+                    else active_roots & reconcile_roots
+                ),
+                cache_conn=cache,
             )
         else:
             observations = load_codex_quota_observations(
@@ -2539,6 +2640,12 @@ def reconcile_codex_quota_projection(
         or alert_scope is None
         or _axes.REASON_SCHEDULED_DEFERRED not in alert_scope.reasons
     )
+    complete_roots = (
+        (active_roots if reconcile_roots is None else active_roots & reconcile_roots)
+        if dirty_units is None else set()
+    )
+    schedule_evaluated_roots = frozenset(
+        complete_roots & alert_eligible_roots)
 
     # ── Apply phase (Task 7 Item 3) ─────────────────────────────────────────
     # The stats.db writes route through the single-flight ingest cycle instead
@@ -2581,7 +2688,16 @@ def reconcile_codex_quota_projection(
             stored_alerts_enabled=(
                 None if ledger_state is None
                 else ledger_state["alerts_enabled"]),
+            stored_next_evaluation_by_root=(
+                {} if ledger_state is None
+                else ledger_state["next_evaluation_by_root"]),
             consume_alert_axes=consume_alert_axes,
+            reconcile_roots=reconcile_roots,
+            schedule_evaluated_roots=schedule_evaluated_roots,
+            prune_inactive_schedule=(
+                source_root_keys is None
+                and dirty_units is None
+                and reconcile_roots is None),
         )
 
     import _cctally_journal as _jr

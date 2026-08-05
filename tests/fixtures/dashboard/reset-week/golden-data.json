@@ -825,6 +825,7 @@
   },
   "dashboard_prefs": {
     "cache_failure_markers": true,
+    "lan_auth": true,
     "live_tail": true
   },
   "data_version": "__VER__",

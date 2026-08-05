@@ -61,4 +61,18 @@ describe('conversation transport adapters', () => {
     const codex = requestKey?.({ source: 'codex', key: 'same' }, 'detail');
     expect(claude).not.toBe(codex);
   });
+
+  it('carries account scope through collection and entity URLs', async () => {
+    const transport = await loadTransport();
+    const browse = transport?.qualifiedBrowseUrl as (source: 'codex', options: Record<string, unknown>) => string;
+    const entity = transport?.conversationEntityUrl as (
+      ref: { source: 'codex'; key: string; account_key: string }, operation: 'outline',
+    ) => string;
+    expect(browse('codex', { accountKey: 'account-a', limit: 50 })).toBe(
+      '/api/conversations?source=codex&account=account-a&limit=50',
+    );
+    expect(entity(
+      { source: 'codex', key: 'v1.root-a', account_key: 'account-a' }, 'outline',
+    )).toBe('/api/conversation/v1.root-a/outline?account=account-a');
+  });
 });

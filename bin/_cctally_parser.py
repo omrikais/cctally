@@ -2800,6 +2800,9 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
              "to Codex (v1.) conversations; an explicit value on any other ref "
              "is a usage error")
     t_export.add_argument(
+        "--account", metavar="REF", default=None,
+        help="Restrict the export to one account (label, email, or key prefix)")
+    t_export.add_argument(
         "-o", "--output", metavar="PATH", default=None,
         help="Write to PATH instead of stdout (same exact bytes)")
     t_export.set_defaults(func=c.cmd_transcript)
@@ -2811,6 +2814,9 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
     t_search.add_argument(
         "--source", choices=("claude", "codex"), default="claude",
         help="Which provider's conversations to search (default: claude)")
+    t_search.add_argument(
+        "--account", metavar="REF", default=None,
+        help="Restrict search to one account (label, email, or key prefix)")
     t_search.add_argument(
         "--kind",
         choices=("all", "prompts", "assistant", "tools", "thinking",

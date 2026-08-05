@@ -383,7 +383,10 @@ def test_sibling_won_recovery_skips_redundant_publication(ns, monkeypatch):
         nonlocal sibling_ran
         if not sibling_ran:
             sibling_ran = True
-            _counted_rebuild(high_water=correction_high_water)
+            _counted_rebuild(
+                context=jr.RebuildContext(trigger="test-fixture"),
+                high_water=correction_high_water,
+            )
         return real_acquire(mode, timeout_s)
 
     monkeypatch.setattr(jr, "rebuild_stats_index", _counted_rebuild)
@@ -594,7 +597,7 @@ def _seed_rederive_source_case(tmp_path, monkeypatch):
         )
     for record in [obs, *wrong_events]:
         runtime.append_record(record, now_utc=FIXED)
-    runtime.rebuild_stats_index()
+    runtime.rebuild_stats_index(context=runtime.RebuildContext(trigger="test-fixture"))
     return mod
 
 

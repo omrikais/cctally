@@ -332,6 +332,9 @@ def _apply(requested, initial_preview):
             try:
                 _call_rebuild_error_hook()
                 rebuild = _journal.rebuild_stats_index(
+                    context=_journal.RebuildContext(
+                        trigger="journal-repair-acknowledge"
+                    ),
                     high_water=audit_high_water,
                     update_quota_cache=False,
                     before_swap=lambda: _call_crash_hook(
@@ -377,6 +380,9 @@ def _apply(requested, initial_preview):
             try:
                 _call_rebuild_error_hook()
                 rebuild = _journal.rebuild_stats_index(
+                    context=_journal.RebuildContext(
+                        trigger="journal-repair-recovery"
+                    ),
                     high_water=recovery_high_water,
                     update_quota_cache=False,
                     before_swap=lambda: _call_crash_hook(

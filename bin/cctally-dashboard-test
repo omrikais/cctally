@@ -896,7 +896,7 @@ for name in "${fixture_scenarios[@]}"; do
     fi
 done
 
-# Local assert helper used only by the banner scenarios below — kept
+# Local assert helpers used only by the banner scenarios below — kept
 # here (rather than at file top) so the existing scenario flow that
 # uses inline ok=0 idioms isn't disturbed.
 assert_contains () {
@@ -907,6 +907,17 @@ assert_contains () {
     else
         echo "FAIL $label (missing $needle)"
         fail_count=$((fail_count + 1))
+    fi
+}
+
+assert_not_contains () {
+    local label="$1" needle="$2" haystack="$3"
+    if printf '%s' "$haystack" | grep -qF "$needle"; then
+        echo "FAIL $label (unexpected $needle)"
+        fail_count=$((fail_count + 1))
+    else
+        echo "PASS $label"
+        pass_count=$((pass_count + 1))
     fi
 }
 
@@ -949,6 +960,10 @@ wait_for_banner_then_kill "$banner_scratch/banner.txt" "$banner_pid"
 
 assert_contains "banner default loopback: single-line localhost" \
     "serving http://localhost:" "$(cat "$banner_scratch/banner.txt")"
+assert_not_contains "banner default loopback: no auth fragment" \
+    "#token=" "$(cat "$banner_scratch/banner.txt")"
+assert_not_contains "banner default loopback: no access token" \
+    "LAN access token:" "$(cat "$banner_scratch/banner.txt")"
 
 # 2) --host 0.0.0.0 -> binds all interfaces -> all-interfaces banner with
 # both localhost and (forced) LAN URLs. Explicit LAN opt-in.
@@ -966,6 +981,10 @@ assert_contains "banner explicit LAN: localhost line" \
     "http://localhost:" "$content"
 assert_contains "banner explicit LAN: LAN line" \
     "http://192.0.2.42:" "$content"
+assert_contains "banner explicit LAN: tokenized URLs" \
+    "#token=" "$content"
+assert_contains "banner explicit LAN: raw access token" \
+    "dashboard: LAN access token:" "$content"
 
 # 3) --host 0.0.0.0 with LAN-IP suppressed -> all-interfaces banner emits
 # localhost line but omits the LAN line entirely (no "(LAN)" trailing tag).
@@ -1014,6 +1033,8 @@ assert_contains "banner config-bind-lan: localhost line" \
     "http://localhost:" "$content"
 assert_contains "banner config-bind-lan: LAN line" \
     "http://192.0.2.42:" "$content"
+assert_contains "banner config-bind-lan: tokenized URLs" \
+    "#token=" "$content"
 
 # 5) config dashboard.bind=loopback, no --host -> binds 127.0.0.1 -> single-line
 # loopback banner using "localhost" as the printed alias.
@@ -1043,6 +1064,32 @@ else
     echo "PASS banner config-bind-loopback: all-interfaces line absent"
     pass_count=$((pass_count + 1))
 fi
+assert_not_contains "banner config-bind-loopback: no auth fragment" \
+    "#token=" "$content"
+
+# 6) Explicit restart-only opt-out: a non-loopback bind stays available with
+# plain URLs for the whole run and prints a conspicuous warning.
+banner_optout_scratch="$SCRATCH_ROOT/banner-auth-optout"
+mkdir -p "$banner_optout_scratch"
+cp -R "$FIX_DIR/no-data/.local" "$banner_optout_scratch/" 2>/dev/null || true
+cat > "$banner_optout_scratch/.local/share/cctally/config.json" <<'JSON'
+{"dashboard": {"bind": "lan", "lan_auth": false}}
+JSON
+HOME="$banner_optout_scratch" TZ=Etc/UTC CCTALLY_TEST_LAN_IP=192.0.2.42 \
+    "$BIN" dashboard --port 0 --no-sync --no-browser \
+    >"$banner_optout_scratch/banner.txt" 2>&1 &
+banner_pid=$!
+BG_PIDS+=("$banner_pid")
+wait_for_banner_then_kill "$banner_optout_scratch/banner.txt" "$banner_pid"
+
+content=$(cat "$banner_optout_scratch/banner.txt")
+assert_contains "banner LAN auth opt-out: warning" \
+    "warning: LAN authentication disabled by dashboard.lan_auth=false; restart after enabling it" \
+    "$content"
+assert_not_contains "banner LAN auth opt-out: no auth fragment" \
+    "#token=" "$content"
+assert_not_contains "banner LAN auth opt-out: no access token" \
+    "LAN access token:" "$content"
 
 # Sanity: every committed golden-data.json must carry a fully-populated
 # `display` block — `tz`, `resolved_tz`, `offset_label`, `offset_seconds`.

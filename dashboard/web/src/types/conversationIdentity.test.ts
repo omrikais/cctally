@@ -23,4 +23,15 @@ describe('qualified conversation identity', () => {
 
     expect(api.parseConversationRefKey?.(api.conversationRefKey!(codexA))).toEqual(codexA);
   });
+
+  it('treats the account qualifier as part of canonical identity', () => {
+    const scopedA = { ...codexA, account_key: 'account-a' } as const;
+    const scopedB = { ...codexA, account_key: 'account-b' } as const;
+    expect(conversation.conversationRefKey(scopedA)).not.toBe(
+      conversation.conversationRefKey(scopedB),
+    );
+    expect(conversation.parseConversationRefKey(
+      conversation.conversationRefKey(scopedA),
+    )).toEqual(scopedA);
+  });
 });

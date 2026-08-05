@@ -14,10 +14,15 @@ import { ExportMenu } from './ExportMenu';
 import { FocusMoreMenu, type FocusSubagentOption } from './FocusMoreMenu';
 import { FocusCompactMenu } from './FocusCompactMenu';
 import { ReaderOverflowMenu } from './ReaderOverflowMenu';
-import { HighlightContext, type HighlightTerms } from './HighlightContext';
+import {
+  ExactFindContext,
+  HighlightContext,
+  type ExactFindState,
+  type HighlightTerms,
+} from './HighlightContext';
 import { MessageItem } from './MessageItem';
 import { SidechainGroup } from './SidechainGroup';
-import { useStableSet, useStableMap, useMonotonicMax } from './useStableIdentity';
+import { useStableSet, useStableMap, useMonotonicMax, useStableSessionIndex } from './useStableIdentity';
 import { CumulativeCostChip } from './CumulativeCostChip';
 import { cumulativeCostThrough } from './cumulativeCost';
 import { ResultIcon, SpinnerIcon, WarningIcon, ChatIcon, SearchIcon } from './ConvIcons';
@@ -29,12 +34,20 @@ import { suppressedHeadingKeys } from './suppressRepeatedHeadings';
 import { headingIsVisible } from './headingVisibility';
 import { nodeIndexForUuid } from './nodeIndexForUuid';
 import { scrollNodeIntoView, alignScrollTop } from './scrollNodeIntoView';
-import { firstLandableMark, applyCurrentMark } from './findMark';
+import { resolveJumpAnchor } from './resolveJumpAnchor';
+import {
+  applyCurrentMark,
+  applyCurrentOccurrence,
+  firstLandableMark,
+  firstLandableOccurrenceFragment,
+} from './findMark';
 import { walkToTarget } from './walkToTarget';
 import { reassertCenter } from './reassertCenter';
 import { resolveJumpOwner } from './resolveJumpOwner';
 import { isLayoutStable, type LayoutSnapshot } from './layoutStable';
-import { buildOutlineTargets, nextTarget, type JumpKind } from './outlineNavigation';
+import {
+  buildOutlineTargets, cursorIndex, distinctOwnerTurns, nextTargetEntry, type JumpKind,
+} from './outlineNavigation';
 import {
   classifyWindowGrowth,
   applyOpenChange,
@@ -50,25 +63,36 @@ import { abbreviateModel } from '../lib/modelName';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { loadReadingPos } from '../store/readingPosition';
 import {
+  buildConversationJump,
   conversationJumpRef,
   conversationRefKey,
   sameConversationRef,
   type ConversationDetail,
   type ConversationItem,
-  type ConversationJump,
   type ConversationOutline,
   type ConversationRef,
   type OpenIntent,
   type SubagentMeta,
 } from '../types/conversation';
 
-function readerJump(ref: ConversationRef, uuid: string, qualified: boolean): ConversationJump {
-  return {
-    ...(qualified ? { conversation_ref: ref } : {}),
-    session_id: ref.key,
-    uuid,
-  };
-}
+// #463 S4 remediation C-2 — `innerAnchorKey` is the finer address INSIDE the
+// item the jump loads, and this builder had no parameter for it, so a keyboard
+// jump to a landmark carried a strictly smaller payload than the rail row and
+// the chip carried for the same landmark: the segment without the failing call.
+// One Codex segment can be 4,098px tall, so the browser gate measured the key
+// press landing up to 6,574px above what it named while a click on the same
+// landmark landed on it. Omitted for a site whose target is a bare turn or
+// segment uuid, which keeps that payload byte-identical to before.
+//
+// Round 3 — the body moved to `buildConversationJump` in types/conversation.ts,
+// which the rail row and the cluster chip now call as well, so the "identical
+// payload for the same target" rule is structural rather than test-enforced.
+// The local name stays because nine call sites read `readerJump(...)`.
+//
+// Round 7 — the optional inputs are the builder's options object, so the three
+// sites here that carry an inner address name it (`{ innerAnchorKey: … }`) and
+// the six that do not simply pass nothing.
+const readerJump = buildConversationJump;
 
 // #186 — belt-and-suspenders title-only skip predicate. Mirrors the server
 // `_CMD_FAMILY_RE` / `_looks_like_command_plumbing` (bin/_lib_conversation_query.py):
@@ -83,14 +107,15 @@ function readerJump(ref: ConversationRef, uuid: string, qualified: boolean): Con
 const CMD_FAMILY_RE = /^\s*(?:<((?:local-)?command-[a-z-]+)>(?:(?!<\/\1>)[\s\S])*<\/\1>\s*)+$/;
 const looksLikeCommandPlumbing = (t: string): boolean => CMD_FAMILY_RE.test(t);
 
-// #237 — convergent re-center bounds for an expand_details disclosure find-jump.
+// #237/#479 — convergent landing bounds. Find hits center; ordinary deep links
+// and card roots align start. Every path survives deferred Virtuoso re-measure.
 const REASSERT_STABLE_FRAMES = 4;  // consecutive same-target within-tol frames = settled
 const REASSERT_BUDGET_MS = 800;    // wall-clock fallback ceiling (refresh-rate-independent)
 
 // #463 S2 §2.7 — bounds on the reasoning-heading spine's two unattended loops.
 // `EDGE_WALK_MAX` caps how many heading-less pages one `h`/`H` press will load
 // while walking past segments that carry no reasoning; `MOUNT_ATTEMPTS` caps how
-// many mounted-range changes a single request waits through for its row to
+// many post-jump commits a subagent request waits through for its inner row to
 // render. A press restarts either, so both only stop an unattended walk.
 const HEADING_EDGE_WALK_MAX = 8;
 const HEADING_MOUNT_ATTEMPTS = 6;
@@ -232,12 +257,24 @@ type ConversationReaderProps = {
   live?: boolean;
 };
 
-function ProviderThreadNav({ detail, conversationRef }: { detail: ConversationDetail; conversationRef: ConversationRef }) {
+// Exported for #463 S5's account-retention test: the whole reader is a heavy
+// mount with its own fetch and virtualization, and the property under test is
+// the ref this strip CONSTRUCTS, not how the reader renders it.
+export function ProviderThreadNav({ detail, conversationRef }: { detail: ConversationDetail; conversationRef: ConversationRef }) {
   const meta = detail.provider_meta;
   if (!meta) return null;
+  // #463 S5 (F24d, spec §4.6) — carry the CURRENT conversation's account through
+  // parent-and-child thread navigation. Conversation identity includes
+  // `account_key`, so rebuilding the ref without it opened an accountless
+  // identity while the global chip still named an account, and no rail row
+  // compared as current — the same identity-loss class as the deep-link defect.
+  // Only carried when the two refs share a source; an account key is scoped to
+  // one provider and means nothing on the other.
   const open = (key: string) => dispatch({
     type: 'SELECT_CONVERSATION',
-    conversationRef: { source: meta.source, key },
+    conversationRef: conversationRef.account_key && conversationRef.source === meta.source
+      ? { source: meta.source, key, account_key: conversationRef.account_key }
+      : { source: meta.source, key },
   });
   const tokens = meta.tokens;
   return (
@@ -416,6 +453,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     selectMarkersEnabled(getState()),
   );
   const [findTerms, setFindTerms] = useState<HighlightTerms | null>(null);
+  const [exactFind, setExactFind] = useState<ExactFindState | null>(null);
   // #281 S4 — the "Anonymize" mode (default ON, persisted). Single source for
   // the header toggle chip, the Export menu, and every per-card CopyButton (via
   // TranscriptContext). Seeded from localStorage; a flip persists immediately.
@@ -668,7 +706,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // #463 S1 — true once a jump has been abandoned as unreachable, so the reader
   // can say so instead of falling silent. Reset when a new jump starts and when
   // the conversation identity changes; the user can also dismiss it.
-  const [jumpUnresolved, setJumpUnresolved] = useState(false);
+  const [jumpFailure, setJumpFailure] = useState<'unresolved' | 'landing_failed' | 'load_failed' | null>(null);
   // #463 S1 — a give-up message is about ONE finished jump, so the next page
   // request retires it. The render used to hide it while `fetching` was true
   // instead, which made it vanish and return around every later page the user's
@@ -681,7 +719,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // renders. Both windows are narrow and deliberately left alone.
   const fetchingWasTrueRef = useRef(false);
   useEffect(() => {
-    if (fetching && !fetchingWasTrueRef.current) setJumpUnresolved(false);
+    if (fetching && !fetchingWasTrueRef.current) setJumpFailure(null);
     fetchingWasTrueRef.current = fetching;
   }, [fetching]);
 
@@ -1032,14 +1070,21 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     [visibleItems],
   );
   const suppressedHeadings = useStableSet(suppressedHeadingKeysRaw);
+  // #463 S3 §3.2 — whole-conversation session index. The server rebuilds it on
+  // EVERY fetch and useConversation prefers any truthy value, so the raw field
+  // is a fresh object on every live-tail tick. Stabilized to content, like the
+  // other two members of this memo, or the provider identity would flip on each
+  // tick and re-render every memoized MessageItem in the visible window.
+  const sessionIndex = useStableSessionIndex(detail?.session_index);
   const transcriptCtx = useMemo(
     () => ({
       sessionId, conversationRef, focusMode, fmtCtx, markersEnabled,
       maxTurnCost: sessionMaxTurnCost, anonMode,
       suppressedHeadingKeys: suppressedHeadings,
+      sessionIndex,
     }),
     [identityKey, focusMode, fmtCtx, markersEnabled, sessionMaxTurnCost, anonMode,
-     suppressedHeadings],
+     suppressedHeadings, sessionIndex],
   );
 
   // #232 — the bottom sentinel observer, the top sentinel observer, and the
@@ -1188,6 +1233,49 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     // Virtuoso's overscan-inclusive range would shift the semantics).
   }, [visible, renderedRangeRev]);
 
+  // #234 / #486 — resolve once the layout tuple (mounted array-range,
+  // scrollHeight, scrollTop, target-anchor rect) is stable across consecutive
+  // frames, or after a bounded frame count. Both the jump pipeline and heading
+  // navigation use this: a one-row giant tail can briefly mount the requested
+  // neighbour, then rebound after Virtuoso corrects its size model. Waiting for
+  // the structural tuple — rather than merely one itemsRendered callback — lets
+  // the caller observe that rebound and issue the next measurement step itself.
+  const waitForLayoutQuiesce = useCallback((
+    anchorUuid: string,
+    isAborted: () => boolean,
+    stableFrames = 1,
+    timerDriven = false,
+  ): Promise<void> => new Promise((resolve) => {
+    const body = bodyRef.current;
+    const snap = (): LayoutSnapshot => {
+      const el = body?.querySelector(`[data-uuid="${CSS.escape(anchorUuid)}"]`) as HTMLElement | null;
+      const sr = body?.getBoundingClientRect();
+      return {
+        first: renderedRangeRef.current.first - firstItemIndexRef.current,
+        last: renderedRangeRef.current.last - firstItemIndexRef.current,
+        scrollHeight: body?.scrollHeight ?? 0, scrollTop: body?.scrollTop ?? 0,
+        anchorTop: el && sr ? el.getBoundingClientRect().top - sr.top : null,
+      };
+    };
+    const structuralStable = (a: LayoutSnapshot, b: LayoutSnapshot): boolean =>
+      isLayoutStable({ ...a, anchorTop: 0 }, { ...b, anchorTop: 0 }, 1);
+    let prev = snap(); let frames = 0; let stableRun = 0;
+    const schedule = (fn: () => void) => {
+      if (timerDriven) window.setTimeout(fn, 16);
+      else requestAnimationFrame(fn);
+    };
+    const tick = () => {
+      if (isAborted()) { resolve(); return; }
+      const cur = snap();
+      const mounted = cur.anchorTop != null && prev.anchorTop != null;
+      const settled = mounted ? isLayoutStable(prev, cur, 1) : structuralStable(prev, cur);
+      stableRun = settled ? stableRun + 1 : 0;
+      if (stableRun >= stableFrames || frames++ > 30) { resolve(); return; }
+      prev = cur; schedule(tick);
+    };
+    schedule(tick);
+  }), []);
+
   // Jump-to-message: page until the target is loaded, then scroll+highlight.
   // Wait for the first page (`detail`) before attempting — otherwise the effect
   // would fire while page 1 is still in flight (nextAfter unknown), page nowhere,
@@ -1206,7 +1294,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     if (!detail || detail.session_id !== sessionId) return; // cross-session transient: keep the pin
     // #463 S1 — a fresh jump supersedes any previous give-up message. Setting the
     // state it already holds is a no-op re-render, so this is safe on a re-fire.
-    setJumpUnresolved(false);
+    setJumpFailure(null);
     let cancelled = false;
     // #234 / #281 S5 A2 — this jump owns a fresh programmatic-run token. The walk
     // and the final landing run inside the async block below; `aborted()` after
@@ -1217,54 +1305,37 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     let myToken = 0;
     const aborted = () => cancelled || !gates.isCurrentRun(myToken);
     const targetUuid = jump.uuid;
-    // #234 §2.2-3 / Codex P0-2 — resolve once the layout tuple (mounted
-    // array-range, scrollHeight, scrollTop, target-anchor rect) is stable across 2
-    // consecutive rAFs, or after a bounded frame count. A range-only waiter would
-    // declare settled while ResizeObserver is still correcting scrollHeight (the
-    // measured R1 stranding) — gating on the whole tuple closes that window.
-    //
-    // Two settle modes keyed on whether the target is mounted yet:
-    //  - target MOUNTED (final landing, or a warm jump): require the FULL tuple
-    //    stable, anchorTop included (isLayoutStable), so the row's measured offset
-    //    has stopped drifting before we write the precise scrollTop.
-    //  - target UNMOUNTED (an intermediate walk step, incl. a stalled one): settle
-    //    on the structural part (range + scrollHeight + scrollTop) alone, so a step
-    //    that made no progress resolves in ~2 frames instead of burning the frame
-    //    bound — the coverage shrink then advances/exhausts quickly.
-    const waitForQuiesce = (anchorUuid: string): Promise<void> => new Promise((resolve) => {
-      const body = bodyRef.current;
-      const snap = (): LayoutSnapshot => {
-        const el = body?.querySelector(`[data-uuid="${CSS.escape(anchorUuid)}"]`) as HTMLElement | null;
-        const sr = body?.getBoundingClientRect();
-        return {
-          first: renderedRangeRef.current.first - firstItemIndexRef.current,
-          last: renderedRangeRef.current.last - firstItemIndexRef.current,
-          scrollHeight: body?.scrollHeight ?? 0, scrollTop: body?.scrollTop ?? 0,
-          anchorTop: el && sr ? el.getBoundingClientRect().top - sr.top : null,
-        };
-      };
-      // Structural stability (range + scroll metrics) ignoring the anchor — used
-      // while the target is unmounted; treats a null anchor as a settled step.
-      const structuralStable = (a: LayoutSnapshot, b: LayoutSnapshot): boolean =>
-        isLayoutStable({ ...a, anchorTop: 0 }, { ...b, anchorTop: 0 }, 1);
-      let prev = snap(); let frames = 0;
-      const tick = () => {
-        // #256 — bail the instant the jump is cancelled (unmount) or superseded
-        // by a newer jump. Without this the loop keeps rescheduling after the
-        // reader unmounts; under the test rAF-via-setTimeout shim a leaked frame
-        // calls CSS.escape() in snap() after the jsdom globals are torn down,
-        // throwing "CSS is not defined" and flaking the full parallel run. Every
-        // `await waitForQuiesce(...)` is followed by an `if (aborted()) return`,
-        // so resolving early here is a no-op for the (already-bailing) caller.
-        if (aborted()) { resolve(); return; }
-        const cur = snap();
-        const mounted = cur.anchorTop != null && prev.anchorTop != null;
-        const settled = mounted ? isLayoutStable(prev, cur, 1) : structuralStable(prev, cur);
-        if (settled || frames++ > 30) { resolve(); return; }
-        prev = cur; requestAnimationFrame(tick);
-      };
-      requestAnimationFrame(tick);
-    });
+    const exactOccurrence = jump.find_occurrence;
+    const reassertLanding = async (
+      resolveTarget: () => HTMLElement | null,
+      align: 'start' | 'center',
+      minimumDurationMs = 0,
+    ): Promise<boolean> => {
+      const result = await reassertCenter({
+        measure: () => {
+          const body = bodyRef.current;
+          const target = resolveTarget();
+          return body && target && target.isConnected
+            ? { desired: alignScrollTop(body, target, align), target }
+            : null;
+        },
+        apply: (frame) => {
+          const body = bodyRef.current;
+          if (body) scrollNodeIntoView(body, frame.target as HTMLElement, align, 'auto');
+        },
+        nextFrame: () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+        now: () => performance.now(),
+        isAborted: aborted,
+        tol: 1,
+        stableNeeded: REASSERT_STABLE_FRAMES,
+        minimumDurationMs,
+        budgetMs: REASSERT_BUDGET_MS,
+        // Virtuoso can recycle the row briefly while applying a measured height.
+        // A longer disappearance is a truthful landing failure, not success.
+        transientGoneGraceMs: 200,
+      });
+      return result === 'settled';
+    };
     // #281 S5 A4 — the jump PIPELINE runs in the pure `runJumpPipeline`; the
     // adapter supplies every side effect. `captured.*` closures read the effect-fire
     // captures (jump/detail/nodes/virtualFirstItemIndex/hasMore/focusMode); `live.*`
@@ -1340,7 +1411,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
             }),
             scrollToIndex: (index, alignEdge) =>
               virtuosoRef.current?.scrollToIndex({ index, align: alignEdge, behavior: 'auto' }),
-            quiesce: () => waitForQuiesce(targetUuid),
+            quiesce: () => waitForLayoutQuiesce(targetUuid, aborted),
             isAborted: aborted,
             // #286 B3 — the step budget must span a FULL drained window in ONE
             // walk call. Removing the scenario-4 pre-page workaround means a cold
@@ -1358,7 +1429,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           });
           return r === 'mounted' ? 'mounted' : 'exhausted';
         },
-        quiesce: () => waitForQuiesce(targetUuid),
+        quiesce: () => waitForLayoutQuiesce(targetUuid, aborted),
         // body && el resolvable — the current `result === 'mounted' && body && el`
         // guard for whether the landing block runs at all.
         hasLandableElement: () => {
@@ -1375,25 +1446,36 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           const body = bodyRef.current;
           const el = (itemRefs.current.get(targetUuid)
             ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-          el?.querySelectorAll('details:not([open])').forEach((d) => {
+          const disclosures = exactOccurrence
+            ? exactOccurrence.disclosure.flatMap((key) => Array.from(
+                el?.querySelectorAll<HTMLDetailsElement>(
+                  `details[data-disclosure-key="${CSS.escape(key)}"]:not([open])`,
+                ) ?? [],
+              ))
+            : Array.from(el?.querySelectorAll<HTMLDetailsElement>('details:not([open])') ?? []);
+          disclosures.forEach((d) => {
             d.classList.add('conv-details--jumpopen');
-            (d as HTMLDetailsElement).open = true;
+            d.open = true;
           });
         },
-        // #204/#234 — a card-root jump aligns the <details> CARD to the top (NOT the
-        // sticky summary), so a tall card shows its head. A DIRECT scrollTop write
-        // (native scrollIntoView is inert inside the giant library-managed row).
+        // #204/#234/#479 — a card-root jump aligns the <details> CARD to the top
+        // (NOT the sticky summary), and reasserts through deferred re-measure.
         landCard: async () => {
-          const body = bodyRef.current;
-          const card = cardRefs.current.get(targetUuid);
-          if (!body || !card) return;
-          scrollNodeIntoView(body, card, 'start', 'auto');
-          await waitForQuiesce(targetUuid);
-          if (aborted()) return;
-          scrollNodeIntoView(body, card, 'start', 'auto'); // §2.1 single re-assert
+          const resolveCard = (): HTMLElement | null => {
+            const card = cardRefs.current.get(targetUuid);
+            return card && card.isConnected ? card : null;
+          };
+          const landed = await reassertLanding(resolveCard, 'start', 250);
+          if (aborted()) return false;
+          const card = resolveCard();
           // #238 R5 — mark the first landable match in the aligned card (never the
           // card root); a no-mark landing clears the highlight.
-          markCurrent(convFindOpenRef.current ? firstLandableMark(card) : null);
+          if (card && convFindOpenRef.current && exactOccurrence) {
+            applyCurrentOccurrence(card, exactOccurrence.occurrence_id);
+          } else {
+            markCurrent(card && convFindOpenRef.current ? firstLandableMark(card) : null);
+          }
+          return landed && card != null;
         },
         // #237/#291 — the convergent find landing, used for EVERY find jump (not just
         // auto-expanded disclosures): re-center the matched mark EVERY frame until the
@@ -1402,50 +1484,54 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         // re-measure (the top-reset). The target re-resolves each frame.
         landFindReassert: async () => {
           const body = bodyRef.current;
-          if (!body) return;
+          if (!body) return false;
           const probeTarget = (): HTMLElement | null => {
             const turn = (itemRefs.current.get(targetUuid)
               ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
             if (!turn || !turn.isConnected) return null;
+            if (convFindOpenRef.current && exactOccurrence) {
+              applyCurrentOccurrence(turn, exactOccurrence.occurrence_id);
+              return firstLandableOccurrenceFragment(turn, exactOccurrence.occurrence_id) ?? turn;
+            }
             return (convFindOpenRef.current ? firstLandableMark(turn) : null) ?? turn;
           };
-          await reassertCenter({
-            measure: () => {
-              const t = probeTarget();
-              return t ? { desired: alignScrollTop(body, t, 'center'), target: t } : null;
-            },
-            apply: (f) => scrollNodeIntoView(body, f.target as HTMLElement, 'center', 'auto'),
-            nextFrame: () => new Promise<void>((r) => requestAnimationFrame(() => r())),
-            now: () => performance.now(),
-            isAborted: aborted,
-            tol: 1,
-            stableNeeded: REASSERT_STABLE_FRAMES,
-            budgetMs: REASSERT_BUDGET_MS,
-            // #291 Disruption C — virtuoso's deferred re-measure transiently recycles
-            // the target row (~57ms) on a force-open; tolerate that transient 'gone'
-            // (per-outage, ¼ of the budget) so the loop resumes centering on re-mount
-            // instead of bailing. SidechainGroup's reveal reassert opts out (default 0).
-            transientGoneGraceMs: 200,
-          });
-          if (aborted()) return;
+          const landed = await reassertLanding(probeTarget, 'center');
+          if (aborted()) return false;
           const ct = (itemRefs.current.get(targetUuid)
             ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-          markCurrent(ct && ct.isConnected && convFindOpenRef.current ? firstLandableMark(ct) : null);
+          if (ct && ct.isConnected && convFindOpenRef.current && exactOccurrence) {
+            applyCurrentOccurrence(ct, exactOccurrence.occurrence_id);
+          } else {
+            markCurrent(ct && ct.isConnected && convFindOpenRef.current ? firstLandableMark(ct) : null);
+          }
+          return landed && !!ct?.isConnected;
         },
-        // #236 — center the turn's first LANDABLE <mark> when find is open (re-query
-        // before each scroll), else center the turn root (#204). Single re-assert.
-        landCenter: async () => {
+        // #479 — an ordinary deep link lands at the START of the requested message,
+        // not the center of a potentially multi-thousand-pixel row. Re-resolve and
+        // reassert every frame so Virtuoso's measured-height correction cannot move
+        // the target away after the runner has declared success.
+        landStartReassert: async () => {
           const body = bodyRef.current;
-          const el = (itemRefs.current.get(targetUuid)
-            ?? body?.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
-          if (!body || !el) return;
-          const centerTarget = (): HTMLElement =>
-            (convFindOpenRef.current ? firstLandableMark(el) : null) ?? el;
-          scrollNodeIntoView(body, centerTarget(), 'center', 'auto');
-          await waitForQuiesce(targetUuid);
-          if (aborted()) return;
-          scrollNodeIntoView(body, centerTarget(), 'center', 'auto'); // §2.1 single re-assert
-          markCurrent(convFindOpenRef.current ? firstLandableMark(el) : null);
+          if (!body) return false;
+          const resolveTarget = (): HTMLElement | null => {
+            const el = (itemRefs.current.get(targetUuid)
+              ?? body.querySelector(`[data-uuid="${CSS.escape(targetUuid)}"]`)) as HTMLElement | null;
+            if (!el || !el.isConnected) return null;
+            // #463 S4 F-A — a tier-2 jump names a block inside the item, not the
+            // item. The browser gate measured the item-only landing putting the
+            // failure it named up to 6,574px below a 635px viewport, because one
+            // Codex segment can be 4,098px tall. A key that resolves to nothing
+            // falls back to the item, which is the pre-S4 landing.
+            const inner = resolveJumpAnchor(el, jump.inner_anchor_key);
+            return inner && inner.isConnected ? inner : el;
+          };
+          // Four stable frames can still precede Virtuoso's delayed correction;
+          // keep observing long enough to catch and repair the measured 68ms shift.
+          const landed = await reassertLanding(resolveTarget, 'start', 250);
+          if (aborted()) return false;
+          const el = resolveTarget();
+          markCurrent(null);
+          return landed && el != null;
         },
         // §5 (Codex P1-D) — force-open the WHOLE ancestor chain (the target subagent
         // + every parent up to the root). Setting it re-fires the effect.
@@ -1467,7 +1553,19 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           // live-tail stick resumes once the target is centered.
           follow.settle();
           setJumpedUuid(targetUuid);
-          dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: targetUuid });
+          // #463 S4 remediation C-3 — the pin carries the inner anchor the jump
+          // REQUESTED, so the outline rail can mark the row the jump named
+          // whichever entry point issued it. Null when the jump named none,
+          // which clears a stale anchor from a previous landmark landing.
+          //
+          // Round 3 (F6) — "requested", not "aligned": when
+          // `resolveJumpAnchor` finds nothing for the key, the landing falls
+          // back to aligning the item while this still records the key. That is
+          // the behaviour we want — the rail should mark the row the user asked
+          // for even when the block it names is not in the DOM — but the
+          // comment claimed the pin recorded what the landing actually used.
+          dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: targetUuid,
+                     anchorKey: jump.inner_anchor_key ?? null });
           setCursor(arrayIndex);
           if (highlightTimerRef.current != null) window.clearTimeout(highlightTimerRef.current);
           highlightTimerRef.current = window.setTimeout(() => {
@@ -1502,7 +1600,9 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         // check is the correct supersession guard: a superseded or torn-down run
         // returns 'aborted', never 'exhausted-cleared'.
         const outcome = await runJumpPipeline(runnerDeps);
-        if (outcome === 'exhausted-cleared') setJumpUnresolved(true);
+        if (outcome === 'exhausted-cleared') setJumpFailure('unresolved');
+        if (outcome === 'landing-failed') setJumpFailure('landing_failed');
+        if (outcome === 'load-failed') setJumpFailure('load_failed');
       } finally {
         // Re-enable edge paging once the whole jump operation has run or bailed, but
         // ONLY if THIS run is still the current owner (a newer run that superseded
@@ -1596,7 +1696,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   useEffect(() => {
     setNewCount(0);
     // #463 S1 — a give-up message belongs to the conversation that produced it.
-    setJumpUnresolved(false);
+    setJumpFailure(null);
     // #217 S3 E2 / #281 S5 A3 — the open-precedence fold: an anchor/restore open
     // lands the user on a SPECIFIC turn (not the tail), so it must NOT force
     // atBottom (else a live append would yank the viewport to the bottom). A tail
@@ -1965,14 +2065,34 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // outline skeleton via the SHARED builder (outlineNavigation.ts), so the
   // reader keys and the OutlinePanel cluster can never drift. Memoized on
   // `outline` so a paged tick doesn't rebuild them; jumpNext reads via refs.
-  const { indexByUuid: turnIndexByUuid, ...targetLists } = useMemo(
-    () => buildOutlineTargets(outline?.turns ?? [], convBookmarks),
+  // #463 S4 remediation C-1 — the WHOLE object is retained rather than peeled
+  // down to the family lists plus a bare `indexByUuid`. `cursorIndex` needs all
+  // three maps, because the pin a landmark jump leaves behind is a SEGMENT key
+  // and only `segmentIndex` holds those.
+  const targetLists = useMemo(
+    () => buildOutlineTargets(outline?.turns ?? [], convBookmarks, outline?.landmarks),
     [outline, convBookmarks],
   );
   const targetListsRef = useRef(targetLists);
   targetListsRef.current = targetLists;
-  const turnIndexByUuidRef = useRef(turnIndexByUuid);
-  turnIndexByUuidRef.current = turnIndexByUuid;
+
+  // #463 S4 remediation round 3 (F2) — the number every Errors-filter badge in
+  // this header shows. It is the error-TURN count, which is what the outline
+  // chip beside it already reported; the length of `targetLists.error` is one
+  // entry per failing CALL under landmark awareness, and the browser gate saw
+  // that length render 27 beside a chip reading 14. Computed once here rather
+  // than at each render site, because the three sites are the desktop segmented
+  // control and its two compact-menu twins, and the previous round fixed the
+  // chip and left all three of them.
+  //
+  // Round 4 — this is the CHIP's number, not a row count for the Errors filter.
+  // Round 3 asserted the two were the same and they are not: `applyFocusMode`
+  // keeps visible NODES, and a segmented Codex turn contributes one node per
+  // segment, so a turn whose failures fall in two segments shows two rows here
+  // against a badge contribution of one. Far closer than the call count it
+  // replaced, and exactly what the badge is specified to equal — but do not
+  // restate it as the filter's row count.
+  const errorTurnCount = useMemo(() => distinctOwnerTurns(targetLists.error), [targetLists]);
 
   // Transient 300ms pulse on the OutlinePanel cluster button for a kind. Skipped
   // entirely under reduced motion (spec §5 / §7). Found via data-jump-kind in
@@ -1994,27 +2114,31 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     // visible, which lags above a centered target); else the focused child's
     // data-uuid; else -1 ("before the start") so a forward jump finds the first
     // target.
-    const byUuid = turnIndexByUuidRef.current;
-    let cursor = -1;
+    const all = targetListsRef.current;
     const cu = convPinnedUuidRef.current ?? currentTurnUuidRef.current;
-    if (cu != null && byUuid.has(cu)) {
-      cursor = byUuid.get(cu)!;
-    } else {
-      // #232 — the keyboard cursor's turn uuid IS the source of truth (the cursored
-      // node may be UNMOUNTED under virtualization, and the index ref can be stale
-      // after a head mutation, so a DOM/index read is wrong). Use cursorUuidRef.
-      const du = cursorUuidRef.current;
-      if (du != null && byUuid.has(du)) cursor = byUuid.get(du)!;
-    }
-    const targetIdx = nextTarget(list, cursor, dir);
-    if (targetIdx == null) { pulseClusterButton(kind); return; }
-    const turn = turns[targetIdx];
+    // #232 — the keyboard cursor's turn uuid IS the source of truth (the cursored
+    // node may be UNMOUNTED under virtualization, and the index ref can be stale
+    // after a head mutation, so a DOM/index read is wrong). Use cursorUuidRef.
+    // #463 S4 remediation C-1 — both lookups go through `cursorIndex`, which
+    // resolves a segment key too. With the own-uuid map alone, the pin a
+    // landmark jump had just written resolved to nothing, the cursor stayed at
+    // -1, and every forward press re-found the FIRST target while every
+    // backward press found none.
+    const resolved = cursorIndex(all, cu);
+    const cursor = resolved >= 0 ? resolved : cursorIndex(all, cursorUuidRef.current);
+    const target = nextTargetEntry(list, cursor, dir);
+    if (target == null) { pulseClusterButton(kind); return; }
+    // #463 S4 §6.3 — the jump loads the target's ANCHOR, which for a tier-2
+    // landmark is the segment holding the failure; the visibility check below
+    // resolves the OWNING turn through `ownerTurnIndex`, which indexes this
+    // same tier-1 array.
+    const turn = turns[target.ownerTurnIndex];
     // Reset to `all` IF the current mode would hide the target. Precise check
     // (spec §5): find the target's TOP-LEVEL RenderNode (recursing into nested
     // subagents), test nodeVisible. A node missing from `groups` (not yet paged
     // in) is treated as hidden → reset.
     const mode = focusModeRef.current;
-    if (mode !== 'all') {
+    if (turn && mode !== 'all') {
       const node = findTopLevelNodeFor(groupsRef.current, turn.uuid, { subagent_meta: subagentMetaRef.current });
       const targetHidden = node == null || !nodeVisible(node, mode);
       if (targetHidden) dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
@@ -2022,7 +2146,8 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef: conversationRefRef.current,
-      jump: readerJump(conversationRefRef.current, turn.uuid, qualifiedInputRef.current),
+      jump: readerJump(conversationRefRef.current, target.anchorKey,
+                       qualifiedInputRef.current, { innerAnchorKey: target.innerAnchorKey }),
     });
   }, [pulseClusterButton]);
   const jumpNextRef = useRef(jumpNext);
@@ -2038,11 +2163,11 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     const turns = outlineRef.current?.turns ?? [];
     if (turns.length === 0) return;
     const list = targetListsRef.current[kind];
-    const targetIdx = list.at(-1);
-    if (targetIdx == null) return;  // no occurrence → no-op
-    const turn = turns[targetIdx];
+    const target = list.at(-1);
+    if (target == null) return;  // no occurrence → no-op
+    const turn = turns[target.ownerTurnIndex];
     const mode = focusModeRef.current;
-    if (mode !== 'all') {
+    if (turn && mode !== 'all') {
       const node = findTopLevelNodeFor(groupsRef.current, turn.uuid, { subagent_meta: subagentMetaRef.current });
       const targetHidden = node == null || !nodeVisible(node, mode);
       if (targetHidden) dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
@@ -2050,7 +2175,8 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef: conversationRefRef.current,
-      jump: readerJump(conversationRefRef.current, turn.uuid, qualifiedInputRef.current),
+      jump: readerJump(conversationRefRef.current, target.anchorKey,
+                       qualifiedInputRef.current, { innerAnchorKey: target.innerAnchorKey }),
     });
   }, []);
   const jumpToLastRef = useRef(jumpToLast);
@@ -2084,6 +2210,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // #177 S6 — close-restore: return keyboard focus to the thread so j/k resume.
   const onFindClose = useCallback(() => {
     setFindTerms(null);
+    setExactFind(null);
     threadRef.current?.focus?.();
   }, []);
 
@@ -2091,7 +2218,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // switch closes find via the store) so stale marks don't linger.
   // #238 R5 — also clear the distinct current-match class on close.
   useEffect(() => {
-    if (!convFindOpen) { setFindTerms(null); markCurrent(null); }
+    if (!convFindOpen) { setFindTerms(null); setExactFind(null); markCurrent(null); }
   }, [convFindOpen, markCurrent]);
   // #238 R5 — clear the current-match class when the needle changes: React may
   // reuse an imperatively-classed <mark> across a find-terms change, so a stale
@@ -2192,6 +2319,14 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         segment: string; steps: number }
     | null
   >(null);
+  // A loaded top-level heading whose owning Virtuoso row is not mounted. State,
+  // rather than only a ref, is load-bearing: the render that records the target
+  // must first pass literal `followOutput={false}` before the measurement walk
+  // starts, or react-virtuoso's resize watcher can pull the one-row tail back to
+  // the bottom while the requested neighbour is being measured (#486).
+  const [headingWalkTarget, setHeadingWalkTarget] = useState<
+    { key: string; uuid: string } | null
+  >(null);
 
   // The VISIBLE element carrying a heading key, or null. Attribute-walk rather
   // than an interpolated attribute selector: a heading key embeds an opaque hash
@@ -2235,7 +2370,13 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // the viewport is moved toward the OWNING item and the request is retried once
   // the row renders. The cursor is not touched until one of those lands.
   const requestHeading = useCallback((target: { key: string; uuid: string }) => {
-    if (focusHeadingRef.current(target)) { pendingHeadingRef.current = null; return; }
+    if (focusHeadingRef.current(target)) {
+      pendingHeadingRef.current = null;
+      setHeadingWalkTarget(null);
+      return;
+    }
+    const existing = pendingHeadingRef.current;
+    if (existing?.kind === 'key' && existing.key === target.key) return;
     pendingHeadingRef.current = { kind: 'key', key: target.key, uuid: target.uuid, attempts: 0 };
     // Loaded, and inside the render tree: this is Virtuoso's window, so scroll
     // the owning row into the mounted set and land on the retry.
@@ -2248,7 +2389,22 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     // for exactly the targets that needed it.
     const hit = nodeIndexForUuid(nodesRef.current, target.uuid, firstItemIndexRef.current);
     if (hit && nodesRef.current[hit.arrayIndex]?.kind !== 'subagent') {
-      virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align: 'center', behavior: 'auto' });
+      setHeadingWalkTarget(target);
+      return;
+    }
+    const owner = resolveJumpOwner(nodesRef.current, target.uuid);
+    if (owner?.isCardRoot && owner.ownerSubagentKey != null) {
+      // A bucket-root jump deliberately flashes the collapsed card without
+      // opening it (#188 B1). Heading navigation has a different contract: the
+      // heading itself must become visible, so force-open the complete ancestor
+      // chain and let the same measurement walk mount its top-level card.
+      const chain = ancestorKeys(owner.ownerSubagentKey, detail?.subagent_meta);
+      setForcedOpenKeys((prev) => {
+        const next = new Set(prev);
+        for (const key of chain) next.add(key);
+        return next;
+      });
+      setHeadingWalkTarget(target);
       return;
     }
     // Not reachable by scrolling alone — a collapsed or internally windowed
@@ -2258,11 +2414,110 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef: conversationRefRef.current,
-      jump: readerJump(conversationRefRef.current, target.uuid, qualifiedInputRef.current),
+      // #463 S4 remediation C-2 — a heading target's `key` is exactly the
+      // `data-heading-key` the reader renders, so the landing can align the
+      // heading itself rather than the top of the item holding it. The pending
+      // request below still runs and still paints the mark; this only removes
+      // the intermediate landing on the wrong scroll position.
+      jump: readerJump(conversationRefRef.current, target.uuid,
+                       qualifiedInputRef.current, { innerAnchorKey: target.key }),
     });
-  }, []);
+  }, [detail?.subagent_meta]);
   const requestHeadingRef = useRef(requestHeading);
   requestHeadingRef.current = requestHeading;
+
+  // Drive a loaded, unmounted heading through the same coverage walk as a jump,
+  // but land on the exact heading rather than the owning row. The walk retries
+  // after structural quiescence even when the final rendered range is unchanged,
+  // breaking the circular "range change arms the retry" dependency from #486.
+  // A failed walk restores the previous heading before releasing follow mode, so
+  // a keypress cannot consume or visibly clear the established cursor.
+  useEffect(() => {
+    const target = headingWalkTarget;
+    if (!target) return;
+    let cancelled = false;
+    let token = 0;
+    const aborted = () => cancelled || !gates.isCurrentRun(token);
+    const previous = currentHeadingRef.current && currentHeadingUuidRef.current
+      ? { key: currentHeadingRef.current, uuid: currentHeadingUuidRef.current }
+      : null;
+    const walkOwner = (owner: { key: string; uuid: string }) => {
+      let lastRequest: { index: number; first: number; last: number } | null = null;
+      const body = bodyRef.current;
+      const pixelHop = Math.max((body?.clientHeight ?? 0) * 2, 1_024);
+      // Enough retries to physically cross the whole current size model in the
+      // worst one-giant-row case, with a ceiling that keeps a detached walk
+      // bounded. Ordinary item-level walks still finish far earlier.
+      const pixelBudget = body ? Math.ceil(body.scrollHeight / pixelHop) + 4 : 0;
+      return walkToTarget({
+        getTargetArrayIndex: () => {
+          const hit = nodeIndexForUuid(nodesRef.current, owner.uuid, firstItemIndexRef.current);
+          return hit ? hit.arrayIndex : null;
+        },
+        getMountedArrayRange: () => ({
+          first: renderedRangeRef.current.first - firstItemIndexRef.current,
+          last: renderedRangeRef.current.last - firstItemIndexRef.current,
+        }),
+        scrollToIndex: (index, alignEdge) => {
+          const range = {
+            first: renderedRangeRef.current.first - firstItemIndexRef.current,
+            last: renderedRangeRef.current.last - firstItemIndexRef.current,
+          };
+          if (body && lastRequest?.index === index
+              && lastRequest.first === range.first && lastRequest.last === range.last) {
+            // Virtuoso ignores an identical estimate-based request after its
+            // measurement correction rebounds to the same mounted row. Move
+            // through that row in real pixels instead; the next item-index step
+            // is then issued from new geometry rather than replaying a no-op.
+            body.scrollTop += index < range.first ? -pixelHop : pixelHop;
+          } else {
+            virtuosoRef.current?.scrollToIndex({ index, align: alignEdge, behavior: 'auto' });
+          }
+          lastRequest = { index, ...range };
+        },
+        // A bare scrollToIndex can look unchanged for one animation frame before
+        // Virtuoso mounts the requested row and then rebounds after measuring it.
+        // Three consecutive stable frames keep the walk alive through that delayed
+        // correction; the generic jump pipeline retains its established one-frame
+        // quiescence contract.
+        // A timer keeps bounded heading navigation progressing even when the
+        // browser throttles animation frames for a partially obscured tab.
+        quiesce: () => waitForLayoutQuiesce(owner.uuid, aborted, 3, true),
+        isAborted: aborted,
+        maxSteps: Math.min(512, Math.max(60, nodesRef.current.length, pixelBudget)),
+        initialWindow: Math.max(1, renderedRangeRef.current.last - renderedRangeRef.current.first + 1),
+      });
+    };
+    void (async () => {
+      token = gates.beginProgrammaticRun();
+      try {
+        if (focusHeadingRef.current(target)) {
+          pendingHeadingRef.current = null;
+          return;
+        }
+        const outcome = await walkOwner(target);
+        if (aborted()) return;
+        if (outcome === 'mounted' && focusHeadingRef.current(target)) {
+          pendingHeadingRef.current = null;
+          return;
+        }
+        if (previous && !focusHeadingRef.current(previous)) {
+          const restored = await walkOwner(previous);
+          if (!aborted() && restored === 'mounted') focusHeadingRef.current(previous);
+        }
+        if (pendingHeadingRef.current?.kind === 'key'
+            && pendingHeadingRef.current.key === target.key) {
+          pendingHeadingRef.current = null;
+        }
+      } finally {
+        gates.endProgrammaticRun(token);
+        if (!cancelled) {
+          setHeadingWalkTarget((live) => live?.key === target.key ? null : live);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [headingWalkTarget, gates, waitForLayoutQuiesce]);
 
   // The nearest key past `fromUuid` in DOCUMENT order that the loaded window does
   // NOT already hold, from the outline's positional index over the FULL wire turn
@@ -2372,7 +2627,17 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     const pending = pendingHeadingRef.current;
     if (!pending) return;
     if (pending.kind === 'key') {
-      if (focusHeading(pending)) { pendingHeadingRef.current = null; return; }
+      // The self-driven top-level walk owns both its retry budget and its exact
+      // landing. Checking this BEFORE focus is load-bearing: a passive range
+      // effect can otherwise claim the briefly mounted row during Virtuoso's
+      // correction, clear the walk, and leave the new cursor unpainted after
+      // the row rebounds. This path remains for post-jump subagent commits only.
+      if (headingWalkTarget?.key === pending.key) return;
+      if (focusHeading(pending)) {
+        pendingHeadingRef.current = null;
+        setHeadingWalkTarget((live) => live?.key === pending.key ? null : live);
+        return;
+      }
       // Drop a request whose heading has left the visible list (a window trim, a
       // focus-mode change). A stale request must never fire later with no
       // keypress behind it.
@@ -2382,14 +2647,6 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
       }
       if (pending.attempts >= HEADING_MOUNT_ATTEMPTS) { pendingHeadingRef.current = null; return; }
       pending.attempts += 1;
-      // Still loaded, still not mounted: nudge the window again. Each mounted
-      // range change measures more rows, so a far target converges. A subagent
-      // hit is skipped for the reason `requestHeading` gives — scrolling cannot
-      // open a shut thread, and that request already went to the jump pipeline.
-      const hit = nodeIndexForUuid(nodesRef.current, pending.uuid, firstItemIndexRef.current);
-      if (hit && nodesRef.current[hit.arrayIndex]?.kind !== 'subagent') {
-        virtuosoRef.current?.scrollToIndex({ index: hit.arrayIndex, align: 'center', behavior: 'auto' });
-      }
       return;
     }
     // The edge walk. The cursor has not moved, so continue from it — through the
@@ -2416,7 +2673,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
       conversationRef: conversationRefRef.current,
       jump: readerJump(conversationRefRef.current, further, qualifiedInputRef.current),
     });
-  }, [headingTargets, renderedRangeRev, forcedOpenKeys, focusHeading, nextUnloadedKey, locateHeadingCursor]);
+  }, [headingTargets, renderedRangeRev, forcedOpenKeys, headingWalkTarget, focusHeading, nextUnloadedKey, locateHeadingCursor]);
 
   // Re-assert the mark from the cursor.
   //
@@ -2891,7 +3148,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
               focusMode={focusMode}
               subagents={subagentOptions}
               onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
-              errorCount={targetLists.error.length}
+              errorCount={errorTurnCount}
             />
             <button
               type="button"
@@ -2938,7 +3195,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
                 focusMode={focusMode}
                 subagents={subagentOptions}
                 onSelect={(mode) => dispatch({ type: 'SET_CONV_FOCUS_MODE', mode })}
-                errorCount={targetLists.error.length}
+                errorCount={errorTurnCount}
               />
               <button
                 type="button"
@@ -2998,11 +3255,17 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
                 // label map is keyed to that narrowed union, not the full FocusMode.
                 const labels: Record<'all' | 'chat' | 'prompts' | 'errors', string> = { all: 'All', chat: 'Chat', prompts: 'Prompts', errors: 'Errors' };
                 // #217 S3 E10#2 — the badge is the error-TURN count (== the jump
-                // cluster chip == what clicking the Errors filter navigates to),
-                // NOT stats.error_count (the server's total error-EVENT count, which
-                // double-counts a turn with multiple error tools). The Stats card
-                // keeps the reconciliation phrasing "N errors in M turns".
-                const errCount = targetLists.error.length;
+                // cluster chip), NOT stats.error_count (the server's total
+                // error-EVENT count, which double-counts a turn with multiple
+                // error tools). The Stats card keeps the reconciliation phrasing
+                // "N errors in M turns". Round 4 dropped the "== what clicking
+                // the Errors filter navigates to" clause: the filter keeps
+                // visible NODES, so a segmented Codex turn can show more rows
+                // than it contributes to this count (see `errorTurnCount`).
+                // #463 S4 remediation round 3 (F2) — and NOT the length of the
+                // target list either, which landmark awareness made one entry per
+                // failing CALL while this comment kept claiming turns.
+                const errCount = errorTurnCount;
                 return (
                   <button
                     key={m}
@@ -3164,6 +3427,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           sessionId={qualifiedInput ? conversationRef : sessionId}
           onClose={onFindClose}
           onTermsChange={onFindTermsChange}
+          onExactFindChange={setExactFind}
           stepRef={findStepRef}
           tailRevision={tailRevision}
         />
@@ -3180,6 +3444,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           reader (T5). The Highlight/Transcript providers wrap it so every mounted
           card reads the find terms + transcript context. */}
       <HighlightContext.Provider value={findTerms}>
+      <ExactFindContext.Provider value={exactFind}>
       <TranscriptContext.Provider value={transcriptCtx}>
       {/* #463 S1 (#448) — an in-scroller indicator for a page request in flight
           with rows already mounted, so a reverse page or a jump drain is visibly
@@ -3222,13 +3487,28 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           `role="status"` sits on the message span rather than on the container,
           so the live region announces the message alone and the dismiss button
           is not read as part of it. */}
-      {detail && jumpUnresolved && (
+      {detail && (jumpFailure === 'unresolved' || jumpFailure === 'landing_failed') && (
         <div className="conv-paging-indicator conv-paging-indicator--failed" data-testid="conv-jump-unresolved">
-          <span className="conv-paging-label" role="status">Could not load the linked message.</span>
+          <span className="conv-paging-label" role="status">
+            {jumpFailure === 'landing_failed'
+              ? 'The linked message could not be brought into view.'
+              : 'The linked message was not found.'}
+          </span>
           <button
             type="button"
             className="conv-paging-dismiss"
-            onClick={() => setJumpUnresolved(false)}
+            onClick={() => setJumpFailure(null)}
+            aria-label="Dismiss"
+          >×</button>
+        </div>
+      )}
+      {detail && jumpFailure === 'load_failed' && (
+        <div className="conv-paging-indicator conv-paging-indicator--failed" data-testid="conv-jump-load-failed">
+          <span className="conv-paging-label" role="status">Could not finish loading the linked message. Check your connection and try again.</span>
+          <button
+            type="button"
+            className="conv-paging-dismiss"
+            onClick={() => setJumpFailure(null)}
             aria-label="Dismiss"
           >×</button>
         </div>
@@ -3271,8 +3551,9 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         // watcher; otherwise the live stick callback runs. …and while a same-session
         // jump is active (`activeJumpForSession`, #291) — the jump-dispatch render
         // must already be `false` so a jump-driven force-open's `SIZE_INCREASED`
-        // finds no armed watcher.
-        followOutput={(followMode === 'suspended' || activeJumpForSession) ? false : (atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
+        // finds no armed watcher. #486 applies the same literal suspension while
+        // a heading measurement walk owns the viewport.
+        followOutput={(followMode === 'suspended' || activeJumpForSession || headingWalkTarget != null) ? false : (atBottom) => (atBottom ? (reduced ? 'auto' : 'smooth') : false)}
         atBottomThreshold={80}
         atBottomStateChange={(atBottom) => { atBottomRef.current = atBottom; gates.arm(); follow.settle(); if (atBottom) setNewCount((n) => (n ? 0 : n)); }}
         itemsRendered={onItemsRendered}
@@ -3280,6 +3561,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         onScroll={onBodyScroll}
       />
       </TranscriptContext.Provider>
+      </ExactFindContext.Provider>
       </HighlightContext.Provider>
       {/* #175 F4 — "↓ N new" pill. A child of .conv-reader (NOT the scrolling
           .conv-reader-body), absolutely positioned so it floats over the body

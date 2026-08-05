@@ -1,0 +1,343 @@
+{
+  "children": [],
+  "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "files": [
+    {
+      "added": 55,
+      "count": 1,
+      "file_path": "/synthetic/root-a/project-red/a-generated-clipped.py",
+      "removed": 0,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "op": "add",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ]
+    },
+    {
+      "added": 2,
+      "count": 1,
+      "file_path": "/synthetic/root-a/project-red/added.py",
+      "removed": 0,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "op": "add",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ]
+    },
+    {
+      "added": 0,
+      "count": 1,
+      "file_path": "/synthetic/root-a/project-red/empty.py",
+      "removed": 0,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "op": "add",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ]
+    },
+    {
+      "added": 0,
+      "count": 1,
+      "file_path": "/synthetic/root-a/project-red/removed.py",
+      "removed": 1,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "op": "delete",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ]
+    },
+    {
+      "added": 1,
+      "count": 1,
+      "file_path": "/synthetic/root-a/project-red/updated.py",
+      "removed": 1,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+          "op": "update",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ]
+    }
+  ],
+  "landmarks": [
+    {
+      "block_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+      "item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "kind": "tool_error",
+      "label": "exec",
+      "landmark_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f#tool_error",
+      "parent_item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "timestamp_utc": "2026-08-02T09:00:07Z"
+    },
+    {
+      "block_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+      "item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "kind": "tool_error",
+      "label": "write_stdin",
+      "landmark_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534#tool_error",
+      "parent_item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "timestamp_utc": "2026-08-02T09:00:13Z"
+    },
+    {
+      "block_key": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e",
+      "item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "kind": "tool_error",
+      "label": "fixture_get_issue",
+      "landmark_key": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e#tool_error",
+      "parent_item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "timestamp_utc": "2026-08-02T09:00:21Z"
+    },
+    {
+      "block_key": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70",
+      "item_key": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+      "kind": "plan",
+      "label": "update_plan",
+      "landmark_key": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70#plan",
+      "parent_item_key": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+      "timestamp_utc": "2026-08-02T09:03:02Z"
+    },
+    {
+      "block_key": "cbk1_d86da189d8427c7e457808cdc573aeb805a0bade",
+      "item_key": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+      "kind": "tool_error",
+      "label": "tool_output",
+      "landmark_key": "cbk1_d86da189d8427c7e457808cdc573aeb805a0bade#tool_error",
+      "parent_item_key": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+      "timestamp_utc": "2026-08-02T09:04:04Z"
+    }
+  ],
+  "stats": {
+    "cost_usd": 0.0039,
+    "duration_seconds": 242,
+    "error_count": 4,
+    "items": 10,
+    "kinds": {
+      "assistant": 3,
+      "event": 2,
+      "tool_call": 14,
+      "tool_output": 13,
+      "user": 5
+    },
+    "models": {
+      "gpt-synthetic-codex": 4
+    },
+    "tokens": {
+      "cached_input": 200,
+      "input": 900,
+      "output": 300,
+      "reasoning_output": 80,
+      "source": "codex"
+    },
+    "tool_counts": {
+      "apply_patch": 1,
+      "exec": 4,
+      "exec_command": 1,
+      "fixture_get_issue": 1,
+      "js": 1,
+      "tool_search_call": 1,
+      "update_plan": 1,
+      "wait": 1,
+      "write_stdin": 3
+    }
+  },
+  "status": "ok",
+  "turns": [
+    {
+      "item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Exercise the synthetic tool-legibility shapes",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+      ],
+      "timestamp_utc": "2026-08-02T09:00:02Z"
+    },
+    {
+      "first_failure_name": "exec",
+      "item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "kinds": {
+        "assistant": 1,
+        "event": 1,
+        "tool_call": 11,
+        "tool_output": 11
+      },
+      "label": "Running the synthetic tool families.",
+      "member_item_keys": [
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+      ],
+      "model": "gpt-synthetic-codex",
+      "segment_item_keys": [
+        "civ1_f335a8740d1142ec42d960880521be2f9614cc14"
+      ],
+      "timestamp_utc": "2026-08-02T09:00:04Z",
+      "tool_call_count": 11,
+      "tools": [
+        {
+          "is_error": true,
+          "name": "exec"
+        },
+        {
+          "is_error": false,
+          "name": "exec_command"
+        },
+        {
+          "is_error": true,
+          "name": "write_stdin"
+        },
+        {
+          "is_error": false,
+          "name": "wait"
+        },
+        {
+          "is_error": false,
+          "name": "js"
+        },
+        {
+          "is_error": false,
+          "name": "tool_search_call"
+        },
+        {
+          "is_error": true,
+          "name": "fixture_get_issue"
+        },
+        {
+          "is_error": false,
+          "name": "apply_patch"
+        }
+      ]
+    },
+    {
+      "item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Apply the synthetic dict-shaped patch",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983"
+      ],
+      "timestamp_utc": "2026-08-02T09:01:01Z"
+    },
+    {
+      "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+      "kinds": {
+        "event": 1
+      },
+      "label": "patch_apply /synthetic/root-a/project-red/a-generated-clipped.py /synthetic/root-a/project-red/added.py /synthetic/root-a/project-red/empty.py /synthetic/root-a/project-red/removed.py /synthetic/root-a/project-red/updated.py",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_a95002d577138d681f720af29a266fdc3fda0c91"
+      ],
+      "timestamp_utc": "2026-08-02T09:01:02Z"
+    },
+    {
+      "item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Delegate the synthetic search",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e"
+      ],
+      "timestamp_utc": "2026-08-02T09:02:01Z"
+    },
+    {
+      "item_key": "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d",
+      "kinds": {
+        "assistant": 2
+      },
+      "label": "Delegating to the search tool.",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_item_keys": [
+        "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d"
+      ],
+      "timestamp_utc": "2026-08-02T09:02:02Z"
+    },
+    {
+      "item_key": "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Record the synthetic plan",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da"
+      ],
+      "timestamp_utc": "2026-08-02T09:03:01Z"
+    },
+    {
+      "first_failure_name": null,
+      "item_key": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+      "kinds": {
+        "tool_call": 1,
+        "tool_output": 1
+      },
+      "label": "update_plan",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_item_keys": [
+        "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa"
+      ],
+      "timestamp_utc": "2026-08-02T09:03:02Z",
+      "tool_call_count": 1,
+      "tools": [
+        {
+          "is_error": false,
+          "name": "update_plan"
+        }
+      ]
+    },
+    {
+      "item_key": "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Run the synthetic command twice under one id",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7"
+      ],
+      "timestamp_utc": "2026-08-02T09:04:01Z"
+    },
+    {
+      "first_failure_name": null,
+      "item_key": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+      "kinds": {
+        "tool_call": 2,
+        "tool_output": 1
+      },
+      "label": "exec",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_item_keys": [
+        "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1"
+      ],
+      "timestamp_utc": "2026-08-02T09:04:02Z",
+      "tool_call_count": 2,
+      "tools": [
+        {
+          "is_error": false,
+          "name": "exec"
+        }
+      ]
+    }
+  ]
+}

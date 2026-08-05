@@ -56,9 +56,10 @@ const PAGE = 50;
 
 export function useConversations(
   source: ConversationSource = 'claude',
-  options: { qualified?: boolean } = {},
+  options: { qualified?: boolean; accountKey?: string } = {},
 ): UseConversations {
   const qualified = options.qualified === true || source === 'codex';
+  const accountKey = options.accountKey;
   const [rows, setRows] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,6 +69,8 @@ export function useConversations(
   sourceRef.current = source;
   const qualifiedRef = useRef(qualified);
   qualifiedRef.current = qualified;
+  const accountRef = useRef(accountKey);
+  accountRef.current = accountKey;
   const [filterDegraded, setFilterDegraded] = useState(false);
   const [sortDegraded, setSortDegraded] = useState(false);
   // Active browse filters from the store (filters spec §4). A `filtersRef` mirror
@@ -126,21 +129,30 @@ export function useConversations(
     ctlRef.current = ctl;
     const activeSource = sourceRef.current;
     const activeQualified = qualifiedRef.current;
+    const activeAccount = accountRef.current;
     const url = activeQualified
       ? qualifiedBrowseUrl(activeSource, {
+          accountKey: activeAccount,
           projectKey: filtersRef.current.projects[0], model: filtersRef.current.models[0], limit: PAGE,
         })
-      : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}`;
+      : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}${activeAccount ? `&account=${encodeURIComponent(activeAccount)}` : ''}`;
     fetchJson<ConversationsPage | QualifiedBrowseEnvelope>(url, ctl.signal)
       .then((raw) => {
-        if (sourceRef.current !== activeSource || qualifiedRef.current !== activeQualified) return;
+        if (sourceRef.current !== activeSource
+          || qualifiedRef.current !== activeQualified
+          || accountRef.current !== activeAccount) return;
         if (activeQualified) {
-          const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope);
+          const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
           setRows(body.rows); setNextOffset(body.cursor); setPending(body.pending);
           setFilterDegraded(false); setSortDegraded(false);
         } else {
           const body = raw as ConversationsPage;
-          setRows(body.conversations);
+          setRows(activeAccount
+            ? body.conversations.map((row) => ({
+                ...row,
+                conversation_ref: { source: activeSource, key: row.session_id, account_key: activeAccount },
+              }))
+            : body.conversations);
           setNextOffset(body.page.next_offset);
           setFilterDegraded(body.page.filter_degraded === true);
           setSortDegraded(body.page.sort_degraded === true);
@@ -175,7 +187,7 @@ export function useConversations(
   // effect below (now keyed on the `revalToken` change signal, #305) already
   // issues the initial page-1 load; double-firing here would re-fetch page 1
   // and, mid-paging, clobber the accumulated tail.
-  const queryKey = JSON.stringify({ source, qualified, filters, sort });
+  const queryKey = JSON.stringify({ source, qualified, accountKey, filters, sort });
   const mountQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (mountQueryKeyRef.current === null) {
@@ -240,20 +252,30 @@ export function useConversations(
     try {
       const activeSource = sourceRef.current;
       const activeQualified = qualifiedRef.current;
+      const activeAccount = accountRef.current;
       const raw = await fetchJson<ConversationsPage | QualifiedBrowseEnvelope>(activeQualified
         ? qualifiedBrowseUrl(activeSource, {
+            accountKey: activeAccount,
             projectKey: filtersRef.current.projects[0], model: filtersRef.current.models[0],
             limit: PAGE, cursor: String(nextOffset),
           })
-        : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}`);
+        : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=${nextOffset}${filterParams(filtersRef.current)}${activeAccount ? `&account=${encodeURIComponent(activeAccount)}` : ''}`);
       if (filterGenRef.current !== gen) return; // filter/sort changed mid-flight — drop stale rows
-      if (sourceRef.current !== activeSource || qualifiedRef.current !== activeQualified) return;
+      if (sourceRef.current !== activeSource
+        || qualifiedRef.current !== activeQualified
+        || accountRef.current !== activeAccount) return;
       if (activeQualified) {
-        const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope);
+        const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
         setRows((prev) => [...prev, ...body.rows]); setNextOffset(body.cursor); setPending(body.pending);
       } else {
         const body = raw as ConversationsPage;
-        setRows((prev) => [...prev, ...body.conversations]);
+        const nextRows = activeAccount
+          ? body.conversations.map((row) => ({
+              ...row,
+              conversation_ref: { source: activeSource, key: row.session_id, account_key: activeAccount },
+            }))
+          : body.conversations;
+        setRows((prev) => [...prev, ...nextRows]);
         setNextOffset(body.page.next_offset);
         setFilterDegraded(body.page.filter_degraded === true);
         setSortDegraded(body.page.sort_degraded === true);

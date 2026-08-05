@@ -74,7 +74,7 @@ Database
   ⚠ Version ahead            cache.db ahead (v99 > known v41) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1006, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1007, 'mismatch': False}
         cache.db: {'user_version': 99, 'registry_size': 41, 'ahead': True}
   ✓ Migrations               0/54 applied
       details:
@@ -154,6 +154,10 @@ Data
         missing_conversation_key_rows: 0
         missing_thread_join_rows: 0
         incomplete_rows: 0
+  ✓ Codex orphan pruning     no refused prune
+      details:
+        refusalCount: 0
+        stores: []
   ✓ Codex transcript replay  none pending
       details:
         pending: False
@@ -254,4 +258,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 52 OK · 5 WARN · 0 FAIL
+Summary: 53 OK · 5 WARN · 0 FAIL

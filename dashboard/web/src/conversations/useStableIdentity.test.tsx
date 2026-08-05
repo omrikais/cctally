@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
-import { useStableSet, useStableMap, useMonotonicMax } from './useStableIdentity';
+import { useStableSet, useStableMap, useMonotonicMax, useStableSessionIndex } from './useStableIdentity';
+import type { ConversationSessionIndex } from '../types/conversation';
 
 // #231 — these hooks are the conversation reader's defense against the
 // MessageItem React.memo being defeated on every reverse-page prepend: a
@@ -68,6 +69,83 @@ describe('useStableMap', () => {
     rerender({ m: grown });
     expect(result.current).not.toBe(first);
     expect(result.current).toBe(grown);
+  });
+});
+
+// #463 S3 — the conversation-scoped session index rides the SAME TranscriptContext
+// value every memoized MessageItem reads, and the server re-sends it on every page
+// fetch and every live-tail poll, so an unstabilized identity re-renders the whole
+// visible window on each tick — the exact failure the two hooks above exist to
+// prevent. Bounded by the server's 64-entry cap, so the comparison is cheap.
+describe('useStableSessionIndex', () => {
+  const index = (
+    sessions: ConversationSessionIndex['sessions'],
+    truncated = false,
+  ): ConversationSessionIndex => ({ sessions, truncated });
+
+  it('keeps the prior reference when a re-fetch returns identical content', () => {
+    const { result, rerender } = renderHook(
+      ({ i }: { i: ConversationSessionIndex | undefined }) => useStableSessionIndex(i),
+      { initialProps: { i: index({ '1': { ordinal: 1, opener_block_key: 'cbk.a' } }) } },
+    );
+    const first = result.current;
+    // A live-tail poll re-sends the same index as a FRESH object.
+    rerender({ i: index({ '1': { ordinal: 1, opener_block_key: 'cbk.a' } }) });
+    expect(result.current).toBe(first);
+  });
+
+  it('returns the new reference when a session is added', () => {
+    const { result, rerender } = renderHook(
+      ({ i }: { i: ConversationSessionIndex | undefined }) => useStableSessionIndex(i),
+      { initialProps: { i: index({ '1': { ordinal: 1, opener_block_key: null } }) } },
+    );
+    const first = result.current;
+    const grown = index({
+      '1': { ordinal: 1, opener_block_key: null },
+      '2': { ordinal: 2, opener_block_key: null },
+    });
+    rerender({ i: grown });
+    expect(result.current).not.toBe(first);
+    expect(result.current).toBe(grown);
+  });
+
+  it('returns the new reference when an opener is newly bound', () => {
+    // A later page can carry the announcing output, so an entry's
+    // `opener_block_key` genuinely flips from null to a block key.
+    const { result, rerender } = renderHook(
+      ({ i }: { i: ConversationSessionIndex | undefined }) => useStableSessionIndex(i),
+      { initialProps: { i: index({ '1': { ordinal: 1, opener_block_key: null } }) } },
+    );
+    const first = result.current;
+    const bound = index({ '1': { ordinal: 1, opener_block_key: 'cbk.opener' } });
+    rerender({ i: bound });
+    expect(result.current).not.toBe(first);
+    expect(result.current).toBe(bound);
+  });
+
+  it('returns the new reference when the index becomes truncated', () => {
+    const { result, rerender } = renderHook(
+      ({ i }: { i: ConversationSessionIndex | undefined }) => useStableSessionIndex(i),
+      { initialProps: { i: index({ '1': { ordinal: 1, opener_block_key: null } }, false) } },
+    );
+    const first = result.current;
+    const capped = index({ '1': { ordinal: 1, opener_block_key: null } }, true);
+    rerender({ i: capped });
+    expect(result.current).not.toBe(first);
+    expect(result.current).toBe(capped);
+  });
+
+  it('carries undefined through unchanged', () => {
+    const { result, rerender } = renderHook(
+      ({ i }: { i: ConversationSessionIndex | undefined }) => useStableSessionIndex(i),
+      { initialProps: { i: undefined as ConversationSessionIndex | undefined } },
+    );
+    expect(result.current).toBeUndefined();
+    rerender({ i: undefined });
+    expect(result.current).toBeUndefined();
+    const arrived = index({ '1': { ordinal: 1, opener_block_key: null } });
+    rerender({ i: arrived });
+    expect(result.current).toBe(arrived);
   });
 });
 

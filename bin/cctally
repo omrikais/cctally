@@ -1058,6 +1058,9 @@ get_entries = _cctally_cache.get_entries
 AccountAttributionUnavailable = _cctally_cache.AccountAttributionUnavailable
 open_cache_db = _cctally_cache.open_cache_db
 open_conversations_db = _cctally_cache.open_conversations_db
+scope_conversations_db_to_account = (
+    _cctally_cache.scope_conversations_db_to_account
+)
 sync_claude_conversations = _cctally_cache.sync_claude_conversations
 sync_codex_conversations = _cctally_cache.sync_codex_conversations
 _reset_orphan_warning_throttle = _cctally_cache._reset_orphan_warning_throttle
@@ -1339,6 +1342,8 @@ _SnapshotRef = _cctally_dashboard._SnapshotRef
 SSEHub = _cctally_dashboard.SSEHub
 STATIC_DIR = _cctally_dashboard.STATIC_DIR
 _format_url = _cctally_dashboard._format_url
+_dashboard_auth_url = _cctally_dashboard._dashboard_auth_url
+_dashboard_lan_auth_token = _cctally_dashboard._dashboard_lan_auth_token
 _discover_lan_ip = _cctally_dashboard._discover_lan_ip
 _model_breakdowns_to_models = _cctally_dashboard._model_breakdowns_to_models
 _compute_intensity_buckets = _cctally_dashboard._compute_intensity_buckets

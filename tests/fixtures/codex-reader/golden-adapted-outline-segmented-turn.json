@@ -1,0 +1,445 @@
+{
+  "outline": {
+    "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "stats": {
+      "turns": {
+        "total": 4,
+        "human": 2,
+        "assistant": 2,
+        "tool_result": 0,
+        "meta": 0
+      },
+      "tool_counts": {
+        "apply_patch": 4,
+        "fixture_function": 225
+      },
+      "error_count": 0,
+      "models": {
+        "gpt-synthetic-codex": 2
+      },
+      "duration_seconds": 472,
+      "tokens": {
+        "source": "codex",
+        "input": 1800,
+        "output": 600,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "cached_input": 400,
+        "reasoning_output": 150
+      },
+      "cost_usd": 0.0078000000000000005,
+      "cache_saved_usd": 0
+    },
+    "files": [
+      {
+        "path": "synthetic-fixture.txt",
+        "add": 4,
+        "del": 4,
+        "touches": [
+          {
+            "uuid": "civ1_6c9d1c06fc1169199a07169917277530c21cf151",
+            "tool_use_id": null,
+            "op": "modified",
+            "add": null,
+            "del": null
+          },
+          {
+            "uuid": "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728",
+            "tool_use_id": null,
+            "op": "modified",
+            "add": null,
+            "del": null
+          },
+          {
+            "uuid": "civ1_7597b54afea5b08945e28f91d29440889d9b1123",
+            "tool_use_id": null,
+            "op": "modified",
+            "add": null,
+            "del": null
+          },
+          {
+            "uuid": "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2",
+            "tool_use_id": null,
+            "op": "modified",
+            "add": null,
+            "del": null
+          }
+        ]
+      }
+    ],
+    "turns": [
+      {
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "kind": "human",
+        "ts": "2026-07-15T12:00:02Z",
+        "label": "Synthetic segmented prompt",
+        "member_uuids": [
+          "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+        ],
+        "segment_uuids": [
+          "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false
+      },
+      {
+        "uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "kind": "assistant",
+        "ts": "2026-07-15T12:00:04Z",
+        "label": "Synthetic segmented assistant opening",
+        "member_uuids": [
+          "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+          "civ1_717959a783d69296276efe45118e7e076b863654",
+          "civ1_b791442bcceaf808b034b85eb738a8eec6cbeaaf",
+          "civ1_004c5ce72825e8fa20e7a9df7b0df1a28a363b6b",
+          "civ1_84cbbf1f9246b109fab1b888b0907142f942c80d"
+        ],
+        "segment_uuids": [
+          "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+          "civ1_6c9d1c06fc1169199a07169917277530c21cf151",
+          "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728",
+          "civ1_7597b54afea5b08945e28f91d29440889d9b1123",
+          "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false,
+        "tools": [
+          {
+            "is_error": false,
+            "name": "fixture_function"
+          },
+          {
+            "is_error": false,
+            "name": "apply_patch"
+          }
+        ],
+        "tool_call_count": 184,
+        "first_failure_name": null,
+        "thinking": [
+          "Planning synthetic sweep 0",
+          "Planning synthetic sweep 1",
+          "Planning synthetic sweep 2",
+          "Planning synthetic sweep 3"
+        ],
+        "model": "gpt-synthetic-codex"
+      },
+      {
+        "uuid": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+        "kind": "human",
+        "ts": "2026-07-15T12:06:19Z",
+        "label": "Synthetic plain prompt",
+        "member_uuids": [
+          "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4"
+        ],
+        "segment_uuids": [
+          "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false
+      },
+      {
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "kind": "assistant",
+        "ts": "2026-07-15T12:06:21Z",
+        "label": "Synthetic plain assistant opening",
+        "member_uuids": [
+          "civ1_d7470541e417bdfd5c96127354539ff5b321170a"
+        ],
+        "segment_uuids": [
+          "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+          "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false,
+        "tools": [
+          {
+            "is_error": false,
+            "name": "fixture_function"
+          }
+        ],
+        "tool_call_count": 45,
+        "first_failure_name": null,
+        "thinking": [
+          "Planning the synthetic plain turn",
+          "Checking the synthetic plain inputs",
+          "Writing the synthetic plain result"
+        ],
+        "model": "gpt-synthetic-codex"
+      }
+    ],
+    "landmarks": [
+      {
+        "landmark_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+        "uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "parent_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "kind": "reasoning",
+        "label": "Planning synthetic sweep 0",
+        "ts": "2026-07-15T12:00:05Z"
+      },
+      {
+        "landmark_key": "cbk1_76ea67a7cfdea21002568837490850723b4dbf8c#0",
+        "block_key": "cbk1_76ea67a7cfdea21002568837490850723b4dbf8c",
+        "uuid": "civ1_6c9d1c06fc1169199a07169917277530c21cf151",
+        "parent_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "kind": "reasoning",
+        "label": "Planning synthetic sweep 1",
+        "ts": "2026-07-15T12:01:38Z"
+      },
+      {
+        "landmark_key": "cbk1_e7b38bbcaf120444ea32fa09a937749873dd28d9#0",
+        "block_key": "cbk1_e7b38bbcaf120444ea32fa09a937749873dd28d9",
+        "uuid": "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728",
+        "parent_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "kind": "reasoning",
+        "label": "Planning synthetic sweep 2",
+        "ts": "2026-07-15T12:03:11Z"
+      },
+      {
+        "landmark_key": "cbk1_ed64160ddfbca871bc15505437553dc7ad58a6e1#0",
+        "block_key": "cbk1_ed64160ddfbca871bc15505437553dc7ad58a6e1",
+        "uuid": "civ1_7597b54afea5b08945e28f91d29440889d9b1123",
+        "parent_uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "kind": "reasoning",
+        "label": "Planning synthetic sweep 3",
+        "ts": "2026-07-15T12:04:44Z"
+      },
+      {
+        "landmark_key": "cbk1_d45dab10725d67a96607514faf1c394ab9afa5bd#0",
+        "block_key": "cbk1_d45dab10725d67a96607514faf1c394ab9afa5bd",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "parent_uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "kind": "reasoning",
+        "label": "Planning the synthetic plain turn",
+        "ts": "2026-07-15T12:06:22Z"
+      },
+      {
+        "landmark_key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#0",
+        "block_key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "parent_uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "kind": "reasoning",
+        "label": "Checking the synthetic plain inputs",
+        "ts": "2026-07-15T12:06:23Z"
+      },
+      {
+        "landmark_key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#1",
+        "block_key": "cbk1_46d0d1cc90657f382ae44256891b54429937e469",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "parent_uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "kind": "reasoning",
+        "label": "Writing the synthetic plain result",
+        "ts": "2026-07-15T12:06:23Z"
+      }
+    ],
+    "positionByKey": {
+      "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+      "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6": 1,
+      "civ1_6c9d1c06fc1169199a07169917277530c21cf151": 2,
+      "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728": 3,
+      "civ1_7597b54afea5b08945e28f91d29440889d9b1123": 4,
+      "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2": 5,
+      "civ1_717959a783d69296276efe45118e7e076b863654": 1,
+      "civ1_b791442bcceaf808b034b85eb738a8eec6cbeaaf": 1,
+      "civ1_004c5ce72825e8fa20e7a9df7b0df1a28a363b6b": 1,
+      "civ1_84cbbf1f9246b109fab1b888b0907142f942c80d": 1,
+      "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4": 6,
+      "civ1_d7470541e417bdfd5c96127354539ff5b321170a": 7,
+      "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7": 8
+    }
+  },
+  "chrome": {
+    "entries": [
+      {
+        "entryId": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "type": "human",
+        "label": "Synthetic segmented prompt",
+        "depth": 0,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "thinkingCount": 4,
+        "toolCount": 0,
+        "turnIndex": 0
+      },
+      {
+        "entryId": "lm:cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "uuid": "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6",
+        "type": "heading",
+        "label": "Planning synthetic sweep 0",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 1
+      },
+      {
+        "entryId": "lm:cbk1_76ea67a7cfdea21002568837490850723b4dbf8c#0",
+        "uuid": "civ1_6c9d1c06fc1169199a07169917277530c21cf151",
+        "type": "heading",
+        "label": "Planning synthetic sweep 1",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_76ea67a7cfdea21002568837490850723b4dbf8c#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 1
+      },
+      {
+        "entryId": "lm:cbk1_e7b38bbcaf120444ea32fa09a937749873dd28d9#0",
+        "uuid": "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728",
+        "type": "heading",
+        "label": "Planning synthetic sweep 2",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_e7b38bbcaf120444ea32fa09a937749873dd28d9#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 1
+      },
+      {
+        "entryId": "lm:cbk1_ed64160ddfbca871bc15505437553dc7ad58a6e1#0",
+        "uuid": "civ1_7597b54afea5b08945e28f91d29440889d9b1123",
+        "type": "heading",
+        "label": "Planning synthetic sweep 3",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_ed64160ddfbca871bc15505437553dc7ad58a6e1#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 1
+      },
+      {
+        "entryId": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+        "uuid": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+        "type": "human",
+        "label": "Synthetic plain prompt",
+        "depth": 0,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "thinkingCount": 3,
+        "toolCount": 0,
+        "turnIndex": 2
+      },
+      {
+        "entryId": "lm:cbk1_d45dab10725d67a96607514faf1c394ab9afa5bd#0",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "type": "heading",
+        "label": "Planning the synthetic plain turn",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_d45dab10725d67a96607514faf1c394ab9afa5bd#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 3
+      },
+      {
+        "entryId": "lm:cbk1_46d0d1cc90657f382ae44256891b54429937e469#0",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "type": "heading",
+        "label": "Checking the synthetic plain inputs",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 3
+      },
+      {
+        "entryId": "lm:cbk1_46d0d1cc90657f382ae44256891b54429937e469#1",
+        "uuid": "civ1_d7470541e417bdfd5c96127354539ff5b321170a",
+        "type": "heading",
+        "label": "Writing the synthetic plain result",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_46d0d1cc90657f382ae44256891b54429937e469#1",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 3
+      }
+    ],
+    "sectionByUuid": {
+      "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_717959a783d69296276efe45118e7e076b863654": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_b791442bcceaf808b034b85eb738a8eec6cbeaaf": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_004c5ce72825e8fa20e7a9df7b0df1a28a363b6b": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_84cbbf1f9246b109fab1b888b0907142f942c80d": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+      "civ1_d7470541e417bdfd5c96127354539ff5b321170a": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4"
+    },
+    "targets": {
+      "error": [],
+      "prompt": [
+        {
+          "anchorKey": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+          "ownerTurnIndex": 0
+        },
+        {
+          "anchorKey": "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4",
+          "ownerTurnIndex": 2
+        }
+      ],
+      "subagent": [],
+      "plan": [],
+      "cache": [],
+      "compaction": [],
+      "bookmark": [],
+      "indexByUuid": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6": 1,
+        "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4": 2,
+        "civ1_d7470541e417bdfd5c96127354539ff5b321170a": 3
+      },
+      "memberIndex": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6": 1,
+        "civ1_717959a783d69296276efe45118e7e076b863654": 1,
+        "civ1_b791442bcceaf808b034b85eb738a8eec6cbeaaf": 1,
+        "civ1_004c5ce72825e8fa20e7a9df7b0df1a28a363b6b": 1,
+        "civ1_84cbbf1f9246b109fab1b888b0907142f942c80d": 1,
+        "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4": 2,
+        "civ1_d7470541e417bdfd5c96127354539ff5b321170a": 3
+      },
+      "segmentIndex": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_10127737cebcedffaac263b2c5a8d7a8c336e5b6": 1,
+        "civ1_6c9d1c06fc1169199a07169917277530c21cf151": 1,
+        "civ1_229f13f79331f64f8a2509bea2560ddd6a5a4728": 1,
+        "civ1_7597b54afea5b08945e28f91d29440889d9b1123": 1,
+        "civ1_74c26fe7ff9cc9f22b7bdd78da8e2abf97c16ea2": 1,
+        "civ1_80d02e9241a57d0f891adfd934493d7ceac753a4": 2,
+        "civ1_d7470541e417bdfd5c96127354539ff5b321170a": 3,
+        "civ1_ef1f516b600538ea6ed7c4b77446b47dac585fd7": 3
+      }
+    }
+  }
+}

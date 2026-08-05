@@ -11,7 +11,9 @@ import { allOneProject, visibleBadges } from './railDiscovery';
 import { modelChipStyle, modelChipSummary } from '../lib/model';
 import { fmt } from '../lib/fmt';
 import { mergeConversationRows, mergeSearchHits } from './conversationComposition';
+import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import {
+  buildConversationJump,
   conversationRefKey,
   conversationSummaryRef,
   sameConversationRef,
@@ -169,6 +171,12 @@ function activeFilterChips(f: ConversationFilters, source: ConversationSource): 
 export function ConversationRail() {
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const source: ConversationSource | 'all' = activeSource;
+  const snapshot = useSyncExternalStore(subscribeStore, () => getState().snapshot);
+  const storedAccount = useSyncExternalStore(
+    subscribeStore,
+    () => source === 'all' ? ALL_ACCOUNTS : getState().accountFocus[source],
+  );
+  const accountKey = resolveAccountFocus(snapshot, source, storedAccount);
   const search = useSyncExternalStore(subscribeStore, () => getState().conversationSearch);
   const kind = useSyncExternalStore(subscribeStore, () => getState().conversationSearchKind);
   const selected = useSyncExternalStore(subscribeStore, () => getState().selectedConversationRef);
@@ -344,8 +352,11 @@ export function ConversationRail() {
             </label>
           </div>
         </div>
-        {filtersOpen && source !== 'all' && <ConversationFiltersPopover source={source} />}
+        {filtersOpen && source !== 'all' && (
+          <ConversationFiltersPopover key={`${source}:${accountKey ?? 'all'}`} source={source} accountKey={accountKey ?? undefined} />
+        )}
         {source === 'all' && <div className="conv-rail-composed-note">Merged locally · source-specific filters and sort</div>}
+        {accountKey && <div className="conv-rail-composed-note">Scoped to the selected account</div>}
         {chips.length > 0 && (
           <div className="conv-rail-filters-active">
             {chips.map((c) => (
@@ -373,10 +384,10 @@ export function ConversationRail() {
       {isSearching
         ? source === 'all'
           ? <AllSearchList needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
-          : <SearchList source={source} needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
+          : <SearchList key={`${source}:${accountKey ?? 'all'}`} source={source} accountKey={accountKey ?? undefined} needle={search} kind={kind} ctx={ctx} selectedId={selected} pickAnchor={comparePick?.anchor ?? null} />
         : source === 'all'
           ? <AllBrowseList selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />
-          : <BrowseList source={source} selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
+          : <BrowseList key={`${source}:${accountKey ?? 'all'}`} source={source} accountKey={accountKey ?? undefined} selectedId={selected} ctx={ctx} pickAnchor={comparePick?.anchor ?? null} />}
     </aside>
   );
 }
@@ -399,8 +410,8 @@ function pickOr(
 
 interface RailCtx { tz: string; offsetLabel: string }
 
-function BrowseList({ source, selectedId, ctx, pickAnchor }: { source: ConversationSource; selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
-  const data = useConversations(source);
+function BrowseList({ source, accountKey, selectedId, ctx, pickAnchor }: { source: ConversationSource; accountKey?: string; selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
+  const data = useConversations(source, { accountKey });
   return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} />;
 }
 
@@ -652,8 +663,8 @@ function KindChips({ kind, proseOnly }: { kind: SearchKind; proseOnly: boolean }
   );
 }
 
-function SearchList({ source, needle, kind, ctx, selectedId, pickAnchor }: { source: ConversationSource; needle: string; kind: SearchKind; ctx: RailCtx; selectedId: ConversationRef | null; pickAnchor: ConversationRef | null }) {
-  const data = useConversationSearch(needle, kind, source);
+function SearchList({ source, accountKey, needle, kind, ctx, selectedId, pickAnchor }: { source: ConversationSource; accountKey?: string; needle: string; kind: SearchKind; ctx: RailCtx; selectedId: ConversationRef | null; pickAnchor: ConversationRef | null }) {
+  const data = useConversationSearch(needle, kind, source, { accountKey });
   return <SearchResults data={data} needle={needle} kind={kind} ctx={ctx} selectedId={selectedId} pickAnchor={pickAnchor} />;
 }
 
@@ -807,7 +818,7 @@ function SearchRow({ hit, ctx, kind, selectedId, pickAnchor }: { hit: SearchHit;
         dispatch({
           type: 'OPEN_CONVERSATION',
           conversationRef: hitRef,
-          jump: { conversation_ref: hitRef, session_id: hitRef.key, uuid: hit.uuid },
+          jump: buildConversationJump(hitRef, hit.uuid, true),
         }),
       )}
     >

@@ -13,6 +13,37 @@ const result1 = {
   search_depth: 'full',
 };
 
+const exactResult = {
+  schema_version: 2,
+  semantics: 'occurrence',
+  status: 'ready',
+  query_id: 'query-1',
+  total: 3,
+  selection_stale: false,
+  mode: 'literal',
+  kind: 'all',
+  search_depth: 'full',
+  page: {
+    start_index: 0,
+    previous_cursor: null,
+    next_cursor: 'ofc1.next',
+    occurrences: [
+      {
+        occurrence_id: 'o1.a', item_key: 'item-a', block_key: 'block-a',
+        container_block_key: 'block-a', surface: 'body', match_kinds: [],
+        disclosure: [], fragments: [{ leaf_key: 't0', start: 0, end: 3 }],
+      },
+      {
+        occurrence_id: 'o1.b', item_key: 'item-b', block_key: 'block-b',
+        container_block_key: 'block-b', surface: 'output', match_kinds: ['tool'],
+        disclosure: ['block-b'], fragments: [{ leaf_key: 't0', start: 4, end: 7 }],
+      },
+    ],
+  },
+};
+
+const codexRef = { source: 'codex' as const, key: 'v1.codex' };
+
 function mockFetchOnce(body: unknown) {
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: true, status: 200, json: async () => body } as Response);
 }
@@ -152,5 +183,127 @@ describe('useConversationFind', () => {
     await act(async () => { vi.advanceTimersByTime(300); });
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('adopts an exact first occurrence and exposes its absolute index', async () => {
+    mockFetchOnce(exactResult);
+    const { result } = renderHook(() => useConversationFind(codexRef, 'hit'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.semantics).toBe('occurrence');
+    expect(result.current.status).toBe('ready');
+    expect(result.current.selectedIndex).toBe(0);
+    expect(result.current.selected?.uuid).toBe('item-a');
+    expect(result.current.total).toBe(3);
+  });
+
+  it('fetches the next exact page at an edge without duplicating targets', async () => {
+    mockFetchOnce({
+      ...exactResult,
+      total: 2,
+      page: { ...exactResult.page, occurrences: [exactResult.page.occurrences[0]] },
+    });
+    mockFetchOnce({
+      ...exactResult,
+      total: 2,
+      page: {
+        start_index: 1, previous_cursor: 'ofc1.previous', next_cursor: null,
+        occurrences: [exactResult.page.occurrences[1]],
+      },
+    });
+    const { result } = renderHook(() => useConversationFind(codexRef, 'hit'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    let selected: Awaited<ReturnType<typeof result.current.step>> = null;
+    await act(async () => { selected = await result.current.step(1); });
+    expect(selected?.uuid).toBe('item-b');
+    expect(result.current.selectedIndex).toBe(1);
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[1][0] as string;
+    expect(url).toContain('cursor=ofc1.next');
+    expect(url).toContain('direction=next');
+  });
+
+  it('completes the requested step after reconciling a stale page cursor', async () => {
+    const first = {
+      ...exactResult,
+      page: {
+        start_index: 0, previous_cursor: null, next_cursor: 'ofc1.stale',
+        occurrences: [exactResult.page.occurrences[0]],
+      },
+    };
+    mockFetchOnce(first);
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      { ok: false, status: 409, json: async () => ({}) } as Response,
+    );
+    mockFetchOnce({
+      ...exactResult,
+      page: {
+        start_index: 0, previous_cursor: null, next_cursor: null,
+        occurrences: exactResult.page.occurrences,
+      },
+    });
+
+    const { result } = renderHook(() => useConversationFind(codexRef, 'hit'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    let selected: Awaited<ReturnType<typeof result.current.step>> = null;
+    await act(async () => { selected = await result.current.step(1); });
+
+    expect(selected?.uuid).toBe('item-b');
+    expect(result.current.selectedIndex).toBe(1);
+    const reconcileUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[2][0] as string;
+    expect(reconcileUrl).toContain('around=o1.a');
+  });
+
+  it('reconciles exact live-tail refreshes around the selected occurrence', async () => {
+    mockFetchOnce(exactResult);
+    const { result, rerender } = renderHook(
+      ({ rev }) => useConversationFind(codexRef, 'hit', { tailRevision: rev }),
+      { initialProps: { rev: 0 } },
+    );
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { await result.current.step(1); });
+    mockFetchOnce({
+      ...exactResult,
+      total: 4,
+      page: {
+        ...exactResult.page,
+        start_index: 1,
+        occurrences: [exactResult.page.occurrences[1]],
+      },
+    });
+    rerender({ rev: 1 });
+    await act(async () => { vi.advanceTimersByTime(300); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(url).toContain('around=o1.b');
+    expect(result.current.selected?.uuid).toBe('item-b');
+    expect(result.current.selectedIndex).toBe(1);
+  });
+
+  it('does not reconcile an occurrence identity across changed query semantics', async () => {
+    mockFetchOnce(exactResult);
+    const { result, rerender } = renderHook(
+      ({ caseSensitive }) => useConversationFind(codexRef, 'hit', { case: caseSensitive }),
+      { initialProps: { caseSensitive: false } },
+    );
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { await result.current.step(1); });
+
+    mockFetchOnce({
+      ...exactResult,
+      query_id: 'query-2',
+      total: 1,
+      page: { ...exactResult.page, occurrences: [exactResult.page.occurrences[0]] },
+    });
+    rerender({ caseSensitive: true });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string;
+    expect(url).toContain('case=1');
+    expect(url).not.toContain('around=');
   });
 });

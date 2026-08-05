@@ -3,7 +3,14 @@ import { dispatch } from '../store/store';
 import { useConversationFind } from '../hooks/useConversationFind';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { loadFindRegex, saveFindRegex, loadFindCase, saveFindCase } from '../store/findPrefs';
-import { normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
+import {
+  buildConversationJump,
+  normalizeConversationRef,
+  type ConversationRefInput,
+  type FindOccurrence,
+} from '../types/conversation';
+import type { FindTarget } from '../hooks/useConversationFind';
+import type { ExactFindState } from './HighlightContext';
 
 // #177 S6 — the floating in-conversation find bar (Cmd+F style pill, top-right
 // inside the reader column). Owns its needle + a 1-based match cursor, drives
@@ -26,6 +33,7 @@ export function FindBar({
   sessionId,
   onClose,
   onTermsChange,
+  onExactFindChange,
   stepRef,
   tailRevision = 0,
 }: {
@@ -35,6 +43,7 @@ export function FindBar({
   // #223 supersedes S4 decision b: regex mode now reports its source for
   // best-effort inline highlighting (was forced to '' to suppress marks).
   onTermsChange: (needle: string, caseSensitive: boolean, regex: boolean) => void;
+  onExactFindChange?: (state: ExactFindState | null) => void;
   // The reader holds this so its n/N bindings (active while the bar is open +
   // the input is blurred) can step the same cursor. Assigned to the live `step`
   // closure each render; null when no bar is mounted.
@@ -46,11 +55,23 @@ export function FindBar({
   const qualifiedInput = typeof sessionId !== 'string';
   const conversationRef = normalizeConversationRef(sessionId);
   const [needle, setNeedle] = useState('');
-  const [cursor, setCursor] = useState(0);
   // Toggle state seeded from localStorage on mount, persisted on each flip.
   const [regex, setRegex] = useState(loadFindRegex);
   const [caseSensitive, setCaseSensitive] = useState(loadFindCase);
-  const { anchors, total, truncated, mode, loading, error } = useConversationFind(
+  const {
+    selected,
+    occurrences,
+    selectedIndex,
+    total,
+    truncated,
+    semantics,
+    status,
+    selectionStale,
+    mode,
+    loading,
+    error,
+    step,
+  } = useConversationFind(
     conversationRef, needle, { regex, case: caseSensitive, tailRevision });
   const inputRef = useRef<HTMLInputElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -64,56 +85,71 @@ export function FindBar({
   // reader can drive best-effort inline highlighting (was forced to '').
   const debouncedNeedle = useDebouncedValue(needle.trim(), 200, '');
   useEffect(() => {
-    onTermsChange(debouncedNeedle, caseSensitive, regex);
-  }, [debouncedNeedle, regex, caseSensitive, onTermsChange]);
+    onTermsChange(semantics === 'occurrence' ? '' : debouncedNeedle, caseSensitive, regex);
+  }, [debouncedNeedle, regex, caseSensitive, semantics, onTermsChange]);
 
-  // #217 S4 / I-1.6 — preserve the selected match BY UUID across a refresh
-  // (Codex P2). `selectedUuidRef` holds the previously-selected uuid, written by
-  // `step` when the user navigates (so it is ALREADY known before the next
-  // `anchors` lands). On a new anchor list, re-find that uuid (findIndex -1 →
-  // reset to 0) and write the resolved uuid back. This replaces the old "reset
-  // cursor to 0 on any anchors change". Critically the ref is NOT recomputed in
-  // an `anchors`-keyed effect (that would read the stale cursor against the new
-  // list and lock onto the wrong match) — only `step` and this reconciliation
-  // touch it.
-  const selectedUuidRef = useRef<string | null>(null);
   useEffect(() => {
-    const prev = selectedUuidRef.current;
-    const idx = prev ? anchors.findIndex((a) => a.uuid === prev) : -1;
-    const next = idx >= 0 ? idx : 0;
-    setCursor(next);
-    selectedUuidRef.current = anchors.length ? (anchors[next]?.uuid ?? null) : null;
-    // Keyed on the anchor LIST identity (a fresh fetch replaces it); the uuid
-    // lookup keeps the cursor on the same match when it survived.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [anchors]);
+    if (!onExactFindChange) return;
+    if (semantics === 'occurrence') {
+      onExactFindChange({
+        occurrences,
+        selectedOccurrenceId: selected && 'occurrence_id' in selected
+          ? selected.occurrence_id
+          : null,
+      });
+    } else {
+      onExactFindChange(null);
+    }
+    return () => onExactFindChange(null);
+  }, [semantics, occurrences, selected, onExactFindChange]);
 
-  // Walk to a target index (wraps modulo length) and deep-link-jump there. The
-  // dispatch is a SAME-session OPEN_CONVERSATION, so the store keeps find open;
-  // expand_details opens the target turn's disclosures when the match was in a
-  // tool/thinking block (the reader can't know which disclosure, so it opens
-  // them all).
-  const step = (delta: number) => {
-    if (anchors.length === 0) return;
-    const next = ((cursor + delta) % anchors.length + anchors.length) % anchors.length;
-    setCursor(next);
-    const a = anchors[next];
-    selectedUuidRef.current = a.uuid;   // remember the selection for cursor-preservation
+  const dispatchTarget = (a: FindTarget | null) => {
+    if (!a) return;
+    const occurrence = 'occurrence_id' in a ? a as FindOccurrence : null;
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef,
-      jump: {
-        ...(qualifiedInput ? { conversation_ref: conversationRef } : {}),
-        session_id: conversationRef.key,
-        uuid: a.uuid,
-        expand_details: a.match_kinds.length > 0,
-      },
+      // Round 4 — through the shared builder like every other jump site. The
+      // find bar is the only caller that supplies `expandDetails`, and it has no
+      // inner anchor, which round 7's options object lets it express by simply
+      // not naming `innerAnchorKey`.
+      //
+      // #463 S4 merge — occurrence-exact find arrived on `main` writing its own
+      // literal here, which is the exact construction `jumpConstruction.test.ts`
+      // forbids. Its two additions are preserved verbatim in behavior: an
+      // occurrence decides `expand_details` from its own disclosure list rather
+      // than from the anchor's match kinds, and the occurrence itself rides on
+      // the jump. Both now go through the builder.
+      jump: buildConversationJump(conversationRef, a.uuid, qualifiedInput, {
+        expandDetails: occurrence ? occurrence.disclosure.length > 0 : a.match_kinds.length > 0,
+        findOccurrence: occurrence,
+      }),
     });
   };
 
+  const navigate = (delta: number) => {
+    const target = step(delta);
+    if (target instanceof Promise) void target.then(dispatchTarget);
+    else dispatchTarget(target);
+  };
+
+  // Exact results select and land their first occurrence as soon as the server
+  // page becomes ready. Legacy section semantics retain their historical
+  // explicit-step behavior.
+  const autoLandedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (semantics !== 'occurrence' || !selected || !('occurrence_id' in selected)) return;
+    if (autoLandedRef.current === selected.occurrence_id) return;
+    autoLandedRef.current = selected.occurrence_id;
+    dispatchTarget(selected);
+    // dispatchTarget is intentionally render-local: its inputs are represented
+    // by the selected occurrence and normalized conversation identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [semantics, selected, conversationRef.key]);
+
   // Expose the live step closure to the reader's n/N bindings. Assigned every
   // render (step closes over the current cursor/anchors); cleared on unmount.
-  if (stepRef) stepRef.current = step;
+  if (stepRef) stepRef.current = navigate;
   useEffect(() => () => { if (stepRef) stepRef.current = null; }, [stepRef]);
 
   const close = () => {
@@ -132,7 +168,7 @@ export function FindBar({
     // listener. Escape is handled at the bar-container level (`onBarKeyDown`),
     // not here, so it behaves identically from the input AND from any bar button
     // — see that handler's note.
-    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); step(e.shiftKey ? -1 : 1); }
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); navigate(e.shiftKey ? -1 : 1); }
   };
 
   // #217 S4 / I-1.4 — focus trap + the bar-level Escape close. Both are handled
@@ -164,9 +200,13 @@ export function FindBar({
     else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
   };
 
-  const has = anchors.length > 0;
-  const current = has ? anchors[cursor] : null;
-  const counter = `${has ? cursor + 1 : 0} / ${total}`;
+  const has = selected != null;
+  const current = selected;
+  const counter = status === 'indexing'
+    ? 'indexing exact matches'
+    : semantics === 'occurrence'
+      ? `${has ? selectedIndex + 1 : 0} / ${total} matches`
+      : `${has ? selectedIndex + 1 : 0} / ${total} containing sections`;
   // #228 S4 D8 — an always-visible mode tag spelling out the active toggles
   // (regex / case / regex · case). It survives typing (unlike a placeholder cue)
   // and answers "what does `.*`/`Aa` mean?" Pure render from the existing
@@ -213,6 +253,7 @@ export function FindBar({
       <span className="conv-findbar-count" aria-live="polite">
         {counter}
         {truncated && <span className="conv-findbar-note"> · first 500</span>}
+        {selectionStale && <span className="conv-findbar-note"> · previous match changed</span>}
       </span>
       {current && current.match_kinds.length > 0 && (
         <span className="conv-findbar-kind">{current.match_kinds.join(' ')}</span>
@@ -233,7 +274,7 @@ export function FindBar({
         aria-label="Previous match"
         title="Previous match (Shift+Enter)"
         disabled={!has}
-        onClick={() => step(-1)}
+        onClick={() => navigate(-1)}
       >‹</button>
       <button
         type="button"
@@ -241,7 +282,7 @@ export function FindBar({
         aria-label="Next match"
         title="Next match (Enter)"
         disabled={!has}
-        onClick={() => step(1)}
+        onClick={() => navigate(1)}
       >›</button>
       <button
         type="button"

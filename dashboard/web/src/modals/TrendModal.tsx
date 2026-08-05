@@ -11,6 +11,7 @@ import { PeriodAccountChips } from '../components/PeriodAccountChips';
 import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { presentationTrend } from '../lib/dashboardPresentation';
+import { providerAccentClass } from '../lib/providerAccent';
 import type { DashboardSelection } from '../types/envelope';
 
 function formatWeeksPill(n: number): string {
@@ -364,7 +365,14 @@ function CanonicalTrendModal({
           <span className={`m-pill accent-amber${N === 0 ? ' m-unavailable' : ''}`} id={idFor('mtr-weeks-pill')}>
             {N === 0 ? 'History unavailable' : formatWeeksPill(N)}
           </span>
-          {!isClaude && <span className="m-pill accent-blue">{source === 'all' ? 'All sources' : 'Codex'}</span>}
+          {/* #463 S5 (F24b) — this pill is a provider identity ONLY when it names
+              one. The `all` form names no provider, so it keeps the generic
+              accent, which is now free of any provider meaning. */}
+          {!isClaude && (
+            <span className={`m-pill ${source === 'all' ? 'accent-blue' : providerAccentClass('codex')}`}>
+              {source === 'all' ? 'All sources' : 'Codex'}
+            </span>
+          )}
         </div>
 
         <div className="period-two-pane">

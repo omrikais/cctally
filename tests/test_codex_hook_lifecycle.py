@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
@@ -35,6 +36,18 @@ def _hook_args(*, source: str = "codex") -> argparse.Namespace:
 
 def _root_key(path: Path) -> str:
     return source_root_key(str(path.resolve()))
+
+
+def _hold_ingest_lock(lock_path: str, ready, release) -> None:
+    """Model the quota verifier's locked projection apply in another process."""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(5.0)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 @pytest.fixture
@@ -147,6 +160,121 @@ def test_codex_tick_cache_contention_is_silent_and_touches_no_marker(
     assert calls == ["sync", "cache-close"]
     marker_dir = ns["APP_DIR"] / "codex-hook-tick"
     assert not any((marker_dir / f"{key}.last-success").exists() for key in keys)
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_codex_tick_retries_budget_after_quota_worker_holds_ingest_lock(
+    runtime, monkeypatch, capsys,
+):
+    """A verifier overlap must not acknowledge away the budget-alert retry.
+
+    The detached quota verifier spends its observation load outside the ingest
+    lock, then holds that lock while applying its projection.  A following hook
+    tick can therefore reach the separate authoritative Codex-budget cycle
+    while the verifier owns the lock.  The authoritative API reports that
+    timeout as ``ran=False``; the hook must leave its lifecycle markers due so
+    the first tick after the verifier commits evaluates the budget leg.
+    """
+    ns, _first, _second = runtime
+    ns["open_db"]().close()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-15T12:00:00Z")
+    import _cctally_core
+    _cctally_core.CONFIG_PATH.write_text(json.dumps({
+        "display": {"tz": "utc"},
+        "budget": {"codex": {
+            "amount_usd": 100.0,
+            "period": "calendar-month",
+            "alerts_enabled": True,
+            "alert_thresholds": [90],
+        }},
+    }) + "\n")
+    monkeypatch.setitem(
+        ns, "_sum_codex_cost_for_range",
+        lambda start, end, *, speed="auto": 100.0,
+    )
+    monkeypatch.setitem(
+        ns, "_dispatch_alert_notification",
+        lambda payload, *, mode="real", **kwargs: "queued",
+    )
+
+    class Cache:
+        def close(self):
+            pass
+
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, *, lock_timeout, **_budget: SimpleNamespace(
+            lock_contended=False),
+    )
+    monkeypatch.setitem(
+        ns, "reconcile_codex_quota_projection",
+        lambda **kwargs: SimpleNamespace(
+            blocks_upserted=0, milestones_upserted=0,
+            blocks_orphaned=0, milestones_orphaned=0,
+            alerts_dispatched=0),
+    )
+
+    import _cctally_journal
+
+    real_ingest = _cctally_journal.run_stats_ingest
+
+    def short_authoritative_wait(*, mode="opportunistic", **kwargs):
+        return real_ingest(mode=mode, timeout_s=0.05, **kwargs)
+
+    monkeypatch.setattr(
+        _cctally_journal, "run_stats_ingest", short_authoritative_wait)
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    release = ctx.Event()
+    holder = ctx.Process(
+        target=_hold_ingest_lock,
+        args=(str(_cctally_core.JOURNAL_INGEST_LOCK_PATH), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.wait(5.0), "quota-worker lock holder never became ready"
+        assert ns["cmd_hook_tick"](_hook_args()) == 0
+        marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+        first_markers = tuple(marker_dir.glob("*.last-success"))
+        first_log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+        conn = ns["open_db"]()
+        try:
+            first_budget_rows = conn.execute(
+                "SELECT threshold FROM budget_milestones "
+                "WHERE vendor='codex' ORDER BY threshold"
+            ).fetchall()
+        finally:
+            conn.close()
+    finally:
+        release.set()
+        holder.join(10.0)
+        assert holder.exitcode == 0
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+    marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+    final_markers = tuple(marker_dir.glob("*.last-success"))
+    log = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text()
+    conn = ns["open_db"]()
+    try:
+        final_budget_rows = conn.execute(
+            "SELECT threshold FROM budget_milestones "
+            "WHERE vendor='codex' ORDER BY threshold"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert first_markers == (), (
+        "the contended tick acknowledged its lifecycle markers, so the next "
+        "tick cannot retry the skipped Codex-budget evaluation")
+    assert first_budget_rows == []
+    assert "sync=contended" in first_log and "result=noop" in first_log
+    assert len(final_markers) == 2, (
+        "the first uncontended tick did not complete and acknowledge both roots")
+    assert [row["threshold"] for row in final_budget_rows] == [90]
+    assert "result=success" in log
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""
 

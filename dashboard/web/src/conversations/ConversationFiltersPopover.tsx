@@ -77,9 +77,9 @@ function patch(p: Partial<ConversationFilters>): void {
   dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: p });
 }
 
-export function ConversationFiltersPopover({ source = 'claude' }: { source?: ConversationSource }) {
+export function ConversationFiltersPopover({ source = 'claude', accountKey }: { source?: ConversationSource; accountKey?: string }) {
   const filters = useSyncExternalStore(subscribeStore, () => getState().conversationFilters);
-  const facets = useConversationFacets(source);
+  const facets = useConversationFacets(source, accountKey);
   // Resolved display tz (concrete IANA zone, Etc/UTC fallback) drives which
   // calendar month a date preset lands on, so it matches the server's display-tz
   // interpretation of the YYYY-MM-DD bounds (FINDING 4).

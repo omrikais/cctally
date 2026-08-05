@@ -1,0 +1,174 @@
+{
+  "projectionCases": [
+    {
+      "name": "plain",
+      "kind": "plain",
+      "leaves": [{"key": "source", "text": "alpha beta"}],
+      "expected": {
+        "text": "alpha beta",
+        "leaves": [{"key": "source", "start": 0, "end": 10}]
+      }
+    },
+    {
+      "name": "formatting boundary",
+      "kind": "markdown",
+      "source": "a**b**c",
+      "expected": {
+        "text": "abc",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 1},
+          {"key": "t1", "start": 1, "end": 2},
+          {"key": "t2", "start": 2, "end": 3}
+        ]
+      }
+    },
+    {
+      "name": "link destination and escapes",
+      "kind": "markdown",
+      "source": "See [docs](https://example.test) and \\*star\\*.",
+      "expected": {
+        "text": "See docs and *star*.",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 4},
+          {"key": "t1", "start": 4, "end": 8},
+          {"key": "t2", "start": 8, "end": 20}
+        ]
+      }
+    },
+    {
+      "name": "inline code",
+      "kind": "markdown",
+      "source": "Use `x*y` now",
+      "expected": {
+        "text": "Use x*y now",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 4},
+          {"key": "t1", "start": 4, "end": 7},
+          {"key": "t2", "start": 7, "end": 11}
+        ]
+      }
+    },
+    {
+      "name": "fenced code",
+      "kind": "markdown",
+      "source": "before\n\n```py\nx ** y\n```\n\nafter",
+      "expected": {
+        "text": "before\nx ** y\n\nafter",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 6},
+          {"key": "t1", "start": 7, "end": 14},
+          {"key": "t2", "start": 15, "end": 20}
+        ]
+      }
+    },
+    {
+      "name": "gfm task entity autolink and hard break",
+      "kind": "markdown",
+      "source": "- [x] done &amp; <https://example.test>  \nnext",
+      "expected": {
+        "text": " done & https://example.test\nnext",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 8},
+          {"key": "t1", "start": 8, "end": 28},
+          {"key": "t2", "start": 29, "end": 33}
+        ]
+      }
+    },
+    {
+      "name": "gfm table",
+      "kind": "markdown",
+      "source": "| A | B |\n|---|---|\n| x | y |",
+      "expected": {
+        "text": "A\tB\nx\ty",
+        "leaves": [
+          {"key": "t0", "start": 0, "end": 1},
+          {"key": "t1", "start": 2, "end": 3},
+          {"key": "t2", "start": 4, "end": 5},
+          {"key": "t3", "start": 6, "end": 7}
+        ]
+      }
+    },
+    {
+      "name": "malformed emphasis fallback",
+      "kind": "markdown",
+      "source": "a**b",
+      "expected": {
+        "text": "a**b",
+        "leaves": [{"key": "t0", "start": 0, "end": 4}]
+      }
+    },
+    {
+      "name": "raw html remains visible text",
+      "kind": "markdown",
+      "source": "<b>raw</b>",
+      "expected": {
+        "text": "<b>raw</b>",
+        "leaves": [{"key": "t0", "start": 0, "end": 10}]
+      }
+    },
+    {
+      "name": "unicode scalar offsets",
+      "kind": "markdown",
+      "source": "café Καλημέρα 😀",
+      "expected": {
+        "text": "café Καλημέρα 😀",
+        "leaves": [{"key": "t0", "start": 0, "end": 15}]
+      }
+    }
+  ],
+  "literalCases": [
+    {
+      "name": "leftmost non-overlap",
+      "text": "aaaa",
+      "query": "aa",
+      "caseSensitive": true,
+      "expected": [{"start": 0, "end": 2}, {"start": 2, "end": 4}]
+    },
+    {
+      "name": "case insensitive unicode one-scalar fold",
+      "text": "Ää İi",
+      "query": "ä",
+      "caseSensitive": false,
+      "expected": [{"start": 0, "end": 1}, {"start": 1, "end": 2}]
+    },
+    {
+      "name": "expanding lowercase is retained",
+      "text": "Ää İi",
+      "query": "i",
+      "caseSensitive": false,
+      "expected": [{"start": 4, "end": 5}]
+    }
+  ],
+  "regexCases": [
+    {
+      "name": "python regex ranges",
+      "text": "ab12 ab345",
+      "pattern": "ab\\d+",
+      "caseSensitive": true,
+      "expected": [{"start": 0, "end": 4}, {"start": 5, "end": 10}]
+    },
+    {
+      "name": "zero width omitted",
+      "text": "aba",
+      "pattern": "(?=a)",
+      "caseSensitive": true,
+      "expected": []
+    }
+  ],
+  "sliceCases": [
+    {
+      "name": "one occurrence spans adjacent leaves",
+      "match": {"start": 0, "end": 3},
+      "leaves": [
+        {"key": "t0", "start": 0, "end": 1},
+        {"key": "t1", "start": 1, "end": 2},
+        {"key": "t2", "start": 2, "end": 3}
+      ],
+      "expected": [
+        {"leaf_key": "t0", "start": 0, "end": 1},
+        {"leaf_key": "t1", "start": 0, "end": 1},
+        {"leaf_key": "t2", "start": 0, "end": 1}
+      ]
+    }
+  ]
+}

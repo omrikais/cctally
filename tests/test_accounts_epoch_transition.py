@@ -49,8 +49,8 @@ def _write_claude_json(path, account_uuid):
 
 # --------------------------------------------------------------------------
 
-def test_epoch_is_1006(ns):
-    assert _cctally_core.STATS_INDEX_EPOCH == 1006
+def test_epoch_is_1007(ns):
+    assert _cctally_core.STATS_INDEX_EPOCH == 1007
 
 
 def test_transition_appends_op_with_resolved_identity(ns, tmp_path):

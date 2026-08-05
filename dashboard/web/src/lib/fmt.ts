@@ -222,6 +222,14 @@ function fmtTimeHHmm(
   return opts.noSuffix ? body : `${body} ${tzSuffixForInstant(d, ctx.tz)}`;
 }
 
+// "1 turn" / "3 turns" — a count and the noun it counts, agreeing in number.
+// Shared rather than local because the same phrase is composed in the reader's
+// block walk and in the outline's stats card, and #463 S4 shipped a rail
+// reading "3 errors in 1 turns" from a site that pluralized one noun of the two.
+export function plural(count: number, one: string, many = `${one}s`): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
 // 5h-block reset times carry sub-10-minute capture jitter (a true :40
 // boundary can arrive as :39). For DISPLAY only, round the instant to the
 // nearest 10-minute boundary so the shown clock time matches the real

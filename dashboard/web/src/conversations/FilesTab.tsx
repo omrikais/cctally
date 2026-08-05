@@ -9,11 +9,21 @@ import type { OutlineFile, OutlineFileTouch, QualifiedOutlineFile } from '../typ
 // jump. Empty state: "No files modified". Reuses the .conv-outline-* row styles;
 // every interactive row is ≥44px on mobile (CSS).
 
-// The op → short verb label shown on each touch row.
-const OP_LABEL: Record<OutlineFileTouch['op'], string> = {
+// The op → short verb label shown on each touch row. CLOSED over the whole
+// vocabulary the two providers emit (#463 S4 §6.6): the Claude edit family, and
+// the raw change kind a Codex patch payload states — `add`/`delete`/`update`
+// from the dict shape and `modified` from the list one. It is deliberately not
+// the tool name; every Codex touch comes from an `apply_patch`, so a single
+// `apply_patch` entry here would have left every real Codex row with an empty
+// label. A `null` op renders no label rather than inventing one.
+const OP_LABEL: Record<NonNullable<OutlineFileTouch['op']>, string> = {
   edit: 'Edit',
   multiedit: 'MultiEdit',
   write: 'Write',
+  add: 'Add',
+  delete: 'Delete',
+  update: 'Update',
+  modified: 'Modified',
 };
 
 // Split a path into (dir-with-trailing-slash, basename). A bare basename yields
@@ -75,10 +85,16 @@ function FileRow({
                 className="conv-files-touch"
                 onClick={() => onJump(t.uuid)}
               >
-                <span className="conv-files-touch-op">{OP_LABEL[t.op]}</span>
-                <span className="conv-files-touch-sep" aria-hidden="true">
-                  ·
-                </span>
+                <span className="conv-files-touch-op">{t.op ? OP_LABEL[t.op] : ''}</span>
+                {/* #463 S4 F-G — the separator needs something on both sides.
+                    A Codex touch whose change kind is outside the closed op
+                    vocabulary renders no label and carries no diff counts, and
+                    the unconditional separator left an orphan dot. */}
+                {t.op && (t.add != null || t.del != null) && (
+                  <span className="conv-files-touch-sep" aria-hidden="true">
+                    ·
+                  </span>
+                )}
                 <StatBadge add={t.add} del={t.del} />
                 <span className="conv-files-touch-jump" aria-hidden="true">
                   →

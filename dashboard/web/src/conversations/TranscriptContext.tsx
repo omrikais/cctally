@@ -12,7 +12,7 @@
 import { createContext, useContext } from 'react';
 import type { FocusMode } from './applyFocusMode';
 import type { FmtCtx } from '../lib/fmt';
-import { legacyClaudeConversationRef, type ConversationRef } from '../types/conversation';
+import { legacyClaudeConversationRef, type ConversationRef, type ConversationSessionIndex } from '../types/conversation';
 
 // #184 — the display-tz FmtCtx rides on the context too. Memo economics: the
 // reader memoizes its MessageItems precisely so an SSE tick doesn't re-render
@@ -56,6 +56,13 @@ export interface TranscriptCtxValue {
   // the MessageItem memo. Optional + default empty, so a provider-less card test
   // renders every heading exactly as before.
   suppressedHeadingKeys?: ReadonlySet<string>;
+  // #463 S3 §3.2 — the conversation-scoped shell-session index. Provided ONCE
+  // by the reader for the same memo economics as fmtCtx: the cards need a
+  // whole-conversation fact (which call opened a session, whether the index is
+  // complete) that no single block can see. Optional + absent by default, so a
+  // provider-less card test and a pre-S3 server both render no session note at
+  // all rather than a wrong one.
+  sessionIndex?: ConversationSessionIndex;
 }
 
 export const TranscriptContext = createContext<TranscriptCtxValue>({
@@ -84,6 +91,10 @@ export const useMaxTurnCost = (): number =>
 // isolated card tests copy raw exactly as before.
 export const useAnonMode = (): boolean =>
   useContext(TranscriptContext).anonMode ?? false;
+// #463 S3 §3.2 — undefined by default: with no index the cards say nothing
+// about openers, which is correct rather than merely safe.
+export const useSessionIndex = (): ConversationSessionIndex | undefined =>
+  useContext(TranscriptContext).sessionIndex;
 // #463 S2 §2.6 — empty by default: no provider value means suppress nothing.
 const NO_SUPPRESSED_HEADINGS: ReadonlySet<string> = new Set<string>();
 export const useSuppressedHeadingKeys = (): ReadonlySet<string> =>

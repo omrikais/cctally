@@ -6,9 +6,11 @@ import _lib_conversation_watch as w
 
 
 class _Stats:
-    def __init__(self, clean, reason=None):
+    def __init__(self, clean, reason=None, visible=None):
         self.targeted_clean = clean
         self.deferred_reason = reason
+        if visible is not None:
+            self.targeted_visible = visible
 
 
 def test_changed_paths_detects_size_change():
@@ -75,6 +77,14 @@ def test_watch_step_unclean_ingest_does_not_advance_or_emit():
         ingest_fn=lambda p: _Stats(False, "truncation"))
     assert emitted is False
     assert new_seen == {"a": 10}             # NOT advanced → retried next cycle
+
+
+def test_watch_step_clean_other_account_change_advances_without_emit():
+    new_seen, emitted = w.watch_step(
+        ["a"], {"a": 10}, stat_fn=lambda p: 20,
+        ingest_fn=lambda p: _Stats(True, visible=False))
+    assert emitted is False
+    assert new_seen == {"a": 20}  # consumed; do not spin on hidden activity
 
 
 def test_watch_step_advances_to_committed_cursor_not_fresh_restat():

@@ -422,6 +422,7 @@ function makeJumpDeps(over: {
   hasCardRef?: boolean;
   findOpen?: boolean;
   expandDetails?: boolean;
+  landingSucceeded?: boolean;
   drain?: Partial<JumpDrainResult>;   // #286 B3 — the loadToTarget committed-epoch result
   committedRev?: number;              // #286 B3 — the captured lastOp.rev at effect-fire
 } = {}): { deps: JumpRunnerDeps; log: string[] } {
@@ -435,7 +436,7 @@ function makeJumpDeps(over: {
     aborted: () => aborted,
     loadToTarget: async () => {
       mark('loadToTarget');
-      return { found: false, exhausted: true, terminalOpRev: 0, ...over.drain };
+      return { found: false, exhausted: true, failed: false, terminalOpRev: 0, ...over.drain };
     },
     committedRev: over.committedRev ?? 0,
     captured: {
@@ -449,9 +450,9 @@ function makeJumpDeps(over: {
       walk: async () => { mark('walk'); return over.walk ?? 'mounted'; },
       quiesce: async () => { mark('quiesce'); },
       openDisclosures: () => { mark('openDisclosures'); },
-      landCard: async () => { mark('landCard'); },
-      landFindReassert: async () => { mark('landFindReassert'); },
-      landCenter: async () => { mark('landCenter'); },
+      landCard: async () => { mark('landCard'); return over.landingSucceeded ?? true; },
+      landFindReassert: async () => { mark('landFindReassert'); return over.landingSucceeded ?? true; },
+      landStartReassert: async () => { mark('landStartReassert'); return over.landingSucceeded ?? true; },
       hasCardRef: () => { mark('hasCardRef'); return over.hasCardRef ?? false; },
       hasLandableElement: () => { mark('hasLandableElement'); return over.hasLandableElement ?? true; },
       findOpen: () => { mark('findOpen'); return over.findOpen ?? false; },
@@ -466,17 +467,17 @@ function makeJumpDeps(over: {
 }
 
 describe('runJumpPipeline', () => {
-  it('(a) a happy warm jump runs drain → modeHidden → resolveHit → mounted → quiesce → findOpen → landCenter → bookkeeping', async () => {
+  it('(a) a happy warm jump runs drain → modeHidden → resolveHit → mounted → quiesce → findOpen → landStartReassert → bookkeeping', async () => {
     const { deps, log } = makeJumpDeps({ isTargetMounted: true });
     const outcome = await runJumpPipeline(deps);
     expect(outcome).toBe('landed');
     // #291 — the landing branch is now `live.findOpen()` (was `deps.expandDetails &&
     // live.findOpen()`), so a find-closed warm jump consults findOpen() before falling
-    // through to the cheap single-shot landCenter (a pure ref read, no side effect).
+    // through to the convergent, start-aligned ordinary deep-link landing.
     expect(log).toEqual([
       'loadToTarget', 'modeHidden', 'resolveHit', 'ownerChainToOpen',
       'isTargetMounted', 'hasLandableElement', 'quiesce', 'hasCardRef',
-      'findOpen', 'landCenter', 'landedBookkeeping:3',
+      'findOpen', 'landStartReassert', 'landedBookkeeping:3',
     ]);
   });
 
@@ -503,19 +504,44 @@ describe('runJumpPipeline', () => {
     expect(outcome).toBe('deferred');
     expect(log).toEqual(['loadToTarget', 'modeHidden', 'resolveHit', 'ownerChainToOpen', 'requestForceOpen:g,p']);
     expect(log).not.toContain('quiesce');
-    expect(log).not.toContain('landCenter');
+    expect(log).not.toContain('landStartReassert');
   });
 
-  it('(e) a cold jump walks; a walk that exhausts skips the landing branch but still books the flash', async () => {
+  it('(e) #479 — a cold jump whose mount walk exhausts clears with a landing failure instead of silently booking success', async () => {
     const { deps, log } = makeJumpDeps({ isTargetMounted: false, walk: 'exhausted' });
     const outcome = await runJumpPipeline(deps);
-    expect(outcome).toBe('landed'); // exhausted falls through to arm+flash+pin+cursor (bug-for-bug)
+    expect(outcome).toBe('landing-failed');
     expect(log).toEqual([
       'loadToTarget', 'modeHidden', 'resolveHit', 'ownerChainToOpen',
-      'isTargetMounted', 'walk', 'landedBookkeeping:3',
+      'isTargetMounted', 'walk', 'clearJump',
     ]);
     expect(log).not.toContain('quiesce');
-    expect(log).not.toContain('landCenter');
+    expect(log).not.toContain('landStartReassert');
+    expect(log).not.toContain('landedBookkeeping:3');
+  });
+
+  it('(e2) #479 — a transient range hit with no mounted target element reports landing failure', async () => {
+    const { deps, log } = makeJumpDeps({ isTargetMounted: true, hasLandableElement: false });
+    const outcome = await runJumpPipeline(deps);
+    expect(outcome).toBe('landing-failed');
+    expect(log).toEqual([
+      'loadToTarget', 'modeHidden', 'resolveHit', 'ownerChainToOpen',
+      'isTargetMounted', 'hasLandableElement', 'clearJump',
+    ]);
+    expect(log).not.toContain('quiesce');
+    expect(log).not.toContain('landedBookkeeping:3');
+  });
+
+  it('(e3) #479 — a target recycled during final alignment reports landing failure instead of clearing as success', async () => {
+    const { deps, log } = makeJumpDeps({ isTargetMounted: true, landingSucceeded: false });
+    const outcome = await runJumpPipeline(deps);
+    expect(outcome).toBe('landing-failed');
+    expect(log).toEqual([
+      'loadToTarget', 'modeHidden', 'resolveHit', 'ownerChainToOpen',
+      'isTargetMounted', 'hasLandableElement', 'quiesce', 'hasCardRef',
+      'findOpen', 'landStartReassert', 'clearJump',
+    ]);
+    expect(log).not.toContain('landedBookkeeping:3');
   });
 
   // #286 B3 — the Task-4 (g) "clear on captured !hasMore" case is UPDATED to the
@@ -572,6 +598,17 @@ describe('runJumpPipeline', () => {
     expect(log).not.toContain('clearJump');
   });
 
+  it('(g5) a terminal page failure clears the jump with a distinct load-failed outcome (#480)', async () => {
+    const { deps, log } = makeJumpDeps({
+      resolveHit: null,
+      drain: { failed: true } as unknown as Partial<JumpDrainResult>,
+      committedRev: 9,
+    });
+    const outcome = await runJumpPipeline(deps);
+    expect(outcome).toBe('load-failed');
+    expect(log).toEqual(['loadToTarget', 'clearJump']);
+  });
+
   it('(h) expandDetails + no card opens disclosures before quiesce and picks landFindReassert', async () => {
     const { deps, log } = makeJumpDeps({ isTargetMounted: true, expandDetails: true, findOpen: true, hasCardRef: false });
     const outcome = await runJumpPipeline(deps);
@@ -590,7 +627,7 @@ describe('runJumpPipeline', () => {
     const outcome = await runJumpPipeline(deps);
     expect(outcome).toBe('landed');
     expect(log).toContain('landCard');
-    expect(log).not.toContain('landCenter');
+    expect(log).not.toContain('landStartReassert');
     expect(log).not.toContain('landFindReassert');
   });
 
@@ -607,11 +644,11 @@ describe('runJumpPipeline', () => {
   // #291 Part 2 — EVERY find landing must route through the convergent every-frame
   // reassert so the center survives virtuoso's deferred ResizeObserver re-measure
   // (a plain-prose find hit whose `expand_details` is false used to fall through to
-  // the single-shot `landCenter`, which the deferred re-measure then clobbered — the
+  // the former single-shot ordinary landing, which the deferred re-measure then clobbered — the
   // top-reset). The branch is relaxed from `deps.expandDetails && live.findOpen()`
   // to just `live.findOpen()`; `openDisclosures()` stays expand-gated. RED lever:
-  // with the OLD condition, case (k) records `landCenter` (not `landFindReassert`).
-  it('(k) #291 — a plain-prose find landing (findOpen, expandDetails=false) routes through landFindReassert, NOT landCenter/openDisclosures', async () => {
+  // with the OLD condition, case (k) records `landStartReassert` (not `landFindReassert`).
+  it('(k) #291 — a plain-prose find landing (findOpen, expandDetails=false) routes through landFindReassert, NOT landStartReassert/openDisclosures', async () => {
     const { deps, log } = makeJumpDeps({
       isTargetMounted: true, hasLandableElement: true, hasCardRef: false,
       findOpen: true, expandDetails: false,
@@ -619,7 +656,7 @@ describe('runJumpPipeline', () => {
     const outcome = await runJumpPipeline(deps);
     expect(outcome).toBe('landed');
     expect(log).toContain('landFindReassert');
-    expect(log).not.toContain('landCenter');
+    expect(log).not.toContain('landStartReassert');
     expect(log).not.toContain('openDisclosures');
   });
 
@@ -632,18 +669,18 @@ describe('runJumpPipeline', () => {
     expect(outcome).toBe('landed');
     expect(log).toContain('openDisclosures');
     expect(log).toContain('landFindReassert');
-    expect(log).not.toContain('landCenter');
+    expect(log).not.toContain('landStartReassert');
     expect(log.indexOf('openDisclosures')).toBeLessThan(log.indexOf('quiesce'));
   });
 
-  it('(m) #291 — a find-CLOSED jump (no open find bar) keeps the cheap single-shot landCenter', async () => {
+  it('(m) #479 — a find-CLOSED jump uses the convergent start-aligned landing', async () => {
     const { deps, log } = makeJumpDeps({
       isTargetMounted: true, hasLandableElement: true, hasCardRef: false,
       findOpen: false, expandDetails: false,
     });
     const outcome = await runJumpPipeline(deps);
     expect(outcome).toBe('landed');
-    expect(log).toContain('landCenter');
+    expect(log).toContain('landStartReassert');
     expect(log).not.toContain('landFindReassert');
     expect(log).not.toContain('openDisclosures');
   });
@@ -659,7 +696,7 @@ describe('runJumpPipeline', () => {
 
 describe('resolveExhaustion', () => {
   const drain = (over: Partial<JumpDrainResult> = {}): JumpDrainResult =>
-    ({ found: false, exhausted: true, terminalOpRev: 0, ...over });
+    ({ found: false, exhausted: true, failed: false, terminalOpRev: 0, ...over });
 
   it('(a) a first no-hit whose committed epoch LAGS the terminal op → defer (pendingExhaustion)', () => {
     // A bringing-prepend is still in flight to commit; wait for its re-fire.

@@ -821,7 +821,10 @@ def test_rebuild_folds_only_effective_events_for_all_family_shapes(ns, tmp_path)
         jr.append_record(record, now_utc=FIXED)
 
     target = tmp_path / "rebuilt.db"
-    jr.rebuild_stats_index(target_path=str(target))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(target),
+    )
     conn = core.open_db(_target_path=str(target))
     try:
         snapshots = {
@@ -939,7 +942,10 @@ def test_rebuild_taints_all_structural_classes_and_publishes_valid_history(
     for record in records:
         jr.append_record(record, now_utc=FIXED)
 
-    result = jr.rebuild_stats_index(target_path=str(destination))
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(destination),
+    )
 
     assert [v.kind for v in result.protocol_violations] == kinds
     conn = core.open_db(_target_path=str(destination))
@@ -1058,7 +1064,10 @@ def test_rebuild_quarantines_divergent_same_revision_events_and_completes(
             now_utc=FIXED,
         )
 
-    jr.rebuild_stats_index(target_path=str(destination))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(destination),
+    )
 
     conn = core.open_db(_target_path=str(destination))
     try:
@@ -1146,7 +1155,10 @@ def test_live_completed_correction_automatically_rebuilds_and_converges(
 
     live = core.open_db()
     independent_path = tmp_path / "independent.db"
-    jr.rebuild_stats_index(target_path=str(independent_path))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(independent_path),
+    )
     independent = core.open_db(_target_path=str(independent_path))
     try:
         live_row = tuple(
@@ -1250,7 +1262,7 @@ def test_completed_correction_rebuild_crash_preserves_old_index_and_retries(
         monkeypatch.setattr(jr.os, "replace", crash_replace)
 
     with pytest.raises(RuntimeError, match="simulated correction"):
-        jr.rebuild_stats_index()
+        jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     conn = core.open_db()
     try:
@@ -1265,7 +1277,7 @@ def test_completed_correction_rebuild_crash_preserves_old_index_and_retries(
         monkeypatch.setattr(jr, "_apply_evt", real_apply)
     else:
         monkeypatch.setattr(jr.os, "replace", real_replace)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = core.open_db()
     try:
         assert conn.execute(

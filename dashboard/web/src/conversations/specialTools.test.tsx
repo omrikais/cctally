@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { specialToolRenderer } from './specialTools';
 import { CodexCard } from './CodexCard';
+import { DiffCard } from './DiffCard';
+import { NativeProgramCard } from './NativeProgramCard';
+import { SessionRefCard } from './SessionRefCard';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -151,5 +154,52 @@ describe('specialToolRenderer — codex', () => {
   it('falls through to the generic chip when there is no usable prompt', () => {
     const el = specialToolRenderer(codexCall({ input: { threadId: 'x' } }));
     expect(el).toBeNull();
+  });
+});
+
+// #463 S3 §5.2 — the three new card types join the same name-keyed dispatch.
+describe('specialToolRenderer — #463 S3 Codex card families', () => {
+  it('dispatches a program card to NativeProgramCard', () => {
+    const el = specialToolRenderer(call({
+      name: 'exec',
+      native_card: {
+        schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+        invocations: [{ kind: 'command', command: 'ls', workdir: null, metadata: {} }],
+      },
+    }));
+    expect(el!.type).toBe(NativeProgramCard);
+  });
+
+  it('dispatches a session_ref card to SessionRefCard', () => {
+    const el = specialToolRenderer(call({
+      name: 'write_stdin',
+      native_card: {
+        schema_version: 1, type: 'session_ref', scope: 'shell', ref: '1',
+        operation: 'write', chars: 'y', truncated: false,
+      },
+    }));
+    expect(el!.type).toBe(SessionRefCard);
+  });
+
+  it('leaves a tool_search card to the generic chip', () => {
+    // §5.4 gives tool_search its query in the collapsed row and nothing more,
+    // so it deliberately has no dedicated component.
+    const el = specialToolRenderer(call({
+      name: 'tool_search_call',
+      native_card: { schema_version: 1, type: 'tool_search', query: 'github', limit: 5 },
+    }));
+    expect(el).toBeNull();
+  });
+
+  it('never relabels exec as Bash or apply_patch as Edit', () => {
+    const program = specialToolRenderer(call({
+      name: 'exec',
+      native_card: {
+        schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+        invocations: [{ kind: 'command', command: 'ls', workdir: null, metadata: {} }],
+      },
+    }));
+    expect(program!.type).not.toBe(DiffCard);
+    expect(program!.props.call.name).toBe('exec');
   });
 });

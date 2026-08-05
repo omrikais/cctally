@@ -7181,7 +7181,7 @@ mark.current {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.source-status-chip.is-stale { color: var(--text); border-color: var(--border); }
+.source-status-chip.is-stale { color: var(--text); border-color: var(--border-soft); }
 .source-status-chip.is-degraded {
   color: var(--sev-warn-fg, var(--accent-amber, #d08700));
   border-color: var(--sev-warn-fg, var(--accent-amber, #d08700));
@@ -7208,8 +7208,16 @@ mark.current {
   border: 1px solid var(--border-soft);
   color: var(--text-dim);
 }
-.source-chip--claude { color: var(--accent-blue, #4c8dff); border-color: currentColor; background: rgba(224, 207, 255, 0.10); }
-.source-chip--codex { color: var(--accent-green, #10b981); border-color: currentColor; background: rgba(148, 163, 184, 0.14); }
+/* #463 S5 (F24b) — ONE identity token per provider. `--accent-blue` previously
+   named Claude here and Codex on the conversation-viewer badge, so one colour
+   meant two different providers. Codex takes `--accent-codex` (its real brand
+   token, already the Codex card's accent) and Claude takes `--accent-purple`
+   (already the viewer badge's). `--accent-blue` and `--accent-green` are now
+   free for non-provider use. The `#10b981` / `#4c8dff` fallbacks are gone: both
+   tokens are defined at `:root`, so the fallback was unreachable and could only
+   ever drift away from the token it shadowed. */
+.source-chip--claude { color: var(--accent-purple); border-color: currentColor; background: rgba(224, 207, 255, 0.10); }
+.source-chip--codex { color: var(--accent-codex); border-color: currentColor; background: rgba(148, 163, 184, 0.14); }
 .source-session-row .source-chip { margin-right: var(--space-1); }
 /* #294 S5 §7 — the `all` selection chip in share chrome (ShareModal /
    PreviewPane). "All" is both providers, so it takes a neutral accent rather
@@ -7914,6 +7922,16 @@ mark.current {
 .conv-outline-stat-kv--models .conv-outline-stat-kv-glyph { color: var(--accent-magenta); }
 .conv-outline-stat-kv--errors .conv-outline-stat-kv-glyph,
 .conv-outline-stat-kv--errors .conv-outline-stat-kv-value { color: var(--accent-red); }
+/* #463 S4 §6.5 — the DECLINED error state. Red would read as "there are errors";
+   this row says the opposite, that nothing could tell either way, so it takes
+   the muted treatment and overrides the red above rather than sitting beside
+   it. Both selectors carry the same two classes, so this wins on source order —
+   it must stay AFTER the rule it overrides. */
+.conv-outline-stat-kv--declined .conv-outline-stat-kv-glyph,
+.conv-outline-stat-kv--declined .conv-outline-stat-kv-value {
+  color: var(--text-faint);
+  font-style: italic;
+}
 /* cache-failure-markers spec §4 — the "Cache" KV row glyph + value in amber. */
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-glyph,
 .conv-outline-stat-kv--cache .conv-outline-stat-kv-value { color: var(--accent-amber); }
@@ -8009,6 +8027,31 @@ mark.current {
    --conv-outline-depth custom property (set per entry) drives the extra pad. */
 .conv-outline-entry--subnested {
   padding-left: calc(22px + (var(--conv-outline-depth, 2) - 1) * 16px);
+}
+/* #463 S4 §6.7 — TIER-2 landmark rows: a reasoning heading, a failing tool call
+   or a plan call INSIDE a turn. They render in the same flat list, indented
+   under their owning turn (D6 — a tier collapsed by default would reproduce the
+   condition the epic opens by naming, "a rich navigation chrome in which almost
+   nothing moves"), and they reuse the EXISTING type modifiers above for glyph
+   and colour, so an error landmark takes `--accent-red` from the established
+   three-tier severity vocabulary rather than a new colour.
+   The row already carries `border: 1px solid transparent`, so colouring only
+   the left edge adds the rule without shifting any layout. */
+.conv-outline-entry--landmark {
+  border-left-color: var(--border-soft);
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
+}
+/* A landmark label is authored reasoning-heading text — 48-character median —
+   in a rail that narrows to about 260px, so it WRAPS instead of ellipsing away
+   the end of the sentence the reader is navigating by. `break-word`, never
+   `anywhere`: `anywhere` participates in intrinsic min-content sizing and is
+   what produces the F18 shatter S5 owns. */
+.conv-outline-entry--landmark .conv-outline-entry-label {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: break-word;
 }
 /* #217 S3 F8 — compaction landmark: a muted/blue cue distinct from the spine.
    The leading glyph (.conv-outline-entry-compaction-glyph) sits inside the
@@ -8611,7 +8654,7 @@ mark.current {
   gap: 4px;
   margin-bottom: 8px;
   padding: 3px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-soft);
   border-radius: 7px;
   background: var(--bg);
 }
@@ -8626,7 +8669,7 @@ mark.current {
 }
 .conv-rail-source-btn.is-on {
   color: var(--text);
-  background: var(--panel-hover);
+  background: var(--panel-bg-2);
   box-shadow: inset 0 0 0 1px var(--accent-blue);
 }
 .conv-rail-composed-note {
@@ -8639,15 +8682,24 @@ mark.current {
   align-items: center;
   width: max-content;
   padding: 1px 5px;
-  border: 1px solid color-mix(in srgb, var(--accent-blue) 55%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 55%, var(--border-soft));
   border-radius: 999px;
   color: var(--text-dim);
   font: 600 11px/1.4 var(--font-mono);
   letter-spacing: .06em;
   text-transform: uppercase;
 }
-.conv-source-badge--codex { color: var(--accent-blue); }
+.conv-source-badge--codex { color: var(--accent-codex); }
 .conv-source-badge--claude { color: var(--accent-purple); }
+/* #463 S5 (F24b) — the identity classes provider pills render through. Five
+   pills in Forecast, Trend and Source Detail previously used a generic
+   accent-blue class, which no CSS-selector scan could see. Route them through
+   `providerAccentClass()` in lib/providerAccent.ts rather than hand-picking an
+   accent class at the render site. These are IDENTITY colours only: state
+   colours (the Codex budget bar's orange, Codex error red, Codex pending amber)
+   name a state rather than a provider and are deliberately outside this axis. */
+.accent-provider-codex { color: var(--accent-codex); }
+.accent-provider-claude { color: var(--accent-purple); }
 .conv-rail-row > .conv-source-badge {
   position: absolute;
   top: 7px;
@@ -8661,7 +8713,7 @@ mark.current {
   gap: 7px;
   min-height: 34px;
   padding: 5px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
   color: var(--text-dim);
   font: 11px/1.4 var(--font-mono);
   overflow-x: auto;
@@ -9541,9 +9593,9 @@ mark.current {
      background to transparent, and the pill rendered as bare text floating over
      the transcript. Measured in a real browser before the fix:
      `border-style: none`, `border-width: 0px`, `background: rgba(0,0,0,0)`.
-     Four other rules in this file still name `--border` and are broken the
-     same way; issue #481 tracks them and proposes a build-time check for
-     undefined custom properties, which no JSDOM test can catch. */
+     Issue #481 extended that repair to every undefined no-fallback custom
+     property and added a build-time guard, which no JSDOM computed-style test
+     can provide. */
   border: 1px solid var(--border-soft);
   border-radius: 999px;
   background: var(--panel-bg-2);
@@ -10304,7 +10356,7 @@ mark.current {
   gap: var(--space-2);
   padding: var(--space-2) 12px 10px;
   border-top: 1px solid var(--border-soft);
-  font-family: var(--font-body);
+  font-family: var(--font-prose);
   font-size: var(--fs-body);
 }
 .conv-codex-reasoning-summary > span,
@@ -10478,6 +10530,12 @@ mark.current {
   color: var(--text-dim);
   background: var(--panel-bg-2);
 }
+
+/* #463 S4 F-A — the per-block jump address wrapper. `display: contents` so the
+   element generates no box: its child becomes the flex item of the enclosing
+   .conv-toolrun exactly as it was before the wrapper existed, and no gap, no
+   margin and no sibling rule can see it. */
+.conv-block-anchor { display: contents; }
 
 /* ---- Tool-run group (consecutive tool_call blocks) ---------------- */
 .conv-toolrun {
@@ -10764,7 +10822,7 @@ mark.current {
   flex-direction: column;
   gap: 6px;
 }
-.conv-term-copy { position: absolute; top: 4px; right: 6px; z-index: 1; display: inline-flex; gap: var(--space-1); align-items: center; }
+.conv-term-copy { align-self: flex-end; display: inline-flex; gap: var(--space-1); align-items: center; }
 .conv-term-cmd {
   margin: 0;
   font-family: var(--font-mono);
@@ -10829,7 +10887,18 @@ mark.current {
 .conv-term-badge--int { color: var(--accent-amber); }
 /* #217 S3 E9 — "show N lines" hint on a collapsed-by-default Bash card. The
    hint only makes sense while collapsed, so hide it once the card opens (the
-   disclosure arrow then affords re-collapse). */
+   disclosure arrow then affords re-collapse).
+
+   #463 S3 browser QA — the hint is rigid (`flex: 0 0 auto`), and measured on a
+   390px viewport it was the LARGEST rigid child of the summary row: 93px of a
+   302px content box, against 66px for the outcome badge and 29px for the `exec`
+   name. It was also the only rigid child in that row shipping a single wording.
+   The result was .conv-chip-preview at 52px — about eight characters — so three
+   consecutive `sed -n…` rows read identically. The renderer therefore emits a
+   wide and a narrow wording ("show 101 lines" / "+101") and the shared
+   .conv-status-* media pair above picks one, the same trade .conv-session-op
+   and .conv-chip-status already make. The prompt preview is the chip's primary
+   identifier and must survive the narrow viewport. */
 .conv-term-collapsed-hint {
   flex: 0 0 auto;
   margin-left: auto;
@@ -10914,6 +10983,210 @@ mark.current {
   word-break: break-word;
 }
 .conv-term[open] > summary .conv-term-collapsed-hint { display: none; }
+
+/* ---- #463 S3 — per-file patch truncation and diff provenance ----------- */
+/* THIS FILE's text was cut, which is independent of the card-level
+   .conv-native-patch-truncated note. Amber rather than red: a clipped file is
+   a bounded view, not a failure. */
+.conv-native-patch-fileclipped {
+  flex: 0 0 auto;
+  color: var(--accent-amber);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+/* A synthesized diff is a rendering of retained content, so its label stays
+   quiet — the reader must not be told the provider transmitted these bytes,
+   but the provenance is not the point of the card either. */
+.conv-native-patch-derived {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+
+/* ---- #463 S3 — the program card (§3.3 / §5.4) -------------------------- */
+.conv-program-body {
+  position: relative;
+  padding: var(--space-2) 10px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.conv-program-copy { position: absolute; top: 4px; right: 6px; z-index: 1; }
+.conv-program-title {
+  color: var(--text);
+  font-size: 11.5px;
+  padding-right: 64px;   /* clear the absolutely positioned copy button */
+}
+.conv-program-invocations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.conv-program-invocation {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.conv-program-invocation--session,
+.conv-program-invocation--other {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.conv-program-tool { color: var(--text); }
+.conv-program-other-note { color: var(--text-faint); font-size: var(--fs-eyebrow); }
+/* §3.3 — a program the scanner could not fully read did MORE than the card
+   lists, so this note is a correction to the list above it and is styled to be
+   read, not skimmed past. */
+.conv-program-incomplete {
+  margin: 0;
+  color: var(--accent-amber);
+  font-size: var(--fs-eyebrow);
+}
+.conv-program-truncated { margin: 0; color: var(--text-faint); font-size: var(--fs-eyebrow); }
+.conv-program-result { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+
+/* ---- #463 S3 — the session_ref card (§3.2 / §5.4) ---------------------- */
+.conv-session-body {
+  padding: var(--space-2) 10px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.conv-session-written,
+.conv-session-result { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+/* What the call did. Rigid like its neighbours, so it ships a wide and a narrow
+   wording and lets the .conv-status-* media pair pick one — measured at 390px,
+   this single-wording child was what starved .conv-chip-preview to about 21px
+   on a `write_stdin` row, and the preview is the chip's primary identifier. */
+.conv-session-op {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--fs-eyebrow);
+  white-space: nowrap;
+}
+/* The conversation-local ordinal (shell) or sandbox cell id. A rigid summary
+   child, so it carries a narrow wording too — see .conv-session-ref--* below. */
+.conv-session-ref {
+  flex: 0 0 auto;
+  padding: 1px var(--space-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.conv-session-ref--cell { color: var(--accent-cyan); }
+.conv-session-chars {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-session-truncated { margin: 0; color: var(--text-faint); font-size: var(--fs-eyebrow); }
+/* §5.3 — the one call that started the session. At most one per session, so
+   the row cost is bounded; it still ships a narrow wording because it is a
+   rigid summary child like every other. */
+.conv-session-opener {
+  flex: 0 0 auto;
+  color: var(--accent-green);
+  font-size: var(--fs-eyebrow);
+  white-space: nowrap;
+}
+/* The full statement about an opener lives in the EXPANDED body, where there
+   is room for a sentence. The collapsed row carries only the badge. */
+.conv-session-note { margin: 0; color: var(--text-faint); font-size: var(--fs-eyebrow); }
+
+/* ---- #463 S3 — the outcome badge (§5.4) -------------------------------- */
+/* Rigid, like every other trailing summary child, so OutcomeBadge emits a wide
+   and a narrow wording and the shipped .conv-status-* media pair picks one.
+   `unknown` is a real state covering 17.6% of outputs and is styled as a
+   neutral one — visible, not alarming, and never absent. */
+.conv-outcome {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+  white-space: nowrap;
+}
+/* The evidence behind the outcome word, in the EXPANDED body. It rode a `title`
+   attribute alone, which a touch viewport cannot open, so the exit code and
+   wall time F11a recovered were unreachable at 390px. Muted: it explains the
+   badge, it does not compete with it. */
+.conv-outcome-evidence {
+  margin: 0;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow);
+}
+.conv-outcome--completed { color: var(--accent-green); }
+.conv-outcome--failed { color: var(--accent-red); }
+.conv-outcome--running { color: var(--accent-blue); }
+.conv-outcome--unknown { color: var(--text-faint); }
+/* The chip's own amber status colour is set by `.conv-chip--tool
+   .conv-chip-status`; the outcome badge is a SIBLING of that element, not a
+   variant of it, so it keeps its own per-status colour without a specificity
+   contest. */
+
+/* ---- #463 S3 — the external-agent marker (§5.5) ------------------------ */
+/* NOT a tool chip: this is the assistant's own serialized call, so it takes a
+   note-like surface rather than the chip vocabulary the outline and the focus
+   filters key off. */
+.conv-external-call {
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel-bg-2);
+  margin: var(--space-2) 0;
+  min-width: 0;
+}
+.conv-external-call > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-width: 0;
+}
+.conv-external-call-label {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.conv-external-call-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.conv-external-call-clipped { flex: 0 0 auto; color: var(--accent-amber); font-size: var(--fs-eyebrow); }
+.conv-external-call-body {
+  position: relative;
+  padding: 0 10px var(--space-2);
+  min-width: 0;
+  overflow-x: auto;
+}
 
 /* ANSI SGR foreground spans (parseAnsi). Mapped onto the in-tree palette — no
    new hexes — so the terminal stays native to the reader's colors. */
@@ -11860,18 +12133,33 @@ mark.current {
        white-space:pre and keep their own scroll boxes, unaffected. */
     overflow-wrap: anywhere;
   }
-  /* #335 Session E — the item-level long-token guard above is correct for prose,
-     but provider labels are semantic units. Keep them on one bounded line and
-     expose the complete text through the title/accessibility tree. */
-  #root .conv-meta--notification .conv-meta-label {
+  /* #463 S5 (F18, #493) — the item-level `overflow-wrap: anywhere` above is
+     correct for prose, but it also drops every summary child's min-content
+     contribution to ONE CHARACTER, so a flex label shrinks below its longest
+     word and then breaks mid-token ("AGENT MODE" -> AGE / NT / MOD / E).
+     Reset the wrap mode for the whole summary row, not per meta kind: #335
+     respelled six declarations for the notification label alone and three other
+     kinds shipped unprotected. Protection is now inherited, so a kind added
+     later cannot miss it. The meta BODY keeps `anywhere`, which is where long
+     paths and URLs genuinely need character-level breaking.
+     Labels wrap at whitespace rather than ellipsize, because a `title` on a
+     non-focusable span is not invokable by touch.
+     `break-word` is the valve, and it sits on the ROW so every child inherits
+     it. `break-word` does not participate in min-content sizing, so it cannot
+     reintroduce the shatter, and it still breaks a single token that genuinely
+     cannot fit on a line of its own. Putting it on individual children instead
+     would recreate the per-element bookkeeping this rule exists to remove — a
+     child added later would render outside the valve and overflow the row. */
+  #root .conv-meta > summary {
+    overflow-wrap: break-word;
+    word-break: normal;
+    flex-wrap: wrap;
+  }
+  #root .conv-meta-label,
+  #root .conv-meta-name {
     flex: 0 1 auto;
     min-width: 0;
-    max-width: 48%;
-    white-space: nowrap;
-    overflow-wrap: normal;
-    word-break: normal;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
   }
   /* The provider strip is a flex child of the height-bounded reader. It must
      size to its wrapped content instead of shrinking below scrollHeight; the
@@ -12298,6 +12586,10 @@ mark.current {
 
 /* citation chip — link text without the dead file:line href */
 .conv-codex-cite { font-size: .92em; padding: 0 5px; border-radius: 4px; background: var(--panel-bg); color: #9fd6c6; border: 1px solid rgba(16,163,127,.25); }
+/* #463 S5 — neutral inert form for a link whose target is not http(s)/mailto.
+   Distinct from .conv-codex-cite, which is Codex-brand green and correct only
+   inside the Codex tool card; this one also renders on Claude prose. */
+.conv-inert-link { color: var(--text-dim); text-decoration: underline dotted; text-underline-offset: 2px; }
 
 /* error block */
 .conv-codex-error { margin: 10px 12px 12px; border: 1px solid rgba(239,68,68,.4); background: rgba(239,68,68,.07); border-radius: 6px; padding: 10px 12px; }

@@ -101,7 +101,7 @@ def _seed_wrong_journal(mod):
     fixed = dt.datetime(2026, 7, 25, 12, 0, tzinfo=dt.timezone.utc)
     for record in [obs, *wrong_events]:
         runtime.append_record(record, now_utc=fixed)
-    runtime.rebuild_stats_index()
+    runtime.rebuild_stats_index(context=runtime.RebuildContext(trigger="test-fixture"))
     return obs, wrong_events
 
 
@@ -255,8 +255,56 @@ def test_preview_is_write_free_apply_converges_and_second_apply_is_noop(
     assert _journal_bytes(mod) == stable_journal
 
     independent = tmp_path / "independent.db"
-    runtime.rebuild_stats_index(target_path=independent)
+    runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
+        target_path=independent,
+    )
     assert _logical_dump(mod.DB_PATH) == _logical_dump(independent)
+
+
+def _cutover_manifests(app_dir) -> list:
+    """Every `preserve-then-atomic-replace-v1` manifest, oldest first."""
+    root = pathlib.Path(app_dir) / "quarantine"
+    if not root.is_dir():
+        return []
+    out = []
+    for incident in sorted(root.iterdir()):
+        path = incident / "manifest.json"
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text())
+        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+            out.append(payload)
+    return out
+
+
+def test_rederive_apply_incident_records_the_rederive_apply_trigger(
+    tmp_path, monkeypatch, capsys
+):
+    """#496 S1 F3, driven through the real `db rederive --yes` entry point.
+
+    Asserting on the manifest rather than on the call expression is the point:
+    a context that never reaches preservation would leave the incident
+    unattributed exactly as it was before this work.
+    """
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    _seed_wrong_journal(mod)
+    capsys.readouterr()
+
+    # The fixture rebuild above already preserved one family under the
+    # test-only identity, so the assertion is about the LAST incident.
+    before = [m["trigger"] for m in _cutover_manifests(mod.APP_DIR)]
+
+    assert mod.cmd_db_rederive(_args(yes=True)) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "applied"
+
+    manifests = _cutover_manifests(mod.APP_DIR)
+    assert len(manifests) == len(before) + 1, (
+        "the apply must have preserved the family it replaced"
+    )
+    assert manifests[-1]["trigger"] == "rederive-apply"
+    assert manifests[-1]["schemaVersion"] == 2
 
 
 def test_command_path_closes_family_and_preserves_provider_owned_state(
@@ -510,7 +558,10 @@ def test_command_path_closes_family_and_preserves_provider_owned_state(
         *retained_codex,
     ]:
         runtime.append_record(record, now_utc=fixed)
-    runtime.rebuild_stats_index(update_quota_cache=False)
+    runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
+        update_quota_cache=False,
+    )
     hwm7 = mod.APP_DIR / "hwm-7d"
     hwm5 = mod.APP_DIR / "hwm-5h"
     hwm7.write_bytes(b"sentinel-week 77\n")
@@ -584,6 +635,7 @@ def test_command_path_closes_family_and_preserves_provider_owned_state(
 
     independent = tmp_path / "family-independent.db"
     runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
         target_path=independent,
         update_quota_cache=False,
     )
@@ -798,6 +850,7 @@ def test_atomic_group_revalidation_and_pinned_rebuild_leave_later_input_unread(
 
     target = tmp_path / "pinned.db"
     runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
         target_path=target,
         high_water=planned_high_water,
         update_quota_cache=False,
@@ -914,6 +967,7 @@ def test_real_sigkill_recovery_converges_without_duplicate_batch(
         assert final_journal[name].startswith(data)
     independent = case / "independent.db"
     runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
         target_path=independent,
         update_quota_cache=False,
     )
@@ -957,7 +1011,7 @@ def _seed_conflicted_journal(mod):
                 now_utc=fixed,
             )
             conflicted_ids.append(action.event_id)
-    runtime.rebuild_stats_index()
+    runtime.rebuild_stats_index(context=runtime.RebuildContext(trigger="test-fixture"))
     return conflicted_ids
 
 

@@ -275,6 +275,16 @@ class StatsDbCorruptError(sqlite3.DatabaseError):
     """
 
 
+class StatsPublicationFailedError(StatsDbCorruptError):
+    """A replacement stats index was published and then FAILED validation.
+
+    Distinct from ``StatsDbCorruptError``'s ordinary case because replacement
+    already occurred, so the inherited "Not auto-recreated" wording would be
+    false. Subclasses it deliberately: every graceful-degrade site and the CLI
+    boundary's staged exit 3 keep applying unchanged (#496 S1 F1).
+    """
+
+
 class StatsDbMaintenanceError(sqlite3.OperationalError):
     """A guided repair owns stats.db; new cctally opens must stay out.
 
@@ -778,6 +788,114 @@ def _corruption_trigger_record(
     }
 
 
+def _capture_corruption_wal_evidence(
+    db_path: pathlib.Path, ts: str, *, db_label: str, trigger_exception,
+) -> dict:
+    """Copy the WAL/SHM bytes present at forensics time (#496 S1 F2).
+
+    Scoped to stats.db. Retention for `logs/stats.db-corruption-forensics-<ts>/`
+    is handed to S6 alongside the other new log families; nobody owns retention
+    for a cache.db or conversations.db evidence directory, and those WALs are
+    not bounded by stats.db's 16 MiB `journal_size_limit` — `cache.db-wal` has
+    been observed above 256 MiB under a multi-agent hook storm (#297).
+    Generalizing this stays available to a later session that brings its own
+    retention story.
+
+    This is a FORENSICS-TIME capture, not an exact detection-time one, and the
+    difference is real: the connection whose failure classified the corruption
+    is closed inside ``open_db`` before the heal hook runs, and the heal's
+    locked re-check probe runs before this, so a clean close of that read-write
+    connection could already have checkpointed the WAL if it was the last
+    handle. Closing that residual gap means capturing at the ``open_db``
+    corruption boundary, which is not this session's surface.
+
+    Field evidence bounds the cost: 41 of the 74 retained production bundles
+    recorded a non-empty WAL at exactly this point.
+
+    Both the heal's re-check and the bundle's own integrity probe open
+    read-only, and a read-only connection cannot checkpoint, so nothing between
+    this capture and those probes can empty the WAL.
+    """
+    empty = {"disposition": None, "path": None, "bytes": {}, "reason": None}
+    if db_label != "stats":
+        # Recorded rather than omitted, so a cache bundle still says WHY it
+        # carries no evidence.
+        return {**empty, "disposition": "skipped_not_stats"}
+    if trigger_exception is None or not _is_sqlite_corruption_error(
+        trigger_exception
+    ):
+        # A deliberate `db rebuild` on a healthy index must not accumulate
+        # evidence directories.
+        return {**empty, "disposition": "skipped_not_corruption"}
+    wal = pathlib.Path(str(db_path) + "-wal")
+    try:
+        wal_bytes = wal.stat().st_size
+    except OSError:
+        wal_bytes = 0
+    if wal_bytes <= 0:
+        return {**empty, "disposition": "skipped_empty"}
+    try:
+        evidence = (
+            _cctally_core.LOG_DIR
+            / f"{db_path.name}-corruption-forensics-{ts}"
+        )
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The main file is deliberately NOT copied: it is tens of megabytes,
+        # and the cutover's preservation retains it anyway.
+        _copy_db_family(
+            db_path, evidence / db_path.name, suffixes=("-wal", "-shm"),
+        )
+        copied: dict = {}
+        for suffix in ("-wal", "-shm"):
+            member = evidence / f"{db_path.name}{suffix}"
+            try:
+                copied[member.name] = member.stat().st_size
+            except OSError:
+                copied[member.name] = None
+        return {
+            "disposition": "captured",
+            "path": str(evidence),
+            "bytes": copied,
+            "reason": None,
+        }
+    except Exception as exc:  # noqa: BLE001 — enrichment never breaks a heal
+        # Deliberately broader than OSError. An escaping exception propagates
+        # out of `write_corruption_forensics`, and in the cache path that
+        # caller's own `except Exception` then DECLINES destructive recovery —
+        # so a diagnostic copy failure would change what the heal does.
+        return {
+            **empty,
+            "disposition": "failed",
+            "reason": _bounded_forensics_text(
+                exc, _FORENSICS_EXCEPTION_MESSAGE_MAX,
+            ),
+        }
+
+
+def _describe_corruption_damage(integrity_rows, probe_db_path) -> dict:
+    """Structured damage description, or a recorded reason it is unavailable.
+
+    A forensics bundle must never fail to write because characterization
+    failed, so every exception is captured rather than propagated (#496 S1 F8).
+    """
+    try:
+        import _lib_stats_damage
+
+        return _lib_stats_damage.describe_damage(
+            integrity_rows=integrity_rows, path=probe_db_path,
+        )
+    except Exception as exc:
+        return {
+            "schemaVersion": 1,
+            "method": "unavailable",
+            "findings": [],
+            "shapeToken": "none",
+            "reason": _bounded_forensics_text(
+                exc, _FORENSICS_EXCEPTION_MESSAGE_MAX,
+            ),
+        }
+
+
 def write_corruption_forensics(
     db_path,
     *,
@@ -834,6 +952,12 @@ def write_corruption_forensics(
         bundle["trigger"] = _corruption_trigger_record(
             trigger_origin, trigger_exception,
         )
+    # Capture the WAL before the integrity probe, and before anything else can
+    # disturb it (#496 S1 F2). Shares the bundle's timestamp stem so the pair
+    # is obvious.
+    bundle["walEvidence"] = _capture_corruption_wal_evidence(
+        db_path, ts, db_label=db_label, trigger_exception=trigger_exception,
+    )
     for suffix in ("", "-wal", "-shm"):
         p = pathlib.Path(str(db_path) + suffix)
         try:
@@ -876,6 +1000,11 @@ def write_corruption_forensics(
             reason = "integrity_check_unavailable"
     bundle["probeDisposition"] = disposition.value
     bundle["probeReason"] = reason
+    # Scanned against `probe_db_path`, the same artifact `integrityCheck`
+    # describes, so a `both` verdict never mixes two files.
+    bundle["damage"] = _describe_corruption_damage(
+        bundle["integrityCheck"], probe_db_path,
+    )
     try:
         cp = subprocess.run(
             ["lsof", "--", str(db_path)],
@@ -1196,7 +1325,15 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
             # authorizer-armed `open_db(_target_path=...)` connection, and we
             # hold maintenance exclusive, which is what spec §3.1 sanctions.
             with _cctally_store.stats_write_scope("maintenance-rebuild"):
-                result = _cctally_journal.rebuild_stats_index()
+                result = _cctally_journal.rebuild_stats_index(
+                    context=_cctally_journal.RebuildContext(
+                        trigger="db-rebuild",
+                        trigger_error=None,
+                        forensics_path=(
+                            str(forensics) if forensics is not None else None
+                        ),
+                    )
+                )
                 incident = result.quarantine_dir
         except Exception as exc:
             eprint(f"cctally: stats.db rebuild failed: {exc}")
@@ -3781,7 +3918,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             ON codex_conversation_rollups(last_activity_utc DESC, conversation_key DESC);
 
         -- codex_conversation_file_touches: write-class axis for the `files`
-        -- search kind + outline file stats (§3.3). source_path gives explicit
+        -- search kind (§3.3). The richer outline file stats stay derived from
+        -- retained event payloads at read time. source_path gives explicit
         -- lineage so the per-file delete/truncate/prune paths scope deletions
         -- exactly as they do for the other Codex families.
         CREATE TABLE IF NOT EXISTS codex_conversation_file_touches (
@@ -4145,7 +4283,8 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         ).fetchone()
     except sqlite3.OperationalError:
         current = None
-    if current is not None and current[0] == "1":
+    if current is not None and current[0] == "2":
+        _apply_codex_find_projection_schema(conn)
         return
 
     _apply_cache_schema(conn)
@@ -4195,11 +4334,81 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # #347: transcript attribution belongs to the physical rows.  These are
+    # pure column additions; migration 005 owns only the one-time legacy
+    # backfill policy.  NULL is the stored spelling of the `unattributed`
+    # sentinel, matching the accounting cache contract from #341.
+    add_column_if_missing(conn, "conversation_messages", "account_key", "TEXT")
+    add_column_if_missing(conn, "codex_conversation_events", "account_key", "TEXT")
+    add_column_if_missing(conn, "codex_conversation_messages", "account_key", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_messages_account_session "
+        "ON conversation_messages(account_key, session_id, timestamp_utc, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_conv_messages_account_conversation "
+        "ON codex_conversation_messages(account_key, conversation_key, timestamp_utc, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_events_account_conversation "
+        "ON codex_conversation_events(account_key, conversation_key, line_offset)"
+    )
     conn.execute(
         "INSERT INTO cache_meta(key,value) VALUES "
-        "('conversation_schema_version','1') "
+        "('conversation_schema_version','2') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
     )
+    _apply_codex_find_projection_schema(conn)
+
+
+def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
+    """Create #482's disposable visible-text projection tables.
+
+    This helper is called even when the conversations base-schema marker is
+    current: migration 004 must be able to add the derivation without bumping
+    or replaying the much larger historical transcript schema.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS codex_find_projection (
+            message_id          INTEGER NOT NULL,
+            conversation_key    TEXT NOT NULL,
+            item_key            TEXT NOT NULL,
+            block_key           TEXT NOT NULL,
+            container_block_key TEXT NOT NULL,
+            surface             TEXT NOT NULL
+                                CHECK(surface IN ('body','call','output','completion')),
+            render_order        INTEGER NOT NULL,
+            projected_text      TEXT NOT NULL,
+            leaves_json         TEXT NOT NULL,
+            disclosure_json     TEXT NOT NULL,
+            projection_version  INTEGER NOT NULL,
+            PRIMARY KEY(message_id, surface),
+            FOREIGN KEY(message_id) REFERENCES codex_conversation_messages(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_find_projection_conversation_order
+            ON codex_find_projection(
+                conversation_key, render_order, message_id, surface
+            );
+        CREATE TRIGGER IF NOT EXISTS codex_find_projection_message_ad
+        AFTER DELETE ON codex_conversation_messages BEGIN
+            DELETE FROM codex_find_projection WHERE message_id=old.id;
+        END;
+        """
+    )
+    # Fresh stores are complete without a backfill. Populated upgrades are
+    # armed by migration 004 under the provider flock.
+    has_state = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key IN "
+        "('codex_find_projection_complete_version',"
+        " 'codex_find_projection_backfill_pending') LIMIT 1"
+    ).fetchone()
+    if has_state is None and conn.execute(
+        "SELECT 1 FROM codex_conversation_messages LIMIT 1"
+    ).fetchone() is None:
+        _set_cache_meta(conn, "codex_find_projection_complete_version", "1")
+        _set_cache_meta(conn, "codex_find_projection_generation", "0")
 
 
 def _fts5_available(conn: sqlite3.Connection) -> bool:
@@ -4331,6 +4540,139 @@ def _conv_003_background_mcp_result_replay(conn: sqlite3.Connection) -> None:
     try:
         _set_cache_meta(
             conn, _cctally_cache.CONVERSATION_BACKGROUND_MCP_REINGEST_KEY, "1")
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("004_codex_find_projection")
+def _conv_004_codex_find_projection(conn: sqlite3.Connection) -> None:
+    """Arm #482's bounded projection backfill for populated Codex stores.
+
+    The projection is fully derivable from retained normalized messages and
+    event payloads, so the migration never replays JSONL. The normal Codex
+    conversation synchronizer consumes the marker under the same provider
+    flock, in bounded batches. Fresh empty stores were certified by the schema
+    helper and this handler becomes an idempotent no-op.
+    """
+    held = _acquire_conversations_db_codex_provider_flock(
+        conn, migration="conversations 004 Codex find projection")
+    try:
+        _apply_codex_find_projection_schema(conn)
+        complete = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='codex_find_projection_complete_version' AND value='1'"
+        ).fetchone()
+        if complete is None:
+            _set_cache_meta(conn, "codex_find_projection_backfill_pending", "1")
+            conn.execute(
+                "INSERT OR IGNORE INTO cache_meta(key,value) VALUES"
+                "('codex_find_projection_backfill_cursor','0')"
+            )
+            _set_cache_meta(conn, "codex_find_projection_generation", "0")
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("005_conversation_account_dimension")
+def _conv_005_conversation_account_dimension(conn: sqlite3.Connection) -> None:
+    """Backfill the #347 transcript account dimension.
+
+    Decision R4 from #341 is the compatibility rule: retained Claude history
+    belongs to the journaled cutover account, while retained Codex history is
+    genuinely unrecoverable and remains NULL/``unattributed``.  The physical
+    columns are added by the base-schema helper before dispatch; this handler
+    owns only the data-shape transition and is idempotent.
+    """
+    import _cctally_journal
+    import _lib_accounts
+
+    held = _acquire_conversations_db_claude_provider_flock(
+        conn, migration="conversations 005 account dimension"
+    )
+    try:
+        held += _acquire_conversations_db_codex_provider_flock(
+            conn, migration="conversations 005 account dimension"
+        )
+        claude_key = _cctally_journal.find_accounts_cutover_op()
+        if claude_key is None:
+            pending = conn.execute(
+                "SELECT 1 FROM conversation_messages "
+                "WHERE account_key IS NULL LIMIT 1"
+            ).fetchone()
+            if pending is not None:
+                raise MigrationGateNotMet(
+                    "accounts cutover op not yet appended; deferring Claude "
+                    "conversation backfill until the epoch transition records it"
+                )
+            claude_key = _lib_accounts.UNATTRIBUTED
+        stored_key = (
+            None if claude_key == _lib_accounts.UNATTRIBUTED else claude_key
+        )
+        conn.execute(
+            "UPDATE conversation_messages SET account_key=? "
+            "WHERE account_key IS NULL",
+            (stored_key,),
+        )
+        # Explicitly preserve the pre-feature Codex decision.  This UPDATE makes
+        # the idempotent intent visible in the migration golden without guessing
+        # from whichever auth.json is active during upgrade.
+        conn.execute(
+            "UPDATE codex_conversation_events SET account_key=NULL "
+            "WHERE account_key IS NULL"
+        )
+        conn.execute(
+            "UPDATE codex_conversation_messages SET account_key=NULL "
+            "WHERE account_key IS NULL"
+        )
+        _set_cache_meta(conn, "conversation_account_dimension", "1")
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("006_backfill_codex_file_touches")
+def _conv_006_backfill_codex_file_touches(conn: sqlite3.Connection) -> None:
+    """Repair the file-search projection for retained dict-shaped patches.
+
+    The normalized writer historically recognized only list-shaped ``changes``;
+    real Codex patch completions use an object keyed by file path. The physical
+    event payloads are retained unbounded, so rebuild the derived touch rows from
+    those authoritative bytes and link only events that still have a normalized
+    message. ``INSERT OR IGNORE`` preserves valid legacy-list rows and makes a
+    markerless retry idempotent.
+    """
+    import _lib_codex_conversation as conversation
+
+    held = _acquire_conversations_db_codex_provider_flock(
+        conn, migration="conversations 006 Codex file touches")
+    try:
+        pending: list[tuple[int, str, str, str, str]] = []
+        for message_id, conversation_key, source_path, payload_json in conn.execute(
+            "SELECT m.id,m.conversation_key,m.source_path,e.payload_json "
+            "FROM codex_conversation_events e "
+            "JOIN codex_conversation_messages m "
+            "ON m.source_path=e.source_path AND m.line_offset=e.line_offset "
+            "WHERE e.event_type='patch_apply_end'"
+        ).fetchall():
+            try:
+                decoded = json.loads(payload_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            payload = decoded.get("payload") if isinstance(decoded, dict) else None
+            for file_path in conversation.codex_patch_file_paths(payload):
+                pending.append((
+                    message_id, conversation_key, source_path,
+                    file_path, "apply_patch",
+                ))
+        if pending:
+            conn.executemany(
+                "INSERT OR IGNORE INTO codex_conversation_file_touches "
+                "(message_id,conversation_key,source_path,file_path,tool) "
+                "VALUES(?,?,?,?,?)",
+                pending,
+            )
         conn.commit()
     finally:
         _release_cache_db_writer_flocks(held)
@@ -4760,6 +5102,7 @@ def _codex_conversation_fts_full_clear(conn: sqlite3.Connection) -> None:
             "INSERT INTO codex_conversation_fts(codex_conversation_fts) VALUES('delete-all')")
         _create_codex_conversation_fts_triggers(conn)
     for stmt in (
+        "DELETE FROM codex_find_projection",
         "DELETE FROM codex_conversation_file_touches",
         "DELETE FROM codex_conversation_rollups",
     ):
@@ -6198,8 +6541,7 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type='table' AND name='codex_conversation_events'"
             ).fetchone() is not None:
-                conn.execute(
-                    "UPDATE quota_window_snapshots AS q SET observed_model=("
+                model_lookup = (
                     " SELECT json_extract(e.payload_json, '$.payload.model')"
                     " FROM codex_conversation_events AS e"
                     " WHERE e.source_path=q.source_path"
@@ -6207,9 +6549,21 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
                     "   AND e.record_type IN ('turn_context','session_meta')"
                     "   AND json_valid(e.payload_json)"
                     "   AND json_type(e.payload_json, '$.payload.model')='text'"
-                    " ORDER BY e.line_offset DESC LIMIT 1)"
-                    " WHERE q.source='codex' AND q.observed_model IS NULL"
+                    " ORDER BY e.line_offset DESC LIMIT 1"
                 )
+                changed = conn.execute(
+                    "UPDATE quota_window_snapshots AS q SET observed_model=("
+                    + model_lookup + ")"
+                    " WHERE q.source='codex' AND q.observed_model IS NULL"
+                    " AND (" + model_lookup + ") IS NOT NULL"
+                )
+                if changed.rowcount:
+                    # #457: migration DML changes the same physical quota
+                    # inputs as ordinary ingest, so invalidate every consumer
+                    # in this transaction.  The IS NOT NULL guard keeps a
+                    # markerless retry byte-idempotent, including this token.
+                    import _cctally_cache
+                    _cctally_cache._bump_codex_physical_mutation_seq(conn)
             for drop in (
                 "DROP TRIGGER IF EXISTS conv_fts_ai",
                 "DROP TRIGGER IF EXISTS conv_fts_ad",
@@ -6854,8 +7208,10 @@ def _039_codex_quota_observed_model_backfill(conn: sqlite3.Connection) -> None:
     AND whose lookup actually resolves are considered, so a re-run over its own
     output writes nothing at all — not even a NULL-to-NULL update, which would
     fire the ledger trigger and dirty a window that never changed. Its real DML
-    IS ledgered, which is the mechanism working as designed: a migration that
-    rewrites this column no longer has to remember to announce it.
+    IS ledgered, which is that mechanism working as designed: a migration that
+    rewrites this column no longer has to remember a ledger-specific
+    announcement. The independent physical mutation token still advances for
+    the dashboard/certificate consumers that consult it before reconciliation.
 
     The migration is the ONE-TIME leg. It is not the whole guarantee: `db skip`
     and a fresh journal-repopulated cache both bypass it, so ``sync_codex_cache``
@@ -6863,7 +7219,13 @@ def _039_codex_quota_observed_model_backfill(conn: sqlite3.Connection) -> None:
 
     NO self-stamp — the dispatcher central-stamps on a clean return (#140).
     """
-    backfill_codex_quota_observed_model(conn)
+    changed = backfill_codex_quota_observed_model(conn)
+    if changed:
+        # #457: the ledger invalidates the incremental projector, while this
+        # shared token independently invalidates certificate/coherence and
+        # dashboard/TUI snapshot consumers.  Both move in this transaction.
+        import _cctally_cache
+        _cctally_cache._bump_codex_physical_mutation_seq(conn)
     conn.commit()
 
 

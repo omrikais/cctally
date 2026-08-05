@@ -12,6 +12,7 @@ import { SessionDetailContent } from './SessionModal';
 import { ShareIcon } from '../components/ShareIcon';
 import type { SharePanelId } from '../share/types';
 import { Modal } from './Modal';
+import { providerAccentClass } from '../lib/providerAccent';
 import type {
   ClaudeBlockDetailBody,
   ClaudeProjectDetailBody,
@@ -334,7 +335,7 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
       {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <div className="m-chipstrip sd-session-chipstrip">
         <span className="msess-badge sd-prompt-clamp" aria-label="Session prompt" title={label}>{label}</span>
-        <span className="m-pill accent-blue">Codex</span>
+        <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
       </div>
       {label.length > 96 ? (
         <details className="sd-prompt-disclosure">
@@ -401,7 +402,7 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
       {d.metadata_availability === 'partial' ? <p className="sd-note">{d.metadata_reason}</p> : null}
       <div className="m-chipstrip">
         <span className="msess-badge sd-project-label" title={d.label || 'Codex project'}>{d.label || 'Codex project'}</span>
-        <span className="m-pill accent-blue">Codex</span>
+        <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
       </div>
       <div className="m-hero cols-3">
         <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd)}</div><div className="lbl">Total cost</div></div></div>
@@ -451,7 +452,7 @@ function CodexBlockDetailView({ d }: { d: CodexBlockDetailBody }) {
     <div className="sd-codex-block modal-content" data-testid="codex-block-detail">
       <div className="m-chipstrip">
         <span className="msess-badge sd-project-label" title={d.label}>{d.label}</span>
-        <span className="m-pill accent-blue">Codex</span>
+        <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
         <span className={`m-pill ${d.is_active ? 'accent-green' : 'm-unavailable'}`}>{d.is_active ? 'Active' : 'Complete'}</span>
         <span className="m-pill accent-cyan">{freshness}</span>
       </div>

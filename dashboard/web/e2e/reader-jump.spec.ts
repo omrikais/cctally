@@ -67,6 +67,64 @@ test('a cold-tail jump to an early turn lands it in the viewport with the flash 
   expect(await flashWasSeen(page), 'the target flashed on landing').toBe(true);
 });
 
+test('a transient drain request failure backs off and still lands the linked turn (#480)', async ({ page }) => {
+  test.setTimeout(60_000);
+  let failures = 0;
+  await page.route(/\/api\/conversation\/.*before=/, async (route) => {
+    if (failures++ === 0) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"transient"}' });
+      return;
+    }
+    await route.continue();
+  });
+
+  await openConversation(page, m.long_session_id);
+  await expect(page.locator(READER_BODY)).toBeVisible();
+  await settleScroller(page);
+  await findJump(page, m.jump_target_needle);
+
+  await expect(page.locator(uuidSel(m.jump_target_uuid))).toBeVisible({ timeout: 15_000 });
+  expect(await turnVisibleInReader(page, m.jump_target_uuid), 'target visible after recovery').toBe(true);
+  expect(failures, 'one failed attempt plus at least one recovered page').toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId('conv-jump-load-failed')).toHaveCount(0);
+});
+
+test('a persistent drain failure stops after three attempts with a distinct visible state (#480)', async ({ page, browser }, testInfo) => {
+  test.setTimeout(30_000);
+  const exercise = async (targetPage: Page, screenshotName: string): Promise<number> => {
+    let attempts = 0;
+    await targetPage.route(/\/api\/conversation\/.*before=/, async (route) => {
+      attempts += 1;
+      // Let current main escape after six failures so the RED run terminates
+      // without exhausting memory. The fixed reader must stop after attempt 3 and
+      // therefore never reach this rescue path.
+      if (attempts <= 6) {
+        await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"persistent"}' });
+        return;
+      }
+      await route.continue();
+    });
+
+    await targetPage.goto(`/#/conversations/${encodeURIComponent(m.long_session_id)}/${encodeURIComponent(m.jump_target_uuid)}`);
+    await expect(targetPage.locator(READER_BODY)).toBeVisible();
+
+    const failure = targetPage.getByTestId('conv-jump-load-failed');
+    await expect(failure).toBeVisible({ timeout: 5_000 });
+    await expect(failure).toContainText('Could not finish loading the linked message.');
+    await targetPage.screenshot({ path: testInfo.outputPath(screenshotName), fullPage: true });
+    return attempts;
+  };
+
+  expect(await exercise(page, 'persistent-drain-desktop.png')).toBe(3);
+
+  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  try {
+    expect(await exercise(await mobile.newPage(), 'persistent-drain-mobile.png')).toBe(3);
+  } finally {
+    await mobile.close();
+  }
+});
+
 // Scenario 8 (spec §4.8 + §5/F10) — a jump-driven prepend doesn't bump the pill.
 // With the reader deliberately scrolled AWAY from the bottom (a BOUNDED wheel-up
 // that fires NO reverse page yet, so the pill guard is non-vacuous — a pill can

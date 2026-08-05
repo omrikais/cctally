@@ -28,6 +28,7 @@ import type { CacheReportDailyRow } from '../types/envelope';
 import { fmt } from '../lib/fmt';
 import { cacheVocabulary } from '../lib/cacheReportVocabulary';
 import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
+import { cacheReportChartDayCount } from '../lib/cacheReportChartLabels';
 
 export interface CacheNetBarsProps {
   days: CacheReportDailyRow[];   // newest-first; render oldest-first
@@ -107,7 +108,7 @@ export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
             viewBox={`0 0 ${cfg.width} ${cfg.height}`}
             width="100%"
             height={cfg.height}
-            aria-label={`Per-day net dollar chart, ${ordered.length} days`}
+            aria-label={`Per-day net dollar chart, ${cacheReportChartDayCount(ordered)}`}
           >
             {/* zero line */}
             <line
@@ -212,7 +213,7 @@ export function CacheNetBars({ days, size, source }: CacheNetBarsProps) {
       height="100%"
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
       preserveAspectRatio="none"
-      aria-label={`14-day net dollar bars, ${ordered.length} days`}
+      aria-label={`Net dollar bars, ${cacheReportChartDayCount(ordered)}`}
     >
       {/* Index-first map, then filter: the unobserved day keeps its x-slot but
           draws no bar (#443 — a synthetic zero is not a measurement). */}

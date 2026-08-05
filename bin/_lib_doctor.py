@@ -210,6 +210,11 @@ class DoctorState:
     # walk, so `files_failed`/`files_deferred_torn` are both zero, no `blocked`
     # record is ever written, and the ingest-backlog leg reads a drained store.
     codex_replay_deferred: Optional[dict] = None
+    # #485: privacy-safe durable records written when cache.db and/or
+    # conversations.db refused to treat an invalid Codex root as deletion
+    # evidence. None is the normal state; each record contains counts/reasons
+    # but never configured paths or provider identifiers.
+    codex_prune_refusals: Optional[list[dict]] = None
     # #279 S2 (F5b): PRAGMA quick_check(1) results, gathered ONLY under
     # doctor_gather_state(deep=True) (CLI cmd_doctor) — the dashboard
     # rebuild loop calls the gather every rebuild and quick_check on a
@@ -1233,6 +1238,64 @@ def _check_data_codex_replay(s: DoctorState) -> CheckResult:
         summary="pending (clears on the next unbudgeted Codex sync)"
                 if s.codex_replay_pending else "none pending",
         remediation=None, details=details,
+    )
+
+
+def _check_data_codex_prune_safety(s: DoctorState) -> CheckResult:
+    """Surface a fail-closed orphan-prune decision instead of silent loss."""
+    records = [
+        record for record in (s.codex_prune_refusals or [])
+        if isinstance(record, dict)
+    ]
+    if not records:
+        return CheckResult(
+            id="data.codex_prune_safety",
+            title="Codex orphan pruning",
+            severity="ok",
+            summary="no refused prune",
+            remediation=None,
+            details={"refusalCount": 0, "stores": []},
+        )
+    stores = sorted({
+        str(record.get("store"))
+        for record in records
+        if record.get("store") in {"cache", "conversations"}
+    })
+    preserved_files = max(
+        (int(record.get("preservedFileCount") or 0) for record in records),
+        default=0,
+    )
+    since_values = sorted({
+        str(record["since"])
+        for record in records
+        if isinstance(record.get("since"), str) and record["since"]
+    })
+    reasons = sorted({
+        str(reason)
+        for record in records
+        for reason in (
+            record.get("reasons") if isinstance(record.get("reasons"), list) else []
+        )
+        if isinstance(reason, str)
+    })
+    return CheckResult(
+        id="data.codex_prune_safety",
+        title="Codex orphan pruning",
+        severity="warn",
+        summary=(
+            f"refused unsafe prune; preserved {preserved_files} tracked file(s)"
+        ),
+        remediation=(
+            "Check that every $CODEX_HOME root is mounted and contains Codex "
+            "rollout JSONL, then run `cctally cache-sync --source codex`"
+        ),
+        details={
+            "refusalCount": len(records),
+            "stores": stores,
+            "since": since_values[0] if since_values else None,
+            "reasons": reasons,
+            "preservedFileCount": preserved_files,
+        },
     )
 
 
@@ -2935,6 +2998,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         # tests/test_doctor_codex_project_metadata.py), so the replay leg goes
         # after the pair rather than between them.
         ("data.codex_project_metadata", "_check_data_codex_project_metadata"),
+        ("data.codex_prune_safety", "_check_data_codex_prune_safety"),
         ("data.codex_replay", "_check_data_codex_replay"),
         ("data.codex_ingest_backlog", "_check_data_codex_ingest_backlog"),
         ("data.codex_quota", "_check_data_codex_quota"),

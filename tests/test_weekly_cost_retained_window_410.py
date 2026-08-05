@@ -327,6 +327,7 @@ def test_old_observation_replay_keeps_its_retained_week_and_cache_bound(
         }
         rebuilt_path = tmp_path / "stats-rebuilt.db"
         rebuild = journal_runtime.rebuild_stats_index(
+            context=journal_runtime.RebuildContext(trigger="test-fixture"),
             target_path=str(rebuilt_path),
             high_water=high_water,
             update_quota_cache=False,

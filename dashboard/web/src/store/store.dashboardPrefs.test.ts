@@ -3,6 +3,7 @@ import {
   _resetForTests,
   dispatch,
   getState,
+  selectLanAuthEnabled,
   selectMarkersEnabled,
 } from './store';
 
@@ -57,5 +58,16 @@ describe('dashboardPrefs slice + markersEnabled selector', () => {
       prefs: { cache_failure_markers: true },
     });
     expect(selectMarkersEnabled(getState())).toBe(true);
+  });
+
+  it('defaults LAN auth on and reflects an explicit restart preference', () => {
+    expect(selectLanAuthEnabled(getState())).toBe(true);
+    dispatch({
+      type: 'INGEST_DASHBOARD_PREFS',
+      prefs: { lan_auth: false },
+    });
+    expect(selectLanAuthEnabled(getState())).toBe(false);
+    dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: {} });
+    expect(selectLanAuthEnabled(getState())).toBe(true);
   });
 });

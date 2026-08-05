@@ -92,7 +92,11 @@ export interface Envelope {
   // cache-rebuild marker opt-out; ABSENCE is treated as ON (default true).
   // `live_tail` is the conversation-viewer live-tail opt-out (live-tail spec
   // §4.2); ABSENCE is likewise treated as ON (default true).
-  dashboard_prefs?: { cache_failure_markers?: boolean; live_tail?: boolean };
+  dashboard_prefs?: {
+    cache_failure_markers?: boolean;
+    live_tail?: boolean;
+    lan_auth?: boolean;
+  };
   // Preview channel marker — set to 'preview' only by the maintainer-local
   // `cctally-preview` wrapper (CCTALLY_CHANNEL=preview); omitted otherwise.
   // Additive-optional, like update?/doctor?/dashboard_prefs? — a Python

@@ -5,9 +5,10 @@ import { CopyButton } from './CopyButton';
 import { AnsiText } from './parseAnsi';
 import { LoadFull } from './LoadFull';
 import { highlightBody } from './CodeBlock';
-import { useFindSplit } from './findMark';
+import { splitToExactNodes, useExactSurfaceTargets, useFindSplit } from './findMark';
 import { useCopy } from './useCopy';
 import { NativePayloadDisclosure } from './NativePayloadDisclosure';
+import { OutcomeBadge, OutcomeEvidence } from './OutcomeBadge';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -64,6 +65,8 @@ function fullSessionText(
 
 export function BashCard({ call }: { call: Call }) {
   const split = useFindSplit();
+  const exactCall = useExactSurfaceTargets(call.block_key, 'call');
+  const exactOutput = useExactSurfaceTargets(call.block_key, 'output');
   const { copied: copiedFull, copy: copyFull } = useCopy();
   // The full output loaded on demand when result.truncated (#178); supersedes
   // the bounded result.text for rendering. The load-full result payload carries
@@ -96,7 +99,8 @@ export function BashCard({ call }: { call: Call }) {
   const nativeStderr = nativeOutput?.parts
     .filter((part) => part.type === 'text' && part.stream === 'stderr')
     .map((part) => part.text).join('');
-  const rawParts = nativeOutput?.parts.filter((part) => part.type === 'raw') ?? [];
+  const rawParts = nativeOutput?.parts.flatMap((part, index) =>
+    part.type === 'raw' ? [{ part, sourceIndex: index }] : []) ?? [];
   const legacyStreams = full == null
     ? splitStreams(rawText, call.stderr)
     : splitStreams(rawText, full.stderr);
@@ -105,10 +109,14 @@ export function BashCard({ call }: { call: Call }) {
     ? (nativeStderr && nativeStderr.length > 0 ? nativeStderr : null)
     : legacyStreams.stderr;
 
+  // #463 S3 §5.4 — outcome on the right. Claude's Bash calls carry no
+  // `outcome`, so this card renders exactly as it does today for them.
   const badge = isError ? (
     <span className="conv-term-badge conv-term-badge--err">● error</span>
   ) : interrupted ? (
     <span className="conv-term-badge conv-term-badge--int">■ interrupted</span>
+  ) : call.outcome ? (
+    <OutcomeBadge outcome={call.outcome} truncated={result?.truncated === true} />
   ) : null;
 
   // #217 S3 E9 — collapse heuristic. A long terminal output buries the next turn
@@ -124,11 +132,12 @@ export function BashCard({ call }: { call: Call }) {
       ? 0
       : (stdout.length > 0 ? stdout.split('\n').length : 0) +
         (stderr != null && stderr.length > 0 ? stderr.split('\n').length : 0) +
-        rawParts.reduce((total, part) => total + Math.max(1, part.text.split('\n').length), 0);
+        rawParts.reduce((total, { part }) => total + Math.max(1, part.text.split('\n').length), 0);
   const collapseLong = outputLineCount > COLLAPSE_LINE_THRESHOLD;
 
   return (
-    <details className="conv-chip conv-chip--tool conv-term" open={!collapseLong}>
+    <details className="conv-chip conv-chip--tool conv-term" open={!collapseLong}
+             {...(call.block_key ? { 'data-disclosure-key': call.block_key } : {})}>
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         <TerminalIcon />
@@ -137,9 +146,16 @@ export function BashCard({ call }: { call: Call }) {
         {badge}
         {/* #217 S3 E9 — collapsed-by-default hint; the disclosure arrow already
             affords expansion, this names the hidden line count. Hidden once the
-            user (or collapse-all) opens the card via the [open] sibling rule. */}
+            user (or collapse-all) opens the card via the [open] sibling rule.
+            Two wordings, like every other rigid child of this row: measured at
+            390px the single "show N lines" form was the LARGEST rigid consumer
+            (93px) and left .conv-chip-preview at 52px, about eight characters,
+            so consecutive commands were indistinguishable. */}
         {collapseLong && (
-          <span className="conv-term-collapsed-hint">show {outputLineCount} lines</span>
+          <span className="conv-term-collapsed-hint">
+            <span className="conv-status-wide">show {outputLineCount} lines</span>
+            <span className="conv-status-narrow">+{outputLineCount}</span>
+          </span>
         )}
       </summary>
       <div className="conv-term-body">
@@ -174,28 +190,39 @@ export function BashCard({ call }: { call: Call }) {
               <span className="conv-term-prompt" aria-hidden="true">
                 ${' '}
               </span>
-              {highlightBody(entry.command, 'bash', split)}
+              {exactCall.get(`commands.${index}`)?.length
+                ? splitToExactNodes(entry.command, exactCall.get(`commands.${index}`)!)
+                : highlightBody(entry.command, 'bash', split)}
             </pre>
           </div>
         ))}
+        {call.outcome && <OutcomeEvidence outcome={call.outcome} />}
         {result && (
           <>
             {/* Empty stdout + interrupted → the badge is the whole story; skip an
                 empty output block. Otherwise render the stdout terminal block. */}
             {(stdout.length > 0 || (!interrupted && stderr == null)) && (
               <pre className="conv-term-out">
-                <AnsiText text={stdout} />
+                <AnsiText
+                  text={stdout}
+                  exactTargets={exactOutput.get('stdout') ?? []}
+                />
               </pre>
             )}
             {stderr != null && (
               <pre className="conv-term-stderr">
-                <AnsiText text={stderr} />
+                <AnsiText
+                  text={stderr}
+                  exactTargets={exactOutput.get('stderr') ?? []}
+                />
               </pre>
             )}
-            {full == null && rawParts.map((part, index) => (
-              <pre className="conv-term-raw" key={`${index}-${part.text.slice(0, 24)}`}>
+            {full == null && rawParts.map(({ part, sourceIndex }) => (
+              <pre className="conv-term-raw" key={`${sourceIndex}-${part.text.slice(0, 24)}`}>
                 <span className="conv-term-raw-label">unparsed output</span>{'\n'}
-                {part.text}
+                {exactOutput.get(`raw.${sourceIndex}`)?.length
+                  ? splitToExactNodes(part.text, exactOutput.get(`raw.${sourceIndex}`)!)
+                  : part.text}
               </pre>
             ))}
             {result.truncated && full == null && (

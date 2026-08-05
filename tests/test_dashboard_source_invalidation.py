@@ -103,7 +103,7 @@ def _append_active_codex_weekly_snapshot(ns, rollout: pathlib.Path, *, now) -> N
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def test_codex_physical_mutation_sequence_tracks_metadata_only_and_reset_changes(
+def test_codex_physical_mutation_sequence_tracks_metadata_and_refuses_unknown_reset(
     tmp_path, monkeypatch,
 ):
     ns, _provider_root, rollout, conn = _sync_setup(tmp_path, monkeypatch)
@@ -124,8 +124,9 @@ def test_codex_physical_mutation_sequence_tracks_metadata_only_and_reset_changes
         assert _physical_seq(conn) == 2
 
         rollout.write_text("{}\n", encoding="utf-8")
-        ns["sync_codex_cache"](conn)
-        assert _physical_seq(conn) == 3
+        refused = ns["sync_codex_cache"](conn)
+        assert refused.prune_refused is True
+        assert _physical_seq(conn) == 2
     finally:
         conn.close()
 
@@ -138,18 +139,25 @@ def test_codex_physical_mutation_sequence_tracks_root_prune_and_rebuild(
         ns["sync_codex_cache"](conn)
         assert _physical_seq(conn) == 1
 
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "absent-root"))
+        provider_b = tmp_path / "provider-b"
+        rollout_b = (
+            provider_b / "sessions" / "2026" / "07" / "16" / "rollout.jsonl"
+        )
+        rollout_b.parent.mkdir(parents=True)
+        shutil.copyfile(CORPUS / "modern-full.jsonl", rollout_b)
+        monkeypatch.setenv("CODEX_HOME", str(provider_b))
         ns["sync_codex_cache"](conn)
-        assert _physical_seq(conn) == 2
+        # One mutation for pruning A and one for ingesting B.
+        assert _physical_seq(conn) == 3
 
         monkeypatch.setenv("CODEX_HOME", str(provider_root))
         ns["sync_codex_cache"](conn)
-        assert _physical_seq(conn) == 3
+        assert _physical_seq(conn) == 5
 
         ns["sync_codex_cache"](conn, rebuild=True)
         # Rebuild clears the old physical families and then commits the
         # reingested file batch in its own transaction.
-        assert _physical_seq(conn) == 5
+        assert _physical_seq(conn) == 7
     finally:
         conn.close()
 

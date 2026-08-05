@@ -25,7 +25,11 @@ vi.mock('../hooks/useConversation', () => ({
       loading: false, error: null, hasMore: false, hasPrev: false, prevBefore: null,
       openScrollIntent: null, lastOp: null,
       loadMore: async () => null, loadPrev: async () => null,
-      loadToTarget: async () => {}, jumpToLatest: async () => {}, tailRevision: 0,
+      loadToTarget: async () => ({
+        found: true, direction: 'none', exhausted: true, failed: false, terminalOpRev: 0,
+      }),
+      jumpToLatest: async () => {}, fetching: false, tailRevision: 0,
+      virtualFirstItemIndex: 1_000_000,
     };
   },
 }));

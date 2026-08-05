@@ -33,8 +33,8 @@ without relabeling it as Claude cache behavior.
 - **Cache %** = `cache_read_tokens / (input + cache_create + cache_read)`
 - **$ Saved** — counterfactual no-cache cost minus actual cost
 - **$ Wasted** — cache-write premium that did not yield enough reads
-- **Net $** — `Saved – Wasted`; negative means caching is costing you
-- **Anomaly glyph (⚠)** — `Net $ < 0` or Cache % drops ≥15pp vs. the trailing median
+- **Net $** — `Saved – Wasted`; more than `1e-9` USD below zero means caching is costing you
+- **Anomaly glyph (⚠)** — Net $ is more than `1e-9` USD below zero, or Cache % drops ≥15pp vs. the trailing median
 
 Claude financial fields use each retained response's effective
 `message.usage.speed`. Current Opus 5/4.8 fast rows use the 2x fast rate;
@@ -81,6 +81,11 @@ cctally cache-report --source all --by-session --json
 ```
 
 ## Gotchas
+
+- **Effectively-zero Net $ is not anomalous.** The `net_negative` trigger uses
+  the repository-wide `1e-9` USD tolerance, so a correctly rounded floating
+  residue between `-1e-9` and zero does not raise a warning. A value below
+  `-1e-9` still does.
 
 ### Codex token reuse, not a cache-hit rate
 

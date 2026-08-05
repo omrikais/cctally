@@ -290,7 +290,11 @@ def would_block_prod_stats_cutover(path) -> bool:
 # verification adds `quota_projection_ledger_state.last_full_pass_at`, and a
 # legacy index that already ran the fixups at version 2 would skip the schema
 # apply that adds it.
-_STATS_OPEN_FIXUPS_VERSION = 3
+#
+# 3 -> 4 (#460): scheduled boundary ownership adds
+# `quota_projection_ledger_state.next_evaluation_by_root_json` through the same
+# in-place legacy cutover seam.
+_STATS_OPEN_FIXUPS_VERSION = 4
 
 
 def stats_open_fixups_current(conn: sqlite3.Connection) -> bool:
@@ -784,6 +788,208 @@ def _stats_repair_marker(db_path) -> pathlib.Path:
     return pathlib.Path(db_path).with_name("stats.db.repairing")
 
 
+def _stats_publication_marker(db_path) -> pathlib.Path:
+    """The durable publication marker for ``db_path`` (#496 S1 F1)."""
+    return pathlib.Path(str(db_path) + ".publication")
+
+
+def _remove_stats_publication_marker(db_path) -> None:
+    import _cctally_journal
+
+    try:
+        _stats_publication_marker(db_path).unlink()
+    except FileNotFoundError:
+        pass
+    _cctally_journal._fsync_dir(pathlib.Path(db_path).parent)
+
+
+def _read_stats_publication_marker(db_path) -> "dict | None":
+    """The marker's state as a MAPPING, or None when no marker exists.
+
+    A marker that is present but unreadable, or whose bytes are valid JSON that
+    is not an object (`null`, `[]`), reads as an empty mapping: it exists, and
+    it records nothing. `json.loads` returns whatever the bytes decode to, so
+    calling `.get(...)` on the raw result raises `AttributeError` on those
+    shapes — which, from `_raise_settled_publication_failure`, escapes the heal
+    hook's `except Exception` and surfaces as a raw traceback from `open_db`.
+    """
+    try:
+        state = json.loads(_stats_publication_marker(db_path).read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _discard_pending_stats_publication_marker(db_path) -> None:
+    """Drop a PENDING marker whose own publication never replaced anything.
+
+    Such a marker's pinned high-water describes an index that was never
+    published, so validating the live destination against it would condemn a
+    healthy index (measured: destination cursor 303 against a pinned
+    high-water of 2852).
+
+    Callers must establish that fact first — see
+    `_pending_stats_publication_never_replaced`. **The maintenance lock does
+    NOT establish it.** A rebuild that dies releases its flock, so a scratch on
+    disk can belong to a strictly later run than the marker beside it, and the
+    two are then unrelated.
+
+    A `priorFailure` block is restored rather than dropped. It records a verdict
+    a PREVIOUS publication owed on bytes that are still live, carried forward by
+    the run whose marker this is; because that run never replaced the
+    destination, those bytes are exactly what a later opener would connect to.
+
+    A `failed` marker is a settled verdict about the CURRENT destination and is
+    never discarded here.
+    """
+    state = _read_stats_publication_marker(db_path)
+    if state is None or str(state.get("status") or "") != "pending":
+        return
+    prior = state.get("priorFailure")
+    if isinstance(prior, dict) and prior:
+        import _cctally_journal
+
+        _cctally_db._atomic_write_private_json(
+            _stats_publication_marker(db_path), prior
+        )
+        _cctally_journal._fsync_dir(pathlib.Path(db_path).parent)
+        return
+    _remove_stats_publication_marker(db_path)
+
+
+def _pending_stats_publication_never_replaced(db_path) -> bool:
+    """Whether a PENDING marker's own scratch index is still on disk.
+
+    `os.replace` is the only thing that consumes ANOTHER run's scratch, so a
+    marker still naming a live scratch pathname proves that run never reached
+    publication: the live destination is the untouched predecessor and the
+    marker is stale. When the scratch is gone the replacement DID happen and
+    the verdict on the published bytes is still owed, so the marker must be
+    resolved rather than discarded.
+
+    The stronger form of that claim — that `os.replace` is the only consumer of
+    any scratch — is false, and the difference is confined to the run's OWN
+    process. `_cctally_journal._cleanup_new_correction_scratches` removes the
+    scratch this run just created when `_recover_completed_correction`'s
+    rebuild raises, so a failing `os.replace` in that path leaves the marker
+    naming a scratch that its own process then deleted, and this predicate
+    reads that as "replaced". The proxy is used only across processes, where
+    that cleanup cannot reach, so the weaker property is the one it needs.
+
+    Must be consulted BEFORE stale-artifact cleanup removes the scratch.
+
+    A marker carrying no `scratchPath` cannot prove it published, so it is
+    treated as never-replaced. No released binary has ever written one — the
+    marker and this field ship together — so the branch exists only to keep an
+    unreadable marker from wedging every open.
+    """
+    state = _read_stats_publication_marker(db_path)
+    if not state:
+        return True
+    if str(state.get("status") or "") != "pending":
+        return False
+    scratch = state.get("scratchPath")
+    if not isinstance(scratch, str) or not scratch:
+        return True
+    return pathlib.Path(scratch).exists()
+
+
+def _stats_publication_failed_error(
+    db_path, record_path,
+) -> _cctally_db.StatsPublicationFailedError:
+    return _cctally_db.StatsPublicationFailedError(
+        _cctally_core.STATS_PUBLICATION_FAILED_MSG.format(
+            path=db_path, record=record_path or "<unrecorded>",
+        )
+    )
+
+
+def _raise_settled_publication_failure(db_path) -> None:
+    """Re-raise a `failed` publication verdict the caller's `except` swallowed.
+
+    Only a marker already written as `failed` reaches this; every other state
+    returns and leaves the caller's behaviour unchanged.
+    """
+    state = _read_stats_publication_marker(db_path)
+    if not state:
+        return
+    if str(state.get("status") or "") == "failed":
+        raise _stats_publication_failed_error(db_path, state.get("recordPath"))
+
+
+def _resolve_stats_publication_marker(db_path: pathlib.Path) -> None:
+    """Honour a durable publication marker (#496 S1 F1).
+
+    Caller holds maintenance EXCLUSIVE, which is what makes the pending case
+    safe: a rebuild that is still in flight owns the lock, so reaching here
+    proves its outcome is settled.
+
+    Order of precedence is established by the caller: a `.rebuilding-*` scratch
+    artifact is classified FIRST, so the existing interrupted-rebuild recovery
+    keeps taking precedence and clears any stale marker when it republishes.
+
+    This function refuses and reports. It never decides to rebuild — choosing
+    when to rebuild is firing policy.
+    """
+    import _cctally_journal
+
+    marker = _stats_publication_marker(db_path)
+    state = _read_stats_publication_marker(db_path)
+    if state is None:
+        return
+    status = str(state.get("status") or "")
+    record_path = state.get("recordPath")
+
+    if status == "failed":
+        raise _stats_publication_failed_error(db_path, record_path)
+    if status != "pending":
+        _remove_stats_publication_marker(db_path)
+        return
+
+    record = None
+    if isinstance(record_path, str):
+        try:
+            record = json.loads(pathlib.Path(record_path).read_text())
+        except (OSError, ValueError):
+            record = None
+    if not isinstance(record, dict) or "highWater" not in record:
+        # Without its record the marker cannot be judged, and validating
+        # against a guessed high-water would condemn a healthy index. This
+        # marker is diagnostic scaffolding; it must not wedge every open.
+        print(
+            "[stats] discarding an unresolvable stats.db publication marker "
+            f"(rebuild record: {record_path!r})",
+            file=sys.stderr,
+        )
+        _remove_stats_publication_marker(db_path)
+        return
+
+    raw = record.get("highWater")
+    high_water = (
+        (str(raw[0]), int(raw[1]))
+        if isinstance(raw, (list, tuple)) and len(raw) == 2
+        else None
+    )
+    error = _cctally_journal.validate_published_stats_index(db_path, high_water)
+    if error is None:
+        _remove_stats_publication_marker(db_path)
+        return
+
+    state.update({"status": "failed", "error": error})
+    try:
+        _cctally_db._atomic_write_private_json(marker, state)
+        record["status"] = "failed"
+        record["postPublicationValidation"] = {"ok": False, "error": error}
+        _cctally_db._atomic_write_private_json(
+            pathlib.Path(record_path), record
+        )
+    except OSError:
+        pass
+    raise _stats_publication_failed_error(db_path, record_path)
+
+
 def _resume_pending_quarantine(db_path: pathlib.Path) -> None:
     """Finish a strict quarantine that a previous owner did not complete.
 
@@ -993,12 +1199,27 @@ def _recover_or_reclaim_interrupted_stats_rebuild(
         # matching legacy prebuild-quarantine incident, exact scratch names are
         # unpublished Task A artifacts and are safe to reclaim under the
         # caller's maintenance EXCLUSIVE hold.
+        #
+        # The marker beside them is a separate question, decided BEFORE the
+        # cleanup destroys the evidence: a scratch here need not belong to the
+        # marker's run at all, because a crashed rebuild releases its flock and
+        # a later run can leave its own scratch behind.
+        stale_marker = _pending_stats_publication_never_replaced(db_path)
         _remove_stale_stats_rebuild_artifacts(artifacts)
+        if stale_marker:
+            _discard_pending_stats_publication_marker(db_path)
+        else:
+            _resolve_stats_publication_marker(db_path)
         return True
     if db_path.exists() and _cctally_journal.stats_index_matches_journal_prefix(
         db_path, high_water
     ):
         _remove_stale_stats_rebuild_artifacts(artifacts)
+        # This branch just PROVED the destination is a fully valid
+        # materialization of the journal prefix, which is strictly stronger
+        # than any publication marker's own check, so the proof supersedes
+        # whatever the marker recorded.
+        _remove_stats_publication_marker(db_path)
         return True
     if high_water is None or high_water[1] == 0:
         return False
@@ -1010,8 +1231,14 @@ def _recover_or_reclaim_interrupted_stats_rebuild(
         )
     try:
         with stats_write_scope("maintenance-interrupted-rebuild"):
-            _cctally_journal.rebuild_stats_index(high_water=high_water)
+            _cctally_journal.rebuild_stats_index(
+                context=_cctally_journal.RebuildContext(
+                    trigger="interrupted-rebuild-recovery"
+                ),
+                high_water=high_water,
+            )
         _remove_stale_stats_rebuild_artifacts(artifacts)
+        _discard_pending_stats_publication_marker(db_path)
         return True
     finally:
         _cctally_journal._release_ingest_lock(ingest_fd)
@@ -1114,6 +1341,11 @@ def stats_open_guarded(
                     except (
                         _cctally_db.ProdMigrationRefused,
                         _cctally_db.StatsDbMaintenanceError,
+                        # Recovery may resolve a publication marker whose run
+                        # DID replace the destination; that verdict carries its
+                        # own guided wording and must not be reworded into a
+                        # maintenance-in-progress error.
+                        _cctally_db.StatsPublicationFailedError,
                     ):
                         raise
                     except Exception as exc:
@@ -1129,6 +1361,36 @@ def stats_open_guarded(
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 if recovered:
                     continue
+                if not _flock_bounded(
+                    lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
+                ):
+                    raise _cctally_db.StatsDbMaintenanceError(
+                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                    )
+                if marker.exists() or pending.exists():
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                    continue
+            # #496 S1 F1: a durable publication marker, honoured AFTER the
+            # scratch-artifact classification above so that path keeps
+            # precedence. Steady state costs one stat() on a file that does not
+            # exist. Suppressed exactly where interrupted recovery is, so
+            # doctor's read-only gather stays read-only.
+            if (
+                recover_interruptions
+                and _INTERRUPTED_RECOVERY_SUPPRESSED.get() == 0
+                and _stats_publication_marker(db_path).exists()
+            ):
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                if not _flock_bounded(
+                    lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
+                ):
+                    raise _cctally_db.StatsDbMaintenanceError(
+                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                    )
+                try:
+                    _resolve_stats_publication_marker(db_path)
+                finally:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
                 ):
@@ -1370,7 +1632,15 @@ def _stats_heal_hook(
     the maintenance lock; False when it DECLINES — a non-corruption
     ``DatabaseError`` (BUSY / disk-full / permission), the dev-checkout-on-prod
     guard, or re-entrancy. A False return leaves ``open_db`` to raise its guided
-    ``StatsDbCorruptError``."""
+    ``StatsDbCorruptError``.
+
+    It can also RAISE ``_cctally_db.StatsPublicationFailedError`` (#496 S1 F1),
+    and both callers depend on that: ``_cctally_tui._tui_heal_post_query_stats``
+    catches it and degrades, while ``_cctally_core.open_db`` deliberately lets
+    it propagate. The heal that replaced the index and then failed to validate
+    it must report that itself, because ``open_db``'s decline branch would tell
+    the user the database was "Not auto-recreated" — false once replacement has
+    occurred."""
     global _HEAL_ACTIVE
     if store != "stats":
         return False
@@ -1402,8 +1672,21 @@ def _stats_heal_hook(
             probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
             if probe(path):
                 return True  # a sibling process already healed it — retry the open
-            # Forensics FIRST — before anything disturbs the evidence.
-            _cctally_db.write_corruption_forensics(path, db_label="stats")
+            # Forensics FIRST — before anything disturbs the evidence. The
+            # trigger pair is what arms the #496 S1 forensics-time WAL capture
+            # and what lets the quarantine incident name the bundle that
+            # preceded it.
+            #
+            # The typed result is CAPTURED but deliberately NOT gated on:
+            # refusing the heal on an UNCONFIRMED disposition is F4 and belongs
+            # to S3. S1 only makes the evidence available at this call site.
+            forensics = _cctally_db.write_corruption_forensics(
+                path,
+                db_label="stats",
+                trigger_origin="corruption-heal",
+                trigger_exception=exc,
+                return_result=True,
+            )
             if holds_ingest_lock():
                 ingest_fd = None       # this context IS the serialized writer
             else:
@@ -1424,7 +1707,20 @@ def _stats_heal_hook(
                 # exclusive, which is exactly what spec §3.1 sanctions.
                 with stats_write_scope("maintenance-heal"):
                     import _cctally_journal
-                    _cctally_journal.rebuild_stats_index()
+                    _cctally_journal.rebuild_stats_index(
+                        context=_cctally_journal.RebuildContext(
+                            trigger="corruption-heal",
+                            trigger_error=_cctally_db._bounded_forensics_text(
+                                exc,
+                                _cctally_db._FORENSICS_EXCEPTION_MESSAGE_MAX,
+                            ),
+                            forensics_path=(
+                                str(forensics.path)
+                                if forensics.path is not None
+                                else None
+                            ),
+                        )
+                    )
             finally:
                 if ingest_fd is not None:
                     _heal_release_flock(ingest_fd)
@@ -1439,6 +1735,15 @@ def _stats_heal_hook(
             _release_stats_maintenance_reentrant(maint_fd)
     except Exception as heal_exc:
         print(f"[heal] stats.db auto-heal failed: {heal_exc}", file=sys.stderr)
+        # A post-publication validation failure has ALREADY replaced the index.
+        # Declining here sends `open_db` to its pre-existing branch, which tells
+        # the user the database was "Not auto-recreated" and to run
+        # `db repair --db stats --yes` — both false once replacement occurred.
+        # The durable marker makes the NEXT process say the right thing; the
+        # process that caused the failure must say it too (#496 S1 F1).
+        # Narrow by construction: it fires only on a `failed` marker, so every
+        # other heal failure keeps its existing behaviour.
+        _raise_settled_publication_failure(path)
         return False
     finally:
         _HEAL_ACTIVE = False

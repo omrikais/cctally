@@ -9,16 +9,27 @@ import {
 } from './ConvIcons';
 import { CopyButton } from './CopyButton';
 import { highlightBody } from './CodeBlock';
-import { splitToReactNodes, useFindSplit } from './findMark';
+import {
+  splitToExactNodes,
+  splitToReactNodes,
+  useExactLeafTargets,
+  useExactSurfaceTargets,
+  useFindSplit,
+} from './findMark';
 import { LineNumberedCode } from './LineNumberedCode';
 import { resultLang } from './toolLang';
 import { specialToolRenderer } from './specialTools';
+import { BLOCK_ANCHOR_CLASS } from './resolveJumpAnchor';
 import { TaskChecklistCard } from './TaskChecklistCard';
 import { parseMcpName } from './parseMcpName';
 import { MediaFigure } from './MediaFigure';
 import { LoadFull } from './LoadFull';
 import { useFocusMode, useSuppressedHeadingKeys } from './TranscriptContext';
 import { NativePayloadDisclosure } from './NativePayloadDisclosure';
+import { ExternalAgentCall } from './ExternalAgentCall';
+import { OutcomeBadge, OutcomeEvidence } from './OutcomeBadge';
+import { runSessionRef } from './sessionIndex';
+import { plural } from '../lib/fmt';
 import type { ConversationBlock } from '../types/conversation';
 
 // #177 S4 (Q5-A): MCP chips show `action [server-pill]`; the full original
@@ -143,7 +154,7 @@ export function MessageBlocks({ blocks, anchorUuid, suppressToolUseIds, spawnKin
       out.push(
         <div className="conv-block" key={`t${out.length}`}
              {...(b.block_key ? { 'data-block-key': b.block_key } : {})}>
-          <Markdown>{b.text}</Markdown>
+          <Markdown findBlockKey={b.block_key} findSurface="body">{b.text}</Markdown>
         </div>,
       );
       i++;
@@ -211,11 +222,19 @@ function ToolRun({ calls }: { calls: Extract<ConversationBlock, { kind: 'tool_ca
     checklist = <TaskChecklistCard call={calls[0]} />;
     rest = calls.slice(lead);
   }
+  // #463 S3 §5.3 — when every session-bearing call in the run belongs to ONE
+  // shell session, the head says which, turning a long run of identical rows
+  // into a run that states what it is. A run that mixes sessions, names none,
+  // or names only sessions the server could not resolve keeps the generic head
+  // and relies on the per-chip badges.
+  const sessionRef = runSessionRef(rest);
   return (
     <div className="conv-toolrun">
       {checklist}
       {rest.length >= 2 && (
-        <div className="conv-toolrun-head">tool run · {rest.length} actions</div>
+        <div className="conv-toolrun-head">
+          tool run · {rest.length} actions{sessionRef ? ` · session ${sessionRef}` : ''}
+        </div>
       )}
       {rest.map((c, i) => (
         <ToolCallChip key={i} call={c} />
@@ -228,14 +247,19 @@ type ToolResult = { text: string; truncated: boolean; is_error: boolean };
 
 // Pick the RESULT renderer: a non-error Read whose file resolves to a known
 // language → gutter + highlight; everything else → the existing plain pre.
-function ToolResultBody({ result, name, preview }: { result: ToolResult; name: string | null; preview: string }) {
+function ToolResultBody({ result, name, preview, blockKey }: {
+  result: ToolResult; name: string | null; preview: string; blockKey?: string;
+}) {
   const split = useFindSplit();
+  const exact = useExactLeafTargets(blockKey, 'output');
   const lang = name === 'Read' && !result.is_error ? resultLang('Read', preview) : '';
   if (lang) return <LineNumberedCode code={result.text} lang={lang} />;
   // #236 — generic result <pre> is highlight-aware (find-closed → bare text).
   return (
     <pre className="conv-code conv-code--result">
-      {split ? splitToReactNodes(result.text, split) : result.text}
+      {exact.length
+        ? splitToExactNodes(result.text, exact)
+        : split ? splitToReactNodes(result.text, split) : result.text}
     </pre>
   );
 }
@@ -251,8 +275,23 @@ function ToolResultBody({ result, name, preview }: { result: ToolResult; name: s
 // dropped; args are a poor fidelity carrier). Header is identical to the
 // collapsed look the user already sees, so the chip simply becomes the thing
 // that expands. Collapsed by default.
+// #463 S4 F-A — a tool card is rendered by one of a dozen components, so the
+// jump address rides a wrapper rather than each card root. The wrapper is
+// `display: contents`, which generates no box at all: measured in a real
+// browser it neither changes the flex layout of `.conv-toolrun` nor has a rect
+// of its own, which is why `resolveJumpAnchor` descends to the card it holds.
+// Rendered ONLY for a Codex block, so Claude markup is byte-identical.
 function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool_call' }> }) {
+  const chip = <ToolCallChipBody call={call} />;
+  if (!call.block_key) return chip;
+  return (
+    <div className={BLOCK_ANCHOR_CLASS} data-block-key={call.block_key}>{chip}</div>
+  );
+}
+
+function ToolCallChipBody({ call }: { call: Extract<ConversationBlock, { kind: 'tool_call' }> }) {
   const split = useFindSplit();
+  const exactCall = useExactLeafTargets(call.block_key, 'call');
   const [fullInput, setFullInput] = useState<string | null>(null);
   const [fullResult, setFullResult] = useState<string | null>(null);
   if (call.skill_body != null) {
@@ -292,12 +331,20 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
   const status = isErr ? ' · error' : bgWide + truncated;
   const statusShort = !isErr && bgNarrow ? bgNarrow + truncated : null;
   return (
-    <details className="conv-chip conv-chip--tool">
+    <details className="conv-chip conv-chip--tool"
+             {...(call.block_key ? { 'data-disclosure-key': call.block_key } : {})}>
       <summary>
         <span className="conv-chev" aria-hidden="true" />
         {toolIcon(call.name)} <ChipName name={call.name} />
         <span className="conv-chip-preview">{call.preview}</span>
-        {status && (
+        {/* #463 S3 §5.4 — a Codex call carries an evidence-based outcome, which
+            replaces the derived status text rather than sitting beside it. The
+            two never coexist: `outcome` is Codex-only and the background-MCP
+            wordings it would collide with are Claude-only, so a Claude chip
+            takes the branch below byte-for-byte unchanged. */}
+        {call.outcome ? (
+          <OutcomeBadge outcome={call.outcome} isError={isErr} truncated={call.result?.truncated === true} />
+        ) : status && (
           <span className="conv-chip-status" title={statusShort ? status.trim() : undefined}>
             {statusShort ? (
               <>
@@ -309,10 +356,18 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
         )}
       </summary>
       <div className="conv-chip-body conv-chip-body--io">
+        {/* #463 S3 F11a — the exit code and wall time behind the badge. A
+            `title` attribute has no touch affordance, so they must also be
+            readable here, like on every other family that shows the badge. */}
+        {call.outcome && <OutcomeEvidence outcome={call.outcome} />}
         <div className="conv-tool-io">
           <div className="conv-tool-io-label">request</div>
           <CopyButton text={fullInput ?? call.input_summary} />
-          <pre className="conv-code conv-code--hl">{highlightBody(fullInput ?? call.input_summary, 'json', split)}</pre>
+          <pre className="conv-code conv-code--hl">{
+            exactCall.length
+              ? splitToExactNodes(fullInput ?? call.input_summary, exactCall)
+              : highlightBody(fullInput ?? call.input_summary, 'json', split)
+          }</pre>
           {call.payload_capable && call.tool_use_id && fullInput == null && (
             <LoadFull
               toolUseId={call.tool_use_id}
@@ -334,7 +389,7 @@ function ToolCallChip({ call }: { call: Extract<ConversationBlock, { kind: 'tool
               {call.result.truncated ? ' · truncated' : ''}
             </div>
             <CopyButton text={fullResult ?? call.result.text} />
-            <ToolResultBody result={{ ...call.result, text: fullResult ?? call.result.text }} name={call.name} preview={call.preview} />
+            <ToolResultBody result={{ ...call.result, text: fullResult ?? call.result.text }} name={call.name} preview={call.preview} blockKey={call.block_key} />
             {call.payload_capable && call.tool_use_id && fullResult == null && (
               <LoadFull
                 toolUseId={call.tool_use_id}
@@ -377,10 +432,6 @@ const GIT_ACTION_LABELS = {
   create_pr: 'Pull request created',
 } as const;
 
-function plural(count: number, one: string, many = `${one}s`): string {
-  return `${count} ${count === 1 ? one : many}`;
-}
-
 function CodexReasoningBlock({ block }: {
   block: Extract<ConversationBlock, { kind: 'codex_reasoning' }>;
 }) {
@@ -404,6 +455,7 @@ function CodexReasoningBlock({ block }: {
   const suppressed = useSuppressedHeadingKeys();
   const kept = block.headings?.filter((heading) => !suppressed.has(heading.key));
   const headings = kept?.length ? kept : null;
+  const exactBody = useExactSurfaceTargets(block.block_key, 'body');
   // Every heading this block decomposed into was a repeat. With no body to
   // disclose the block would render as an empty REASONING label, so it is
   // dropped (MessageBlocks drops it a step earlier so the container goes too;
@@ -424,29 +476,46 @@ function CodexReasoningBlock({ block }: {
           {headings.map((heading) => (
             <span className="conv-codex-reasoning-title" key={heading.key}
                   data-heading-key={heading.key}>
-              {heading.text}
+              {exactBody.get(`headings.${block.headings?.indexOf(heading) ?? -1}`)?.length
+                ? splitToExactNodes(
+                    heading.text,
+                    exactBody.get(`headings.${block.headings?.indexOf(heading) ?? -1}`)!,
+                  )
+                : heading.text}
             </span>
           ))}
         </span>
       ) : allHeadingsSuppressed ? null : (
-        <span className="conv-codex-reasoning-title"><Markdown>{headline}</Markdown></span>
+        <span className="conv-codex-reasoning-title">
+          <Markdown
+            findBlockKey={block.block_key}
+            findSurface="body"
+            findLeafPrefix={block.title ? 'title' : block.summary ? 'summary' : 'body'}
+          >{headline}</Markdown>
+        </span>
       )}
     </>
   );
+  // #463 S4 F-A — the block's own jump address. Its decomposed headings each
+  // carry a finer one (`data-heading-key`), which a reasoning landmark targets
+  // in preference; this is what a jump lands on when the headings were not
+  // decomposed.
+  const anchor = block.block_key ? { 'data-block-key': block.block_key } : {};
   if (!expandable) {
-    return <div className="conv-codex-reasoning conv-codex-reasoning--line" role="note">{summary}</div>;
+    return <div className="conv-codex-reasoning conv-codex-reasoning--line" role="note" {...anchor}>{summary}</div>;
   }
   return (
-    <details className="conv-codex-reasoning conv-codex-reasoning--expandable">
+    <details className="conv-codex-reasoning conv-codex-reasoning--expandable" {...anchor}
+             {...(block.block_key ? { 'data-disclosure-key': block.block_key } : {})}>
       <summary>{summary}</summary>
       <div className="conv-codex-reasoning-content">
         {block.summary && (
           <div className="conv-codex-reasoning-summary">
-            <span>Summary</span><Markdown>{block.summary}</Markdown>
+            <span>Summary</span><Markdown findBlockKey={block.block_key} findSurface="body" findLeafPrefix="summary">{block.summary}</Markdown>
           </div>
         )}
         <div className="conv-codex-reasoning-body">
-          <span>Body</span><Markdown>{block.body ?? ''}</Markdown>
+          <span>Body</span><Markdown findBlockKey={block.block_key} findSurface="body" findLeafPrefix="body">{block.body ?? ''}</Markdown>
         </div>
       </div>
     </details>
@@ -501,6 +570,11 @@ function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid
       return <SystemActionsBlock block={block} />;
     case 'codex_lifecycle':
       return <CodexLifecycleBlock block={block} />;
+    // #463 S3 §5.5 — the assistant's own serialized marker, rendered as
+    // structure. It survives chat focus mode because it is prose the provider
+    // wrote, not tool texture the mode strips.
+    case 'external_call':
+      return <ExternalAgentCall block={block} />;
     case 'thinking':
       return (
         <details className="conv-chip conv-chip--thinking">
@@ -529,7 +603,12 @@ function BlockChip({ block, anchorUuid }: { block: ConversationBlock; anchorUuid
       );
     case 'tool_result': // orphan items only
       return (
-        <details className="conv-chip conv-chip--result">
+        // #463 S4 remediation C-4 — the chip carries its own address, the way
+        // `CodexReasoningBlock` does. No `display: contents` wrapper is needed
+        // here: this <details> is the rendered row itself and generates a box,
+        // so it has a rect a jump can align.
+        <details className="conv-chip conv-chip--result"
+                 {...(block.block_key ? { 'data-block-key': block.block_key } : {})}>
           <summary>
             <span className="conv-chev" aria-hidden="true" />
             <ResultIcon /> <span className="conv-chip-name">Result</span>

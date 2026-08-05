@@ -283,7 +283,10 @@ def test_outline_prompts_find_v1_codex(tmp_path, monkeypatch):
         assert s == 200 and p["status"] == "ok" and "prompts" in p
         s, f, _ = _get_json(
             port, _entity_path(key, "/find") + "?q=Synthetic&kind=all")
-        assert s == 200 and f["status"] == "ok" and "anchors" in f
+        assert s == 200 and f["status"] == "ready"
+        assert f["schema_version"] == 2
+        assert f["semantics"] == "occurrence"
+        assert "occurrences" in f["page"]
     finally:
         srv.shutdown()
 
@@ -297,6 +300,66 @@ def test_find_bad_kind_is_400_for_qualified(tmp_path, monkeypatch):
         s, _b, _ = _get_json(
             port, _entity_path(keys["modern-full"], "/find") + "?q=x&kind=title")
         assert s == 400
+    finally:
+        srv.shutdown()
+
+
+def test_find_v1_codex_cursor_validation_and_staleness(tmp_path, monkeypatch):
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        path = _entity_path(keys["modern-full"], "/find")
+        malformed, body, _ = _get_json(
+            port, path + "?q=Synthetic&limit=1&cursor=garbage")
+        assert malformed == 400
+        assert body == {"error": "invalid find cursor"}
+        for suffix in (
+            "&limit=0",
+            "&limit=201",
+            "&limit=nope",
+            "&direction=sideways",
+            "&cursor=garbage&around=o1.anything",
+        ):
+            invalid, _body, _ = _get_json(port, path + "?q=Synthetic" + suffix)
+            assert invalid == 400, suffix
+
+        status, first, _ = _get_json(port, path + "?q=Synthetic&limit=1")
+        assert status == 200
+        cursor = first["page"]["next_cursor"]
+        assert cursor is not None
+        conn = ns["open_conversations_db"]()
+        try:
+            conn.execute(
+                "UPDATE cache_meta SET value=CAST(value AS INTEGER)+1 "
+                "WHERE key='codex_find_projection_generation'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        stale, body, _ = _get_json(
+            port,
+            path + "?q=Synthetic&limit=1&cursor=" + _u.quote(cursor, safe=""),
+        )
+        assert stale == 409
+        assert body == {"error": "stale find cursor"}
+    finally:
+        srv.shutdown()
+
+
+def test_find_paging_params_are_codex_only_and_claude_bytes_stay_frozen(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    srv, _root, _keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        qualified = _entity_path(_claude_key("s1"), "/find")
+        bare = _entity_path("s1", "/find")
+        suffix = "?q=synthetic&kind=all"
+        paging = "&limit=not-an-int&cursor=garbage&direction=sideways&around=x"
+        assert _get(port, qualified + suffix) == _get(port, qualified + suffix + paging)
+        assert _get(port, bare + suffix) == _get(port, bare + suffix + paging)
     finally:
         srv.shutdown()
 
@@ -732,6 +795,43 @@ def test_search_qualified_returns_neutral_envelope(tmp_path, monkeypatch):
         srv.shutdown()
 
 
+def test_account_qualifier_reaches_collection_and_entity_queries(
+        tmp_path, monkeypatch):
+    """#347 route proof: fresh fixtures are stably unattributed, so an explicit
+    account qualifier must preserve their browse/search/detail visibility. The
+    cross-account exclusion itself is pinned by test_conversation_account_dimension.
+    """
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        s, browse, _c = _get_json(
+            port, "/api/conversations?source=codex&account=unattributed"
+        )
+        assert s == 200
+        assert browse["status"] == "ok"
+        assert [row["conversation_key"] for row in browse["rows"]] == [
+            keys["modern-full"]
+        ]
+
+        s, search, _c = _get_json(
+            port,
+            "/api/conversation/search?source=codex&account=unattributed&q=Synthetic",
+        )
+        assert s == 200
+        assert search["status"] == "ok"
+        assert search["total"] > 0
+
+        s, detail, _c = _get_json(
+            port,
+            _entity_path(keys["modern-full"]) + "?account=unattributed",
+        )
+        assert s == 200
+        assert detail["status"] == "ok"
+    finally:
+        srv.shutdown()
+
+
 # ── §6.1 two-page browse pagination over real HTTP (both providers) ──────────
 
 
@@ -846,6 +946,50 @@ def test_anon_map_v1_codex_includes_roots_and_scrubs(tmp_path, monkeypatch):
         # The wire plan must carry a replacement keyed on the observed Codex root.
         flat = json.dumps(wire)
         assert "/synthetic/root-a/project-red" in flat or "project-red" in flat
+    finally:
+        srv.shutdown()
+
+
+def test_scoped_claude_anon_map_excludes_other_account_file_path(
+        tmp_path, monkeypatch):
+    ns = load_script()
+    srv, _root, _keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=(),
+        claude_sids=("s1", "s2"),
+    )
+    account_a = "a" * 32
+    account_b = "b" * 32
+    conversations = ns["open_conversations_db"]()
+    try:
+        conversations.execute(
+            "UPDATE conversation_messages SET account_key=? WHERE session_id='s1'",
+            (account_a,),
+        )
+        conversations.execute(
+            "UPDATE conversation_messages SET account_key=? WHERE session_id='s2'",
+            (account_b,),
+        )
+        conversations.commit()
+    finally:
+        conversations.close()
+    accounting = ns["open_cache_db"]()
+    try:
+        accounting.execute(
+            "UPDATE session_files SET project_path=?,account_key=? "
+            "WHERE session_id='s2'",
+            ("/Users/bravo/private-project", account_b),
+        )
+        accounting.commit()
+    finally:
+        accounting.close()
+    try:
+        port = srv.server_address[1]
+        path = _entity_path(_claude_key("s1"), "/anon-map")
+        s, wire, ctype = _get_json(
+            port, path + f"?account={account_a}"
+        )
+        assert s == 200 and "application/json" in ctype
+        assert "/Users/bravo/private-project" not in json.dumps(wire)
     finally:
         srv.shutdown()
 
@@ -1011,5 +1155,251 @@ def test_page_hydration_miss_raises_and_the_route_answers_500(tmp_path, monkeypa
         assert status == 500, (status, body)
         assert "application/json" in (ctype or ""), ctype
         assert json.loads(body).get("error"), body
+    finally:
+        srv.shutdown()
+
+
+# ── #463 S3 — the export path is insensitive to the read-time enrichment ─────
+
+
+def test_s3_export_is_unchanged_by_the_external_agent_marker(tmp_path, monkeypatch):
+    """Spec section 6.4, the half `modern-full` cannot witness.
+
+    The byte-frozen `modern-full` golden covers an assistant row and four tool
+    renderings, but it carries no external-agent marker, so it can only show that
+    detection found nothing. This exports a conversation that DOES carry one and
+    asserts the marker still renders as ordinary assistant prose, verbatim.
+
+    Two properties are at stake. The exporter reads `text` and `detail.name` and
+    never `detail.external_call`, so the addition cannot move a byte; and the
+    detection must write to `external_call` and never to `markers`, because that
+    key is what selects which rows the export path hydrates from retained
+    payloads — 729 assistant rows already carry it.
+    """
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch,
+                                 codex_scenarios=("tool-legibility",),
+                                 claude_sids=())
+    key = keys["tool-legibility"]
+    try:
+        conn = ns["open_conversations_db"]()
+        try:
+            disp2 = ns["_load_sibling"]("_lib_conversation_dispatch")
+            env = disp2.neutral_export(conn, key, scope="all",
+                                       effective_speed="standard")
+            q = ns["_load_sibling"]("_lib_codex_conversation_query")
+            detail = q.get_codex_conversation(
+                conn, key, effective_speed="standard", limit=0)
+            stored_markers = conn.execute(
+                "SELECT COUNT(*) FROM codex_conversation_messages "
+                "WHERE conversation_key = ? AND detail_json LIKE '%\"markers\"%'",
+                (key,)).fetchone()[0]
+        finally:
+            conn.close()
+    finally:
+        srv.shutdown()
+    assert env["status"] == "ok"
+    md = env["markdown"]
+    # Non-vacuity: the detail envelope really did detect the marker, so the
+    # export assertion below is about a conversation where the new path fired.
+    detected = [b for item in detail["items"] for b in item["blocks"]
+                if (b.get("detail") or {}).get("external_call")]
+    assert len(detected) == 1
+    # The exported prose is the authored text, unrestructured.
+    assert "[external_agent_tool_call: ToolSearch]" in md
+    assert 'input: {"query": "select:SyntheticAlpha,SyntheticBeta"}' in md
+    # Detection never wrote into `markers`, so the export path's payload
+    # hydration selector is untouched.
+    assert stored_markers == 0
+    assert "external_call" not in md
+
+
+def _raw_string_lines(rollout_path):
+    """Every LINE of every string the retained rollout holds, as a set.
+
+    Used to attribute a token in a rendered surface: a line that is a member of
+    this set was rendered verbatim from provider bytes, while a line that is not
+    was composed by a decoder.
+
+    Line MEMBERSHIP, not substring containment against a joined blob: a derived
+    line consisting of nothing but the bare integer `70001` is a substring of
+    almost any blob carrying the token, so a containment test would attribute a
+    decoder's own output to the provider and pass while the property failed.
+    """
+    parts = []
+
+    def walk(value):
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                parts.append(str(key))
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for line in rollout_path.read_text().splitlines():
+        if line.strip():
+            walk(json.loads(line))
+    return {segment.strip()
+            for part in parts for segment in part.splitlines()
+            if segment.strip()}
+
+
+# ── #463 S3 §6.5 — the privacy gate over the tool-legibility surfaces ────────
+
+
+# Every provider session id the tool-legibility rollout holds. Named once so a
+# new session added to the fixture cannot quietly escape the leak assertions.
+_S3_PROVIDER_SESSION_IDS = ("70001", "70002", "70003", "70004")
+
+
+def test_s3_no_raw_session_id_reaches_any_served_route(tmp_path, monkeypatch):
+    """Spec §4.3 / §6.5, at the ROUTE boundary.
+
+    The provider's own `session_id` (70001, 70002) is present in the underlying
+    rollout arguments and in the harness preamble of a retained output. The
+    reader is served a conversation-local ordinal instead, so the token must be
+    ABSENT from the detail envelope, the anon-map plan and an anonymized
+    export — not scrubbed, absent. It cannot be scrubbed: these are short
+    integers, and a rule that replaced a bare `70001` would corrupt arbitrary
+    text elsewhere in the conversation.
+
+    THREE boundaries are recorded (wire contract §8), and this test asserts each
+    of them positively rather than leaving it implied: `detail.args` is the
+    pre-existing generic disclosure, the payload readback's `content` is the raw
+    re-read record, and the byte-frozen export renders provider prose verbatim.
+    Each is asserted to still carry the token, because a boundary that silently
+    stopped carrying it would mean the recorded rule no longer describes the
+    code. What is asserted as ABSENT is every S3-derived surface: the cards, the
+    session index and the anon plan.
+    """
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=("tool-legibility",),
+        claude_sids=())
+    try:
+        port = srv.server_address[1]
+        key = keys["tool-legibility"]
+
+        s, detail, _c = _get_json(port, _entity_path(key, ""))
+        assert s == 200 and detail["status"] == "ok"
+        # Non-vacuity: the enrichment under test really is on this envelope.
+        assert detail["session_index"]["sessions"]["1"]["ordinal"] == 1
+        cards_seen = 0
+        stdin_block_keys = []
+        args_carrying_the_token = 0
+        for item in detail["items"]:
+            for block in item["blocks"]:
+                if (block.get("detail") or {}).get("name") == "write_stdin":
+                    stdin_block_keys.append(block["block_key"])
+                args = (block.get("detail") or {}).get("args") or ""
+                if any(token in args for token in _S3_PROVIDER_SESSION_IDS):
+                    args_carrying_the_token += 1
+                for card in ((block.get("detail") or {}).get("card"),
+                             ((block.get("output") or {}).get("detail") or {}).get("card")):
+                    if card is None:
+                        continue
+                    cards_seen += 1
+                    blob = json.dumps(card)
+                    for token in _S3_PROVIDER_SESSION_IDS:
+                        assert token not in blob, (token, card)
+        # Non-vacuity: the loop really did examine cards.
+        assert cards_seen > 0
+        for token in _S3_PROVIDER_SESSION_IDS:
+            assert token not in json.dumps(detail["session_index"]), token
+
+        # Boundary 1 — `detail.args` is the pre-existing generic disclosure and
+        # is stored at ingest, so rewriting it would break the read-time-only
+        # rule. It still shows the provider's own argument JSON verbatim.
+        assert args_carrying_the_token > 0
+
+        # Boundary 2 — the payload readback serves the raw re-read record, which
+        # is the route's entire purpose. Its `card` is decoded by the same
+        # kernel the paged route uses, so it must still publish the ordinal.
+        assert stdin_block_keys
+        for block_key in stdin_block_keys:
+            s_pay, payload, _c = _get_json(
+                port, _entity_path(key, "/payload")
+                + f"?block_key={_u.quote(block_key)}&which=call")
+            assert s_pay == 200 and payload["status"] == "ok"
+            assert any(token in payload["content"] for token in _S3_PROVIDER_SESSION_IDS), payload["content"]
+            card_blob = json.dumps(payload.get("card"))
+            for token in _S3_PROVIDER_SESSION_IDS:
+                assert token not in card_blob, (token, card_blob)
+
+        # The anon-map plan: the token is never offered to the client as a
+        # replacement, because it was never published in the first place.
+        s_map, plan, _c = _get_json(port, _entity_path(key, "/anon-map"))
+        assert s_map == 200
+        for token in _S3_PROVIDER_SESSION_IDS:
+            assert token not in json.dumps(plan), token
+
+        # Boundary 3 — an anonymized export, which is a DIFFERENT code path
+        # from the anon map: the export body is scrubbed server-side, while
+        # per-card copy is scrubbed client-side through the plan above. A test
+        # of one is not a test of the other.
+        #
+        # The export renders the provider's own bytes verbatim and is
+        # byte-frozen, so the token DOES survive there — in the raw `exec`
+        # program source, in a retained output's harness preamble, and in the
+        # raw `write_stdin` arguments. That is the §8 boundary showing through
+        # a prose surface, not a leak S3 introduced, and it cannot be closed by
+        # scrubbing: the token is a short integer, so a rule that replaced a
+        # bare `70001` would corrupt arbitrary text elsewhere (spec §4.3).
+        #
+        # So the property asserted here is the one that is both true and worth
+        # having: every export line carrying the token is provider bytes
+        # rendered verbatim. No field S3 derives can put it there, because a
+        # derived field would produce a line the retained payload does not
+        # contain.
+        s_exp, exported, _c = _get(
+            port, _entity_path(key, "/export") + "?anonymize=1")
+        assert s_exp == 200
+        raw_lines = _raw_string_lines(CORPUS / "tool-legibility.jsonl")
+        hits = [line for line in exported.decode().splitlines()
+                if any(token in line for token in _S3_PROVIDER_SESSION_IDS)]
+        # Non-vacuity, in both directions: the export really did render this
+        # conversation, and the token really is present to be attributed.
+        assert hits, exported[:400]
+        for line in hits:
+            assert line.strip() in raw_lines, line
+    finally:
+        srv.shutdown()
+
+
+def test_s3_patch_card_paths_are_covered_by_the_anon_plan(tmp_path, monkeypatch):
+    """Spec §4.3 / §6.5 — patch file paths are surfaced as STRUCTURED card
+    fields rather than inside a raw blob, but they are the same token class the
+    plan already draws from authoritative roots, so no new anon source is
+    required. This asserts that: every path the patch event card publishes is a
+    token the served plan can scrub, and applying the plan removes it.
+    """
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=("tool-legibility",),
+        claude_sids=())
+    try:
+        port = srv.server_address[1]
+        key = keys["tool-legibility"]
+        s, detail, _c = _get_json(port, _entity_path(key, ""))
+        assert s == 200
+        paths = [f["path"]
+                 for item in detail["items"] for block in item["blocks"]
+                 for f in (((block.get("detail") or {}).get("card") or {}).get("files") or [])
+                 if f.get("path")]
+        # Non-vacuity: the dict-shaped patch event really did decode per file.
+        assert any(p.startswith("/synthetic/root-a/project-red") for p in paths), paths
+
+        s_map, plan, _c = _get_json(port, _entity_path(key, "/anon-map"))
+        assert s_map == 200
+        tokens = {t["text"]: t["replacement"] for t in plan["tokens"]}
+        for path in paths:
+            if not path.startswith("/synthetic/"):
+                continue
+            # The plan scrubs by longest-token replacement over known roots, so
+            # the covering token is a prefix of the card path.
+            assert any(path.startswith(token) for token in tokens), (path, sorted(tokens))
     finally:
         srv.shutdown()

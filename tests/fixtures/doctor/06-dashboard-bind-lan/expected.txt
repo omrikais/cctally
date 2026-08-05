@@ -46,6 +46,7 @@ Data
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Codex project metadata   qualified
+  ✓ Codex orphan pruning     no refused prune
   ✓ Codex transcript replay  none pending
   ✓ Codex ingest backlog     no Codex ingest backlog
   ✓ Codex quota              not applicable
@@ -75,4 +76,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 49 OK · 8 WARN · 0 FAIL
+Summary: 50 OK · 8 WARN · 0 FAIL

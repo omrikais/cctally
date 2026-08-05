@@ -2,6 +2,7 @@ import { forwardRef, memo } from 'react';
 import { Markdown } from '../components/Markdown';
 import { MessageBlocks, reasoningBlockIsEmpty } from './MessageBlocks';
 import { ResultIcon, SystemIcon, SkillIcon } from './ConvIcons';
+import { MetaLabel, MetaName } from './MetaLabel';
 import { CopyButton } from './CopyButton';
 import { PermalinkButton } from './PermalinkButton';
 import { BookmarkButton } from './BookmarkButton';
@@ -344,26 +345,26 @@ function MessageItemImpl(
     const head =
       mk === 'skill' ? (
         <>
-          <SkillIcon /> <span className="conv-meta-label">Skill content</span>
-          {item.skill_name && <span className="conv-meta-name">· {item.skill_name}</span>}
+          <SkillIcon /> <MetaLabel text="Skill content" />
+          {item.skill_name && <MetaName text={item.skill_name} />}
         </>
       ) : mk === 'command' ? (
         <>
-          <SystemIcon /> <span className="conv-meta-label">System marker</span>
+          <SystemIcon /> <MetaLabel text="System marker" />
         </>
       ) : mk === 'compaction' ? (
         <>
-          <SystemIcon /> <span className="conv-meta-label">Compacted earlier conversation</span>
+          <SystemIcon /> <MetaLabel text="Compacted earlier conversation" />
         </>
       ) : mk === 'notification' ? (
         <>
-          <SystemIcon /> <span className="conv-meta-label" title={notificationLabel}>{notificationLabel}</span>
+          <SystemIcon /> <MetaLabel text={notificationLabel} />
           <span className="conv-meta-preview">{notificationSummary(item.text)}</span>
         </>
       ) : (
         <>
-          <SystemIcon /> <span className="conv-meta-label">{providerLabel ?? 'Injected context'}</span>
-          {sections && <span className="conv-meta-name">· {sections}</span>}
+          <SystemIcon /> <MetaLabel text={providerLabel ?? 'Injected context'} />
+          {sections && <MetaName text={sections} />}
           <span className="conv-meta-preview">{metaPreview(item.text)}</span>
         </>
       );
@@ -434,7 +435,10 @@ function MessageItemImpl(
         {commandName && <span className="conv-cmd-badge">{commandName}</span>}
         {eyebrow}
       </div>
-      {item.text && <Markdown>{item.text}</Markdown>}
+      {item.text && <Markdown
+        findBlockKey={item.blocks.find((block) => block.kind === 'text')?.block_key}
+        findSurface="body"
+      >{item.text}</Markdown>}
       {/* Joined prose renders above via item.text; pass only NON-text blocks to
           the walk so it doesn't double the human's prose. */}
       <MessageBlocks blocks={item.blocks.filter((b) => b.kind !== 'text')} anchorUuid={item.anchor.uuid} suppressToolUseIds={suppressToolUseIds} spawnKindByToolUseId={spawnKindByToolUseId} />

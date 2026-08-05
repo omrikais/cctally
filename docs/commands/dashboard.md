@@ -57,13 +57,19 @@ same Wi-Fi):
 Once LAN-bound, the banner shows both URLs:
 
     dashboard: serving on all interfaces:
-      - http://localhost:8789/      (this machine)
-      - http://192.168.1.42:8789/   (LAN)
+      - http://localhost:8789/#token=<per-run-token>      (this machine)
+      - http://192.168.1.42:8789/#token=<per-run-token>   (LAN)
+    dashboard: LAN access token: <per-run-token>
     Ctrl-C to stop
 
-The sync chip / `r` shortcut works from any of these devices. Read
-[Threat model](#threat-model) before opting in — LAN bind exposes every
-`/api/*` surface to anyone on the same network.
+Open or copy one of those tokenized URLs. The browser removes the fragment
+before making API requests, exchanges it for an HttpOnly cookie scoped to
+`/api`, and then starts Fetch and SSE traffic. The token exists only for that
+dashboard process; restarting prints a new one. Loopback-only dashboards do
+not mint or require a token.
+
+The sync chip / `r` shortcut works from any authenticated device. Read
+[Threat model](#threat-model) before opting in.
 
 Valid `dashboard.bind` values: `loopback` (= `127.0.0.1`, default), `lan`
 (= `0.0.0.0`), or any literal host string (an IPv4, IPv6, hostname, or e.g.
@@ -71,22 +77,24 @@ a Tailscale tun IP).
 
 ## Threat model
 
-The dashboard has **no authentication**. Origin/Host parity blocks
-browser-driven cross-origin attacks, but anyone on the same LAN with `curl`
-can:
+Every non-loopback dashboard requires a fresh per-run bearer token on all
+`/api/*` methods by default. Missing or wrong credentials receive `401`; an
+explicit malformed/wrong `Authorization` header is never rescued by a valid
+cookie. Origin/Host parity remains an additional CSRF gate on state-changing
+browser requests.
 
-- Read your usage data (GET /api/data, /api/events)
-- Trigger an OAuth refresh from Anthropic (POST /api/sync) — capped only by
-  Anthropic's per-User-Agent 429 rate limit. A hostile LAN peer can burn
-  your OAuth quota for ~15 minutes by hammering the chip.
-- Mutate your persisted config (POST /api/settings) — disable alerts,
-  change display tz, etc. There is no rate cap on this surface.
-- Trigger an osascript popup (POST /api/alerts/test).
+This is bearer authentication over plain HTTP, not transport encryption. A
+party able to observe LAN traffic can steal the credential, and anyone who can
+read the launch terminal can copy it. Use LAN binding only on a trusted network
+or encrypted tailnet/VPN; do not expose the server directly to the internet.
+The separate `dashboard.expose_transcripts` gate still controls whether
+conversation content is available off loopback.
 
-Use `cctally dashboard` only on networks you trust — home Wi-Fi, a
-Tailscale tailnet, a VPN. NOT on public Wi-Fi or shared/untrusted LANs.
-
-Token-based auth for off-LAN exposure is a deferred design concern.
+You can opt out with `cctally config set dashboard.lan_auth false` or the
+Settings overlay's **Require LAN access token** toggle. The change is captured
+only at process startup: restart the dashboard to apply it. With authentication
+disabled, any LAN peer can read usage data, invoke refresh, mutate Settings, and
+trigger alert tests.
 
 ## Keybindings (v2)
 
@@ -237,6 +245,7 @@ Before merging or releasing v2 changes, run through:
 |---|---|
 | `GET /` | The dashboard HTML |
 | `GET /static/*` | CSS / JS / SVG sprite |
+| `POST /api/auth` | Exchange the startup URL's bearer token for an HttpOnly, `SameSite=Strict`, `/api`-scoped session cookie. Available only on an authenticated non-loopback run; success is 204. |
 | `GET /api/data` | One-shot JSON snapshot (curl-friendly). It retains the legacy Claude fields and appends source-aware backend fields (`source_schema_version`, `default_source`, `source_order`, `sources`). |
 | `GET /api/events` | SSE stream — full snapshot on every sync tick |
 | `GET /api/session/:id` | Per-session detail (v2) — powers the Sessions modal |
@@ -248,13 +257,22 @@ Before merging or releasing v2 changes, run through:
 | `GET /api/conversations/facets` | Conversation-viewer filter facets — sorted distinct project labels with per-label conversation counts, plus per-model-family session counts (fold-then-count), for the Filters popover's project + model multi-selects. Project counts are a rollup GROUP BY; the model-family counts are an index-only scan of `conversation_messages(model, session_id)` (#301). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Browse filters](#browse-filters). |
 | `GET /api/conversation/<id>` | Conversation-viewer reader — one session's deduped, turn-grouped messages with cost-once. Pages with `?after=<id>` (forward), `?before=<id>` (backward), or `?tail=1` (open at the bottom — the last page in one request), plus `?limit=N` (default `500`, clamped `1`–`1000`); the three cursors are mutually exclusive (supplying more than one is `400`). The `page` object carries `next_after`/`has_more` (more newer turns) and the additive `prev_before`/`has_prev` (more older turns), so a client can page both directions; a stale cursor yields an empty page (never a head/tail re-serve). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Reader pagination](#reader-pagination-217-s2). |
 | `GET /api/conversation/search` | Conversation-viewer cross-session FTS search (`?q=…&kind=…&limit=…&offset=…`; LIKE fallback when FTS5 is unavailable). `kind ∈ {all, prompts, assistant, tools, thinking, title, files}` (default `all`; an unknown value is `400`). `kind=title` searches the AI-generated session titles and returns one session-level hit per match, anchored to the session's first turn. `kind=files` searches the write-class file paths each session edited/created and returns one hit per distinct `(session, file path)`, anchored to that path's most-recent touch. Also accepts the same server-side filter params as the browse rail (`date_from`/`date_to`/`projects`/`cost_min`/`cost_max`/`rebuild_min`), applied as a session-scope restriction across every kind; a malformed filter value is `400`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Search depth](#search-depth-177-s6) and [Browse filters](#browse-filters). |
-| `GET /api/conversation/<id>/find` | Conversation-viewer in-conversation find (#177 S6) — document-ordered rendered-turn anchors for one open session (`?q=…&kind=…`). `kind ∈ {all, prompts, assistant, tools, thinking}` — the cross-session-only `title` and `files` kinds are **not** valid here and return `400`. `?regex=1` / `?case=1` (#217 S4) switch to a physical-row scan (`mode: "regex"` / `"like"`, always `search_depth: "full"`); an invalid regex is pre-validated → `400`, never `500`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Search depth](#search-depth-177-s6). |
+| `GET /api/conversation/<id>/find` | Conversation-viewer in-conversation find (`?q=…&kind=…`; `kind ∈ {all, prompts, assistant, tools, thinking}`; `?regex=1` / `?case=1`). A qualified Codex `v1.` id returns schema 2 occurrence semantics: the exact visible-match total plus bounded pages of durable fragment/disclosure targets (`limit` defaults to 100, maximum 200; `cursor`, `direction`, and `around` support forward/backward navigation and live-tail reconciliation). Malformed cursors are `400`, stale or query-mismatched cursors are `409`, and an incomplete projection reports `status: "indexing"` without an approximate total. Qualified Claude and bare legacy ids retain their byte-identical containing-section response. An invalid regex is `400`, never `500`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Search depth](#search-depth-177-s6). |
 | `GET /api/conversation/<id>/payload` | On-demand "load full tool payload" (#178) — re-reads the source JSONL line to serve the un-capped tool `result` or `input` for one `tool_use_id` (`?tool_use_id=…&which=result\|input`). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
 | `GET /api/conversation/<id>/media` | On-demand media bytes (#177 S4) — re-reads the source JSONL line to decode and serve one inline image or PDF (`?tool_use_id=…&index=N` for tool-result media, or `?uuid=…&index=N` for user-content media). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2) **plus** a cross-origin Fetch-Metadata check; see [Conversation viewer endpoints](#conversation-viewer-endpoints-plan-2). |
 | `GET /api/conversation/<id>/events` | Conversation-viewer live-tail SSE stream — watches only the open session's JSONL file(s) and emits `event: tail` within ~1s of growth (with `: keep-alive` comments while idle). Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). See [Live-tail](#live-tail). |
 | `GET /api/conversation/<id>/export` | Conversation-viewer whole-session Markdown export (#217 S5, F1/F5) — runs the full server-side assembly and serializes it to Markdown for one `?scope=` ∈ `{all, prompts, chat, recipe}` (default `all`; an unknown value is `400`, validated in the handler before the kernel — never a `500`). **#281 S4:** an optional `?anonymize=1` scrubs the body (project paths/labels, home, username, and documented secret patterns); it is strict-parsed (at most once, literal `0`/`1` — a blank/duplicate/other value is a `400` before the kernel), and its absence is byte-identical to the pre-#281 raw export. Serves `text/markdown; charset=utf-8`; unknown session → `404`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2) — the **same** `_require_transcripts_allowed()` fail-closed gate as the sibling reader routes, with **no** extra CSRF check (parity with `/payload`/`/outline`/`/find`). |
 | `GET /api/conversation/<id>/anon-map` | Conversation-viewer client scrub plan (#281 S4) — returns the JSON wire form of the anonymization plan (`{tokens, patterns}`) so the reader can anonymize per-card copies with the same rules the server export uses. The plan is global, but the route probes existence and `404`s on an unknown session (sibling envelope discipline); it exposes only tokens the same gated client already sees raw. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
 | `GET /api/conversation/<id>/prompts` | Conversation-viewer session-comparison prompt bodies (#217 S7, F10) — returns `{session_id, prompts: [{uuid, text}]}`, the ordered **main-thread** human prompts (the same `subagent_key == null && !is_sidechain` + non-empty-text predicate the `recipe`/`prompts` export reuses) each with its **full** text and turn uuid, in document order. Used by the [Session comparison](#session-comparison-217-s7) view for lazy inline full-prompt expansion. Unknown session → `404`. Behind the [transcript gate](#conversation-viewer-endpoints-plan-2). |
+
+Every conversation collection and entity route accepts an optional immutable
+`?account=<account_key>` qualifier. It scopes the physical transcript rows and
+their accounting joins before browse, facets, search, detail, outline, prompts,
+payload, media, find, export, comparison, or live-tail existence checks run.
+Omitting it is the merged all-account path and retains the existing response
+shape. The dashboard sends the qualifier only for a decorated multi-account
+provider with a focused account; it also stores it in the conversation identity
+and permalink, so a reopened link cannot drift with the global account chip.
 | `POST /api/sync` | OAuth refresh + snapshot rebuild (chip / `r`). 204 on clean success; 200 + `{warnings:[{code: ...}]}` when refresh-usage returned a non-`ok` status (`rate_limited`, `no_oauth_token`, `fetch_failed`, `parse_failed`, `record_failed`); 503 if another sync is in flight. Origin-vs-Host parity CSRF (see [Threat model](#threat-model)). |
 
 > `/api/conversation/search`, `/api/conversation/<id>/payload`,
@@ -281,11 +299,21 @@ and persists via `POST /api/settings` like the other mirrored keys. On the
 beta channel the update badge/modal show a `(beta)` marker and the exact
 resolved install command (`cctally@X.Y.Z`); Homebrew always tracks stable.
 
+The **Require LAN access token** toggle mirrors `dashboard.lan_auth`. Saving
+shows a restart notice and deliberately leaves the Settings overlay open; the
+active dashboard retains its startup authentication mode until it restarts.
+
 ### Dual-form conversation routes (#294 S7)
 
 The conversation routes are source-qualified **in place** — no new namespace. On the entity routes (`/api/conversation/<id>` and its `…/outline`, `…/prompts`, `…/find`, `…/payload`, `…/export`, `…/anon-map`, `…/media`, `…/events` suffixes), an id beginning `v1.` opts into the provider-neutral dispatch and returns the neutral envelope: `ok` → `200` JSON, `normalization_pending` → `200` JSON (a Codex normalized corpus that is not yet authoritative — a cache predating migration `025`, or a store with a byte-zero replay still pending), `not_found` (including a malformed `v1.*`) → `404` JSON, payload `gone` → `410`, `…/export` `ok` → `200 text/markdown`, and Codex `…/media` → `404 {"status":"capability_unsupported","source":"codex"}` (Codex media is capability-gated until real media data is shown to exist). Any other id — a bare Claude `sessionId`, UUID-shaped or not — takes the legacy handler unchanged and never touches the resolver, so existing behavior and bytes are byte-identical. The three collection routes (`/api/conversations`, `/api/conversations/facets`, `/api/conversation/search`) gain a strict `?source={claude,codex}`: exactly one literal value, a per-route parameter whitelist (blank/duplicate/`all`/unknown, a legacy-only axis with `source` present, or an out-of-range `limit` is a `400`); absent `?source=`, the legacy lenient parsing is unchanged. Browse cursors are raw conversation keys (echoed verbatim); the search cursor is unpadded base64url. The transcript privacy gate stays the first act of every handler, including the `capability_unsupported` and `normalization_pending` answers.
 
 The `/api/conversation/<v1key>/events` live-tail preflights (privacy gate → resolve → Codex normalization authority → existence) and answers a non-`ok` result as plain JSON **before** any SSE bytes; only on `ok` does it commit SSE headers and stream `conversationKey`-framed `ready`/`tail`/keep-alive frames (a bare Claude stream keeps its `sessionId` frames byte-identical). The Codex stream uses targeted ingest and a budgeted directory-frontier child discovery, so a child thread spawned mid-watch joins the stream via a `tail` refetch. `--no-sync` passivity and the `dashboard.live_tail` opt-out apply to both providers.
+
+### Occurrence-exact Codex find (#482)
+
+Find in a qualified Codex conversation counts what the reader can actually see, not the number of containing messages or reading units. Literal search uses leftmost, non-overlapping matches over a canonical visible-text projection; `Aa` preserves case-sensitive literal semantics, and `.*` uses Python regular-expression semantics while omitting zero-width matches. Markdown syntax, hidden duplicate headings, and static card chrome are not searchable. Visible prose plus call, output, and folded patch/web/MCP completion content are searchable, including one logical match fragmented across several formatted leaves.
+
+Each result carries a durable occurrence id, its physical `body` / `call` / `output` / `completion` surface, exact render-leaf fragments, and only the disclosure ancestors required to reveal it. The find bar opens those disclosures, selects every coordinated fragment together, and transparently crosses server pages in both directions. A live-tail refresh reconciles around the selected occurrence; if it disappeared, the bar selects the first current result and announces that the previous match changed. Claude continues to label and navigate legacy `containing sections` because its response intentionally carries no occurrence identities.
 
 ### Source-aware backend (S4)
 
@@ -415,6 +443,14 @@ than aborting.
 
 **Codex terminal and patch cards (#331).** Supported Codex `exec` calls now use that same terminal vocabulary without showing the JavaScript/JSON harness: the provider name stays `exec`, each decoded command keeps its workdir, output retains stdout/stderr/error/raw distinctions, request-only and blank results remain visible, and long output follows the same collapsed-by-default rule. Supported `apply_patch`, patch-over-`exec`, and standalone patch-completion records render the exact retained per-file diff rows with native file status and move labels. A provider record without retained diff text says **No diff retained** and shows its status/stdout/stderr instead of inventing a patch. The visible cards are bounded; `raw request`, `raw output`, and `raw event` fetch the authoritative stored payload on demand. Unknown or future wrapper shapes remain generic tool/event disclosures, and Codex exports keep their canonical raw semantics.
 
+**Codex tool legibility (#463 S3).** Four more Codex tool families are now legible rather than raw. An `exec` call whose body is a JavaScript program, and every `js` call, render as a **program card** listing the invocations the reader could decode; when it could not read the whole body the card says so explicitly, so the list is never presented as the whole program. A `write_stdin` or `wait` call renders as a **session card** showing which shell session it wrote to, or which sandbox cell it polled, and a preview of the characters written. A `tool_search_call` shows its query in the collapsed row. A patch event shows a per-file diff, including for added and deleted files, whose content the provider retains but whose diff it does not transmit — those are labelled as rendered from retained content rather than presented as provider-supplied. A file whose diff was clipped to nothing says a diff exists and none of it fit, which is a different fact from no diff having been retained.
+
+**Session grouping.** A conversation's shell sessions are numbered, and every call that names one carries that number. A run of consecutive tool calls that all belong to one session names it in the run's heading. The call that opened a session is marked as the one that started it, identified from that call's own output rather than by proximity. Where the retained data does not identify an opener the card says so; where the session list itself was capped it says that instead, so a session is never reported as having no opener when the opener was simply not loaded. Session numbers are conversation-local: they are assigned by the server over the whole conversation and mean nothing outside it, and the provider's own session identifier is never shown. About a fifth of sessions cannot be numbered at all — they are named only inside a program body the index does not read — and those calls show no session number rather than a guessed one.
+
+**Outcome on every Codex tool call.** Each Codex tool call now ends with an explicit outcome: **ok**, **error**, **running**, or **outcome unknown**. The state is read from the harness's own output preamble rather than guessed, and `running` is not treated as a failure — an open shell session is not an error. `outcome unknown` is shown as a real state, because for some results the retained output does not say how the call ended, and showing nothing there is what made every Codex call look identical before this. A failing call now also matches the reader's **Errors** focus filter, which previously matched no Codex call at all.
+
+**The external-agent marker.** An assistant message that carries a serialized `[external_agent_tool_call: …]` marker now renders it as a labelled disclosure naming the invoked tool with its JSON input behind it, instead of printing the raw marker text mid-prose. These are not tool calls and do not appear in the tool chips, the focus filters, the Files tab or the outline. Exported transcripts are unchanged.
+
 **MCP, web & inline media (#177 S4).** MCP tool calls, web tools, and images now render with purpose-built chrome instead of falling through to the generic JSON chip. An MCP call chip leads with the **action** (`browser_take_screenshot`) and a quiet pill carrying the friendly server name, with a per-server icon — `playwright`, `chrome` (claude-in-chrome), `computer` (computer-use), and `codex` each get a dedicated glyph, and any other MCP server gets a generic plug icon plus its raw server name; the full original namespaced tool name (`mcp__plugin_playwright_playwright__browser_take_screenshot`) stays in the chip's title tooltip and the expanded request panel. A malformed MCP name with no action segment degrades to a server-only chip without breaking, and every non-MCP tool that has no dedicated card renders exactly as before. `WebFetch` becomes a semantic source card: a header with the fetched **domain** and an HTTP status chip (green for `2xx`/`3xx`, red for `4xx`/`5xx`; absent on older transcripts captured before the status was recorded), labeled `url` (an external link) and `prompt` fields, and the fetch summary rendered as Markdown — clamped with a "Show full summary" reveal, and a "load full summary" affordance through the `/payload` route when the result was clipped at ingest. `WebSearch` becomes a card with the quoted query, a result-count chip, and a clickable list of the `{title, url}` results (the first ten, then a "+ N more results" expander) with each result's domain shown dim beneath its title; an older transcript with no captured link list falls back to the plain result-text panel. Both web cards only ever render a clickable link for `http:`/`https:` URLs — any other scheme (including `javascript:`) renders as inert text — and neither card makes any outbound request (no favicon fetches); the only network traffic is a link you click yourself. The MCP server/action split and the web captures land on existing history the next time the cache syncs (the one-time reingest described below); older rows simply keep today's rendering until then.
 
 **Inline media & the media route (#177 S4).** Images that previously showed only as a byte-count badge — or, for screenshots returned inside an MCP `tool_result`, were dropped entirely — now render inline. A figure shows the image clamped to a readable height with a quiet caption row (`media type · ~size · open full size ↗`), where the open link loads the full-resolution image in a new browser tab; images load lazily (`loading="lazy"`), so a screenshot-heavy session only fetches the images you scroll near. PDF documents are not embedded inline — they keep an upgraded badge with an `open ↗` link that opens the file in a new tab. The pixel data is never written to `cache.db`: the figure's `src` points at the new `GET /api/conversation/<id>/media` route, which **re-reads the original session JSONL line on demand** (the same mechanism as `/payload`), decodes the base64, and streams the raw bytes — so the cache does not grow and there is no new at-rest copy of your screenshots. Media is addressed by exactly one of `?tool_use_id=<id>&index=N` (an image/PDF inside that tool's result) or `?uuid=<uuid>&index=N` (an image/PDF you attached to a message), where `index` is the ordinal among the media items in that content list; supplying both keys, neither, or a non-integer/negative index is a `400`. The route sits behind the **same fail-closed transcript gate** as the other conversation routes (loopback by default, LAN only under `dashboard.expose_transcripts`, IP-literal `Host` only — a spoofed/rebinding `Host` is `403`) and, because an image can be embedded cross-origin in a way the JSON routes cannot, additionally rejects any request whose browser-set `Sec-Fetch-Site` cross-origin marker is present and not one of `same-origin`/`same-site`/`none` with a `403` (an absent header — `curl`, older browsers — is allowed; this is defense-in-depth layered on the primary gate). Only the allowlisted media types `image/png`, `image/jpeg`, `image/gif`, `image/webp`, and `application/pdf` are served, always with the canonical `Content-Type` for the matched type (never an echoed transcript string) and `X-Content-Type-Options: nosniff`; images additionally get `Content-Security-Policy: default-src 'none'`, while PDFs instead get `Content-Disposition: inline; filename="attachment-N.pdf"` (a CSP sandbox would break native PDF viewers). A non-allowlisted media type is a `404` (no existence oracle), a source line whose file has been rotated/deleted or whose payload is no longer decodable is a `410`, and a pathologically large payload is rejected at a `413` before any decode. The reader degrades gracefully on every error path: a figure that fails to load (`404`/`410`/`413`) falls back to the byte-count badge with a "source no longer available" hint, and a row that predates the reingest — and so carries no media ordinal to address — shows the badge until the reingest backfills it.
@@ -475,6 +511,20 @@ The reader now opens a long conversation **at the bottom** — the newest turns 
 
 **Compaction landmark + jump.** A conversation **compaction** (the auto-summarize point) now shows as a dedicated outline landmark with its own "Jump to" chip, and `m`/`M` step to the next/previous compaction in the reader — so a long, compacted session is easy to navigate around the summary boundary.
 
+### Codex navigation chrome (#463 S4)
+
+**Two-tier outline for Codex conversations.** A Codex turn can run to well over a hundred tool calls, so a per-turn outline offered almost no purchase on a long conversation. Alongside the existing per-turn spine, the outline now lists each authored **reasoning heading**, each **failing tool call**, and each **plan call** as its own row, indented beneath the turn it belongs to. Clicking one loads the part of the turn that holds it rather than the top of the turn, and scrolls to the individual call or heading it names — so a failure inside a very tall turn lands at the top of the window instead of thousands of pixels below the fold. The heaviest conversation in a real store gains 424 landmarks where it previously had none. Claude conversations are unaffected: they publish no landmarks, so their outline behaves exactly as before.
+
+**Stepping and jumping treat landmarks as first-class stops.** The `e`/`E` (errors) and `p`/`P` (plans) keys, the "Jump to" chips (primary click jumps to the latest occurrence, shift-click steps back), and clicks on an outline row all navigate the same landmark set and land identically. Stepping stays turn-granular, so a forward step lands on the first landmark of the next owning turn and a backward step on the last landmark of the previous one; several landmarks inside a single turn share that turn's stop. Repeated plan rows are numbered (`plan 1` … `plan 8`) so they can be told apart.
+
+**Stats card and comparison strip report Codex's real figures.** The outline's stats card previously left four rows blank for a Codex conversation; it now reports the models used, the tool histogram, the wall-clock duration and the error count. Where the conversation's retained evidence cannot establish whether anything failed, both the card and the comparison strip say **"not reported"** rather than showing a confident zero. The card's error line reads "11 errors in 2 turns" for Codex as it already did for Claude, reconciling the error-event total against the number of turns those events fall in, and the jump chip beside it counts error **turns** — the same number the `Errors` filter navigates between.
+
+**Files tab covers Codex patches.** The Files tab lists each file a patch touched with its per-file `+N −M`, and a file row jumps to the change that touched it. A count that cannot be determined from the retained payload is left blank rather than understated.
+
+**Cleaner conversation titles.** A title no longer shows the harness's own markup — a skill invocation's private filesystem path, or a slash-command wrapper — on any surface that renders one, including `cctally transcript search --source codex --kind title`. A prompt written directly against the end of a skill link is cleaned too.
+
+**Codex failures reach the Errors filter.** A tool call that reported an error status is now treated as failed by the reader's `Errors` filter and badge, matching what the server reports, so a failing Codex call is reachable from the chrome without a text search.
+
 ### Reader polish & a11y (#217 S3)
 
 A batch of smaller reading and accessibility refinements:
@@ -496,7 +546,7 @@ The reader header carries a **`Latest ↓`** action (titled "Jump to latest", an
 
 ### Search depth (#177 S6)
 
-Conversation search now reaches past prose into what a session actually contains — commands, file paths, error strings, and the assistant's thinking — with exact kind facets, result counts, and a browser-style in-conversation find bar. Three surfaces share one consolidated full-text index, so totals, pages, and match badges are exact by construction.
+Conversation search now reaches past prose into what a session actually contains — commands, file paths, error strings, and the assistant's thinking — with exact kind facets, result counts, and a browser-style in-conversation find bar. Structured Codex tool-result content arrays are presented as their ordered readable text leaves instead of raw JSON wrappers; if retained search text was clipped mid-array, only complete leaves are shown. Three surfaces share one consolidated full-text index, so totals, pages, and match badges are exact by construction.
 
 **Rail search kinds, counts, and load-more.** While a search needle is active, a single-select chip row — `All · Prompts · Assistant · Tools · Thinking` followed (after a subtle separator) by the two structural facets `Title · Files` — sits between the input and the results. The chips map 1:1 to the `kind` param on `/api/conversation/search`: `All` is unscoped, `Prompts` and `Assistant` scope to prose in your prompts vs the assistant's replies, `Tools` searches tool inputs and results (commands, file paths, error output, recorded answers, Bash stderr), and `Thinking` searches the assistant's thinking blocks; the trailing `Title` facet searches the AI-generated session titles and `Files` searches the write-class file paths each session edited or created (see [Title search](#search-depth-177-s6) and [File-path search](#search-depth-177-s6) below). Unlike `Tools`/`Thinking`, the `Title` and `Files` facets do **not** ride the split index, so they stay enabled even during the prose-only indexing window. Switching kind aborts any in-flight fetch and restarts at page one. The row wraps to a second line on a narrow rail and every chip keeps the mobile ≥44px touch target. Under the chips, a `aria-live` count line shows `No results`, `{N} results`, or `{N} results · basic search` (the last when the host has no FTS5 and search falls back to the degraded substring mode below). Non-prose hits carry small uppercase match badges (`tool`, `thinking`, `title`, `file`) in the title row; a hit matching only prose is unbadged, and a turn matching in several columns at once dedups to one row. A **title** hit shows the matched session title as its snippet and opens the session at its first turn; a **file** hit leads with the file path (file styling) with the session title secondary, its snippet is the plain path, and it opens the session at that path's most-recent touch. Results page in fixed chunks: when more remain, a `Load {N} more ({M} remaining)` button at the list end fetches the next page and appends (capped at 50 per click), with no infinite scroll. Search-as-you-type matches the last word as a prefix, so `cache.d` finds `cache.db` before you finish typing.
 
@@ -552,9 +602,8 @@ state in the sync chip.
 
 ## Deferred
 
-Token-based authentication for off-LAN exposure (binding beyond the local
-network) is a deferred design concern. The default loopback bind
-(`127.0.0.1`) plus Origin-vs-Host parity CSRF is the current contract; LAN
-exposure is opt-in (see [LAN access](#lan-access)). Remote use across the
-internet (or untrusted shared networks) will need a stronger auth story
-first. See [Threat model](#threat-model) for the LAN-bind caveat.
+Internet-grade exposure remains deferred. The per-run bearer token protects
+LAN API access but does not add TLS, certificate management, durable users, or
+revocation. Keep the default loopback bind unless LAN access is needed; use an
+encrypted tailnet/VPN rather than publishing the dashboard directly. See
+[Threat model](#threat-model).

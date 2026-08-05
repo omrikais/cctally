@@ -28,6 +28,7 @@ if str(BIN_DIR) not in sys.path:
 import _cctally_db as db  # noqa: E402
 import _cctally_core as core  # noqa: E402
 import _lib_codex_conversation as kern  # noqa: E402
+import _lib_codex_landmarks as landmarks  # noqa: E402
 import _lib_codex_conversation_export as cexport  # noqa: E402
 import _lib_codex_conversation_query as q  # noqa: E402
 import _lib_conversation as lc  # noqa: E402
@@ -518,6 +519,34 @@ def test_taxonomy_mapping_over_modern_full():
     # patch_apply_end feeds a file touch.
     assert any(t.file_path == "synthetic.txt" and t.tool == "apply_patch"
                for t in result.touches)
+
+
+def test_patch_dict_changes_feed_normalized_file_touches():
+    event = dataclasses.replace(
+        _events("modern-full")[0],
+        record_type="event_msg",
+        event_type="patch_apply_end",
+        line_offset=999,
+        conversation_key="dict-patch-conversation",
+        payload_json=json.dumps({"payload": {
+            "type": "patch_apply_end",
+            "changes": {
+                "src/alpha.py": {"type": "update"},
+                "src/beta.py": {"type": "add", "content": "new\n"},
+            },
+        }}),
+    )
+
+    result = kern.normalize_codex_events(
+        [event], initial=kern.CodexStickyState())
+
+    assert [
+        (touch.file_path, touch.tool, touch.line_offset)
+        for touch in result.touches
+    ] == [
+        ("src/alpha.py", "apply_patch", 999),
+        ("src/beta.py", "apply_patch", 999),
+    ]
 
 
 def test_search_split_columns_route_by_kind():
@@ -1092,6 +1121,67 @@ def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_dict_patch_ingest_populates_file_search_and_skips_orphans(
+        tmp_path, monkeypatch):
+    records = _codex_turn_records([])
+    records.append({
+        "payload": {
+            "type": "patch_apply_end",
+            "call_id": "patch-dict-1",
+            "turn_id": "turn-a",
+            "status": "completed",
+            "changes": {
+                "src/searchable-dict.py": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                },
+            },
+            "success": True,
+        },
+        "timestamp": "2026-07-14T12:02:00Z",
+        "type": "event_msg",
+    })
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        touch = conn.execute(
+            "SELECT t.message_id,t.file_path,t.tool,m.line_offset "
+            "FROM codex_conversation_file_touches t "
+            "JOIN codex_conversation_messages m ON m.id=t.message_id"
+        ).fetchone()
+        assert touch is not None
+        assert touch[1:3] == ("src/searchable-dict.py", "apply_patch")
+        assert touch[3] > 0
+
+        search = q.search_codex_conversations(
+            conn, "searchable-dict.py", kind="files",
+            effective_speed="standard")
+        assert search["status"] == "ok"
+        assert search["total"] == 1
+        assert search["hits"][0]["item_key"] is not None
+        assert search["hits"][0]["snippet"] == "src/searchable-dict.py"
+
+        # message_id is intentionally an application-level link, not a declared
+        # foreign key. A stale orphan must not hide or duplicate the valid hit.
+        conversation_key = search["hits"][0]["conversation_key"]
+        conn.execute(
+            "INSERT INTO codex_conversation_file_touches "
+            "(message_id,conversation_key,source_path,file_path,tool) "
+            "VALUES(?,?,?,?,?)",
+            (touch[0] + 1_000_000, conversation_key, "/missing.jsonl",
+             "src/searchable-dict.py", "apply_patch"),
+        )
+        search_with_orphan = q.search_codex_conversations(
+            conn, "searchable-dict.py", kind="files",
+            effective_speed="standard")
+        assert search_with_orphan["total"] == 1
+        assert search_with_orphan["hits"] == search["hits"]
+    finally:
+        conn.close()
+
+
 def test_ingest_normalized_batch_is_atomic_and_next_sync_retries(tmp_path, monkeypatch):
     """A failed transcript batch rolls back and its independent cursor retries."""
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
@@ -1146,23 +1236,42 @@ def test_truncation_rederives_normalized_rows(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_rebuild_clears_all_three_normalized_tables(tmp_path, monkeypatch):
+def test_rebuild_with_empty_root_preserves_all_three_normalized_tables(
+    tmp_path, monkeypatch,
+):
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
     conn = ns["open_cache_db"]()
     try:
         ns["sync_codex_cache"](conn)
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_messages").fetchone()[0] > 0
-        # Point CODEX_HOME at an empty root and rebuild -> full clear.
+        tables = (
+            "codex_conversation_messages",
+            "codex_conversation_file_touches",
+            "codex_conversation_rollups",
+        )
+        before = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        }
+        before_fts = conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_fts "
+            "WHERE codex_conversation_fts MATCH 'Synthetic'"
+        ).fetchone()[0]
+
+        # #485: an empty root is unknown filesystem state, not permission to
+        # erase the only retained normalized transcript generation.
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-root"))
-        ns["sync_codex_cache"](conn, rebuild=True)
-        for table in ("codex_conversation_messages", "codex_conversation_file_touches",
-                      "codex_conversation_rollups"):
-            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
-        # FTS empty too.
+        refused = ns["sync_codex_cache"](conn, rebuild=True)
+        assert refused.prune_refused is True
+        assert {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        } == before
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_fts "
-            "WHERE codex_conversation_fts MATCH 'Synthetic'").fetchone()[0] == 0
+            "WHERE codex_conversation_fts MATCH 'Synthetic'"
+        ).fetchone()[0] == before_fts
     finally:
         conn.close()
 
@@ -1658,6 +1767,148 @@ def test_a_boundary_never_splits_a_bracketed_patch_completion(tmp_path, monkeypa
         conn.close()
 
 
+def test_find_projection_reuses_the_actual_native_completion_fold_owner(
+    tmp_path, monkeypatch
+):
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _fold_shape_records(filler=1, web_owners=3)
+    )
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+        owner_by_event = {}
+        for item in detail["items"]:
+            for block in item["blocks"]:
+                card = (block.get("detail") or {}).get("card")
+                completion = card.get("completion") if isinstance(card, dict) else None
+                if isinstance(completion, dict) and completion.get("event_block_key"):
+                    owner_by_event[completion["event_block_key"]] = block["block_key"]
+        assert len(owner_by_event) == 2
+
+        projected = {
+            block_key: container_block_key
+            for block_key, container_block_key in conn.execute(
+                "SELECT block_key,container_block_key FROM codex_find_projection "
+                "WHERE conversation_key=? AND surface='completion'",
+                (ck,),
+            )
+        }
+        assert projected == owner_by_event
+    finally:
+        conn.close()
+
+
+def test_find_projection_scopes_reused_mcp_completion_ids_to_their_turn(
+    tmp_path, monkeypatch
+):
+    records = _codex_turn_records([
+        {"type": "function_call", "name": "fixture_search_issues",
+         "call_id": "reused-mcp", "arguments": "{\"state\":\"open\"}"},
+    ], turn_id="turn-one")
+    records.extend([
+        {
+            "type": "event_msg", "timestamp": "2026-07-14T12:03:00Z",
+            "payload": {
+                "type": "mcp_tool_call_end", "call_id": "reused-mcp",
+                "invocation": {"server": "fixture", "tool": "search_issues",
+                               "arguments": {"state": "open"}},
+                "result": {"Ok": {"content": [{"type": "text", "text": "one"}]}},
+            },
+        },
+        {
+            "type": "turn_context", "timestamp": "2026-07-14T12:04:00Z",
+            "payload": {"model": "gpt-x", "model_context_window": 272000,
+                        "turn_id": "turn-two"},
+        },
+        {
+            "type": "response_item", "timestamp": "2026-07-14T12:05:00Z",
+            "payload": {"type": "function_call", "name": "fixture_search_issues",
+                        "call_id": "reused-mcp", "arguments": "{\"state\":\"closed\"}"},
+        },
+        {
+            "type": "event_msg", "timestamp": "2026-07-14T12:06:00Z",
+            "payload": {
+                "type": "mcp_tool_call_end", "call_id": "reused-mcp",
+                "invocation": {"server": "fixture", "tool": "search_issues",
+                               "arguments": {"state": "closed"}},
+                "result": {"Ok": {"content": [{"type": "text", "text": "two"}]}},
+            },
+        },
+    ])
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = _detail_of(conn, ck, limit=0)
+        owner_by_event = {}
+        for item in detail["items"]:
+            for block in item["blocks"]:
+                card = (block.get("detail") or {}).get("card")
+                completion = card.get("completion") if isinstance(card, dict) else None
+                if isinstance(completion, dict) and completion.get("event_block_key"):
+                    owner_by_event[completion["event_block_key"]] = block["block_key"]
+        assert len(owner_by_event) == 2
+        assert len(set(owner_by_event.values())) == 2
+        projected = dict(conn.execute(
+            "SELECT block_key,container_block_key FROM codex_find_projection "
+            "WHERE conversation_key=? AND surface='completion'",
+            (ck,),
+        ))
+        assert projected == owner_by_event
+    finally:
+        conn.close()
+
+
+def test_find_projection_uses_visible_first_occurrence_reasoning_headings(
+    tmp_path, monkeypatch
+):
+    records = _codex_turn_records([
+        {
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "Alpha heading"},
+                {"type": "summary_text", "text": "Beta heading"},
+            ],
+            "content": [],
+        },
+        {
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "Alpha heading"},
+                {"type": "summary_text", "text": "Beta heading"},
+                {"type": "summary_text", "text": "Gamma heading"},
+            ],
+            "content": [],
+        },
+    ])
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        alpha = q.find_occurrences_in_codex_conversation(
+            conn, ck, "Alpha heading", regex=False, case_sensitive=True,
+            kind="thinking",
+        )
+        gamma = q.find_occurrences_in_codex_conversation(
+            conn, ck, "Gamma heading", regex=False, case_sensitive=True,
+            kind="thinking",
+        )
+        assert alpha["total"] == 1
+        assert gamma["total"] == 1
+        assert alpha["page"]["occurrences"][0]["fragments"] == [
+            {"leaf_key": "headings.0", "start": 0, "end": 13}
+        ]
+        assert gamma["page"]["occurrences"][0]["fragments"] == [
+            {"leaf_key": "headings.2", "start": 0, "end": 13}
+        ]
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("web_owners", [2, 3])
 def test_a_boundary_never_splits_a_web_search_completion(
         tmp_path, monkeypatch, web_owners):
@@ -2102,8 +2353,17 @@ def test_outline_ok_over_modern_full(tmp_path, monkeypatch):
         assert len(o["turns"]) == 8
         labels = [t["label"] for t in o["turns"]]
         assert "Synthetic first meaningful user prompt" in labels
-        assert {"file_path": "synthetic.txt", "tool": "apply_patch",
-                "count": 1} in o["files"]
+        # #463 S4 §4.3 — the file list is derived read-time now, so each entry
+        # also carries its touches and its diff counts. `op` is None here
+        # because this fixture's list-shaped change states neither `type` nor
+        # `status`, and the derivation reports what the provider said rather
+        # than inventing a kind.
+        assert o["files"] == [{
+            "file_path": "synthetic.txt", "tool": "apply_patch", "count": 1,
+            "added": None, "removed": None,
+            "touches": [{"item_key": o["files"][0]["touches"][0]["item_key"],
+                         "timestamp_utc": "2026-07-14T12:10:00Z", "op": None}],
+        }]
         # item keys align with the detail assembly.
         d = q.get_codex_conversation(conn, ck, effective_speed="standard")
         assert [t["item_key"] for t in o["turns"]] == [it["item_key"] for it in d["items"]]
@@ -2223,6 +2483,11 @@ def test_session_b_card_ready_detail_and_guarded_replay_contract(
             }],
         }
         assert terminal["output"]["text"] == "alpha\n"
+        # #463 S3 moved this card deliberately: the served `terminal_output` now
+        # carries `exit_code` and `wall_time_seconds` from the preamble reader,
+        # each null when the grammar did not supply it (spec section 4.3). This
+        # fixture's `Wall time 0.1 seconds` line is where the 0.1 comes from, and
+        # its grammar supplies no exit code.
         assert terminal["output"]["detail"]["card"] == {
             "schema_version": 1,
             "type": "terminal_output",
@@ -2230,6 +2495,8 @@ def test_session_b_card_ready_detail_and_guarded_replay_contract(
             "is_error": False,
             "parts": [{"stream": "output", "text": "alpha\n", "type": "text"}],
             "truncated": False,
+            "exit_code": None,
+            "wall_time_seconds": 0.1,
         }
         assert by_call["exec-string"]["output"]["text"] == "plain string output\n"
         failed = by_call["exec-failed"]["output"]["detail"]["card"]
@@ -2251,8 +2518,14 @@ def test_session_b_card_ready_detail_and_guarded_replay_contract(
         patch_card = direct_patch["detail"]["card"]
         assert patch_card["type"] == "patch"
         assert patch_card["source"] == "apply_patch"
+        # #463 S3 remediation B1 — the call side decodes the envelope it is
+        # already holding, so the entry carries the same field vocabulary the
+        # event side publishes rather than a bare file list.
         assert patch_card["files"] == [{
-            "path": "synthetic-added.txt", "status": "added"}]
+            "path": "synthetic-added.txt", "status": "added", "truncated": False,
+            "diff_source": "derived",
+            "unified_diff": "--- /dev/null\n+++ synthetic-added.txt\n"
+                            "@@ -0,0 +1,1 @@\n+alpha\n"}]
         completion = patch_card["completion"]
         assert completion["success"] is True
         assert completion["stdout"] == "patch ok\n" and completion["stderr"] == ""
@@ -2278,8 +2551,10 @@ def test_session_b_card_ready_detail_and_guarded_replay_contract(
         assert bracketed["completion"]["files"][0]["path"] == "synthetic-edit.txt"
         heredoc = by_call["heredoc-patch"]["detail"]["card"]
         assert heredoc["type"] == "patch" and heredoc["source"] == "exec_apply_patch"
+        # A V4A delete names the file and carries no body, so there is genuinely
+        # no line-level diff to publish.
         assert heredoc["files"] == [{
-            "path": "synthetic-delete.txt", "status": "deleted"}]
+            "path": "synthetic-delete.txt", "status": "deleted", "truncated": False}]
         repeated = [by_call["repeat-patch-1"], by_call["repeat-patch-2"]]
         assert len({block["block_key"] for block in repeated}) == 2
         assert len({block["detail"]["card"]["completion"]["event_block_key"]
@@ -2290,8 +2565,11 @@ def test_session_b_card_ready_detail_and_guarded_replay_contract(
         diff_less = next(block for block in blocks
                          if block["kind"] == "event" and block.get("call_id") == "diff-less")
         assert diff_less["detail"]["card"]["has_diff"] is False
+        # Per-file `truncated` is on EVERY served file entry since #463 S3
+        # remediation F5, including the list branch and the entries with no diff.
         assert diff_less["detail"]["card"]["files"] == [{
-            "path": "synthetic-summary.txt", "status": "modified"}]
+            "path": "synthetic-summary.txt", "status": "modified",
+            "truncated": False}]
         assert diff_less["detail"]["card"]["success"] is False
         assert diff_less["block_key"].startswith("cbk1_")
         assert diff_less["payload_which"] == "event"
@@ -2415,15 +2693,43 @@ def test_session_b_harness_parser_is_closed_bounded_and_non_executing():
         'const r = await tools.exec_command({cmd: process.env.SECRET}); text(r.output);',
         supported + ' /* unclosed',
         'const r = await tools.exec_command({cmd: `template`}); text(r.output);',
-        'evil(); ' + supported,
-        supported + ' sendSecret();',
         'const r = await evil.tools.exec_command({cmd: "nope"}); text(r.output);',
+        # The same lookalike with whitespace and a newline around the dot, which
+        # JavaScript permits. A guard reading the character immediately before
+        # `tools` is defeated by all three; only the previous significant TOKEN
+        # decides whether anything binds to `tools` on the left.
+        'const r = await evil . tools.exec_command({cmd: "nope"}); text(r.output);',
+        'const r = await evil.\n  tools.exec_command({cmd: "nope"}); text(r.output);',
+        'const r = await this . tools.exec_command({cmd: "nope"}); text(r.output);',
         ('const r = await tools.exec_command({cmd: "ok", max_output_tokens: '
          + "9" * 5000 + '}); text(r.output);'),
+        # #463 S3 adds four more, all of which would defeat a naive tokenizer
+        # and let a call inside a literal or a comment reach a card.
+        'const s = "he said \\"tools.exec_command(1)\\" and it\'s fine";',
+        'const r = /"/; const t = "tools.exec_command(2)";',
+        "// it's a comment about tools.exec_command(3)\nconst x = 1;",
+        'const t = `a${"tools.exec_command(4)"}b`;',
     ]
     for raw in unsupported:
         bad = dict(payload, input=raw)
         assert kern.decode_tool_call_card(bad) is None, raw
+
+    # TWO assertions are DELIBERATELY INVERTED here (#463 S3, spec sections 3.3
+    # and 7). Both inputs are a recognized invocation with an unrecognized
+    # statement beside it, and recognizing exactly that is the point of the
+    # change: 17,777 uncarded `exec` calls are programs rather than command
+    # chains. They no longer refuse; they produce a `program` card that states
+    # what it found and says, through `complete: false`, that it is not the whole
+    # story. Every other entry in the list above still asserts `None`, and the
+    # scanner is what keeps that true — a textual scan would have decoded the
+    # string, comment and regex cases as well.
+    for raw in ['evil(); ' + supported, supported + ' sendSecret();']:
+        inverted = kern.decode_tool_call_card(dict(payload, input=raw))
+        assert inverted is not None, raw
+        assert inverted["type"] == "program", raw
+        assert inverted["complete"] is False, raw
+        assert [i["kind"] for i in inverted["invocations"]] == ["command"], raw
+        assert inverted["invocations"][0]["command"] == "printf ok", raw
 
     too_many = "\n".join(
         f'const r{i} = await tools.exec_command({{cmd: "cmd-{i}"}}); '
@@ -2643,6 +2949,74 @@ def test_session_c_secondary_tool_wire_is_structured_and_completion_folded(
         assert wait["result"]["value"]["timed_out"] is False
     finally:
         conn.close()
+
+
+def _mcp_protocol_error_payload():
+    """The retained provider shape sampled for #494 (transport Ok, MCP error)."""
+    return {
+        "type": "mcp_tool_call_end", "call_id": "mcp-protocol-error",
+        "duration": {"secs": 0, "nanos": 250000000},
+        "invocation": {
+            "server": "fixture", "tool": "get_issue",
+            "arguments": {"number": 999},
+        },
+        "result": {
+            "Ok": {
+                "content": [{"type": "text", "text": "synthetic failure"}],
+                "isError": True,
+            },
+        },
+    }
+
+
+def test_mcp_protocol_error_decodes_as_failure():
+    """#494 RED: successful transport does not override MCP's own verdict."""
+    card = kern.decode_secondary_event_card(_mcp_protocol_error_payload())
+    assert card is not None
+    assert card["status"] == "error"
+
+    for non_error in (False, "true"):
+        payload = _mcp_protocol_error_payload()
+        payload["result"]["Ok"]["isError"] = non_error
+        assert kern.decode_secondary_event_card(payload)["status"] == "ok"
+
+
+def test_mcp_protocol_error_reaches_card_outline_and_error_landmark(
+    tmp_path, monkeypatch,
+):
+    """#494 RED: the decoder verdict is the one downstream surfaces consume."""
+    records = _codex_turn_records([{
+        "type": "function_call", "name": "fixture_get_issue",
+        "call_id": "mcp-protocol-error", "arguments": "{\"number\":999}",
+    }])
+    records.append({
+        "timestamp": "2026-07-14T12:03:00Z", "type": "event_msg",
+        "payload": _mcp_protocol_error_payload(),
+    })
+    ns, _root, _path = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=0)
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+    finally:
+        conn.close()
+
+    call = next(
+        block for item in detail["items"] for block in item["blocks"]
+        if block.get("call_id") == "mcp-protocol-error")
+    assert call["detail"]["card"]["completion"]["status"] == "error"
+    assert outline["stats"]["error_count"] == 1
+    assert [(lm["kind"], lm["label"]) for lm in outline["landmarks"]] == [
+        ("tool_error", "fixture_get_issue"),
+    ]
+    tool = next(
+        tool for turn in outline["turns"] for tool in turn.get("tools", [])
+        if tool["name"] == "fixture_get_issue")
+    assert tool["is_error"] is True
 
 
 def test_session_c_fixture_contract_links_only_exact_same_root_child(
@@ -3312,6 +3686,11 @@ def test_outline_pending_and_not_found_exact_envelopes(tmp_path, monkeypatch):
     conn = _cache_schema()
     try:
         _insert_msg(conn, offset=1, text="x", conversation_key="conv-p")
+        # The insert opened an implicit write transaction; committing it is what
+        # a real writer does, and #463 S4's `_read_snapshot` refuses to serve an
+        # envelope from inside a foreign write rather than reading uncommitted
+        # state without a snapshot of its own.
+        conn.commit()
         o = q.get_codex_conversation_outline(conn, "conv-p", effective_speed="standard")
         assert o == {"status": "normalization_pending", "conversation_key": "conv-p",
                      "turns": [], "files": [], "children": []}
@@ -3464,11 +3843,74 @@ def test_browse_rollup_fast_path_equals_live_recompute(tmp_path, monkeypatch):
     try:
         ns["sync_codex_cache"](conn)
         fast = q.list_codex_conversations(conn, effective_speed="standard")
+        fast_page_1 = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2)
+        fast_page_2 = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2,
+            cursor=fast_page_1["page"]["cursor"])
+        fast_invalid_cursor = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2, cursor="not-present")
         # Force the live-recompute branch by deleting the stored rollups.
         conn.execute("DELETE FROM codex_conversation_rollups")
         live = q.list_codex_conversations(conn, effective_speed="standard")
+        live_page_1 = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2)
+        live_page_2 = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2,
+            cursor=live_page_1["page"]["cursor"])
+        live_invalid_cursor = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2, cursor="not-present")
         assert fast == live
+        assert fast_page_1 == live_page_1
+        assert fast_page_2 == live_page_2
+        assert fast_invalid_cursor == live_invalid_cursor == live_page_1
     finally:
+        conn.close()
+
+
+def test_browse_rollup_fast_path_is_constant_query_count(tmp_path, monkeypatch):
+    """The authoritative rollup path must page before per-conversation work.
+
+    #438's retained-store reproduction executed four SELECTs per conversation
+    before returning a 50-row page.  Count the SQL boundary directly so a
+    future refactor cannot hide the same N+1 behind a faster fixture.
+    """
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, _BROWSE_MIX)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        statements = []
+        conn.set_trace_callback(statements.append)
+        env = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2)
+        conn.set_trace_callback(None)
+
+        assert env["page"]["total"] == 5
+        assert len(env["rows"]) == 2
+        selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+        assert len(selects) <= 8, selects
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+
+
+def test_codex_facets_do_not_build_or_price_a_browse_page(tmp_path, monkeypatch):
+    """The facets endpoint owns facet aggregation, not a discarded browse page."""
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, _BROWSE_MIX)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        statements = []
+        conn.set_trace_callback(statements.append)
+        env = q.list_codex_conversation_facets(conn)
+        conn.set_trace_callback(None)
+
+        assert env["status"] == "ok"
+        assert env["facets"]["projects"]
+        assert env["facets"]["models"]
+        assert not any("codex_session_entries" in sql for sql in statements)
+    finally:
+        conn.set_trace_callback(None)
         conn.close()
 
 
@@ -3555,6 +3997,33 @@ def _search_like(conn, query, kind):
 def test_search_kinds_tuple_is_pinned():
     assert q.CODEX_SEARCH_KINDS == (
         "all", "prompts", "assistant", "tools", "thinking", "title", "files")
+
+
+def test_search_tool_output_content_array_snippet_is_readable_prose(
+        tmp_path, monkeypatch):
+    """Structured tool output stays searchable without leaking its JSON wrapper."""
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["session-b-card-wire"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        env = q.search_codex_conversations(
+            conn, "synthetic stderr", kind="tools", effective_speed="standard")
+
+        assert env["hits"]
+        snippet = env["hits"][0]["snippet"]
+        assert "synthetic stderr" in snippet
+        assert "Script failed" in snippet
+        assert not snippet.lstrip().startswith("[{")
+        assert '"type":"input_text"' not in snippet
+    finally:
+        conn.close()
+
+
+def test_search_truncated_content_array_uses_complete_text_parts_only():
+    raw = ('[{"text":"readable header","type":"input_text"},'
+           '{"text":"unterminated provider payload')
+    assert q._search_display_text(raw) == "readable header\n…"
 
 
 @pytest.mark.parametrize("kind,query", [
@@ -3994,6 +4463,17 @@ def test_neutral_browse_codex_matches_kernel(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_neutral_facets_codex_matches_dedicated_kernel(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, _BROWSE_MIX)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        assert disp.neutral_facets(conn, source="codex") == \
+            q.list_codex_conversation_facets(conn)
+    finally:
+        conn.close()
+
+
 # --- neutral outline + search: both providers (§5.6) ------------------------
 
 
@@ -4016,14 +4496,155 @@ def test_neutral_outline_claude_aligns_with_detail_item_keys():
         conn.close()
 
 
+def test_neutral_outline_claude_preserves_navigation_shape(monkeypatch):
+    """A qualified Claude outline must retain every legacy navigation fact."""
+    legacy = {
+        "session_id": _SID_A,
+        "subagent_meta": {
+            "child": {
+                "kind": "general-purpose",
+                "parent_subagent_key": None,
+                "spawn_uuid": "a1",
+                "spawn_tool_use_id": "toolu_spawn",
+            },
+        },
+        "subagent_costs": {"child": 1.25},
+        "stats": {
+            "turns": {"total": 1, "human": 0, "assistant": 1,
+                      "tool_result": 0, "meta": 0},
+            "tool_counts": {"Bash": 1},
+            "error_count": 1,
+            "models": {"claude-opus-4-8": 1},
+            "duration_seconds": 5,
+            "tokens": {"input": 1, "output": 2,
+                       "cache_creation": 3, "cache_read": 4},
+            "cost_usd": 0.5,
+            "cache_saved_usd": 0.1,
+            "cache_failures": {
+                "count": 1,
+                "tokens_recreated": 10,
+                "est_wasted_usd": 0.2,
+                "rebuilds": [{
+                    "uuid": "a1", "subagent_key": "child",
+                    "ts": "2026-06-01T00:00:05Z",
+                    "tokens_recreated": 10, "est_wasted_usd": 0.2,
+                }],
+            },
+        },
+        "files": [{
+            "path": "src/app.py", "add": 2, "del": 1,
+            "touches": [{
+                "uuid": "a1", "tool_use_id": "toolu_edit", "op": "edit",
+                "add": 2, "del": 1,
+            }],
+        }],
+        "task_completion": {
+            "all_done": True, "total": 2, "completed": 2,
+            "anchor_uuid": "a1",
+        },
+        "turns": [{
+            "uuid": "a1", "kind": "assistant",
+            "ts": "2026-06-01T00:00:05Z", "label": "Failed command",
+            "member_uuids": ["a1", "folded"],
+            "subagent_key": "child", "parent_uuid": "parent",
+            "is_sidechain": True,
+            "tools": [{"name": "Bash", "is_error": True}],
+            "thinking": ["Investigating"], "model": "claude-opus-4-8",
+            "tokens": {"input": 1, "output": 2,
+                       "cache_creation": 3, "cache_read": 4},
+            "cache_failure": {"tokens_recreated": 10, "prev_cached": 20,
+                              "est_wasted_usd": 0.2},
+        }],
+    }
+    monkeypatch.setattr(lcq, "get_conversation_outline",
+                        lambda _conn, _sid: legacy)
+    monkeypatch.setattr(lcq, "_assemble_session_memoized",
+                        lambda _conn, _sid: {"items": []})
+
+    body = disp._claude_outline(object(), _SID_A, "v1.claude")
+    item_key = disp._claude_item_key(_SID_A, "a1")
+
+    assert body["turns"] == [{
+        "item_key": item_key,
+        "kind": "assistant",
+        "label": "Failed command",
+        "timestamp_utc": "2026-06-01T00:00:05Z",
+        "kinds": {"assistant": 1},
+        "member_item_keys": [disp._claude_item_key(_SID_A, "folded")],
+        "subagent_key": "child",
+        "parent_item_key": disp._claude_item_key(_SID_A, "parent"),
+        "is_sidechain": True,
+        "tools": [{"name": "Bash", "is_error": True}],
+        "thinking": ["Investigating"],
+        "model": "claude-opus-4-8",
+        "tokens": {"input": 1, "output": 2,
+                   "cache_creation": 3, "cache_read": 4},
+        "cache_failure": {"tokens_recreated": 10, "prev_cached": 20,
+                          "est_wasted_usd": 0.2},
+    }]
+    assert body["stats"]["cache_failures"]["rebuilds"][0]["uuid"] == item_key
+    assert body["subagent_meta"]["child"]["spawn_uuid"] == item_key
+    assert body["subagent_costs"] == {"child": 1.25}
+    assert body["task_completion"]["anchor_uuid"] == item_key
+    assert body["files"] == [{
+            "file_path": "src/app.py", "tool": "edit", "count": 1,
+        "added": 2, "removed": 1,
+        "touches": [{
+            "item_key": item_key, "timestamp_utc": None,
+            "tool_use_id": "toolu_edit", "op": "edit",
+            "added": 2, "removed": 1,
+        }],
+    }]
+
+
+def test_map_claude_item_preserves_navigation_shape():
+    item = {
+        "anchor": {"uuid": "a1"},
+        "kind": "assistant", "ts": "2026-06-01T00:00:05Z",
+        "model": "claude-opus-4-8", "blocks": [], "cost_usd": 0.5,
+        "tokens": {"input": 1, "output": 2,
+                   "cache_creation": 3, "cache_read": 4},
+        "member_uuids": ["a1", "folded"],
+        "subagent_key": "child", "parent_uuid": "parent",
+        "is_sidechain": True,
+        "meta_kind": None, "skill_name": None,
+        "command_name": None,
+        "cache_failure": {"tokens_recreated": 10, "prev_cached": 20,
+                          "est_wasted_usd": 0.2},
+    }
+    own = disp._claude_item_key(_SID_A, "a1")
+    assert disp._map_claude_item(_SID_A, item) == {
+        "item_key": own,
+        "kind": "assistant",
+        "timestamp_utc": "2026-06-01T00:00:05Z",
+        "model": "claude-opus-4-8",
+        "blocks": [], "cost_usd": 0.5,
+        "tokens": {"source": "claude", "input": 1, "output": 2,
+                   "cache_create": 3, "cache_read": 4},
+        "member_item_keys": [disp._claude_item_key(_SID_A, "folded")],
+        "subagent_key": "child",
+        "parent_item_key": disp._claude_item_key(_SID_A, "parent"),
+        "is_sidechain": True,
+        "meta_kind": None, "skill_name": None, "command_name": None,
+        "cache_failure": {"tokens_recreated": 10, "prev_cached": 20,
+                          "est_wasted_usd": 0.2},
+    }
+
+
 def test_neutral_outline_codex_matches_kernel(tmp_path, monkeypatch):
     ns, _root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, ["modern-full"])
     conn = ns["open_cache_db"]()
     try:
         ns["sync_codex_cache"](conn)
         ck = _single_ck(conn)
-        assert disp.neutral_outline(conn, ck, effective_speed="standard") == \
-            q.get_codex_conversation_outline(conn, ck, effective_speed="standard")
+        outline = q.get_codex_conversation_outline(
+            conn, ck, effective_speed="standard")
+        assert disp.neutral_outline(conn, ck, effective_speed="standard") == outline
+        detail = q.get_codex_conversation(
+            conn, ck, effective_speed="standard", limit=1)
+        assert outline["stats"]["cost_usd"] == pytest.approx(
+            detail["total_cost_usd"], abs=1e-9)
+        assert outline["stats"]["tokens"] == detail["tokens"]
     finally:
         conn.close()
 
@@ -4634,7 +5255,15 @@ def test_neutral_find_dispatch_both_providers(tmp_path, monkeypatch):
         ns["sync_codex_cache"](conn)
         ck = _single_ck(conn)
         via = disp.neutral_find(conn, ck, "Synthetic", kind="all")
-        assert via == q.find_in_codex_conversation(conn, ck, "Synthetic", kind="all")
+        assert via == q.find_occurrences_in_codex_conversation(
+            conn,
+            ck,
+            "Synthetic",
+            kind="all",
+            regex=False,
+            case_sensitive=False,
+        )
+        assert via["semantics"] == "occurrence"
         # garbage ref -> not_found; bad kind -> ValueError (route 400).
         assert disp.neutral_find(conn, "garbage", "x")["status"] == "not_found"
         with pytest.raises(ValueError):
@@ -5123,3 +5752,2300 @@ def test_reasoning_title_boundaries_are_computed_from_the_stored_projection(
     # And it DID decompose, so the two facts are being asserted about the same
     # row rather than about an aggregate that produced nothing.
     assert len(_first_reasoning_block(page)["detail"]["reasoning"]["headings"]) == 2
+
+
+# --- #463 S3: tool legibility ------------------------------------------------
+#
+# Spec docs/superpowers/specs/2026-08-03-463-s3-tool-legibility-design.md.
+#
+# The invariant these tests exist to hold, and the one that is easiest to break
+# without noticing: EVERY card addition below is computed at READ time.
+# `_extract` keeps storing today's bounded card unchanged (spec section 3.0),
+# because `_row_source_bytes` is a row's content length plus its stored
+# `detail_json` byte length and that total drives `PAGE_SOURCE_BYTE_BUDGET` page
+# boundaries. Persisting the enrichment would make two conversations with
+# identical content paginate differently according to which binary ingested them.
+
+
+def _s3_stored_detail(tmp_path, monkeypatch, records):
+    """`(rows_by_call_id, conn, conversation_key)` for a staged record list.
+
+    Returns the STORED `detail_json` per row, which is what the read-time-only
+    rule is asserted against.
+    """
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    ns["sync_codex_cache"](conn)
+    ck = _single_ck(conn)
+    stored = {}
+    for call_id, kind, detail_json in conn.execute(
+        "SELECT call_id, kind, detail_json FROM codex_conversation_messages "
+        "WHERE conversation_key = ? ORDER BY source_path, line_offset", (ck,)
+    ):
+        stored[(call_id, kind)] = detail_json
+    return stored, conn, ck
+
+
+def test_s3_output_card_resolves_status_and_strips_the_preamble():
+    payload = {"type": "custom_tool_call_output", "call_id": "c1",
+               "output": [{"type": "input_text",
+                           "text": "Script failed\nWall time 2 seconds\nOutput:\n"},
+                          {"type": "input_text", "text": "boom\n"}]}
+    card, body = kern.decode_tool_output_card(payload)
+    assert card["status"] == "failed" and card["is_error"] is True
+    assert card["wall_time_seconds"] == 2.0
+    assert "Script failed" not in body and "Wall time" not in body
+    assert body == "boom\n"
+
+
+def test_s3_running_is_not_an_error_and_leaks_no_session_id():
+    payload = {"type": "function_call_output", "call_id": "c2",
+               "output": "Chunk ID: aa11\nWall time: 1 seconds\n"
+                         "Process running with session ID 59671\n"
+                         "Original token count: 0\nOutput:\nrunning...\n"}
+    card, body = kern.decode_tool_output_card(payload)
+    assert card["status"] == "running" and card["is_error"] is False
+    assert "59671" not in json.dumps(card)
+    assert body == "running...\n"
+
+
+def test_s3_output_card_publishes_exit_code_and_wall_time_per_grammar():
+    """Every grammar, on the card rather than only in the reader (section 4.3)."""
+    cases = [
+        ("Chunk ID: 8c93bf\nWall time: 0.9007 seconds\n"
+         "Process exited with code 0\nOriginal token count: 31\nOutput:\ndone\n",
+         "completed", 0, 0.9007, False, "done\n"),
+        ("Chunk ID: 8c93bf\nWall time: 0.9007 seconds\n"
+         "Process exited with code 127\nOriginal token count: 31\n"
+         "Output:\nnot found\n",
+         "failed", 127, 0.9007, True, "not found\n"),
+        ("Exit code: 0\nWall time: 0.0304 seconds\nOutput:\nSuccess\n",
+         "completed", 0, 0.0304, False, "Success\n"),
+        ("Wall time: 0.7312 seconds\nOutput:\n{}\n",
+         "unknown", None, 0.7312, False, "{}\n"),
+    ]
+    for raw, status, exit_code, wall, is_error, body_text in cases:
+        card, body = kern.decode_tool_output_card(
+            {"type": "function_call_output", "call_id": "c", "output": raw})
+        assert card["status"] == status, raw
+        assert card["exit_code"] == exit_code, raw
+        assert card["wall_time_seconds"] == wall, raw
+        assert card["is_error"] is is_error, raw
+        assert body == body_text, raw
+        assert "chunk_id" not in card and "session_id" not in card, raw
+
+
+def test_s3_an_output_with_no_preamble_is_left_exactly_as_it_was():
+    """The 10,177 no-preamble outputs, untouched by construction (section 4.1)."""
+    raw = "usage: git [--version] [--help]\n"
+    card, body = kern.decode_tool_output_card(
+        {"type": "function_call_output", "call_id": "c", "output": raw})
+    assert card["status"] == "unknown"
+    assert card["is_error"] is False
+    assert card["exit_code"] is None and card["wall_time_seconds"] is None
+    assert body == raw
+
+
+def test_s3_extract_stores_the_frozen_card_and_never_the_enrichment(
+    tmp_path, monkeypatch,
+):
+    """Spec section 3.0. The enrichment must not reach `detail_json`.
+
+    A stored card that resolved its status, dropped its preamble part or gained
+    `exit_code` would grow `detail_json` for newly ingested rows while historical
+    rows kept their old estimates, so `_row_source_bytes` — and therefore the
+    page boundary — would depend on which binary did the ingest.
+    """
+    records = _codex_turn_records([
+        {"call_id": "s3-out", "input": "irrelevant", "name": "exec",
+         "status": "completed", "type": "custom_tool_call"},
+        {"call_id": "s3-out", "type": "custom_tool_call_output",
+         "output": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess\n"},
+    ])
+    stored, conn, _ck = _s3_stored_detail(tmp_path, monkeypatch, records)
+    try:
+        card = json.loads(stored[("s3-out", "tool_output")])["card"]
+    finally:
+        conn.close()
+    assert card["status"] == "unknown"
+    assert "exit_code" not in card
+    assert "wall_time_seconds" not in card
+    # The preamble is still IN the stored part, because stripping it is a
+    # read-time projection.
+    assert card["parts"][0]["text"].startswith("Exit code: 0\n")
+
+
+def test_s3_unrecognised_preamble_still_takes_the_call_cards_status(
+    tmp_path, monkeypatch,
+):
+    """Spec section 4.6: the existing backfill keeps covering the remainder.
+
+    `_item_blocks_with_rows` copies a call card's status onto an output card
+    whose status is `unknown`. It is gated on `unknown`, so it stops firing for
+    the 82.4% that now resolve and continues to cover the rest. This asserts the
+    'rest' half directly, because a reader could easily conclude from the
+    reduced firing rate that it had regressed.
+    """
+    records = _codex_turn_records([
+        {"call_id": "s3-nopre", "name": "exec", "status": "failed",
+         "type": "custom_tool_call",
+         "input": ('const r = await tools.exec_command({cmd: "printf ok"}); '
+                   'text(r.output);')},
+        {"call_id": "s3-nopre", "type": "custom_tool_call_output",
+         "output": "no preamble at all, just output\n"},
+    ])
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        detail = _detail_of(conn, _single_ck(conn), limit=0)
+    finally:
+        conn.close()
+    block = next(b for item in detail["items"] for b in item["blocks"]
+                 if b.get("call_id") == "s3-nopre")
+    output_card = block["output"]["detail"]["card"]
+    # The preamble reader recognized nothing, so the call card's own status is
+    # what reaches the output card — exactly today's behaviour.
+    assert output_card["status"] == "failed"
+    assert output_card["is_error"] is True
+    assert block["output"]["text"] == "no preamble at all, just output\n"
+
+
+# --- #463 S3 Task 3: the patch dict branch and synthesized diffs -------------
+
+
+def test_s3_patch_dict_changes_decode_per_file():
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": {
+                   "/synthetic/a.py": {"move_path": None, "type": "update",
+                                       "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"},
+                   "/synthetic/b.py": {"type": "add", "content": "one\ntwo\n"},
+                   "/synthetic/c.py": {"type": "delete", "content": "gone\n"},
+                   "/synthetic/d.py": {"type": "add", "content": ""}}}
+    card = kern.decode_patch_event_card(payload)
+    assert card["has_diff"] is True
+    by_path = {f["path"]: f for f in card["files"]}
+    assert by_path["/synthetic/a.py"]["status"] == "update"
+    assert by_path["/synthetic/a.py"]["diff_source"] == "retained"
+    assert by_path["/synthetic/b.py"]["diff_source"] == "derived"
+    assert by_path["/synthetic/b.py"]["unified_diff"] == (
+        "--- /dev/null\n+++ /synthetic/b.py\n@@ -0,0 +1,2 @@\n+one\n+two\n")
+    assert by_path["/synthetic/c.py"]["unified_diff"] == (
+        "--- /synthetic/c.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n")
+    assert by_path["/synthetic/d.py"]["unified_diff"] == (
+        "--- /dev/null\n+++ /synthetic/d.py\n@@ -0,0 +0,0 @@\n")
+    # Payload key order is iteration order; `json.loads` preserves it.
+    assert [f["path"] for f in card["files"]] == [
+        "/synthetic/a.py", "/synthetic/b.py", "/synthetic/c.py", "/synthetic/d.py"]
+
+
+def test_s3_patch_missing_trailing_newline_marker():
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": {"/synthetic/e.py": {"type": "add", "content": "no-eol"}}}
+    card = kern.decode_patch_event_card(payload)
+    assert card["files"][0]["unified_diff"] == (
+        "--- /dev/null\n+++ /synthetic/e.py\n@@ -0,0 +1,1 @@\n+no-eol\n"
+        "\\ No newline at end of file\n")
+
+
+def test_s3_one_huge_file_does_not_starve_its_siblings():
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": {"/synthetic/big.py": {"type": "delete",
+                                                 "content": "x\n" * 40000},
+                           "/synthetic/small.py": {"type": "add",
+                                                   "content": "kept\n"}}}
+    card = kern.decode_patch_event_card(payload)
+    by_path = {f["path"]: f for f in card["files"]}
+    assert by_path["/synthetic/big.py"]["truncated"] is True
+    assert "kept" in by_path["/synthetic/small.py"]["unified_diff"]
+    assert by_path["/synthetic/small.py"]["truncated"] is False
+    # Cut at a line boundary, never mid-line, so what is shown still parses.
+    assert by_path["/synthetic/big.py"]["unified_diff"].endswith("\n")
+
+
+def test_s3_patch_list_shape_unchanged():
+    # The existing list branch keeps its diff bytes and gains only `diff_source`.
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": [{"path": "/synthetic/a.py", "status": "update",
+                            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"}]}
+    card = kern.decode_patch_event_card(payload)
+    assert card["files"][0]["unified_diff"].endswith("-old\n+new\n")
+    assert card["files"][0]["diff_source"] == "retained"
+
+
+def test_s3_patch_dict_entry_that_is_not_an_object_degrades_without_a_partial_card():
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": {"/synthetic/weird.py": ["not", "an", "object"]}}
+    card = kern.decode_patch_event_card(payload)
+    entry = card["files"][0]
+    assert entry["path"] == "/synthetic/weird.py"
+    assert "unified_diff" not in entry
+    assert entry["raw"].startswith("[")
+    assert card["has_diff"] is False
+
+
+def test_s3_a_clip_that_keeps_no_diff_body_publishes_no_unified_diff():
+    """Spec section 3.1: `has_diff` means a diff is RENDERABLE.
+
+    A minified single-line file is one physical line, so a clip at a line
+    boundary keeps the `---`/`+++`/`@@` headers and nothing else — or, when the
+    first line is already longer than the share, nothing at all. Either way the
+    client receives a `unified_diff` it cannot render while `has_diff` says it
+    can. The key is omitted instead; `truncated` and `diff_source` stay, so the
+    reader is told the diff exists and was cut rather than told nothing.
+    """
+    # A one-line ~20,000-character delete: the whole file body is a single line.
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "", "stderr": "",
+               "changes": {"/synthetic/min.js": {"type": "delete",
+                                                 "content": "x" * 20000}}}
+    card = kern.decode_patch_event_card(payload)
+    entry = card["files"][0]
+    assert "unified_diff" not in entry, entry.get("unified_diff", "")[:120]
+    assert entry["truncated"] is True
+    assert entry["diff_source"] == "derived"
+    assert card["has_diff"] is False
+
+    # The same defect on the RETAINED side: a provider diff for a minified file
+    # is a hunk header plus two enormous lines, so the clip keeps the header.
+    retained = {"type": "patch_apply_end", "status": "completed", "success": True,
+                "stdout": "", "stderr": "",
+                "changes": {"/synthetic/min.js": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-" + "x" * 20000
+                                    + "\n+" + "y" * 20000 + "\n"}}}
+    card = kern.decode_patch_event_card(retained)
+    entry = card["files"][0]
+    assert "unified_diff" not in entry, entry.get("unified_diff", "")[:120]
+    assert entry["truncated"] is True
+    assert entry["diff_source"] == "retained"
+    assert card["has_diff"] is False
+
+
+def test_s3_every_patch_file_entry_carries_its_own_truncated_flag():
+    """Spec section 3.1 requires per-file `truncated` on EVERY file entry.
+
+    It reached only dict-branch entries that carried a diff, so a client would
+    have had to treat absent as false — and the two branches disagreed with each
+    other about whether the field existed at all.
+    """
+    dict_payload = {
+        "type": "patch_apply_end", "status": "completed", "success": True,
+        "stdout": "", "stderr": "",
+        "changes": {
+            "/synthetic/a.py": {"type": "update",
+                                "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"},
+            "/synthetic/b.py": {"type": "update"},        # no diff at all
+            "/synthetic/c.py": ["not", "an", "object"]}}  # the raw entry
+    card = kern.decode_patch_event_card(dict_payload)
+    assert [entry.get("truncated") for entry in card["files"]] == [
+        False, False, False]
+
+    list_payload = {
+        "type": "patch_apply_end", "status": "completed", "success": True,
+        "stdout": "", "stderr": "",
+        "changes": [{"path": "/synthetic/a.py", "status": "update",
+                     "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"},
+                    {"path": "/synthetic/b.py", "status": "update"},
+                    ["not", "an", "object"]]}
+    served = kern.decode_patch_event_card(list_payload)
+    assert [entry.get("truncated") for entry in served["files"]] == [
+        False, False, False]
+    # STORED stays byte-identical. Per-file `truncated` is read-time only for the
+    # same reason `diff_source` is: `detail_json` bytes feed `_row_source_bytes`
+    # and therefore the page boundary (spec section 3.0).
+    stored = kern.decode_patch_event_card(list_payload, for_storage=True)
+    assert all("truncated" not in entry for entry in stored["files"])
+
+
+def test_s3_the_synthesized_diff_header_names_the_providers_path(monkeypatch):
+    """Spec section 3.1, and the rule the patch card family exists for.
+
+    `entry["path"]` is what the shared budget kept; naming THAT in the
+    `---`/`+++` header would make the one card family whose purpose is
+    provider-truthfulness assert a file that does not exist. The unclipped path
+    goes into the header and the shared allocation clips the result, exactly as
+    `_allocate_diff_budget` already does for a retained diff.
+    """
+    seen: list[str] = []
+    real = kern._synthesized_unified_diff
+
+    def spy(path, kind, content):
+        seen.append(path)
+        return real(path, kind, content)
+
+    monkeypatch.setattr(kern, "_synthesized_unified_diff", spy)
+    path = "/synthetic/" + "d" * 400 + "/deep.py"
+    payload = {"type": "patch_apply_end", "status": "completed", "success": True,
+               "stdout": "s" * 15900, "stderr": "",
+               "changes": {path: {"type": "add", "content": "one\n"}}}
+    card = kern.decode_patch_event_card(payload)
+    # Non-vacuity: the budget really did clip the published path, which is the
+    # only condition under which the two could differ.
+    assert card["files"][0]["path"] != path
+    assert seen == [path]
+
+
+def test_s3_extract_stores_the_frozen_patch_card(tmp_path, monkeypatch):
+    """Spec section 3.0 again, for the branch that grows the card the most.
+
+    A dict-shaped `patch_apply_end` averages 3,812 characters of `add` content
+    and 20,859 of `delete` content per entry. Persisting the decoded per-file
+    diffs would be the single largest `detail_json` growth in S3, and it would
+    move `PAGE_SOURCE_BYTE_BUDGET` boundaries for newly ingested rows only.
+    """
+    records = _codex_turn_records([]) + [{
+        "timestamp": "2026-07-14T12:30:00Z", "type": "event_msg",
+        "payload": {
+            "type": "patch_apply_end", "status": "completed", "success": True,
+            "stdout": "", "stderr": "", "turn_id": "turn-a",
+            "call_id": "s3-frozen-patch",
+            "changes": {"/synthetic/f.py": {"type": "add", "content": "one\ntwo\n"}}}}]
+    stored, conn, _ck = _s3_stored_detail(tmp_path, monkeypatch, records)
+    try:
+        card = json.loads(stored[("s3-frozen-patch", "event")])["card"]
+    finally:
+        conn.close()
+    assert card["has_diff"] is False
+    assert card["files"] == [{"raw": '{"/synthetic/f.py":{"content":"one\\ntwo\\n",'
+                                     '"type":"add"}}'}]
+
+
+# --- #463 S3 remediation B1: the call side decodes the envelope it retains ---
+#
+# The call-side card held the complete `*** Begin Patch` envelope in `patch`,
+# named each file and its status, and then published a file LIST with no diffs —
+# so the reader was shown `1 file · 0 diffs` and "no diff retained" over a card
+# that was holding the whole patch. The event side already renders full diffs for
+# the sibling `patch_apply_end`, so the two patch surfaces contradicted each
+# other on the same conversation.
+
+_S3_CALL_PATCH = (
+    "*** Begin Patch\n"
+    "*** Update File: synthetic-legible.txt\n"
+    "@@\n"
+    "-old\n"
+    "+new\n"
+    "*** Add File: synthetic-added.txt\n"
+    "+one\n"
+    "+two\n"
+    "*** Delete File: synthetic-gone.txt\n"
+    "*** End Patch"
+)
+
+
+def _s3_call_patch_card(patch: str = _S3_CALL_PATCH, **kwargs):
+    payload = {"type": "custom_tool_call", "name": "apply_patch",
+               "status": "completed", "input": patch}
+    return kern.decode_tool_call_card(payload, **kwargs)
+
+
+def test_s3_call_side_patch_decodes_its_retained_envelope_into_per_file_diffs():
+    card = _s3_call_patch_card()
+    by_path = {entry["path"]: entry for entry in card["files"]}
+    # No `has_diff` on this side: the call card publishes no such key and the
+    # client derives renderability from the entries themselves.
+    assert "has_diff" not in card
+    assert any(entry.get("unified_diff") for entry in card["files"])
+    # An UPDATE section carries the provider's own body rows. The offsets are
+    # relative because the V4A envelope states none, which is the same contract
+    # the edit-diff card has always rendered under.
+    assert by_path["synthetic-legible.txt"]["unified_diff"] == (
+        "--- synthetic-legible.txt\n+++ synthetic-legible.txt\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n")
+    # An ADD section produces the SAME bytes the event side synthesizes from
+    # retained `content`, so one patch does not read two ways.
+    assert by_path["synthetic-added.txt"]["unified_diff"] == (
+        "--- /dev/null\n+++ synthetic-added.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n")
+    # Every entry states its provenance and its own truncation.
+    for entry in (by_path["synthetic-legible.txt"], by_path["synthetic-added.txt"]):
+        assert entry["diff_source"] == "derived"
+        assert entry["truncated"] is False
+    # A V4A delete names the file and carries no body at all, so the card claims
+    # no diff — and says only that, rather than "no diff retained".
+    gone = by_path["synthetic-gone.txt"]
+    assert "unified_diff" not in gone and "diff_source" not in gone
+    assert gone["truncated"] is False
+    # The raw envelope is still published for the payload disclosure.
+    assert card["patch"] == _S3_CALL_PATCH
+
+
+def test_s3_call_side_patch_diffs_are_read_time_only():
+    """Spec section 3.0 — `detail_json` bytes feed page boundaries."""
+    stored = _s3_call_patch_card(for_storage=True)
+    assert stored["files"] == [
+        {"path": "synthetic-legible.txt", "status": "modified"},
+        {"path": "synthetic-added.txt", "status": "added"},
+        {"path": "synthetic-gone.txt", "status": "deleted"},
+    ]
+    assert stored["patch"] == _S3_CALL_PATCH
+
+
+def test_s3_call_side_patch_carries_a_move_and_numbers_hunks_in_sequence():
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: synthetic-old.txt\n"
+        "*** Move to: synthetic-new.txt\n"
+        "@@\n"
+        " keep\n"
+        "-a\n"
+        "+b\n"
+        "@@\n"
+        " also\n"
+        "+c\n"
+        "*** End Patch"
+    )
+    entry = _s3_call_patch_card(patch)["files"][0]
+    assert entry["move_path"] == "synthetic-new.txt"
+    # The second hunk continues the running count rather than restarting at 1,
+    # so two hunks of one file do not render the same gutter numbers twice.
+    assert entry["unified_diff"] == (
+        "--- synthetic-old.txt\n+++ synthetic-new.txt\n"
+        "@@ -1,2 +1,2 @@\n keep\n-a\n+b\n"
+        "@@ -3,1 +3,2 @@\n also\n+c\n")
+
+
+def test_s3_call_side_patch_diff_is_clipped_within_the_shared_budget():
+    """The derived diffs are an ALLOCATION of the card's one text budget.
+
+    They are taken before the raw `patch`, because `patch` is the payload
+    disclosure's copy and the reader never renders it, while the diffs are the
+    only thing on the card a reader can actually read.
+    """
+    body = "".join(f"+line {i}\n" for i in range(4000))
+    patch = f"*** Begin Patch\n*** Add File: synthetic-huge.txt\n{body}*** End Patch"
+    card = _s3_call_patch_card(patch)
+    entry = card["files"][0]
+    assert entry["truncated"] is True
+    assert entry["diff_source"] == "derived"
+    # Clipped at a line boundary, so what survived still parses as a hunk.
+    assert entry["unified_diff"].endswith("\n")
+    assert card["truncated"] is True
+    assert len(json.dumps(card)) < 2 * kern.CODEX_TEXT_CAP
+
+
+# --- #463 S3 Task 4: the program card and the function_call families ---------
+
+
+def test_s3_wholly_recognised_exec_still_produces_a_terminal_card():
+    """The 19,960 calls that already decode must be byte-unchanged."""
+    supported = ('const r = await tools.exec_command({cmd: "printf ok", '
+                 'workdir: "/synthetic", yield_time_ms: 10000}); text(r.output);')
+    card = kern.decode_tool_call_card(
+        {"type": "custom_tool_call", "name": "exec", "status": "completed",
+         "input": supported})
+    assert card["type"] == "terminal"
+    assert card["commands"][0]["command"] == "printf ok"
+    # No `complete` key: the terminal card's bytes do not move.
+    assert "complete" not in card
+
+
+def test_s3_mixed_program_produces_a_program_card():
+    source = ('const names = ALL_TOOLS.filter(x => x.name);\n'
+              'const r = await tools.exec_command({cmd: "ls"});\n'
+              'const w = await tools.write_stdin({session_id: 7, chars: "y"});\n')
+    card = kern.decode_tool_call_card(
+        {"type": "custom_tool_call", "name": "exec", "status": "completed",
+         "input": source})
+    assert card["type"] == "program" and card["complete"] is False
+    kinds = [i["kind"] for i in card["invocations"]]
+    assert kinds == ["command", "session"]
+    assert card["invocations"][1]["ref"] == "7"
+    assert card["invocations"][1]["operation"] == "write"
+    assert card["invocations"][1]["scope"] == "shell"
+
+
+def test_s3_function_call_families():
+    assert kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "exec_command",
+         "arguments": '{"cmd": "ls", "workdir": "/synthetic", "tty": true}'}
+    )["type"] == "terminal"
+    sess = kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "write_stdin",
+         "arguments": '{"session_id": 7, "chars": "hello"}'})
+    assert sess["type"] == "session_ref" and sess["scope"] == "shell"
+    assert sess["operation"] == "write" and sess["chars"] == "hello"
+    cell = kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "wait", "arguments": '{"cell_id": "12"}'})
+    assert cell["scope"] == "cell" and cell["operation"] == "poll"
+    js = kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "js",
+         "arguments": '{"code": "const r = await tools.exec_command({cmd: \\"ls\\"});",'
+                      ' "title": "list files"}'})
+    assert js["type"] == "program" and js["title"] == "list files"
+    ts = kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "tool_search_call",
+         "arguments": '{"query": "github", "limit": 5}'})
+    assert ts["type"] == "tool_search" and ts["query"] == "github"
+
+
+def test_s3_unknown_family_still_refuses():
+    assert kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "totally_unknown",
+         "arguments": '{"x": 1}'}) is None
+
+
+def test_s3_exec_command_maps_onto_the_existing_terminal_card():
+    """Spec section 3.2: no new type, and `BashCard` renders it unchanged."""
+    card = kern.decode_secondary_tool_call_card(
+        {"type": "function_call", "name": "exec_command", "status": "completed",
+         "arguments": '{"cmd": "ls -1", "workdir": "/synthetic", "tty": true,'
+                      ' "yield_time_ms": 5000, "unknown_key": "dropped"}'})
+    assert card["commands"] == [{
+        "command": "ls -1", "workdir": "/synthetic",
+        "metadata": {"tty": True, "yield_time_ms": 5000}}]
+    assert card["status"] == "completed"
+
+
+def test_s3_a_program_whose_arguments_the_literal_parser_declines_is_an_other():
+    """Spec section 3.3: an entry the parser located but could not read.
+
+    The card degrades that ENTRY rather than failing, because the invocation was
+    genuinely located; what it must never do is claim to know arguments it could
+    not read.
+    """
+    source = ('doSomethingElse();\n'
+              'const r = await tools.exec_command({cmd: process.env.SECRET});\n')
+    card = kern.decode_tool_call_card(
+        {"type": "custom_tool_call", "name": "exec", "status": "completed",
+         "input": source})
+    assert card["type"] == "program"
+    assert card["invocations"] == [{"kind": "other", "name": "exec_command"}]
+
+
+def test_s3_a_program_the_scanner_cannot_lex_produces_no_card():
+    for source in ['evil(); const r = await tools.exec_command({cmd: "ls"}); /* open',
+                   'evil(); const s = "unterminated']:
+        assert kern.decode_tool_call_card(
+            {"type": "custom_tool_call", "name": "exec", "status": "completed",
+             "input": source}) is None, source
+
+
+def test_s3_a_program_past_the_invocation_cap_is_truncated_not_dropped():
+    source = "evil();\n" + "".join(
+        f'await tools.wait({{cell_id: {i}}});\n' for i in range(12))
+    card = kern.decode_tool_call_card(
+        {"type": "custom_tool_call", "name": "exec", "status": "completed",
+         "input": source})
+    assert card["type"] == "program"
+    assert len(card["invocations"]) == kern._CARD_MAX_COMMANDS
+    assert card["truncated"] is True
+
+
+def test_s3_extract_stores_no_card_for_the_new_families(tmp_path, monkeypatch):
+    """Spec section 3.0, for the branch that reaches the most rows.
+
+    34,935 uncarded calls gain a card at read time. Persisting them would grow
+    `detail_json` on more rows than any other S3 change.
+    """
+    records = _codex_turn_records([
+        {"call_id": "s3-stdin", "name": "write_stdin", "type": "function_call",
+         "arguments": '{"session_id": 70001, "chars": "yes\\n"}',
+         "status": "completed"},
+        {"call_id": "s3-prog", "name": "exec", "type": "custom_tool_call",
+         "status": "completed",
+         "input": ('evil();\nconst r = await tools.exec_command({cmd: "ls"});\n')},
+    ])
+    stored, conn, ck = _s3_stored_detail(tmp_path, monkeypatch, records)
+    try:
+        detail = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    assert "card" not in json.loads(stored[("s3-stdin", "tool_call")])
+    assert "card" not in json.loads(stored[("s3-prog", "tool_call")])
+    # And the READ path does produce them, so the two facts are asserted about
+    # the same rows rather than about a store that decoded nothing at all.
+    served = {block["call_id"]: block for item in detail["items"]
+              for block in item["blocks"] if block.get("call_id")}
+    assert served["s3-stdin"]["detail"]["card"]["type"] == "session_ref"
+    assert served["s3-prog"]["detail"]["card"]["type"] == "program"
+
+
+# --- #463 S3 Task 5: the session index and the external-agent marker ---------
+
+
+def _s3_tool_legibility_detail(tmp_path, monkeypatch):
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["tool-legibility"])
+    conn = ns["open_cache_db"]()
+    ns["sync_codex_cache"](conn)
+    return conn, _single_ck(conn)
+
+
+def test_s3_session_index_binds_openers_and_assigns_stable_ordinals(
+    tmp_path, monkeypatch,
+):
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _detail_of(conn, ck, tail=True, limit=500)
+    finally:
+        conn.close()
+    idx = body["session_index"]
+    assert idx["truncated"] is False
+    # Three synthetic sessions: one announced by a separate `exec_command`, one
+    # nothing announced at all, and one announced by its own `write_stdin` row.
+    ordinals = sorted(s["ordinal"] for s in idx["sessions"].values())
+    assert ordinals == [1, 2, 3]
+    by_ordinal = {s["ordinal"]: s for s in idx["sessions"].values()}
+    assert by_ordinal[2]["opener_block_key"] is None
+    blocks = {b.get("block_key"): b for item in body["items"] for b in item["blocks"]}
+    # The opener is the CALL that opened the session, not the output row that
+    # announced it — the output folds into the call and has no block of its own.
+    for ordinal, tool in ((1, "exec_command"), (3, "write_stdin")):
+        opener_key = by_ordinal[ordinal]["opener_block_key"]
+        assert opener_key.startswith("cbk1_")
+        assert blocks[opener_key]["detail"]["name"] == tool
+    # Ordinal 3's opener is its OWN row, which is what makes the "started this
+    # session" state reachable on a `session_ref` card at all — the 80.2%
+    # production case binds it to an `exec_command`, whose `terminal` card does
+    # not render the note.
+    assert blocks[by_ordinal[3]["opener_block_key"]]["call_id"] == "s3-fc-stdin-c"
+
+
+# Every provider session id the tool-legibility rollout holds. Named once so a
+# new session added to the fixture cannot quietly escape the leak assertions.
+_S3_PROVIDER_SESSION_IDS = ("70001", "70002", "70003", "70004")
+
+
+def test_s3_no_raw_session_id_reaches_any_card_or_the_index(tmp_path, monkeypatch):
+    """Spec section 4.3 and 6.5.
+
+    The reader sees a conversation-local ordinal, never the provider's own
+    session id, because these are short integers that cannot be scrubbed without
+    corrupting arbitrary text. So the token is REMOVED rather than scrubbed, and
+    `build_anon_plan_for_sources` needs no new source.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _detail_of(conn, ck, tail=True, limit=500)
+        stdin_block = next(b for item in body["items"] for b in item["blocks"]
+                           if b.get("call_id") == "s3-fc-stdin-a")
+        readback = q.read_codex_payload(
+            conn, ck, stdin_block["block_key"], "call")
+    finally:
+        conn.close()
+    cards = [(b.get("detail") or {}).get("card")
+             for item in body["items"] for b in item["blocks"]]
+    cards += [((b.get("output") or {}).get("detail") or {}).get("card")
+              for item in body["items"] for b in item["blocks"]]
+    for card in cards:
+        if card is None:
+            continue
+        for token in _S3_PROVIDER_SESSION_IDS:
+            assert token not in json.dumps(card), (token, card)
+    for token in _S3_PROVIDER_SESSION_IDS:
+        assert token not in json.dumps(body["session_index"]), token
+
+    # The READBACK route serves the same card family and must publish the same
+    # ordinal. Without this the field's meaning differed by route — the paged
+    # detail carried the conversation-local ordinal while
+    # `GET /api/conversation/<key>/payload` carried the provider's own id — and a
+    # client validator written against the ordinal meaning would be wrong for one
+    # of the two (spec sections 4.3 and 6.5).
+    assert readback["status"] == "ok"
+    assert readback["card"]["type"] == "session_ref"
+    assert readback["card"]["ref"] == "1"
+    assert "70001" not in json.dumps(readback["card"]), readback["card"]
+
+    # The boundary, asserted rather than left implicit: the PRE-EXISTING generic
+    # disclosure still shows the provider's own arguments verbatim, exactly as it
+    # does for every uncarded call today. S3 does not change `detail.args`, and
+    # it could not — `args` is stored at ingest, so rewriting it would break the
+    # read-time-only rule of spec section 3.0. The same is true of the raw
+    # payload the readback route exists to serve.
+    stdin_call = next(b for item in body["items"] for b in item["blocks"]
+                      if (b.get("detail") or {}).get("name") == "write_stdin")
+    assert "70001" in stdin_call["detail"]["args"]
+    assert "70001" in readback["content"]
+
+
+def test_s3_session_ref_and_program_refs_carry_the_ordinal(tmp_path, monkeypatch):
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _detail_of(conn, ck, tail=True, limit=500)
+    finally:
+        conn.close()
+    by_call = {b.get("call_id"): b for item in body["items"]
+               for b in item["blocks"] if b.get("call_id")}
+    assert by_call["s3-fc-stdin-a"]["detail"]["card"]["ref"] == "1"
+    assert by_call["s3-fc-stdin-b"]["detail"]["card"]["ref"] == "2"
+    # A cell reference is published as given and is never a shell session.
+    wait_card = by_call["s3-fc-wait"]["detail"]["card"]
+    assert wait_card["scope"] == "cell" and wait_card["ref"] == "12"
+    # The program's own session invocation is rewritten the same way.
+    program = by_call["s3-exec-program"]["detail"]["card"]
+    session = next(i for i in program["invocations"] if i["kind"] == "session")
+    assert session["ref"] == "1"
+
+
+def test_s3_external_agent_marker_detected_at_read_time(tmp_path, monkeypatch):
+    """The fixture row's stored detail has no `external_call`; detection is
+    read-time, which is the only way it can reach the 3,789 historical markers."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        stored = [row[0] for row in conn.execute(
+            "SELECT detail_json FROM codex_conversation_messages "
+            "WHERE conversation_key = ? AND kind = 'assistant'", (ck,))]
+        body = _detail_of(conn, ck, tail=True, limit=500)
+    finally:
+        conn.close()
+    assert all("external_call" not in (row or "") for row in stored)
+    blocks = [b for item in body["items"] for b in item["blocks"]]
+    marker = [b for b in blocks if (b.get("detail") or {}).get("external_call")]
+    assert len(marker) == 1, "exactly the one real marker, not the fenced lookalike"
+    call = marker[0]["detail"]["external_call"]
+    assert call["name"] == "ToolSearch"
+    assert call["input"]["query"].startswith("select:")
+    # NEVER `markers`: that key selects which rows the export path hydrates.
+    assert "markers" not in marker[0]["detail"]
+    # The span resolves against the SERVED text, which is what lets the client
+    # hide the prose the card already renders instead of showing it twice.
+    served_text = marker[0]["text"]
+    start, end = call["span"]
+    assert served_text[start:end].startswith("[external_agent_tool_call: ToolSearch]\n")
+    assert served_text[start:end].rstrip("\n").endswith("}")
+    assert kern.external_call_span_resolves(served_text, call) is True
+
+
+def test_s3_external_agent_marker_negative_cases():
+    for text in ["[external_agent_tool_call: X]\nno input line",
+                 "[external_agent_tool_call: X]\ninput: {not json",
+                 "```\n[external_agent_tool_call: X]\ninput: {}\n```",
+                 "prefix [external_agent_tool_call: X]\ninput: {}",
+                 "[external_agent_tool_call: " + "n" * 129 + "]\ninput: {}",
+                 "[external_agent_tool_call: ]\ninput: {}",
+                 "nothing here at all"]:
+        assert kern._external_call_from_text(text) is None, text
+
+
+def test_s3_external_agent_marker_positive_shape():
+    card = kern._external_call_from_text(
+        'Delegating.\n\n[external_agent_tool_call: ToolSearch]\n'
+        'input: {"query": "select:Alpha", "max_results": 5}')
+    assert card["schema_version"] == 1
+    assert card["name"] == "ToolSearch"
+    assert card["input"] == {"query": "select:Alpha", "max_results": 5}
+    assert card["truncated"] is False
+
+
+def test_s3_external_call_publishes_the_span_it_consumed():
+    """Spec section 5.5 renders the marker as structure rather than prose.
+
+    The full `[external_agent_tool_call: …]` / `input: …` run stays in the
+    served `text`, because the export keeps it verbatim and the export bytes are
+    frozen. Without the span the client cannot locate it, so the viewer would
+    show the marker twice — once as a card and once as the raw prose behind it.
+    """
+    text = ('Delegating.\n\n[external_agent_tool_call: ToolSearch]\n'
+            'input: {"query": "select:Alpha"}\nand then some prose.\n')
+    card = kern._external_call_from_text(text)
+    start, end = card["span"]
+    assert text[start:end] == ('[external_agent_tool_call: ToolSearch]\n'
+                               'input: {"query": "select:Alpha"}\n')
+    # Removing the span leaves exactly the prose either side of it, with no
+    # orphaned blank line where the marker was.
+    assert text[:start] + text[end:] == "Delegating.\n\nand then some prose.\n"
+
+
+def test_s3_external_call_span_ends_at_the_json_when_no_newline_follows():
+    text = '[external_agent_tool_call: X]\ninput: {"a": 1}'
+    card = kern._external_call_from_text(text)
+    assert card["span"] == [0, len(text)]
+
+
+def test_s3_external_call_fails_closed_when_clipping_truncates_the_marker():
+    """Every strict prefix of a marker must produce no card at all.
+
+    The row's `text` is capped at ingest, so a marker straddling the cap arrives
+    clipped. A span published against a marker the served text does not wholly
+    contain would not resolve, so the card is withheld instead.
+    """
+    full = ('[external_agent_tool_call: ToolSearch]\n'
+            'input: {"query": "select:Alpha", "max_results": 5}')
+    for cut in range(1, len(full)):
+        assert kern._external_call_from_text(full[:cut]) is None, full[:cut]
+    assert kern._external_call_from_text(full) is not None
+
+
+def test_s3_external_call_span_guard_rejects_a_span_that_does_not_resolve():
+    """The guard is what makes the fail-closed rule enforceable at the seam.
+
+    The assembler publishes the card only when its span resolves inside the very
+    string it is about to serve as `block["text"]`.
+    """
+    text = '[external_agent_tool_call: ToolSearch]\ninput: {}\n'
+    card = kern._external_call_from_text(text)
+    assert kern.external_call_span_resolves(text, card) is True
+    assert kern.external_call_span_resolves("much shorter", card) is False
+    assert kern.external_call_span_resolves(text, dict(card, span=[0, 0])) is False
+    assert kern.external_call_span_resolves(text, dict(card, span=[5, 9])) is False
+    assert kern.external_call_span_resolves(text, dict(card, span=[-1, 4])) is False
+    assert kern.external_call_span_resolves(text, dict(card, span="0,4")) is False
+    assert kern.external_call_span_resolves(text, {"name": "X"}) is False
+
+
+# The read-time keys the SERVED envelope must carry. This is the positive
+# control for the property below: it proves the store under test really does
+# enrich at read time, so the property is asserted about a live read path rather
+# than about a store that decodes nothing at all.
+_S3_READ_TIME_KEYS_ON_THE_WIRE = (
+    '"exit_code"', '"wall_time_seconds"', '"diff_source"', '"external_call"',
+    '"invocations"', '"session_ref"', '"tool_search"', '"program"',
+    '"complete"', '"session_index"', '"span"',
+)
+
+
+def _storage_card_for(record_json):
+    """The card `_extract` persists for one physical record.
+
+    ``record_json`` is the retained `codex_conversation_events.payload_json`,
+    which holds the WHOLE canonical record — the same bytes
+    `_reread_codex_full_content` validates against — so the record type and the
+    inner payload are read from it exactly as the re-read path reads them.
+
+    The SAME decoders `_extract` calls, with `for_storage=True` — which is what
+    the one-off byte comparison actually measured. A key list cannot state that
+    property: it has to anticipate every future read-time key, and it was already
+    wrong about `unified_diff`, which the list branch genuinely stores
+    (`bin/_lib_codex_conversation.py` sets it unconditionally; only `diff_source`
+    is gated). The list only passed because the scenario's patch event happens to
+    be dict-shaped.
+    """
+    record = json.loads(record_json)
+    record_type = record.get("type") or record.get("record_type")
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    ptype = payload.get("type")
+    if record_type == "response_item":
+        if ptype in kern._RESPONSE_TOOL_CALLS:
+            return (kern.decode_tool_call_card(payload, for_storage=True)
+                    or kern.decode_secondary_tool_call_card(
+                        payload, for_storage=True))
+        if ptype in kern._RESPONSE_TOOL_OUTPUTS:
+            shaped = kern.decode_tool_output_card(payload, for_storage=True)
+            return shaped[0] if shaped is not None else None
+        return None
+    if record_type == "event_msg" and ptype in kern._EVENT_CARD_TYPES:
+        return (kern.decode_patch_event_card(payload, for_storage=True)
+                or kern.decode_secondary_event_card(payload))
+    return None
+
+
+def test_s3_no_read_time_enrichment_is_ever_persisted(tmp_path, monkeypatch):
+    """Spec section 3.0, as a standing guard rather than a one-off measurement.
+
+    The one-off measurement that established this ingested the whole 40-rollout
+    parity corpus under the pre-S3 binary and under this one and compared every
+    row's `content_len`, `detail_json` byte length and `source_bytes`: 240 rows,
+    all identical. It caught a real defect — `diff_source` was reaching the
+    stored list-branch card — which is why this cheaper standing form exists.
+
+    The standing form asserts the PROPERTY rather than a list of key names: every
+    stored card equals the card the same decoder produces from that row's own
+    payload with `for_storage=True`. A read-time key that no list anticipated is
+    caught by construction.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        rows = conn.execute(
+            "SELECT m.kind, m.detail_json, e.record_type, e.payload_json "
+            "FROM codex_conversation_messages AS m "
+            "JOIN codex_conversation_events AS e "
+            "  ON e.source_path = m.source_path "
+            " AND e.line_offset = m.line_offset "
+            "WHERE m.conversation_key = ? "
+            "ORDER BY m.source_path, m.line_offset", (ck,)).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages "
+            "WHERE conversation_key = ?", (ck,)).fetchone()[0]
+        body = _detail_of(conn, ck, tail=True, limit=500)
+    finally:
+        conn.close()
+    assert rows and len(rows) == total, "every row must carry its payload"
+    carded = 0
+    for kind, detail_json, record_type, payload_json in rows:
+        stored = json.loads(detail_json) if detail_json else {}
+        expected = _storage_card_for(payload_json)
+        assert stored.get("card") == expected, (kind, record_type)
+        carded += expected is not None
+    assert carded >= 5, "non-vacuity: the fixture must carry stored cards"
+    # And the SERVED envelope does carry the read-time keys, so the property
+    # above is about a store whose read path really does enrich.
+    served = json.dumps(body)
+    for key in _S3_READ_TIME_KEYS_ON_THE_WIRE:
+        assert key in served, key
+
+
+# ── #463 S4 Task 2 — the enumerated failed-call classification (spec §6.4) ────
+
+
+def test_classify_tool_failure_enumerates_every_disjunct():
+    """One explicitly enumerated server definition of a failed call.
+
+    Spec §6.4 takes CORRECTNESS OVER BUG-COMPATIBILITY here. The client's
+    `OUTCOME_STATUSES` excludes `'error'`, so a card carrying `status: "error"`
+    on a call whose call-side card is not `terminal` collapses to `'unknown'`
+    and is not flagged client-side, while the server's own
+    `decode_tool_output_card` already sets `is_error` for
+    `status in {"failed", "error"}`. Reproducing the client exactly would have
+    frozen that gap, so this test pins the server's definition and Task 9 brings
+    the client to it.
+    """
+    from _lib_codex_landmarks import classify_tool_failure
+
+    assert classify_tool_failure({"terminal_output": {"is_error": True}}) is True
+    assert classify_tool_failure({"patch": {"success": False}}) is True
+    assert classify_tool_failure({"patch": {"status": "failed"}}) is True
+    assert classify_tool_failure({"web": {"completion": {"status": "error"}}}) is True
+    assert classify_tool_failure({"mcp": {"completion": {"status": "error"}}}) is True
+    # status "error" IS a failure — §6.4 takes correctness over client bug-compat
+    assert classify_tool_failure({"terminal_output": {"status": "error"}}) is True
+    # running and unknown are NOT failures
+    assert classify_tool_failure({"terminal_output": {"status": "running"}}) is False
+    assert classify_tool_failure({"terminal_output": {"status": "unknown"}}) is False
+
+
+def _outline_derivation(conn, ck):
+    """The wide read the outline performs, and the scoped pass over its positions."""
+    rows = q._load_conversation_rows(conn, ck)
+    return rows, q._derive_outline_events(conn, ck, rows)
+
+
+def _positions_of_kind(rows, kind):
+    return {(row.source_path, row.line_offset) for row in rows if row.kind == kind}
+
+
+class _EventRowCounter:
+    """A connection facade counting the PAYLOAD rows a query really pulls back.
+
+    Only the fetched-row count can observe the scope of the payload pass; see
+    ``test_derive_outline_events_reads_only_the_scoped_positions``. Returning a
+    materialized list rather than the cursor is safe because every caller here
+    iterates the result exactly once.
+
+    Gated on ``payload_json`` rather than on the table name, because the S4
+    derivation cache's watermark read also names that table and deliberately
+    fetches NO payload: it is one covering-index aggregate. Counting its single
+    row would make the scope assertion off by one and would then be "fixed" by
+    loosening the assertion, which is the observation this class exists to keep
+    exact.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.event_rows = 0
+
+    def execute(self, sql, parameters=()):
+        cursor = self._conn.execute(sql, parameters)
+        if "codex_conversation_events" not in sql or "payload_json" not in sql:
+            return cursor
+        rows = list(cursor)
+        self.event_rows += len(rows)
+        return rows
+
+
+def test_derive_outline_events_finds_failures_the_stored_card_cannot(
+    tmp_path, monkeypatch,
+):
+    """Task 1 measured this against the real store and it is pinned here.
+
+    Over 63,150 production `tool_output` rows the STORED card's `is_error` is
+    True for 0 of them while the read-time decode finds 896, because the
+    provider sets `status` on an output record 80 times in 63,150 rows and never
+    to a failure value — the outcome is stated only in the harness preamble that
+    the read-time five-grammar parse consumes. So this is not a preference for
+    the more expensive read; the cheap one answers "did it fail" with silence.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        rows, derivation = _outline_derivation(conn, ck)
+        stored = {
+            (row.source_path, row.line_offset):
+                (q._parse_detail(row.detail_json) or {}).get("card") or {}
+            for row in rows if row.kind == "tool_output"
+        }
+    finally:
+        conn.close()
+
+    failing = derivation.failing_positions()
+    assert failing, "non-vacuity: the fixture must carry a failing output"
+    # Every failure the pass found is invisible in the stored projection.
+    for position in failing:
+        if position in stored:
+            assert stored[position].get("is_error") is False, position
+            assert stored[position].get("status") != "failed", position
+    # `running` is not a failure, and the fixture carries two of them.
+    outputs = _positions_of_kind(rows, "tool_output")
+    verdicts = {p: v for p, v in derivation.errors_by_position.items() if p in outputs}
+    assert len(verdicts) == len(outputs), "every output row must get a verdict"
+    assert sum(verdicts.values()) == 3, (
+        "the fixture's failing outputs are 'Script failed' on the mixed exec, "
+        "'Process exited with code 3' on a write_stdin, and the second "
+        "'Script failed' on the AMBIGUOUS-id turn (#463 S4 round 3)")
+
+
+def test_derive_outline_events_reads_only_the_scoped_positions(tmp_path, monkeypatch):
+    """The pass must not decode an event row no landmark can come from.
+
+    Asserted on the rows the pass really FETCHES, which is the only observation
+    that can see the regression. What the pass RECORDS cannot: it records a
+    verdict only for a position it was already asked about, so widening the
+    SELECT to every event row of the conversation — the exact `positions=None`
+    regression this test exists to prevent — leaves the recorded set unchanged
+    and any assertion over it green while the request decodes 92 MB of JSON.
+    Task 1 measured that figure on the heaviest production conversation, and
+    this route is refetched on every live-tail growth push.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        rows = q._load_conversation_rows(conn, ck)
+        counter = _EventRowCounter(conn)
+        derivation = q._derive_outline_events(counter, ck, rows)
+        every_event = {
+            (sp, lo) for sp, lo in conn.execute(
+                "SELECT source_path, line_offset FROM codex_conversation_events "
+                "WHERE conversation_key = ?", (ck,))}
+    finally:
+        conn.close()
+    touched = (set(derivation.errors_by_position)
+               | set(derivation.patch_files_by_position)
+               | set(derivation.headings_by_position))
+    in_scope = (_positions_of_kind(rows, "tool_output")
+                | _positions_of_kind(rows, "reasoning")
+                | {(row.source_path, row.line_offset) for row in rows
+                   if row.kind == "event"
+                   and row.event_type in q._S4_OUTCOME_EVENTS})
+    assert touched <= in_scope, sorted(touched - in_scope)
+    assert counter.event_rows == len(in_scope & every_event), (
+        f"the pass fetched {counter.event_rows} event rows for a scope of "
+        f"{len(in_scope & every_event)}")
+    # Non-vacuity: the conversation must hold event rows OUTSIDE the scope, or
+    # an unscoped read would fetch the same count as a scoped one.
+    assert len(every_event) > len(in_scope & every_event), (
+        "fixture carries no out-of-scope event row")
+
+
+def test_derive_outline_events_counts_diff_lines_from_the_unbounded_changes(
+    tmp_path, monkeypatch,
+):
+    """Spec §4.5 — counts come from the raw entry, never from a served card.
+
+    `decode_patch_event_card` shares one 16,000-character budget across stdout,
+    stderr and every file, so the clipped fixture file's card diff carries 43
+    added lines while its raw `content` carries 55. Counting off the card would
+    understate the change and would report nothing at all for a file whose diff
+    was wholly clipped.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        _rows, derivation = _outline_derivation(conn, ck)
+        payloads = q._load_row_payloads(conn, ck, set(derivation.patch_files_by_position))
+    finally:
+        conn.close()
+    touches = [t for entry in derivation.patch_files_by_position.values()
+               for t in entry]
+    clipped = next(t for t in touches if t["path"].endswith("a-generated-clipped.py"))
+    assert clipped == {"path": clipped["path"], "op": "add",
+                       "added": 55, "removed": 0}
+    # And the card a reader is served really is clipped, so the assertion above
+    # is not merely restating what the card would have said.
+    payload = next(iter(payloads.values()))[1]
+    card = kern.decode_patch_event_card(payload, for_storage=False)
+    card_file = next(f for f in card["files"]
+                     if f["path"].endswith("a-generated-clipped.py"))
+    assert card_file["truncated"] is True
+    card_added = sum(1 for line in card_file["unified_diff"].split("\n")
+                     if line.startswith("+") and not line.startswith("+++"))
+    assert card_added == 43 < clipped["added"]
+
+
+# A hunk whose content lines are indistinguishable from file headers by prefix.
+# `-- legacy comment` is a SQL comment, and removing it renders `--- legacy
+# comment`; removing the bare rule `--` renders `---`; adding `++i;` renders
+# `+++i;`. A `startswith("---")`/`startswith("+++")` header filter drops three
+# of these four real content lines.
+_HEADER_LOOKALIKE_DIFF = (
+    "--- a/schema.sql\n"
+    "+++ b/schema.sql\n"
+    "@@ -1,3 +1,3 @@\n"
+    "--- legacy comment\n"
+    "---\n"
+    " shared context\n"
+    "+++i;\n"
+    "+ok\n"
+)
+
+
+def test_patch_touch_counts_do_not_swallow_content_that_looks_like_a_header():
+    """Spec §4.5's undercount, arriving by a second route.
+
+    Counting inside `@@` hunks is immune to this: a `---`/`+++` file header can
+    only appear BEFORE a hunk opens, and the hunk header states exactly how many
+    old-side and new-side lines follow, so nothing inside one has to be
+    recognised by its prefix alone.
+    """
+    payload = {"type": "patch_apply_end", "changes": {
+        "/synthetic/root-a/project-red/schema.sql": {
+            "type": "update", "unified_diff": _HEADER_LOOKALIKE_DIFF}}}
+    assert landmarks.patch_file_touches(payload) == [{
+        "path": "/synthetic/root-a/project-red/schema.sql",
+        "op": "update", "added": 2, "removed": 2,
+    }]
+
+
+def test_patch_touch_counts_decline_rather_than_guess_without_a_hunk():
+    """An undetermined count is None, never 0, because 0 is a claim (§4.5).
+
+    A change entry with no diff and no content — a move-only update — cannot be
+    counted at all, and a `unified_diff` carrying no hunk header is not a unified
+    diff, so counting its `+`/`-` prefixed lines would be the same guess the
+    header filter above made.
+    """
+    payload = {"type": "patch_apply_end", "changes": {
+        "/synthetic/root-a/project-red/moved.py": {
+            "type": "update", "move_path": "/synthetic/root-a/project-red/new.py"},
+        "/synthetic/root-a/project-red/hunkless.py": {
+            "type": "update", "unified_diff": "+one\n-two\n"},
+    }}
+    touches = {t["path"].rsplit("/", 1)[-1]: t
+               for t in landmarks.patch_file_touches(payload)}
+    assert touches["moved.py"]["added"] is None
+    assert touches["moved.py"]["removed"] is None
+    assert touches["hunkless.py"]["added"] is None
+    assert touches["hunkless.py"]["removed"] is None
+
+
+def test_derive_outline_events_publishes_the_reader_routes_headings(
+    tmp_path, monkeypatch,
+):
+    """One decomposition rule, not two (spec §4.6).
+
+    The outline's heading texts must be exactly the texts the detail route
+    publishes for the same block, or the outline row and the reader heading would
+    be different sets and a jump could land on a heading the outline never
+    offered.
+    """
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        _rows, derivation = _outline_derivation(conn, ck)
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    served = [h["text"] for h in
+              _first_reasoning_block(page)["detail"]["reasoning"]["headings"]]
+    assert served, "non-vacuity: the fixture must publish headings"
+    assert list(derivation.headings_by_position.values())[0] == served
+
+
+def test_fold_owner_attributes_a_failing_output_to_its_tool_call(
+    tmp_path, monkeypatch,
+):
+    """§4.1's attribution plumbing, end to end on a real store.
+
+    `_fold_groups_for_item` computes the membership payload-free and
+    `_build_segment_index` discarded it, so nothing could say WHICH call a
+    failing output belongs to. A `tool_error` landmark anchors on the call, so
+    for an output whose `call_id` has exactly ONE owning `tool_call` in the turn
+    the answer has to be that call and not the output itself.
+
+    #463 S4 remediation round 3 — and the OTHER branch, which this test asserted
+    away until the corpus grew a turn that reaches it. An output whose `call_id`
+    is owned by two or more calls belongs to no one of them, so it opens no
+    group, becomes its own head, and `_outline_failing_calls` charges the failure
+    to the output's own position. That is not a degradation: it is what gives the
+    unfolded output its own `tool_error` landmark, and `_landmark_label` names
+    that branch as reachable. Both shapes are required below, so neither can be
+    lost to a later fixture change without failing here.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        rows, derivation = _outline_derivation(conn, ck)
+        detail_bytes = q._detail_bytes_of(rows)
+        kept, _suppressed = kern.pair_mirrors(rows)
+        items = kern.canonical_items(kept)
+        groups = []
+        for entry in q._build_segment_index(
+                ck, items, detail_bytes, segmented=True, fold_groups=True):
+            groups.extend(entry["_fold_groups"])
+    finally:
+        conn.close()
+    owners = landmarks.fold_owner_by_position(groups)
+    kind_at = {(row.source_path, row.line_offset): row.kind for row in rows}
+    # Round 4 — scope the oracle the way production scopes it.
+    # `_build_segment_index` computes `_turn_scoped_call_owner_count` over ONE
+    # item's rows; computing it here over the whole conversation is a different
+    # function whenever a call id repeats across turns, and a fixture that grew
+    # such a turn would make this test disagree with the implementation and fail
+    # for a reason that has nothing to do with fold ownership.
+    owner_count_at: dict[tuple[str, int], int] = {}
+    for item in items:
+        counts = q._turn_scoped_call_owner_count(item["rows"])
+        for row in item["rows"]:
+            owner_count_at[(row.source_path, row.line_offset)] = counts.get(
+                row.call_id or "", 0)
+    failing = derivation.failing_positions()
+    assert failing, "non-vacuity"
+    uniquely_owned = 0
+    ambiguous = 0
+    for position in failing:
+        owner = owners.get(position)
+        assert owner is not None, ("every failing position must have a fold "
+                                   "group head", position)
+        assert position in owner_count_at, (
+            "a failing position must belong to a canonical item", position)
+        if owner_count_at[position] == 1:
+            assert kind_at[owner] == "tool_call", (position, owner, kind_at[owner])
+            assert owner != position, "a failure must anchor on its call, not itself"
+            uniquely_owned += 1
+        else:
+            assert owner == position, (
+                "an output no single call owns is its own group head", position)
+            assert kind_at[owner] == "tool_output", (position, kind_at[owner])
+            ambiguous += 1
+    assert uniquely_owned, "the fixture must carry a uniquely-owned failure"
+    assert ambiguous, "the fixture must carry an ambiguous-id failure"
+    assert uniquely_owned + ambiguous == len(failing)
+
+
+def test_outline_reads_under_one_snapshot(tmp_path, monkeypatch):
+    """§4.1 — the route's several reads share one snapshot, and release it."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    seen: list[bool] = []
+    real = q._load_conversation_rows
+
+    def spy(conn_, key):
+        seen.append(conn_.in_transaction)
+        return real(conn_, key)
+
+    try:
+        monkeypatch.setattr(q, "_load_conversation_rows", spy)
+        body = q.get_codex_conversation_outline(conn, ck, effective_speed="standard")
+        assert body["status"] == "ok"
+        assert seen == [True], "the wide read must run inside the snapshot"
+        assert conn.in_transaction is False, "the route must release the snapshot"
+        # Nesting through the guard itself is fine: the outer scope is a read
+        # snapshot this module opened, so the inner one reuses it rather than
+        # issuing a second BEGIN, which SQLite would refuse.
+        with q._read_snapshot(conn):
+            again = q.get_codex_conversation_outline(
+                conn, ck, effective_speed="standard")
+            assert again == body
+            assert conn.in_transaction is True
+        assert conn.in_transaction is False, "the outer snapshot is released too"
+    finally:
+        conn.close()
+
+
+def test_outline_refuses_a_transaction_it_did_not_open(tmp_path, monkeypatch):
+    """A foreign transaction is not a snapshot this route may borrow (§4.1).
+
+    ``conn.in_transaction`` is true for an outer WRITE transaction exactly as it
+    is for an outer read snapshot, and Python's ``sqlite3`` exposes no
+    ``txn_state``, so the two cannot be told apart after the fact. Only one of
+    them is safe to inherit: inside a write, the outline would read that
+    writer's uncommitted and possibly half-applied state — a message row whose
+    events are already deleted — and would report an absence that no committed
+    state ever held. So the route refuses rather than guessing, and a caller
+    that wants several envelopes under one snapshot opens it through
+    ``_read_snapshot``, which nests.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RuntimeError, match="read snapshot"):
+            q.get_codex_conversation_outline(conn, ck, effective_speed="standard")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_every_outline_caller_arrives_outside_a_transaction(tmp_path, monkeypatch):
+    """The caller sweep, recorded as a test rather than as a claim (§4.1).
+
+    ``get_codex_conversation_outline`` has three call paths:
+    ``_lib_conversation_dispatch.neutral_outline`` (which the dashboard's
+    ``/api/conversation/<v1.…>/outline`` route reaches through
+    ``_run_conversation_query_impl``, on a connection ``open_conversations_db``
+    returns fresh per request), ``bin/build-codex-reader-fixtures.py``, and the
+    tests. None of them holds a transaction at the call, because the opener
+    commits every write it makes — the schema apply, the legacy import and
+    ``_ensure_codex_conversation_contract`` each end in ``commit`` or
+    ``rollback`` — and a route handler opens, queries and closes. That is what
+    this asserts, on a connection from the real opener after a real sync, so the
+    day one of those commits is removed the refusal above surfaces here rather
+    than in production.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        assert conn.in_transaction is False, (
+            "open_conversations_db returned a connection inside a transaction")
+        body = disp.neutral_outline(conn, ck, effective_speed="standard")
+        assert body["status"] == "ok"
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+
+# ── #463 S4 Task 3 — tier-1 enrichment and the stats block ───────────────────
+#
+# These live here rather than in tests/test_codex_conversation_api.py, which the
+# plan names: that file drives real HTTP and owns route-level concerns, while
+# every existing outline-ENVELOPE assertion in the estate is in this file, next
+# to the staging helpers these need.
+
+
+def _outline_of(conn, ck):
+    return q.get_codex_conversation_outline(conn, ck, effective_speed="standard")
+
+
+def test_outline_turn_tools_are_deduped_by_name_with_true_count(
+    tmp_path, monkeypatch,
+):
+    """Spec §4.4 — dedupe by name, and republish what dedupe destroys.
+
+    A Codex turn can carry 523 calls, so a per-call array on one outline turn is
+    unreasonable. But two consumers read `tools.length` and one reads the first
+    failing entry's name, and dedupe changes both — a tool that succeeds early
+    and fails late moves ahead of an earlier failing call once errors are
+    OR-aggregated by name. `tool_call_count` and `first_failure_name` carry those
+    two facts alongside the deduplicated array.
+
+    The fixture's failing calls are the second `exec` ("Script failed") and the
+    second `write_stdin` ("Process exited with code 3"), so first-failure order
+    and the OR-aggregation are both observable here.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    turn = next(t for t in body["turns"] if t["kinds"].get("tool_call"))
+    assert turn["tools"] == [
+        {"name": "exec", "is_error": True},
+        {"name": "exec_command", "is_error": False},
+        {"name": "write_stdin", "is_error": True},
+        {"name": "wait", "is_error": False},
+        {"name": "js", "is_error": False},
+        {"name": "tool_search_call", "is_error": False},
+        {"name": "fixture_get_issue", "is_error": True},
+        {"name": "apply_patch", "is_error": False},
+    ]
+    assert turn["tool_call_count"] == 11
+    assert turn["first_failure_name"] == "exec"
+    # A turn with no calls publishes neither, rather than a zero and a null.
+    prompt = next(t for t in body["turns"] if t["kinds"] == {"user": 1})
+    assert "tools" not in prompt and "tool_call_count" not in prompt
+
+
+def test_outline_stats_report_tools_models_and_errors(tmp_path, monkeypatch):
+    """Spec §3.5 / §4.2 — the stats card's four unreported figures.
+
+    `models` is a histogram over canonical tier-1 ASSISTANT turns, not the
+    distinct sorted list `_rollup_fields` returns: the client renders `model ×N`
+    and a list is not that shape. `error_count` counts failing CALLS, which is
+    why the two failing terminal outputs and the MCP protocol error collapse
+    onto their calls; the fourth failure, on the AMBIGUOUS-id turn, collapses
+    onto nothing and is counted at its own position.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    stats = body["stats"]
+    assert stats["tool_counts"] == {
+        "exec": 4, "exec_command": 1, "write_stdin": 3, "wait": 1, "js": 1,
+        "tool_search_call": 1, "fixture_get_issue": 1, "apply_patch": 1,
+        "update_plan": 1,
+    }
+    assert stats["models"] == {"gpt-synthetic-codex": 4}
+    assert stats["error_count"] == 4
+    assert stats["duration_seconds"] == 242
+    # One entry per canonical tier-1 turn, and the model rides the ASSISTANT
+    # ones — which is the counting unit the histogram above uses. The last turn
+    # is a response carrying only a call and its output, and `_item_kind` files
+    # a response as assistant, so it counts.
+    assert [t.get("model") for t in body["turns"]] == [
+        None, "gpt-synthetic-codex", None, None, None, "gpt-synthetic-codex",
+        None, "gpt-synthetic-codex", None, "gpt-synthetic-codex"]
+
+
+def _stamped_row(stamp):
+    return kern.CodexNormalizedRow(
+        conversation_key="conv", source_root_key="root", source_path="p",
+        line_offset=0, timestamp_utc=stamp, turn_id=None, call_id=None,
+        kind="assistant", event_type=None, record_family="response_item",
+        model=None, text="", content_digest="d", content_len=0,
+        detail_json=None, search_tool="", search_thinking="")
+
+
+def test_outline_duration_uses_min_max_not_first_last():
+    """Spec §4.2 — min/max over row timestamps, never last minus first.
+
+    Asserted on the helper rather than through the route, because the route
+    cannot exhibit the failure and a test that cannot observe the field it names
+    is not evidence. `_load_conversation_rows` reads
+    `ORDER BY timestamp_utc, source_path, line_offset`, so the rows the outline
+    hands this helper are already sorted and the two forms coincide THERE. The
+    rule is about the helper's own contract: §3.4 records that item and segment
+    emission is physical order rather than timestamp order, and Task 1 found
+    five decreases across turns in the corpus, so a caller that later passes an
+    item-anchor list — the obvious next caller — must not get a negative
+    duration out of it.
+    """
+    rows = [_stamped_row(s) for s in (
+        "2026-07-14T12:00:02Z", "2026-07-14T12:10:00Z",
+        "2026-07-14T12:05:00Z", "2026-07-14T12:05:30Z")]
+    stamps = [r.timestamp_utc for r in rows]
+    assert stamps[-1] < stamps[1], "non-vacuity: this list is not sorted"
+    assert q._conversation_duration_seconds(rows) == 598
+    assert q._conversation_duration_seconds([]) is None
+    assert q._conversation_duration_seconds([_stamped_row(None)]) is None
+
+
+def test_outline_error_count_is_zero_when_nothing_ran(tmp_path, monkeypatch):
+    """A determinable zero, which is a different claim from null (D3)."""
+    ns, _root, _rollouts = _stage_codex_provider(
+        tmp_path, monkeypatch, ["title-wrapper-window"])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert not any(t["kinds"].get("tool_output") for t in body["turns"]), (
+        "non-vacuity: this fixture must carry no outcome-bearing row")
+    assert body["stats"]["error_count"] == 0
+    assert body["stats"]["tool_counts"] == {}
+
+
+def test_outline_error_count_is_null_when_undeterminable(tmp_path, monkeypatch):
+    """Spec D3 — nullable, because 0 is a claim and silence is not evidence.
+
+    A conversation whose retained event payloads are gone still has
+    outcome-bearing rows in the message table, and the stored card answers
+    nothing: Task 1 measured `is_error` true for 0 of 63,150 production
+    `tool_output` rows. Reporting 0 there would assert an absence nobody proved,
+    which is the literal defect F13 names.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        intact = _outline_of(conn, ck)
+        assert intact["stats"]["error_count"] == 4, "non-vacuity"
+        conn.execute(
+            "DELETE FROM codex_conversation_events WHERE conversation_key = ?", (ck,))
+        conn.commit()
+        stripped = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert stripped["stats"]["error_count"] is None
+    # The outcome-bearing rows are still there; only the evidence is gone. That
+    # is what makes null the honest answer rather than zero.
+    assert any(t["kinds"].get("tool_output") for t in stripped["turns"])
+
+
+# ── #463 S4 Task 4 — landmarks[] ─────────────────────────────────────────────
+
+
+def _landmarks_of(body, kind=None):
+    return [lm for lm in body["landmarks"]
+            if kind is None or lm["kind"] == kind]
+
+
+def test_landmark_key_is_unique_across_a_multi_heading_reasoning_block(
+    tmp_path, monkeypatch,
+):
+    """§3.2 — the identity is the compound the server already mints.
+
+    One reasoning block yields several headings, so `block_key` alone is not
+    unique per heading and using it as the identity — as the first draft did —
+    would give several landmarks the same key. The compound
+    `<block_key>#<ordinal>` is the key the reader route already publishes for a
+    heading, so a jump target and a landmark name the same thing.
+    """
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    reasoning = _landmarks_of(body, "reasoning")
+    assert len(reasoning) > 1, "non-vacuity: one block, several headings"
+    keys = [lm["landmark_key"] for lm in reasoning]
+    assert len(keys) == len(set(keys))
+    assert all("#" in key for key in keys)
+    assert {lm["block_key"] for lm in reasoning} == {reasoning[0]["block_key"]}, (
+        "non-vacuity: block_key alone would have collided here")
+    # The same identity the reader publishes for the same heading.
+    served = _first_reasoning_block(page)["detail"]["reasoning"]["headings"]
+    assert keys == [h["key"] for h in served]
+    assert [lm["label"] for lm in reasoning] == [h["text"] for h in served]
+
+
+def test_landmark_item_key_is_the_containing_segment(tmp_path, monkeypatch):
+    """§3.2 — `item_key` is what a jump LOADS, `parent_item_key` who owns it.
+
+    A jump to a turn key lands on segment 0, which S1 defined as the start of a
+    turn whose failure may be fifteen segments later. The landmark carries the
+    segment instead, and the owning turn separately, so the client can indent the
+    row under its turn and still load the right page.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert body["landmarks"], "non-vacuity"
+    segments = {key for turn in body["turns"] for key in turn["segment_item_keys"]}
+    turn_keys = {turn["item_key"] for turn in body["turns"]}
+    by_turn = {turn["item_key"]: turn for turn in body["turns"]}
+    for landmark in body["landmarks"]:
+        assert landmark["item_key"] in segments, landmark
+        assert landmark["parent_item_key"] in turn_keys, landmark
+        assert landmark["item_key"] in by_turn[
+            landmark["parent_item_key"]]["segment_item_keys"]
+
+
+def test_landmark_tool_error_anchors_on_the_failing_call(tmp_path, monkeypatch):
+    """One `tool_error` per failing call, on the call rather than on the turn.
+
+    The fixture's first three failures are the second `exec`, the second
+    `write_stdin`, and the MCP protocol error; all fold into their call, so the
+    landmark's label is the tool the reader is being sent to.
+
+    The fourth is the AMBIGUOUS-id turn (#463 S4 round 3), and it is labelled
+    `tool_output`. That is `_landmark_label`'s KIND fallback, taken because the
+    row is a `tool_output` rather than a named `tool_call` or a typed `event`,
+    and it is deliberate: §3.6 enumerates exactly two label sources, and the
+    row's own text is the harness preamble that carries the provider session id,
+    so the label must never come from there. Nothing covered this branch before
+    the corpus grew the turn that reaches it.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    errors = _landmarks_of(body, "tool_error")
+    assert [lm["label"] for lm in errors] == [
+        "exec", "write_stdin", "fixture_get_issue", "tool_output",
+    ]
+    assert body["stats"]["error_count"] == len(errors)
+    # Emission is physical order, and nothing sorts by timestamp (§3.4).
+    assert [lm["timestamp_utc"] for lm in errors] == sorted(
+        lm["timestamp_utc"] for lm in errors)
+    keys = [lm["landmark_key"] for lm in body["landmarks"]]
+    assert len(keys) == len(set(keys)), "landmark_key is unique across kinds too"
+
+
+def test_update_plan_opens_the_plan_landmark_family(tmp_path, monkeypatch):
+    """§3.2 — the `plan` kind is not free, and this is the mapping that opens it.
+
+    Codex's decoded plan card is named `update_plan`, and both existing CLIENT
+    plan predicates recognise only Claude's `ExitPlanMode` and
+    `AskUserQuestion`. Publishing raw Codex tool names into tier-1 `tools`
+    therefore would not have made the plan jump work — it would have been a
+    silent no-op, and nothing would have failed if it never worked. The rollout
+    fixture gained an `update_plan` turn for exactly this reason: the tool
+    appeared zero times in every rollout in the corpus, so the mapping had no
+    fixture anywhere and would have shipped invisible to every golden.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    plans = _landmarks_of(body, "plan")
+    assert [lm["label"] for lm in plans] == ["update_plan"]
+    assert body["stats"]["tool_counts"]["update_plan"] == 1
+    segments = {key for turn in body["turns"] for key in turn["segment_item_keys"]}
+    assert plans[0]["item_key"] in segments
+
+
+def test_external_call_block_produces_no_landmark(tmp_path, monkeypatch):
+    """§3.2's exclusion, and what actually guarantees it.
+
+    S3's wire contract §7 states these blocks must not enter chips, filters, the
+    Files tab or the outline, and F9 measured the marker in 7,578 rows across 46
+    conversations. The property holds by construction rather than by a filter:
+    `detail.external_call` is published on `assistant` blocks only, and no
+    landmark kind comes from an assistant row. This pins it, so a later kind
+    derived from prose cannot quietly break it — which is the only way it could
+    break.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+        page = _detail_of(conn, ck, tail=True, limit=500)
+    finally:
+        conn.close()
+    external = {block["block_key"] for item in page["items"]
+                for block in item["blocks"]
+                if (block.get("detail") or {}).get("external_call")}
+    assert external, "non-vacuity: the fixture must carry the marker"
+    assert body["landmarks"], "non-vacuity: it must carry landmarks elsewhere"
+    assert not external & {lm["block_key"] for lm in body["landmarks"]}
+
+
+# ── #463 S4 Task 6 — title cleaning ──────────────────────────────────────────
+
+
+def test_known_harness_grammar_is_cleaned():
+    """The three grammars the census of the real store actually found (§5.4).
+
+    Counts over 438 stored Codex rollup titles on 2026-08-04: the skill link
+    165, the command wrapper 41, `<recommended_plugins>` 6. Within the command
+    wrapper the tags are dispositioned separately from what their content looks
+    like — the slash command is stripped, the message and the args are the human
+    text and are kept.
+    """
+    from _lib_codex_title_clean import clean_codex_title
+
+    assert clean_codex_title(
+        "<command-name>/clear</command-name> "
+        "<command-message>x</command-message>") == "x"
+    assert clean_codex_title(
+        "<command-name>/clear</command-name> <command-message>clear"
+        "</command-message> <command-args></command-args>") == "clear"
+    assert clean_codex_title(
+        "<command-name>/model</command-name> <command-message>model"
+        "</command-message> <command-args>fable</command-args>") == "model fable"
+    assert clean_codex_title(
+        "[$cctally-session-kickoff](/Volumes/x/.agents/skills/k/SKILL.md) 294 S4"
+    ) == "$cctally-session-kickoff 294 S4"
+    # Never closes in the data: titles are capped at 120 characters, so the
+    # stored value is the head of a plugin catalogue and nothing survives.
+    assert clean_codex_title(
+        "<recommended_plugins> Here is a list of plugins that are available") == ""
+
+
+def test_unknown_markup_passes_through_untouched():
+    """NEW coverage, and the spec says so rather than claiming a guard it lacks.
+
+    The existing `<future_harness>` test asserts `unknown.kind == "user"`. It
+    pins that the wrapper is not misclassified as a META row, says nothing about
+    titles, and a loose stripper would pass it. The closed allowlist stands on
+    its own merits — a general tag stripper would eat user-authored angle
+    brackets — and this is the case that pins it.
+    """
+    from _lib_codex_title_clean import clean_codex_title
+
+    for untouched in (
+        "<future_harness>real title</future_harness>",
+        "Why does <T> not compile?",
+        "[a link](https://example.test/page) and prose",
+        "  leading and  internal   spacing kept  ",
+        "",
+    ):
+        assert clean_codex_title(untouched) == untouched
+    # Idempotent, which matters because the client applies its own skill-link
+    # cleaner to the same string.
+    once = clean_codex_title(
+        "[$commit-cctally](/Volumes/x/skills/c/SKILL.md) ship it")
+    assert clean_codex_title(once) == once == "$commit-cctally ship it"
+
+
+def test_display_chain_cleans_and_falls_through_when_nothing_survives():
+    """§5.3 — a construct that strips to empty falls through on its own."""
+    assert q._display_chain({
+        "title": "<command-name>/clear</command-name> "
+                 "<command-message>clear</command-message>",
+        "project_label": "proj", "native_thread_id": "abcdef0123"}) == "clear"
+    assert q._display_chain({
+        "title": "<recommended_plugins> a catalogue",
+        "project_label": "proj", "native_thread_id": "abcdef0123"}) == "proj"
+    assert q._display_chain({
+        "title": "<recommended_plugins> a catalogue",
+        "project_label": None, "native_thread_id": "abcdef0123"}) == "abcdef01"
+
+
+def _wrapped_title_records(title):
+    records = _codex_turn_records([
+        {"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": title}]},
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "acknowledged"}]},
+    ])
+    return records
+
+
+def test_title_cleaning_reaches_all_three_read_paths(tmp_path, monkeypatch):
+    """§5.1 — `_display_chain` is NOT the universal chokepoint.
+
+    Verified routing: the detail title, the browse rail, the parent/child
+    summaries and the export go through it; the OUTLINE TURN LABEL is built
+    independently from anchor-row text, and the `kind=title` SEARCH path reads
+    raw rollup titles directly. Cleaning only `_display_chain` would leave two
+    surfaces raw, one of them user-facing on the CLI through
+    `cctally transcript search --source codex --kind title`.
+    """
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _wrapped_title_records(
+            "<command-name>/clear</command-name> "
+            "<command-message>reset the context</command-message>"))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        stored = conn.execute(
+            "SELECT title FROM codex_conversation_rollups WHERE conversation_key = ?",
+            (ck,)).fetchone()[0]
+        detail = q.get_codex_conversation(conn, ck, effective_speed="standard")
+        outline = _outline_of(conn, ck)
+        hits = q.search_codex_conversations(
+            conn, "reset the context", kind="title", effective_speed="standard")
+        export = q.get_codex_conversation_export(
+            conn, ck, effective_speed="standard")
+    finally:
+        conn.close()
+    assert stored.startswith("<command-name>"), (
+        "non-vacuity: the STORED title must still carry the markup, since this "
+        "is a read-time rule and no migration rewrites history")
+    assert detail["title"] == "reset the context"
+    assert outline["turns"][0]["label"] == "reset the context"
+    assert [h["title"] for h in hits["hits"]] == ["reset the context"]
+    assert [h["snippet"] for h in hits["hits"]] == ["reset the context"]
+    # §5.2 — export renders its title through `_display_chain` and its bytes are
+    # goldened, so the claim that "export should be unchanged" is false in
+    # general. The COMMITTED export golden happens not to move, because its
+    # fixture's title carries no grammar in the allowlist; that is a property of
+    # that fixture and not of the change, so the behaviour is asserted here on a
+    # conversation whose title does carry one.
+    assert "reset the context" in export["markdown"]
+    assert "<command-name>" not in export["markdown"].split("\n", 1)[0]
+
+
+# ── #463 S4 Task 5 — file touches, derived read-time ─────────────────────────
+
+
+def test_files_come_from_the_payload_pass_not_the_stored_table(
+    tmp_path, monkeypatch,
+):
+    """§1.2 — the search projection is not the richer outline source.
+
+    Issue #489 deliberately fills the stored table for ``kind=files`` search.
+    Delete that derived projection after ingest and prove the outline still
+    reconstructs paths, anchors, counts, and document order from retained event
+    payloads rather than quietly depending on the repaired table.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        conn.execute(
+            "DELETE FROM codex_conversation_file_touches "
+            "WHERE conversation_key = ?", (ck,))
+        conn.commit()
+        body = _outline_of(conn, ck)
+        stored = conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_file_touches "
+            "WHERE conversation_key = ?", (ck,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == 0
+    assert [f["file_path"].rsplit("/", 1)[-1] for f in body["files"]] == [
+        "a-generated-clipped.py", "added.py", "empty.py", "removed.py",
+        "updated.py"]
+    assert all(f["tool"] == "apply_patch" for f in body["files"])
+    assert all(f["count"] == len(f["touches"]) for f in body["files"])
+
+
+def test_touch_anchor_resolves_to_a_segment_in_the_same_envelope(
+    tmp_path, monkeypatch,
+):
+    """§4.3 — a touch anchor is a real jump target, not a plausible string."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    segments = {key for turn in body["turns"] for key in turn["segment_item_keys"]}
+    touches = [t for f in body["files"] for t in f["touches"]]
+    assert touches, "non-vacuity"
+    for touch in touches:
+        assert touch["item_key"] in segments, touch
+        assert touch["timestamp_utc"]
+
+
+def test_file_diff_counts_come_from_the_unbounded_changes(tmp_path, monkeypatch):
+    """§4.5 — counted before card allocation, never off a served `unified_diff`.
+
+    `decode_patch_event_card` shares one 16,000-character budget across stdout,
+    stderr and every file, so the clipped fixture file's served diff carries 43
+    added lines against 55 in the raw `content`. `op` is the raw change KIND —
+    `add`/`delete`/`update` in the dict shape — not the tool name.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    files = {f["file_path"].rsplit("/", 1)[-1]: f for f in body["files"]}
+    assert files["a-generated-clipped.py"]["added"] == 55
+    assert files["a-generated-clipped.py"]["removed"] == 0
+    assert files["a-generated-clipped.py"]["touches"][0]["op"] == "add"
+    assert files["removed.py"]["touches"][0]["op"] == "delete"
+    assert (files["updated.py"]["added"], files["updated.py"]["removed"]) == (1, 1)
+    assert files["updated.py"]["touches"][0]["op"] == "update"
+
+
+def _two_patch_records():
+    """Two patch events whose paths invert alphabetically.
+
+    The historical table-backed outline ordered file touches by path, while
+    `OutlineFile` promises first-touch DOCUMENT order. Only a corpus where the
+    two disagree can tell them apart, and neither committed rollout is one: the
+    dict-shaped fixture's `changes` object is emitted with sorted keys and the
+    segmented fixture touches a single path.
+    """
+    def patch_event(ts, path, added):
+        return {"timestamp": ts, "type": "event_msg", "payload": {
+            "type": "patch_apply_end", "status": "completed", "success": True,
+            "stdout": "", "stderr": "",
+            "changes": {path: {"type": "add", "content": added}}}}
+    records = _codex_turn_records([
+        {"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": "apply two patches"}]},
+    ])
+    records.append(patch_event("2026-07-14T12:10:00Z", "/synth/z-first.py", "one\n"))
+    records.append(patch_event("2026-07-14T12:11:00Z", "/synth/a-second.py",
+                               "one\ntwo\n"))
+    return records
+
+
+def test_files_are_in_first_touch_physical_order(tmp_path, monkeypatch):
+    """§3.5 — first-touch document order, which the alphabetical SQL replaced."""
+    ns, _root, _rollout = _stage_codex_records(
+        tmp_path, monkeypatch, _two_patch_records())
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    paths = [f["file_path"] for f in body["files"]]
+    assert paths == ["/synth/z-first.py", "/synth/a-second.py"]
+    assert paths != sorted(paths), "non-vacuity: alphabetical would invert this"
+    assert [f["added"] for f in body["files"]] == [1, 2]
+
+
+def test_file_counts_are_null_when_they_cannot_be_determined(
+    tmp_path, monkeypatch,
+):
+    """§4.5 — an undetermined count is null, and null is not 0.
+
+    A move-only `update` carries neither a diff nor content, so nothing can be
+    counted from it. Rendering 0 would claim the file did not change.
+    """
+    records = _codex_turn_records([
+        {"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": "move a file"}]},
+    ])
+    records.append({"timestamp": "2026-07-14T12:10:00Z", "type": "event_msg",
+                    "payload": {"type": "patch_apply_end", "status": "completed",
+                                "success": True, "stdout": "", "stderr": "",
+                                "changes": {"/synth/moved.py": {
+                                    "type": "update",
+                                    "move_path": "/synth/new.py"}}}})
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert len(body["files"]) == 1
+    assert body["files"][0]["added"] is None
+    assert body["files"][0]["removed"] is None
+    assert body["files"][0]["count"] == 1
+
+
+def test_outline_thinking_carries_the_read_time_reasoning_headings(
+    tmp_path, monkeypatch,
+):
+    """§3.1's `thinking`, from the same decomposition the landmarks use.
+
+    The Claude outline publishes one label per thinking block; the Codex
+    equivalent is the authored reasoning headings, which only the read-time
+    payload pass can produce — `_reasoning_headings` returns None without
+    `payload["summary"]`, so a stored-only derivation would degrade to one line
+    per block (§4.1).
+    """
+    conn, ck = _heading_page(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+        page = _detail_of(conn, ck, limit=0)
+    finally:
+        conn.close()
+    served = [h["text"] for h in
+              _first_reasoning_block(page)["detail"]["reasoning"]["headings"]]
+    assert served, "non-vacuity: the fixture must publish headings"
+    thinking = [line for t in body["turns"] for line in t.get("thinking", ())]
+    assert served == thinking[:len(served)]
+
+
+# ── #463 S4 — the Tasks 3-6 review findings ──────────────────────────────────
+
+
+def test_outline_label_falls_back_when_cleaning_empties_it():
+    """A cleaned-to-empty label must not leave the outline row wordless.
+
+    Two of the four allowlisted grammars carry the `strip` disposition and can
+    consume the whole string, and §5.3 justifies that on the grounds that
+    `_display_chain` is "already a fallback chain". The outline label path has
+    no chain at all: it cleans the anchor row's first non-blank line and
+    publishes the result, and the client's
+    `cleanQualifiedTitle(turn.label) ?? turn.label` passes `''` straight
+    through. The reader then gets an outline row with no text, which is worse
+    than the raw catalogue head it replaced.
+    """
+    from _lib_codex_title_clean import clean_codex_title
+
+    plugins = "<recommended_plugins> Here is a list"
+    command = "<command-name>/x</command-name>"
+    # Non-vacuity: these are the two inputs the kernel really does empty.
+    assert clean_codex_title(plugins) == ""
+    assert clean_codex_title(command) == ""
+    assert q._clean_outline_label(plugins) == plugins
+    assert q._clean_outline_label(command) == command
+    # The cleaning that CAN produce text is untouched by the fallback.
+    assert q._clean_outline_label(
+        "<command-name>/model</command-name> <command-message>pick</command-message>"
+    ) == "pick"
+    assert q._clean_outline_label("ordinary prose title") == "ordinary prose title"
+
+
+def _landmark_row(**overrides):
+    fields = dict(
+        conversation_key="conv", source_root_key="root", source_path="p",
+        line_offset=0, timestamp_utc="2026-07-14T12:00:00Z", turn_id=None,
+        call_id=None, kind="tool_output", event_type=None,
+        record_family="response_item", model=None, text="", content_digest="d",
+        content_len=0, detail_json=None, search_tool="", search_thinking="")
+    fields.update(overrides)
+    return kern.CodexNormalizedRow(**fields)
+
+
+def test_landmark_label_never_falls_through_to_row_prose():
+    """§3.6 enumerates exactly two label sources; the fallback must not add a third.
+
+    A failing `tool_output` whose `call_id` is owned by two or more `tool_call`s
+    in its turn is not folded, becomes its own group head, and enters
+    `failed_calls` directly — so it reaches `_landmark_label` as a row that is
+    neither a named `tool_call` nor a typed `event`. The prose fallback then
+    published the first non-blank line of the RAW stored `text` column, which
+    for a Codex tool output is the harness preamble that
+    `decode_tool_output_card(for_storage=False)` exists to remove and which
+    `test_s3_no_raw_session_id_reaches_any_served_route` documents as carrying
+    the provider `session_id`.
+    """
+    preamble = ("Chunk ID: ee33ff\n"
+                "Session 44444444-4444-4444-8444-444444444444\n"
+                "Process exited with code 3\nOutput:\nrefused\n")
+    row = _landmark_row(text=preamble)
+    # Non-vacuity: the prose fallback's own source really does carry it.
+    assert q._first_nonblank_line(q._strip_ansi(q._row_display(row))) == "Chunk ID: ee33ff"
+    label = q._landmark_label(row)
+    assert "44444444" not in label and "ee33ff" not in label
+    assert label == "tool_output"
+    # The two enumerated sources are unchanged.
+    assert q._landmark_label(_landmark_row(
+        kind="tool_call", detail_json=json.dumps({"name": "exec"}))) == "exec"
+    assert q._landmark_label(_landmark_row(
+        kind="event", event_type="patch_apply_end")) == "patch_apply_end"
+    # A `tool_call` whose stored detail names nothing falls back to the row's
+    # KIND, which is normalizer vocabulary rather than conversation content.
+    assert q._landmark_label(_landmark_row(
+        kind="tool_call", text=preamble)) == "tool_call"
+
+
+def test_a_failing_plan_call_lands_in_both_the_error_and_plan_families(
+    tmp_path, monkeypatch,
+):
+    """§3.2 — the `plan` kind gets one entry per plan call, failing or not.
+
+    The branch tested `if position in failed_calls` before the plan branch, so a
+    failed plan call was filed only as `tool_error` and the jump cluster's plan
+    family reported ZERO — which, under this spec's own rule that 0 is a claim
+    and hiding is not, asserts no plan activity in a conversation that has some.
+    The constraint forcing that choice was self-imposed: the bare `block_key`
+    was the identity for every non-reasoning kind, so one block could carry at
+    most one landmark. The reasoning kind already proved the compound shape is
+    acceptable.
+    """
+    records = _codex_turn_records([
+        {"type": "message", "role": "user", "phase": "input",
+         "content": [{"type": "input_text", "text": "record the plan"}]},
+        {"type": "function_call", "name": "update_plan", "call_id": "plan-fail",
+         "status": "completed",
+         "arguments": json.dumps({"plan": [{"status": "pending", "step": "s"}]})},
+        {"type": "function_call_output", "call_id": "plan-fail",
+         "output": "Wall time: 0.1 seconds\nProcess exited with code 1\n"
+                   "Output:\nrefused\n"},
+    ])
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    # Non-vacuity: the call really did fail, which is what suppressed the plan.
+    assert body["stats"]["error_count"] == 1
+    errors = _landmarks_of(body, "tool_error")
+    plans = _landmarks_of(body, "plan")
+    assert [lm["label"] for lm in errors] == ["update_plan"]
+    assert [lm["label"] for lm in plans] == ["update_plan"]
+    assert errors[0]["block_key"] == plans[0]["block_key"]
+    assert errors[0]["item_key"] == plans[0]["item_key"]
+    keys = [lm["landmark_key"] for lm in body["landmarks"]]
+    assert len(keys) == len(set(keys)), keys
+
+
+def test_file_counts_decline_when_one_touch_cannot_be_counted(
+    tmp_path, monkeypatch,
+):
+    """§4.5 — an understated aggregate is a wrong number, not a partial one.
+
+    The per-file sum added only the touches it could count, so a file touched
+    once with a countable diff and once by a move-only `update` published the
+    first touch's figure for a file that changed more, with nothing in
+    `touches[]` marking the total as partial. §4.5 requires the value to be null
+    where a count cannot be determined, and that rule has to reach the aggregate
+    and not only the individual touch.
+    """
+    records = _codex_turn_records([
+        {"type": "message", "role": "user", "phase": "input",
+         "content": [{"type": "input_text", "text": "edit then move"}]},
+    ])
+    records.append({"timestamp": "2026-07-14T12:10:00Z", "type": "event_msg",
+                    "payload": {"type": "patch_apply_end", "status": "completed",
+                                "success": True, "stdout": "", "stderr": "",
+                                "changes": {"/synth/a.py": {
+                                    "type": "update",
+                                    "unified_diff": "@@ -1,1 +1,2 @@\n ctx\n+added\n"}}}})
+    records.append({"timestamp": "2026-07-14T12:11:00Z", "type": "event_msg",
+                    "payload": {"type": "patch_apply_end", "status": "completed",
+                                "success": True, "stdout": "", "stderr": "",
+                                "changes": {"/synth/a.py": {
+                                    "type": "update",
+                                    "move_path": "/synth/b.py"}}}})
+    ns, _root, _rollout = _stage_codex_records(tmp_path, monkeypatch, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        ck = _single_ck(conn)
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert len(body["files"]) == 1
+    entry = body["files"][0]
+    assert entry["count"] == 2
+    # Non-vacuity, on the kernel that produced these two touches: exactly one of
+    # them is countable, so the summing form published +1/-0 for a file whose
+    # second change nobody could measure.
+    counted, moved = (
+        landmarks.patch_file_touches(rec["payload"])[0] for rec in records[-2:])
+    assert (counted["added"], counted["removed"]) == (1, 0)
+    assert (moved["added"], moved["removed"]) == (None, None)
+    assert entry["added"] is None
+    assert entry["removed"] is None
+
+
+# ── #463 S4 Task 11 — the §4.7 perf gate's escalation ────────────────────────
+
+
+def test_outline_payload_pass_is_watermark_cached_and_extends(tmp_path, monkeypatch):
+    """D2's fallback, reached because Task 11's re-measurement breached §4.7.
+
+    The event payload pass is 242 ms of the warm outline's 332 ms on the
+    heaviest production conversation, and the route is refetched on every
+    live-tail growth push — so it costs more than the detail page it opens
+    beside (229 ms), which is the ceiling "the outline must not become the
+    critical path on conversation open".
+
+    The cache is keyed on a watermark of the conversation's event rows and
+    EXTENDS rather than only hitting or missing: an append decodes the new
+    positions and reuses the rest. That is sound because a derivation is keyed
+    by physical position and a rollout line at a byte offset is immutable — the
+    same offset never names different content.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    asked: list[int] = []
+    real = q._iter_row_payloads
+
+    def spy(conn_, key, positions=None):
+        asked.append(len(positions) if positions is not None else -1)
+        return real(conn_, key, positions)
+
+    monkeypatch.setattr(q, "_iter_row_payloads", spy)
+    try:
+        q.reset_outline_derivation_cache()
+        first = _outline_of(conn, ck)
+        second = _outline_of(conn, ck)
+        # A repeat with no growth reads no payload at all.
+        assert asked[0] > 0, "non-vacuity: the first call must do the work"
+        assert len(asked) == 1, asked
+        # And answers identically, which is what makes the cache invisible.
+        assert second == first
+
+        rows = q._load_conversation_rows(conn, ck)
+        assert len(rows) > 4, "non-vacuity: the fixture must be splittable"
+        q.reset_outline_derivation_cache()
+        asked.clear()
+        q._derive_outline_events(conn, ck, rows[:len(rows) // 2])
+        extended = q._derive_outline_events(conn, ck, rows)
+        q.reset_outline_derivation_cache()
+        fresh = q._derive_outline_events(conn, ck, rows)
+        # The extension asked for strictly fewer payloads than the full pass ...
+        assert asked[1] < asked[2], asked
+        # ... and produced exactly the same three maps.
+        assert extended.errors_by_position == fresh.errors_by_position
+        assert extended.headings_by_position == fresh.headings_by_position
+        assert extended.patch_files_by_position == fresh.patch_files_by_position
+
+        # A DELETE lowers the watermark, so the prefix check fails and the pass
+        # recomputes rather than serving a verdict for evidence that is gone.
+        q.reset_outline_derivation_cache()
+        asked.clear()
+        _outline_of(conn, ck)
+        conn.execute(
+            "DELETE FROM codex_conversation_events WHERE conversation_key = ?", (ck,))
+        conn.commit()
+        after = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    assert len(asked) == 2, asked
+    assert after["stats"]["error_count"] is None
+
+
+# ── #463 S4 remediation ───────────────────────────────────────────────────────
+
+
+def _model_row(kind, model, offset):
+    return kern.CodexNormalizedRow(
+        conversation_key="conv", source_root_key="root", source_path="p",
+        line_offset=offset, timestamp_utc="2026-08-04T00:00:00Z", turn_id=None,
+        call_id=None, kind=kind, event_type=None, record_family="response_item",
+        model=model, text="", content_digest="d%d" % offset, content_len=0,
+        detail_json=None, search_tool="", search_thinking="")
+
+
+def test_item_model_reads_the_turn_not_only_its_anchor_row():
+    """§4.2 — the unit is the canonical tier-1 assistant TURN.
+
+    Measured against the production store on 2026-08-04: a conversation with 13
+    outline turns carrying assistant rows and 82 assistant rows rendered
+    `gpt-5.6-sol x2`, and 182 of 200 Codex conversations reported a model total
+    under a third of their turn count. The cause is that most Codex response
+    items anchor on a `reasoning` row, which carries no model, so reading the
+    anchor row alone discards the model the turn plainly states.
+    """
+    anchor = _model_row("reasoning", None, 0)
+    item = {"klass": "response", "anchor_row": anchor,
+            "rows": [anchor, _model_row("assistant", "gpt-5.6-sol", 1)]}
+    assert q._item_model(item) == "gpt-5.6-sol"
+    # The anchor still wins when it has one, so no existing turn can move.
+    anchored = _model_row("assistant", "gpt-anchor", 0)
+    assert q._item_model({
+        "klass": "response", "anchor_row": anchored,
+        "rows": [anchored, _model_row("assistant", "gpt-later", 1)]}) == "gpt-anchor"
+    # A turn that names no model anywhere still names none.
+    silent = _model_row("reasoning", None, 0)
+    assert q._item_model({"klass": "response", "anchor_row": silent,
+                          "rows": [silent]}) is None
+
+
+def test_outline_models_reconcile_against_the_turns_that_name_one(
+    tmp_path, monkeypatch,
+):
+    """`stats.models` and `turns[].model` are one derivation, counted once each.
+
+    The Claude histogram sums to exactly `stats.turns.assistant` because every
+    Claude assistant turn states a model. The Codex total sums to the tier-1
+    turns that NAME one, which is the same rule and a smaller number.
+
+    The denominator is stated here because the first version of this docstring
+    got it wrong. It is **canonical tier-1 items whose kind is `assistant`** —
+    NOT every canonical item, and not model-bearing rows. Measured over the 200
+    Codex conversations with the largest `SUM(content_len)` in the production
+    store on 2026-08-04: those conversations hold 8,062 canonical items of every
+    kind, of which **1,009 are assistant turns**; the anchor-row rule attributes
+    675 of them and the turn rule 725, leaving **284 (28.1%) that name no model
+    on ANY of their rows**. Over the whole store the residual is 712 of 1,786
+    (39.9%). The superseded figures — 4,954 of 5,489, a 9.7% residual —
+    reproduce under no unit measured over that corpus; the working is in
+    docs/superpowers/plans/463-s4-measurements.md section 8.1.
+
+    That residual is an ingest-time property — `codex_normalize_events` clears
+    the sticky model on every `session_meta` and only a later `turn_context`
+    restores it — and no read-time rule can recover a model the rows do not
+    carry.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _outline_of(conn, ck)
+    finally:
+        conn.close()
+    named = [t["model"] for t in body["turns"] if t.get("model")]
+    assert named, "non-vacuity: the fixture must publish at least one model"
+    recount: dict[str, int] = {}
+    for model in named:
+        recount[model] = recount.get(model, 0) + 1
+    assert body["stats"]["models"] == recount
+    assert sum(body["stats"]["models"].values()) == len(named)
+
+
+def test_failing_positions_are_confined_to_this_conversation_request(
+    tmp_path, monkeypatch,
+):
+    """F-G — `errors_by_position` is CACHED, so it can outlive one request.
+
+    Every other consumer of the derivation indexes it by a position the current
+    request produced. `failed_calls` iterated the whole map instead, so a
+    verdict retained from an earlier request could file a failure against a row
+    this request never read. The intersection is defensive rather than a
+    reproduction of an observed miscount, which is why the assertion is on the
+    filter and not on a contrived cache state.
+    """
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        rows = q._load_conversation_rows(conn, ck)
+        derivation = q._derive_outline_events(conn, ck, rows)
+        # A verdict for a position no row of this conversation occupies.
+        derivation.errors_by_position[("/elsewhere.jsonl", 999999)] = True
+        outcomes = q._outline_outcome_positions(rows)
+        failing = q._outline_failing_calls(derivation, outcomes, {})
+    finally:
+        conn.close()
+    assert ("/elsewhere.jsonl", 999999) not in failing
+    assert failing, "non-vacuity: the fixture's real failures must survive"
+
+
+def test_skill_link_is_cleaned_when_prompt_text_abuts_the_paren():
+    """F-E — the lookahead required whitespace or end of string after `)`.
+
+    Verified by execution against the served titles: the no-space form returned
+    unchanged, so both the reader header and the outline rail rendered the raw
+    Markdown link including an absolute filesystem path. Two of 300 served
+    titles in the test store carry it.
+    """
+    from _lib_codex_title_clean import clean_codex_title
+
+    abutting = ("[$cctally-codex-split](/Volumes/x/.agents/skills/s/SKILL.md)"
+                "Task B of issue #450.")
+    spaced = ("[$cctally-codex-split](/Volumes/x/.agents/skills/s/SKILL.md) "
+              "Task B of issue #450.")
+    assert clean_codex_title(abutting) == "$cctally-codex-split Task B of issue #450."
+    assert clean_codex_title(spaced) == "$cctally-codex-split Task B of issue #450."
+    # A path is never left in the output.
+    assert "/Volumes/x" not in clean_codex_title(abutting)
+    # Still closed: a link that is not a SKILL.md target passes through.
+    other = "[a link](https://example.test/page)and prose"
+    assert clean_codex_title(other) == other

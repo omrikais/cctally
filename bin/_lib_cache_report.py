@@ -114,6 +114,11 @@ DEFAULT_TIERED_THRESHOLD = 200_000
 CACHE_REPORT_MIN_BASELINE_DAYS = 5
 CACHE_REPORT_MIN_BASELINE_SESSIONS = 10
 
+# Monetary comparisons elsewhere in cctally reconcile within 1e-9 USD. Keep
+# an exactly-cancelling cache row inside that same tolerance so a value that
+# renders as zero cannot raise a non-actionable ``net_negative`` anomaly.
+CACHE_REPORT_NET_NEGATIVE_TOLERANCE_USD = 1e-9
+
 
 # Anomaly-threshold bounds and default. #443 S3 F17: four sites used to
 # decide independently what `cache_report.anomaly_threshold_pp` means —
@@ -857,8 +862,8 @@ def _classify_anomalies(
 ) -> None:
     """Mutate each row's ``anomaly_triggered`` / ``anomaly_reasons`` in place.
 
-    Trigger 1 (``net_negative``): ``net_usd < 0`` (strict). Skipped when the
-    row has zero cache activity (no-op session, not a bug).
+    Trigger 1 (``net_negative``): ``net_usd < -1e-9``. Skipped when the row
+    has zero cache activity (no-op session, not a bug).
 
     Trigger 2 (``cache_drop``): ``cache_hit_percent`` is ``>= threshold_pp``
     below the trailing ``window_days`` median of OTHER rows. Requires
@@ -901,7 +906,7 @@ def _classify_anomalies(
 
         # Trigger 1: net_negative (no baseline needed; cache-activity guard).
         if row.cache_creation_tokens + row.cache_read_tokens > 0:
-            if row.net_usd < 0:
+            if row.net_usd < -CACHE_REPORT_NET_NEGATIVE_TOLERANCE_USD:
                 reasons.append("net_negative")
         else:
             unevaluated.append("net_negative")

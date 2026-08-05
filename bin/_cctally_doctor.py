@@ -971,6 +971,7 @@ def _doctor_gather_state_impl(
     conv_rollup_sync_in_progress = False
     conversations_db_page_count = None
     conversations_db_freelist_count = None
+    codex_prune_refusals: list[dict] = []
     try:
         if _cctally_core.CONVERSATIONS_DB_PATH.exists():
             # This gather also runs inside dashboard snapshot precompute. A
@@ -1008,6 +1009,18 @@ def _doctor_gather_state_impl(
                     if row is not None:
                         conv_messages_distinct_sessions = int(row[0])
                 except sqlite3.OperationalError:
+                    pass
+                try:
+                    import _cctally_cache as _cc_sib
+                    row = conn.execute(
+                        "SELECT value FROM cache_meta WHERE key=?",
+                        (_cc_sib.CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
+                    ).fetchone()
+                    if row and row[0]:
+                        record = json.loads(row[0])
+                        if isinstance(record, dict):
+                            codex_prune_refusals.append(record)
+                except (sqlite3.OperationalError, ValueError, TypeError):
                     pass
                 # Pending reingest/split/backfill flags ⇒ a full sync hasn't yet
                 # reconciled the rollup. Read the canonical flag set from
@@ -1219,7 +1232,8 @@ def _doctor_gather_state_impl(
             try:
                 for _key in ("parse_health_claude", "parse_health_codex",
                              "codex_torn_auth_deferred", _blocked_key,
-                             _deferred_key, "codex_ingest_backlog"):
+                             _deferred_key, "codex_ingest_backlog",
+                             "codex_orphan_prune_refused"):
                     try:
                         row = conn.execute(
                             "SELECT value FROM cache_meta WHERE key = ?",
@@ -1238,6 +1252,8 @@ def _doctor_gather_state_impl(
                                     codex_replay_deferred = _parsed
                                 elif _key == "codex_ingest_backlog":
                                     codex_ingest_backlog = _parsed
+                                elif _key == "codex_orphan_prune_refused":
+                                    codex_prune_refusals.append(_parsed)
                                 else:
                                     codex_torn_deferred = _parsed
                     except (sqlite3.OperationalError, ValueError):
@@ -1828,6 +1844,7 @@ def _doctor_gather_state_impl(
         codex_replay_pending=codex_replay_pending,
         codex_replay_blocked=codex_replay_blocked,
         codex_replay_deferred=codex_replay_deferred,
+        codex_prune_refusals=codex_prune_refusals or None,
         stats_db_quick_check=stats_db_quick_check,
         cache_db_quick_check=cache_db_quick_check,
         conversations_db_quick_check=conversations_db_quick_check,

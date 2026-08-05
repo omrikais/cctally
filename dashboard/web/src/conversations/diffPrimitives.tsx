@@ -5,7 +5,7 @@
 
 import type { DiffRow } from './computeDiff';
 import { highlightBody } from './CodeBlock';
-import { splitToReactNodes, useFindSplit } from './findMark';
+import { splitToExactNodes, splitToReactNodes, useFindSplit, type ExactLeafTarget } from './findMark';
 
 // One rendered diff body: a set of rows (Edit/Write) is a single hunk; MultiEdit
 // is N hunks rendered under `edit k of n` dividers; a git-context diff is one
@@ -19,11 +19,15 @@ export { highlightBody };
 // changed lines render the tint + intra-line word-emphasis as PLAIN text (no
 // per-token color — spec §4.1 / Codex P2.6). The gutter shows relative old/new
 // running numbers (absolute file offsets aren't derivable from old/new strings).
-export function DiffRowEl({ row, lang }: { row: DiffRow; lang: string }) {
+export function DiffRowEl({ row, lang, exactTargets = [] }: {
+  row: DiffRow; lang: string; exactTargets?: ExactLeafTarget[];
+}) {
   const split = useFindSplit();
   const sign = row.type === 'add' ? '+' : row.type === 'del' ? '−' : ' ';
   let content: React.ReactNode;
-  if (row.type === 'context') {
+  if (exactTargets.length) {
+    content = splitToExactNodes(row.text, exactTargets);
+  } else if (row.type === 'context') {
     // Full syntax highlighting on unchanged lines (#236 — find-highlight-aware).
     content = highlightBody(row.text, lang, split);
   } else if (row.segments) {
@@ -61,11 +65,15 @@ export function DiffRowEl({ row, lang }: { row: DiffRow; lang: string }) {
   );
 }
 
-export function HunkEl({ rows, lang }: { rows: Hunk; lang: string }) {
+export function HunkEl({ rows, lang, exactTargetsForRow }: {
+  rows: Hunk;
+  lang: string;
+  exactTargetsForRow?: (rowIndex: number) => ExactLeafTarget[];
+}) {
   return (
     <div className="conv-diff-hunk">
       {rows.map((r, i) => (
-        <DiffRowEl key={i} row={r} lang={lang} />
+        <DiffRowEl key={i} row={r} lang={lang} exactTargets={exactTargetsForRow?.(i)} />
       ))}
     </div>
   );

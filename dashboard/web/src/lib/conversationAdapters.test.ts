@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  adaptBlocks,
   adaptQualifiedBrowse,
   adaptQualifiedDetail,
   adaptQualifiedFind,
   adaptQualifiedOutline,
+  adaptQualifiedPayload,
   adaptQualifiedPrompts,
   adaptQualifiedSearch,
   buildQualifiedOutlinePositions,
 } from './conversationAdapters';
+import type { ConversationBlock, NativeTerminalOutput, NativeToolCard } from '../types/conversation';
 
 const ref = { source: 'codex' as const, key: 'v1.root-a' };
 
@@ -448,15 +451,74 @@ describe('qualified Codex conversation adapters', () => {
   });
 
   it('adapts item-key find and prompt envelopes', () => {
-    expect(adaptQualifiedFind({
+    const find = adaptQualifiedFind({
       status: 'ok', conversation_key: ref.key, total: 1,
       anchors: [{ item_key: 'civ1.item', match_kinds: ['tool'] }],
       anchors_truncated: false, search_depth: 'full', kind: 'all', mode: 'fts',
-    }).anchors).toEqual([{ uuid: 'civ1.item', match_kinds: ['tool'] }]);
+    });
+    expect('anchors' in find ? find.anchors : []).toEqual([{ uuid: 'civ1.item', match_kinds: ['tool'] }]);
     expect(adaptQualifiedPrompts({
       status: 'ok', conversation_key: ref.key,
       prompts: [{ item_key: 'civ1.prompt', text: 'Prompt' }],
     })).toEqual({ prompts: [{ uuid: 'civ1.prompt', text: 'Prompt' }] });
+  });
+
+  it('preserves occurrence-exact find fragments, disclosures, and indexing state', () => {
+    const exact = adaptQualifiedFind({
+      schema_version: 2,
+      semantics: 'occurrence',
+      status: 'ready',
+      query_id: 'query-1',
+      total: 2,
+      selection_stale: false,
+      mode: 'literal',
+      kind: 'all',
+      search_depth: 'full',
+      page: {
+        start_index: 0,
+        previous_cursor: null,
+        next_cursor: 'ofc1.next',
+        occurrences: [{
+          occurrence_id: 'o1.hit', item_key: 'civ1.item', block_key: 'cbv1.row',
+          container_block_key: 'cbv1.call', surface: 'output',
+          match_kinds: ['tool'], disclosure: ['cbv1.call'],
+          fragments: [
+            { leaf_key: 't0', start: 2, end: 5 },
+            { leaf_key: 't1', start: 0, end: 1 },
+          ],
+        }],
+      },
+      additive_future_field: true,
+    });
+    expect(exact).toMatchObject({
+      schema_version: 2,
+      semantics: 'occurrence',
+      status: 'ready',
+      total: 2,
+      page: {
+        next_cursor: 'ofc1.next',
+        occurrences: [{
+          occurrence_id: 'o1.hit',
+          uuid: 'civ1.item',
+          block_key: 'cbv1.row',
+          container_block_key: 'cbv1.call',
+          disclosure: ['cbv1.call'],
+          fragments: [
+            { leaf_key: 't0', start: 2, end: 5 },
+            { leaf_key: 't1', start: 0, end: 1 },
+          ],
+        }],
+      },
+    });
+
+    const indexing = adaptQualifiedFind({
+      schema_version: 2, semantics: 'occurrence', status: 'indexing',
+      query_id: 'query-2', selection_stale: false, mode: 'literal', kind: 'all',
+      search_depth: 'full',
+      page: { start_index: 0, previous_cursor: null, next_cursor: null, occurrences: [] },
+    });
+    expect('status' in indexing ? indexing.status : null).toBe('indexing');
+    expect(indexing.total).toBeUndefined();
   });
 
   it('uses qualified Claude prompt keys to preserve the outline role spine', () => {
@@ -483,6 +545,99 @@ describe('qualified Codex conversation adapters', () => {
       tokens: { source: 'claude', cache_creation: 3, cache_read: 4 },
       duration_seconds: 5,
     });
+  });
+
+  it('preserves qualified Claude navigation, files, subagents, rebuilds, and completion', () => {
+    const claudeRef = { source: 'claude' as const, key: 'v1.claude-rich' };
+    const outline = adaptQualifiedOutline(claudeRef, {
+      status: 'ok', conversation_key: claudeRef.key,
+      turns: [{
+        item_key: 'cliv1.assistant', kind: 'assistant', label: 'Failed command',
+        timestamp_utc: '2026-07-14T12:00:05Z', kinds: { assistant: 1 },
+        member_item_keys: ['cliv1.folded'],
+        subagent_key: 'child', parent_item_key: 'cliv1.parent', is_sidechain: true,
+        tools: [{ name: 'Bash', is_error: true }], thinking: ['Investigating'],
+        model: 'claude-opus-4-8',
+        tokens: { input: 1, output: 2, cache_creation: 3, cache_read: 4 },
+        cache_failure: { tokens_recreated: 10, prev_cached: 20, est_wasted_usd: 0.2 },
+      }],
+      stats: {
+        turns: { total: 1, human: 0, assistant: 1, tool_result: 0, meta: 0 },
+        tool_counts: { Bash: 1 }, error_count: 1,
+        models: { 'claude-opus-4-8': 1 }, duration_seconds: 5,
+        tokens: { source: 'claude', input: 1, output: 2, cache_creation: 3, cache_read: 4 },
+        cost_usd: 0.5, cache_saved_usd: 0.1,
+        cache_failures: {
+          count: 1, tokens_recreated: 10, est_wasted_usd: 0.2,
+          rebuilds: [{
+            uuid: 'cliv1.assistant', subagent_key: 'child', ts: '2026-07-14T12:00:05Z',
+            tokens_recreated: 10, est_wasted_usd: 0.2,
+          }],
+        },
+      },
+      files: [{
+        file_path: 'src/app.py', tool: 'Edit', count: 1, added: 2, removed: 1,
+        touches: [{
+          item_key: 'cliv1.assistant', timestamp_utc: null, tool_use_id: 'toolu_edit',
+          op: 'edit', added: 2, removed: 1,
+        }],
+      }],
+      subagent_meta: {
+        child: { kind: 'general-purpose', parent_subagent_key: null, spawn_uuid: 'cliv1.assistant' },
+      },
+      subagent_costs: { child: 1.25 },
+      task_completion: { all_done: true, total: 2, completed: 2, anchor_uuid: 'cliv1.assistant' },
+      children: [],
+    });
+
+    expect(outline.turns[0]).toMatchObject({
+      uuid: 'cliv1.assistant', kind: 'assistant',
+      member_uuids: ['cliv1.assistant', 'cliv1.folded'],
+      subagent_key: 'child', parent_uuid: 'cliv1.parent', is_sidechain: true,
+      tools: [{ name: 'Bash', is_error: true }], thinking: ['Investigating'],
+      model: 'claude-opus-4-8',
+      tokens: { input: 1, output: 2, cache_creation: 3, cache_read: 4 },
+      cache_failure: { tokens_recreated: 10, prev_cached: 20, est_wasted_usd: 0.2 },
+    });
+    expect(outline.stats.cache_failures?.rebuilds[0].uuid).toBe('cliv1.assistant');
+    expect(outline.subagent_meta?.child.spawn_uuid).toBe('cliv1.assistant');
+    expect(outline.subagent_costs).toEqual({ child: 1.25 });
+    expect(outline.task_completion?.anchor_uuid).toBe('cliv1.assistant');
+    expect(outline.files).toEqual([{
+      path: 'src/app.py', add: 2, del: 1,
+      touches: [{
+        uuid: 'cliv1.assistant', tool_use_id: 'toolu_edit', op: 'edit', add: 2, del: 1,
+      }],
+    }]);
+  });
+
+  it('preserves qualified Claude detail grouping and cache navigation', () => {
+    const claudeRef = { source: 'claude' as const, key: 'v1.claude-detail' };
+    const detail = adaptQualifiedDetail(claudeRef, {
+      status: 'ok', conversation_key: claudeRef.key, title: 'Claude detail',
+      items: [{
+        item_key: 'cliv1.assistant', kind: 'assistant',
+        timestamp_utc: '2026-07-14T12:00:05Z', model: 'claude-opus-4-8',
+        blocks: [{ kind: 'assistant', text: 'Answer' }], cost_usd: 0.5,
+        tokens: { source: 'claude', input: 1, output: 2, cache_creation: 3, cache_read: 4 },
+        member_item_keys: ['cliv1.folded'],
+        subagent_key: 'child', parent_item_key: 'cliv1.parent', is_sidechain: true,
+        cache_failure: { tokens_recreated: 10, prev_cached: 20, est_wasted_usd: 0.2 },
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      subagent_meta: {
+        child: { kind: 'general-purpose', parent_subagent_key: null, spawn_uuid: 'cliv1.parent' },
+      },
+      children: [], parent: null, total_cost_usd: 0.5,
+      tokens: { source: 'claude', input: 1, output: 2, cache_creation: 3, cache_read: 4 },
+    });
+
+    expect(detail.items[0]).toMatchObject({
+      kind: 'assistant', member_uuids: ['cliv1.assistant', 'cliv1.folded'],
+      subagent_key: 'child', parent_uuid: 'cliv1.parent', is_sidechain: true,
+      cache_failure: { tokens_recreated: 10, prev_cached: 20, est_wasted_usd: 0.2 },
+    });
+    expect(detail.subagent_meta?.child.spawn_uuid).toBe('cliv1.parent');
   });
 
   // #463 S1 — segmentation additions to the wire, consumed by the client.
@@ -764,5 +919,1082 @@ describe('#463 S2 adapters', () => {
       children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
     } as Parameters<typeof adaptQualifiedDetail>[1]);
     expect(detail.items[0].member_uuids.some((u) => u.includes('#'))).toBe(false);
+  });
+});
+
+// #463 S3 §5.1/§5.2 — the result-side unlock and the additive neutral model.
+// The wire shapes asserted here are the published contract
+// (docs/superpowers/specs/2026-08-03-463-s3-wire-contract.md), not a reading of
+// server source.
+describe('#463 S3 — Codex tool legibility on the neutral model', () => {
+  const outputCard = (over: Record<string, unknown> = {}) => ({
+    schema_version: 1, type: 'terminal_output', status: 'completed', is_error: false,
+    parts: [{ type: 'text', stream: 'output', text: 'body\n' }],
+    truncated: false, exit_code: null, wall_time_seconds: null, ...over,
+  });
+
+  it('publishes outcome for an uncarded Codex call and sets is_error', () => {
+    const block = {
+      kind: 'tool_call', detail: { name: 'wait', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'failed', is_error: true, exit_code: 3, wall_time_seconds: 1.5 }) } },
+    };
+    const [out] = adaptBlocks([block as never], 'codex');
+    expect(out).toMatchObject({ kind: 'tool_call' });
+    const call = out as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.outcome).toEqual({ status: 'failed', exit_code: 3, wall_time_seconds: 1.5 });
+    expect(call.result?.is_error).toBe(true);
+    expect(call.native_card).toBeUndefined();   // the call side is still uncarded
+  });
+
+  it('publishes a running outcome without calling it an error', () => {
+    const block = {
+      kind: 'tool_call', detail: { name: 'exec_command', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'running', wall_time_seconds: 1.0034 }) } },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.outcome).toEqual({ status: 'running', exit_code: null, wall_time_seconds: 1.0034 });
+    expect(call.result?.is_error).toBe(false);
+  });
+
+  it('publishes an explicit unknown outcome rather than nothing', () => {
+    const block = {
+      kind: 'tool_call', detail: { name: 'wait', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'unknown' }) } },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.outcome?.status).toBe('unknown');
+  });
+
+  it('normalizes an unrecognized status to unknown rather than passing it through', () => {
+    const block = {
+      kind: 'tool_call', detail: { name: 'wait', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'weird-future-state' }) } },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.outcome?.status).toBe('unknown');
+  });
+
+  it('does NOT publish outcome for a qualified Claude conversation', () => {
+    const block = {
+      kind: 'tool_call', detail: { name: 'Bash', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'failed', is_error: true }) } },
+    };
+    const call = adaptBlocks([block as never], 'claude')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.outcome).toBeUndefined();
+    expect(call.result?.is_error).toBe(false);
+  });
+
+  it('validates a program card and keeps its discriminated invocations', () => {
+    const block = {
+      kind: 'tool_call',
+      detail: {
+        name: 'exec', args: '{}',
+        card: {
+          schema_version: 1, type: 'program', title: null, complete: false, truncated: false,
+          invocations: [
+            { kind: 'command', command: 'ls -1', workdir: '/synthetic', metadata: {} },
+            { kind: 'session', scope: 'shell', ref: '1', operation: 'write', chars: 'yes\n' },
+            { kind: 'other', name: 'view_image' },
+          ],
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.native_card).toEqual({
+      schema_version: 1, type: 'program', title: null, complete: false, truncated: false,
+      invocations: [
+        { kind: 'command', command: 'ls -1', workdir: '/synthetic', metadata: {} },
+        { kind: 'session', scope: 'shell', ref: '1', operation: 'write', chars: 'yes\n' },
+        { kind: 'other', name: 'view_image' },
+      ],
+    });
+  });
+
+  it('keeps the generic disclosure for a malformed program card', () => {
+    const block = {
+      kind: 'tool_call',
+      detail: { name: 'exec', args: '{}', card: { schema_version: 1, type: 'program', invocations: 'not-an-array' } },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.native_card).toBeUndefined();
+  });
+
+  it('keeps the generic disclosure for a program whose invocation kind is unknown', () => {
+    const block = {
+      kind: 'tool_call',
+      detail: { name: 'exec', args: '{}', card: {
+        schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+        invocations: [{ kind: 'teleport', name: 'x' }],
+      } },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.native_card).toBeUndefined();
+  });
+
+  it('validates session_ref at both scopes and keeps a null ref null', () => {
+    const shell = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'write_stdin', args: '{}', card: {
+        schema_version: 1, type: 'session_ref', scope: 'shell', ref: '2',
+        operation: 'write', chars: 'no\n', truncated: false } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(shell.native_card).toMatchObject({ type: 'session_ref', scope: 'shell', ref: '2', operation: 'write' });
+
+    const cell = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'wait', args: '{}', card: {
+        schema_version: 1, type: 'session_ref', scope: 'cell', ref: '12',
+        operation: 'poll', chars: null, truncated: false } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(cell.native_card).toMatchObject({ type: 'session_ref', scope: 'cell', ref: '12', operation: 'poll', chars: null });
+
+    // §3.2 coverage limitation: a session named only inside a program body has
+    // no ordinal, and the client must carry that through as null rather than
+    // inventing one.
+    const unnamed = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'write_stdin', args: '{}', card: {
+        schema_version: 1, type: 'session_ref', scope: 'shell', ref: null,
+        operation: 'write', chars: 'y', truncated: false } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect((unnamed.native_card as { ref: string | null }).ref).toBeNull();
+  });
+
+  it('keeps the generic disclosure for a session_ref with an unknown scope', () => {
+    const call = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'write_stdin', args: '{}', card: {
+        schema_version: 1, type: 'session_ref', scope: 'process', ref: '1',
+        operation: 'write', chars: null, truncated: false } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.native_card).toBeUndefined();
+  });
+
+  it('validates a tool_search card', () => {
+    const call = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'tool_search_call', args: '{}', card: {
+        schema_version: 1, type: 'tool_search', query: 'synthetic', limit: 5 } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.native_card).toEqual({ schema_version: 1, type: 'tool_search', query: 'synthetic', limit: 5 });
+  });
+
+  it('carries per-file truncated and diff_source through a patch event card', () => {
+    const call = adaptBlocks([{
+      kind: 'event', block_key: 'ev1', text: 'patch_apply',
+      detail: { event: 'patch_apply_end', card: {
+        schema_version: 1, type: 'patch', source: 'patch_apply_end', status: 'completed',
+        success: true, stdout: '', stderr: '', has_diff: true, truncated: false,
+        files: [
+          { path: '/s/a.py', status: 'add', truncated: false, diff_source: 'derived',
+            unified_diff: '--- /dev/null\n+++ /s/a.py\n@@ -0,0 +1,1 @@\n+one\n' },
+          { path: '/s/b.py', status: 'update', truncated: true, diff_source: 'retained' },
+        ] } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    const card = call.native_card as Extract<NativeToolCard, { type: 'patch' }>;
+    expect(card.files[0]).toMatchObject({ truncated: false, diff_source: 'derived' });
+    // "there is a diff and none of it survived the budget" — truncated with no
+    // renderable diff is a real, distinct state (wire contract §4).
+    expect(card.files[1]).toMatchObject({ truncated: true, diff_source: 'retained' });
+    expect(card.files[1].unified_diff).toBeUndefined();
+  });
+
+  it('never lifts a diff key onto a call-side apply_patch file entry', () => {
+    const call = adaptBlocks([{
+      kind: 'tool_call', detail: { name: 'apply_patch', args: '{}', card: {
+        schema_version: 1, type: 'patch', source: 'apply_patch', status: 'completed',
+        patch: '*** Begin Patch\n', truncated: false,
+        files: [{ path: 'synthetic.txt', status: 'modified' }],
+        completion: {
+          schema_version: 1, type: 'patch', source: 'patch_apply_end', status: 'completed',
+          success: true, stdout: '', stderr: '', has_diff: false, truncated: false,
+          files: [{ path: 'synthetic.txt', status: 'update', truncated: false }],
+          event_block_key: 'ev9',
+        } } },
+    } as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    const card = call.native_card as Extract<NativeToolCard, { type: 'patch' }>;
+    expect(card.request_files).toEqual([{ path: 'synthetic.txt', status: 'modified' }]);
+    expect(card.request_files?.[0]).not.toHaveProperty('truncated');
+    expect(card.request_files?.[0]).not.toHaveProperty('diff_source');
+  });
+
+  it('adapts the conversation-level session index onto the detail', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      session_index: {
+        sessions: { '1': { ordinal: 1, opener_block_key: 'cbk1_open' }, '2': { ordinal: 2, opener_block_key: null } },
+        truncated: false,
+      },
+      items: [{
+        item_key: 'civ1.a', kind: 'assistant', timestamp_utc: '2026-08-02T09:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null,
+        blocks: [{ kind: 'assistant', text: 'hi', block_key: 'bk0', detail: null }],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.session_index).toEqual({
+      sessions: { '1': { ordinal: 1, opener_block_key: 'cbk1_open' }, '2': { ordinal: 2, opener_block_key: null } },
+      truncated: false,
+    });
+  });
+
+  it('drops a malformed session index rather than passing it through half-built', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      session_index: { sessions: { '1': { ordinal: 'one', opener_block_key: null } }, truncated: false },
+      items: [],
+      page: { total: 0, returned: 0, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(detail.session_index).toBeUndefined();
+  });
+
+  it('builds the session map without a prototype, so a "__proto__" key stays data', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      // Built through JSON.parse because an object LITERAL treats `__proto__`
+      // as the prototype setter, while the wire arrives parsed — where it is an
+      // ordinary own key, exactly as a hostile payload would deliver it.
+      session_index: JSON.parse('{"sessions":{"__proto__":{"ordinal":1,"opener_block_key":null}},"truncated":false}'),
+      items: [],
+      page: { total: 0, returned: 0, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    const sessions = detail.session_index?.sessions as Record<string, unknown> | undefined;
+    expect(Object.getPrototypeOf(sessions)).toBeNull();
+    expect(Object.keys(sessions ?? {})).toEqual(['__proto__']);
+  });
+
+  it('names a program\'s leading session invocation the way the card body does', () => {
+    // One thing, one name: the collapsed row said "wrote to shell 1" while the
+    // expanded body said "session 1" for the same invocation.
+    const block = {
+      kind: 'tool_call',
+      detail: {
+        name: 'exec', args: '{}',
+        card: {
+          schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+          invocations: [
+            { kind: 'session', scope: 'shell', ref: '1', operation: 'write', chars: 'y\n' },
+            { kind: 'command', command: 'ls', workdir: null, metadata: {} },
+          ],
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe('wrote to session 1 +1 more');
+  });
+
+  it('names a program\'s leading cell invocation as a cell', () => {
+    const block = {
+      kind: 'tool_call',
+      detail: {
+        name: 'exec', args: '{}',
+        card: {
+          schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+          invocations: [{ kind: 'session', scope: 'cell', ref: '12', operation: 'poll', chars: null }],
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe('polled cell 12');
+  });
+
+  it('claims no reference at all for a program session the server could not resolve', () => {
+    const block = {
+      kind: 'tool_call',
+      detail: {
+        name: 'exec', args: '{}',
+        card: {
+          schema_version: 1, type: 'program', title: null, complete: true, truncated: false,
+          invocations: [{ kind: 'session', scope: 'shell', ref: null, operation: 'write', chars: null }],
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe('wrote to');
+  });
+
+  it('clamps a session_ref preview to the same bound the card body uses', () => {
+    const chars = 'x'.repeat(200);
+    const block = {
+      kind: 'tool_call',
+      detail: {
+        name: 'write_stdin', args: '{}',
+        card: {
+          schema_version: 1, type: 'session_ref', scope: 'shell', ref: '1',
+          operation: 'write', chars, truncated: false,
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe(`session 1 · ${'x'.repeat(60)}…`);
+  });
+
+  it('falls through a blank authored title to the first recognized invocation', () => {
+    // A bare `??` treats `""` as a value, so a blank authored title produced an
+    // EMPTY collapsed row where the pre-S3 fallback showed something.
+    const block = {
+      kind: 'tool_call', text: 'js\n{"title":""}',
+      detail: {
+        name: 'js', args: '{"title":""}',
+        card: {
+          schema_version: 1, type: 'program', title: '', complete: true, truncated: false,
+          invocations: [{ kind: 'other', name: 'view_image' }],
+        },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe('view_image');
+  });
+
+  it('falls back to the first text line when a tool_search query is blank', () => {
+    const block = {
+      kind: 'tool_call', text: 'tool_search_call\n{"query":""}',
+      detail: {
+        name: 'tool_search_call', args: '{"query":""}',
+        card: { schema_version: 1, type: 'tool_search', query: '', limit: null },
+      },
+    };
+    const call = adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(call.preview).toBe('tool_search_call');
+  });
+
+  it('renders the external-agent marker as structure and removes its span from the prose', () => {
+    const text = 'Delegating to the search tool.\n\n[external_agent_tool_call: ToolSearch]\ninput: {"query": "select:A,B"}';
+    const blocks = adaptBlocks([{
+      kind: 'assistant', block_key: 'bk9', text,
+      detail: { external_call: {
+        schema_version: 1, name: 'ToolSearch', input: { query: 'select:A,B' },
+        truncated: false, span: [32, text.length],
+      } },
+    } as never], 'codex');
+    expect(blocks).toEqual([
+      { kind: 'text', text: 'Delegating to the search tool.', block_key: 'bk9' },
+      { kind: 'external_call', name: 'ToolSearch', input: { query: 'select:A,B' }, truncated: false, block_key: 'bk9' },
+    ]);
+  });
+
+  it('renders the prose ALONE when the span does not resolve', () => {
+    // Wire contract §7 — the span exists to stop the marker being shown twice,
+    // once as prose and once as the structured disclosure. When it does not
+    // resolve the prose is served whole, so emitting the block as well is the
+    // very double render the span prevents. Degrade to the prose.
+    const text = 'no marker here';
+    const blocks = adaptBlocks([{
+      kind: 'assistant', block_key: 'bk9', text,
+      detail: { external_call: {
+        schema_version: 1, name: 'ToolSearch', input: {}, truncated: false, span: [4, 900],
+      } },
+    } as never], 'codex');
+    expect(blocks).toEqual([{ kind: 'text', text: 'no marker here', block_key: 'bk9' }]);
+  });
+
+  it('renders the prose ALONE when the card carries no span at all', () => {
+    const blocks = adaptBlocks([{
+      kind: 'assistant', block_key: 'bk9', text: 'prose with no span',
+      detail: { external_call: {
+        schema_version: 1, name: 'ToolSearch', input: {}, truncated: false,
+      } },
+    } as never], 'codex');
+    expect(blocks).toEqual([{ kind: 'text', text: 'prose with no span', block_key: 'bk9' }]);
+  });
+
+  it('ignores an external_call on a human turn', () => {
+    // The server publishes the marker on `assistant` blocks only. A `user`
+    // block renders its prose from `item.text`, which retains the marker, so
+    // honouring the field here would render it twice.
+    const text = 'ask\n\n[external_agent_tool_call: ToolSearch]\ninput: {}';
+    const blocks = adaptBlocks([{
+      kind: 'user', block_key: 'bk9', text,
+      detail: { external_call: {
+        schema_version: 1, name: 'ToolSearch', input: {}, truncated: false,
+        span: [5, text.length],
+      } },
+    } as never], 'codex');
+    expect(blocks).toEqual([{ kind: 'text', text, block_key: 'bk9' }]);
+  });
+
+  it('alters nothing but the orphaned newline the removal leaves behind', () => {
+    // The non-marker path serves `text` exactly as stored, so the marker path
+    // must strip only the newline the removal orphaned. A whole-remainder trim
+    // also swallows a two-space Markdown hard break at the end of the prose
+    // that FOLLOWS the marker, which the reader then renders as one run-on line.
+    const head = 'before\n\n';
+    const marker = '[external_agent_tool_call: ToolSearch]\ninput: {}\n';
+    const text = `${head}${marker}after  `;
+    const blocks = adaptBlocks([{
+      kind: 'assistant', block_key: 'bk9', text,
+      detail: { external_call: {
+        schema_version: 1, name: 'ToolSearch', input: {}, truncated: false,
+        span: [head.length, head.length + marker.length],
+      } },
+    } as never], 'codex');
+    expect(blocks[0]).toEqual({ kind: 'text', text: 'before\n\nafter  ', block_key: 'bk9' });
+  });
+
+  it('keeps ordinary prose for a malformed external_call', () => {
+    const blocks = adaptBlocks([{
+      kind: 'assistant', block_key: 'bk9', text: 'prose',
+      detail: { external_call: { schema_version: 1, name: '', input: {}, truncated: false } },
+    } as never], 'codex');
+    expect(blocks).toEqual([{ kind: 'text', text: 'prose', block_key: 'bk9' }]);
+  });
+});
+
+// #463 S3 §6.5 — the privacy gate on the CLIENT model. The provider's own
+// session id is never published on a card, so no S3-derived field on the
+// adapted model can carry it. The pre-existing generic disclosure
+// (`detail.args` → `input` / `input_summary`) is the one recorded boundary and
+// carried the token long before S3; the wire contract names it in §8.
+describe('#463 S3 — no raw provider identifier reaches an S3-derived field', () => {
+  const wireBlock = {
+    kind: 'tool_call',
+    block_key: 'cbk1_stdin',
+    detail: {
+      name: 'write_stdin',
+      args: '{"chars":"yes\\n","session_id":70001}',
+      card: {
+        schema_version: 1, type: 'session_ref', scope: 'shell', ref: '1',
+        operation: 'write', chars: 'yes\n', truncated: false,
+      },
+    },
+    output: { text: 'ok\n', detail: { card: {
+      schema_version: 1, type: 'terminal_output', status: 'completed', is_error: false,
+      parts: [{ type: 'text', stream: 'output', text: 'ok\n' }],
+      truncated: false, exit_code: 0, wall_time_seconds: 0.5,
+    } } },
+  };
+
+  it('keeps the token out of every field S3 added', () => {
+    const [block] = adaptBlocks([wireBlock as never], 'codex');
+    const call = block as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    for (const derived of [call.native_card, call.outcome, call.preview]) {
+      expect(JSON.stringify(derived ?? null)).not.toContain('70001');
+    }
+    // Non-vacuity: the token really is in this fixture, on the one recorded
+    // boundary, so the assertions above are not passing over empty fields.
+    expect(JSON.stringify(call.input)).toContain('70001');
+    expect(call.input_summary).toContain('70001');
+    // And the reference the reader actually sees is the conversation-local
+    // ordinal, not the provider id.
+    expect((call.native_card as { ref: string }).ref).toBe('1');
+  });
+
+  it('keeps the token out of the adapted session index', () => {
+    const detail = adaptQualifiedDetail(ref, {
+      status: 'ok', conversation_key: ref.key, title: 't',
+      session_index: { sessions: { '1': { ordinal: 1, opener_block_key: 'cbk1_open' } }, truncated: false },
+      items: [{
+        item_key: 'civ1.a', kind: 'assistant', timestamp_utc: '2026-08-02T09:00:00Z',
+        model: 'gpt-synthetic-codex', cost_usd: 0, tokens: null, blocks: [wireBlock],
+      }],
+      page: { total: 1, returned: 1, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0, tokens: null,
+    } as Parameters<typeof adaptQualifiedDetail>[1]);
+    expect(JSON.stringify(detail.session_index)).not.toContain('70001');
+  });
+});
+
+// #463 S4 Task 7 — tier-1 enrichment, tier-2 landmarks, and the retention rule.
+describe('#463 S4 — the two-tier outline model', () => {
+  // A wire envelope shaped like real Codex data: the heavy assistant turn
+  // carries event rows, so the navigation filter drops it, and it is the turn
+  // that owns every landmark. S1 measured all 589 multi-segment Codex turns in
+  // the corpus carrying event rows and being dropped by that filter.
+  type OutlineWire = Parameters<typeof adaptQualifiedOutline>[1];
+  const heavyEnvelope = (): OutlineWire => ({
+    status: 'ok', conversation_key: ref.key,
+    turns: [
+      {
+        item_key: 'civ1.prompt', label: 'Ask', timestamp_utc: null,
+        kinds: { user: 1 }, segment_item_keys: ['civ1.prompt'],
+      },
+      {
+        item_key: 'civ1.reply', label: 'Long reply', timestamp_utc: '2026-08-02T09:00:00Z',
+        kinds: { event: 22, assistant: 15, tool_call: 142 },
+        member_item_keys: ['civ1.folded'],
+        segment_item_keys: ['civ1.reply', 'civ1.reply.s1', 'civ1.reply.s2'],
+        tools: [
+          { name: 'exec', is_error: true },
+          { name: 'apply_patch', is_error: false },
+        ],
+        tool_call_count: 142,
+        first_failure_name: 'exec',
+        thinking: ['Read the failing case', 'Apply the patch'],
+        model: 'gpt-synthetic-codex',
+      },
+    ],
+    landmarks: [
+      {
+        landmark_key: 'cbk1.head#0', block_key: 'cbk1.head', item_key: 'civ1.reply',
+        parent_item_key: 'civ1.reply', kind: 'reasoning' as const,
+        label: 'Read the failing case', timestamp_utc: '2026-08-02T09:00:01Z',
+      },
+      {
+        landmark_key: 'cbk1.err#tool_error', block_key: 'cbk1.err',
+        item_key: 'civ1.reply.s2', parent_item_key: 'civ1.reply',
+        kind: 'tool_error', label: 'exec',
+        timestamp_utc: '2026-08-02T09:00:07Z',
+      },
+      {
+        landmark_key: 'cbk1.plan#plan', block_key: 'cbk1.plan',
+        item_key: 'civ1.reply.s1', parent_item_key: 'civ1.reply',
+        kind: 'plan', label: 'update_plan',
+        timestamp_utc: '2026-08-02T09:00:05Z',
+      },
+    ],
+    stats: {
+      items: 2, kinds: { user: 1, assistant: 15 },
+      tool_counts: { exec: 2, apply_patch: 1 }, error_count: 1,
+      models: { 'gpt-synthetic-codex': 1 }, duration_seconds: 181,
+    },
+    files: [{
+      file_path: 'src/app.ts', tool: 'apply_patch', count: 2,
+      added: 5, removed: 1,
+      touches: [
+        { item_key: 'civ1.reply.s1', timestamp_utc: '2026-08-02T09:00:05Z', op: 'update' },
+        { item_key: 'civ1.reply.s2', timestamp_utc: '2026-08-02T09:00:09Z', op: 'add' },
+      ],
+    }],
+    children: [],
+  });
+
+  it('retains an event-bearing turn that owns a landmark', () => {
+    const wire = heavyEnvelope();
+    // Non-vacuity: with no landmarks the existing filter drops it, which is
+    // exactly why every landmark would otherwise be an orphan.
+    const without = adaptQualifiedOutline(
+      ref, { ...wire, landmarks: [] }, {}, new Set(['civ1.prompt']));
+    expect(without.turns.map((turn) => turn.uuid)).toEqual(['civ1.prompt']);
+
+    const outline = adaptQualifiedOutline(
+      ref, wire, {}, new Set(['civ1.prompt']));
+    expect(outline.turns.map((turn) => turn.uuid)).toEqual(['civ1.prompt', 'civ1.reply']);
+    // The retained turn keeps its document position, so the merged rail reads
+    // in wire order rather than with the landmark owner appended at the end.
+    expect(outline.turns[1].kind).toBe('assistant');
+  });
+
+  it('populates the tier-1 enrichment the jump families and stats card consume', () => {
+    const outline = adaptQualifiedOutline(
+      ref, heavyEnvelope(), {}, new Set(['civ1.prompt']));
+    const reply = outline.turns[1];
+    expect(reply.tools).toEqual([
+      { name: 'exec', is_error: true },
+      { name: 'apply_patch', is_error: false },
+    ]);
+    // Dedupe destroys both of these, so the wire republishes them (§4.4).
+    expect(reply.tool_call_count).toBe(142);
+    expect(reply.first_failure_name).toBe('exec');
+    expect(reply.thinking).toEqual(['Read the failing case', 'Apply the patch']);
+    expect(reply.model).toBe('gpt-synthetic-codex');
+    // Deliberately hardcoded (§6.2): Codex nests through separate child
+    // conversations, and `cache_failure` is a Claude concept.
+    expect(reply.subagent_key).toBeNull();
+    expect(reply.cache_failure).toBeUndefined();
+  });
+
+  it('maps landmarks onto their segment anchor and their owning turn', () => {
+    const outline = adaptQualifiedOutline(
+      ref, heavyEnvelope(), {}, new Set(['civ1.prompt']));
+    expect(outline.landmarks).toEqual([
+      {
+        landmark_key: 'cbk1.head#0', block_key: 'cbk1.head', uuid: 'civ1.reply',
+        parent_uuid: 'civ1.reply', kind: 'reasoning', label: 'Read the failing case',
+        ts: '2026-08-02T09:00:01Z',
+      },
+      {
+        landmark_key: 'cbk1.err#tool_error', block_key: 'cbk1.err',
+        uuid: 'civ1.reply.s2', parent_uuid: 'civ1.reply', kind: 'tool_error',
+        label: 'exec', ts: '2026-08-02T09:00:07Z',
+      },
+      {
+        landmark_key: 'cbk1.plan#plan', block_key: 'cbk1.plan',
+        uuid: 'civ1.reply.s1', parent_uuid: 'civ1.reply', kind: 'plan',
+        label: 'update_plan', ts: '2026-08-02T09:00:05Z',
+      },
+    ]);
+    // The anchor is a SEGMENT, which is what makes a jump land within forty
+    // blocks of the failure rather than at the top of a 142-call turn.
+    expect(outline.turns[1].segment_uuids).toContain(outline.landmarks![1].uuid);
+  });
+
+  it('publishes Codex files in the rich shape and omits provider_files', () => {
+    const outline = adaptQualifiedOutline(
+      ref, heavyEnvelope(), {}, new Set(['civ1.prompt']));
+    expect(outline.files).toEqual([{
+      path: 'src/app.ts', add: 5, del: 1,
+      touches: [
+        { uuid: 'civ1.reply.s1', tool_use_id: null, op: 'update', add: null, del: null },
+        { uuid: 'civ1.reply.s2', tool_use_id: null, op: 'add', add: null, del: null },
+      ],
+    }]);
+    // Rendering both arrays would list every Codex file twice, and the inert
+    // provider row is what kept the rich FileRow path unreachable (§6.6).
+    expect(outline.provider_files).toBeUndefined();
+  });
+
+  it('keeps a count-free file shape on provider_files', () => {
+    const outline = adaptQualifiedOutline(ref, {
+      status: 'ok', conversation_key: ref.key,
+      turns: [{ item_key: 'civ1.prompt', label: 'Ask', timestamp_utc: null, kinds: { user: 1 } }],
+      files: [{ file_path: 'src/app.ts', tool: 'patch_apply', count: 2 }],
+      children: [],
+    } as Parameters<typeof adaptQualifiedOutline>[1], {}, new Set(['civ1.prompt']));
+    expect(outline.files).toEqual([]);
+    expect(outline.provider_files).toEqual([{ path: 'src/app.ts', tool: 'patch_apply', count: 2 }]);
+  });
+
+  it('carries a null error_count through instead of coercing it to zero', () => {
+    const wire = heavyEnvelope();
+    const outline = adaptQualifiedOutline(ref, {
+      ...wire, stats: { ...wire.stats, error_count: null },
+    }, {}, new Set(['civ1.prompt']));
+    // `0` and `null` are different claims: one says nothing failed, the other
+    // says nobody could tell. Coercing turned the second into the first.
+    expect(outline.stats.error_count).toBeNull();
+  });
+});
+
+// #463 S4 §6.4 — the client half of ONE enumerated definition of a failed call.
+// The server kernel applies the uniform `{failed, error}` set to all four
+// disjuncts. Until these two edits landed, the server flagged a `status:
+// "error"` call as failed while the client resolved that card to `unknown` and
+// rendered no error badge — so the reader would jump to a call the interface
+// insists succeeded. §8.3 names that divergence as a risk and this is its
+// control: the two sides ship together.
+describe('#463 S4 — the client agrees with the server about a failed call', () => {
+  const outputCard = (over: Record<string, unknown> = {}) => ({
+    schema_version: 1, type: 'terminal_output', status: 'completed', is_error: false,
+    parts: [{ type: 'text', stream: 'output', text: 'body\n' }],
+    truncated: false, exit_code: null, wall_time_seconds: null, ...over,
+  });
+  const call = (block: unknown) =>
+    adaptBlocks([block as never], 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+
+  it('treats a terminal status of "error" as a failure, not as unknown', () => {
+    // `OUTCOME_STATUSES` excluded 'error', so the card collapsed to 'unknown'
+    // and `outcome?.status === 'failed'` never fired. §6.4 takes correctness
+    // over bug-compatibility: reproducing the client "exactly" would have
+    // frozen the defect.
+    const out = call({
+      kind: 'tool_call', detail: { name: 'exec_command', args: '{}' },
+      output: { detail: { card: outputCard({ status: 'error' }) } },
+    });
+    expect(out.outcome?.status).toBe('error');
+    expect(out.result?.is_error).toBe(true);
+  });
+
+  it('treats a web or MCP completion status of "failed" as a failure too', () => {
+    // The kernel applies ONE failure-status set to all four disjuncts. Reading
+    // `error` on web and MCP but `failed` on the others would mean a web
+    // completion carrying `failed` is a failure nobody flags — the same defect
+    // as the 'error' collapse with the two words exchanged.
+    const web = call({
+      kind: 'tool_call',
+      detail: {
+        name: 'web_search', args: '{}',
+        card: {
+          schema_version: 1, type: 'web_search', source: 'web_search_call',
+          call_status: 'completed', query: 'q', action: {},
+          completion: { status: 'failed', query: 'q', action: {}, results: [], error: 'upstream refused' },
+        },
+      },
+    });
+    expect(web.result?.is_error).toBe(true);
+    const mcp = call({
+      kind: 'tool_call',
+      detail: {
+        name: 'fixture_tool', args: '{}',
+        card: {
+          schema_version: 1, type: 'mcp', source: 'function_call', name: 'fixture_tool',
+          call_status: 'completed',
+          completion: {
+            server: 'fixture', tool: 't', arguments: {}, duration: { secs: 0, nanos: 1 },
+            result: { Err: 'nope' }, status: 'failed',
+          },
+        },
+      },
+    });
+    expect(mcp.result?.is_error).toBe(true);
+  });
+
+  it('still refuses to call running or unknown a failure', () => {
+    // `unknown` is a real state covering 17.6% of outputs — 4,585 of them are
+    // open sessions, measured — rather than an absence.
+    for (const status of ['running', 'unknown']) {
+      const out = call({
+        kind: 'tool_call', detail: { name: 'wait', args: '{}' },
+        output: { detail: { card: outputCard({ status }) } },
+      });
+      expect(out.result?.is_error).toBe(false);
+    }
+  });
+
+  // §7.3 — the second assertion. The shipped version asserted only
+  // `result === null`, which holds for ANY classification of `status: 'error'`
+  // — including one that ignores it — so it could not go red. This one pins the
+  // relationship it names: `'error'` must be a failure status, and the web
+  // family must read the same set as every other.
+  it('flags a web completion whose status is the word `error`', () => {
+    const web = (status: string) => call({
+      kind: 'tool_call',
+      detail: {
+        name: 'web_search', args: '{}',
+        card: {
+          schema_version: 1, type: 'web_search', source: 'web_search_call',
+          call_status: 'completed', query: 'q', action: {},
+          completion: { status, query: 'q', action: {}, results: [], error: 'upstream 502' },
+        },
+      },
+    });
+    // Drop `'error'` from FAILED_STATUSES and this flips to false.
+    expect(web('error').result?.is_error).toBe(true);
+    // Non-vacuity in the other direction: the flag is not simply always on.
+    expect(web('completed').result?.is_error).toBe(false);
+  });
+
+  // §7.3 / §8.2, corrected. The spec claimed such a card "can have
+  // `outputError === true` while `result` stays null, so the filter and the
+  // badge are not the same set even in principle". They ARE the same set here:
+  // `outcome` is terminal-only, so the badge has nothing to read either, and a
+  // card with no renderable output reports its failure on NEITHER surface.
+  it('reports a resultless web failure on neither surface, badge included', () => {
+    const out = call({
+      kind: 'tool_call',
+      detail: {
+        name: 'web_search', args: '{}',
+        card: {
+          schema_version: 1, type: 'web_search', source: 'web_search_call',
+          call_status: 'completed', query: 'q', action: {},
+          completion: { status: 'error', query: 'q', action: {}, results: [] },
+        },
+      },
+    });
+    expect(out.result).toBeNull();
+    expect(out.outcome).toBeUndefined();
+  });
+});
+
+// #463 S4 F-A — the finer jump anchor has to survive adaptation, because the
+// landmark names a physical row and the reader can only find it in the DOM if
+// the adapted block still carries that row's key.
+describe('#463 S4 F-A — block keys reach the rendered block', () => {
+  it('retains the block key on an adapted Codex tool call', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_call', block_key: 'cbk1.e1', detail: { name: 'exec', args: '{}' },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(out.block_key).toBe('cbk1.e1');
+  });
+
+  it('retains the block key on an adapted patch_apply_end event', () => {
+    const out = adaptBlocks([{
+      kind: 'event', block_key: 'cbk1.pa',
+      detail: {
+        card: {
+          schema_version: 1, type: 'patch', source: 'patch_apply_end',
+          success: true, files: [{ path: 'a.py', kind: 'update' }],
+        },
+      },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+    expect(out.block_key).toBe('cbk1.pa');
+  });
+
+  it('retains the block key on an adapted Codex reasoning block', () => {
+    const out = adaptBlocks([{
+      kind: 'reasoning', block_key: 'cbk1.r',
+      detail: { reasoning: { schema_version: 1, title: 'Checking', source: 'codex' } },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'codex_reasoning' }>;
+    expect(out.kind).toBe('codex_reasoning');
+    expect(out.block_key).toBe('cbk1.r');
+  });
+});
+
+// C-4 — an unfolded failing `tool_output` is its own group head and therefore
+// its own landmark, so the outline can publish its block key as a jump address.
+// The adapter dropped that key on the floor, so the address named nothing.
+describe('#463 S4 remediation — the unfolded tool_output keeps its address', () => {
+  it('retains the block key on an adapted Codex tool_output block', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_output', text: 'boom', block_key: 'cbk1.o',
+      call_id: 'call-shared', detail: { is_error: true },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.kind).toBe('tool_result');
+    expect(out.is_error).toBe(true);
+    expect(out.block_key).toBe('cbk1.o');
+  });
+
+  // Round 3 — found by the golden F3 added, not by reading the code. The wire
+  // block for the ambiguous-call output carries its verdict on the DECODED CARD
+  // (`detail.card.is_error` / `detail.card.status`), which is where
+  // `decode_tool_output_card` writes it; `detail.is_error` is the Claude-shaped
+  // field and is absent on every Codex output. So the one block the C-4 work
+  // exists to make addressable rendered without the failure treatment, and the
+  // new golden would have certified `is_error: false` for a row the server had
+  // already classified as a failure and published a `tool_error` landmark for.
+  it('reads the failure verdict off the decoded card on a Codex tool_output', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_output', text: 'which call was this\n', block_key: 'cbk1.amb',
+      call_id: 'shared', detail: {
+        card: {
+          schema_version: 1, type: 'terminal_output', status: 'failed',
+          is_error: true, truncated: false, exit_code: null,
+          parts: [{ type: 'text', stream: 'output', text: 'which call was this\n' }],
+        },
+      },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.is_error).toBe(true);
+  });
+
+  // The sibling field on the same card, swept with it: `truncated` was hard
+  // coded `false` on this branch, so an output the text budget had cut rendered
+  // as if it were whole. A Claude `tool_result` decodes no card and keeps
+  // `false`, which is what it always was.
+  it('reports truncation from the same decoded card', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_output', text: 'partial', block_key: 'cbk1.cut', call_id: 'shared',
+      detail: {
+        card: {
+          schema_version: 1, type: 'terminal_output', status: 'completed',
+          is_error: false, truncated: true, exit_code: 0,
+          parts: [{ type: 'text', stream: 'output', text: 'partial' }],
+        },
+      },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.truncated).toBe(true);
+  });
+
+  it('does not invent a failure on a decoded card that completed', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_output', text: 'ok\n', block_key: 'cbk1.ok', call_id: 'shared',
+      detail: {
+        card: {
+          schema_version: 1, type: 'terminal_output', status: 'completed',
+          is_error: false, truncated: false, exit_code: 0,
+          parts: [{ type: 'text', stream: 'output', text: 'ok\n' }],
+        },
+      },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.is_error).toBe(false);
+  });
+
+  it('retains the block key on an adapted Claude tool_result block', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_result', text: 'boom', block_key: 'cbk1.tr',
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.block_key).toBe('cbk1.tr');
+  });
+
+  // The sibling site: an UNFOLDED `web_search_end` / `mcp_tool_call_end` falls
+  // through to the prose fallback, and a failing one of those is a landmark
+  // anchored on its own block key.
+  it('retains the block key on the prose fallback for an unfolded event', () => {
+    const out = adaptBlocks([{
+      kind: 'event', text: 'web_search_end', block_key: 'cbk1.ev',
+      detail: { event: 'web_search_end' },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'text' }>;
+    expect(out.kind).toBe('text');
+    expect(out.block_key).toBe('cbk1.ev');
+  });
+
+  // Round 3 (F12) — the prose fallback was gated on `block.text`, so an event
+  // row with no display text emitted NO block and a landmark anchored on it had
+  // no address at all. Pre-existing rather than introduced by S4, and inert on
+  // the store measured here — 0 of the 219,503 normalized rows in the real
+  // conversations database have an empty display text on any kind that reaches
+  // this branch (11,479 event rows and 2,982 meta rows, all non-empty via
+  // `_row_display`'s text / search_thinking / search_tool chain) — but the
+  // address is exactly what a `tool_error` landmark on such a row needs, so the
+  // block is emitted for its key rather than dropped.
+  it('emits a keyed anchor for an unfolded event with no display text', () => {
+    const out = adaptBlocks([{
+      kind: 'event', text: '', block_key: 'cbk1.silent',
+      detail: { event: 'mcp_tool_call_end' },
+    }] as never, 'codex') as Extract<ConversationBlock, { kind: 'text' }>[];
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe('text');
+    expect(out[0].text).toBe('');
+    expect(out[0].block_key).toBe('cbk1.silent');
+  });
+
+  it('still emits nothing for a text-less block that carries no key to anchor', () => {
+    expect(adaptBlocks([{
+      kind: 'event', text: '', detail: { event: 'mcp_tool_call_end' },
+    }] as never, 'codex')).toEqual([]);
+  });
+});
+
+// ---- #463 S4 remediation round 4 — the last two Claude-shaped verdicts ------
+//
+// `classify_tool_failure` (`bin/_lib_codex_landmarks.py`) treats a patch as
+// failed on `success is False` OR `status in {"failed", "error"}`, and
+// `decode_patch_event_card` passes the provider's raw status through. The
+// client tested `status === 'failed'` as a bare literal on both the adapter and
+// the card, so a `patch_apply_end` carrying `status: "error"` without
+// `success: false` got a `tool_error` landmark from the server — counted by the
+// Errors badge — while the client called it not-failed and the Errors filter
+// hid the very turn the badge had counted.
+describe('#463 S4 — a patch event reads the same failure-status set as the server', () => {
+  const patchEvent = (card: Record<string, unknown>) => adaptBlocks([{
+    kind: 'event', block_key: 'cbk1.pa', text: 'patch',
+    detail: {
+      card: {
+        schema_version: 1, type: 'patch', source: 'patch_apply_end',
+        files: [{ path: 'a.py', status: 'update' }], has_diff: false,
+        stdout: '', stderr: '', truncated: false, ...card,
+      },
+    },
+  }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+
+  it('calls a patch whose status is the word `error` a failure', () => {
+    expect(patchEvent({ status: 'error' }).result?.is_error).toBe(true);
+  });
+
+  it('keeps calling `failed` a failure', () => {
+    expect(patchEvent({ status: 'failed' }).result?.is_error).toBe(true);
+  });
+
+  it('keeps calling `success: false` a failure whatever the status says', () => {
+    expect(patchEvent({ status: 'completed', success: false }).result?.is_error).toBe(true);
+  });
+
+  it('does not invent a failure on a completed patch', () => {
+    expect(patchEvent({ status: 'completed', success: true }).result?.is_error).toBe(false);
+  });
+});
+
+// P3-3 — the `FAILED_STATUSES.has(outputCard?.status)` disjunct on the
+// unfolded-`tool_output` branch was never exercised on its own: the three
+// round-3 tests set `is_error` and `status` consistently, so the earlier
+// disjunct short-circuited and the status read could have been deleted without
+// reddening anything.
+describe('#463 S4 — the tool_output status disjunct stands on its own', () => {
+  it('flags a card whose is_error is false but whose status is `error`', () => {
+    const out = adaptBlocks([{
+      kind: 'tool_output', text: 'boom\n', block_key: 'cbk1.statusonly', call_id: 'shared',
+      detail: {
+        card: {
+          schema_version: 1, type: 'terminal_output', status: 'error',
+          is_error: false, truncated: false, exit_code: 1,
+          parts: [{ type: 'text', stream: 'output', text: 'boom\n' }],
+        },
+      },
+    }] as never, 'codex')[0] as Extract<ConversationBlock, { kind: 'tool_result' }>;
+    expect(out.is_error).toBe(true);
+  });
+});
+
+// P3-1 — `adaptQualifiedPayload` hard-coded `is_error: false` on the result
+// branch, discarding the verdict the server publishes on the same card the
+// paged detail path reads. Dead today, because `useFullPayload` consumers read
+// only `text`/`input`, but it is the third instance of the same Claude-shaped
+// assumption and the one a future consumer would trust.
+describe('#463 S4 — the full-payload result branch keeps the server verdict', () => {
+  const payload = (card?: NativeToolCard | NativeTerminalOutput) => {
+    const out = adaptQualifiedPayload('cbk1.o', 'result', {
+      which: 'output', content: 'boom\n', truncated: false, card,
+    });
+    // Narrow the discriminated union so `is_error` is reachable at all — the
+    // field exists only on the result arm, which is the point of the branch.
+    if (out.which !== 'result') throw new Error(`expected a result payload, got ${out.which}`);
+    return out;
+  };
+
+  // Round 5 — no cast. The body annotation is a union that includes
+  // `NativeTerminalOutput`, so the card this branch really receives is now
+  // expressible; before, the only way to hand the adapter a correct card was to
+  // cast it through `unknown` into a union it does not belong to.
+  const outputCard = (over: Partial<NativeTerminalOutput>): NativeTerminalOutput => ({
+    schema_version: 1, type: 'terminal_output', status: 'completed',
+    is_error: false, truncated: false, exit_code: 0,
+    parts: [{ type: 'text', stream: 'output', text: 'boom\n' }],
+    ...over,
+  });
+
+  it('reports the failure the card states', () => {
+    expect(payload(outputCard({ is_error: true, status: 'failed' })).is_error).toBe(true);
+  });
+
+  it('reports a failure stated only by the status', () => {
+    expect(payload(outputCard({ is_error: false, status: 'error' })).is_error).toBe(true);
+  });
+
+  it('reports no failure on a completed card', () => {
+    expect(payload(outputCard({})).is_error).toBe(false);
+  });
+
+  it('reports no failure when the route published no card at all', () => {
+    expect(payload(undefined).is_error).toBe(false);
+  });
+});
+
+// #463 S4 remediation round 6 — the event branch's fail-closed card drop is
+// runtime behavior, not an annotation. Round 5 stopped passing `body.card`
+// straight through and substitutes `undefined` for a `terminal_output` card,
+// because `FullPayload`'s event arm means an event card specifically and a
+// result card arriving there would be a server publishing the wrong family.
+// Nothing tested that substitution, so it could have been reverted silently.
+describe('#463 S4 — the full-payload event branch drops a foreign card family', () => {
+  const eventPayload = (card?: NativeToolCard | NativeTerminalOutput) => {
+    const out = adaptQualifiedPayload('cbk1.e', 'event', {
+      which: 'event', content: 'raw event\n', truncated: false, card,
+    });
+    if (out.which !== 'event') throw new Error(`expected an event payload, got ${out.which}`);
+    return out;
+  };
+
+  const terminalOutputCard: NativeTerminalOutput = {
+    schema_version: 1, type: 'terminal_output', status: 'failed',
+    is_error: true, truncated: false, exit_code: 1,
+    parts: [{ type: 'text', stream: 'output', text: 'boom\n' }],
+  };
+
+  const eventCard: NativeToolCard = {
+    schema_version: 1, type: 'plan', source: 'update_plan', call_status: 'requested',
+    explanation: null, items: [{ step: 'Only step', status: 'completed' }],
+  };
+
+  it('drops a terminal_output card rather than publishing it as an event card', () => {
+    expect(eventPayload(terminalOutputCard).card).toBeUndefined();
+  });
+
+  it('passes a genuine event card through unchanged', () => {
+    expect(eventPayload(eventCard).card).toBe(eventCard);
+  });
+
+  it('leaves the rest of the event payload intact when the card is dropped', () => {
+    const out = eventPayload(terminalOutputCard);
+    expect(out.text).toBe('raw event\n');
+    expect(out.tool_use_id).toBe('cbk1.e');
+    expect(out.full_length).toBe('raw event\n'.length);
+  });
+});
+
+describe('qualified Claude conversation adapters', () => {
+  it('preserves the canonical top-level tool-call contract', () => {
+    const input = { query: 'select:TaskCreate,TaskUpdate', max_results: 10 };
+    const result = {
+      text: '{"matches":["TaskCreate","TaskUpdate"]}',
+      truncated: false,
+      full_length: 45,
+      is_error: false,
+    };
+    const call = adaptBlocks([{
+      kind: 'tool_call',
+      name: 'ToolSearch',
+      input,
+      input_summary: '{"query":"select:TaskCreate,TaskUpdate","max_results":10}',
+      input_truncated: false,
+      preview: 'select:TaskCreate,TaskUpdate',
+      result,
+      tool_use_id: 'toolu_fixture',
+    } as never], 'claude')[0] as Extract<ConversationBlock, { kind: 'tool_call' }>;
+
+    expect(call).toMatchObject({
+      kind: 'tool_call',
+      name: 'ToolSearch',
+      input,
+      input_summary: '{"query":"select:TaskCreate,TaskUpdate","max_results":10}',
+      preview: 'select:TaskCreate,TaskUpdate',
+      result,
+      tool_use_id: 'toolu_fixture',
+    });
   });
 });

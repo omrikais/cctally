@@ -15,6 +15,7 @@ cctally config unset <key>
 | Key | Values | Default |
 |-----|--------|---------|
 | `dashboard.bind` | `loopback` (= `127.0.0.1`, default), `lan` (= `0.0.0.0`), or any literal host string (IPv4, IPv6, hostname). Resolution order: `--host` flag > config > default. Applies only at server startup. | `loopback` |
+| `dashboard.lan_auth` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Requires the per-run bearer token on every `/api/*` request when the dashboard binds to a non-loopback address. `true` (default) is fail-safe; set `false` only for a trusted LAN. Also toggleable from the dashboard Settings overlay. The running server keeps its startup access mode, so a change applies **only after restarting the dashboard**. | `true` |
 | `dashboard.expose_transcripts` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). The LAN opt-in for the conversation-viewer transcript endpoints. When `false` (default) those routes are served **only** over loopback; set `true` to also serve them on a LAN bind. Even then an anti-DNS-rebinding `Host` allowlist applies — see [`dashboard.md`](dashboard.md#conversation-viewer-endpoints-plan-2). | `false` |
 | `dashboard.cache_failure_markers` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the conversation-viewer cache-rebuild markers (the amber `⚡` chip on a turn that re-created the bulk of its cached prefix). `true` (default) shows them; set `false` to hide every marker, the outline landmark/jump button, and the stats count. Absence is treated as ON. Also toggleable from the dashboard settings modal. | `true` |
 | `dashboard.live_tail` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the conversation-viewer live-tail. `true` (default) lets the open reader follow an active session in near-real time via a dedicated per-conversation SSE stream (new turns within ~1s of the session's file changing); set `false` to fall back to the periodic 5-second snapshot tick. Absence is treated as ON. Also toggleable from the dashboard settings modal. See [`dashboard.md`](dashboard.md#live-tail). | `true` |
@@ -204,8 +205,10 @@ the dashboard without `--tz` to re-enable Settings-driven changes.
 
 ## Dashboard mirror
 
-The web dashboard's Settings overlay (`s` key) has a "Display timezone"
-section that mirrors `display.tz`. Saving from the dashboard hits
+The web dashboard's Settings overlay (`s` key) mirrors `display.tz` and the
+dashboard preferences. Its **Require LAN access token** toggle controls
+`dashboard.lan_auth`; saving it does not alter the running server, and the
+new access mode begins only after the dashboard restarts. Saving hits
 `POST /api/settings` (gated by Origin-vs-Host parity CSRF; see
 [`docs/commands/dashboard.md`](dashboard.md#threat-model)); the change
 propagates to all open tabs via SSE within ~100ms. Disabled while pinned
@@ -228,7 +231,9 @@ For the parse-time tz rules on `--since`/`--until` and friends, see the per-subc
   neither `local` nor `utc` nor a recognized IANA name.
 - `cctally config: unknown config key '<X>'` (exit 2) — the key is not
   in the allowlist (`display.tz`, `dashboard.bind`,
-  `dashboard.expose_transcripts`, `telemetry.enabled`, the `alerts.*` keys
+  `dashboard.lan_auth`, `dashboard.expose_transcripts`,
+  `dashboard.cache_failure_markers`, `dashboard.live_tail`,
+  `telemetry.enabled`, the `alerts.*` keys
   including `alerts.notifier` / `alerts.command_template`, the `statusline.*`
   keys, the `budget.*` keys, and the `update.check.*` keys).
 - `cctally: alerts config error: <detail>` (exit 2) — an

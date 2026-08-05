@@ -38,6 +38,7 @@
 // and BlockTimeline.tsx precedent.
 import type { CacheReportDailyRow } from '../types/envelope';
 import { CACHE_REPORT_BAND_PP } from '../lib/cache-report-constants';
+import { cacheReportChartDayCount } from '../lib/cacheReportChartLabels';
 import { cachePercent, cacheVocabulary } from '../lib/cacheReportVocabulary';
 import { computeAutoZoomDomain } from '../lib/chartDomain';
 import { cacheReportChartSlot } from '../lib/cacheReportChartSlots';
@@ -173,20 +174,12 @@ export function CacheSparkline({
   // The shared band-center contract keeps the guide fully inside the viewBox;
   // unlike the former edge-to-edge sparkline, no one-off inset is needed.
   const todayGuideCx = todayCx;
-  // #443 S2 QA P3-b noted that this announces the MEASURED count while the
-  // net-bars beside it announce the window, so a screen-reader user hears two
-  // sizes for one report. Left alone deliberately: counting only observed
-  // days here is an S1 decision with its own test, and reconciling the two
-  // charts is a presentation call that belongs in a design gate, not a QA
-  // fix-up. Tracked in cctally-dev#469.
-  const plottedCount = plottable.length;
-
   const svg = (
     <svg
       className="cr-spark"
       {...svgSizeProps}
       viewBox={`0 0 ${cfg.width} ${cfg.height}`}
-      aria-label={`${vocab.sparklineLabel}, ${plottedCount} days`}
+      aria-label={`${vocab.sparklineLabel}, ${cacheReportChartDayCount(ordered)}`}
     >
       {/* Gridlines (large only) — three horizontal rules at the zoomed
           domain's hi / mid / lo so the user can read the polyline's

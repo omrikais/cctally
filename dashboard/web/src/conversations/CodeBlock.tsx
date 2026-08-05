@@ -14,7 +14,15 @@ import { toJsxRuntime } from 'hast-util-to-jsx-runtime';
 import { Fragment, jsx as _jsx, jsxs as _jsxs } from 'react/jsx-runtime';
 import type { Root } from 'hast';
 import { CopyButton } from './CopyButton';
-import { applyMarksToHast, splitToReactNodes, useFindSplit, type SplitFn } from './findMark';
+import {
+  applyGlobalExactMarksToHast,
+  applyMarksToHast,
+  splitToExactNodes,
+  splitToReactNodes,
+  useFindSplit,
+  type ExactLeafTarget,
+  type SplitFn,
+} from './findMark';
 
 // Syntax-highlighted fenced-code renderer (C6). refractor (the Prism
 // tokenizer) produces a hast tree; hast-util-to-jsx-runtime turns that tree
@@ -57,21 +65,36 @@ export function isRegistered(lang: string): boolean {
 // (skipCode: false — marks ARE wanted inside a code block) before toJsxRuntime;
 // an unregistered language (or a refractor throw) routes through
 // splitToReactNodes so the raw text still marks.
-export function highlightBody(code: string, lang: string, split?: SplitFn | null): React.ReactNode {
+export function highlightBody(
+  code: string,
+  lang: string,
+  split?: SplitFn | null,
+  exactTargets: ExactLeafTarget[] = [],
+): React.ReactNode {
   const l = ALIASES[lang] ?? lang;
   if (refractor.registered(l)) {
     try {
       const tree = refractor.highlight(code, l) as unknown as Root;
-      if (split) applyMarksToHast(tree, split, { skipCode: false });
+      if (exactTargets.length) applyGlobalExactMarksToHast(tree, exactTargets);
+      else if (split) applyMarksToHast(tree, split, { skipCode: false });
       return toJsxRuntime(tree, { Fragment, jsx: _jsx, jsxs: _jsxs });
     } catch {
+      if (exactTargets.length) {
+        const byTarget = exactTargets;
+        return splitToExactNodes(code, byTarget);
+      }
       return split ? splitToReactNodes(code, split) : code;
     }
   }
   return split ? splitToReactNodes(code, split) : code;
 }
 
-export function CodeBlock({ lang, filename, code }: { lang: string; filename?: string; code: string }) {
+export function CodeBlock({ lang, filename, code, exactTargets = [] }: {
+  lang: string;
+  filename?: string;
+  code: string;
+  exactTargets?: ExactLeafTarget[];
+}) {
   const split = useFindSplit();
   return (
     <div className="codeblock">
@@ -80,7 +103,7 @@ export function CodeBlock({ lang, filename, code }: { lang: string; filename?: s
         {filename && <span className="cb-file">{filename}</span>}
         <CopyButton text={code} className="cb-copy" />
       </div>
-      <pre className="conv-code conv-code--hl">{highlightBody(code, lang, split)}</pre>
+      <pre className="conv-code conv-code--hl">{highlightBody(code, lang, split, exactTargets)}</pre>
     </div>
   );
 }

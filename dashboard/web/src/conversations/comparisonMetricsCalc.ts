@@ -19,7 +19,11 @@ export interface ComparisonMetrics {
   cost: number;
   tokens: number;
   prompts: number;
-  errors: number;
+  // #463 S4 §6.5 — NULLABLE, following durationSeconds. `?? 0` turned "nobody
+  // could tell" into "nothing failed", so Compare rendered a confident zero for
+  // a conversation whose failure evidence is gone. The strip renders the
+  // declined state instead.
+  errors: number | null;
   durationSeconds: number | null;
   files: number;
 }
@@ -35,8 +39,13 @@ export function metricsFromOutline(
       ? (t.input ?? 0) + (t.output ?? 0)
       : (t?.input ?? 0) + (t?.output ?? 0) + (t?.cache_creation ?? 0) + (t?.cache_read ?? 0),
     prompts: promptSpineLength,
-    errors: o.stats.error_count ?? 0,
+    errors: o.stats.error_count ?? null,
     durationSeconds: o.stats.duration_seconds ?? null,
-    files: o.provider_files?.length ?? o.files?.length ?? 0,
+    // #463 S4 §6.5 — prefer whichever array has entries. The precedence read
+    // `provider_files?.length ?? files?.length`, and `0` is not nullish, so an
+    // EMPTY provider list masked a populated rich one. §6.2 omits
+    // `provider_files` for Codex so the mask does not fire today; the
+    // precedence is wrong regardless of whether anything currently trips it.
+    files: (o.provider_files?.length || o.files?.length) ?? 0,
   };
 }

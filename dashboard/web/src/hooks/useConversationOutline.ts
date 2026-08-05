@@ -4,7 +4,6 @@ import { useSnapshot } from './useSnapshot';
 import { revalToken } from '../lib/revalToken';
 import { conversationEntityUrl } from '../lib/conversationTransport';
 import { adaptQualifiedOutline, ConversationNormalizationPending } from '../lib/conversationAdapters';
-import type { NativeTokens } from '../lib/conversationAdapters';
 import {
   conversationRefKey,
   isQualifiedConversationRef,
@@ -64,15 +63,13 @@ export function useConversationOutline(
       const body = isQualifiedConversationRef(ref)
         ? await Promise.all([
             fetchJson<Parameters<typeof adaptQualifiedOutline>[1]>(conversationEntityUrl(ref, 'outline')),
-            fetchJson<{ total_cost_usd?: number; tokens?: NativeTokens }>(
-              conversationEntityUrl(ref, 'detail', { limit: 1 })),
             ref.source === 'claude'
               ? fetchJson<{ prompts?: { item_key: string; text: string }[] }>(conversationEntityUrl(ref, 'prompts'))
               : Promise.resolve(null),
-          ]).then(([rawOutline, rawDetail, rawPrompts]) => adaptQualifiedOutline(
+          ]).then(([rawOutline, rawPrompts]) => adaptQualifiedOutline(
             ref,
             rawOutline,
-            rawDetail,
+            {},
             rawPrompts ? new Set((rawPrompts.prompts ?? []).map((prompt) => prompt.item_key)) : undefined,
           ))
         : await fetchJson<ConversationOutline>(conversationEntityUrl(ref, 'outline'));

@@ -18,12 +18,10 @@ model-to-row fold: applying ``stable_sum`` only at the outer layer leaves
 it intact. These tests therefore drive the real aggregators, not just the
 helper.
 
-Note on the settled verdict: ``stable_sum`` is exactly-rounded, and the
-true sum of these three binary floats IS negative (by ~1e-20), so every
-order now agrees on ``net_negative=True``. ONE verdict is the invariant
-under test. Whether the predicate should additionally carry the repo's
-1e-9 USD tolerance is a SEPARATE decision on preserve-listed
-``net_negative`` behavior and is deliberately not made here.
+The stable sum is exactly-rounded, and the true sum of these three binary
+floats is negative by ~1e-20. The anomaly predicate applies the repository's
+1e-9 USD tolerance, so every order must now agree that this effectively-zero
+row is not ``net_negative``.
 """
 from __future__ import annotations
 
@@ -132,7 +130,7 @@ def _day_entry(cc, cr):
     )
 
 
-def test_day_aggregator_verdict_is_entry_order_independent():
+def test_day_exact_cancellation_is_not_net_negative_across_entry_orders():
     """The end-to-end case: the real day fold, all six permutations.
 
     All three entries share one model and one calendar day, so they land
@@ -150,8 +148,9 @@ def test_day_aggregator_verdict_is_entry_order_independent():
         nets.add(rows[0].net_usd)
         verdicts.add(rows[0].anomaly_triggered)
     assert len(nets) == 1, f"entry order changed the day row's net_usd: {nets}"
-    assert len(verdicts) == 1, (
-        f"entry order changed the day row's anomaly verdict: {verdicts}"
+    assert verdicts == {False}, (
+        "an effectively-zero day row must not trigger net_negative, "
+        f"got {verdicts}"
     )
 
 

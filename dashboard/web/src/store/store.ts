@@ -337,6 +337,9 @@ export interface DashboardPrefs {
   // absent on the wire — the selector treats absence as ON (opt-out, default
   // true).
   live_tail?: boolean;
+  // Restart-only non-loopback API authentication preference (issue #282).
+  // Absence is fail-safe ON for older servers and first paint.
+  lan_auth?: boolean;
 }
 
 export interface UIState {
@@ -401,6 +404,15 @@ export interface UIState {
   // (Bug 2 ≡ #187) rather than the scroll-sync topmost-visible turn (which sits
   // above a centered target). Transient: reset on a genuine session switch.
   convPinnedUuid: string | null;
+  // #463 S4 remediation — the INNER anchor the pinned jump aligned, when it had
+  // one. A pin names the item a jump loaded, and a Codex item can hold several
+  // landmarks, so the uuid alone does not say which of them the reader is
+  // sitting on. The outline rail needs that to mark one row rather than every
+  // row sharing the segment, and it must hold for a chip jump and a keyboard
+  // jump too — not only for the rail's own click, which is the single writer the
+  // pre-remediation code had. Null whenever the landed jump named no inner
+  // anchor (a prompt, a deep link, a reading-position restore).
+  convPinnedAnchorKey: string | null;
   // #217 S6 F4 — the CURRENT conversation's bookmarks (uuid → { note, ts }), UI
   // state in the same family as convPinnedUuid / convFocusMode. Hydrated from
   // localStorage (loadBookmarks) on BOTH selection actions (OPEN_CONVERSATION +
@@ -728,6 +740,7 @@ function loadInitial(): UIState {
     convOutlineTab: 'outline',
     convCurrentTurnUuid: null,
     convPinnedUuid: null,
+    convPinnedAnchorKey: null,
     // #217 S6 F4 — no conversation selected at init → no bookmarks hydrated.
     convBookmarks: {},
     convFindOpen: false,
@@ -811,6 +824,12 @@ export function selectMarkersEnabled(s: UIState = state): boolean {
 // EventSource, so the defaulting lives in one place.
 export function selectLiveTailEnabled(s: UIState = state): boolean {
   return s.dashboardPrefs.live_tail !== false;
+}
+
+// Restart-only LAN API authentication opt-out. The active process captures
+// this at boot; Settings edits only change what the next dashboard run uses.
+export function selectLanAuthEnabled(s: UIState = state): boolean {
+  return s.dashboardPrefs.lan_auth !== false;
 }
 
 // Beta-channel (spec 2026-07-21 §3) — the single defaulting path for the
@@ -1005,7 +1024,7 @@ export type Action =
   // the reader's jump effect when a jump lands; CLEAR_CONV_PIN by explicit user
   // navigation. The pin takes precedence over the scroll-sync cursor for
   // aria-current + jump-to-next (closes #187).
-  | { type: 'SET_CONV_PINNED_TURN'; uuid: string }
+  | { type: 'SET_CONV_PINNED_TURN'; uuid: string; anchorKey?: string | null }
   | { type: 'CLEAR_CONV_PIN' }
   // #217 S6 F4 — bookmark mutations on the current conversation. Both reducers
   // write through to localStorage (the recordReadingPos write-through pattern)
@@ -1233,6 +1252,15 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         accountFocus: { ...state.accountFocus, [action.source]: action.account },
+        // #347 an open reader is account-qualified identity.  Clear it before
+        // the rail reloads so content fetched under the prior focus can never
+        // remain visible while the global chip names a different account.
+        selectedConversationId: null,
+        selectedConversationRef: null,
+        conversationJump: null,
+        convFindOpen: false,
+        compare: null,
+        comparePick: null,
       };
       break;
     case 'OPEN_SOURCE_DETAIL':
@@ -1329,7 +1357,7 @@ export function dispatch(action: Action): void {
         // jump) keeps the live map (which may carry an unsaved-to-state mutation
         // mid-flight). action.sessionId is non-null for OPEN_CONVERSATION.
         ...(switched
-          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convFindOpen: false, convOutlineMobileOpen: false, convBookmarks: loadBookmarks(conversationRef) }
+          ? { convFocusMode: 'all' as const, convOutlineTab: 'outline' as const, convCurrentTurnUuid: null, convPinnedUuid: null, convPinnedAnchorKey: null, convFindOpen: false, convOutlineMobileOpen: false, convBookmarks: loadBookmarks(conversationRef) }
           : {}),
       };
       break;
@@ -1374,6 +1402,7 @@ export function dispatch(action: Action): void {
         convCurrentTurnUuid: null,
         // #188 S2 — drop the explicit pin on a select too.
         convPinnedUuid: null,
+        convPinnedAnchorKey: null,
       };
       break;
     }
@@ -1565,13 +1594,19 @@ export function dispatch(action: Action): void {
       }
       state = { ...state, convCurrentTurnUuid: action.uuid };
       break;
-    case 'SET_CONV_PINNED_TURN':
-      if (state.convPinnedUuid === action.uuid) break; // no-op: avoid a needless emit
-      state = { ...state, convPinnedUuid: action.uuid };
+    case 'SET_CONV_PINNED_TURN': {
+      // #463 S4 remediation — the anchor is part of the pin's identity, so the
+      // no-op guard tests BOTH halves. Re-pinning the same segment on a
+      // different landmark inside it is a real move of the rail's highlight.
+      const anchorKey = action.anchorKey ?? null;
+      if (state.convPinnedUuid === action.uuid
+          && state.convPinnedAnchorKey === anchorKey) break;
+      state = { ...state, convPinnedUuid: action.uuid, convPinnedAnchorKey: anchorKey };
       break;
+    }
     case 'CLEAR_CONV_PIN':
-      if (state.convPinnedUuid === null) break; // already clear — no emit
-      state = { ...state, convPinnedUuid: null };
+      if (state.convPinnedUuid === null && state.convPinnedAnchorKey === null) break;
+      state = { ...state, convPinnedUuid: null, convPinnedAnchorKey: null };
       break;
     case 'TOGGLE_BOOKMARK': {
       // #217 S6 F4 — write through to localStorage, then re-read the saved map so

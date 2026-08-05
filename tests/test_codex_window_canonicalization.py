@@ -1085,9 +1085,9 @@ def test_the_stats_index_epoch_is_unchanged(stats_ns):
     Public #5 IS such a change and deliberately turned it red: the incremental
     projector adds the reverse map + composable group digest to
     `quota_window_blocks` and the `quota_projection_ledger_state` row, which is
-    a stats SCHEMA change against a frozen registry. 1004 -> 1005 -> 1006."""
+    a stats SCHEMA change against a frozen registry. 1004 -> 1005 -> 1007."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1006
+    assert _cctally_core.STATS_INDEX_EPOCH == 1007
 
 
 # --------------------------------------------------------------------------

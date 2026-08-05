@@ -306,14 +306,43 @@ def _map_claude_item(session_id: str, it: dict) -> dict:
     """One Claude assembled item → the neutral detail item shape (§5.6). Claude's
     kinds/blocks pass through untranslated (both vocabularies are provider-truthful
     values of the same required field)."""
+    own_uuid = it["anchor"]["uuid"]
     return {
-        "item_key": _claude_item_key(session_id, it["anchor"]["uuid"]),
+        "item_key": _claude_item_key(session_id, own_uuid),
         "kind": it["kind"],
         "timestamp_utc": it.get("ts"),
         "model": it.get("model"),
         "blocks": it.get("blocks", []),
         "cost_usd": it.get("cost_usd"),
         "tokens": _claude_tokens_union(it.get("tokens")),
+        "member_item_keys": [
+            _claude_item_key(session_id, uuid)
+            for uuid in it.get("member_uuids", []) if uuid != own_uuid
+        ],
+        "subagent_key": it.get("subagent_key"),
+        "parent_item_key": (
+            _claude_item_key(session_id, it["parent_uuid"])
+            if it.get("parent_uuid") is not None else None
+        ),
+        "is_sidechain": bool(it.get("is_sidechain")),
+        "meta_kind": it.get("meta_kind"),
+        "skill_name": it.get("skill_name"),
+        "command_name": it.get("command_name"),
+        "cache_failure": it.get("cache_failure"),
+    }
+
+
+def _map_claude_subagent_meta(session_id: str, values: dict | None) -> dict:
+    """Translate the one identity-bearing field in legacy subagent metadata."""
+    return {
+        key: ({
+            **meta,
+            "spawn_uuid": (
+                _claude_item_key(session_id, meta["spawn_uuid"])
+                if meta.get("spawn_uuid") is not None else None
+            ),
+        } if isinstance(meta, dict) else meta)
+        for key, meta in (values or {}).items()
     }
 
 
@@ -386,6 +415,8 @@ def _claude_detail(
         "title": res["title"],
         "items": neutral_items,
         "page": page,
+        "subagent_meta": _map_claude_subagent_meta(
+            session_id, res.get("subagent_meta")),
         "children": [],
         "parent": None,
         "total_cost_usd": res["cost_usd"],
@@ -399,33 +430,98 @@ def _claude_detail(
 def _claude_outline(
     conn: sqlite3.Connection, session_id: str, conversation_key: str,
 ) -> dict:
-    """Claude outline envelope (§5.6). Reuses the existing kernel outline for
-    ``stats``/``files``; the per-turn ``item_key`` + block-kind counts are built
-    from the SAME assembled items the detail pages, so outline and detail item
-    keys align exactly. ``children`` is empty (no native threading)."""
+    """Claude outline envelope (§5.6), without weakening the native outline.
+
+    The legacy kernel is the authority for navigation: it already derives tool
+    failures, subagent topology, cache rebuilds, files, task completion, and the
+    complete turn skeleton from the same assembled items as detail.  This
+    adapter changes only identity-bearing fields from native UUIDs to neutral
+    item keys and names the provider-neutral file fields.  Re-deriving a smaller
+    outline from assembled blocks here previously stripped precisely the facts
+    the qualified reader needs (#491).
+    """
     o = lcq.get_conversation_outline(conn, session_id)
     if o is None:
         return {"status": "not_found", "conversation_key": conversation_key}
-    asm = lcq._assemble_session_memoized(conn, session_id)
+
+    def item_key(uuid):
+        return _claude_item_key(session_id, uuid) if uuid is not None else None
+
     turns = []
-    for it in asm["items"]:
-        kinds: dict[str, int] = {}
-        for b in it.get("blocks", []):
-            bk = b.get("kind")
-            if bk:
-                kinds[bk] = kinds.get(bk, 0) + 1
-        turns.append({
-            "item_key": _claude_item_key(session_id, it["anchor"]["uuid"]),
-            "label": lcq._outline_label(it.get("text", "")),
-            "timestamp_utc": it.get("ts"),
-            "kinds": kinds,
+    for turn in o["turns"]:
+        own_key = item_key(turn["uuid"])
+        neutral = {
+            "item_key": own_key,
+            "kind": turn["kind"],
+            "label": turn["label"],
+            "timestamp_utc": turn.get("ts"),
+            "kinds": {turn["kind"]: 1},
+            "member_item_keys": [
+                item_key(uuid) for uuid in turn.get("member_uuids", [])
+                if uuid != turn["uuid"]
+            ],
+            "subagent_key": turn.get("subagent_key"),
+            "parent_item_key": item_key(turn.get("parent_uuid")),
+            "is_sidechain": bool(turn.get("is_sidechain")),
+        }
+        for field in (
+                "tools", "thinking", "model", "tokens", "meta_kind",
+                "skill_name", "cache_failure"):
+            if field in turn:
+                neutral[field] = turn[field]
+        turns.append(neutral)
+
+    stats = dict(o["stats"])
+    cache_failures = stats.get("cache_failures")
+    if isinstance(cache_failures, dict):
+        cache_failures = dict(cache_failures)
+        cache_failures["rebuilds"] = [
+            {**row, "uuid": item_key(row.get("uuid"))}
+            for row in cache_failures.get("rebuilds", [])
+        ]
+        stats["cache_failures"] = cache_failures
+
+    files = []
+    for file in o.get("files", []):
+        touches = [{
+            "item_key": item_key(touch.get("uuid")),
+            "timestamp_utc": None,
+            "tool_use_id": touch.get("tool_use_id"),
+            "op": touch.get("op"),
+            "added": touch.get("add"),
+            "removed": touch.get("del"),
+        } for touch in file.get("touches", [])]
+        tools = list(dict.fromkeys(
+            touch["op"] for touch in touches if touch.get("op")))
+        files.append({
+            "file_path": file.get("path"),
+            # The count-only neutral file shape requires a tool label.  Rich
+            # Claude entries retain every native operation instead of claiming
+            # that Write/MultiEdit touches were Edit calls.
+            "tool": ",".join(tools),
+            "count": len(touches),
+            "added": file.get("add"),
+            "removed": file.get("del"),
+            "touches": touches,
         })
+
+    subagent_meta = _map_claude_subagent_meta(
+        session_id, o.get("subagent_meta"))
+    task_completion = o.get("task_completion")
+    if isinstance(task_completion, dict):
+        task_completion = {
+            **task_completion,
+            "anchor_uuid": item_key(task_completion.get("anchor_uuid")),
+        }
     return {
         "status": "ok",
         "conversation_key": conversation_key,
         "turns": turns,
-        "stats": o["stats"],
-        "files": o["files"],
+        "subagent_meta": subagent_meta,
+        "subagent_costs": o.get("subagent_costs", {}),
+        "stats": stats,
+        "files": files,
+        "task_completion": task_completion,
         "children": [],
     }
 
@@ -528,6 +624,25 @@ def neutral_browse(
         return q.list_codex_conversations(conn, effective_speed=speed, **filters)
     if source == "claude":
         return _claude_browse(conn, effective_speed=speed, **filters)
+    raise ValueError(f"unknown source: {source!r}")
+
+
+def neutral_facets(
+    conn: sqlite3.Connection, *, source: str, effective_speed: str | None = None,
+) -> dict:
+    """Facet-only collection envelope for one source.
+
+    Codex has a dedicated rollup projection so the facets request never builds
+    or prices a browse page that its transport discards.  Claude retains its
+    established browse-derived facet contract.
+    """
+    speed = effective_speed or _DEFAULT_SPEED
+    if source == "codex":
+        return q.list_codex_conversation_facets(conn)
+    if source == "claude":
+        env = _claude_browse(conn, effective_speed=speed)
+        return {"status": env.get("status"), "facets": env.get("facets") or {
+            "projects": [], "models": []}}
     raise ValueError(f"unknown source: {source!r}")
 
 
@@ -725,6 +840,8 @@ def _claude_export(
 def neutral_find(
     conn: sqlite3.Connection, ref: str, query: str, *, kind: str = "all",
     regex: bool = False, case: bool = False, effective_speed: str | None = None,
+    limit: int = 100, cursor: str | None = None, direction: str = "next",
+    around: str | None = None,
 ) -> dict:
     """In-conversation find for a neutral reference (§3.1). An unknown ``kind``
     raises ``ValueError`` (route → 400); an unknown/garbage ref → ``not_found``.
@@ -736,8 +853,23 @@ def neutral_find(
     if cref is None:
         return {"status": "not_found", "conversation_key": ref}
     if cref.source == "codex":
-        return q.find_in_codex_conversation(
-            conn, cref.conversation_key, query, kind=kind, regex=regex, case=case)
+        try:
+            return q.find_occurrences_in_codex_conversation(
+                conn,
+                cref.conversation_key,
+                query,
+                kind=kind,
+                regex=regex,
+                case_sensitive=case,
+                limit=limit,
+                cursor=cursor,
+                direction=direction,
+                around=around,
+            )
+        except q.InvalidFindCursor:
+            return {"status": "invalid_find_cursor"}
+        except q.StaleFindCursor:
+            return {"status": "stale_find_cursor"}
     return _claude_find(
         conn, cref.native_key, cref.conversation_key, query,
         kind=kind, regex=regex, case=case)

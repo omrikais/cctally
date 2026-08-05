@@ -1,5 +1,9 @@
-import type { CacheFailure, OutlineTaskCompletion, OutlineTurn, SubagentMeta } from '../types/conversation';
+import type {
+  CacheFailure, OutlineLandmark, OutlineTaskCompletion, OutlineTurn, SubagentMeta,
+} from '../types/conversation';
 import { fmt } from '../lib/fmt';
+import { LANDMARK_ENTRY_TYPE, landmarkAnchorKey, landmarksByOwner } from './mergeLandmarks';
+import { suppressedFromOccurrences } from './suppressRepeatedHeadings';
 
 // cache-failure-markers spec §4 — the standalone cache-landmark label:
 // "cache rebuilt · 130K · ~$0.75". Uppercase-K humanized tokens (fmt.compact)
@@ -78,6 +82,15 @@ export interface OutlineEntry {
   // tokens/$ for the row label + the jump list; absent on unflagged rows.
   cache?: boolean;
   cacheInfo?: { tokens_recreated: number; est_wasted_usd: number };
+  // #463 S4 §6.7 — a TIER-2 row: a landmark inside a turn rather than a turn.
+  // It reuses the existing `error` / `plan` / `heading` types (and therefore the
+  // existing glyphs and the existing three-tier severity colour) and carries
+  // this flag only so the rail can indent and rule it as belonging to the row
+  // above. ABSENT on every tier-1 entry, so the pre-S4 output is byte-identical.
+  landmark?: boolean;
+  // #463 S4 F-A — the finer address INSIDE the jump anchor: the rendered block
+  // this landmark names. ABSENT on every tier-1 entry.
+  innerAnchorKey?: string;
   thinkingCount: number;              // prompt rows: total thinking blocks in the section; 0 otherwise
   toolCount: number;
   subagentKey?: string;
@@ -112,7 +125,30 @@ export function deriveOutline(
   // the section walk is untouched; the bookmark pass runs LAST over the full
   // skeleton. Absent/empty → byte-identical output (no bookmark entries).
   bookmarks?: Record<string, { note: string; ts: number }>,
+  // #463 S4 §1.4 — the tier-2 landmarks. When any are present this module stops
+  // deriving the error, plan and heading families from `tools` and `label` and
+  // takes them from here instead, so each failure produces exactly ONE row, at
+  // the finer granularity. Populating tier-1 `tools` without this would have
+  // made it emit its own turn-granular error row BESIDE the segment-granular
+  // landmark — the same failure twice, one of them on the turn key D1 rejected.
+  //
+  // Gated on landmark PRESENCE, not on a source string: a Claude outline
+  // receives none, so its behaviour is byte-identical to today's.
+  landmarks?: readonly OutlineLandmark[],
 ): DerivedOutline {
+  const landmarkAware = !!landmarks?.length;
+  const landmarksOf = landmarkAware ? landmarksByOwner(landmarks!) : null;
+  // §4.6 — Codex writes CUMULATIVE reasoning summaries inside one turn, so a
+  // later block re-states the earlier block's headings. The wire publishes every
+  // heading (so #482's exact-find addressing still sees them all) and the render
+  // layer dedupes, through the ONE shared rule rather than a second copy.
+  const suppressedHeadings = landmarkAware
+    ? suppressedFromOccurrences(landmarks!
+      .filter((landmark) => landmark.kind === 'reasoning')
+      .map((landmark) => ({
+        turn: landmark.parent_uuid, key: landmark.landmark_key, text: landmark.label,
+      })))
+    : new Set<string>();
   // 1. Bucket sidechains by subagent_key over the WHOLE list (mirror
   //    groupSidechains resolution; placement differs below).
   const buckets = new Map<string, OutlineTurn[]>();
@@ -168,7 +204,27 @@ export function deriveOutline(
   // reproduces the pre-change call for every top-level bucket.
   const emitBucket = (k: string, entryDepth: number = depth(), parentEntryId?: string) => {
     const b = buckets.get(k)!;
-    const anyErr = b.some((t) => t.tools?.some((x) => x.is_error));
+    // #463 S4 remediation round 4 — landmark-aware, like the per-turn error
+    // derivation below and `outlineNavigation`'s target collection. This was the
+    // third derivation of the error family from tier-1 `tools` and the one the
+    // §1.4 sweep missed. It is unreachable today because no Codex conversation
+    // emits a `subagent_key`, so this is a latent instance rather than a live
+    // defect — but the day sidechains land it would flag the bucket row beside
+    // the segment-granular landmark, which is the same failure reported twice at
+    // two granularities that D1 rejected.
+    //
+    // Round 5 — this TURNS THE FLAG OFF under landmarks rather than re-deriving
+    // it from the contained landmarks, and that is the deliberate reading of the
+    // no-double-reporting rule: under landmark awareness the segment-granular
+    // landmark IS the report, and the bucket row is a container for it, not a
+    // second summary of it. The known consequence, once Codex sidechains land,
+    // is that a COLLAPSED bucket hiding a failure shows no error indicator on
+    // the bucket row itself — the failure is visible only after expanding.
+    // Deriving `anyErr` from the landmarks whose `parent_uuid` falls inside `b`
+    // is the alternative, and it stays adoptable: it changes this one expression
+    // and nothing else. Reopen the choice when sidechains actually arrive and a
+    // reader can say which of the two they want; do not flip it silently.
+    const anyErr = !landmarkAware && b.some((t) => t.tools?.some((x) => x.is_error));
     // cache-failure-markers spec §4 — a flagged subagent turn flags the BUCKET
     // row (trailing ⚡) rather than nesting a row inside it (keeps the rail
     // shallow). Use the FIRST flagged member's payload for the row's cacheInfo.
@@ -202,6 +258,48 @@ export function deriveOutline(
     }
   };
 
+  // #463 S4 §6.7 / D6 — the tier-2 rows, emitted into the SAME flat list right
+  // after their owning turn's position, one level deeper than the section's
+  // landmarks so they read as belonging to that turn. A tier collapsed by
+  // default would reproduce the condition the epic opens by naming, "a rich
+  // navigation chrome in which almost nothing moves".
+  //
+  // `entryId` is prefixed because a landmark's jump anchor is a SEGMENT key and
+  // several landmarks of one turn can share it, so the anchor is not a unique
+  // React key. The `landmark_key` is.
+  //
+  // #463 S4 F-G — the plan family is NUMBERED across the conversation. Every
+  // Codex plan landmark labels as the same tool name, so four of them rendered
+  // four rows reading the bare word `plan` with nothing to tell them apart,
+  // while an error row carries its tool and a heading row its heading text. The
+  // ordinal is the only discriminator available here: the wire publishes a plan
+  // landmark's tool name and nothing about the plan's content.
+  let planOrdinal = 0;
+  const emitLandmarks = (t: OutlineTurn) => {
+    for (const landmark of landmarksOf?.get(t.uuid) ?? []) {
+      if (suppressedHeadings.has(landmark.landmark_key)) continue;
+      const type = LANDMARK_ENTRY_TYPE[landmark.kind];
+      if (type === 'plan') planOrdinal += 1;
+      entries.push({
+        entryId: `lm:${landmark.landmark_key}`,
+        uuid: landmark.uuid,
+        type,
+        // The existing rail vocabulary, deliberately reused rather than
+        // extended: a failure reads `tool error · <tool>` exactly as a Claude
+        // one does.
+        label: type === 'error'
+          ? `tool error${landmark.label ? ` · ${landmark.label}` : ''}`
+          : type === 'plan' ? `plan ${planOrdinal}` : landmark.label,
+        depth: depth() + 1,
+        error: type === 'error', plan: type === 'plan', question: false,
+        landmark: true,
+        innerAnchorKey: landmarkAnchorKey(landmark),
+        thinkingCount: 0, toolCount: 0,
+        turnIndex: indexOf.get(t.uuid) ?? 0,
+      });
+    }
+  };
+
   for (const t of turns) {
     // Subagent member turns are handled by the bucket; place the bucket landmark
     // at the FIRST member's document position, then map all member uuids. #217 S3
@@ -214,10 +312,16 @@ export function deriveOutline(
       continue;
     }
 
-    const err = (t.tools ?? []).some((x) => x.is_error);
-    const plan = (t.tools ?? []).some((x) => x.name != null && PLAN_TOOLS.has(x.name));
+    // #463 S4 §1.4 — the three families the landmarks own once they exist. The
+    // suppression is unconditional on landmark presence rather than per-turn:
+    // a Codex turn whose own landmark list happens to be empty must not fall
+    // back to the turn-granular derivation, or the rail would mix the two
+    // granularities within one conversation.
+    const err = !landmarkAware && (t.tools ?? []).some((x) => x.is_error);
+    const plan = !landmarkAware
+      && (t.tools ?? []).some((x) => x.name != null && PLAN_TOOLS.has(x.name));
     const question = (t.tools ?? []).some((x) => x.name != null && QUESTION_TOOLS.has(x.name));
-    const heading = t.kind === 'assistant' && HEADING_RE.test(t.label);
+    const heading = !landmarkAware && t.kind === 'assistant' && HEADING_RE.test(t.label);
     const toolCount = t.tools?.length ?? 0;
     const thinkN = t.thinking?.length ?? 0;
 
@@ -233,6 +337,7 @@ export function deriveOutline(
         thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
       };
       entries.push(sectionPromptEntry);
+      emitLandmarks(t);
       continue;
     }
 
@@ -252,6 +357,7 @@ export function deriveOutline(
           thinkingCount: 0, toolCount: 0, turnIndex: indexOf.get(t.uuid) ?? 0,
         });
       }
+      emitLandmarks(t);
       continue;
     }
 
@@ -298,6 +404,7 @@ export function deriveOutline(
           thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
         });
       }
+      emitLandmarks(t);
       continue;
     }
 
@@ -310,6 +417,7 @@ export function deriveOutline(
       cache: cf ? true : undefined, cacheInfo,
       thinkingCount: 0, toolCount, turnIndex: indexOf.get(t.uuid) ?? 0,
     });
+    emitLandmarks(t);
   }
 
   // Defensive sweep: any bucket the main walk never reached (mirrors

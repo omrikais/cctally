@@ -522,6 +522,45 @@ describe('useConversation', () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
   });
 
+  it('loadToTarget backs off after a transient page failure and still reaches the target (#480)', async () => {
+    mockOnce(detail([it1], 2));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns: fwdOutline }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('transient page failure'));
+    mockOnce(detail([it2], null));
+
+    const started = performance.now();
+    let drain: unknown;
+    await act(async () => { drain = await result.current.loadToTarget('u2b'); });
+
+    expect(performance.now() - started, 'retry must not be an immediate hot loop').toBeGreaterThanOrEqual(80);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(3);
+    expect(drain).toMatchObject({ failed: false });
+    expect(result.current.detail?.items.some((item) => item.member_uuids.includes('u2b'))).toBe(true);
+  });
+
+  it('loadToTarget stops after three failed page attempts instead of draining forever (#480)', async () => {
+    mockOnce(detail([it1], 2));
+    const { result } = renderHook(() => useConversation('s', { outlineTurns: fwdOutline }));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+
+    // Six failures plus a rescue response keep the RED run bounded on current
+    // main: the buggy loop burns through all six immediately and reaches the
+    // rescue page, while the fixed drain must stop before that response.
+    for (let i = 0; i < 6; i++) {
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error(`persistent page failure ${i}`));
+    }
+    mockOnce(detail([], null));
+
+    let drain: unknown;
+    await act(async () => { drain = await result.current.loadToTarget('u2b'); });
+
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4); // open + 3 attempts
+    expect(drain).toMatchObject({ found: false, exhausted: false, failed: true });
+    expect(result.current.hasMore).toBe(true); // cursor stays retryable; failure is not exhaustion
+  });
+
   it('loadToTarget drains an unbounded number of forward pages (no 20-page cap; jump-to-latest spec §5)', async () => {
     // A conversation whose pages exceed the old 20-cap: page 1 + 25 subsequent
     // pages, each carrying ONE item. loadToTarget(last) must drain ALL pages so

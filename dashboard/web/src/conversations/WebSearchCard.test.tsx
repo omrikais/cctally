@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { WebSearchCard } from './WebSearchCard';
-import { HighlightContext } from './HighlightContext';
+import { ExactFindContext, HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -22,6 +22,54 @@ const call = (over: Partial<Call>): Call =>
   }) as Call;
 
 describe('WebSearchCard', () => {
+  it('uses the shared ok outcome wording for a native Codex completion', () => {
+    const { container } = render(<WebSearchCard call={call({
+      native_card: {
+        schema_version: 1, type: 'web_search', source: 'web_search_call',
+        call_status: 'completed', query: 'best cli usage tracker', action: {},
+        completion: { status: 'returned', query: 'best cli usage tracker', action: {}, results: [] },
+      },
+      web_search: { query: 'best cli usage tracker', links: [] },
+    })} />);
+    expect(container.querySelector('.conv-outcome')?.textContent).toContain('ok');
+    expect(container.querySelector('.conv-chip-status')).toBeNull();
+  });
+
+  it('uses the shared error outcome wording for a failed native Codex completion', () => {
+    const { container } = render(<WebSearchCard call={call({
+      native_card: {
+        schema_version: 1, type: 'web_search', source: 'web_search_call',
+        call_status: 'completed', query: 'best cli usage tracker', action: {},
+        completion: { status: 'error', query: 'best cli usage tracker', action: {}, results: [], error: 'boom' },
+      },
+      web_search: { query: 'best cli usage tracker', links: [] },
+      result: { text: 'boom', truncated: false, is_error: true },
+    })} />);
+    expect(container.querySelector('.conv-outcome')?.textContent).toContain('error');
+    expect(container.querySelector('.conv-chip-status')).toBeNull();
+  });
+
+  it('maps a completion fragment onto the exact rendered result snippet', () => {
+    const { container } = render(
+      <ExactFindContext.Provider value={{
+        selectedOccurrenceId: 'occ-web',
+        occurrences: [{
+          occurrence_id: 'occ-web', item_key: 'item', uuid: 'item',
+          block_key: 'cbk.web-event', container_block_key: 'cbk.web', surface: 'completion',
+          match_kinds: ['tool'], disclosure: ['cbk.web'],
+          fragments: [{ leaf_key: 'results.0.snippet', start: 0, end: 6 }],
+        }],
+      }}>
+        <WebSearchCard call={call({
+          block_key: 'cbk.web',
+          web_search: { query: 'q', links: [{ title: 'Result', url: 'https://example.test', snippet: 'needle web' }] },
+        })} />
+      </ExactFindContext.Provider>,
+    );
+    expect(container.querySelector('.conv-web-link-snippet mark')?.textContent).toBe('needle');
+    expect(container.querySelector('details')?.dataset.disclosureKey).toBe('cbk.web');
+  });
+
   it('shows the quoted query in the header', () => {
     const { container } = render(<WebSearchCard call={call({})} />);
     expect(container.querySelector('.conv-web-domain')!.textContent).toContain('best cli usage tracker');

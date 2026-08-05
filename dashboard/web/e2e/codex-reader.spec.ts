@@ -11,7 +11,9 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
 
   const sourceSwitch = page.locator('.conv-rail-source');
   await sourceSwitch.getByRole('button', { name: 'Codex', exact: true }).click();
-  await expect(page.locator('.conv-rail-row')).toHaveCount(8);
+  // Eight canonical reader/card fixtures plus #482's isolated occurrence-find
+  // conversation.
+  await expect(page.locator('.conv-rail-row')).toHaveCount(9);
 
   const modern = page.locator('.conv-rail-row').filter({ hasText: 'Synthetic first meaningful user prompt' });
   await modern.click();
@@ -26,8 +28,11 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
   const outlineToggle = page.getByRole('button', { name: 'Toggle session outline' });
   if (await outlineToggle.getAttribute('aria-pressed') === 'false') await outlineToggle.click();
   await page.getByRole('tab', { name: 'Files', exact: true }).click();
-  await expect(page.locator('.conv-outline-files')).toContainText('synthetic.txt');
-  await expect(page.locator('.conv-outline-files')).toContainText('apply_patch');
+  const outlineFiles = page.locator('.conv-outline-files');
+  await expect(outlineFiles).toContainText('synthetic.txt');
+  await expect(outlineFiles).toContainText('×1');
+  await outlineFiles.getByRole('button', { name: /synthetic\.txt/ }).click();
+  await expect(outlineFiles.locator('.conv-files-touch')).toHaveCount(1);
 
   const tool = page.locator('.conv-chip--tool').filter({ hasText: 'fixture_function' });
   await tool.locator('summary').click();
@@ -37,7 +42,8 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
 
   await page.getByRole('button', { name: 'Find in conversation' }).click();
   await page.locator('.conv-findbar input').fill('Synthetic');
-  await expect(page.locator('.conv-findbar-count')).toHaveText('1 / 5');
+  // #482 counts rendered occurrences, not only the five containing sections.
+  await expect(page.locator('.conv-findbar-count')).toHaveText('1 / 11 matches');
 });
 
 test('qualified Codex parent and child links remain opaque and navigable', async ({ page }) => {
@@ -86,7 +92,8 @@ test('All composes qualified sources locally and collision state stays isolated'
   await page.goto('/#/conversations');
   await page.locator('.conv-rail-source').getByRole('button', { name: 'All', exact: true }).click();
 
-  await expect(page.locator('.conv-rail-row')).toHaveCount(16);
+  // Eight Claude fixtures plus the nine Codex fixtures above.
+  await expect(page.locator('.conv-rail-row')).toHaveCount(17);
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root A red prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root B blue prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Claude seed user prompt distinct from codex' })).toBeVisible();

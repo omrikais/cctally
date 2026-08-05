@@ -509,6 +509,61 @@ def test_apply_appends_one_exact_audit_and_rebuilds_usable_index(tmp_path):
     assert not (app_dir / "alerts.log").exists()
 
 
+def _cutover_manifests(app_dir: pathlib.Path) -> list:
+    """Every `preserve-then-atomic-replace-v1` manifest, oldest first."""
+    root = pathlib.Path(app_dir) / "quarantine"
+    if not root.is_dir():
+        return []
+    out = []
+    for incident in sorted(root.iterdir()):
+        path = incident / "manifest.json"
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text())
+        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+            out.append(payload)
+    return out
+
+
+def test_acknowledge_apply_incident_records_its_trigger_identity(tmp_path):
+    """#496 S1 F3, driven through the real `db journal-repair --yes` CLI.
+
+    The AST sweep in tests/test_stats_incident_identity.py proves the call
+    expression names a known trigger; only running the command proves that
+    identity reaches the quarantine incident.
+    """
+    app_dir = tmp_path / "data"
+    journal_dir = app_dir / "journal"
+    journal_dir.mkdir(parents=True)
+    segment = journal_dir / "observations-2026-07.jsonl"
+    segment.write_bytes(
+        b"".join(
+            journal.encode_line(record)
+            for record in [_valid_base_event(), *_invalid_marker_conflict()]
+        )
+    )
+    # Materialize the live index first. Preview is write-free by design, so
+    # without this the apply would publish into an ABSENT destination, preserve
+    # nothing, and write no manifest — which is not the state a real install is
+    # ever in when an operator runs this command.
+    seeded = _run_cli(app_dir, "report", "--json")
+    assert seeded.returncode == 0, seeded.stderr
+    assert (app_dir / "stats.db").exists()
+
+    preview = json.loads(_run(app_dir, "--json").stdout)
+    fingerprint = preview["unacknowledgedViolations"][0]["fingerprint"]
+    before = len(_cutover_manifests(app_dir))
+
+    applied = _run(app_dir, "--violation", fingerprint, "--yes", "--json")
+
+    assert applied.returncode == 0, applied.stderr
+    assert json.loads(applied.stdout)["status"] == "applied"
+    manifests = _cutover_manifests(app_dir)
+    assert len(manifests) == before + 1
+    assert manifests[-1]["trigger"] == "journal-repair-acknowledge"
+    assert manifests[-1]["schemaVersion"] == 2
+
+
 def test_repeated_exact_apply_reports_already_resolved_without_append(tmp_path):
     """Appending a second audit for the same fingerprint would break idempotence."""
     app_dir = tmp_path / "data"

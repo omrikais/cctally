@@ -100,3 +100,47 @@ describe('CacheRebuildsSection', () => {
     expect(getState().conversationJump?.uuid).toBe('u0');
   });
 });
+
+// #463 S4 remediation round 3 (F8) — the focus-mode unhide check, on the
+// sibling OUTSIDE the outline panel.
+//
+// Every rail row in OutlinePanel routes through one `jumpTo` that resets the
+// focus mode to `all` when the current mode would hide the target turn, and the
+// previous round moved `OutlineCacheRebuilds` onto it after finding it built its
+// own `OPEN_CONVERSATION` inline. This component is the same construction in the
+// session modal: reachable whenever the viewer already holds that session with a
+// non-`all` focus mode, where a same-session OPEN_CONVERSATION preserves the
+// mode by design and the jump therefore loads a turn mounted nowhere.
+describe('#463 S4 — the session modal jump performs the same unhide check', () => {
+  function outlineWithTurn(kind: 'human' | 'assistant'): ConversationOutline {
+    const o = outlineWith(1, 0);
+    o.turns = [{
+      uuid: 'u0', kind, label: 'flagged turn', ts: '2026-06-01T00:00:00Z',
+      member_uuids: [], subagent_key: null, parent_uuid: null,
+      is_sidechain: false, tools: [],
+      cache_failure: { tokens_recreated: 100, prev_cached: 100, est_wasted_usd: 0.1 },
+    }];
+    return o;
+  }
+
+  it('resets a focus mode that would hide the flagged turn', () => {
+    MOCK_OUTLINE = outlineWithTurn('assistant');
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 's1' });
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    render(<CacheRebuildsSection sessionId="s1" />);
+    fireEvent.click(screen.getByRole('button', { name: /Jump/ }));
+    // `prompts` hides an assistant turn, so the jump must unhide before loading.
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump?.uuid).toBe('u0');
+  });
+
+  it('leaves a focus mode that would show it alone', () => {
+    MOCK_OUTLINE = outlineWithTurn('human');
+    dispatch({ type: 'SELECT_CONVERSATION', sessionId: 's1' });
+    dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'prompts' });
+    render(<CacheRebuildsSection sessionId="s1" />);
+    fireEvent.click(screen.getByRole('button', { name: /Jump/ }));
+    expect(getState().convFocusMode).toBe('prompts');
+    expect(getState().conversationJump?.uuid).toBe('u0');
+  });
+});

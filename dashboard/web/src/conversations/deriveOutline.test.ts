@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { deriveOutline } from './deriveOutline';
-import type { OutlineTaskCompletion, OutlineTurn, SubagentMeta } from '../types/conversation';
+import type { OutlineLandmark, OutlineTaskCompletion, OutlineTurn, SubagentMeta } from '../types/conversation';
 
 // Minimal OutlineTurn factory — every field the curation reads, sane defaults.
 function turn(over: Partial<OutlineTurn> & { uuid: string; kind: OutlineTurn['kind'] }): OutlineTurn {
@@ -514,5 +514,138 @@ describe('deriveOutline bookmark landmarks (#217 S6 F4)', () => {
     const turns = [turn({ uuid: 'h1', kind: 'human', label: 'x' })];
     const { entries } = deriveOutline(turns, undefined, true, null, {});
     expect(entries.some((e) => e.type === 'bookmark')).toBe(false);
+  });
+});
+
+// #463 S4 §1.4 — deriveOutline is the RENDERED-outline authority. OutlinePanel
+// does not render `outline.turns`; it renders `deriveOutline(...)`. So once
+// tier-1 `tools` is populated, this module starts emitting its own turn-granular
+// error and plan rows from `tools` and its own heading rows from `label` — beside
+// the segment-granular tier-2 landmarks, shipping each failure twice at two
+// granularities, one of which lands on the turn key D1 rejected.
+describe('deriveOutline landmark-awareness (#463 S4 §1.4)', () => {
+  const landmark = (over: Partial<OutlineLandmark> & { landmark_key: string }): OutlineLandmark => ({
+    block_key: 'cbk1.b', uuid: 'seg', parent_uuid: 'a1', kind: 'tool_error',
+    label: 'exec', ts: null, ...over,
+  });
+
+  // A turn shaped like real Codex data: retained by the S4 retention rule,
+  // carrying tools that would each produce a turn-granular row of their own.
+  const codexTurns = () => [
+    turn({ uuid: 'h1', kind: 'human', label: 'fix the build' }),
+    turn({
+      uuid: 'a1', kind: 'assistant', label: '## Investigating the failure',
+      tools: [
+        { name: 'exec', is_error: true },
+        { name: 'update_plan', is_error: false },
+      ],
+      tool_call_count: 142,
+      first_failure_name: 'exec',
+      thinking: ['Read the failing case'],
+    }),
+  ];
+
+  it('emits exactly one row per failure, on the segment key', () => {
+    const landmarks = [
+      landmark({ landmark_key: 'cbk1.e#tool_error', uuid: 'seg-15', kind: 'tool_error', label: 'exec' }),
+    ];
+    // Non-vacuity: without landmarks it emits its OWN turn-granular error row,
+    // which is the row that would ship alongside.
+    const bare = deriveOutline(codexTurns(), undefined);
+    expect(bare.entries.filter((e) => e.type === 'error').map((e) => e.uuid)).toEqual(['a1']);
+
+    const { entries } = deriveOutline(codexTurns(), undefined, true, undefined, undefined, landmarks);
+    const errors = entries.filter((e) => e.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].uuid).toBe('seg-15');
+    // A jump to the turn key lands on segment 0 — the start of a turn whose
+    // failure may be fifteen segments later.
+    expect(errors.map((e) => e.uuid)).not.toContain('a1');
+  });
+
+  it('takes the plan and heading families from the landmarks too', () => {
+    const landmarks = [
+      landmark({ landmark_key: 'cbk1.p#plan', uuid: 'seg-3', kind: 'plan', label: 'update_plan' }),
+      landmark({ landmark_key: 'cbk1.r#0', uuid: 'seg-1', kind: 'reasoning', label: 'Read the failing case' }),
+    ];
+    const { entries } = deriveOutline(codexTurns(), undefined, true, undefined, undefined, landmarks);
+    expect(entries.filter((e) => e.type === 'plan').map((e) => e.uuid)).toEqual(['seg-3']);
+    // The turn's own `## Investigating the failure` heading row is suppressed;
+    // the heading rows now come from the authored reasoning headings.
+    expect(entries.filter((e) => e.type === 'heading').map((e) => e.label))
+      .toEqual(['Read the failing case']);
+  });
+
+  it('dedupes repeated reasoning headings through the shared render-layer rule', () => {
+    // Codex writes CUMULATIVE reasoning summaries inside one turn: a later block
+    // re-states the earlier block's headings and appends one. §4.6 keeps the
+    // wire publishing every heading and dedupes at the render layer, through the
+    // one existing rule rather than a second copy of it.
+    const landmarks = [
+      landmark({ landmark_key: 'r#0', uuid: 's1', kind: 'reasoning', label: 'Read the case' }),
+      landmark({ landmark_key: 'r2#0', uuid: 's2', kind: 'reasoning', label: 'Read the case' }),
+      landmark({ landmark_key: 'r2#1', uuid: 's2', kind: 'reasoning', label: 'Apply the patch' }),
+    ];
+    const { entries } = deriveOutline(codexTurns(), undefined, true, undefined, undefined, landmarks);
+    expect(entries.filter((e) => e.type === 'heading').map((e) => e.label))
+      .toEqual(['Read the case', 'Apply the patch']);
+  });
+
+  it('leaves Claude behaviour unchanged when no landmarks are present', () => {
+    // Gated on landmark PRESENCE, not on a source string, so a Claude outline
+    // takes exactly today's path.
+    const before = deriveOutline(codexTurns(), undefined);
+    const after = deriveOutline(codexTurns(), undefined, true, undefined, undefined, []);
+    expect(after.entries).toEqual(before.entries);
+  });
+
+  it('indents a landmark row under its owning turn', () => {
+    const landmarks = [
+      landmark({ landmark_key: 'cbk1.e#tool_error', uuid: 'seg-15' }),
+    ];
+    const { entries } = deriveOutline(codexTurns(), undefined, true, undefined, undefined, landmarks);
+    const row = entries.find((e) => e.type === 'error')!;
+    expect(row.depth).toBe(2);
+    expect(row.entryId).toBe('lm:cbk1.e#tool_error');
+    // The rail is one flat list, so the landmark sits after its owning turn's
+    // position rather than in a collapsed second tier.
+    expect(entries.map((e) => e.entryId)).toEqual(['h1', 'lm:cbk1.e#tool_error']);
+  });
+});
+
+// #463 S4 remediation round 4 (P3-7) — the subagent bucket's error flag is the
+// third derivation of the error family from tier-1 `tools`, and it was the one
+// site the §1.4 sweep missed. `emitBucket` read `t.tools?.some(x => x.is_error)`
+// with no landmark-awareness guard, unlike the per-turn derivation and
+// `outlineNavigation`'s target collection. No Codex conversation emits a
+// `subagent_key` today, so this is unreachable rather than wrong on the wire —
+// but it is a latent instance of exactly the class §1.4 exists to close, and the
+// day Codex sidechains land it would flag a bucket row beside the segment-
+// granular landmark, which is the double-reporting D1 rejected.
+// Round 5 — the assertion below is named for the DECISION it pins, not for the
+// mechanism. Under landmarks the bucket flag is turned OFF rather than
+// re-derived from the landmarks the bucket contains, so a collapsed bucket
+// hiding a failure carries no error indicator of its own. That is the intended
+// reading of the no-double-reporting rule, and the alternative (deriving the
+// flag from the contained landmarks) stays adoptable — changing this one
+// expression must move this assertion, not pass unnoticed.
+describe('#463 S4 — a landmark-aware subagent bucket reports no error of its own', () => {
+  const bucketTurns = () => [
+    turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+    turn({ uuid: 's1', kind: 'assistant', label: 'sub', subagent_key: 'sk1', parent_uuid: 'x',
+           tools: [{ name: 'exec', is_error: true }] }),
+  ];
+
+  it('turns the bucket flag off under landmarks instead of re-deriving it from them', () => {
+    // Non-vacuity: without landmarks the bucket still flags, exactly as before.
+    const bare = deriveOutline(bucketTurns(), { sk1: { kind: 'agent' } });
+    expect(bare.entries.find((e) => e.type === 'subagent')).toMatchObject({ error: true });
+
+    const { entries } = deriveOutline(
+      bucketTurns(), { sk1: { kind: 'agent' } }, true, undefined, undefined,
+      [{ landmark_key: 'cbk1.e#tool_error', block_key: 'cbk1.e', uuid: 'seg-1',
+         parent_uuid: 's1', kind: 'tool_error', label: 'exec', ts: null }],
+    );
+    expect(entries.find((e) => e.type === 'subagent')).toMatchObject({ error: false });
   });
 });

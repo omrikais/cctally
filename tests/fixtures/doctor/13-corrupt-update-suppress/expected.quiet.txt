@@ -26,4 +26,4 @@ Safety
       → `rm ~/.local/share/cctally/update-suppress.json`
 Telemetry
 
-Summary: 49 OK · 7 WARN · 1 FAIL
+Summary: 50 OK · 7 WARN · 1 FAIL

@@ -81,7 +81,7 @@ def _cmd_transcript_export(args) -> int:
 
     if session_id.startswith("v1."):
         return _cmd_transcript_export_qualified(
-            c, session_id, scope, raw, output, speed_arg)
+            c, args, session_id, scope, raw, output, speed_arg)
 
     # Legacy bare Claude path — byte-untouched. --speed is Codex pricing behavior,
     # so an explicit value on any non-Codex ref is a usage error (resolved-source
@@ -90,8 +90,16 @@ def _cmd_transcript_export(args) -> int:
         eprint(_SPEED_ONLY_CODEX_MSG)
         return 2
 
+    account_key, account_error = c.resolve_account_filter(
+        args, "claude", needs_cache=True
+    )
+    if account_error is not None:
+        return account_error
+
     conn = c.open_conversations_db()
     try:
+        if account_key is not None:
+            c.scope_conversations_db_to_account(conn, account_key)
         cq = c._load_sibling("_lib_conversation_query")
         md = cq.get_conversation_export(conn, session_id, scope)
         if md is None:
@@ -109,7 +117,7 @@ def _cmd_transcript_export(args) -> int:
 
 
 def _cmd_transcript_export_qualified(
-        c, session_id, scope, raw, output, speed_arg) -> int:
+        c, args, session_id, scope, raw, output, speed_arg) -> int:
     """Qualified (``v1.``) export via the neutral dispatch layer (§4.1). Anonymized
     by default with the QUALIFIED provider-aware plan (§3.6); ``--raw`` escapes.
     Byte-matches ``GET /api/conversation/<v1key>/export`` in both modes."""
@@ -121,9 +129,17 @@ def _cmd_transcript_export_qualified(
         eprint(_SPEED_ONLY_CODEX_MSG)
         return 2
     speed = c._resolve_codex_speed(speed_arg or "auto")
+    provider = cref.source if cref is not None else "claude"
+    account_key, account_error = c.resolve_account_filter(
+        args, provider, needs_cache=True
+    )
+    if account_error is not None:
+        return account_error
 
     conn = c.open_conversations_db()
     try:
+        if account_key is not None:
+            c.scope_conversations_db_to_account(conn, account_key)
         env = disp.neutral_export(
             conn, session_id, scope=scope, effective_speed=speed)
         status = env.get("status")
@@ -176,6 +192,11 @@ def _cmd_transcript_search_claude(args) -> int:
     cost_min = getattr(args, "cost_min", None)
     cost_max = getattr(args, "cost_max", None)
     rebuild_min = getattr(args, "rebuild_min", None)
+    account_key, account_error = c.resolve_account_filter(
+        args, "claude", needs_cache=True
+    )
+    if account_error is not None:
+        return account_error
 
     # Date-only bounds parse through the SAME display-tz-aware helper the HTTP
     # filter handler uses (no second parser) — reuse, don't reimplement.
@@ -195,6 +216,8 @@ def _cmd_transcript_search_claude(args) -> int:
 
     conn = c.open_conversations_db()
     try:
+        if account_key is not None:
+            c.scope_conversations_db_to_account(conn, account_key)
         cq = c._load_sibling("_lib_conversation_query")
         try:
             result = cq.search_conversations(
@@ -233,6 +256,11 @@ def _cmd_transcript_search_codex(args) -> int:
     limit = getattr(args, "limit", 50)
     cursor = getattr(args, "cursor", None)
     as_json = bool(getattr(args, "json", False))
+    account_key, account_error = c.resolve_account_filter(
+        args, "codex", needs_cache=True
+    )
+    if account_error is not None:
+        return account_error
 
     # Pagination + filter axes the Codex kernel does not have → exit 2 (silently
     # ignoring a filter would fabricate results).
@@ -271,6 +299,8 @@ def _cmd_transcript_search_codex(args) -> int:
 
     conn = c.open_conversations_db()
     try:
+        if account_key is not None:
+            c.scope_conversations_db_to_account(conn, account_key)
         result = disp.neutral_search(
             conn, query, source="codex", kind=kind,
             effective_speed=c._resolve_codex_speed("auto"),

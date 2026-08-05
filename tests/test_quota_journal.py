@@ -166,6 +166,45 @@ def test_quota_applier_materializes_obs_into_cache(tmp_path, monkeypatch):
     assert jr.run_stats_ingest(mode="authoritative").consumed == 0
 
 
+def test_quota_applier_advances_physical_sequence_only_on_row_change(
+    tmp_path, monkeypatch,
+):
+    """The journal cache leg participates in the shared invalidation token.
+
+    A durable observation can be replayed after a cursor recovery, so the
+    sequence must advance with the first materialization but stay flat when
+    ``INSERT OR IGNORE`` proves the quota row was already current.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    obs = _codex_quota_obs(
+        jl, source_root_key="root-a", source_path="/codex/root-a/r.jsonl",
+        line_offset=10, captured_at_utc=_iso(10), used_percent=42.0)
+    decoded = [(obs, "seg", 100)]
+
+    assert jr._quota_applier(decoded) is None
+    conn = ns["open_cache_db"]()
+    try:
+        first = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert first == ("1",)
+    assert jr._quota_applier(decoded) is None
+    conn = ns["open_cache_db"]()
+    try:
+        second = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert second == first, "an idempotent replay must not invalidate readers"
+
+
 def test_quota_applier_converges_cross_batch_records_by_physical_order(
         tmp_path, monkeypatch):
     ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
@@ -547,7 +586,7 @@ def test_disabled_arming_tombstone_survives_rebuild_without_historical_fire(
 
     _seed_quota(ns, root="root-a", observations=[(_iso(11, 10), 20, 95.0)])
     _seed_quota(ns, root="root-b", observations=[(_iso(11, 10), 20, 95.0)])
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = ns["open_db"]()
     try:
         assert conn.execute(

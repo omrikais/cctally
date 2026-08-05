@@ -115,6 +115,7 @@ export type QualifiedSearchEnvelope =
     };
 
 export interface QualifiedBrowseOptions {
+  accountKey?: string;
   projectKey?: string;
   model?: string;
   limit?: number;
@@ -122,6 +123,7 @@ export interface QualifiedBrowseOptions {
 }
 
 export interface QualifiedSearchOptions {
+  accountKey?: string;
   query: string;
   kind?: 'all' | 'prompts' | 'assistant' | 'tools' | 'thinking' | 'title' | 'files';
   limit?: number;
@@ -138,6 +140,7 @@ export function qualifiedBrowseUrl(
 ): string {
   const params = new URLSearchParams();
   params.append('source', source);
+  append(params, 'account', options.accountKey);
   append(params, 'project_key', options.projectKey);
   append(params, 'model', options.model);
   append(params, 'limit', options.limit);
@@ -145,8 +148,10 @@ export function qualifiedBrowseUrl(
   return `/api/conversations?${params.toString()}`;
 }
 
-export function qualifiedFacetsUrl(source: ConversationSource): string {
-  return `/api/conversations/facets?source=${source}`;
+export function qualifiedFacetsUrl(source: ConversationSource, accountKey?: string): string {
+  const params = new URLSearchParams({ source });
+  append(params, 'account', accountKey);
+  return `/api/conversations/facets?${params.toString()}`;
 }
 
 export function qualifiedSearchUrl(
@@ -155,6 +160,7 @@ export function qualifiedSearchUrl(
 ): string {
   const params = new URLSearchParams();
   params.append('source', source);
+  append(params, 'account', options.accountKey);
   params.append('q', options.query);
   append(params, 'kind', options.kind);
   append(params, 'limit', options.limit);
@@ -195,6 +201,7 @@ export function conversationEntityUrl(
     throw new Error('Codex conversation keys must be qualified');
   }
   const query = new URLSearchParams();
+  append(query, 'account', ref.account_key);
   for (const [key, value] of Object.entries(params ?? {})) {
     if (value !== undefined) query.append(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
   }

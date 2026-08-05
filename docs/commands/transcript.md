@@ -20,8 +20,10 @@ bodies or invent a combined CLI source.
 
 ```
 cctally transcript export <id> [--scope {all,prompts,chat,recipe}] [--raw]
-                               [--speed {auto,standard,fast}] [-o PATH]
+                               [--speed {auto,standard,fast}] [--account REF]
+                               [-o PATH]
 cctally transcript search <query> [--source {claude,codex}]
+                                  [--account REF]
                                   [--kind {all,prompts,assistant,tools,thinking,title,files}]
                                   [--limit N] [--offset N] [--cursor TOKEN]
                                   [--project LABEL ...] [--model FAMILY ...]
@@ -42,6 +44,7 @@ Renders one whole conversation to Markdown. The output is byte-for-byte the same
   - `recipe` — a `# Replay recipe` header plus a numbered list of the main-thread prompts.
 - `--raw` — disable the whole scrub (identity **and** secrets). The result is byte-identical to the dashboard's raw export. Use this only for a transcript you intend to keep private. Qualified (`v1.`) exports anonymize by default via the provider-aware plan (which draws Codex roots and labels from the authoritative Codex tables); `--raw` escapes it.
 - `--speed {auto,standard,fast}` — the Codex service tier used for per-turn cost in a Codex export (default `auto`, resolved once from your `$CODEX_HOME` config). Speed is Codex pricing behavior, so an **explicit** `--speed` (any value, including `auto`) on a bare Claude id or a `v1.` **Claude** key is a usage error (exit 2) — never a silent no-op. Omit it for Claude exports.
+- `--account REF` — restrict every exported transcript leaf to one account, resolved by label, email, or immutable key prefix within the conversation's provider. The filter applies to the body, title provenance, files/media, tokens, and cost; omitting it preserves the merged export bytes. Attribution requires the cache and fails closed with exit `3` when unavailable.
 - `-o`, `--output PATH` — write to `PATH` instead of stdout. The file receives the exact same bytes stdout would; nothing else is printed on stdout.
 
 **Emission is byte-exact.** The export is written as raw UTF-8 with no added trailing newline (the render already ends in exactly one). This is what lets `transcript export` byte-match the dashboard endpoint — a qualified default export byte-matches `GET /api/conversation/<v1key>/export?anonymize=1`, and `--raw` byte-matches the un-parameterized download — and lets you diff two exports meaningfully.
@@ -56,6 +59,7 @@ Cross-session search over the cached transcripts (FTS5 when available, otherwise
 
 - `<query>` — the search text (positional, required).
 - `--source {claude,codex}` — which provider's conversations to search (default `claude`). The default-Claude table and `--json` envelope are byte-frozen; `--source codex` selects the Codex output described below.
+- `--account REF` — restrict search, snippets, facets, and returned conversation keys to one account. Refs use the same provider-scoped label/email/key-prefix resolution as other account-aware commands; omitting the flag preserves the merged output bytes.
 - `--kind {all,prompts,assistant,tools,thinking,title,files}` — the search facet (default `all`; identical taxonomy for both providers).
 - `--limit N` — max results (default `50`).
 - `--offset N` — Claude-only result offset (default `0`). The Codex search kernel paginates by opaque cursor, so `--offset` with `--source codex` is a usage error (exit 2).
@@ -145,5 +149,6 @@ Anonymization is **best-effort over known tokens; review before sharing.** The t
 - `0` — success (including a search with zero hits, and a Codex search whose normalization is still pending).
 - `1` — unknown conversation on `transcript export` (either source), or a Codex export whose normalization is still pending (a `transcript: …` message is printed to stderr).
 - `2` — usage / validation error: a bad flag, an unknown `--scope`/`--kind`, a malformed `--date-from`/`--date-to`, an explicit `--speed` on a non-Codex ref, a non-default `--scope` on a Codex export, or a Codex-incompatible `--offset` / `--cursor` / filter flag.
+- `3` — `--account` was requested but the attribution cache is unavailable.
 
 See [`docs/cli-contract.md`](../cli-contract.md) for the repo-wide exit-code taxonomy and JSON envelope conventions.

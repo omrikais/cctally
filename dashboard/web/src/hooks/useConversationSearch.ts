@@ -47,9 +47,10 @@ export function useConversationSearch(
   query: string,
   kind: SearchKind = 'all',
   source: ConversationSource = 'claude',
-  options: { qualified?: boolean } = {},
+  options: { qualified?: boolean; accountKey?: string } = {},
 ): UseConversationSearch {
   const qualified = options.qualified === true || source === 'codex';
+  const accountKey = options.accountKey;
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [mode, setMode] = useState<'fts' | 'like' | null>(null);
   const [total, setTotal] = useState(0);
@@ -86,12 +87,12 @@ export function useConversationSearch(
 
   const url = useCallback(
     (offset: number, nextCursor?: string | null) => qualified
-      ? qualifiedSearchUrl(source, { query: debouncedQ, kind, limit: 50, cursor: nextCursor ?? undefined })
-      : `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}${filterParams(filtersRef.current)}`,
+      ? qualifiedSearchUrl(source, { accountKey, query: debouncedQ, kind, limit: 50, cursor: nextCursor ?? undefined })
+      : `/api/conversation/search?q=${encodeURIComponent(debouncedQ)}&limit=50&offset=${offset}&kind=${kind}${filterParams(filtersRef.current)}${accountKey ? `&account=${encodeURIComponent(accountKey)}` : ''}`,
     // filterKey is in the deps so a filter change re-creates `url` → re-fires the
     // keyed page-0 effect (reset/abort), even though the body reads filtersRef.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [debouncedQ, kind, filterKey, source, qualified],
+    [debouncedQ, kind, filterKey, source, qualified, accountKey],
   );
 
   // Reset on an empty needle, and abort any in-flight fetch the instant the raw
@@ -100,7 +101,7 @@ export function useConversationSearch(
   useEffect(() => {
     if (!q) { setHits([]); setMode(null); setTotal(0); setSearchDepth(null); setFilterDegraded(false); setError(null); }
     return () => { ctlRef.current?.abort(); };
-  }, [q, kind, filterKey]);
+  }, [q, kind, filterKey, source, qualified, accountKey]);
 
   // Page-0 fetch, keyed on the settled needle + the kind facet. REPLACES hits.
   useEffect(() => {
@@ -111,13 +112,26 @@ export function useConversationSearch(
     if (!debouncedQ) { setFetching(false); setLoadingMore(false); return; }
     const ctl = new AbortController();
     ctlRef.current = ctl;
+    setHits([]);
+    setTotal(0);
+    setCursor(null);
     setFetching(true);
     setLoadingMore(false);
     fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(0), ctl.signal)
       .then((raw) => {
         const body = qualified
-          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope)
-          : { ...(raw as ConversationSearchResult), cursor: null, pending: false };
+          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope, accountKey)
+          : {
+              ...(raw as ConversationSearchResult),
+              hits: accountKey
+                ? (raw as ConversationSearchResult).hits.map((hit) => ({
+                    ...hit,
+                    conversation_ref: { source, key: hit.session_id, account_key: accountKey },
+                  }))
+                : (raw as ConversationSearchResult).hits,
+              cursor: null,
+              pending: false,
+            };
         setHits(body.hits);
         setMode(body.mode);
         setTotal(body.total);
@@ -147,8 +161,18 @@ export function useConversationSearch(
     fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(offset, cursor), ctl.signal)
       .then((raw) => {
         const body = qualified
-          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope)
-          : { ...(raw as ConversationSearchResult), cursor: null, pending: false };
+          ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope, accountKey)
+          : {
+              ...(raw as ConversationSearchResult),
+              hits: accountKey
+                ? (raw as ConversationSearchResult).hits.map((hit) => ({
+                    ...hit,
+                    conversation_ref: { source, key: hit.session_id, account_key: accountKey },
+                  }))
+                : (raw as ConversationSearchResult).hits,
+              cursor: null,
+              pending: false,
+            };
         setHits((prev) => [...prev, ...body.hits]);
         setTotal(body.total);
         setMode(body.mode);
@@ -162,7 +186,7 @@ export function useConversationSearch(
         if (isAbortError(e)) return;   // stale append discarded on needle/kind change
         setError('Search failed.'); setLoadingMore(false);
       });
-  }, [url, cursor, source, qualified]);
+  }, [url, cursor, source, qualified, accountKey]);
 
   // `loading` is DERIVED, not imperatively set: true while a non-empty needle's
   // results aren't ready — either the debounce hasn't caught up to the typed

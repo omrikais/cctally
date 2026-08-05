@@ -51,7 +51,10 @@ def test_rebuild_1m_lines_within_120s(monkeypatch, tmp_path, capsys):
     import _cctally_journal as jr
     dest = tmp_path / "rebuilt.db"
     t0 = time.monotonic()
-    res = jr.rebuild_stats_index(target_path=str(dest))
+    res = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(dest),
+    )
     rebuild_dur = time.monotonic() - t0
 
     with capsys.disabled():

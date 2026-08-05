@@ -1,44 +1,49 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson, isAbortError, HttpError } from '../lib/fetchJson';
 import { useDebouncedValue } from './useDebouncedValue';
 import { conversationEntityUrl } from '../lib/conversationTransport';
 import { adaptQualifiedFind } from '../lib/conversationAdapters';
-import { conversationRefKey, isQualifiedConversationRef, normalizeConversationRef, type ConversationFindResult, type ConversationRefInput, type FindAnchor } from '../types/conversation';
+import {
+  conversationRefKey,
+  isQualifiedConversationRef,
+  normalizeConversationRef,
+  type ConversationFindResult,
+  type ConversationRefInput,
+  type FindAnchor,
+  type FindOccurrence,
+  type LegacyConversationFindResult,
+  type OccurrenceFindResult,
+} from '../types/conversation';
 
-// #177 S6 — in-conversation find. A debounced, session-scoped fetch to
-// /api/conversation/<id>/find returning the full ordered rendered-turn anchor
-// list (find walks it via the reader's loadToTarget(uuid) + jump machinery).
-// Mirrors useConversationSearch's debounce/abort skeleton (200ms, seeded ''
-// so the first keystroke still debounces, ONE shared AbortController so a
-// newer needle aborts the older in-flight fetch and a late prior response can
-// never commit).
-//
-// #217 S4 / I-1 power features:
-//  - `regex` / `case` append `&regex=1` / `&case=1`; the fetch effect keys on
-//    them so flipping a toggle re-runs the query.
-//  - an invalid-regex 400 (HttpError(400) — `fetchJson` discards the body) maps
-//    client-side to error === 'invalid regex' (matches cleared).
-//  - `tailRevision` is a fetch dependency (DEBOUNCED via the existing 200ms
-//    debounce) so live-tail growth re-runs the query — keyed on the monotonic
-//    pollTail counter, NOT items.length (Codex P1, see useConversation).
+export type FindTarget = FindAnchor | FindOccurrence;
+
 export interface UseConversationFind {
   anchors: FindAnchor[];
+  occurrences: FindOccurrence[];
+  selected: FindTarget | null;
+  selectedIndex: number;
   total: number;
   truncated: boolean;
-  mode: 'fts' | 'like' | 'regex' | null;
+  semantics: 'section' | 'occurrence';
+  status: 'ready' | 'indexing';
+  selectionStale: boolean;
+  mode: 'fts' | 'like' | 'regex' | 'literal' | null;
   loading: boolean;
   error: string | null;
+  step: (delta: number) => FindTarget | null | Promise<FindTarget | null>;
 }
 
 export interface UseConversationFindOptions {
   regex?: boolean;
   case?: boolean;
-  // The monotonic live-tail merge counter from useConversation; a bump re-runs
-  // the find query (debounced). Omitted → point-in-time (no live-refresh).
   tailRevision?: number;
 }
 
 const DEBOUNCE_MS = 200;
+
+function isExact(result: ConversationFindResult | null): result is OccurrenceFindResult {
+  return result != null && 'semantics' in result && result.semantics === 'occurrence';
+}
 
 export function useConversationFind(
   rawRef: ConversationRefInput,
@@ -48,72 +53,212 @@ export function useConversationFind(
   const conversationRef = normalizeConversationRef(rawRef);
   const identityKey = conversationRefKey(conversationRef);
   const { regex = false, case: caseSensitive = false, tailRevision = 0 } = opts;
-  const [anchors, setAnchors] = useState<FindAnchor[]>([]);
-  const [total, setTotal] = useState(0);
-  const [truncated, setTruncated] = useState(false);
-  const [mode, setMode] = useState<'fts' | 'like' | 'regex' | null>(null);
-  const [fetching, setFetching] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const q = needle.trim();
   const debouncedQ = useDebouncedValue(q, DEBOUNCE_MS, '');
-  // Debounce the live-tail revision too so a burst of ticks coalesces into one
-  // refetch (same 200ms window as the needle).
   const debouncedRev = useDebouncedValue(tailRevision, DEBOUNCE_MS, 0);
-  // ONE controller ref: any needle change aborts whatever it points at, so a
-  // stale response can never commit over the newer query's state.
+  const searchKey = JSON.stringify([identityKey, debouncedQ, regex, caseSensitive]);
+  const [result, setResult] = useState<ConversationFindResult | null>(null);
+  const [selectedOffset, setSelectedOffset] = useState(0);
+  const [fetching, setFetching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const ctlRef = useRef<AbortController | null>(null);
+  const edgeRef = useRef<Promise<FindTarget | null> | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const committedSearchKeyRef = useRef<string | null>(null);
 
-  // Reset on an empty needle, and abort any in-flight fetch the instant the raw
-  // needle changes (so a prior response can't commit late).
-  useEffect(() => {
-    if (!q) { setAnchors([]); setTotal(0); setTruncated(false); setMode(null); setError(null); }
-    return () => { ctlRef.current?.abort(); };
-  }, [q]);
+  const decode = useCallback((raw: unknown): ConversationFindResult => (
+    isQualifiedConversationRef(conversationRef)
+      ? adaptQualifiedFind(raw as Parameters<typeof adaptQualifiedFind>[0])
+      : raw as LegacyConversationFindResult
+  ), [identityKey]);
 
-  // Keyed on the settled needle + regex/case toggles + the debounced live-tail
-  // revision (a tail bump re-runs the query against the grown corpus).
-  useEffect(() => {
-    if (!debouncedQ) { setFetching(false); return; }
-    const ctl = new AbortController();
-    ctlRef.current = ctl;
-    setFetching(true);
+  const commit = useCallback((next: ConversationFindResult): FindTarget | null => {
+    setResult(next);
+    if (isExact(next)) {
+      const offset = 0;
+      setSelectedOffset(offset);
+      const selected = next.page.occurrences[offset] ?? null;
+      selectedIdRef.current = selected?.occurrence_id ?? null;
+      return selected;
+    }
+    const previous = selectedIdRef.current;
+    const offset = previous
+      ? Math.max(0, next.anchors.findIndex((anchor) => anchor.uuid === previous))
+      : 0;
+    setSelectedOffset(offset);
+    const selected = next.anchors[offset] ?? null;
+    selectedIdRef.current = selected?.uuid ?? null;
+    return selected;
+  }, []);
+
+  const request = useCallback(async ({
+    cursor,
+    direction,
+    around,
+    signal,
+  }: {
+    cursor?: string;
+    direction?: 'next' | 'previous';
+    around?: string;
+    signal?: AbortSignal;
+  } = {}): Promise<ConversationFindResult> => {
     const url = conversationEntityUrl(conversationRef, 'find', {
       q: debouncedQ,
       regex: regex || undefined,
       case: caseSensitive || undefined,
+      ...(isQualifiedConversationRef(conversationRef) && conversationRef.source === 'codex'
+        ? {
+            limit: 100,
+            cursor,
+            direction: direction && (cursor || direction === 'previous') ? direction : undefined,
+            around,
+          }
+        : {}),
     });
-    fetchJson<ConversationFindResult | Parameters<typeof adaptQualifiedFind>[0]>(url, ctl.signal)
-      .then((raw) => {
-        const body = isQualifiedConversationRef(conversationRef)
-          ? adaptQualifiedFind(raw as Parameters<typeof adaptQualifiedFind>[0])
-          : raw as ConversationFindResult;
-        setAnchors(body.anchors);
-        setTotal(body.total);
-        setTruncated(body.anchors_truncated);
-        setMode(body.mode);
+    return decode(await fetchJson<unknown>(url, signal));
+  }, [identityKey, debouncedQ, regex, caseSensitive, decode]);
+
+  useEffect(() => {
+    if (!q) {
+      ctlRef.current?.abort();
+      setResult(null);
+      setSelectedOffset(0);
+      selectedIdRef.current = null;
+      committedSearchKeyRef.current = null;
+      setError(null);
+      setFetching(false);
+    }
+    return () => { ctlRef.current?.abort(); };
+  }, [q]);
+
+  useEffect(() => {
+    if (!debouncedQ) { setFetching(false); return; }
+    const ctl = new AbortController();
+    ctlRef.current?.abort();
+    ctlRef.current = ctl;
+    edgeRef.current = null;
+    setFetching(true);
+    const around = isExact(result) && committedSearchKeyRef.current === searchKey
+      ? selectedIdRef.current ?? undefined
+      : undefined;
+    request({ around, signal: ctl.signal })
+      .then((next) => {
+        if (ctl.signal.aborted) return;
+        commit(next);
+        committedSearchKeyRef.current = searchKey;
         setError(null);
         setFetching(false);
       })
       .catch((e) => {
         if (isAbortError(e)) return;
-        // #177 S6 M5 — clear the prior result on a real failure so a failing
-        // refetch can't leave the bar navigating stale anchors.
-        setAnchors([]); setTotal(0); setTruncated(false); setMode(null);
-        // #217 S4 / I-1.3 — a 400 from the regex pre-validation is an invalid
-        // pattern. `fetchJson` throws HttpError(status) and discards the body
-        // (Codex P2), so the actionable message is reconstructed client-side
-        // rather than read from the server's `{"error":"invalid regex…"}`.
-        // Both strings are rendered verbatim by FindBar (role="alert"), so they
-        // must match the UI wording exactly — keep them lowercase + un-punctuated.
+        setResult(null);
+        selectedIdRef.current = null;
+        committedSearchKeyRef.current = null;
         setError(e instanceof HttpError && e.status === 400 ? 'invalid regex' : 'find failed');
         setFetching(false);
       });
     return () => ctl.abort();
-  }, [identityKey, debouncedQ, regex, caseSensitive, debouncedRev]);
+    // `result` is deliberately excluded: a committed page must not refetch itself.
+    // `debouncedRev` is the live-tail reconciliation trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identityKey, debouncedQ, regex, caseSensitive, debouncedRev, searchKey, request, commit]);
 
-  // Derived, mirroring useConversationSearch: true while a non-empty needle's
-  // results aren't ready (debounce lag or fetch in flight).
+  const step = useCallback((delta: number): FindTarget | null | Promise<FindTarget | null> => {
+    if (!result || delta === 0) return null;
+    if (!isExact(result)) {
+      if (result.anchors.length === 0) return null;
+      const offset = (
+        (selectedOffset + delta) % result.anchors.length + result.anchors.length
+      ) % result.anchors.length;
+      setSelectedOffset(offset);
+      const selected = result.anchors[offset];
+      selectedIdRef.current = selected.uuid;
+      return selected;
+    }
+    if (result.status !== 'ready' || result.page.occurrences.length === 0) return null;
+    const within = selectedOffset + (delta > 0 ? 1 : -1);
+    if (within >= 0 && within < result.page.occurrences.length) {
+      setSelectedOffset(within);
+      const selected = result.page.occurrences[within];
+      selectedIdRef.current = selected.occurrence_id;
+      return selected;
+    }
+    if (edgeRef.current) return edgeRef.current;
+    const forward = delta > 0;
+    const cursor = forward ? result.page.next_cursor : result.page.previous_cursor;
+    const direction = forward ? 'next' as const : 'previous' as const;
+    const pending = (async () => {
+      try {
+        let next: ConversationFindResult;
+        try {
+          next = await request({ cursor: cursor ?? undefined, direction });
+        } catch (e) {
+          if (!(e instanceof HttpError) || e.status !== 409) throw e;
+          next = await request({ around: selectedIdRef.current ?? undefined });
+          if (isExact(next) && !next.selection_stale) {
+            const reconciledAt = next.page.occurrences.findIndex(
+              (occurrence) => occurrence.occurrence_id === selectedIdRef.current,
+            );
+            const steppedAt = reconciledAt + (forward ? 1 : -1);
+            if (reconciledAt >= 0 && steppedAt >= 0 && steppedAt < next.page.occurrences.length) {
+              setResult(next);
+              setSelectedOffset(steppedAt);
+              const selected = next.page.occurrences[steppedAt];
+              selectedIdRef.current = selected.occurrence_id;
+              setError(null);
+              return selected;
+            }
+            const reconciledCursor = forward
+              ? next.page.next_cursor
+              : next.page.previous_cursor;
+            if (reconciledAt >= 0 && reconciledCursor) {
+              next = await request({ cursor: reconciledCursor, direction });
+            }
+          }
+        }
+        if (!isExact(next)) return commit(next);
+        setResult(next);
+        const offset = forward ? 0 : Math.max(0, next.page.occurrences.length - 1);
+        setSelectedOffset(offset);
+        const selected = next.page.occurrences[offset] ?? null;
+        selectedIdRef.current = selected?.occurrence_id ?? null;
+        setError(null);
+        return selected;
+      } catch (e) {
+        if (!isAbortError(e)) setError('find failed');
+        return null;
+      } finally {
+        edgeRef.current = null;
+      }
+    })();
+    edgeRef.current = pending;
+    return pending;
+  }, [result, selectedOffset, request, commit]);
+
+  const exact = isExact(result);
+  const anchors = exact || !result ? [] : result.anchors;
+  const occurrences = exact ? result.page.occurrences : [];
+  const targets: FindTarget[] = exact ? occurrences : anchors;
+  const selected = targets[selectedOffset] ?? null;
+  const selectedIndex = exact
+    ? result.page.start_index + (selected ? selectedOffset : 0)
+    : (selected ? selectedOffset : 0);
+  const total = exact ? result.total ?? 0 : result?.total ?? 0;
   const loading = q !== '' && (q !== debouncedQ || fetching);
 
-  return { anchors, total, truncated, mode, loading, error };
+  return {
+    anchors,
+    occurrences,
+    selected,
+    selectedIndex,
+    total,
+    truncated: !exact && result ? result.anchors_truncated : false,
+    semantics: exact ? 'occurrence' : 'section',
+    status: exact ? result.status : 'ready',
+    selectionStale: exact ? result.selection_stale : false,
+    mode: result?.mode ?? null,
+    loading,
+    error,
+    step,
+  };
 }

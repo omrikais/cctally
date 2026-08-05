@@ -46,6 +46,38 @@ describe('useConversationOutline', () => {
     expect(result.current.error).toBeNull();
   });
 
+  it('qualified Codex outline loads totals without a redundant detail request (#477)', async () => {
+    const ref = { source: 'codex' as const, key: 'v1.codex-heavy' };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      const body = url.includes('/outline')
+        ? {
+            status: 'ok', conversation_key: ref.key, turns: [], files: [], children: [],
+            stats: {
+              items: 0, kinds: {}, cost_usd: 12.5,
+              tokens: { source: 'codex', input: 100, output: 20, cached_input: 40, reasoning_output: 5 },
+            },
+          }
+        : {
+            status: 'ok', conversation_key: ref.key, items: [], children: [], parent: null,
+            page: { total: 0, returned: 0, before: null, after: null, has_before: false, has_after: false },
+            total_cost_usd: 12.5,
+            tokens: { source: 'codex', input: 100, output: 20, cached_input: 40, reasoning_output: 5 },
+          };
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline(ref));
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(12.5));
+
+    const urls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map(([url]) => String(url));
+    expect(urls).toEqual([expect.stringContaining('/outline')]);
+    expect(urls.some((url) => url.includes('limit=1'))).toBe(false);
+    expect(result.current.outline?.stats.tokens).toMatchObject({
+      source: 'codex', input: 100, output: 20, cached_input: 40, reasoning_output: 5,
+    });
+  });
+
   it('resets to null when the session switches', async () => {
     mockOnce(outline('s1'));
     const { result, rerender } = renderHook(({ sid }) => useConversationOutline(sid), { initialProps: { sid: 's1' as string | null } });

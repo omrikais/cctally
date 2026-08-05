@@ -1956,6 +1956,11 @@
       "change": "thread_source inference: conversation-identity rollouts whose session_meta OMITS thread_source (string and single-key-object source forms) plus four mixed-shape files pinning the per-record stateless rule across explicit/absent transitions, a changed native id, a delta-resume boundary, and the same-category continuity case.",
       "date": "2026-07-31",
       "version": 8
+    },
+    {
+      "change": "#463 S3 conversation tool legibility: a dict-shaped patch_apply_end holding update/add/delete/empty entries, a wholly recognized and a mixed exec program, the exec_command/write_stdin/wait/js/tool_search_call function families, every output preamble grammar in its production shape including both Chunk ID third-line variants, an announced, an unannounced and a self-announcing shell session, a session named only inside a program body, a patch file whose diff the per-file budget clips, and the external-agent marker beside an authored fenced lookalike.",
+      "date": "2026-08-03",
+      "version": 9
     }
   ],
   "identityFields": [
@@ -2035,6 +2040,7 @@
     "thread-source-mixed-explicit-first": "rollouts/thread-source-mixed-explicit-first.jsonl",
     "thread-source-mixed-missing-first": "rollouts/thread-source-mixed-missing-first.jsonl",
     "title-wrapper-window": "rollouts/title-wrapper-window.jsonl",
+    "tool-legibility": "rollouts/tool-legibility.jsonl",
     "unknown-records": "rollouts/unknown-records.jsonl",
     "unturned-event-prose": "rollouts/unturned-event-prose.jsonl"
   },

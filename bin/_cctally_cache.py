@@ -227,6 +227,12 @@ _CONV_INSERT_SQL = (
     " search_tool,search_thinking)"
     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
+_CONV_ACCOUNT_INSERT_SQL = _CONV_INSERT_SQL.replace(
+    "search_tool,search_thinking)", "search_tool,search_thinking,account_key)"
+).replace(
+    "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+)
 
 # #193: last non-null write wins (ai-title carries no timestamp; see spec S1). NO
 # byte_offset guard — it can't order a cross-file resumed session. Ordering is
@@ -383,7 +389,7 @@ SESSION_ENTRY_UPSERT_SQL_REWALK = (
     + _SESSION_ENTRY_REWALK_PHYSICAL_GUARD)
 
 
-def _conv_row_tuple(m, path_str):
+def _conv_row_tuple(m, path_str, account_key=None, *, include_account=False):
     """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order.
 
     The #177 enrichment fields (stop_reason / attribution_skill /
@@ -393,7 +399,7 @@ def _conv_row_tuple(m, path_str):
     one tuple. #217 S1 / U7a: the documented-dead ``search_aux`` column is gone
     from the live schema (dropped by migration 016); the split
     ``search_tool``/``search_thinking`` columns carry the non-prose index."""
-    return (
+    row = (
         m.session_id, m.uuid, m.parent_uuid, path_str, m.byte_offset,
         m.timestamp_utc, m.entry_type, m.text, m.blocks_json, m.model,
         m.msg_id, m.req_id, m.cwd, m.git_branch, m.is_sidechain,
@@ -401,6 +407,7 @@ def _conv_row_tuple(m, path_str):
         m.stop_reason, m.attribution_skill, m.attribution_plugin,
         m.search_tool, m.search_thinking,
     )
+    return row + ((account_key,) if include_account else ())
 
 
 def _iter_sync_entries(
@@ -1300,15 +1307,24 @@ def _codex_provider_roots() -> list[CodexProviderRoot]:
     roots: list[CodexProviderRoot] = []
     seen: set[pathlib.Path] = set()
     for configured in _cctally()._codex_home_roots():
-        provider_root = _canonical_codex_path(configured)
+        try:
+            provider_root = _canonical_codex_path(configured)
+        except OSError:
+            # An unreadable configured root is unknown filesystem state. Leave
+            # it out of discovery; the prune scope still retains its configured
+            # identity and will refuse destructive cleanup for that root.
+            continue
         if provider_root in seen:
             continue
         sessions = configured / "sessions"
-        if sessions.is_dir():
-            walk_root = sessions
-        elif configured.is_dir():
-            walk_root = configured
-        else:
+        try:
+            if sessions.is_dir():
+                walk_root = sessions
+            elif configured.is_dir():
+                walk_root = configured
+            else:
+                continue
+        except OSError:
             continue
         seen.add(provider_root)
         roots.append(CodexProviderRoot(
@@ -1436,6 +1452,214 @@ def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
                 source_root_key=root.source_root_key,
             ))
     return discovered
+
+
+CODEX_ORPHAN_PRUNE_REFUSED_KEY = "codex_orphan_prune_refused"
+_CODEX_ROOT_RECOGNITION_TYPES = frozenset({
+    "session_meta", "turn_context", "event_msg", "response_item", "world_state",
+    "compacted",
+})
+_CODEX_ROOT_RECOGNITION_MAX_FILES = 32
+_CODEX_ROOT_RECOGNITION_MAX_BYTES = 64 * 1024
+_CODEX_ROOT_RECOGNITION_MAX_LINES = 64
+
+
+def _codex_file_is_recognizable(path: pathlib.Path) -> bool:
+    """Boundedly prove that one JSONL contains a known Codex record envelope.
+
+    Unknown records remain ingestible for forward compatibility, but they are
+    not strong enough evidence to authorize deletion of retained history.
+    """
+    consumed = 0
+    lines = 0
+    try:
+        with path.open("rb") as fh:
+            while (
+                lines < _CODEX_ROOT_RECOGNITION_MAX_LINES
+                and consumed < _CODEX_ROOT_RECOGNITION_MAX_BYTES
+            ):
+                remaining = _CODEX_ROOT_RECOGNITION_MAX_BYTES - consumed
+                raw = fh.readline(remaining + 1)
+                if not raw:
+                    break
+                lines += 1
+                consumed += len(raw)
+                if len(raw) > remaining or not raw.endswith(b"\n"):
+                    break
+                try:
+                    obj = json.loads(
+                        raw,
+                        parse_constant=_lib_jsonl._reject_nonfinite_json_constant,
+                    )
+                except (UnicodeDecodeError, ValueError, TypeError):
+                    continue
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("type") in _CODEX_ROOT_RECOGNITION_TYPES
+                    and isinstance(obj.get("payload"), dict)
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+@dataclass(frozen=True)
+class _CodexPruneScope:
+    """Filesystem evidence that may authorize one whole-tree orphan prune.
+
+    A configured root is only *recognized* after a bounded probe finds at least
+    one known Codex record envelope under it. A missing, empty, or unrelated
+    directory therefore remains protected. When a current root is recognized,
+    roots no longer present in the configured set may still be removed — that
+    preserves issue #108's deliberate A -> B cache scoping. Within a recognized
+    root, a missing file is deletion evidence only while its parent directory is
+    still readable; losing an entire mounted subtree fails closed.
+    """
+
+    configured_root_keys: frozenset[str]
+    recognized_root_keys: frozenset[str]
+
+    def refusal_reason(self, source_path: str, root_key: str | None) -> str | None:
+        if not self.recognized_root_keys:
+            return "no_recognizable_roots"
+        if (
+            root_key in self.configured_root_keys
+            and root_key not in self.recognized_root_keys
+        ):
+            return "configured_root_unrecognizable"
+        if root_key in self.recognized_root_keys:
+            parent = pathlib.Path(source_path).parent
+            try:
+                if not parent.is_dir() or not os.access(parent, os.R_OK | os.X_OK):
+                    return "source_parent_unavailable"
+            except OSError:
+                return "source_parent_unavailable"
+        return None
+
+    def root_refusal_reason(self, root_key: str) -> str | None:
+        if not self.recognized_root_keys:
+            return "no_recognizable_roots"
+        if (
+            root_key in self.configured_root_keys
+            and root_key not in self.recognized_root_keys
+        ):
+            return "configured_root_unrecognizable"
+        return None
+
+
+def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
+    configured: set[str] = set()
+    for raw_root in _cctally()._codex_home_roots():
+        try:
+            provider_root = _canonical_codex_path(raw_root)
+            configured.add(source_root_key(str(provider_root)))
+        except (OSError, TypeError, ValueError):
+            continue
+    recognized: set[str] = set()
+    checked_per_root: dict[str, int] = {}
+    # Discovery is stable oldest-first for Codex's dated rollout paths. Probe
+    # from the tail so a bounded check sees the current envelope generation,
+    # rather than spending its entire budget on a large legacy prefix. A root
+    # containing only legacy/unknown envelopes still fails closed.
+    for item in reversed(files):
+        if item.source_root_key in recognized:
+            continue
+        checked = checked_per_root.get(item.source_root_key, 0)
+        if checked >= _CODEX_ROOT_RECOGNITION_MAX_FILES:
+            continue
+        checked_per_root[item.source_root_key] = checked + 1
+        if _codex_file_is_recognizable(item.source_path):
+            recognized.add(item.source_root_key)
+    return _CodexPruneScope(
+        configured_root_keys=frozenset(configured),
+        recognized_root_keys=frozenset(recognized),
+    )
+
+
+def _partition_codex_prune_candidates(
+    scope: _CodexPruneScope,
+    sources: list[tuple[str, str | None]],
+    root_keys: set[str],
+) -> tuple[
+    list[tuple[str, str | None]], list[tuple[str, str | None]], set[str], set[str]
+]:
+    safe_sources: list[tuple[str, str | None]] = []
+    refused_sources: list[tuple[str, str | None]] = []
+    for source in sources:
+        target = refused_sources if scope.refusal_reason(*source) else safe_sources
+        target.append(source)
+    safe_roots: set[str] = set()
+    refused_roots: set[str] = set()
+    for root_key in root_keys:
+        target = refused_roots if scope.root_refusal_reason(root_key) else safe_roots
+        target.add(root_key)
+    return safe_sources, refused_sources, safe_roots, refused_roots
+
+
+def _codex_prune_refusal_record(
+    conn: sqlite3.Connection,
+    *,
+    store: str,
+    scope: _CodexPruneScope,
+    refused_sources: list[tuple[str, str | None]],
+    refused_root_keys: set[str],
+) -> None:
+    """Persist a privacy-safe refusal signal in the store that declined."""
+    now = (
+        _cctally_core._command_as_of()
+        .astimezone(dt.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    since = now
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (CODEX_ORPHAN_PRUNE_REFUSED_KEY,),
+    ).fetchone()
+    if row and row[0]:
+        try:
+            previous = json.loads(row[0])
+            if isinstance(previous, dict) and isinstance(previous.get("since"), str):
+                since = previous["since"]
+        except (TypeError, ValueError):
+            pass
+    reasons = sorted({
+        reason
+        for path, root_key in refused_sources
+        if (reason := scope.refusal_reason(path, root_key)) is not None
+    } | {
+        reason
+        for root_key in refused_root_keys
+        if (reason := scope.root_refusal_reason(root_key)) is not None
+    })
+    record = {
+        "schemaVersion": 1,
+        "store": store,
+        "since": since,
+        "at": now,
+        "reasons": reasons,
+        "configuredRootCount": len(scope.configured_root_keys),
+        "recognizedRootCount": len(scope.recognized_root_keys),
+        "preservedFileCount": len({path for path, _root in refused_sources}),
+        "preservedRootCount": len(refused_root_keys),
+    }
+    conn.execute(
+        "INSERT INTO cache_meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (CODEX_ORPHAN_PRUNE_REFUSED_KEY, json.dumps(record, sort_keys=True)),
+    )
+    eprint(
+        f"[codex-{store}] orphan prune refused: preserved "
+        f"{record['preservedFileCount']} tracked file(s); "
+        "configured Codex roots were not sufficient deletion evidence"
+    )
+
+
+def _clear_codex_prune_refusal(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key=?", (CODEX_ORPHAN_PRUNE_REFUSED_KEY,)
+    )
 
 
 def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
@@ -1603,7 +1827,12 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
 
 
 def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
-    """Advance the dashboard's Codex physical-identity sequence in this txn."""
+    """Advance the shared Codex physical-state invalidation token in this txn.
+
+    Dashboard/TUI snapshot versions and the quota projection certificate both
+    consume this value.  Every writer that changes their cache.db inputs must
+    advance it in the same transaction as that change.
+    """
     conn.execute(
         "INSERT INTO cache_meta(key, value) VALUES "
         "('codex_physical_mutation_seq', '1') "
@@ -1621,6 +1850,10 @@ _CODEX_NORM_COLS = (
 _CODEX_MSG_INSERT_SQL = (
     "INSERT OR IGNORE INTO codex_conversation_messages (" + _CODEX_NORM_COLS + ") "
     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_CODEX_ACCOUNT_MSG_INSERT_SQL = (
+    "INSERT OR IGNORE INTO codex_conversation_messages (" + _CODEX_NORM_COLS
+    + ", account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -1679,17 +1912,29 @@ def _load_codex_normalized_rows(
     ]
 
 
-def _insert_codex_normalized_rows(conn: sqlite3.Connection, rows: list, touches: list) -> None:
+def _insert_codex_normalized_rows(
+    conn: sqlite3.Connection,
+    rows: list,
+    touches: list,
+    account_by_physical: "dict[tuple[str, int], str | None] | None" = None,
+) -> None:
     """Insert normalized rows (INSERT OR IGNORE on the physical key) + their file
     touches (message linkage resolved via (source_path, line_offset))."""
     if rows:
-        conn.executemany(_CODEX_MSG_INSERT_SQL, [
+        with_accounts = account_by_physical is not None
+        account_by_physical = account_by_physical or {}
+        conn.executemany(
+            _CODEX_ACCOUNT_MSG_INSERT_SQL if with_accounts else _CODEX_MSG_INSERT_SQL,
+            [
             (r.conversation_key, r.source_root_key, r.source_path, r.line_offset,
              r.timestamp_utc, r.turn_id, r.call_id, r.kind, r.event_type,
              r.record_family, r.model, r.text, r.content_digest, r.content_len,
              r.detail_json, r.search_tool, r.search_thinking)
+            + ((account_by_physical.get((r.source_path, r.line_offset)),)
+               if with_accounts else ())
             for r in rows
-        ])
+            ],
+        )
     for touch in touches:
         conn.execute(
             "INSERT OR IGNORE INTO codex_conversation_file_touches "
@@ -1764,26 +2009,120 @@ def _replay_codex_normalization(conn: sqlite3.Connection) -> None:
     the plain rowid alias make a re-run byte-idempotent."""
     kern = _lib_codex_conversation
     events_by_file: dict[str, list] = {}
+    accounts_by_file: dict[str, dict[tuple[str, int], str | None]] = {}
     order: list[str] = []
+    has_account = "account_key" in {
+        str(info[1])
+        for info in conn.execute("PRAGMA table_info(codex_conversation_events)")
+    }
+    account_select = ", account_key" if has_account else ""
     for row in conn.execute(
         "SELECT source_path, line_offset, source_root_key, conversation_key, "
         "native_thread_id, root_thread_id, parent_thread_id, timestamp_utc, "
         "record_type, event_type, turn_id, call_id, payload_json "
+        + account_select + " "
         "FROM codex_conversation_events "
         "ORDER BY source_path ASC, line_offset ASC"
     ):
-        event = _lib_jsonl.CodexPhysicalEvent(*row)
+        event = _lib_jsonl.CodexPhysicalEvent(*(row[:-1] if has_account else row))
         if event.source_path not in events_by_file:
             events_by_file[event.source_path] = []
+            accounts_by_file[event.source_path] = {}
             order.append(event.source_path)
         events_by_file[event.source_path].append(event)
+        if has_account:
+            accounts_by_file[event.source_path][
+                (event.source_path, int(event.line_offset))
+            ] = row[-1]
     affected: set = set()
     for source_path in order:
         result = kern.normalize_codex_events(
             events_by_file[source_path], initial=kern.CodexStickyState())
-        _insert_codex_normalized_rows(conn, result.rows, result.touches)
+        _insert_codex_normalized_rows(
+            conn, result.rows, result.touches,
+            accounts_by_file[source_path] if has_account else None,
+        )
         affected.update(r.conversation_key for r in result.rows)
     _recompute_codex_rollups(conn, affected)
+    # Migration 025 still replays this helper against legacy cache.db fixtures,
+    # where the conversations-only #482 projection table does not exist. Live
+    # conversations.db replays must refresh the projection, but the historical
+    # cache migration must remain byte-stable and cannot create a newer store's
+    # derivation out of order.
+    projection_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='codex_find_projection'"
+    ).fetchone() is not None
+    if projection_exists:
+        import _lib_codex_conversation_query as query
+        query.materialize_codex_find_projection(conn, affected)
+
+
+def run_codex_find_projection_backfill(
+    conn: sqlite3.Connection,
+    *,
+    batch_size: int = 400,
+) -> dict[str, object]:
+    """Consume one resumable #482 projection batch from retained rows.
+
+    The caller owns the Codex conversations provider flock. Progress is keyed
+    by the normalized message rowid, but a selected conversation is always
+    rebuilt as a whole so native folds never straddle a batch boundary.
+    """
+    pending = conn.execute(
+        "SELECT 1 FROM cache_meta "
+        "WHERE key='codex_find_projection_backfill_pending'"
+    ).fetchone()
+    if pending is None:
+        complete = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='codex_find_projection_complete_version' AND value='1'"
+        ).fetchone() is not None
+        return {"processed": 0, "complete": complete}
+    row = conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_find_projection_backfill_cursor'"
+    ).fetchone()
+    try:
+        cursor = int(row[0]) if row is not None else 0
+    except (TypeError, ValueError):
+        cursor = 0
+    selected_rows = conn.execute(
+        "SELECT id,conversation_key FROM codex_conversation_messages "
+        "WHERE id>? ORDER BY id LIMIT ?",
+        (cursor, max(1, batch_size)),
+    ).fetchall()
+    selected = {conversation_key for _message_id, conversation_key in selected_rows}
+    if selected_rows:
+        import _lib_codex_conversation_query as query
+        query.materialize_codex_find_projection(conn, selected)
+        # Advance only over raw rows actually consumed by this batch. A
+        # conversation may own later, interleaved row ids; jumping to its MAX
+        # would skip another conversation whose first row lies in between and
+        # could falsely certify the projection complete.
+        cursor = int(selected_rows[-1][0])
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES"
+            "('codex_find_projection_backfill_cursor',?)",
+            (str(cursor),),
+        )
+    remaining = conn.execute(
+        "SELECT 1 FROM codex_conversation_messages WHERE id>? LIMIT 1",
+        (cursor,),
+    ).fetchone()
+    complete = remaining is None
+    if complete:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES"
+            "('codex_find_projection_complete_version','1')"
+        )
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key IN "
+            "('codex_find_projection_backfill_pending',"
+            " 'codex_find_projection_backfill_cursor')"
+        )
+    conn.commit()
+    return {"processed": len(selected), "complete": complete}
 
 
 def _repair_codex_turn_ids_for_source(
@@ -1832,27 +2171,18 @@ def _repair_codex_turn_ids_for_source(
     return affected
 
 
-def _collect_inactive_codex_paths_and_roots(
+def _collect_retained_codex_paths_and_roots(
     conn: sqlite3.Connection,
-    current_file_identities: set[tuple[str, str]],
-    active_root_keys: set[str],
 ) -> tuple[list[tuple[str, str | None]], set[str]]:
-    """Return stale real source identities and their candidate root keys.
+    """Return every retained real source identity and provider root.
 
     A failed/partial prior write can leave any S1 child family without its
-    terminal ``codex_session_files`` row.  Scope pruning must therefore use
-    every physical family, compare each row's path AND provider root, and leave
-    relative fixture rows alone.
+    terminal ``codex_session_files`` row. Safety decisions must therefore see
+    every physical family, including a still-discovered path whose root no
+    longer contains recognizable Codex data. Relative fixture rows have no
+    on-disk authority and remain outside filesystem pruning.
     """
-    stale_identities: set[tuple[str, str | None]] = set()
-    stale_root_keys: set[str] = set()
-    current_paths = {path for path, _root_key in current_file_identities}
-    terminal_file_identities = {
-        (path, root_key)
-        for path, root_key in conn.execute(
-            "SELECT path, source_root_key FROM codex_session_files"
-        )
-    }
+    retained_identities: set[tuple[str, str | None]] = set()
     family_queries = (
         "SELECT path, source_root_key FROM codex_session_files",
         "SELECT source_path, source_root_key FROM codex_session_entries",
@@ -1862,29 +2192,59 @@ def _collect_inactive_codex_paths_and_roots(
     )
     for query in family_queries:
         for source_path, root_key in conn.execute(query):
-            identity = (source_path, root_key)
-            if (
-                not os.path.isabs(source_path)
-                or identity in current_file_identities
-                # An old terminal file at a currently discovered path must
-                # reach the normal requalification loop, which resets every
-                # family as one file transaction and records the reset stat.
-                or (
-                    source_path in current_paths
-                    and identity in terminal_file_identities
-                )
-            ):
+            if not os.path.isabs(source_path):
                 continue
-            stale_identities.add(identity)
-            if root_key is not None:
-                stale_root_keys.add(root_key)
-    stale_root_keys.update(
+            retained_identities.add((source_path, root_key))
+    retained_root_keys = {
+        root_key for _path, root_key in retained_identities if root_key is not None
+    }
+    retained_root_keys.update(
         root_key
         for (root_key,) in conn.execute(
             "SELECT source_root_key FROM codex_source_roots"
         )
-        if root_key not in active_root_keys
     )
+    return (
+        sorted(retained_identities, key=lambda item: (item[0], item[1] or "")),
+        retained_root_keys,
+    )
+
+
+def _collect_inactive_codex_paths_and_roots(
+    conn: sqlite3.Connection,
+    current_file_identities: set[tuple[str, str]],
+    active_root_keys: set[str],
+) -> tuple[list[tuple[str, str | None]], set[str]]:
+    """Return stale retained source identities and candidate root keys."""
+    retained_identities, retained_root_keys = (
+        _collect_retained_codex_paths_and_roots(conn)
+    )
+    current_paths = {path for path, _root_key in current_file_identities}
+    terminal_file_identities = {
+        (path, root_key)
+        for path, root_key in conn.execute(
+            "SELECT path, source_root_key FROM codex_session_files"
+        )
+    }
+    stale_identities = {
+        identity
+        for identity in retained_identities
+        if (
+            identity not in current_file_identities
+            # An old terminal file at a currently discovered path must reach
+            # the normal requalification loop. The caller separately protects
+            # that loop when the configured root is unrecognizable.
+            and not (
+                identity[0] in current_paths
+                and identity in terminal_file_identities
+            )
+        )
+    }
+    stale_root_keys = {
+        root_key
+        for root_key in retained_root_keys
+        if root_key not in active_root_keys
+    }
     return sorted(stale_identities, key=lambda item: (item[0], item[1] or "")), stale_root_keys
 
 
@@ -3793,7 +4153,9 @@ def _reingest_parse_file(jp, path_str):
     return rows
 
 
-def _resumable_reingest_conversation_messages(conn):
+def _resumable_reingest_conversation_messages(
+    conn, active_account_key: "str | None" = None,
+):
     """#179: resumable, lock-friendly replacement for the old global
     ``clear_conversation_messages`` + offset-0 ``backfill_conversation_messages``
     reingest, which re-armed the whole ~2.5min rebuild on any interrupt. Walks
@@ -3841,6 +4203,30 @@ def _resumable_reingest_conversation_messages(conn):
             conn.commit()
             continue
         try:
+            # #347 enrichment replays must not erase first-stamped transcript
+            # ownership.  Snapshot by physical offset before the destructive
+            # per-source replace and carry it onto the re-parsed row.
+            account_capable = "account_key" in {
+                str(info[1])
+                for info in conn.execute("PRAGMA table_info(conversation_messages)")
+            }
+            account_by_offset = {
+                int(offset): account_key
+                for offset, account_key in conn.execute(
+                    "SELECT byte_offset,account_key FROM conversation_messages "
+                    "WHERE source_path=?",
+                    (path_str,),
+                )
+            } if account_capable else {}
+            if account_capable:
+                rows = [
+                    row + (
+                        account_by_offset[int(row[4])]
+                        if int(row[4]) in account_by_offset
+                        else active_account_key,
+                    )
+                    for row in rows
+                ]
             # #217 S2 / I-3 (P1-4): conversation_file_touches is derived state
             # keyed by conversation_messages.id, and this per-source reingest
             # DELETEs + re-inserts the file's message rows (bumping autoincrement
@@ -3855,7 +4241,11 @@ def _resumable_reingest_conversation_messages(conn):
             conn.execute("DELETE FROM conversation_messages WHERE source_path=?",
                          (path_str,))
             if rows:
-                conn.executemany(_CONV_INSERT_SQL, rows)
+                conn.executemany(
+                    _CONV_ACCOUNT_INSERT_SQL if account_capable
+                    else _CONV_INSERT_SQL,
+                    rows,
+                )
                 # Refill scoped to this file's just-reinserted physical keys
                 # (col 3=source_path, col 4=byte_offset per _conv_row_tuple).
                 _fill_file_touches(
@@ -4860,6 +5250,12 @@ class CodexIngestStats:
     # Count of cached files dropped because they fall outside the CURRENT
     # $CODEX_HOME root set (issue #108 — a prior-root purge, not a delta).
     files_pruned: int = 0
+    # #485: a whole-tree walk may discover no trustworthy current Codex root.
+    # In that state absence is not deletion evidence, so ordinary orphan
+    # pruning is refused and retained rows stay untouched. These fields make
+    # the destructive decision directly observable to callers and tests.
+    prune_refused: bool = False
+    prune_refused_files: int = 0
     lock_contended: bool = False
     # #279 S2 F1 parse-health counters — folded from each file's
     # _CodexIterState after its drain. Same vocabulary as the iterator
@@ -5456,6 +5852,7 @@ def sync_codex_cache(
             _cache_root_keys,
         )
         seq_before = codex_physical_mutation_seq(conn)
+        rebuild_prune_scope: _CodexPruneScope | None = None
 
         # #416 spec D1: which rollouts were ALREADY ingested before this rebuild
         # cleared the cursor table. A rebuild re-reads their bytes, and bytes
@@ -5485,6 +5882,46 @@ def sync_codex_cache(
                         str(_canonical_codex_path(pathlib.Path(str(_path))))))
                 except (ValueError, TypeError, OSError):
                     continue
+        if rebuild and not targeted:
+            # #485: rebuild used to clear first and discover second. With an
+            # empty/missing/misconfigured root that made the explicit repair
+            # command itself destroy the only retained copy. Discover before
+            # the clear and require the same positive root evidence as ordinary
+            # pruning whenever real absolute Codex rows already exist.
+            preflight_files = _discover_codex_files_with_roots()
+            preflight_scope = _codex_prune_scope(preflight_files)
+            rebuild_prune_scope = preflight_scope
+            preflight_sources, _preflight_root_keys = (
+                _collect_retained_codex_paths_and_roots(conn)
+            )
+            preflight_source_root_keys = {
+                root_key
+                for _path, root_key in preflight_sources
+                if root_key is not None
+            }
+            (
+                _safe_sources,
+                refused_sources,
+                _safe_roots,
+                refused_root_keys,
+            ) = _partition_codex_prune_candidates(
+                preflight_scope, preflight_sources, preflight_source_root_keys
+            )
+            if refused_sources or refused_root_keys:
+                _codex_prune_refusal_record(
+                    conn,
+                    store="cache",
+                    scope=preflight_scope,
+                    refused_sources=refused_sources,
+                    refused_root_keys=refused_root_keys,
+                )
+                conn.commit()
+                stats.files_total = len(preflight_files)
+                stats.prune_refused = True
+                stats.prune_refused_files = len({
+                    path for path, _root in refused_sources
+                })
+                return stats
         if rebuild:
             # Clear INSIDE the lock — see sync_cache() for the full
             # rationale. Done before the existing SELECT so delta
@@ -5590,19 +6027,13 @@ def sync_codex_cache(
             stats.files_total = len(files)
             _p_disc.set_count(len(files))
 
-        # Scope the cache to the CURRENT root set: drop rows ingested under a
-        # prior $CODEX_HOME (issue #108). iter_codex_entries() has NO root
-        # predicate — it reads every row in range — so without this, reusing
-        # the same cache.db across `CODEX_HOME=/A` then `CODEX_HOME=/B` runs
-        # returns A+B instead of just B. Prune every real (absolute) row
-        # outside the current set, even when that set is empty (an empty
-        # current root then prunes the cache to empty): the cache is fully
-        # re-derivable, so honoring the override beats retaining unreachable
-        # rows. Done INSIDE the lock and committed BEFORE the existing-SELECT
-        # + parse loop so no cache.db write lock is held across the read-heavy
-        # ingest (same invariant as the --rebuild clear above). Concurrent
-        # processes with different $CODEX_HOME would prune each other; the
-        # flock serializes them and that is a pathological configuration.
+        # Scope the cache to the CURRENT root set (issue #108), but only from
+        # positive filesystem evidence (#485). A recognized new root still
+        # authorizes the deliberate A -> B scope switch. No recognized root,
+        # or one configured-but-unrecognizable sibling, is unknown filesystem
+        # state rather than proof of deletion and therefore fails closed.
+        protected_paths: set[str] = set()
+        ordinary_prune_scope: _CodexPruneScope | None = None
         if not rebuild and not targeted:  # --rebuild already cleared; targeted bypasses
             current_file_identities = {
                 (str(item.source_path), item.source_root_key) for item in files
@@ -5619,12 +6050,39 @@ def sync_codex_cache(
             orphan_sources, orphan_root_keys = _collect_inactive_codex_paths_and_roots(
                 conn, current_file_identities, active_root_keys,
             )
-            if orphan_sources or orphan_root_keys:
+            prune_scope = _codex_prune_scope(files)
+            ordinary_prune_scope = prune_scope
+            (
+                safe_sources,
+                _refused_orphan_sources,
+                safe_root_keys,
+                _refused_orphan_root_keys,
+            ) = _partition_codex_prune_candidates(
+                prune_scope, orphan_sources, orphan_root_keys
+            )
+            retained_sources, _retained_root_keys = (
+                _collect_retained_codex_paths_and_roots(conn)
+            )
+            retained_source_root_keys = {
+                root_key
+                for _path, root_key in retained_sources
+                if root_key is not None
+            }
+            (
+                _safe_retained_sources,
+                refused_sources,
+                _safe_retained_roots,
+                refused_root_keys,
+            ) = _partition_codex_prune_candidates(
+                prune_scope, retained_sources, retained_source_root_keys
+            )
+            protected_paths = {path for path, _root in refused_sources}
+            if safe_sources or safe_root_keys:
                 before_prune = conn.total_changes
                 # #294 S6: capture the conversation keys the orphan rows belong to
                 # BEFORE deleting, so the rollups can be repaired/deleted after.
                 orphan_keys: set = set()
-                for orphan_path, orphan_root_key in orphan_sources:
+                for orphan_path, orphan_root_key in safe_sources:
                     orphan_keys.update(
                         row[0] for row in conn.execute(
                             "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
@@ -5637,7 +6095,7 @@ def sync_codex_cache(
                     )
                 _prune_inactive_codex_source_roots(
                     conn, active_root_keys,
-                    candidate_root_keys=orphan_root_keys,
+                    candidate_root_keys=safe_root_keys,
                 )
                 # Recompute-affected-or-delete the rollups the prune touched (§3.2):
                 # a conversation with no surviving rows loses its rollup, one that
@@ -5645,8 +6103,24 @@ def sync_codex_cache(
                 _recompute_codex_rollups(conn, orphan_keys)
                 if conn.total_changes != before_prune:
                     _bump_codex_physical_mutation_seq(conn)
+                stats.files_pruned = len({path for path, _root in safe_sources})
+            if refused_sources or refused_root_keys:
+                _codex_prune_refusal_record(
+                    conn,
+                    store="cache",
+                    scope=prune_scope,
+                    refused_sources=refused_sources,
+                    refused_root_keys=refused_root_keys,
+                )
+                stats.prune_refused = True
+                stats.prune_refused_files = len({
+                    path for path, _root in refused_sources
+                })
+            if (
+                safe_sources or safe_root_keys
+                or refused_sources or refused_root_keys
+            ):
                 conn.commit()
-                stats.files_pruned = len({path for path, _root in orphan_sources})
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
@@ -5808,6 +6282,12 @@ def sync_codex_cache(
                 break
             jp = discovered.source_path
             path_str = str(jp)
+            if path_str in protected_paths:
+                # The file is still visible, but its configured root did not
+                # yield recognizable Codex data. Treat that as unknown
+                # filesystem state: neither truncation/requalification reset
+                # nor append ingestion may replace the retained generation.
+                continue
             try:
                 st = jp.stat()
             except OSError as exc:
@@ -6543,6 +7023,17 @@ def sync_codex_cache(
                 and stats.files_failed == 0
                 and stats.files_deferred_torn == 0
             ):
+                recovery_scope = rebuild_prune_scope or ordinary_prune_scope
+                if (
+                    recovery_scope is not None
+                    and recovery_scope.recognized_root_keys
+                    and not stats.prune_refused
+                    and (
+                        stats.files_processed + stats.files_skipped_unchanged
+                        == stats.files_total
+                    )
+                ):
+                    _clear_codex_prune_refusal(conn)
                 if replay_pending:
                     conn.execute("DELETE FROM cache_meta WHERE key = ?",
                                  (CODEX_REPLAY_FROM_ZERO_KEY,))
@@ -8095,6 +8586,126 @@ def open_conversations_db(*, attach_cache: bool = True) -> sqlite3.Connection:
     return _conversations_open_guarded(attach_cache=attach_cache)
 
 
+def scope_conversations_db_to_account(
+    conn: sqlite3.Connection, account_key: str,
+) -> None:
+    """Narrow one conversation read connection to ``account_key`` (#347).
+
+    The query kernels intentionally retain their byte-frozen unqualified SQL.
+    A qualified request gets a fresh SQLite connection and this helper shadows
+    every transcript/accounting leaf with TEMP views on that connection only.
+    SQLite resolves TEMP before main/attached schemas, so browse, facets,
+    search, detail, outline, export, payload, media, find, and cost/token joins
+    all inherit the same physical-row predicate without a parallel query stack.
+
+    The two rollups are rebuilt into TEMP tables from the filtered leaves.  No
+    persistent row is changed and an unqualified connection takes none of this
+    path, preserving the existing SQL plans and serialized bytes.
+    """
+    import _lib_accounts
+
+    key = str(account_key or "").strip()
+    if not key:
+        raise ValueError("account_key is required")
+    if key == _lib_accounts.UNATTRIBUTED:
+        stored_predicate = "COALESCE(account_key,'unattributed')='unattributed'"
+    else:
+        # The value lives in a one-row TEMP table and reaches every view through
+        # a subquery; never interpolate an opaque account key into DDL.
+        stored_predicate = (
+            "COALESCE(account_key,'unattributed')="
+            "(SELECT account_key FROM _conversation_account_scope)"
+        )
+
+    conn.execute(
+        "CREATE TEMP TABLE _conversation_account_scope "
+        "(account_key TEXT NOT NULL PRIMARY KEY)"
+    )
+    conn.execute(
+        "INSERT INTO _conversation_account_scope(account_key) VALUES(?)", (key,)
+    )
+
+    conn.executescript(
+        f"""
+        CREATE TEMP VIEW conversation_messages AS
+            SELECT * FROM main.conversation_messages WHERE {stored_predicate};
+        CREATE TEMP VIEW conversation_ai_titles AS
+            SELECT t.* FROM main.conversation_ai_titles t
+            WHERE EXISTS (
+                SELECT 1 FROM conversation_messages m
+                WHERE m.source_path=t.source_path
+                  AND m.byte_offset=t.byte_offset
+            );
+        CREATE TEMP VIEW conversation_file_touches AS
+            SELECT t.* FROM main.conversation_file_touches t
+            WHERE EXISTS (
+                SELECT 1 FROM conversation_messages m WHERE m.id=t.message_id
+            );
+        CREATE TEMP VIEW session_entries AS
+            SELECT * FROM cache_db.session_entries WHERE {stored_predicate};
+        -- A file-level project path cannot be partitioned when one JSONL
+        -- switches accounts. Scoped anonymization therefore uses only the
+        -- already-filtered physical message CWDs.
+        CREATE TEMP VIEW session_files AS
+            SELECT * FROM cache_db.session_files WHERE 0;
+
+        CREATE TEMP VIEW codex_conversation_events AS
+            SELECT * FROM main.codex_conversation_events WHERE {stored_predicate};
+        CREATE TEMP VIEW codex_conversation_messages AS
+            SELECT * FROM main.codex_conversation_messages WHERE {stored_predicate};
+        CREATE TEMP VIEW codex_conversation_file_touches AS
+            SELECT t.* FROM main.codex_conversation_file_touches t
+            WHERE EXISTS (
+                SELECT 1 FROM codex_conversation_messages m WHERE m.id=t.message_id
+            );
+        CREATE TEMP VIEW codex_find_projection AS
+            SELECT p.* FROM main.codex_find_projection p
+            WHERE EXISTS (
+                SELECT 1 FROM codex_conversation_messages m WHERE m.id=p.message_id
+            );
+        CREATE TEMP VIEW codex_session_entries AS
+            SELECT * FROM cache_db.codex_session_entries WHERE {stored_predicate};
+
+        -- Thread metadata has conversation-level provenance and can predate an
+        -- in-file account switch.  Do not expose it in a scoped connection;
+        -- the Codex rollup degrades explicitly to unassigned rather than leaking
+        -- another account's cwd/git metadata.
+        CREATE TEMP VIEW codex_conversation_threads AS
+            SELECT * FROM cache_db.codex_conversation_threads WHERE 0;
+        CREATE TEMP VIEW codex_source_roots AS
+            SELECT * FROM cache_db.codex_source_roots WHERE 0;
+
+        CREATE TEMP TABLE conversation_sessions AS
+            SELECT * FROM main.conversation_sessions WHERE 0;
+        CREATE TEMP TABLE codex_conversation_rollups (
+            conversation_key  TEXT NOT NULL PRIMARY KEY,
+            source_root_key   TEXT NOT NULL,
+            parent_thread_id  TEXT,
+            item_count        INTEGER NOT NULL DEFAULT 0,
+            started_utc       TEXT,
+            last_activity_utc TEXT,
+            project_key       TEXT,
+            project_label     TEXT,
+            models_json       TEXT,
+            title             TEXT
+        );
+        """
+    )
+    _recompute_conversation_sessions(conn)
+    codex_keys = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT conversation_key FROM codex_conversation_messages"
+        )
+        if row[0]
+    }
+    _recompute_codex_rollups(conn, codex_keys)
+    # TEMP rollup writes open a transaction. Close it before a long-lived
+    # account-scoped SSE reader starts watching so later provider-writer commits
+    # are visible to the dynamic leaf views and never contend on this setup work.
+    conn.commit()
+
+
 def _open_conversations_db_for_recovery(
     *, attach_cache: bool = True,
 ) -> sqlite3.Connection:
@@ -8669,6 +9280,7 @@ def _prepare_claude_conversation_maintenance(
     *,
     rebuild: bool,
     targeted: bool,
+    active_account_key: "str | None" = None,
 ) -> bool:
     """Consume transcript-only upgrade work under the conversation flock.
 
@@ -8760,7 +9372,9 @@ def _prepare_claude_conversation_maintenance(
         "'conversation_background_mcp_reingest_pending')"
     ).fetchone() is not None
     if reingest:
-        _resumable_reingest_conversation_messages(conn)
+        _resumable_reingest_conversation_messages(
+            conn, active_account_key=active_account_key,
+        )
         _set_cache_meta(conn, "conversation_sessions_backfill_pending", "1")
         conn.commit()
 
@@ -8806,6 +9420,20 @@ def sync_claude_conversations(
             stats.lock_contended = True
             return stats
 
+        # #347 observe-and-stamp mirrors the accounting ingest boundary.  A
+        # torn credential read is undecided, not unattributed: defer before any
+        # maintenance/rebuild mutation so the cursor remains replayable.
+        import _lib_accounts
+        claude_identity = _cctally_core._resolve_active_claude_identity()
+        if claude_identity.get("status") == "torn":
+            stats.files_deferred_torn += 1
+            stats.deferred_reason = "identity_torn"
+            return stats
+        active_key = claude_identity["account_key"]
+        active_account_key = (
+            None if active_key == _lib_accounts.UNATTRIBUTED else active_key
+        )
+
         targeted = only_paths is not None
         pending_rebuild = conn.execute(
             "SELECT 1 FROM cache_meta "
@@ -8835,10 +9463,19 @@ def sync_claude_conversations(
 
         _report_conversation_progress(progress, "prepare", stats)
         maintenance_replayed = _prepare_claude_conversation_maintenance(
-            conn, rebuild=rebuild, targeted=targeted
+            conn, rebuild=rebuild, targeted=targeted,
+            active_account_key=active_account_key,
         )
 
+        rebuild_account_stamps: dict[tuple[str, int], str | None] = {}
         if rebuild:
+            rebuild_account_stamps = {
+                (str(path), int(offset)): account_key
+                for path, offset, account_key in conn.execute(
+                    "SELECT source_path,byte_offset,account_key "
+                    "FROM conversation_messages"
+                )
+            }
             clear_conversation_messages(conn)
             conn.execute("DELETE FROM conversation_ai_titles")
             conn.execute("DELETE FROM conversation_sessions")
@@ -8915,7 +9552,16 @@ def sync_claude_conversations(
                         include_cost=False,
                     ):
                         if mrow is not None:
-                            conv_rows.append(_conv_row_tuple(mrow, path_str))
+                            account_key = rebuild_account_stamps.get(
+                                (path_str, int(mrow.byte_offset)),
+                                active_account_key,
+                            )
+                            conv_rows.append(
+                                _conv_row_tuple(
+                                    mrow, path_str, account_key,
+                                    include_account=True,
+                                )
+                            )
                         if ai is not None:
                             ai_rows.append(
                                 (ai.session_id, ai.ai_title, path_str, ai.byte_offset)
@@ -8952,7 +9598,7 @@ def sync_claude_conversations(
                     )
                     stats.files_reset_truncated += 1
                 if conv_rows:
-                    conn.executemany(_CONV_INSERT_SQL, conv_rows)
+                    conn.executemany(_CONV_ACCOUNT_INSERT_SQL, conv_rows)
                     _fill_file_touches(
                         conn, scope=[(row[3], row[4]) for row in conv_rows]
                     )
@@ -9059,6 +9705,7 @@ def sync_codex_conversations(
     """Delta-sync Codex events/search rows into conversations.db (#320)."""
     stats = CodexIngestStats()
     did_from_zero_replay = False
+    rebuild_account_stamps: dict[tuple[str, int], str | None] = {}
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
     lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
@@ -9106,7 +9753,51 @@ def sync_codex_conversations(
             return stats
         rebuild = (
             rebuild or pending_rebuild or contract_rebuild or codex_replay_pending)
+        rebuild_prune_scope: _CodexPruneScope | None = None
         if rebuild:
+            rebuild_account_stamps = {
+                (str(path), int(offset)): account_key
+                for path, offset, account_key in conn.execute(
+                    "SELECT source_path,line_offset,account_key "
+                    "FROM codex_conversation_events"
+                )
+            }
+            # #485: establish positive root evidence before the destructive
+            # clear. A rebuild against an empty or missing CODEX_HOME must keep
+            # the retained transcript store and its pending replay marker.
+            preflight_files = _discover_codex_files_with_roots()
+            preflight_scope = _codex_prune_scope(preflight_files)
+            rebuild_prune_scope = preflight_scope
+            preflight_sources = [
+                (path, root_key)
+                for path, root_key in conn.execute(
+                    "SELECT path,source_root_key "
+                    "FROM codex_conversation_source_files"
+                )
+            ]
+            (
+                _safe_sources,
+                refused_sources,
+                _safe_roots,
+                _refused_roots,
+            ) = _partition_codex_prune_candidates(
+                preflight_scope, preflight_sources, set()
+            )
+            if refused_sources:
+                _codex_prune_refusal_record(
+                    conn,
+                    store="conversations",
+                    scope=preflight_scope,
+                    refused_sources=refused_sources,
+                    refused_root_keys=set(),
+                )
+                conn.commit()
+                stats.files_total = len(preflight_files)
+                stats.prune_refused = True
+                stats.prune_refused_files = len({
+                    path for path, _root in refused_sources
+                })
+                return stats
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                 ("conversation_rebuild_codex_pending", "1"),
@@ -9152,9 +9843,36 @@ def sync_codex_conversations(
                 if current_size < prev[0]:
                     stats.deferred_reason = "truncation"
                     return stats
+        protected_paths: set[str] = set()
+        ordinary_prune_scope: _CodexPruneScope | None = None
         if only_paths is None:
             active_paths = {str(item.source_path) for item in files}
-            for stale_path in sorted(set(existing) - active_paths):
+            prune_scope = _codex_prune_scope(files)
+            ordinary_prune_scope = prune_scope
+            stale_sources = [
+                (stale_path, existing[stale_path][3])
+                for stale_path in sorted(set(existing) - active_paths)
+            ]
+            safe_sources, _refused_stale, _safe_roots, _refused_roots = (
+                _partition_codex_prune_candidates(
+                    prune_scope, stale_sources, set()
+                )
+            )
+            retained_sources = [
+                (path, values[3])
+                for path, values in existing.items()
+                if os.path.isabs(path)
+            ]
+            (
+                _safe_retained,
+                refused_sources,
+                _safe_retained_roots,
+                _refused_retained_roots,
+            ) = _partition_codex_prune_candidates(
+                prune_scope, retained_sources, set()
+            )
+            protected_paths = {path for path, _root in refused_sources}
+            for stale_path, _stale_root_key in safe_sources:
                 affected = {
                     row[0] for row in conn.execute(
                         "SELECT DISTINCT conversation_key "
@@ -9179,11 +9897,30 @@ def sync_codex_conversations(
                     (stale_path,),
                 )
                 _recompute_codex_rollups(conn, affected)
+                import _lib_codex_conversation_query as query
+                query.materialize_codex_find_projection(conn, affected)
+            stats.files_pruned = len({path for path, _root in safe_sources})
+            if refused_sources:
+                _codex_prune_refusal_record(
+                    conn,
+                    store="conversations",
+                    scope=prune_scope,
+                    refused_sources=refused_sources,
+                    refused_root_keys=set(),
+                )
+                stats.prune_refused = True
+                stats.prune_refused_files = len({
+                    path for path, _root in refused_sources
+                })
             conn.commit()
 
         for discovered in files:
             jp = discovered.source_path
             path_str = str(jp)
+            if path_str in protected_paths:
+                # Visible but unrecognizable input is not evidence that the
+                # retained transcript generation should be reset or replaced.
+                continue
             try:
                 st = jp.stat()
             except OSError:
@@ -9219,6 +9956,31 @@ def sync_codex_conversations(
             initial_conversation = prev[10] if prev else None
             initial_turn = prev[11] if prev else None
 
+            # #347 uses the accounting cache's journal-backed file-range map as
+            # the Codex transcript oracle.  It is already attached read-only,
+            # and core ingest runs first, so rebuilds replay the original
+            # decision instead of consulting the currently-active auth.json.
+            try:
+                file_identity = codex_file_identity(discovered)
+                incarnation_row = conn.execute(
+                    "SELECT incarnation FROM cache_db.codex_file_incarnations "
+                    "WHERE file_identity=?",
+                    (file_identity,),
+                ).fetchone()
+                incarnation = int(incarnation_row[0]) if incarnation_row else 1
+                account_ranges = [
+                    (int(off), key)
+                    for off, key in conn.execute(
+                        "SELECT from_offset,account_key "
+                        "FROM cache_db.codex_file_accounts "
+                        "WHERE file_identity=? AND incarnation=? "
+                        "ORDER BY from_offset",
+                        (file_identity, incarnation),
+                    )
+                ]
+            except sqlite3.OperationalError:
+                account_ranges = []
+
             state = _CodexIterState(
                 session_id=initial_session_id,
                 model=initial_model,
@@ -9241,6 +10003,7 @@ def sync_codex_conversations(
                 )
             events = []
             event_rows = []
+            account_by_physical: dict[tuple[str, int], str | None] = {}
             yielded = 0
             try:
                 with open(jp, "rb") as fh:
@@ -9256,6 +10019,16 @@ def sync_codex_conversations(
                     ):
                         event = emission.event
                         events.append(event)
+                        covered, account_key = codex_account_for_offset(
+                            account_ranges, int(event.line_offset)
+                        )
+                        if not covered:
+                            account_key = rebuild_account_stamps.get(
+                                (event.source_path, int(event.line_offset))
+                            )
+                        account_by_physical[
+                            (event.source_path, int(event.line_offset))
+                        ] = account_key
                         event_rows.append((
                             event.source_path,
                             event.line_offset,
@@ -9270,6 +10043,7 @@ def sync_codex_conversations(
                             event.turn_id,
                             event.call_id,
                             event.payload_json,
+                            account_key,
                         ))
                         if emission.accounting is not None:
                             yielded += 1
@@ -9327,12 +10101,13 @@ def sync_codex_conversations(
                         "INSERT OR IGNORE INTO codex_conversation_events "
                         "(source_path,line_offset,source_root_key,conversation_key,"
                         "native_thread_id,root_thread_id,parent_thread_id,"
-                        "timestamp_utc,record_type,event_type,turn_id,call_id,payload_json) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "timestamp_utc,record_type,event_type,turn_id,call_id,payload_json,"
+                        "account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         event_rows,
                     )
                 _insert_codex_normalized_rows(
-                    conn, normalized.rows, normalized.touches
+                    conn, normalized.rows, normalized.touches,
+                    account_by_physical,
                 )
                 affected_keys.update(
                     row.conversation_key for row in normalized.rows
@@ -9345,6 +10120,8 @@ def sync_codex_conversations(
                         _repair_codex_turn_ids_for_source(conn, path_str)
                     )
                 _recompute_codex_rollups(conn, affected_keys)
+                import _lib_codex_conversation_query as query
+                query.materialize_codex_find_projection(conn, affected_keys)
                 terminal = state.thread
                 conn.execute(
                     "INSERT INTO codex_conversation_source_files "
@@ -9392,8 +10169,20 @@ def sync_codex_conversations(
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
 
+        run_codex_find_projection_backfill(conn)
         _report_conversation_progress(progress, "finalize", stats)
         if only_paths is None and stats.files_failed == 0:
+            recovery_scope = rebuild_prune_scope or ordinary_prune_scope
+            if (
+                recovery_scope is not None
+                and recovery_scope.recognized_root_keys
+                and not stats.prune_refused
+                and (
+                    stats.files_processed + stats.files_skipped_unchanged
+                    == stats.files_total
+                )
+            ):
+                _clear_codex_prune_refusal(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                 (

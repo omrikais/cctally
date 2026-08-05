@@ -199,7 +199,10 @@ loader.exec_module(module)
 import _cctally_journal
 import _cctally_store
 with _cctally_store.stats_write_scope("test-independent-rebuild"):
-    _cctally_journal.rebuild_stats_index(target_path=target)
+    _cctally_journal.rebuild_stats_index(
+        context=_cctally_journal.RebuildContext(trigger="test-fixture"),
+        target_path=target,
+    )
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(ROOT), str(destination)],
@@ -328,6 +331,60 @@ def test_next_open_recovers_partial_destination_with_complete_metadata(
     assert _read_usage_rows(db)[0][0] == 7.0
     assert db.stat().st_ino != inode_before
     assert not list(db.parent.glob("stats.db.rebuilding-????????T??????_??????*"))
+
+
+def _cutover_manifests(app_dir: pathlib.Path) -> list[dict]:
+    """Every `preserve-then-atomic-replace-v1` manifest, oldest first.
+
+    Selected by protocol so the synthesized legacy incident that sets this
+    scenario up is never mistaken for one the recovery cutover wrote.
+    """
+    root = pathlib.Path(app_dir) / "quarantine"
+    if not root.is_dir():
+        return []
+    out = []
+    for incident in sorted(root.iterdir()):
+        path = incident / "manifest.json"
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text())
+        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+            out.append(payload)
+    return out
+
+
+def test_recovery_rebuild_incident_records_its_trigger_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """#496 S1 F3, driven through a real kill and a real next open.
+
+    The partial-destination shape is used deliberately: it is the branch that
+    actually calls `rebuild_stats_index`, so it is the only interrupted-rebuild
+    path that preserves a family and therefore writes a manifest at all.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed(env)
+    complete = tmp_path / "complete.db"
+    _build_independent_rebuild(env, complete)
+    _create_legacy_interrupted_state(env, db, tmp_path)
+    shutil.copy2(complete, db)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM weekly_usage_snapshots")
+        conn.commit()
+    finally:
+        conn.close()
+    data = pathlib.Path(env["CCTALLY_DATA_DIR"])
+    assert _cutover_manifests(data) == []
+
+    opened = _cli(env, "report", "--json")
+
+    assert opened.returncode == 0, opened.stderr
+    assert json.loads(opened.stdout)["current"]["weeklyPercent"] == 7.0
+    manifests = _cutover_manifests(data)
+    assert [m["trigger"] for m in manifests] == ["interrupted-rebuild-recovery"]
+    assert manifests[0]["schemaVersion"] == 2
+    assert manifests[0]["triggerError"] is None
 
 
 def test_legitimate_empty_index_is_not_rebuilt_merely_because_scratch_exists(

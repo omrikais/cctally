@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Build the committed Codex reader-path wire fixture (#463 S1, finding F23).
+"""Build the committed Codex reader-path wire fixtures (#463 S1, finding F23).
 
-Emits ``tests/fixtures/codex-reader/wire-detail.json`` — the exact JSON envelope
-``get_codex_conversation`` produces for a synthetic Codex conversation. The
-frontend harness ``bin/cctally-frontend-test`` feeds that envelope through
-``adaptQualifiedDetail`` and pins the adapted neutral model as a second golden,
-so the two sides drift independently: a server change to segmentation or block
-building moves this file, a client change to adaptation moves the adapted one.
+Emits ``tests/fixtures/codex-reader/wire-detail*.json`` — the exact JSON envelope
+``get_codex_conversation`` produces for a synthetic Codex conversation — and, per
+scenario, ``wire-outline-<scenario>.json``, the envelope
+``get_codex_conversation_outline`` produces for the same conversation (#463 S4).
+The frontend harness ``bin/cctally-frontend-test`` feeds each envelope through
+``adaptQualifiedDetail`` / ``adaptQualifiedOutline`` and pins the adapted neutral
+model as a second golden, so the two sides drift independently: a server change
+to segmentation, block building or outline derivation moves these files, a client
+change to adaptation moves the adapted ones.
 
 **The fixture must stay synthetic.** ``.mirror-allowlist`` publishes ``tests/**``
 to the public repository, so the corpus is ``tests/fixtures/codex-parity/v1/
@@ -83,10 +86,41 @@ OUT_DIR = REPO_ROOT / "tests" / "fixtures" / "codex-reader"
 # declared REQUIRED_SCENARIO and checksums the whole tree into a versioned
 # manifest, so adding a rollout there would mean a corpus version bump for a
 # fixture only this builder consumes.
+#   * tool-legibility (#463 S3) carries the shapes S3 decodes and the earlier
+#     two do not hold at all: a dict-shaped `patch_apply_end`, a wholly
+#     recognized and a mixed `exec` program, the five `function_call` tool
+#     families, every output preamble grammar, an announced and an unannounced
+#     shell session, and the external-agent marker. Adding a scenario rather
+#     than enlarging `modern-full` keeps the record-family pin and the
+#     tool-legibility pin independently reviewable.
+#
+#     #463 S4 remediation round 3 — it also carries the AMBIGUOUS-call turn:
+#     two `custom_tool_call` rows sharing one `call_id`, and a failing output
+#     for that id. That is the primary C-4 case — the output cannot fold into
+#     either call, so it becomes its own block and carries a `tool_error`
+#     landmark anchored on its own key — and no committed golden held the shape
+#     before, so the wire→adapted pin that exists to stop client/server drift
+#     had nothing to say about the branch that renders it. `main()` asserts the
+#     resulting `tool_output` block is present rather than trusting the diff.
 SCENARIOS = (
     ("modern-full", "wire-detail.json"),
     ("segmented-turn", "wire-detail-segmented.json"),
+    ("tool-legibility", "wire-detail-tool-legibility.json"),
 )
+
+# #463 S4, Task 0. The OUTLINE envelope of the same three scenarios, emitted as
+# its own fixture family. The builder already computed these outlines for the
+# kept-versus-dropped shape guard in main() and then discarded them, so the
+# navigation chrome — the outline turns, their labels, the stats block, the file
+# list, and everything S4 adds beside them — had no two-sided pin at all: a
+# server-side outline change moved no committed byte, and the client-side
+# adaptation of it was never exercised against a real envelope.
+#
+# One file per scenario rather than one file for all three, so a diff names the
+# scenario that moved.
+OUTLINE_OUT_NAMES = {
+    scenario: f"wire-outline-{scenario}.json" for scenario, _name in SCENARIOS
+}
 
 # A single turn shaped to cross the segment budget SEVERAL times, with a
 # reasoning title sitting inside each boundary window, so the committed fixture
@@ -134,12 +168,13 @@ LIMIT = 500
 # anchors from _lib_codex_conversation_query.
 _OPAQUE_RE = re.compile(r"\A(?:v1\.[A-Za-z0-9_-]{16,}|civ1_[0-9a-f]{40}|cbk1_[0-9a-f]{40})\Z")
 
-# The one COMPOUND identity: a reasoning heading key is a block key and the
-# heading's zero-based ordinal joined by `#` (#463 S2 §2.5). It is not opaque as
-# a whole, so `_OPAQUE_RE` cannot match it, and without this the fixture would
+# The COMPOUND identity: a block key and a discriminator joined by `#`. A
+# reasoning heading key discriminates by the heading's zero-based ordinal (#463
+# S2 §2.5); an S4 landmark key discriminates by its kind. Neither is opaque as a
+# whole, so `_OPAQUE_RE` cannot match it, and without this the fixture would
 # retain the real path-derived block hash and churn on every machine — which is
 # exactly what `bin/cctally-frontend-test`'s byte comparison caught.
-_COMPOUND_RE = re.compile(r"\A(cbk1_[0-9a-f]{40})#(\d+)\Z")
+_COMPOUND_RE = re.compile(r"\A(cbk1_[0-9a-f]{40})#([0-9A-Za-z_]+)\Z")
 
 
 def _synthetic_key(real: str, ordinal: int) -> str:
@@ -394,7 +429,7 @@ def _load_cctally():
     return mod
 
 
-def _build(scratch: pathlib.Path) -> dict[str, dict]:
+def _build(scratch: pathlib.Path) -> tuple[dict[str, dict], dict[str, dict]]:
     codex_home = scratch / "codex"
     sessions = codex_home / "sessions" / "2026" / "07" / "15"
     sessions.mkdir(parents=True, exist_ok=True)
@@ -526,6 +561,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"{detail.get('status')!r}, expected 'ok'")
         # A fresh key mapping per scenario, so one fixture's numbering never
         # depends on the other's content.
+        #
+        # #463 S4 — the DETAIL and OUTLINE fixtures of one scenario deliberately
+        # SHARE this mapping, because they describe the same conversation. With
+        # two independent mappings, ``civ1_<a>`` would name one item in
+        # ``wire-detail.json`` and a different item in
+        # ``wire-outline-modern-full.json``, so a reader comparing the two
+        # envelopes — or a later test that crosses the boundary, which §7.1 of
+        # the S4 spec anticipates — would be reading a mistranslation. Detail is
+        # normalized first, so its numbering is unchanged by this addition and
+        # an outline-only key is appended after it.
         mapping: dict[str, str] = {}
         detail = _normalize_opaque_keys(detail, mapping)
         serialized = json.dumps(
@@ -538,6 +583,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {out_file} "
               f"({len(items)} items, {blocks} blocks, "
               f"segment ordinals {ordinals})")
+
+        outline = outlines[scenario]
+        if outline.get("status") != "ok":
+            raise SystemExit(
+                f"build-codex-reader-fixtures: {scenario} outline status is "
+                f"{outline.get('status')!r}, expected 'ok'")
+        outline_file = out_dir / OUTLINE_OUT_NAMES[scenario]
+        outline = _normalize_opaque_keys(outline, mapping)
+        outline_serialized = json.dumps(
+            outline, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        _assert_no_unnormalized_identity(
+            f"{scenario} outline", outline_serialized, mapping)
+        outline_file.write_text(outline_serialized, encoding="utf-8")
+        outline_turns = outline.get("turns") or []
+        print(f"wrote {outline_file} "
+              f"({len(outline_turns)} turns, "
+              f"{len(outline.get('files') or [])} files, "
+              f"{len(outline.get('landmarks') or [])} landmarks)")
     segmented = details["segmented-turn"]
     if max((item.get("segment_ordinal") or 0)
            for item in segmented["items"]) < 1:
@@ -564,6 +627,35 @@ def main(argv: list[str] | None = None) -> int:
             "conversationAdapters.test.ts; no production conversation has one "
             "(all 589 multi-segment Codex turns measured 2026-08-02 carry "
             "event rows). See docs/codex-gotchas.md.")
+
+    # #463 S4 remediation round 3 — the AMBIGUOUS-call shape actually reached
+    # the envelope. Asserted rather than left to the golden diff, because a
+    # golden diff answers "did these bytes change", not "does this fixture still
+    # exercise the branch it was added for": a later normalizer change that made
+    # the output fold after all would move the golden once, the move would be
+    # accepted as the change under review, and the C-4 primary case would be
+    # uncovered again with every gate green.
+    #
+    # The block-level assertion is the one that matters. An unfolded output is a
+    # `tool_output` BLOCK, which is what `adaptBlocks` turns into the
+    # `tool_result` the reader renders and anchors a landmark on; the same rows
+    # folded would leave a `tool_call` carrying an `output` and no such block.
+    legibility = details["tool-legibility"]
+    unfolded = [block
+                for item in legibility.get("items") or []
+                for block in item.get("blocks") or []
+                if block.get("kind") == "tool_output"]
+    if not unfolded:
+        raise SystemExit(
+            "build-codex-reader-fixtures: the tool-legibility fixture holds no "
+            "unfolded `tool_output` block. The turn whose two `custom_tool_call` "
+            "rows share one call_id is what produces it, and it is the only "
+            "committed cover for the C-4 primary case.")
+    if any(not block.get("block_key") for block in unfolded):
+        raise SystemExit(
+            "build-codex-reader-fixtures: an unfolded `tool_output` block "
+            "carries no `block_key`. That key is the landmark's only DOM "
+            "address, and without it the jump degrades to aligning the turn.")
     return 0
 
 

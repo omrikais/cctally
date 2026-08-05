@@ -36,7 +36,7 @@ def _seed(observes):
     import _lib_journal as lj
     for kw in observes:
         jr.append_record(lj.make_account_observe(**kw))
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
 
 def _ns_list(emit_json=False):
@@ -162,7 +162,7 @@ def test_label_survives_rebuild(cc, capsys):
     ka, _kb = _two_claude()
     assert cc.cmd_account(_ns_label("alice", "primary")) == 0
     import _cctally_journal as jr
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     capsys.readouterr()
     assert cc.cmd_account(_ns_show(ka[:8], emit_json=True)) == 0
     obj = json.loads(capsys.readouterr().out)

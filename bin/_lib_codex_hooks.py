@@ -57,14 +57,16 @@ def _command_tokens(command: object) -> list[str] | None:
 
 def is_owned_codex_hook_command(command: object, binary: str) -> bool:
     # The absolute installed path changes across package-manager upgrades, so
-    # ownership is the exact argument tail plus an absolute ``cctally`` binary,
-    # not a string-equality check against today's install location.
+    # ownership is the exact argument tail plus either the canonical ``cctally``
+    # basename or today's resolved hook-target basename. The latter admits the
+    # npm shim while still tolerating version-directory changes.
     tokens = _command_tokens(command)
+    owned_basenames = {"cctally", pathlib.Path(binary).name}
     return bool(
         tokens
         and len(tokens) == 5
         and pathlib.Path(tokens[0]).is_absolute()
-        and pathlib.Path(tokens[0]).name == "cctally"
+        and pathlib.Path(tokens[0]).name in owned_basenames
         and tokens[1:] == ["hook-tick", "--foreground", "--source", "codex"]
     )
 

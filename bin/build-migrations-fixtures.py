@@ -6277,6 +6277,21 @@ def build_per_migration_041_codex_quota_unresolved_model_index(
     _build_post(pre, post)
 
 
+def _apply_conversations_schema_v1_fixture(mod, conn: sqlite3.Connection) -> None:
+    """Build a historical conversations 001-004 schema-helper state.
+
+    The live schema helper always projects the newest physical columns before
+    migration dispatch.  These older migration goldens intentionally retain
+    the version-1 marker that their handlers observed; conversations migration
+    005 is the first fixture that owns the version-2 account-dimension marker.
+    """
+    mod._apply_conversations_schema(conn)
+    conn.execute(
+        "UPDATE cache_meta SET value='1' "
+        "WHERE key='conversation_schema_version'"
+    )
+
+
 def build_per_migration_conversations_002_codex_thread_source_inference_replay(
     scenario_dir: Path,
 ) -> None:
@@ -6302,7 +6317,7 @@ def build_per_migration_conversations_002_codex_thread_source_inference_replay(
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-            mod._apply_conversations_schema(conn)
+            _apply_conversations_schema_v1_fixture(mod, conn)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
@@ -6388,7 +6403,7 @@ def build_per_migration_conversations_003_background_mcp_result_replay(
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-            mod._apply_conversations_schema(conn)
+            _apply_conversations_schema_v1_fixture(mod, conn)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
@@ -6453,6 +6468,281 @@ def build_per_migration_conversations_003_background_mcp_result_replay(
 
     _build_pre(pre)
     _build_post(pre, post)
+
+
+def build_per_migration_conversations_004_codex_find_projection(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #482's disposable projection backfill.
+
+    The pre-store is at conversations 003 with one retained normalized Codex
+    row and no projection schema/state. The post-store adds only the empty
+    projection table, pending/cursor/generation metadata, and the 004 stamp;
+    the normal synchronizer performs the bounded data backfill later.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "004_codex_find_projection"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        mod = _load_db_module()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _apply_conversations_schema_v1_fixture(mod, conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (
+                "001_adopt_schema_version_marker",
+                "002_codex_thread_source_inference_replay",
+                "003_background_mcp_result_replay",
+            ):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                    (name, TS_STATS_FIVE_APPLIED),
+                )
+            conn.execute(
+                "INSERT INTO codex_conversation_messages "
+                "(conversation_key,source_root_key,source_path,line_offset,"
+                "timestamp_utc,turn_id,call_id,kind,event_type,record_family,"
+                "model,text,content_digest,content_len,detail_json,search_tool,"
+                "search_thinking) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "fixture-conversation", "fixture-root", "/fixture.jsonl", 1,
+                    "2026-08-04T08:00:00Z", "fixture-turn", None, "user", None,
+                    "response_item", "gpt-5", "fixture text", "fixture-digest",
+                    12, "{}", None, None,
+                ),
+            )
+            conn.execute("DROP TABLE IF EXISTS codex_find_projection")
+            conn.execute("DROP INDEX IF EXISTS idx_codex_find_projection_conversation_order")
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key LIKE 'codex_find_projection_%'"
+            )
+            conn.execute("PRAGMA user_version=3")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        mod = _load_db_module()
+        handler = next(
+            (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+            None,
+        )
+        if handler is None:
+            raise SystemExit(f"conversations migration {migration} not registered")
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (migration, TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute("PRAGMA user_version=4")
+            conn.commit()
+        finally:
+            conn.close()
+        lock = dst.with_name(dst.name + ".codex.lock")
+        if lock.exists():
+            lock.unlink()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_conversations_005_conversation_account_dimension(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #347's transcript account backfill."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "005_conversation_account_dimension"
+    fixture_account = "a" * 32
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute(
+            "INSERT INTO conversation_messages "
+            "(session_id,uuid,source_path,byte_offset,entry_type,text,blocks_json) "
+            "VALUES('claude-session','claude-uuid','/claude.jsonl',1,'human',"
+            "'legacy Claude','[]')"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_events "
+            "(source_path,line_offset,source_root_key,payload_json) "
+            "VALUES('/codex.jsonl',1,'fixture-root','{}')"
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_messages "
+            "(conversation_key,source_root_key,source_path,line_offset,kind,"
+            "record_family,text,content_digest,content_len) "
+            "VALUES('codex-key','fixture-root','/codex.jsonl',1,'user',"
+            "'response_item','legacy Codex','digest',12)"
+        )
+        conn.execute("PRAGMA user_version=4")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    import _cctally_journal
+    original = _cctally_journal.find_accounts_cutover_op
+    _cctally_journal.find_accounts_cutover_op = lambda: fixture_account
+    try:
+        conn = sqlite3.connect(post)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            handler(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) "
+                "VALUES(?,?)",
+                (migration, TS_STATS_FIVE_APPLIED),
+            )
+            conn.execute("PRAGMA user_version=5")
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        _cctally_journal.find_accounts_cutover_op = original
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
+def build_per_migration_conversations_006_backfill_codex_file_touches(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #489's retained Codex patch backfill."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "006_backfill_codex_file_touches"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        payload_json = json.dumps({"payload": {
+            "type": "patch_apply_end",
+            "changes": {
+                "src/legacy-alpha.py": {"type": "update"},
+                "src/legacy-beta.py": {
+                    "type": "delete", "content": "old\n",
+                },
+            },
+        }}, separators=(",", ":"))
+        conn.execute(
+            "INSERT INTO codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,event_type,payload_json) "
+            "VALUES(?,?,?,?,?,?)",
+            ("/codex.jsonl", 42, "fixture-root", "codex-key",
+             "patch_apply_end", payload_json),
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_messages "
+            "(conversation_key,source_root_key,source_path,line_offset,kind,"
+            "event_type,record_family,content_digest,content_len) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("codex-key", "fixture-root", "/codex.jsonl", 42, "event",
+             "patch_apply_end", "event_msg", "digest", 0),
+        )
+        conn.execute("PRAGMA user_version=5")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=6")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
 
 
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
@@ -6920,7 +7210,7 @@ def build_per_migration_conversations_001_adopt_schema_version_marker(
         conn = sqlite3.connect(path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
-            mod._apply_conversations_schema(conn)
+            _apply_conversations_schema_v1_fixture(mod, conn)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations "
                 "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
@@ -7143,6 +7433,18 @@ def main() -> int:
     build_per_migration_conversations_003_background_mcp_result_replay(
         FIXTURES_ROOT / "per-migration"
         / "conversations_003_background_mcp_result_replay"
+    )
+    build_per_migration_conversations_004_codex_find_projection(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_004_codex_find_projection"
+    )
+    build_per_migration_conversations_005_conversation_account_dimension(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_005_conversation_account_dimension"
+    )
+    build_per_migration_conversations_006_backfill_codex_file_touches(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_006_backfill_codex_file_touches"
     )
     build_per_migration_036_codex_quota_window_identity_index(
         FIXTURES_ROOT / "per-migration"

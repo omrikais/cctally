@@ -94,6 +94,10 @@ def test_028_preserves_core_tables_and_is_idempotent(tmp_path, monkeypatch):
         )
         conn.commit()
         _handler(db)(conn)
+        assert conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone() == ("1",)
         assert conn.execute("SELECT COUNT(*) FROM session_entries").fetchone() == (1,)
         assert conn.execute(
             "SELECT observed_model FROM quota_window_snapshots "

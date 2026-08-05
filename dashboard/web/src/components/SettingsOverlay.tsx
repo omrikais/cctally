@@ -6,6 +6,7 @@ import {
   defaultPrefs,
   selectMarkersEnabled,
   selectLiveTailEnabled,
+  selectLanAuthEnabled,
   selectConfiguredChannel,
   subscribeStore,
   SESSION_SORT_KEYS,
@@ -183,6 +184,11 @@ export function SettingsOverlay() {
     selectLiveTailEnabled(getState()),
   );
   const [liveTail, setLiveTail] = useState<boolean>(liveTailServer);
+  const lanAuthServer = useSyncExternalStore(subscribeStore, () =>
+    selectLanAuthEnabled(getState()),
+  );
+  const [lanAuth, setLanAuth] = useState<boolean>(lanAuthServer);
+  const [lanAuthRestartSaved, setLanAuthRestartSaved] = useState(false);
   // Beta-channel (spec 2026-07-21 §3): the configured release channel toggle.
   // Same plumbing as liveTail — seeds from the SSE-mirrored update slice,
   // dirties independently, and travels in its OWN `update` block on the
@@ -228,6 +234,7 @@ export function SettingsOverlay() {
   const lastSeenNotifier = useRef<NotifierKind>(alertsConfig.notifier ?? 'auto');
   const lastSeenMarkers = useRef<boolean>(markersEnabledServer);
   const lastSeenLiveTail = useRef<boolean>(liveTailServer);
+  const lastSeenLanAuth = useRef<boolean>(lanAuthServer);
   const lastSeenChannel = useRef<UpdateChannel>(channelServer);
   const wasOpen = useRef<boolean>(false);
 
@@ -287,6 +294,10 @@ export function SettingsOverlay() {
   useEffect(() => {
     reconcile(setLiveTail, lastSeenLiveTail, liveTailServer);
   }, [liveTailServer]);
+
+  useEffect(() => {
+    reconcile(setLanAuth, lastSeenLanAuth, lanAuthServer);
+  }, [lanAuthServer]);
 
   // Beta-channel — guarded update-channel re-seed (same posture as liveTail).
   useEffect(() => {
@@ -349,6 +360,8 @@ export function SettingsOverlay() {
       setNotifier(alertsConfig.notifier ?? 'auto');
       setCacheMarkers(markersEnabledServer);
       setLiveTail(liveTailServer);
+      setLanAuth(lanAuthServer);
+      setLanAuthRestartSaved(false);
       setUpdateChannel(channelServer);
       setTestError(null);
       setTestOk(false);
@@ -370,6 +383,7 @@ export function SettingsOverlay() {
       lastSeenNotifier.current = alertsConfig.notifier ?? 'auto';
       lastSeenMarkers.current = markersEnabledServer;
       lastSeenLiveTail.current = liveTailServer;
+      lastSeenLanAuth.current = lanAuthServer;
       lastSeenChannel.current = channelServer;
     }
     wasOpen.current = open;
@@ -388,6 +402,7 @@ export function SettingsOverlay() {
     alertsConfig.notifier,
     markersEnabledServer,
     liveTailServer,
+    lanAuthServer,
     channelServer,
   ]);
 
@@ -467,6 +482,7 @@ export function SettingsOverlay() {
   // live-tail spec §4.2 — dirty against the SSE-mirrored server value. Rides the
   // SAME `dashboard` block as cacheMarkers (both leaves, one block).
   const liveTailDirty = liveTail !== liveTailServer;
+  const lanAuthDirty = lanAuth !== lanAuthServer;
   // Beta-channel (spec 2026-07-21 §3): dirty against the SSE-mirrored channel.
   // Rides its OWN `update` block on the combined Save POST.
   const channelDirty = updateChannel !== channelServer;
@@ -495,7 +511,8 @@ export function SettingsOverlay() {
   const dirtyFlags = [
     tzDirty, alertsDirty, projectedWeeklyDirty, notifierDirty,
     projectedBudgetDirty, projectAlertsDirty, codexBudgetAlertsDirty, codexProjectedDirty,
-    cacheMarkersDirty, liveTailDirty, channelDirty, sortDirty, perPageDirty, filterDirty,
+    cacheMarkersDirty, liveTailDirty, lanAuthDirty, channelDirty,
+    sortDirty, perPageDirty, filterDirty,
     resetTableSortStaged, resetCardOrderStaged,
   ];
   const dirtyCount = dirtyFlags.filter(Boolean).length;
@@ -515,6 +532,7 @@ export function SettingsOverlay() {
   // on-open effect resets it, and so the inert flag is never left stale (#252).
   const close = () => {
     setConfirmDiscard(false);
+    setLanAuthRestartSaved(false);
     setOpen(false);
   };
   const save = async () => {
@@ -573,10 +591,11 @@ export function SettingsOverlay() {
     // dashboard-scoped opt-outs ride ONE shared `dashboard` block in the SAME
     // combined POST (one round-trip, applied atomically server-side). Each leaf
     // is sent only when its own toggle is dirty.
-    if (cacheMarkersDirty || liveTailDirty) {
+    if (cacheMarkersDirty || liveTailDirty || lanAuthDirty) {
       body.dashboard = {
         ...(cacheMarkersDirty ? { cache_failure_markers: cacheMarkers } : {}),
         ...(liveTailDirty ? { live_tail: liveTail } : {}),
+        ...(lanAuthDirty ? { lan_auth: lanAuth } : {}),
       };
     }
     // Beta-channel (spec 2026-07-21 §3): the release channel rides its OWN
@@ -594,9 +613,19 @@ export function SettingsOverlay() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
+        const saved = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          dashboard?: {
+            cache_failure_markers?: boolean;
+            live_tail?: boolean;
+            lan_auth?: boolean;
+          };
+        };
         if (!res.ok) {
-          const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-          throw new Error(errBody.error ?? `HTTP ${res.status}`);
+          throw new Error(saved.error ?? `HTTP ${res.status}`);
+        }
+        if (saved.dashboard) {
+          dispatch({ type: 'INGEST_DASHBOARD_PREFS', prefs: saved.dashboard });
         }
         // No optimistic UI: the F2 SSE broadcast arrives within ~100ms
         // and updates display.* / alertsConfig.* via the snapshot
@@ -632,6 +661,10 @@ export function SettingsOverlay() {
     }
     if (resetTableSortStaged) dispatch({ type: 'CLEAR_TABLE_SORTS' });
     if (resetCardOrderStaged) dispatch({ type: 'RESET_PANEL_ORDER' });
+    if (lanAuthDirty) {
+      setLanAuthRestartSaved(true);
+      return;
+    }
     close();
   };
   // S6 (#252): the deferred "Restore view preferences" affordance. Sourced from
@@ -697,6 +730,7 @@ export function SettingsOverlay() {
     alertsDirty || projectedWeeklyDirty || projectedBudgetDirty || projectAlertsDirty;
   const codexChanged = codexBudgetAlertsDirty || codexProjectedDirty;
   const viewerChanged = cacheMarkersDirty || liveTailDirty;
+  const accessChanged = lanAuthDirty;
   const restoreChanged = resetTableSortStaged || resetCardOrderStaged;
 
   return (
@@ -1085,6 +1119,31 @@ export function SettingsOverlay() {
               Fetch new turns the instant the session's file changes (instead of
               waiting for the periodic refresh). On by default.
             </p>
+          </fieldset>
+          <fieldset className={`settings-fs${accessChanged ? ' is-changed' : ''}`}>
+            <legend>Dashboard access{changedMark(accessChanged)}</legend>
+            <label>
+              <input
+                type="checkbox"
+                name="lan-auth"
+                checked={lanAuth}
+                onChange={(e) => {
+                  setLanAuth(e.target.checked);
+                  setLanAuthRestartSaved(false);
+                }}
+              />{' '}
+              Require LAN access token
+            </label>
+            <p className="settings-hint">
+              Protects API and live-update traffic on non-loopback binds. Changes
+              take effect only after restarting the dashboard; this running
+              dashboard keeps its current access mode.
+            </p>
+            {lanAuthRestartSaved && (
+              <div className="settings-ok">
+                Saved. Restart the dashboard to apply LAN access authentication.
+              </div>
+            )}
           </fieldset>
           {/* Beta-channel (spec 2026-07-21 §3): the release channel `cctally
               update` tracks. Beta gets every release as it ships; stable only

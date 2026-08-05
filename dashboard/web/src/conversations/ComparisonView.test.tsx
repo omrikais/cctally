@@ -136,4 +136,37 @@ describe('ComparisonView', () => {
     expect(b.getAttribute('aria-hidden')).toBeNull();
     for (const s of sides) expect(s.querySelector('.conv-cmp-head-side-name')).not.toBeNull();
   });
+
+  // #463 S4 remediation round 5 (P3-1) — `ComparisonView`'s own onOpenInReader
+  // handler had no test that executed it. `ComparisonDiff.test.tsx` passes a
+  // stub, so it verified only that the button calls the prop; and
+  // `jumpConstruction.test.ts` enforces that no site WRITES a jump literal
+  // without asserting what the builder produces at any of them. The payload was
+  // therefore unpinned at this site: a change to `buildConversationJump`'s
+  // defaults could alter what a comparison jump dispatches with nothing red.
+  // Assert it byte-for-byte, per side, so the field set and the `qualified`
+  // decision are both nailed down here.
+  it.each([
+    ['a', 'A', 'A-h1'],
+    ['b', 'B', 'B-h1'],
+  ])('dispatches the builder-shaped jump when side %s opens in the reader', async (side, key, uuid) => {
+    mockFetch();
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    const { container } = render(<ComparisonView a="A" b="B" />);
+    await waitFor(() => expect(screen.getAllByText('shared').length).toBeGreaterThan(0));
+
+    // Expand the first aligned row so its per-side open-in-reader buttons mount.
+    fireEvent.click(container.querySelector('.conv-cmp-row') as HTMLButtonElement);
+    const open = await screen.findByLabelText(
+      new RegExp(`open in reader — run ${side} at this prompt`, 'i'),
+    );
+    fireEvent.click(open);
+
+    expect(getState().selectedConversationRef).toEqual({ source: 'claude', key });
+    expect(getState().conversationJump).toEqual({
+      conversation_ref: { source: 'claude', key },
+      session_id: key,
+      uuid,
+    });
+  });
 });

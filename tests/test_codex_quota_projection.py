@@ -660,14 +660,16 @@ def test_real_s1_rebuild_recovery_preserves_generation_and_terminal_claims(
         finally:
             stats.close()
 
-        # A real rebuild from an empty configured root prunes physical rows
-        # and leaves the terminal claim intact but historical.
+        # #485: an empty configured root is not deletion evidence. The rebuild
+        # refuses before clearing physical rows, so the terminal claim remains
+        # current rather than being spuriously orphaned.
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-sessions"))
-        ns["sync_codex_cache"](cache, rebuild=True)
-        orphaned_events = _projection_rows(ns, "quota_threshold_events")
-        assert len(orphaned_events) == 1
-        assert orphaned_events[0]["disposition"] == "alerted"
-        assert orphaned_events[0]["orphaned_at"] is not None
+        refused = ns["sync_codex_cache"](cache, rebuild=True)
+        assert refused.prune_refused is True
+        preserved_events = _projection_rows(ns, "quota_threshold_events")
+        assert len(preserved_events) == 1
+        assert preserved_events[0]["disposition"] == "alerted"
+        assert preserved_events[0]["orphaned_at"] is None
 
         def fail_after_stats_commit():
             def raise_after_commit():

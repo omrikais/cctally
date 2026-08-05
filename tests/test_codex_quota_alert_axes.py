@@ -43,6 +43,7 @@ def _scope(**overrides):
         "gate_after": True,
         "now": NOW,
         "next_evaluation_at": None,
+        "scheduled_roots": None,
     }
     kwargs.update(overrides)
     return axes.alert_dirty_scope(**kwargs)
@@ -125,7 +126,7 @@ def test_a_newly_resolvable_identity_counts_as_changed():
 
 # ── axis 4: scheduled time ─────────────────────────────────────────────────
 
-def test_a_boundary_that_has_come_due_widens_to_everything():
+def test_a_legacy_boundary_that_has_come_due_widens_to_everything():
     """An observation captured in the future is skipped as a qualifier today and
     becomes eligible when wall time passes it, with no mutation to observe.
     Which identity it belongs to is not recorded — only the instant — so the
@@ -133,6 +134,19 @@ def test_a_boundary_that_has_come_due_widens_to_everything():
     scope = _scope(next_evaluation_at=NOW - dt.timedelta(seconds=1))
     assert scope.scope == axes.SCOPE_ALL
     assert "scheduled" in scope.reasons
+
+
+def test_a_due_boundary_with_owners_scopes_to_only_those_roots():
+    """Persisted ownership makes axis 4 bounded enough for the hook path."""
+    scope = _scope(
+        next_evaluation_at=NOW - dt.timedelta(seconds=1),
+        scheduled_roots=("root-a",),
+        defer_scheduled=True,
+    )
+    assert scope.scope == axes.SCOPE_ROOTS
+    assert scope.roots == frozenset({"root-a"})
+    assert "scheduled" in scope.reasons
+    assert axes.REASON_SCHEDULED_DEFERRED not in scope.reasons
 
 
 def test_a_boundary_still_in_the_future_adds_nothing():
@@ -276,6 +290,18 @@ def _stored_boundary(ns):
         conn.close()
 
 
+def _stored_schedule(ns):
+    conn = ns["open_db"]()
+    try:
+        row = conn.execute(
+            "SELECT next_evaluation_by_root_json "
+            "FROM quota_projection_ledger_state WHERE source='codex'"
+        ).fetchone()
+        return {} if row is None else __import__("json").loads(row[0])
+    finally:
+        conn.close()
+
+
 def _stored_gate(ns):
     """The persisted delivery-gate state (axis 3's `gate_before`)."""
     conn = ns["open_db"]()
@@ -304,6 +330,24 @@ def _stats_write(ns, sql, params=()):
     try:
         conn.execute(sql, params)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def test_mismatched_scalar_and_owned_schedule_fail_safe(tmp_path, monkeypatch):
+    ns, quota = _load(tmp_path, monkeypatch)
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO quota_projection_ledger_state "
+            "(source, next_evaluation_at_utc, next_evaluation_by_root_json) "
+            "VALUES ('codex', ?, ?)",
+            (
+                quota._utc_iso(NOW),
+                '{"root-a":"2026-07-31T13:00:00+00:00"}',
+            ),
+        )
+        assert quota._ledger_state(conn) is None
     finally:
         conn.close()
 
@@ -366,6 +410,178 @@ def test_a_future_capture_is_remembered_and_re_evaluated(tmp_path, monkeypatch):
     assert counter.groups == 4, (
         f"the due boundary did not widen the pass (expanded {counter.groups} "
         f"of 4 groups) — a future-clocked observation would never be evaluated")
+
+
+def test_a_quiet_due_hook_tick_reconciles_only_the_owning_root(
+    tmp_path, monkeypatch,
+):
+    """Issue #460: a scheduled hook pass is bounded, consumed, and stable."""
+    ns, quota = _load(tmp_path, monkeypatch)
+    other_root = "root-later"
+    build_codex_quota_store(ns, closed_windows=3, observations_per_window=2)
+    build_codex_quota_store(
+        ns, closed_windows=3, observations_per_window=2,
+        root_key=other_root)
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE quota_window_snapshots "
+            "SET captured_at_utc=strftime('%Y-%m-%dT%H:%M:%SZ', "
+            "    captured_at_utc, '+30 minutes') "
+            "WHERE source_root_key=?", (other_root,))
+        cache.commit()
+    finally:
+        cache.close()
+    enable_quota_alerts(ns, actual=(2,))
+    early = store_as_of(ns, before_reset=dt.timedelta(hours=2))
+    eligible = {ROOT_KEY, other_root}
+    observations = quota.load_codex_quota_observations()
+    future_roots = {
+        observation.identity.source_root_key
+        for observation in observations
+        if observation.captured_at > early
+    }
+    assert future_roots == eligible, (
+        f"the acceptance fixture did not retain future captures for {eligible}; "
+        f"got {future_roots}")
+    quota.reconcile_codex_quota_projection(
+        now=early, alert_eligible_root_keys=eligible)
+
+    schedule = _stored_schedule(ns)
+    assert set(schedule) == eligible
+    first = dt.datetime.fromisoformat(
+        schedule[ROOT_KEY].replace("Z", "+00:00"))
+    later = dt.datetime.fromisoformat(
+        schedule[other_root].replace("Z", "+00:00"))
+    assert early < first < later
+
+    with count_expanded_groups(quota) as due:
+        quota.reconcile_codex_quota_projection(
+            now=first + dt.timedelta(seconds=1),
+            alert_eligible_root_keys=eligible,
+            full_pass="defer",
+        )
+    assert due.groups == 4, (
+        f"the first due hook tick expanded {due.groups} groups instead of "
+        "the four belonging to its recorded root")
+    assert _stored_boundary(ns) == schedule[other_root]
+
+    with count_expanded_groups(quota) as quiet:
+        quota.reconcile_codex_quota_projection(
+            now=first + dt.timedelta(seconds=2),
+            alert_eligible_root_keys=eligible,
+            full_pass="defer",
+        )
+    assert quiet.groups == 0, (
+        f"the quiet follow-up expanded {quiet.groups} groups after the due "
+        "root had already been evaluated")
+
+
+def test_due_root_and_dirty_root_converge_before_watermark_and_certificate(
+    tmp_path, monkeypatch,
+):
+    """A due owner must not make simultaneous ledger work disappear.
+
+    Root A owns the matured schedule, root B has one physically dirty group,
+    and root C is clean. The combined pass must promote A and B to complete
+    root histories (four groups), leave C unloaded, consume/prune the ledger
+    only after B converges, and still publish a certificate for all three roots.
+    """
+    import _fixture_builders
+
+    ns, quota = _load(tmp_path, monkeypatch)
+    dirty_root = "root-dirty"
+    clean_root = "root-clean"
+    for root_key in (ROOT_KEY, dirty_root, clean_root):
+        build_codex_quota_store(
+            ns, closed_windows=1, observations_per_window=2,
+            root_key=root_key)
+    cache = ns["open_cache_db"]()
+    try:
+        for root_key, minutes in ((dirty_root, 30), (clean_root, 60)):
+            cache.execute(
+                "UPDATE quota_window_snapshots "
+                "SET captured_at_utc=strftime('%Y-%m-%dT%H:%M:%SZ', "
+                "    captured_at_utc, ?) WHERE source_root_key=?",
+                (f"+{minutes} minutes", root_key),
+            )
+        cache.commit()
+    finally:
+        cache.close()
+
+    roots = {ROOT_KEY, dirty_root, clean_root}
+    enable_quota_alerts(ns, actual=(2,))
+    early = store_as_of(ns, before_reset=dt.timedelta(hours=2))
+    quota.reconcile_codex_quota_projection(
+        now=early, alert_eligible_root_keys=roots)
+    schedule = _stored_schedule(ns)
+    due_at = dt.datetime.fromisoformat(
+        schedule[ROOT_KEY].replace("Z", "+00:00"))
+    assert due_at < dt.datetime.fromisoformat(
+        schedule[dirty_root].replace("Z", "+00:00"))
+
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE quota_window_snapshots SET used_percent=used_percent+0.25 "
+            "WHERE id=(SELECT MAX(id) FROM quota_window_snapshots "
+            "WHERE source_root_key=?)", (dirty_root,))
+        _fixture_builders.bump_codex_physical_mutation_seq(cache)
+        cache.commit()
+        ledger_high = cache.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name='quota_window_change_log'"
+        ).fetchone()[0]
+    finally:
+        cache.close()
+
+    with count_expanded_groups(quota) as combined:
+        quota.reconcile_codex_quota_projection(
+            now=due_at + dt.timedelta(seconds=1),
+            alert_eligible_root_keys=roots,
+            full_pass="defer",
+        )
+    assert combined.groups == 4, (
+        f"the due+dirty pass expanded {combined.groups} groups instead of "
+        "the two complete affected roots")
+    assert {key[1] for key in combined.group_keys} == {ROOT_KEY, dirty_root}
+
+    stats = ns["open_db"]()
+    try:
+        watermark = stats.execute(
+            "SELECT watermark_seq FROM quota_projection_ledger_state "
+            "WHERE source='codex'"
+        ).fetchone()[0]
+        dirty_current = stats.execute(
+            "SELECT MAX(current_percent) FROM quota_window_blocks "
+            "WHERE source_root_key=? AND orphaned_at IS NULL",
+            (dirty_root,),
+        ).fetchone()[0]
+    finally:
+        stats.close()
+    assert watermark == ledger_high
+    assert dirty_current == pytest.approx(6.25)
+
+    cache = ns["open_cache_db"]()
+    try:
+        assert cache.execute(
+            "SELECT COUNT(*) FROM quota_window_change_log WHERE seq<=?",
+            (watermark,),
+        ).fetchone()[0] == 0
+        certificate = __import__("json").loads(cache.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (quota._DASHBOARD_PROJECTION_CERTIFICATE_KEY,),
+        ).fetchone()[0])
+    finally:
+        cache.close()
+    assert set(certificate["signatures"]) == roots
+
+    with count_expanded_groups(quota) as reporting:
+        quota.reconcile_codex_quota_projection(
+            now=due_at + dt.timedelta(seconds=2))
+    assert reporting.calls == 0, (
+        "the all-root certificate was incoherent after the scoped pass, so a "
+        "reporting reconcile missed its O(1) short-circuit")
 
 
 # ── the axes against `full_pass="defer"` (the hook path) ───────────────────

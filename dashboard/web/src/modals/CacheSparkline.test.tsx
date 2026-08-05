@@ -48,6 +48,7 @@ describe('<CacheSparkline /> size=large layout (issue #77 P2-1, P2-2)', () => {
     const svg = container.querySelector('svg.cr-spark') as SVGSVGElement;
     expect(svg).toBeTruthy();
     expect(svg.getAttribute('width')).toBe('100%');
+    expect(svg.getAttribute('aria-label')).toBe('Cache hit % timeline, 4 days');
   });
 
   it('size=large empty-data fallback also renders width="100%"', () => {
@@ -371,7 +372,7 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
       .toContain(`${expected.toFixed(1)},`);
   });
 
-  it('counts only observed days in the accessible label', () => {
+  it('announces the full window and the measured subset in the accessible label (#469)', () => {
     const days = [
       { ...row('2026-07-31', 0), observed: false },
       row('2026-07-30', 71),
@@ -386,7 +387,7 @@ describe('<CacheSparkline /> unobserved today (#443 S1)', () => {
       />,
     );
     expect(container.querySelector('svg.cr-spark')!.getAttribute('aria-label'))
-      .toBe('Cache hit % timeline, 2 days');
+      .toBe('Cache hit % timeline, 3 days, 2 measured');
   });
 });
 

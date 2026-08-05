@@ -57,6 +57,12 @@ export function FocusCompactMenu({
   focusMode: FocusMode;
   subagents: FocusSubagentOption[];
   onSelect: (mode: FocusMode) => void;
+  // #463 S4 remediation round 3 (F2) — the number of error TURNS, which is what
+  // picking Errors navigates to and what the outline chip shows. Not the number
+  // of failing calls: under landmark awareness one turn can hold several, and
+  // this menu is the mobile twin of the desktop segmented badge, so a caller
+  // passing the call count makes the two headers disagree with each other and
+  // with the filter. The reader computes it once as `errorTurnCount`.
   errorCount?: number;
 }) {
   const [open, setOpen] = useState(false);

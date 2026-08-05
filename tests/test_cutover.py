@@ -342,7 +342,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1006  # public #5 incremental quota projection
+    assert core.STATS_INDEX_EPOCH == 1007  # #460 scheduled-boundary ownership
     assert core.LEGACY_STATS_HEAD == 13
 
 
@@ -419,7 +419,10 @@ def test_rebuild_from_bootstrap_reproduces_cutover_db(ns, tmp_path):
     live_dump = _canonical_dump(live)
 
     target = tmp_path / "rebuilt.db"
-    jr.rebuild_stats_index(target_path=str(target))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(target),
+    )
     rb = core.open_db(_target_path=str(target))
     try:
         rb_dump = _canonical_dump(rb)
@@ -452,7 +455,10 @@ def test_cutover_rematerializes_quota_from_bootstrap(ns, tmp_path):
         cache.commit()
     finally:
         cache.close()
-    jr.rebuild_stats_index(target_path=str(tmp_path / "rb.db"))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "rb.db"),
+    )
     cache = _cctally_cache.open_cache_db()
     try:
         n = cache.execute(
@@ -484,7 +490,10 @@ def test_cutover_arming_boundary_survives_rebuild_verbatim(ns, tmp_path):
     # Rebuild from the bootstrap segment ALONE (no live reconcile) — the boundary
     # must be byte-verbatim, proving replay of the journaled state, not a re-arm.
     target = tmp_path / "rb.db"
-    jr.rebuild_stats_index(target_path=str(target))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(target),
+    )
     rb = core.open_db(_target_path=str(target))
     try:
         row = rb.execute(
@@ -675,7 +684,10 @@ def test_double_cutover_is_idempotent(ns, tmp_path):
     finally:
         live.close()
     # a rebuild over BOTH bootstrap segments folds idempotently.
-    jr.rebuild_stats_index(target_path=str(tmp_path / "rb.db"))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "rb.db"),
+    )
     rb = core.open_db(_target_path=str(tmp_path / "rb.db"))
     try:
         assert _canonical_dump(rb) == d1
@@ -879,7 +891,10 @@ def test_terminal_quota_events_survive_rebuild_verbatim(ns, tmp_path):
         live.close()
 
     target = tmp_path / "rb.db"
-    jr.rebuild_stats_index(target_path=str(target))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(target),
+    )
     rb = core.open_db(_target_path=str(target))
     try:
         after = _terminal_row(rb)
@@ -906,7 +921,10 @@ def test_rebuild_fires_no_alerts_for_a_replayed_terminal_event(ns, tmp_path):
     journal.ALERT_DISPATCHER = lambda *a, **k: dispatched.append((a, k))
     try:
         target = tmp_path / "rb.db"
-        jr.rebuild_stats_index(target_path=str(target))
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture"),
+            target_path=str(target),
+        )
     finally:
         if saved is None:
             delattr(journal, "ALERT_DISPATCHER")

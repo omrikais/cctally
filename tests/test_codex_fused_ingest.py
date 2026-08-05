@@ -866,11 +866,10 @@ def _insert_incomplete_absolute_codex_children(
     conn.commit()
 
 
-def test_sync_codex_cache_prunes_all_absolute_children_and_rebuilds_every_table(
+def test_sync_codex_cache_refuses_invalid_root_for_ordinary_and_rebuild(
     tmp_path, monkeypatch,
 ):
-    """An inactive root purges every absolute S1 child but leaves baked
-    relative fixtures alone; rebuild deliberately clears the whole Codex cache."""
+    """#485: no recognized root means no absolute child is deletion evidence."""
     ns, _provider_root, _rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     conn = ns["open_cache_db"]()
     tables = (
@@ -881,25 +880,28 @@ def test_sync_codex_cache_prunes_all_absolute_children_and_rebuilds_every_table(
     try:
         ns["sync_codex_cache"](conn)
         _insert_relative_codex_fixture_rows(conn)
+        retained_counts = [
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        ]
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-such-root"))
 
-        pruned = ns["sync_codex_cache"](conn)
+        refused = ns["sync_codex_cache"](conn)
 
-        assert pruned.files_pruned == 1
+        assert refused.files_pruned == 0
+        assert refused.prune_refused is True
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 1, 1, 1, 1]
-        assert conn.execute("SELECT path FROM codex_session_files").fetchall() == [
-            ("fixtures/codex/synthetic.jsonl",)
-        ]
+        ] == retained_counts
 
-        ns["sync_codex_cache"](conn, rebuild=True)
+        rebuilt = ns["sync_codex_cache"](conn, rebuild=True)
 
+        assert rebuilt.prune_refused is True
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [0, 0, 0, 0, 0]
+        ] == retained_counts
     finally:
         conn.close()
 
@@ -958,10 +960,10 @@ def test_sync_codex_cache_rebuild_respects_held_flock_then_reingests_all_surface
         conn.close()
 
 
-def test_sync_codex_cache_prunes_incomplete_absolute_children_but_keeps_relative_rows(
+def test_sync_codex_cache_preserves_incomplete_children_without_valid_root(
     tmp_path, monkeypatch,
 ):
-    """Current-root pruning cannot depend on a terminal file row existing."""
+    """#485 applies even when a failed batch left no terminal file row."""
     ns, _provider_root, _rollout = _stage_c_sync_setup(tmp_path, monkeypatch)
     conn = ns["open_cache_db"]()
     tables = (
@@ -974,18 +976,20 @@ def test_sync_codex_cache_prunes_incomplete_absolute_children_but_keeps_relative
         _insert_incomplete_absolute_codex_children(
             conn, str(tmp_path / "orphan" / "rollout.jsonl"),
         )
+        retained_counts = [
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in tables
+        ]
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-such-root"))
 
-        pruned = ns["sync_codex_cache"](conn)
+        refused = ns["sync_codex_cache"](conn)
 
-        assert pruned.files_pruned == 1
+        assert refused.files_pruned == 0
+        assert refused.prune_refused is True
         assert [
             conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ] == [1, 1, 1, 1, 1]
-        assert conn.execute("SELECT path FROM codex_session_files").fetchall() == [
-            ("fixtures/codex/synthetic.jsonl",)
-        ]
+        ] == retained_counts
     finally:
         conn.close()
 

@@ -424,6 +424,19 @@ def test_classify_anomalies_net_negative_only():
     assert rows[-1].anomaly_triggered is True
 
 
+def test_classify_anomalies_net_negative_uses_usd_tolerance_boundary():
+    """Effectively-zero net is clean; a value below -1e-9 still triggers."""
+    rows = [
+        _make_daily_row("2026-05-15", (100, 0, 233), -1e-9),
+        _make_daily_row("2026-05-16", (100, 0, 233), -(1e-9 + 1e-12)),
+    ]
+    crk._classify_anomalies(rows, threshold_pp=15, window_days=14, enabled=True)
+    assert rows[0].anomaly_reasons == []
+    assert rows[0].anomaly_triggered is False
+    assert rows[1].anomaly_reasons == ["net_negative"]
+    assert rows[1].anomaly_triggered is True
+
+
 def test_classify_anomalies_silent_skip_when_baseline_too_thin():
     """Fewer than CACHE_REPORT_MIN_BASELINE_DAYS daily rows in window →
     cache_drop trigger silently skipped."""

@@ -150,7 +150,10 @@ def _assert_blocks_converge(live, rb):
 
 def _rebuild_into(jr, tmp_path):
     target = tmp_path / "rebuilt.db"
-    res = jr.rebuild_stats_index(target_path=str(target))
+    res = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(target),
+    )
     import _cctally_core
     conn = _cctally_core.open_db(_target_path=str(target))
     return conn, res
@@ -251,7 +254,7 @@ def test_rebuild_validation_failure_leaves_live_destination_untouched(
 
     monkeypatch.setattr(jr, "_validate_rebuilt_stats_index", reject)
     with pytest.raises(jr.JournalError, match="representative B-tree"):
-        jr.rebuild_stats_index()
+        jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     after = _cctally_core.open_db()
     try:
@@ -343,7 +346,7 @@ def test_live_rebuild_fsyncs_quarantine_entry_in_app_dir(
         return real_fsync_dir(path)
 
     monkeypatch.setattr(jr, "_fsync_dir", record_fsync)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     assert _cctally_core.APP_DIR in fsynced
 
 
@@ -448,7 +451,10 @@ def test_rebuild_rematerializes_quota_cache_from_journal(ns, tmp_path):
         cache.commit()
     finally:
         cache.close()
-    jr.rebuild_stats_index(target_path=str(tmp_path / "rb.db"))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "rb.db"),
+    )
     cache = _cctally_cache.open_cache_db()
     try:
         n = cache.execute(
@@ -664,7 +670,7 @@ def test_db_rebuild_prod_guard_precedes_common_cutover(
 
     monkeypatch.setattr(_cctally_db, "_would_block_prod_stats", lambda _path: True)
 
-    def forbidden_rebuild():
+    def forbidden_rebuild(**_kwargs):
         raise AssertionError("prod guard allowed rebuild construction")
 
     monkeypatch.setattr(

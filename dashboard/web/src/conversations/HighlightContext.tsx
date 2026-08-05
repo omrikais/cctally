@@ -1,4 +1,5 @@
 import { createContext } from 'react';
+import type { FindOccurrence } from '../types/conversation';
 
 // #177 S6 / #217 S4 / #223 — find-term highlight context for the Markdown
 // renderer. The reader provides either a DEBOUNCED term list (whitespace-split,
@@ -13,3 +14,10 @@ export type HighlightTerms =
   | { kind: 'regex'; source: string; caseSensitive: boolean };
 
 export const HighlightContext = createContext<HighlightTerms | null>(null);
+
+export interface ExactFindState {
+  occurrences: FindOccurrence[];
+  selectedOccurrenceId: string | null;
+}
+
+export const ExactFindContext = createContext<ExactFindState | null>(null);

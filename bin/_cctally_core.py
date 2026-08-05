@@ -364,8 +364,25 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # full pass is measured against. Same mechanical reason as 1005 — an
 # epoch-current open returns before any schema work — so it is a second bump
 # rather than an amendment to the first.
-STATS_INDEX_EPOCH = 1006
+# 1006 -> 1007 (#460): scheduled quota-alert ownership. Adds the per-root
+# future-capture schedule that lets a matured boundary widen to its owning root
+# instead of deferring forever on a quiet hook-only install.
+STATS_INDEX_EPOCH = 1007
 LEGACY_STATS_HEAD = 13
+
+#: #496 S1 F1. A NEW branch, for a state that cannot occur before the
+#: publication transaction exists: a replacement index was published and then
+#: failed validation on a fresh connection. The existing corrupt-stats text
+#: says the database was "Not auto-recreated", which would be false here, so
+#: this path gets its own wording. It does not alter the heal message or any
+#: other corruption path.
+STATS_PUBLICATION_FAILED_MSG = (
+    "stats.db published a rebuilt index that then FAILED validation, so the "
+    "live index is known bad and cctally refuses to use it. path: {path}. "
+    "The rebuild record naming the failing check is at {record}. The damaged "
+    "predecessor was preserved under quarantine/ with a forensics bundle in "
+    "logs/. Recovery: run `cctally db rebuild --db stats`."
+)
 
 
 # === Telemetry constants (non-path; see spec 2026-07-07) =============
@@ -1369,6 +1386,9 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
         -- that are not functions of window dirtiness — a delivery-gate
         -- transition, and a future-clocked observation that becomes eligible
         -- when wall time passes it with no row mutation at all.
+        -- `next_evaluation_by_root_json` owns that scalar minimum: one earliest
+        -- future capture per root, so a due hook tick can reconcile only the
+        -- roots whose instants matured.
         --
         -- `last_full_pass_at` is the periodic verification's deadline. Two
         -- cases a scoped sweep structurally cannot see — a block whose physical
@@ -1386,6 +1406,7 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             alerts_enabled         INTEGER,
             next_evaluation_at_utc TEXT,
             last_full_pass_at      TEXT,
+            next_evaluation_by_root_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY(source)
         );
 
@@ -1417,14 +1438,19 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
     }
     if "account_key" not in _proj_cols:
         conn.execute("DROP TABLE quota_projection_state")
+        # SQLite stores `sqlite_schema.sql` verbatim apart from stripping
+        # `IF NOT EXISTS`, and `_stats_schema_fingerprint` hashes that text, so
+        # this body must stay character-for-character equal to the fresh-path
+        # definition above (#496 S1 F18).
         conn.execute(
-            "CREATE TABLE quota_projection_state ("
-            " source_root_key TEXT NOT NULL,"
-            " account_key TEXT NOT NULL DEFAULT 'unattributed',"
-            " generation TEXT NOT NULL,"
-            " physical_signature TEXT NOT NULL,"
-            " completed_at_utc TEXT NOT NULL,"
-            " PRIMARY KEY(source_root_key, account_key))"
+            "CREATE TABLE quota_projection_state (\n"
+            "            source_root_key    TEXT NOT NULL,\n"
+            "            account_key        TEXT NOT NULL DEFAULT 'unattributed',\n"
+            "            generation         TEXT NOT NULL,\n"
+            "            physical_signature TEXT NOT NULL,\n"
+            "            completed_at_utc   TEXT NOT NULL,\n"
+            "            PRIMARY KEY(source_root_key, account_key)\n"
+            "        )"
         )
     if add_column_if_missing is not None:
         for _tbl in ("quota_window_blocks", "quota_percent_milestones",
@@ -1445,6 +1471,11 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
         # no-op over the table it already has.
         add_column_if_missing(
             conn, "quota_projection_ledger_state", "last_full_pass_at", "TEXT")
+        # Epoch 1007 / #460: same legacy-cutover seam. Current-epoch indexes
+        # rebuild; a legacy index cuts over in place and needs the column added.
+        add_column_if_missing(
+            conn, "quota_projection_ledger_state",
+            "next_evaluation_by_root_json", "TEXT NOT NULL DEFAULT '{}'")
 
 
 def open_db(*, _target_path=None) -> sqlite3.Connection:

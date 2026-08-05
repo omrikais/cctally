@@ -131,8 +131,55 @@ run_scenario "instances-order-desc" "instances-desc" \
     --instances --order desc --since 20260520 --until 20260521
 run_scenario "project-filter-lib" "project-filter" \
     -p repos/lib --since 20260520 --until 20260521
+# Use fixture-owned path suffixes rather than the shared display key `app`.
+# `_project_filter_matches` deliberately substring-matches the full absolute
+# git root, so a random mktemp ancestor containing `app` would otherwise admit
+# every fixture project and make this scenario flaky. The two repeated filters
+# still select both same-basename app roots while excluding repos/lib.
 run_scenario "project-filter-app-json" "project-filter-app-json" \
-    -p app --json --since 20260520 --until 20260521
+    -p work/app -p personal/app --json --since 20260520 --until 20260521
+
+# A byte diff reports the whole changed JSON but does not name the foreign
+# model that caused it. Assert the exact filtered model vocabulary separately
+# so any future scope leak identifies the intruder directly.
+project_filter_app_models_exact () {
+    local name="project-filter-app-json-models-exact"
+    local actual verdict
+    actual=$(HOME="$FAKE_HOME" NO_COLOR=1 TZ=Etc/UTC \
+             COLUMNS="${COLUMNS_OVERRIDE:-200}" CCTALLY_AS_OF="$AS_OF" \
+             "$BIN" daily -p work/app -p personal/app --json \
+             --since 20260520 --until 20260521 2>&1)
+    if verdict=$(printf '%s\n' "$actual" | python3 -c '
+import json
+import sys
+
+expected = {"claude-opus-4-1", "claude-sonnet-4-5"}
+payload = json.load(sys.stdin)
+found = {
+    model
+    for day in payload["daily"]
+    for model in day["modelsUsed"]
+}
+unexpected = sorted(found - expected)
+missing = sorted(expected - found)
+if unexpected or missing:
+    parts = []
+    if unexpected:
+        parts.append("unexpected model(s): " + ", ".join(unexpected))
+    if missing:
+        parts.append("missing model(s): " + ", ".join(missing))
+    print("; ".join(parts))
+    raise SystemExit(1)
+print(", ".join(sorted(found)))
+'); then
+        echo "PASS $name ($verdict)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "FAIL $name: $verdict"
+        fail_count=$((fail_count + 1))
+    fi
+}
+project_filter_app_models_exact
 
 # ── Alias is display-only: JSON keys never carry the alias ─────────────────
 # `--project-aliases lib=Library` must NOT change the {projects} JSON keys

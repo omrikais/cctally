@@ -99,4 +99,30 @@ describe('ComparisonMetrics', () => {
     expect(cell.textContent).toContain('provider-specific');
     expect(deltaOf(container, 'tokens')).toBeNull();
   });
+
+  // #463 S4 §6.5, closed here at the RENDER layer (remediation round 3). The
+  // calc-layer test in comparisonMetricsCalc.test.ts proves `metricsFromOutline`
+  // preserves a null `error_count` instead of collapsing it to 0; nothing proved
+  // what the strip then draws. The browser gate could not reach the state
+  // through the picker or a deep link, so it is pinned here: the cell declines
+  // with the em dash the strip uses for every unavailable value, and it computes
+  // no delta — a "±0" would be the confident zero in a different costume.
+  it('declines rather than reporting a confident zero for a null error count', () => {
+    const { container } = render(
+      <ComparisonMetrics a={M({ errors: null })} b={M({ errors: 4 })} />,
+    );
+    const cell = container.querySelector('[data-metric="errors"]') as HTMLElement;
+    expect(cell.querySelector('.conv-cmp-metric-a')!.textContent).toBe('Run A —');
+    expect(cell.textContent).not.toMatch(/\b0\b/);
+    expect(deltaOf(container, 'errors')).toBeNull();
+  });
+
+  it('declines on both sides when neither run reported an error count', () => {
+    const { container } = render(
+      <ComparisonMetrics a={M({ errors: null })} b={M({ errors: null })} />,
+    );
+    const cell = container.querySelector('[data-metric="errors"]') as HTMLElement;
+    expect(cell.querySelector('.conv-cmp-metric-b')!.textContent).toBe('Run B —');
+    expect(deltaOf(container, 'errors')).toBeNull();
+  });
 });

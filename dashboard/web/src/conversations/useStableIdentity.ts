@@ -1,4 +1,5 @@
 import { useRef } from 'react';
+import type { ConversationSessionIndex } from '../types/conversation';
 
 // #231 — Referential-stability hooks for derived collections.
 //
@@ -54,6 +55,40 @@ export function useMonotonicMax(value: number, resetKey: string): number {
   }
   if (value > maxRef.current) maxRef.current = value;
   return maxRef.current;
+}
+
+/** Keep the prior session-index reference when `next` is content-equal (#463 S3).
+ *
+ *  The server re-sends `session_index` on EVERY page fetch and every live-tail
+ *  poll, and `useConversation` merges it as `body.session_index ?? prev`, so a
+ *  truthy value always wins and the identity changes on each tick. That object
+ *  rides the TranscriptContext value every memoized MessageItem reads, and a
+ *  changed context value re-renders every consumer regardless of `React.memo` —
+ *  the same #231 failure the two hooks above exist to prevent, reached by a
+ *  different field. Bounded by the server's 64-entry index cap, so the
+ *  comparison is cheap relative to the re-render it prevents. */
+export function useStableSessionIndex(
+  next: ConversationSessionIndex | undefined,
+): ConversationSessionIndex | undefined {
+  const ref = useRef(next);
+  const prev = ref.current;
+  if (prev === next) return prev;
+  if (prev && next && prev.truncated === next.truncated) {
+    const prevKeys = Object.keys(prev.sessions);
+    const nextKeys = Object.keys(next.sessions);
+    if (prevKeys.length === nextKeys.length) {
+      let equal = true;
+      for (const key of nextKeys) {
+        const before = prev.sessions[key];
+        const after = next.sessions[key];
+        if (!before || before.ordinal !== after.ordinal
+            || before.opener_block_key !== after.opener_block_key) { equal = false; break; }
+      }
+      if (equal) return prev;
+    }
+  }
+  ref.current = next;
+  return next;
 }
 
 /** Keep the prior Map reference when `next` is entry-equal (same size, same

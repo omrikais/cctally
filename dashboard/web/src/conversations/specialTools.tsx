@@ -10,6 +10,8 @@ import { WebSearchCard } from './WebSearchCard';
 import { CodexCard } from './CodexCard';
 import { NativePatchCard } from './NativePatchCard';
 import { NativeAgentCard, NativeMcpCard, NativePlanCard } from './NativeSecondaryToolCards';
+import { NativeProgramCard } from './NativeProgramCard';
+import { SessionRefCard } from './SessionRefCard';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
 
@@ -66,6 +68,11 @@ export function specialToolRenderer(call: Call): ReactElement | null {
   if (call.native_card?.type === 'web_search') return <WebSearchCard call={call} />;
   if (call.native_card?.type === 'mcp') return <NativeMcpCard call={call} />;
   if (call.native_card?.type === 'agent') return <NativeAgentCard call={call} />;
+  // #463 S3 §5.2. `tool_search` deliberately has no dedicated component: §5.4
+  // gives it its query in the collapsed row and nothing more, which the generic
+  // chip already renders from the adapted preview.
+  if (call.native_card?.type === 'program') return <NativeProgramCard call={call} />;
+  if (call.native_card?.type === 'session_ref') return <SessionRefCard call={call} />;
   switch ((call.name ?? '').toLowerCase()) {
     case 'askuserquestion': return <AskUserQuestionCard call={call} />;
     case 'todowrite': return <TodoWriteCard call={call} />;

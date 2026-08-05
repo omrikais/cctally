@@ -26,7 +26,10 @@ describe('PermalinkButton', () => {
     expect(writeText).toHaveBeenCalledWith(
       `${window.location.origin}/#/conversations/source/claude/s/u`,
     );
-    expect(replace).toHaveBeenCalledWith(null, '', '#/conversations/source/claude/s/u');
+    // #463 S5 (review F5) — urlRouting stamps every entry it writes so a
+    // Back/Forward can be told apart from a fresh fragment navigation, which
+    // Chromium announces with the same popstate. The reflect write carries it too.
+    expect(replace).toHaveBeenCalledWith({ cctallyRoute: true }, '', '#/conversations/source/claude/s/u');
     await act(async () => {
       await Promise.resolve();
     });

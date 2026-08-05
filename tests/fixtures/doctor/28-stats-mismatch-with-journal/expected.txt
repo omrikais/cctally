@@ -22,7 +22,7 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1006) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1007) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
   ✓ Migrations               0/54 applied
   ⚠ Pending migrations       54 pending
@@ -45,6 +45,7 @@ Data
   ✓ Claude cache             0 entries (no JSONL corpus)
   ✓ Codex cache              none (no Codex session JSONL found)
   ✓ Codex project metadata   qualified
+  ✓ Codex orphan pruning     no refused prune
   ✓ Codex transcript replay  none pending
   ✓ Codex ingest backlog     no Codex ingest backlog
   ✓ Codex quota              not applicable
@@ -73,4 +74,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 51 OK · 6 WARN · 0 FAIL
+Summary: 52 OK · 6 WARN · 0 FAIL

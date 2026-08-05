@@ -62,3 +62,41 @@ describe('FilesTab', () => {
     expect(screen.getByText(/No files modified/i)).toBeInTheDocument();
   });
 });
+
+// #463 S4 §6.6 — the Codex branch. Its touches carry a real SEGMENT anchor, so a
+// file row jumps to its change; its op is the raw change kind the patch payload
+// stated, never the tool name.
+describe('#463 S4 — a Codex file row jumps to its change', () => {
+  const codexFiles: OutlineFile[] = [
+    {
+      path: 'bin/_lib_codex_landmarks.py',
+      add: 55, del: 0,
+      touches: [
+        { uuid: 'segment-key-7', tool_use_id: null, op: 'update', add: null, del: null },
+        { uuid: 'segment-key-9', tool_use_id: null, op: 'add', add: null, del: null },
+      ],
+    },
+  ];
+
+  it('renders every op the kernel emits and jumps on the touch row', () => {
+    const onJump = vi.fn();
+    render(<FilesTab files={codexFiles} onJump={onJump} />);
+    fireEvent.click(screen.getByRole('button', { name: /_lib_codex_landmarks\.py/i }));
+    // `apply_patch` is the TOOL, not the op. A closed record over the tool name
+    // would have left every real Codex touch with an empty label.
+    const update = screen.getByRole('button', { name: /update/i });
+    fireEvent.click(update);
+    expect(onJump).toHaveBeenCalledWith('segment-key-7');
+    expect(screen.getByRole('button', { name: /^add/i })).toBeInTheDocument();
+  });
+
+  it('renders no op label when the provider stated no change kind', () => {
+    render(<FilesTab files={[{
+      path: 'a.py', add: null, del: null,
+      touches: [{ uuid: 's1', tool_use_id: null, op: null, add: null, del: null }],
+    }]} onJump={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: /a\.py/i }));
+    const row = document.querySelector('.conv-files-touch')!;
+    expect(row.querySelector('.conv-files-touch-op')?.textContent).toBe('');
+  });
+});

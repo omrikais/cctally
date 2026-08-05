@@ -549,7 +549,10 @@ def test_real_record_usage_retry_preserves_durable_frozen_block(
         conn.close()
 
     rebuilt_path = tmp_path / "rebuilt-399.db"
-    jr.rebuild_stats_index(target_path=str(rebuilt_path))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(rebuilt_path),
+    )
     rebuilt = jr._cctally_core.open_db(_target_path=str(rebuilt_path))
     try:
         assert _block_logical_shape(rebuilt, first_window) == live_shape
@@ -604,7 +607,7 @@ def test_rebuild_projection_waits_for_retained_successor_close(
     monkeypatch.setattr(
         five_hour, "now_utc_iso", lambda: "2026-07-27T13:00:00Z"
     )
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = jr._cctally_core.open_db()
     try:
         projection = conn.execute(
@@ -1605,7 +1608,10 @@ def test_live_dump_equals_rebuild_after_conflict_and_duplicate_paths(ns, tmp_pat
         conn.close()
 
     rebuilt_path = tmp_path / "rebuilt.db"
-    jr.rebuild_stats_index(target_path=str(rebuilt_path))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(rebuilt_path),
+    )
     rb = jr._cctally_core.open_db(_target_path=str(rebuilt_path))
     try:
         assert _canonical_dump(rb) == live_dump
@@ -1700,7 +1706,10 @@ def test_crash_after_harvest_append_replay_converges_before_next_harvest(
         conn.close()
 
     rebuilt = tmp_path / "rebuilt.db"
-    jr.rebuild_stats_index(target_path=str(rebuilt))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(rebuilt),
+    )
     rb = jr._cctally_core.open_db(_target_path=str(rebuilt))
     try:
         assert _canonical_dump(rb) == live_dump
@@ -1778,7 +1787,10 @@ def test_budget_reconcile_crash_is_contained_by_replay_then_insert_or_ignore(
         conn.close()
 
     rebuilt = tmp_path / "rebuilt.db"
-    jr.rebuild_stats_index(target_path=str(rebuilt))
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(rebuilt),
+    )
     rb = jr._cctally_core.open_db(_target_path=str(rebuilt))
     try:
         assert _canonical_dump(rb) == live_dump
@@ -1824,7 +1836,10 @@ def test_rebuild_reports_quarantined_groups_and_exits_zero(ns, tmp_path, capsys)
     jr = _jr()
     _append_divergent_snapshot_pair(jr)
 
-    result = jr.rebuild_stats_index(target_path=str(tmp_path / "probe.db"))
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "probe.db"),
+    )
     assert [c.event_id for c in result.conflicts] == ["sa:conflict"]
     assert result.conflicts[0].rev == 0
     assert len(result.conflicts[0].content_hashes) == 2
@@ -1861,7 +1876,7 @@ def test_rebuild_json_uses_journal_conflicts_not_conflicts(ns, capsys):
 def test_doctor_deep_gather_reports_quarantined_groups(ns):
     jr = _jr()
     _append_divergent_snapshot_pair(jr)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     state = ns["doctor_gather_state"](deep=True)
 
@@ -1932,7 +1947,7 @@ def test_doctor_deep_gather_reports_tainted_batch_and_available_conflicts(
     assert protocol_leg.severity == "fail"
     assert "tainted correction batches omitted" in protocol_leg.summary
 
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     shallow = ns["doctor_gather_state"](deep=False)
     assert [
         (item["batchId"], item["kind"])

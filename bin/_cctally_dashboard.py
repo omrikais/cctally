@@ -265,12 +265,14 @@ import bisect
 import contextlib
 import dataclasses
 import datetime as dt
+import hmac
 import io
 import json
 import os
 import pathlib
 import queue
 import re
+import secrets
 import shutil
 import signal as _signal
 import socket
@@ -1771,6 +1773,33 @@ def _format_url(host: str, port: int) -> str:
     if ":" in host:
         return f"http://[{host}]:{port}/"
     return f"http://{host}:{port}/"
+
+
+def _dashboard_auth_url(url: str, token: "str | None") -> str:
+    """Append a per-run token as a fragment, never as a server-visible query."""
+    if token is None:
+        return url
+    return f"{url}#token={urllib.parse.quote(token, safe='')}"
+
+
+def _dashboard_lan_auth_token(
+        bind_host: str, enabled: bool, *,
+        token_factory=secrets.token_urlsafe) -> "str | None":
+    """Mint one process-local token only for authenticated non-loopback binds."""
+    gate = sys.modules["cctally"]._load_sibling("_lib_transcript_access")
+    if not enabled or gate.is_loopback(gate.authority_host(bind_host)):
+        return None
+    return token_factory(32)
+
+
+def _dashboard_token_from_cookie(raw_cookie: str) -> "str | None":
+    """Return the sole dashboard session-token cookie, rejecting duplicates."""
+    values = []
+    for part in (raw_cookie or "").split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name == "cctally_dashboard_token":
+            values.append(value)
+    return values[0] if len(values) == 1 and values[0] else None
 
 
 def _discover_lan_ip() -> "str | None":
@@ -4530,6 +4559,7 @@ _GET_ROUTES = (
 )
 
 _POST_ROUTES = (
+    ("exact", "/api/auth", "_handle_post_auth", None, False),
     ("exact", "/api/sync", "_handle_post_sync", None, False),
     ("exact", "/api/settings", "_handle_post_settings", None, False),
     ("exact", "/api/alerts/test", "_handle_post_alerts_test", None, False),
@@ -4599,6 +4629,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # cmd_dashboard before serve_forever; the per-request gate
     # (`_require_transcripts_allowed`) ANDs this with the request Host.
     cctally_expose_transcripts: bool = False
+    # Per-process LAN API token. None preserves the byte-stable loopback and
+    # explicit opt-out behavior; a value gates every /api/* request.
+    cctally_api_token: "str | None" = None
 
     # Access log stays silent (deliberate — noisy in the parent terminal),
     # but server errors are REAL as of #279 S2: log_error routes through
@@ -4678,7 +4711,43 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _require_api_auth(self) -> bool:
+        """Authenticate an API request before any route or method dispatch."""
+        if not self.path.split("?", 1)[0].startswith("/api/"):
+            return True
+        token = type(self).cctally_api_token
+        if token is None:
+            return True
+
+        authorization = self.headers.get_all("Authorization", [])
+        supplied = None
+        if authorization:
+            if (len(authorization) == 1
+                    and authorization[0].startswith("Bearer ")):
+                candidate = authorization[0][len("Bearer "):]
+                if candidate:
+                    supplied = candidate
+        else:
+            supplied = _dashboard_token_from_cookie(
+                self.headers.get("Cookie", "")
+            )
+        if (supplied is not None and supplied.isascii()
+                and hmac.compare_digest(supplied, token)):
+            return True
+
+        encoded = encode_dashboard_json_bytes({"error": "unauthorized"})
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
+        return False
+
     def do_GET(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
         if self._method_not_allowed_for_settings():
             return
         path = self.path.split("?", 1)[0]
@@ -4716,6 +4785,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "not found")
 
     def do_POST(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
         # No _method_not_allowed_for_settings() guard here (gate P1-3): POST
         # /api/settings must route to _handle_post_settings, not 405.
         if not self._dispatch(_POST_ROUTES):
@@ -4728,20 +4799,54 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
     # For other paths we fall through to send_error(501) so the rest of
     # the surface keeps stdlib semantics.
     def do_PUT(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
         if self._method_not_allowed_for_settings():
             return
         self.send_error(501, "Unsupported method ('PUT')")
 
     def do_DELETE(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
         if self._method_not_allowed_for_settings():
             return
         if not self._dispatch(_DELETE_ROUTES):
             self.send_error(501, "Unsupported method ('DELETE')")
 
     def do_PATCH(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
         if self._method_not_allowed_for_settings():
             return
         self.send_error(501, "Unsupported method ('PATCH')")
+
+    def do_HEAD(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
+        if self._method_not_allowed_for_settings():
+            return
+        self.send_error(501, "Unsupported method ('HEAD')")
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 — stdlib API
+        if not self._require_api_auth():
+            return
+        if self._method_not_allowed_for_settings():
+            return
+        self.send_error(501, "Unsupported method ('OPTIONS')")
+
+    def _handle_post_auth(self) -> None:
+        """Bridge an accepted Bearer token to a browser-native session cookie."""
+        token = type(self).cctally_api_token
+        if token is None:
+            self.send_error(404, "not found")
+            return
+        self.send_response(204)
+        self.send_header(
+            "Set-Cookie",
+            f"cctally_dashboard_token={token}; Path=/api; "
+            "HttpOnly; SameSite=Strict",
+        )
+        self.end_headers()
 
     def _handle_post_sync(self) -> None:
         """Trigger refresh-usage + snapshot rebuild on user demand.
@@ -5256,7 +5361,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                          "field": f"dashboard.{leaf}"},
                     )
                     return
-                if leaf not in ("cache_failure_markers", "live_tail"):
+                if leaf not in (
+                    "cache_failure_markers", "live_tail", "lan_auth"
+                ):
                     self._respond_json(
                         400,
                         {"error": f"unknown dashboard settings key: {leaf}",
@@ -5264,7 +5371,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     )
                     return
             dashboard_validated = {}
-            for _leaf in ("cache_failure_markers", "live_tail"):
+            for _leaf in ("cache_failure_markers", "live_tail", "lan_auth"):
                 if _leaf in dashboard_block:
                     if not isinstance(dashboard_block[_leaf], bool):
                         self._respond_json(
@@ -5659,12 +5766,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # + live_tail) so the SettingsOverlay can repaint without a
             # follow-up GET. Default true (opt-out) when nothing is persisted.
             persisted_dash = merged.get("dashboard") or {}
+            persisted_lan_auth = persisted_dash.get("lan_auth", True)
             out["dashboard"] = {
                 "cache_failure_markers": bool(
                     persisted_dash.get("cache_failure_markers", True)
                 ),
                 "live_tail": bool(persisted_dash.get("live_tail", True)),
+                "lan_auth": (
+                    persisted_lan_auth
+                    if isinstance(persisted_lan_auth, bool)
+                    else True
+                ),
             }
+            if "lan_auth" in dashboard_validated:
+                out["restart_required"] = ["dashboard.lan_auth"]
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7266,6 +7381,10 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             stored = "loopback"
         resolved_bind_stored = stored
     args.host = _resolve_dashboard_bind_for_runtime(resolved_bind_stored)
+    lan_auth_enabled = bool(
+        _config_known_value(config, "dashboard.lan_auth")
+    )
+    api_token = _dashboard_lan_auth_token(args.host, lan_auth_enabled)
 
     # F3: capture the canonical tz token from `--tz` (NOT the ZoneInfo
     # — the override needs to flow through `load_config()`-style readers
@@ -7365,6 +7484,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # in the doctor SSE block + /api/doctor reflects the actual --host
     # the process is serving, not just the config-only view the CLI sees.
     DashboardHTTPHandler.cctally_host = args.host
+    DashboardHTTPHandler.cctally_api_token = api_token
     # Conversation viewer (Plan 2, spec §5): the resolved
     # `dashboard.expose_transcripts` opt-in. Read off the already-loaded
     # `config` the same way `dashboard.bind` is resolved above (the
@@ -7490,20 +7610,40 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     is_loopback = bind_host in ("127.0.0.1", "localhost", "::1")
 
     if is_all_interfaces:
-        local_url = _format_url("localhost", bind_port)
+        local_url = _dashboard_auth_url(
+            _format_url("localhost", bind_port), api_token
+        )
         lan_ip = _discover_lan_ip()
         print("dashboard: serving on all interfaces:", flush=True)
         print(f"  - {local_url}      (this machine)", flush=True)
         if lan_ip:
-            lan_url = _format_url(lan_ip, bind_port)
+            lan_url = _dashboard_auth_url(
+                _format_url(lan_ip, bind_port), api_token
+            )
             print(f"  - {lan_url}   (LAN)", flush=True)
+        if api_token is not None:
+            print(f"dashboard: LAN access token: {api_token}", flush=True)
+        elif not lan_auth_enabled:
+            print(
+                "warning: LAN authentication disabled by "
+                "dashboard.lan_auth=false; restart after enabling it",
+                flush=True,
+            )
         print("Ctrl-C to stop", flush=True)
     elif is_loopback:
         url = _format_url("localhost", bind_port)
         print(f"dashboard: serving {url} — Ctrl-C to stop", flush=True)
     else:
-        url = _format_url(bind_host, bind_port)
+        url = _dashboard_auth_url(_format_url(bind_host, bind_port), api_token)
         print(f"dashboard: serving {url} — Ctrl-C to stop", flush=True)
+        if api_token is not None:
+            print(f"dashboard: LAN access token: {api_token}", flush=True)
+        elif not lan_auth_enabled:
+            print(
+                "warning: LAN authentication disabled by "
+                "dashboard.lan_auth=false; restart after enabling it",
+                flush=True,
+            )
 
     http_thread = threading.Thread(target=srv.serve_forever, daemon=True,
                                    name="dashboard-http")
@@ -7528,6 +7668,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
             browser_url = _format_url("localhost", bind_port)
         else:
             browser_url = _format_url(bind_host, bind_port)
+        browser_url = _dashboard_auth_url(browser_url, api_token)
         try:
             _wb.open(browser_url)
         except Exception as exc:

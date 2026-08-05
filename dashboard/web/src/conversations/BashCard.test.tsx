@@ -2,7 +2,7 @@ import { render, fireEvent, act } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BashCard } from './BashCard';
 import { TranscriptContext } from './TranscriptContext';
-import { HighlightContext } from './HighlightContext';
+import { ExactFindContext, HighlightContext } from './HighlightContext';
 import type { ConversationBlock } from '../types/conversation';
 
 type Call = Extract<ConversationBlock, { kind: 'tool_call' }>;
@@ -77,6 +77,45 @@ describe('BashCard', () => {
     expect(container.textContent).not.toContain('tools.exec_command');
     expect(container.querySelector('button[aria-label="Load raw request payload"]')).toBeTruthy();
     expect(container.querySelector('button[aria-label="Load raw output payload"]')).toBeTruthy();
+  });
+
+  it('marks visible ANSI output while preserving terminal styling', () => {
+    const occurrence = {
+      occurrence_id: 'o1.ansi', item_key: 'item', uuid: 'item', block_key: 'output',
+      container_block_key: 'owner', surface: 'output' as const, match_kinds: ['tool' as const],
+      disclosure: ['owner'], fragments: [{ leaf_key: 'stdout', start: 0, end: 3 }],
+    };
+    const call = base({
+      block_key: 'owner',
+      tool_use_id: 'owner',
+      stderr: undefined,
+      result: { text: '\x1b[31mhit\x1b[0m plain', truncated: false, is_error: false },
+      native_card: {
+        schema_version: 1,
+        type: 'terminal',
+        status: 'completed',
+        commands: [{ command: 'printf hit', metadata: {} }],
+        output: {
+          schema_version: 1,
+          type: 'terminal_output',
+          status: 'completed',
+          is_error: false,
+          parts: [{ type: 'text', stream: 'stdout', text: '\x1b[31mhit\x1b[0m plain' }],
+          truncated: false,
+        },
+      },
+    } as Call);
+    const { container } = render(
+      <ExactFindContext.Provider value={{ occurrences: [occurrence], selectedOccurrenceId: 'o1.ansi' }}>
+        <TranscriptContext.Provider value={{ sessionId: 's1' }}>
+          <BashCard call={call} />
+        </TranscriptContext.Provider>
+      </ExactFindContext.Provider>,
+    );
+    const mark = container.querySelector('mark[data-find-occurrence-id="o1.ansi"]');
+    expect(mark?.textContent).toBe('hit');
+    expect(mark?.closest('.ansi-red')).not.toBeNull();
+    expect(container.querySelector('.conv-term-out')?.textContent).toBe('hit plain');
   });
 
   it('renders the command as $ <command>, bash-highlighted', () => {
@@ -233,6 +272,22 @@ describe('BashCard collapse heuristic (#217 S3 E9)', () => {
     expect(hint?.textContent).toMatch(/show\s+40\s+lines/i);
   });
 
+  it('ships a narrow wording for the hint, like every other rigid summary child', () => {
+    // #463 S3 browser QA — measured at 390px on an `exec` row, this hint was the
+    // LARGEST rigid summary child (93px of a 302px content box) and the only one
+    // with no narrow wording, which left .conv-chip-preview at 52px — about eight
+    // characters, so consecutive `sed -n…` rows were indistinguishable.
+    const { container } = renderCard(
+      base({
+        stderr: undefined,
+        result: { text: longOutput(40), truncated: false, is_error: false },
+      }),
+    );
+    const hint = container.querySelector('.conv-term-collapsed-hint');
+    expect(hint?.querySelector('.conv-status-wide')?.textContent).toBe('show 40 lines');
+    expect(hint?.querySelector('.conv-status-narrow')?.textContent).toBe('+40');
+  });
+
   it('a request-only card (no result) stays open — nothing to collapse', () => {
     const { container } = renderCard(base({ result: null, stderr: undefined }));
     const d = container.querySelector('details.conv-term') as HTMLDetailsElement;
@@ -326,6 +381,56 @@ describe('BashCard find highlighting (#236)', () => {
     );
     const mark = container.querySelector('.conv-term-cmd mark');
     expect(mark?.textContent).toBe('flock');
+  });
+
+  it('maps an exact call fragment onto the matching native command leaf', () => {
+    const nativeCall = base({
+      block_key: 'cbk.exec', name: 'exec',
+      native_card: {
+        schema_version: 1, type: 'terminal', status: 'completed',
+        commands: [{ command: 'printf needle', workdir: null, metadata: {} }],
+      },
+      result: null,
+    });
+    const { container } = render(
+      <TranscriptContext.Provider value={{ sessionId: 's1' }}>
+        <ExactFindContext.Provider value={{
+          selectedOccurrenceId: 'occ-exec',
+          occurrences: [{
+            occurrence_id: 'occ-exec', item_key: 'item', uuid: 'item',
+            block_key: 'cbk.exec', container_block_key: 'cbk.exec', surface: 'call',
+            match_kinds: ['tool'], disclosure: ['cbk.exec'],
+            fragments: [{ leaf_key: 'commands.0', start: 7, end: 13 }],
+          }],
+        }}>
+          <BashCard call={nativeCall} />
+        </ExactFindContext.Provider>
+      </TranscriptContext.Provider>,
+    );
+    expect(container.querySelector('.conv-term-cmd mark')?.textContent).toBe('needle');
+    expect(container.querySelector('details')?.dataset.disclosureKey).toBe('cbk.exec');
+  });
+});
+
+// #463 S3 F11a — the exit code and wall time the harness-preamble reader
+// recovered. They rode a `title` attribute alone, which the 390px viewport the
+// spec targets cannot open, so the evidence was unreachable exactly where the
+// collapsed row is shortest.
+describe('BashCard outcome evidence (#463 S3)', () => {
+  it('states the exit code and wall time in the expanded body', () => {
+    const { container } = renderCard(base({
+      name: 'exec_command',
+      result: { text: 'ok\n', truncated: false, is_error: false },
+      stderr: null,
+      outcome: { status: 'completed', exit_code: 0, wall_time_seconds: 1.0034 },
+    }));
+    expect(container.querySelector('.conv-term-body .conv-outcome-evidence')?.textContent)
+      .toBe('exit 0 · 1.0034s');
+  });
+
+  it('renders no evidence line for a Claude Bash call, which carries no outcome', () => {
+    const { container } = renderCard(base());
+    expect(container.querySelector('.conv-outcome-evidence')).toBeNull();
   });
 });
 

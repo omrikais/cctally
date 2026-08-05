@@ -1,0 +1,961 @@
+{
+  "children": [],
+  "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "items": [
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_6fd6acaeca97be59cbe94fbdc6fa6a9761fb6e0b",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Exercise the synthetic tool-legibility shapes",
+          "timestamp_utc": "2026-08-02T09:00:02Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:00:02Z",
+      "tokens": null,
+      "turn_item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_def77b9b71f9ed7670170de5ce2aea17ad754544",
+          "call_id": null,
+          "detail": null,
+          "kind": "assistant",
+          "text": "Running the synthetic tool families.",
+          "timestamp_utc": "2026-08-02T09:00:04Z"
+        },
+        {
+          "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+          "call_id": "s3-exec-whole",
+          "detail": {
+            "args": "const r = await tools.exec_command({cmd: \"printf ok\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+            "card": {
+              "commands": [
+                {
+                  "command": "printf ok",
+                  "metadata": {
+                    "yield_time_ms": 10000
+                  },
+                  "workdir": "/synthetic/root-a/project-red"
+                }
+              ],
+              "schema_version": 1,
+              "status": "completed",
+              "type": "terminal"
+            },
+            "name": "exec"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "ok\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "completed",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.5
+              }
+            },
+            "text": "ok\n"
+          },
+          "text": "exec\nconst r = await tools.exec_command({cmd: \"printf ok\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+          "timestamp_utc": "2026-08-02T09:00:05Z"
+        },
+        {
+          "block_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "call_id": "s3-exec-program",
+          "detail": {
+            "args": "const names = ALL_TOOLS.filter(x => /gh/.test(x.name));\n// tools.exec_command({cmd: \"this one is a comment\"})\nconst r = await tools.exec_command({cmd: \"ls -1\", workdir: \"/synthetic/root-a/project-red\"});\nconst w = await tools.write_stdin({session_id: 70001, chars: \"yes\\n\"});\nconst u = await tools.write_stdin({session_id: 70004, chars: \"maybe\\n\"});\ntext(r.output);\n",
+            "card": {
+              "complete": false,
+              "invocations": [
+                {
+                  "command": "ls -1",
+                  "kind": "command",
+                  "metadata": {},
+                  "workdir": "/synthetic/root-a/project-red"
+                },
+                {
+                  "chars": "yes\n",
+                  "kind": "session",
+                  "operation": "write",
+                  "ref": "1",
+                  "scope": "shell"
+                },
+                {
+                  "chars": "maybe\n",
+                  "kind": "session",
+                  "operation": "write",
+                  "ref": null,
+                  "scope": "shell"
+                }
+              ],
+              "schema_version": 1,
+              "title": null,
+              "truncated": false,
+              "type": "program"
+            },
+            "name": "exec"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": true,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "boom\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "failed",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 2.0
+              }
+            },
+            "text": "boom\n"
+          },
+          "text": "exec\nconst names = ALL_TOOLS.filter(x => /gh/.test(x.name));\n// tools.exec_command({cmd: \"this one is a comment\"})\nconst r = await tools.exec_command({cmd: \"ls -1\", workdir: \"/synthetic/root-a/project-red\"});\nconst w = await tools.write_stdin({session_id: 70001, chars: \"yes\\n\"});\nconst u = await tools.write_stdin({session_id: 70004, chars: \"maybe\\n\"});\ntext(r.output);\n",
+          "timestamp_utc": "2026-08-02T09:00:07Z"
+        },
+        {
+          "block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "call_id": "s3-fc-exec",
+          "detail": {
+            "args": "{\"cmd\":\"bash -i\",\"tty\":true,\"workdir\":\"/synthetic/root-a/project-red\",\"yield_time_ms\":5000}",
+            "card": {
+              "commands": [
+                {
+                  "command": "bash -i",
+                  "metadata": {
+                    "tty": true,
+                    "yield_time_ms": 5000
+                  },
+                  "workdir": "/synthetic/root-a/project-red"
+                }
+              ],
+              "schema_version": 1,
+              "status": "completed",
+              "type": "terminal"
+            },
+            "name": "exec_command"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "session opened\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "running",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 1.0034
+              }
+            },
+            "text": "session opened\n"
+          },
+          "text": "exec_command\n{\"cmd\":\"bash -i\",\"tty\":true,\"workdir\":\"/synthetic/root-a/project-red\",\"yield_time_ms\":5000}",
+          "timestamp_utc": "2026-08-02T09:00:09Z"
+        },
+        {
+          "block_key": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "call_id": "s3-fc-stdin-a",
+          "detail": {
+            "args": "{\"chars\":\"yes\\n\",\"session_id\":70001}",
+            "card": {
+              "chars": "yes\n",
+              "operation": "write",
+              "ref": "1",
+              "schema_version": 1,
+              "scope": "shell",
+              "truncated": false,
+              "type": "session_ref"
+            },
+            "name": "write_stdin"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": 0,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "ok\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "completed",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.5
+              }
+            },
+            "text": "ok\n"
+          },
+          "text": "write_stdin\n{\"chars\":\"yes\\n\",\"session_id\":70001}",
+          "timestamp_utc": "2026-08-02T09:00:11Z"
+        },
+        {
+          "block_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "call_id": "s3-fc-stdin-b",
+          "detail": {
+            "args": "{\"chars\":\"no\\n\",\"session_id\":70002}",
+            "card": {
+              "chars": "no\n",
+              "operation": "write",
+              "ref": "2",
+              "schema_version": 1,
+              "scope": "shell",
+              "truncated": false,
+              "type": "session_ref"
+            },
+            "name": "write_stdin"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": 3,
+                "is_error": true,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "refused\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "failed",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.5
+              }
+            },
+            "text": "refused\n"
+          },
+          "text": "write_stdin\n{\"chars\":\"no\\n\",\"session_id\":70002}",
+          "timestamp_utc": "2026-08-02T09:00:13Z"
+        },
+        {
+          "block_key": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+          "call_id": "s3-fc-stdin-c",
+          "detail": {
+            "args": "{\"chars\":\"start\\n\",\"session_id\":70003}",
+            "card": {
+              "chars": "start\n",
+              "operation": "write",
+              "ref": "3",
+              "schema_version": 1,
+              "scope": "shell",
+              "truncated": false,
+              "type": "session_ref"
+            },
+            "name": "write_stdin"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "started\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "running",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.2
+              }
+            },
+            "text": "started\n"
+          },
+          "text": "write_stdin\n{\"chars\":\"start\\n\",\"session_id\":70003}",
+          "timestamp_utc": "2026-08-02T09:00:14Z"
+        },
+        {
+          "block_key": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001",
+          "call_id": "s3-fc-wait",
+          "detail": {
+            "args": "{\"cell_id\":\"12\"}",
+            "card": {
+              "chars": null,
+              "operation": "poll",
+              "ref": "12",
+              "schema_version": 1,
+              "scope": "cell",
+              "truncated": false,
+              "type": "session_ref"
+            },
+            "name": "wait"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "still waiting\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": null
+              }
+            },
+            "text": "still waiting\n"
+          },
+          "text": "wait\n{\"cell_id\":\"12\"}",
+          "timestamp_utc": "2026-08-02T09:00:15Z"
+        },
+        {
+          "block_key": "cbk1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+          "call_id": "s3-fc-js",
+          "detail": {
+            "args": "{\"code\":\"const r = await tools.exec_command({cmd: \\\"ls -1 /synthetic\\\"});\\ntext(r.output);\\n\",\"title\":\"list the synthetic tree\"}",
+            "card": {
+              "complete": true,
+              "invocations": [
+                {
+                  "command": "ls -1 /synthetic",
+                  "kind": "command",
+                  "metadata": {},
+                  "workdir": null
+                }
+              ],
+              "schema_version": 1,
+              "title": "list the synthetic tree",
+              "truncated": false,
+              "type": "program"
+            },
+            "name": "js"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "{}",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.73
+              }
+            },
+            "text": "{}"
+          },
+          "text": "js\n{\"code\":\"const r = await tools.exec_command({cmd: \\\"ls -1 /synthetic\\\"});\\ntext(r.output);\\n\",\"title\":\"list the synthetic tree\"}",
+          "timestamp_utc": "2026-08-02T09:00:17Z"
+        },
+        {
+          "block_key": "cbk1_fb0a485bf58794391b5e1f6e9116f54664843aec",
+          "call_id": "s3-fc-search",
+          "detail": {
+            "args": "{\"limit\":5,\"query\":\"synthetic\"}",
+            "card": {
+              "limit": 5,
+              "query": "synthetic",
+              "schema_version": 1,
+              "type": "tool_search"
+            },
+            "name": "tool_search_call"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "[]",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": null
+              }
+            },
+            "text": "[]"
+          },
+          "text": "tool_search_call\n{\"limit\":5,\"query\":\"synthetic\"}",
+          "timestamp_utc": "2026-08-02T09:00:19Z"
+        },
+        {
+          "block_key": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e",
+          "call_id": "s3-fc-mcp-protocol-error",
+          "detail": {
+            "args": "{\"number\":999}",
+            "card": {
+              "call_status": "completed",
+              "completion": {
+                "arguments": {
+                  "number": 999
+                },
+                "duration": {
+                  "nanos": 250000000,
+                  "secs": 0
+                },
+                "event_block_key": "cbk1_e0eefd23adb5226d2b8868fa8e18996b1d2561ce",
+                "result": {
+                  "Ok": {
+                    "content": [
+                      {
+                        "text": "synthetic failure",
+                        "type": "text"
+                      }
+                    ],
+                    "isError": true
+                  }
+                },
+                "server": "fixture",
+                "status": "error",
+                "tool": "get_issue"
+              },
+              "name": "fixture_get_issue",
+              "schema_version": 1,
+              "source": "function_call",
+              "type": "mcp"
+            },
+            "name": "fixture_get_issue"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "synthetic MCP protocol failure",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": null
+              }
+            },
+            "text": "synthetic MCP protocol failure"
+          },
+          "text": "fixture_get_issue\n{\"number\":999}",
+          "timestamp_utc": "2026-08-02T09:00:21Z"
+        },
+        {
+          "block_key": "cbk1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+          "call_id": "s3-apply-patch",
+          "detail": {
+            "args": "*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch",
+            "card": {
+              "files": [
+                {
+                  "diff_source": "derived",
+                  "path": "synthetic-legible.txt",
+                  "status": "modified",
+                  "truncated": false,
+                  "unified_diff": "--- synthetic-legible.txt\n+++ synthetic-legible.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+                }
+              ],
+              "patch": "*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch",
+              "schema_version": 1,
+              "source": "apply_patch",
+              "status": "completed",
+              "truncated": false,
+              "type": "patch"
+            },
+            "name": "apply_patch"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": 0,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "Success\n",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "completed",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": 0.1
+              }
+            },
+            "text": "Success\n"
+          },
+          "text": "apply_patch\n*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch",
+          "timestamp_utc": "2026-08-02T09:00:24Z"
+        }
+      ],
+      "cost_usd": 0.0039,
+      "item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "kind": "assistant",
+      "member_item_keys": [
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+      ],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:00:04Z",
+      "tokens": {
+        "cached_input": 200,
+        "input": 900,
+        "output": 300,
+        "reasoning_output": 80,
+        "source": "codex"
+      },
+      "turn_item_key": "civ1_f335a8740d1142ec42d960880521be2f9614cc14"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Apply the synthetic dict-shaped patch",
+          "timestamp_utc": "2026-08-02T09:01:01Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:01:01Z",
+      "tokens": null,
+      "turn_item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29",
+          "call_id": "s3-orphan-patch",
+          "detail": {
+            "card": {
+              "files": [
+                {
+                  "diff_source": "derived",
+                  "path": "/synthetic/root-a/project-red/a-generated-clipped.py",
+                  "status": "add",
+                  "truncated": true,
+                  "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/a-generated-clipped.py\n@@ -0,0 +1,55 @@\n+value_000 = 'synthetic filler row 000 for the per-file clip fixture'\n+value_001 = 'synthetic filler row 001 for the per-file clip fixture'\n+value_002 = 'synthetic filler row 002 for the per-file clip fixture'\n+value_003 = 'synthetic filler row 003 for the per-file clip fixture'\n+value_004 = 'synthetic filler row 004 for the per-file clip fixture'\n+value_005 = 'synthetic filler row 005 for the per-file clip fixture'\n+value_006 = 'synthetic filler row 006 for the per-file clip fixture'\n+value_007 = 'synthetic filler row 007 for the per-file clip fixture'\n+value_008 = 'synthetic filler row 008 for the per-file clip fixture'\n+value_009 = 'synthetic filler row 009 for the per-file clip fixture'\n+value_010 = 'synthetic filler row 010 for the per-file clip fixture'\n+value_011 = 'synthetic filler row 011 for the per-file clip fixture'\n+value_012 = 'synthetic filler row 012 for the per-file clip fixture'\n+value_013 = 'synthetic filler row 013 for the per-file clip fixture'\n+value_014 = 'synthetic filler row 014 for the per-file clip fixture'\n+value_015 = 'synthetic filler row 015 for the per-file clip fixture'\n+value_016 = 'synthetic filler row 016 for the per-file clip fixture'\n+value_017 = 'synthetic filler row 017 for the per-file clip fixture'\n+value_018 = 'synthetic filler row 018 for the per-file clip fixture'\n+value_019 = 'synthetic filler row 019 for the per-file clip fixture'\n+value_020 = 'synthetic filler row 020 for the per-file clip fixture'\n+value_021 = 'synthetic filler row 021 for the per-file clip fixture'\n+value_022 = 'synthetic filler row 022 for the per-file clip fixture'\n+value_023 = 'synthetic filler row 023 for the per-file clip fixture'\n+value_024 = 'synthetic filler row 024 for the per-file clip fixture'\n+value_025 = 'synthetic filler row 025 for the per-file clip fixture'\n+value_026 = 'synthetic filler row 026 for the per-file clip fixture'\n+value_027 = 'synthetic filler row 027 for the per-file clip fixture'\n+value_028 = 'synthetic filler row 028 for the per-file clip fixture'\n+value_029 = 'synthetic filler row 029 for the per-file clip fixture'\n+value_030 = 'synthetic filler row 030 for the per-file clip fixture'\n+value_031 = 'synthetic filler row 031 for the per-file clip fixture'\n+value_032 = 'synthetic filler row 032 for the per-file clip fixture'\n+value_033 = 'synthetic filler row 033 for the per-file clip fixture'\n+value_034 = 'synthetic filler row 034 for the per-file clip fixture'\n+value_035 = 'synthetic filler row 035 for the per-file clip fixture'\n+value_036 = 'synthetic filler row 036 for the per-file clip fixture'\n+value_037 = 'synthetic filler row 037 for the per-file clip fixture'\n+value_038 = 'synthetic filler row 038 for the per-file clip fixture'\n+value_039 = 'synthetic filler row 039 for the per-file clip fixture'\n+value_040 = 'synthetic filler row 040 for the per-file clip fixture'\n+value_041 = 'synthetic filler row 041 for the per-file clip fixture'\n+value_042 = 'synthetic filler row 042 for the per-file clip fixture'\n"
+                },
+                {
+                  "diff_source": "derived",
+                  "path": "/synthetic/root-a/project-red/added.py",
+                  "status": "add",
+                  "truncated": false,
+                  "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/added.py\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+                },
+                {
+                  "diff_source": "derived",
+                  "path": "/synthetic/root-a/project-red/empty.py",
+                  "status": "add",
+                  "truncated": false,
+                  "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/empty.py\n@@ -0,0 +0,0 @@\n"
+                },
+                {
+                  "diff_source": "derived",
+                  "path": "/synthetic/root-a/project-red/removed.py",
+                  "status": "delete",
+                  "truncated": false,
+                  "unified_diff": "--- /synthetic/root-a/project-red/removed.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n"
+                },
+                {
+                  "diff_source": "retained",
+                  "path": "/synthetic/root-a/project-red/updated.py",
+                  "status": "update",
+                  "truncated": false,
+                  "unified_diff": "@@ -1 +1 @@\n-old\n+new\n"
+                }
+              ],
+              "has_diff": true,
+              "schema_version": 1,
+              "source": "patch_apply_end",
+              "status": "completed",
+              "stderr": "",
+              "stdout": "patch ok\n",
+              "success": true,
+              "truncated": true,
+              "type": "patch"
+            },
+            "event": "patch_apply_end"
+          },
+          "kind": "event",
+          "payload_which": "event",
+          "text": "patch_apply /synthetic/root-a/project-red/a-generated-clipped.py /synthetic/root-a/project-red/added.py /synthetic/root-a/project-red/empty.py /synthetic/root-a/project-red/removed.py /synthetic/root-a/project-red/updated.py",
+          "timestamp_utc": "2026-08-02T09:01:02Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+      "kind": "event",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:01:02Z",
+      "tokens": null,
+      "turn_item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_164fbd4071b1d7940671365b38147480a6ba47c0",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Delegate the synthetic search",
+          "timestamp_utc": "2026-08-02T09:02:01Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:02:01Z",
+      "tokens": null,
+      "turn_item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_e3aedf86278c94bcc915af437ee683b8d57d1438",
+          "call_id": null,
+          "detail": {
+            "external_call": {
+              "input": {
+                "query": "select:SyntheticAlpha,SyntheticBeta"
+              },
+              "name": "ToolSearch",
+              "schema_version": 1,
+              "span": [
+                32,
+                126
+              ],
+              "truncated": false
+            }
+          },
+          "kind": "assistant",
+          "text": "Delegating to the search tool.\n\n[external_agent_tool_call: ToolSearch]\ninput: {\"query\": \"select:SyntheticAlpha,SyntheticBeta\"}",
+          "timestamp_utc": "2026-08-02T09:02:02Z"
+        },
+        {
+          "block_key": "cbk1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+          "call_id": null,
+          "detail": null,
+          "kind": "assistant",
+          "text": "Here is how that marker is written:\n\n```\n[external_agent_tool_call: NotACall]\ninput: {\"query\": \"authored\"}\n```\n",
+          "timestamp_utc": "2026-08-02T09:02:03Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d",
+      "kind": "assistant",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:02:02Z",
+      "tokens": null,
+      "turn_item_key": "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_743bc02e8c6710f2b8d5ee4839f30e322e5d9711",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Record the synthetic plan",
+          "timestamp_utc": "2026-08-02T09:03:01Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:03:01Z",
+      "tokens": null,
+      "turn_item_key": "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70",
+          "call_id": "s3-fc-plan",
+          "detail": {
+            "args": "{\"explanation\":\"Recording the synthetic plan\",\"plan\":[{\"status\":\"completed\",\"step\":\"Decode the synthetic tool families\"},{\"status\":\"in_progress\",\"step\":\"Apply the synthetic patch\"}]}",
+            "card": {
+              "call_status": "completed",
+              "explanation": "Recording the synthetic plan",
+              "items": [
+                {
+                  "status": "completed",
+                  "step": "Decode the synthetic tool families"
+                },
+                {
+                  "status": "in_progress",
+                  "step": "Apply the synthetic patch"
+                }
+              ],
+              "result": {
+                "status": "returned",
+                "truncated": false,
+                "value": "Plan updated"
+              },
+              "schema_version": 1,
+              "source": "update_plan",
+              "type": "plan"
+            },
+            "name": "update_plan"
+          },
+          "kind": "tool_call",
+          "output": {
+            "detail": {
+              "card": {
+                "exit_code": null,
+                "is_error": false,
+                "parts": [
+                  {
+                    "stream": "output",
+                    "text": "Plan updated",
+                    "type": "text"
+                  }
+                ],
+                "schema_version": 1,
+                "status": "unknown",
+                "truncated": false,
+                "type": "terminal_output",
+                "wall_time_seconds": null
+              }
+            },
+            "text": "Plan updated"
+          },
+          "text": "update_plan\n{\"explanation\":\"Recording the synthetic plan\",\"plan\":[{\"status\":\"completed\",\"step\":\"Decode the synthetic tool families\"},{\"status\":\"in_progress\",\"step\":\"Apply the synthetic patch\"}]}",
+          "timestamp_utc": "2026-08-02T09:03:02Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+      "kind": "assistant",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:03:02Z",
+      "tokens": null,
+      "turn_item_key": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_63f70b2dc603eb0d6b243220298bb3cfbff5b2cc",
+          "call_id": null,
+          "detail": null,
+          "kind": "user",
+          "text": "Run the synthetic command twice under one id",
+          "timestamp_utc": "2026-08-02T09:04:01Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7",
+      "kind": "user",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:04:01Z",
+      "tokens": null,
+      "turn_item_key": "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7"
+    },
+    {
+      "blocks": [
+        {
+          "block_key": "cbk1_b5ffdfd26c634e1a9777d4c1b1f71f64be8ebad2",
+          "call_id": "s3-ambiguous",
+          "detail": {
+            "args": "const r = await tools.exec_command({cmd: \"printf first\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+            "card": {
+              "commands": [
+                {
+                  "command": "printf first",
+                  "metadata": {
+                    "yield_time_ms": 10000
+                  },
+                  "workdir": "/synthetic/root-a/project-red"
+                }
+              ],
+              "schema_version": 1,
+              "status": "completed",
+              "type": "terminal"
+            },
+            "name": "exec"
+          },
+          "kind": "tool_call",
+          "text": "exec\nconst r = await tools.exec_command({cmd: \"printf first\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+          "timestamp_utc": "2026-08-02T09:04:02Z"
+        },
+        {
+          "block_key": "cbk1_68cae44e514148dca3824072d3b60557eda366a6",
+          "call_id": "s3-ambiguous",
+          "detail": {
+            "args": "const r = await tools.exec_command({cmd: \"printf second\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+            "card": {
+              "commands": [
+                {
+                  "command": "printf second",
+                  "metadata": {
+                    "yield_time_ms": 10000
+                  },
+                  "workdir": "/synthetic/root-a/project-red"
+                }
+              ],
+              "schema_version": 1,
+              "status": "completed",
+              "type": "terminal"
+            },
+            "name": "exec"
+          },
+          "kind": "tool_call",
+          "text": "exec\nconst r = await tools.exec_command({cmd: \"printf second\", workdir: \"/synthetic/root-a/project-red\", yield_time_ms: 10000}); text(r.output);",
+          "timestamp_utc": "2026-08-02T09:04:03Z"
+        },
+        {
+          "block_key": "cbk1_d86da189d8427c7e457808cdc573aeb805a0bade",
+          "call_id": "s3-ambiguous",
+          "detail": {
+            "card": {
+              "exit_code": null,
+              "is_error": true,
+              "parts": [
+                {
+                  "stream": "output",
+                  "text": "which call was this\n",
+                  "type": "text"
+                }
+              ],
+              "schema_version": 1,
+              "status": "failed",
+              "truncated": false,
+              "type": "terminal_output",
+              "wall_time_seconds": 2.0
+            }
+          },
+          "kind": "tool_output",
+          "text": "which call was this\n",
+          "timestamp_utc": "2026-08-02T09:04:04Z"
+        }
+      ],
+      "cost_usd": null,
+      "item_key": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+      "kind": "assistant",
+      "member_item_keys": [],
+      "model": "gpt-synthetic-codex",
+      "segment_ordinal": 0,
+      "timestamp_utc": "2026-08-02T09:04:02Z",
+      "tokens": null,
+      "turn_item_key": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1"
+    }
+  ],
+  "page": {
+    "after": null,
+    "before": null,
+    "has_after": false,
+    "has_before": false,
+    "returned": 10,
+    "total": 10
+  },
+  "parent": null,
+  "session_index": {
+    "sessions": {
+      "1": {
+        "opener_block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+        "ordinal": 1
+      },
+      "2": {
+        "opener_block_key": null,
+        "ordinal": 2
+      },
+      "3": {
+        "opener_block_key": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+        "ordinal": 3
+      }
+    },
+    "truncated": false
+  },
+  "status": "ok",
+  "title": "Exercise the synthetic tool-legibility shapes",
+  "tokens": {
+    "cached_input": 200,
+    "input": 900,
+    "output": 300,
+    "reasoning_output": 80,
+    "source": "codex"
+  },
+  "total_cost_usd": 0.0039,
+  "unattributed_cost_usd": 0.0
+}

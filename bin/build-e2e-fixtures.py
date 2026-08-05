@@ -497,7 +497,7 @@ def build_codex_task_b(out: pathlib.Path) -> dict:
         {
             "payload": {
                 "call_id": "exec-long",
-                "input": "const r = await tools.exec_command({\n  cmd: \"seq 1 25\",\n  workdir: \"/synthetic/root-a/project-red\"\n});\ntext(r.output);",
+                "input": "const r = await tools.exec_command({\n  cmd: \"seq 1 25\",\n  workdir: \"/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy\"\n});\ntext(r.output);",
                 "name": "exec",
                 "status": "completed",
                 "type": "custom_tool_call",
@@ -568,6 +568,207 @@ def build_codex_task_b(out: pathlib.Path) -> dict:
     }
 
 
+def build_codex_occurrence_find(out: pathlib.Path) -> dict:
+    """Build #482's production-shaped occurrence-find browser corpus.
+
+    One turn deliberately repeats a unique needle within a rendered Markdown
+    row and across each native row-backed surface.  The pre-fix product can
+    find the containing rows but cannot count or navigate every occurrence.
+    """
+    target = out / "codex-find"
+    target.mkdir(parents=True, exist_ok=True)
+    needle = "occneedle482"
+    title = "Occurrence find projection fixture"
+    rows = [
+        {
+            "payload": {
+                "context_window": 272000,
+                "cwd": "/synthetic/occurrence-find",
+                "id": "482-occurrence-find-thread",
+                "model": "gpt-synthetic-codex",
+                "model_context_window": 272000,
+                "model_provider": "fixture-provider",
+                "session_id": "48248248-2482-4482-8482-482482482482",
+                "source": "codex",
+                "thread_source": "482-occurrence-find-thread",
+                "tools": [{"name": "fixture-tool"}],
+            },
+            "timestamp": "2026-08-04T08:00:00Z",
+            "type": "session_meta",
+        },
+        {
+            "payload": {
+                "model": "gpt-synthetic-codex",
+                "model_context_window": 272000,
+                "turn_id": "482-find-turn",
+            },
+            "timestamp": "2026-08-04T08:00:01Z",
+            "type": "turn_context",
+        },
+        {
+            "payload": {
+                "content": [{"text": f"{title}: {needle}", "type": "input_text"}],
+                "phase": "input",
+                "role": "user",
+                "type": "message",
+            },
+            "timestamp": "2026-08-04T08:00:02Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "content": [{
+                    "text": (
+                        f"a**{needle}**c {needle} {needle} café Καλημέρα "
+                        "CaseProbe482 caseprobe482 CASEPROBE482"
+                    ),
+                    "type": "output_text",
+                }],
+                "phase": "output",
+                "role": "assistant",
+                "type": "message",
+            },
+            "timestamp": "2026-08-04T08:00:03Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "content": [{"text": f"collapsed {needle} reasoning", "type": "reasoning_text"}],
+                "summary": [{"text": "Occurrence reasoning", "type": "summary_text"}],
+                "type": "reasoning",
+            },
+            "timestamp": "2026-08-04T08:00:04Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "482-exact-call",
+                "input": f"text('{needle} call')",
+                "name": "exec",
+                "status": "completed",
+                "type": "custom_tool_call",
+            },
+            "timestamp": "2026-08-04T08:00:05Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "482-exact-call",
+                "output": f"{needle} output one\n{needle} output two\n",
+                "type": "custom_tool_call_output",
+            },
+            "timestamp": "2026-08-04T08:00:06Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "482-patch",
+                "input": "*** Begin Patch\n*** Add File: occurrence.txt\n+fixture\n*** End Patch",
+                "name": "apply_patch",
+                "status": "completed",
+                "type": "custom_tool_call",
+            },
+            "timestamp": "2026-08-04T08:00:07Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "482-patch",
+                "changes": [{
+                    "path": "occurrence.txt",
+                    "status": "added",
+                    "unified_diff": f"--- /dev/null\n+++ b/occurrence.txt\n@@ -0,0 +1 @@\n+{needle}\n",
+                }],
+                "status": "completed",
+                "stderr": "",
+                "stdout": f"{needle} patch completion",
+                "success": True,
+                "turn_id": "482-find-turn",
+                "type": "patch_apply_end",
+            },
+            "timestamp": "2026-08-04T08:00:08Z",
+            "type": "event_msg",
+        },
+        {
+            "payload": {
+                "action": {"query": "fixture web query", "type": "search"},
+                "id": "482-web",
+                "status": "completed",
+                "type": "web_search_call",
+            },
+            "timestamp": "2026-08-04T08:00:09Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "action": {"query": "fixture web query", "type": "search"},
+                "call_id": "482-web",
+                "query": "fixture web query",
+                "results": [{
+                    "domain": "example.test",
+                    "ref_id": "turn0search0",
+                    "snippet": f"{needle} web completion",
+                    "title": "Occurrence result",
+                    "type": "computer_initialize_state",
+                    "url": "https://example.test/occurrence",
+                }],
+                "type": "web_search_end",
+            },
+            "timestamp": "2026-08-04T08:00:10Z",
+            "type": "event_msg",
+        },
+        {
+            "payload": {
+                "arguments": "{\"query\":\"fixture\"}",
+                "call_id": "482-mcp",
+                "name": "fixture_search",
+                "type": "function_call",
+            },
+            "timestamp": "2026-08-04T08:00:11Z",
+            "type": "response_item",
+        },
+        {
+            "payload": {
+                "call_id": "482-mcp",
+                "duration": {"nanos": 1, "secs": 0},
+                "invocation": {"arguments": {"query": "fixture"}, "server": "fixture", "tool": "search"},
+                "result": {"Ok": {"content": [{"text": f"{needle} MCP completion", "type": "text"}]}},
+                "type": "mcp_tool_call_end",
+            },
+            "timestamp": "2026-08-04T08:00:12Z",
+            "type": "event_msg",
+        },
+        {
+            "payload": {
+                "content": [{
+                    "text": " ".join([needle] * 205),
+                    "type": "output_text",
+                }],
+                "phase": "output",
+                "role": "assistant",
+                "type": "message",
+            },
+            "timestamp": "2026-08-04T08:00:13Z",
+            "type": "response_item",
+        },
+    ]
+    path = target / "occurrence-find.jsonl"
+    path.write_text("".join(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n" for value in rows))
+    return {
+        "occurrence_find_file": str(path.resolve()),
+        "occurrence_find_title": title,
+        "occurrence_find_needle": needle,
+        # The retained reasoning body above is not part of the rendered
+        # decomposed-heading surface.  Count only occurrences the reader can
+        # actually render and address.
+        "occurrence_find_total": 216,
+        "occurrence_find_cross_leaf_query": f"a{needle}c",
+        "occurrence_find_case_query": "caseprobe482",
+        "occurrence_find_regex_query": "caseprobe482|café",
+        "occurrence_find_reasoning_query": "Occurrence reasoning",
+    }
+
+
 def build(out: pathlib.Path) -> dict:
     scratch = out / "scratch"
     data = scratch / "data"
@@ -586,6 +787,7 @@ def build(out: pathlib.Path) -> dict:
     manifest.update(build_second_model(projects, rng))
     manifest.update(build_codex_task_a(out))
     manifest.update(build_codex_task_b(out))
+    manifest.update(build_codex_occurrence_find(out))
     manifest["project_dir"] = PROJECT_DIR
     manifest["cwd"] = CWD
     manifest["page_size"] = PAGE

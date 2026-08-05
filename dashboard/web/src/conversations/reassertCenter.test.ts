@@ -8,7 +8,7 @@ import { reassertCenter, type ReassertFrame } from './reassertCenter';
 // identity; null = target gone). Counts apply() calls and advances a fake clock.
 function driver(
   seq: Array<{ desired: number; target?: unknown } | null>,
-  opts?: { msPerFrame?: number; transientGoneGraceMs?: number },
+  opts?: { msPerFrame?: number; transientGoneGraceMs?: number; minimumDurationMs?: number },
 ) {
   const msPerFrame = opts?.msPerFrame ?? 16;
   let i = 0;
@@ -26,6 +26,7 @@ function driver(
     isAborted: () => false,
     tol: 1, stableNeeded: 4, budgetMs: 800,
     transientGoneGraceMs: opts?.transientGoneGraceMs,
+    minimumDurationMs: opts?.minimumDurationMs,
   };
   return { deps, applied: () => applied, nextFrames: () => nextFrameCount };
 }
@@ -64,6 +65,22 @@ describe('reassertCenter', () => {
     // the lull's three 1000s only reach stable=2, then the 900 resets; settles only
     // after four stable 900s — re-centering every frame throughout.
     expect(applied().map((f) => f.desired)).toEqual([1000, 1000, 1000, 900, 900, 900, 900, 900]);
+  });
+
+  it('#479 — a minimum observation window catches a delayed virtualizer correction after an apparently stable landing', async () => {
+    // Virtuoso can leave the row stable for four animation frames, then apply a
+    // deferred height correction around 68ms later. Without the duration floor,
+    // stableNeeded=4 returns at 64ms and never observes/re-applies the corrected
+    // offset. The floor keeps the loop alive until the later 500px landing has
+    // itself stabilized.
+    const early = { desired: 1000 };
+    const corrected = { desired: 500 };
+    const { deps, applied } = driver(
+      [early, early, early, early, early, corrected, corrected, corrected, corrected, corrected],
+      { minimumDurationMs: 100 },
+    );
+    expect(await reassertCenter(deps)).toBe('settled');
+    expect(applied().map((frame) => frame.desired)).toContain(500);
   });
 
   it('a target-identity swap resets the stable counter and re-applies', async () => {

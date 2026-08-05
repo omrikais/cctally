@@ -61,6 +61,7 @@ describe('<CacheNetBars size="mini" /> (issue #77 P2-4)', () => {
     expect(svg.getAttribute('width')).toBe('100%');
     expect(svg.getAttribute('height')).toBe('100%');
     expect(svg.getAttribute('preserveAspectRatio')).toBe('none');
+    expect(svg.getAttribute('aria-label')).toBe('Net dollar bars, 14 days');
     // ViewBox preserves the bar-math coordinates (0..272 x, 0..28 y).
     expect(svg.getAttribute('viewBox')).toBe('0 0 272 28');
   });
@@ -166,6 +167,8 @@ describe('<CacheNetBars /> #443 S1 unobserved day', () => {
         ?.getAttribute('x');
     expect(xOf(container, '2026-05-19')).toBe(xOf(observed.container, '2026-05-19'));
     expect(xOf(container, '2026-05-07')).toBe(xOf(observed.container, '2026-05-07'));
+    expect(container.querySelector('svg')!.getAttribute('aria-label'))
+      .toBe('Per-day net dollar chart, 14 days, 13 measured');
   });
 
   it('draws no mini bar for the unobserved day but keeps its x-slot', () => {
@@ -184,6 +187,8 @@ describe('<CacheNetBars /> #443 S1 unobserved day', () => {
         ?.getAttribute('x');
     expect(xOf(container, '2026-05-19')).toBe(xOf(observed.container, '2026-05-19'));
     expect(xOf(container, '2026-05-07')).toBe(xOf(observed.container, '2026-05-07'));
+    expect(container.querySelector('svg')!.getAttribute('aria-label'))
+      .toBe('Net dollar bars, 14 days, 13 measured');
   });
 });
 
@@ -195,6 +200,8 @@ describe('<CacheNetBars size="large" /> still wraps in section chrome', () => {
     expect(container.querySelector('.crm-section')).toBeTruthy();
     expect(container.querySelector('.crm-section-head.crm-sh-net')).toBeTruthy();
     expect(container.querySelector('.crm-chart-frame.netbars')).toBeTruthy();
+    expect(container.querySelector('svg')!.getAttribute('aria-label'))
+      .toBe('Per-day net dollar chart, 14 days');
   });
 
   it('renders 14 bars with "Mon DD" / "Today" axis labels (CR-5)', () => {

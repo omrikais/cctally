@@ -1,12 +1,12 @@
 import { renderHook, act } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversationFind } from './useConversationFind';
-import type { ConversationFindResult } from '../types/conversation';
+import type { LegacyConversationFindResult } from '../types/conversation';
 
 // useConversationFind debounces 200ms (seeded '') before fetching. Drive it by
 // stubbing fetch + advancing the fake timers, mirroring FindBar.test.tsx.
-function okResponse(body: Partial<ConversationFindResult>): Response {
-  const full: ConversationFindResult = {
+function okResponse(body: Partial<LegacyConversationFindResult>): Response {
+  const full: LegacyConversationFindResult = {
     anchors: [], total: 0, anchors_truncated: false, mode: 'fts', search_depth: 'full', ...body,
   };
   return { ok: true, status: 200, json: async () => full } as Response;

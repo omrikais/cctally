@@ -2,12 +2,11 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FindBar } from './FindBar';
 import { _resetForTests, dispatch, getState } from '../store/store';
-import type { ConversationFindResult } from '../types/conversation';
 
 // Drive the find hook by mocking fetch. Each render of FindBar mounts
 // useConversationFind, which debounces (200ms) before fetching.
-function mockFind(body: Partial<ConversationFindResult>) {
-  const full: ConversationFindResult = {
+function mockFind(body: Record<string, unknown>) {
+  const full = body.schema_version === 2 ? body : {
     anchors: [], total: 0, anchors_truncated: false, mode: 'fts', search_depth: 'full', ...body,
   };
   (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, status: 200, json: async () => full } as Response);
@@ -46,6 +45,44 @@ describe('FindBar', () => {
     await typeNeedle(input, 'needle');
     // cursor starts at 0 → "1 / 2"
     expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('1 / 2');
+  });
+
+  it('labels exact Codex occurrences and auto-dispatches the full fragment target', async () => {
+    mockFind({
+      schema_version: 2, semantics: 'occurrence', status: 'ready', query_id: 'q1',
+      total: 37, selection_stale: false, mode: 'literal', kind: 'all',
+      search_depth: 'full',
+      page: {
+        start_index: 0, previous_cursor: null, next_cursor: null,
+        occurrences: [{
+          occurrence_id: 'o1.a', item_key: 'item-a', block_key: 'block-a',
+          container_block_key: 'call-a', surface: 'output', match_kinds: ['tool'],
+          disclosure: ['call-a'], fragments: [{ leaf_key: 't0', start: 2, end: 5 }],
+        }],
+      },
+    });
+    const ref = { source: 'codex' as const, key: 'v1.codex' };
+    render(<FindBar sessionId={ref} onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    await typeNeedle(input, 'needle');
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('1 / 37 matches');
+    expect(getState().conversationJump).toMatchObject({
+      conversation_ref: ref,
+      session_id: 'v1.codex',
+      uuid: 'item-a',
+      find_occurrence: {
+        occurrence_id: 'o1.a', block_key: 'block-a', surface: 'output',
+        fragments: [{ leaf_key: 't0', start: 2, end: 5 }],
+      },
+    });
+  });
+
+  it('labels legacy results as containing sections', async () => {
+    mockFind({ anchors: [{ uuid: 'u1', match_kinds: [] }], total: 5 });
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    await typeNeedle(input, 'needle');
+    expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('1 / 5 containing sections');
   });
 
   it('Enter steps to the next anchor and dispatches OPEN_CONVERSATION with the jump; expand_details reflects match_kinds', async () => {

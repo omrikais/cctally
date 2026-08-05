@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildOutlineTargets, nextTarget, outlineTurnVisible, resolveTurnIndex } from './outlineNavigation';
-import type { OutlineTurn } from '../types/conversation';
+import { buildOutlineTargets, nextTarget, nextTargetEntry, outlineTurnVisible, resolveTurnIndex } from './outlineNavigation';
+import type { OutlineLandmark, OutlineTurn } from '../types/conversation';
 
 function turn(over: Partial<OutlineTurn>): OutlineTurn {
   return {
@@ -34,7 +34,13 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 'h', kind: 'human' }),
       turn({ uuid: 'h2', kind: 'human' }),
     ]);
-    expect(t.prompt).toEqual([1, 2]);
+    // #463 S4 §6.3 — a target names the anchor it loads AND the tier-1 turn
+    // that owns it, so a tier-2 landmark can jump to a segment while the three
+    // consumers that need a whole `OutlineTurn` still resolve one.
+    expect(t.prompt).toEqual([
+      { anchorKey: 'h', ownerTurnIndex: 1 },
+      { anchorKey: 'h2', ownerTurnIndex: 2 },
+    ]);
   });
 
   it('collects is_error tool turns into `error`', () => {
@@ -42,7 +48,7 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 'a', tools: [{ name: 'Bash', is_error: false }] }),
       turn({ uuid: 'b', tools: [{ name: 'Bash', is_error: true }] }),
     ]);
-    expect(t.error).toEqual([1]);
+    expect(t.error).toEqual([{ anchorKey: 'b', ownerTurnIndex: 1 }]);
   });
 
   it('records only the FIRST turn index per distinct subagent_key in `subagent`', () => {
@@ -52,7 +58,11 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 's3', subagent_key: 'B', is_sidechain: true }),
       turn({ uuid: 'm', subagent_key: null }),
     ]);
-    expect(t.subagent).toEqual([0, 2]); // first-A at 0, first-B at 2; null ignored
+    // first-A at 0, first-B at 2; null ignored
+    expect(t.subagent).toEqual([
+      { anchorKey: 's1', ownerTurnIndex: 0 },
+      { anchorKey: 's3', ownerTurnIndex: 2 },
+    ]);
   });
 
   it('collects plan/question tool turns (ExitPlanMode / AskUserQuestion) into `plan`', () => {
@@ -61,7 +71,10 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 'b', tools: [{ name: 'ExitPlanMode', is_error: false }] }),
       turn({ uuid: 'c', tools: [{ name: 'AskUserQuestion', is_error: false }] }),
     ]);
-    expect(t.plan).toEqual([1, 2]);
+    expect(t.plan).toEqual([
+      { anchorKey: 'b', ownerTurnIndex: 1 },
+      { anchorKey: 'c', ownerTurnIndex: 2 },
+    ]);
   });
 
   it('maps every turn uuid to its skeleton index', () => {
@@ -84,7 +97,10 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 'c' }),
       turn({ uuid: 'd', cache_failure: cf }),
     ]);
-    expect(t.cache).toEqual([1, 3]);
+    expect(t.cache).toEqual([
+      { anchorKey: 'b', ownerTurnIndex: 1 },
+      { anchorKey: 'd', ownerTurnIndex: 3 },
+    ]);
   });
 
   it('cache list is empty when no turn is flagged', () => {
@@ -101,7 +117,10 @@ describe('buildOutlineTargets', () => {
       turn({ uuid: 'a', kind: 'assistant' }),
       turn({ uuid: 'cx2', kind: 'meta', meta_kind: 'compaction' }),
     ]);
-    expect(t.compaction).toEqual([1, 3]);
+    expect(t.compaction).toEqual([
+      { anchorKey: 'cx1', ownerTurnIndex: 1 },
+      { anchorKey: 'cx2', ownerTurnIndex: 3 },
+    ]);
   });
 
   it('a non-compaction meta turn does NOT collect into `compaction`', () => {
@@ -305,7 +324,11 @@ describe('buildOutlineTargets bookmark list (#217 S6 F4)', () => {
       turn({ uuid: 'c', kind: 'assistant' }),
     ];
     const t = buildOutlineTargets(turns, { c: { note: '', ts: 1 }, a: { note: '', ts: 2 } });
-    expect(t.bookmark).toEqual([0, 2]); // indices of a and c, in document order
+    // a and c, in document order
+    expect(t.bookmark).toEqual([
+      { anchorKey: 'a', ownerTurnIndex: 0 },
+      { anchorKey: 'c', ownerTurnIndex: 2 },
+    ]);
   });
   it('defaults bookmark to [] when no bookmarks param is passed', () => {
     const turns = [turn({ uuid: 'a', kind: 'human' })];
@@ -358,5 +381,93 @@ describe('resolveTurnIndex — segment key resolution (#463 S1)', () => {
     const t = buildOutlineTargets([{ uuid: 'a', kind: 'human', member_uuids: ['a'] }] as unknown as OutlineTurn[]);
     expect(t.segmentIndex.size).toBe(0);
     expect(resolveTurnIndex(t, 'nope')).toBeUndefined();
+  });
+});
+
+// #463 S4 §6.3 — the target representation. `buildOutlineTargets` returned
+// numeric indices into the array it was given, and three sites dereferenced
+// them against tier-1 `turns`: JumpCluster's `jumpToIndex` and two sites in
+// ConversationReader. Indexing a merged list would have broken all three, so a
+// target now carries the anchor it loads AND the tier-1 turn that owns it.
+describe('#463 S4 — landmark-aware jump targets', () => {
+  const landmark = (over: Partial<OutlineLandmark> & { landmark_key: string }): OutlineLandmark => ({
+    block_key: 'cbk1.b', uuid: 'seg', parent_uuid: 'a1', kind: 'tool_error',
+    label: 'exec', ts: null, ...over,
+  });
+  const turns = () => [
+    turn({ uuid: 'h1', kind: 'human' }),
+    turn({ uuid: 'a1', kind: 'assistant', tools: [{ name: 'exec', is_error: true }] }),
+    turn({ uuid: 'h2', kind: 'human' }),
+  ];
+
+  it('carries the anchor and its owning turn index', () => {
+    const t = buildOutlineTargets(turns());
+    expect(t.prompt).toEqual([
+      { anchorKey: 'h1', ownerTurnIndex: 0 },
+      { anchorKey: 'h2', ownerTurnIndex: 2 },
+    ]);
+  });
+
+  it('anchors the error family on the landmark segment, not the turn', () => {
+    // Non-vacuity: without landmarks the family still targets the turn key.
+    expect(buildOutlineTargets(turns()).error)
+      .toEqual([{ anchorKey: 'a1', ownerTurnIndex: 1 }]);
+    const t = buildOutlineTargets(turns(), undefined, [
+      landmark({ landmark_key: 'e#tool_error', uuid: 'seg-15' }),
+      landmark({ landmark_key: 'p#plan', uuid: 'seg-3', kind: 'plan', label: 'update_plan' }),
+    ]);
+    expect(t.error).toEqual([
+      { anchorKey: 'seg-15', ownerTurnIndex: 1, innerAnchorKey: 'cbk1.b' },
+    ]);
+    // `PLAN_QUESTION_TOOLS` holds only Claude's ExitPlanMode and
+    // AskUserQuestion, so without the landmark the Codex plan family is empty.
+    expect(t.plan).toEqual([
+      { anchorKey: 'seg-3', ownerTurnIndex: 1, innerAnchorKey: 'cbk1.b' },
+    ]);
+  });
+
+  it('resolves a landmark jump to its owning turn via parent_uuid', () => {
+    const t = buildOutlineTargets(turns(), undefined, [
+      landmark({ landmark_key: 'e#tool_error', uuid: 'seg-15' }),
+    ]);
+    // `segmentIndex` is built from SURVIVING turns' `segment_uuids` and is EMPTY
+    // on real Codex data — the fixture below has none — so consulting it would
+    // return undefined and the focus-mode visibility test would be skipped
+    // exactly as it is today: a production no-op. The owner comes from the
+    // landmark's own `parent_uuid`, which the server already sends.
+    expect(t.segmentIndex.size).toBe(0);
+    expect(t.error[0].ownerTurnIndex).toBe(1);
+    expect(turns()[t.error[0].ownerTurnIndex].uuid).toBe('a1');
+  });
+
+  // #463 S4 F-A — the gate measured a jump landing the right SEGMENT at the top
+  // of a 635px viewport with the failure it named 1,984-6,574px below the fold,
+  // because one segment can be 4,098px tall. The target therefore carries a
+  // second, finer key naming the element inside that item.
+  it('carries the inner anchor each landmark family addresses', () => {
+    const t = buildOutlineTargets(turns(), undefined, [
+      landmark({ landmark_key: 'cbk1.e#tool_error', block_key: 'cbk1.e', uuid: 'seg-15' }),
+      landmark({ landmark_key: 'cbk1.p#plan', block_key: 'cbk1.p', uuid: 'seg-3',
+                 kind: 'plan', label: 'update_plan' }),
+    ]);
+    expect(t.error[0].innerAnchorKey).toBe('cbk1.e');
+    expect(t.plan[0].innerAnchorKey).toBe('cbk1.p');
+  });
+
+  it('leaves a tier-1 target with no inner anchor', () => {
+    const t = buildOutlineTargets(turns());
+    expect(t.prompt[0].innerAnchorKey).toBeUndefined();
+    expect(t.error[0].innerAnchorKey).toBeUndefined();
+  });
+
+  it('steps through landmark targets with the shared cursor math', () => {
+    const t = buildOutlineTargets(turns(), undefined, [
+      landmark({ landmark_key: 'e#tool_error', uuid: 'seg-15' }),
+    ]);
+    expect(nextTargetEntry(t.error, -1, 1))
+      .toEqual({ anchorKey: 'seg-15', ownerTurnIndex: 1, innerAnchorKey: 'cbk1.b' });
+    expect(nextTargetEntry(t.error, 1, 1)).toBeNull();
+    expect(nextTargetEntry(t.error, 2, -1))
+      .toEqual({ anchorKey: 'seg-15', ownerTurnIndex: 1, innerAnchorKey: 'cbk1.b' });
   });
 });

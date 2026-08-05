@@ -51,7 +51,9 @@ def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn, committed_sig_fn=Non
     cursor, in session_files, lags the new disk size). committed_sig_fn defaults
     to stat_fn for pure unit tests with no cache. A contended/declined/failed
     ingest leaves `seen` untouched so the next cycle retries (the 5s backstop is
-    the floor)."""
+    the floor). Account-scoped callers may additionally expose
+    ``stats.targeted_visible``: the clean ingest still advances ``seen``, but a
+    false value suppresses the tail frame when only another account changed."""
     committed_sig_fn = committed_sig_fn or stat_fn
     changed = changed_paths(files, seen, stat_fn)
     if not changed:
@@ -64,4 +66,4 @@ def watch_step(files, seen, *, stat_fn=file_sig, ingest_fn, committed_sig_fn=Non
         sig = committed_sig_fn(p)
         if sig is not None:
             new_seen[p] = sig
-    return new_seen, True
+    return new_seen, bool(getattr(stats, "targeted_visible", True))

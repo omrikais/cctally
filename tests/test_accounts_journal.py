@@ -152,7 +152,7 @@ def test_registry_survives_rebuild(ns):
         now_utc=FIXED)
     jr.run_stats_ingest(mode="authoritative")
 
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     row = _accounts_rows(ns)[key]
     assert row["label"] == "Personal"
     assert row["label_source"] == "user"
@@ -348,7 +348,7 @@ def test_block_close_children_inherit_parent_account_on_legacy_rebuild(ns):
     window_key = 111
     jr.append_record(_legacy_block_close_evt(J, window_key=window_key),
                      now_utc=FIXED)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     conn = ns["open_db"]()
     try:
@@ -391,7 +391,7 @@ def test_block_close_children_keep_stamped_account_on_rebuild(ns):
     for child in evt["payload"]["_models"] + evt["payload"]["_projects"]:
         child["account_key"] = real
     jr.append_record(evt, now_utc=FIXED)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     conn = ns["open_db"]()
     try:

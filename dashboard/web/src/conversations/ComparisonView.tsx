@@ -13,7 +13,8 @@ import { ComparisonMetrics } from './ComparisonMetrics';
 import { ComparisonLegend } from './ComparisonLegend';
 import { ComparisonDiff } from './ComparisonDiff';
 import { useCopy } from './useCopy';
-import { conversationRefKey, normalizeConversationRef, type ConversationOutline, type ConversationRef, type ConversationRefInput } from '../types/conversation';
+import { runConversationEntry } from '../store/urlRouting';
+import { buildConversationJump, conversationRefKey, normalizeConversationRef, type ConversationOutline, type ConversationRef, type ConversationRefInput } from '../types/conversation';
 
 // #217 S7 F10 — the comparison view. Instantiates TWO useConversationOutline
 // hooks (the prompt spine + metrics) and manages its own local transient state:
@@ -170,10 +171,17 @@ export function ComparisonView({ a: rawA, b: rawB }: { a: ConversationRefInput; 
           // OPEN_CONVERSATION clears `compare` (reverse-clear, Task 3) so the
           // single reader replaces the comparison, landing on the jumped turn.
           const conversationRef = side === 'a' ? a : b;
-          dispatch({
+          // #463 S5 (F24d, spec §4.5) — resolve the board for the side actually
+          // being opened, NOT side A. A cross-source comparison opened from side
+          // B otherwise leaves the rail on A's source with no row marked current.
+          // Routed through runConversationEntry rather than dispatched here: the
+          // batch transiently clears the selection, and an unsuppressed dispatch
+          // makes the reflector push `#/conversations` before the target (spec
+          // §4.4). That is the same defect the hash reader already suppresses.
+          runConversationEntry(dispatch, conversationRef, {
             type: 'OPEN_CONVERSATION',
             conversationRef,
-            jump: { conversation_ref: conversationRef, session_id: conversationRef.key, uuid },
+            jump: buildConversationJump(conversationRef, uuid, true),
           });
         }}
       />

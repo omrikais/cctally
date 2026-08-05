@@ -7,7 +7,7 @@
 // anchor's viewport rect top too (a scrollTop-only settle can read "stable" while
 // Virtuoso's mounted range or the target rect is still moving — the reader's own
 // layoutStable.ts contract). All under a bounded wall-clock budget.
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Page } from '@playwright/test';
@@ -41,6 +41,14 @@ export interface Manifest {
   project_dir: string;
   cwd: string;
   page_size: number;
+  occurrence_find_file: string;
+  occurrence_find_title: string;
+  occurrence_find_needle: string;
+  occurrence_find_total: number;
+  occurrence_find_cross_leaf_query: string;
+  occurrence_find_case_query: string;
+  occurrence_find_regex_query: string;
+  occurrence_find_reasoning_query: string;
 }
 
 /** Read the fixture manifest the launcher's builder wrote into e2e/.runtime/. */
@@ -189,6 +197,36 @@ export function appendLiveTurn(manifest: Manifest): string {
   appendFileSync(path, line + '\n');
   lastUuidByPath.set(path, uuid);
   return uuid;
+}
+
+const OCCURRENCE_FIND_LIVE_FILE = resolve(
+  RUNTIME,
+  'scratch/codex-main/sessions/2026/07/20/occurrence-find.jsonl',
+);
+
+/** Append an unrelated visible row to #482's isolated Codex source. */
+export function appendOccurrenceFindTurn(): void {
+  appendFileSync(OCCURRENCE_FIND_LIVE_FILE, JSON.stringify({
+    payload: {
+      content: [{ text: 'unrelated live-tail append', type: 'output_text' }],
+      phase: 'output',
+      role: 'assistant',
+      type: 'message',
+    },
+    timestamp: '2026-08-04T08:00:14Z',
+    type: 'response_item',
+  }) + '\n');
+}
+
+/** Remove the selected visible reasoning heading by replaying the isolated source. */
+export function removeOccurrenceFindReasoning(manifest: Manifest): void {
+  const source = readFileSync(OCCURRENCE_FIND_LIVE_FILE, 'utf8');
+  const exact = manifest.occurrence_find_reasoning_query;
+  if (!source.includes(exact)) throw new Error('occurrence reasoning fixture phrase missing');
+  // Shrink the file so the delta ingester recognizes the rewrite and replays
+  // it from byte zero; growing an in-place edit is indistinguishable from an
+  // append tail to the incremental reader.
+  writeFileSync(OCCURRENCE_FIND_LIVE_FILE, source.replace(exact, 'Gone reasoning'));
 }
 
 /** A `[data-uuid="…"]` selector, CSS-escaped for the deterministic fixture ids. */

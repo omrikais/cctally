@@ -64,18 +64,35 @@ export function parseAnsi(input: string): AnsiSpan[] {
 }
 
 // React wrapper: render the tokenized spans, coloring the ones with a class.
-export function AnsiText({ text }: { text: string }) {
+export function AnsiText({ text, exactTargets = [] }: {
+  text: string;
+  exactTargets?: ExactLeafTarget[];
+}) {
+  let cursor = 0;
   return (
     <>
-      {parseAnsi(text).map((s, i) =>
-        s.cls ? (
+      {parseAnsi(text).map((s, i) => {
+        const length = Array.from(s.text).length;
+        const localTargets = exactTargets
+          .filter((target) => target.start < cursor + length && target.end > cursor)
+          .map((target) => ({
+            ...target,
+            start: Math.max(0, target.start - cursor),
+            end: Math.min(length, target.end - cursor),
+          }));
+        cursor += length;
+        const body = localTargets.length
+          ? splitToExactNodes(s.text, localTargets)
+          : s.text;
+        return s.cls ? (
           <span key={i} className={s.cls}>
-            {s.text}
+            {body}
           </span>
         ) : (
-          <span key={i}>{s.text}</span>
-        ),
-      )}
+          <span key={i}>{body}</span>
+        );
+      })}
     </>
   );
 }
+import { splitToExactNodes, type ExactLeafTarget } from './findMark';

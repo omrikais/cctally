@@ -1202,6 +1202,139 @@ def test_h4_new_opener_after_pid_scan(tmp_path):
     assert len(_quarantine_incidents(app)) == 1, _quarantine_incidents(app)
 
 
+def test_contender_after_sidecar_removal_is_excluded(tmp_path, record_property):
+    """The window #496 S2 identified: the destination's sidecars are gone and
+    the old main file is still at that path, with `os.replace` not yet run.
+
+    The assertion is EXCLUSION, mirroring test_h4_new_opener_after_pid_scan.
+    This test records what a contender actually experiences there — whether its
+    open completed and whether it was refused — together with the parent's view
+    of the destination's inode and sidecars, so a later protocol change cannot
+    quietly open the window. It does NOT reproduce damage and must not be read
+    as having tried and failed to. The contender's own view of the inode is not
+    captured; only the parent's.
+
+    test_h4_new_opener_after_pid_scan pins the same property at
+    `stats_replace_drained`, which is earlier: before the preservation copy,
+    before the checkpoint and before the sidecar removal. Nothing pinned this
+    later point, which is the one S2's file-ordering analysis names.
+    """
+    sys.path.insert(0, str(ROOT / "bin"))
+    import _lib_stats_damage as dmg
+
+    env = _storm_env(tmp_path / "data")
+    _seed_journal(env, 4)
+    app = _resolved_app_dir(env)
+    db = app / "stats.db"
+    marker = tmp_path / "paused.pid"
+
+    rebuild = subprocess.Popen(
+        [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
+        env=_storm_pause_env(env, "stats_replace_sidecars_removed", marker),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    opener = None
+    opener_rc = None
+    opener_err = ""
+    try:
+        _await_marker(marker, rebuild)
+        # State at the pause. These three alone do NOT locate it: a fixture
+        # seeded by clean CLI runs has no sidecars at `stats_replace_drained`
+        # either, and all three hold again after the post-publication removal.
+        assert db.exists(), (
+            "the old main file left the destination before the rename"
+        )
+        parked_inode = db.stat().st_ino
+        assert not _wal_path(db).exists(), (
+            "the destination still carries a -wal, so the pause is BEFORE the "
+            "sidecar removal"
+        )
+        assert not pathlib.Path(str(db) + "-shm").exists(), (
+            "the destination still carries a -shm, so the pause is BEFORE the "
+            "sidecar removal"
+        )
+        # THESE two bracket the pause to exactly the window S2 named. The
+        # incident directory is created by the preservation copy, which runs
+        # strictly after `stats_replace_drained`, so it is absent at the earlier
+        # seam the existing test covers. The publication marker is written in
+        # Phase 1 strictly before `os.replace` and removed only on success, so
+        # its absence rules out every seam from the rename onwards.
+        assert len(_quarantine_incidents(app)) == 1, (
+            "no incident preserved yet, so the pause is BEFORE the preservation "
+            f"copy: {_quarantine_incidents(app)}"
+        )
+        assert not pathlib.Path(str(db) + ".publication").exists(), (
+            "a publication marker exists, so the pause is at or AFTER the "
+            "rename rather than inside the window"
+        )
+
+        # The replacement is parked in that window. Race a contender into it.
+        opener = subprocess.Popen(
+            [sys.executable, str(CCTALLY), "report"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if opener.poll() is not None:
+                break
+            time.sleep(0.05)
+        opener_rc = opener.poll()
+        if opener_rc is not None:
+            opener_out, opener_err = opener.communicate(timeout=30)
+            assert opener_rc != 0, (
+                "a contender completed while a replacement was parked with the "
+                "destination's sidecars removed and its rename not yet run — "
+                f"the window is open to guarded openers: {opener_out}"
+            )
+            # Attribute the refusal, so an unrelated crash cannot satisfy it.
+            assert "maintenance" in opener_err.lower(), opener_err
+        # Whatever the contender did, the old generation is still the file at
+        # the destination: no rename can have happened behind the refusal.
+        assert db.stat().st_ino == parked_inode
+        # RECORDED, NOT ASSERTED. A refused contender still creates a `-wal`
+        # beside the old main file here, so the destination is not sidecar-free
+        # for the whole window even though every guarded open is declined. The
+        # spec states in section 4 that sidecar creation alone does not imply
+        # page mixing, so this is evidence for S3 rather than a property this
+        # test claims. Asserting the sidecars stay absent would assert something
+        # the design does not promise, and it fails.
+        sidecars_after_contender = {
+            path.name: (path.stat().st_size if path.exists() else None)
+            for path in (_wal_path(db), pathlib.Path(str(db) + "-shm"))
+        }
+        # `print` alone is captured and discarded on a passing run, and this
+        # test is expected to pass, so the observation would never be visible.
+        record_property("s2_contender_rc", opener_rc)
+        record_property(
+            "s2_sidecars_in_window", repr(sidecars_after_contender)
+        )
+        print(
+            f"[496-S2] contender rc={opener_rc} sidecars_in_window="
+            f"{sidecars_after_contender}"
+        )
+    finally:
+        rebuild.send_signal(signal.SIGCONT)
+        rebuild.wait(timeout=120)
+        if opener is not None and opener.poll() is None:
+            opener.communicate(timeout=120)
+
+    assert rebuild.returncode == 0
+    # Control: with the replacement finished, the SAME command succeeds. Without
+    # this, "the contender was excluded" could be satisfied by a contender that
+    # is simply broken.
+    res = _cctally(env, "report")
+    assert res.returncode == 0, res.stderr
+
+    ok, text = _integrity_ok(db)
+    assert ok, text
+    assert _no_orphan_sidecars(db)
+    assert dmg.scan_sqlite_file(db)["findings"] == []
+
+
 def test_h4_resume_of_partial_quarantine(tmp_path):
     """A half-completed strict quarantine must be COMPLETED, never recreated.
 

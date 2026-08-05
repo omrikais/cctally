@@ -1,0 +1,975 @@
+{
+  "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "title": "Exercise the synthetic tool-legibility shapes",
+  "project_label": "—",
+  "git_branch": null,
+  "started_utc": "2026-08-02T09:00:02Z",
+  "last_activity_utc": "2026-08-02T09:04:02Z",
+  "cost_usd": 0.0039,
+  "models": [
+    "gpt-synthetic-codex"
+  ],
+  "items": [
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "id": 3955054124
+      },
+      "member_uuids": [
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+      ],
+      "ts": "2026-08-02T09:00:02Z",
+      "text": "Exercise the synthetic tool-legibility shapes",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Exercise the synthetic tool-legibility shapes",
+          "block_key": "cbk1_6fd6acaeca97be59cbe94fbdc6fa6a9761fb6e0b"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+        "id": 1626515449
+      },
+      "member_uuids": [
+        "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+      ],
+      "ts": "2026-08-02T09:00:04Z",
+      "text": "Running the synthetic tool families.",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Running the synthetic tool families.",
+          "block_key": "cbk1_def77b9b71f9ed7670170de5ce2aea17ad754544"
+        },
+        {
+          "kind": "tool_call",
+          "name": "exec",
+          "input_summary": "{\"commands\":[{\"command\":\"printf ok\",\"workdir\":\"/synthetic/root-a/project-red\",\"metadata\":{\"yield_time_ms\":10000}}]}",
+          "input": {
+            "command": "printf ok",
+            "workdir": "/synthetic/root-a/project-red"
+          },
+          "preview": "printf ok",
+          "tool_use_id": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+          "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "terminal",
+            "status": "completed",
+            "commands": [
+              {
+                "command": "printf ok",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {
+                  "yield_time_ms": 10000
+                }
+              }
+            ],
+            "output": {
+              "schema_version": 1,
+              "type": "terminal_output",
+              "status": "completed",
+              "is_error": false,
+              "parts": [
+                {
+                  "type": "text",
+                  "stream": "output",
+                  "text": "ok\n"
+                }
+              ],
+              "truncated": false,
+              "exit_code": null,
+              "wall_time_seconds": 0.5
+            },
+            "truncated": false
+          },
+          "outcome": {
+            "status": "completed",
+            "exit_code": null,
+            "wall_time_seconds": 0.5
+          },
+          "result": {
+            "text": "ok\n",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "exec",
+          "input_summary": "const names = ALL_TOOLS.filter(x => /gh/.test(x.name));\n// tools.exec_command({cmd: \"this one is a comment\"})\nconst r = await tools.exec_command({cmd: \"ls -1\", workdir: \"/synthetic/root-a/project-red\"});\nconst w = await tools.write_stdin({session_id: 70001, chars: \"yes\\n\"});\nconst u = await tools.write_stdin({session_id: 70004, chars: \"maybe\\n\"});\ntext(r.output);\n",
+          "input": {
+            "raw": "const names = ALL_TOOLS.filter(x => /gh/.test(x.name));\n// tools.exec_command({cmd: \"this one is a comment\"})\nconst r = await tools.exec_command({cmd: \"ls -1\", workdir: \"/synthetic/root-a/project-red\"});\nconst w = await tools.write_stdin({session_id: 70001, chars: \"yes\\n\"});\nconst u = await tools.write_stdin({session_id: 70004, chars: \"maybe\\n\"});\ntext(r.output);\n"
+          },
+          "preview": "ls -1 +2 more",
+          "tool_use_id": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "block_key": "cbk1_7cc54a2c1518b44a4475b8ba50db3af3111ecf1f",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "program",
+            "title": null,
+            "complete": false,
+            "invocations": [
+              {
+                "kind": "command",
+                "command": "ls -1",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {}
+              },
+              {
+                "kind": "session",
+                "scope": "shell",
+                "operation": "write",
+                "ref": "1",
+                "chars": "yes\n"
+              },
+              {
+                "kind": "session",
+                "scope": "shell",
+                "operation": "write",
+                "ref": null,
+                "chars": "maybe\n"
+              }
+            ],
+            "truncated": false
+          },
+          "outcome": {
+            "status": "failed",
+            "exit_code": null,
+            "wall_time_seconds": 2
+          },
+          "result": {
+            "text": "boom\n",
+            "truncated": false,
+            "is_error": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "exec_command",
+          "input_summary": "{\"commands\":[{\"command\":\"bash -i\",\"workdir\":\"/synthetic/root-a/project-red\",\"metadata\":{\"tty\":true,\"yield_time_ms\":5000}}]}",
+          "input": {
+            "command": "bash -i",
+            "workdir": "/synthetic/root-a/project-red"
+          },
+          "preview": "bash -i",
+          "tool_use_id": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "terminal",
+            "status": "completed",
+            "commands": [
+              {
+                "command": "bash -i",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {
+                  "tty": true,
+                  "yield_time_ms": 5000
+                }
+              }
+            ],
+            "output": {
+              "schema_version": 1,
+              "type": "terminal_output",
+              "status": "running",
+              "is_error": false,
+              "parts": [
+                {
+                  "type": "text",
+                  "stream": "output",
+                  "text": "session opened\n"
+                }
+              ],
+              "truncated": false,
+              "exit_code": null,
+              "wall_time_seconds": 1.0034
+            },
+            "truncated": false
+          },
+          "outcome": {
+            "status": "running",
+            "exit_code": null,
+            "wall_time_seconds": 1.0034
+          },
+          "result": {
+            "text": "session opened\n",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "write_stdin",
+          "input_summary": "{\"chars\":\"yes\\n\",\"session_id\":70001}",
+          "input": {
+            "chars": "yes\n",
+            "session_id": 70001
+          },
+          "preview": "session 1 · yes",
+          "tool_use_id": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "block_key": "cbk1_9f887df81942840b6ce7b48b1de64f224459a851",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "session_ref",
+            "scope": "shell",
+            "operation": "write",
+            "ref": "1",
+            "chars": "yes\n",
+            "truncated": false
+          },
+          "outcome": {
+            "status": "completed",
+            "exit_code": 0,
+            "wall_time_seconds": 0.5
+          },
+          "result": {
+            "text": "ok\n",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "write_stdin",
+          "input_summary": "{\"chars\":\"no\\n\",\"session_id\":70002}",
+          "input": {
+            "chars": "no\n",
+            "session_id": 70002
+          },
+          "preview": "session 2 · no",
+          "tool_use_id": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "block_key": "cbk1_f8d20c3dec03b65e87ec90ee7ac84977c4e66534",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "session_ref",
+            "scope": "shell",
+            "operation": "write",
+            "ref": "2",
+            "chars": "no\n",
+            "truncated": false
+          },
+          "outcome": {
+            "status": "failed",
+            "exit_code": 3,
+            "wall_time_seconds": 0.5
+          },
+          "result": {
+            "text": "refused\n",
+            "truncated": false,
+            "is_error": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "write_stdin",
+          "input_summary": "{\"chars\":\"start\\n\",\"session_id\":70003}",
+          "input": {
+            "chars": "start\n",
+            "session_id": 70003
+          },
+          "preview": "session 3 · start",
+          "tool_use_id": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+          "block_key": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "session_ref",
+            "scope": "shell",
+            "operation": "write",
+            "ref": "3",
+            "chars": "start\n",
+            "truncated": false
+          },
+          "outcome": {
+            "status": "running",
+            "exit_code": null,
+            "wall_time_seconds": 0.2
+          },
+          "result": {
+            "text": "started\n",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "wait",
+          "input_summary": "{\"cell_id\":\"12\"}",
+          "input": {
+            "cell_id": "12"
+          },
+          "preview": "cell 12",
+          "tool_use_id": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001",
+          "block_key": "cbk1_168ffcecfa0ea4ff93b09453f6aa211f8c656001",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "session_ref",
+            "scope": "cell",
+            "operation": "poll",
+            "ref": "12",
+            "chars": null,
+            "truncated": false
+          },
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
+          "result": {
+            "text": "still waiting\n",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "js",
+          "input_summary": "{\"code\":\"const r = await tools.exec_command({cmd: \\\"ls -1 /synthetic\\\"});\\ntext(r.output);\\n\",\"title\":\"list the synthetic tree\"}",
+          "input": {
+            "code": "const r = await tools.exec_command({cmd: \"ls -1 /synthetic\"});\ntext(r.output);\n",
+            "title": "list the synthetic tree"
+          },
+          "preview": "list the synthetic tree",
+          "tool_use_id": "cbk1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+          "block_key": "cbk1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "program",
+            "title": "list the synthetic tree",
+            "complete": true,
+            "invocations": [
+              {
+                "kind": "command",
+                "command": "ls -1 /synthetic",
+                "workdir": null,
+                "metadata": {}
+              }
+            ],
+            "truncated": false
+          },
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": 0.73
+          },
+          "result": {
+            "text": "{}",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "tool_search_call",
+          "input_summary": "{\"limit\":5,\"query\":\"synthetic\"}",
+          "input": {
+            "limit": 5,
+            "query": "synthetic"
+          },
+          "preview": "synthetic",
+          "tool_use_id": "cbk1_fb0a485bf58794391b5e1f6e9116f54664843aec",
+          "block_key": "cbk1_fb0a485bf58794391b5e1f6e9116f54664843aec",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "tool_search",
+            "query": "synthetic",
+            "limit": 5
+          },
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
+          "result": {
+            "text": "[]",
+            "truncated": false,
+            "is_error": false
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "fixture_get_issue",
+          "input_summary": "{\"number\":999}",
+          "input": {
+            "number": 999
+          },
+          "preview": "get_issue · fixture",
+          "tool_use_id": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e",
+          "block_key": "cbk1_aeca72557d48349c1ffb7fef62c3a9d4896a514e",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "mcp",
+            "source": "function_call",
+            "name": "fixture_get_issue",
+            "call_status": "completed",
+            "completion": {
+              "status": "error",
+              "server": "fixture",
+              "tool": "get_issue",
+              "arguments": {
+                "number": 999
+              },
+              "result": {
+                "Ok": {
+                  "content": [
+                    {
+                      "text": "synthetic failure",
+                      "type": "text"
+                    }
+                  ],
+                  "isError": true
+                }
+              },
+              "duration": {
+                "secs": 0,
+                "nanos": 250000000
+              },
+              "event_block_key": "cbk1_e0eefd23adb5226d2b8868fa8e18996b1d2561ce"
+            }
+          },
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
+          "result": {
+            "text": "{\n  \"Ok\": {\n    \"content\": [\n      {\n        \"text\": \"synthetic failure\",\n        \"type\": \"text\"\n      }\n    ],\n    \"isError\": true\n  }\n}",
+            "truncated": false,
+            "is_error": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "name": "apply_patch",
+          "input_summary": "*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch",
+          "input": {
+            "raw": "*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch"
+          },
+          "preview": "synthetic-legible.txt",
+          "tool_use_id": "cbk1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+          "block_key": "cbk1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "apply_patch",
+            "status": "completed",
+            "files": [
+              {
+                "path": "synthetic-legible.txt",
+                "status": "modified",
+                "unified_diff": "--- synthetic-legible.txt\n+++ synthetic-legible.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+                "truncated": false,
+                "diff_source": "derived"
+              }
+            ],
+            "patch": "*** Begin Patch\n*** Update File: synthetic-legible.txt\n@@\n-old\n+new\n*** End Patch",
+            "success": null,
+            "stdout": null,
+            "stderr": null,
+            "has_diff": true,
+            "truncated": false
+          },
+          "outcome": {
+            "status": "completed",
+            "exit_code": 0,
+            "wall_time_seconds": 0.1
+          },
+          "result": {
+            "text": "Success\n",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_f335a8740d1142ec42d960880521be2f9614cc14",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": 0.0039,
+      "tokens": {
+        "source": "codex",
+        "input": 900,
+        "output": 300,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "cached_input": 200,
+        "reasoning_output": 80
+      }
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+        "id": 546937662
+      },
+      "member_uuids": [
+        "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983"
+      ],
+      "ts": "2026-08-02T09:01:01Z",
+      "text": "Apply the synthetic dict-shaped patch",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Apply the synthetic dict-shaped patch",
+          "block_key": "cbk1_74e44903f7f49447d5a46a698613ae0bd31f486e"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+        "id": 3304959656
+      },
+      "member_uuids": [
+        "civ1_a95002d577138d681f720af29a266fdc3fda0c91"
+      ],
+      "ts": "2026-08-02T09:01:02Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "patch_apply_end",
+          "input_summary": "patch_apply /synthetic/root-a/project-red/a-generated-clipped.py /synthetic/root-a/project-red/added.py /synthetic/root-a/project-red/empty.py /synthetic/root-a/project-red/removed.py /synthetic/root-a/project-red/updated.py",
+          "input": null,
+          "preview": "/synthetic/root-a/project-red/a-generated-clipped.py, /synthetic/root-a/project-red/added.py, /synthetic/root-a/project-red/empty.py, /synthetic/root-a/project-red/removed.py, /synthetic/root-a/project-red/updated.py",
+          "tool_use_id": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29",
+          "block_key": "cbk1_3f22dc5729900a1f6fda4c97eddc1990fe39cf29",
+          "payload_capable": true,
+          "payload_kind": "event",
+          "native_card": {
+            "schema_version": 1,
+            "type": "patch",
+            "source": "patch_apply_end",
+            "status": "completed",
+            "files": [
+              {
+                "path": "/synthetic/root-a/project-red/a-generated-clipped.py",
+                "status": "add",
+                "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/a-generated-clipped.py\n@@ -0,0 +1,55 @@\n+value_000 = 'synthetic filler row 000 for the per-file clip fixture'\n+value_001 = 'synthetic filler row 001 for the per-file clip fixture'\n+value_002 = 'synthetic filler row 002 for the per-file clip fixture'\n+value_003 = 'synthetic filler row 003 for the per-file clip fixture'\n+value_004 = 'synthetic filler row 004 for the per-file clip fixture'\n+value_005 = 'synthetic filler row 005 for the per-file clip fixture'\n+value_006 = 'synthetic filler row 006 for the per-file clip fixture'\n+value_007 = 'synthetic filler row 007 for the per-file clip fixture'\n+value_008 = 'synthetic filler row 008 for the per-file clip fixture'\n+value_009 = 'synthetic filler row 009 for the per-file clip fixture'\n+value_010 = 'synthetic filler row 010 for the per-file clip fixture'\n+value_011 = 'synthetic filler row 011 for the per-file clip fixture'\n+value_012 = 'synthetic filler row 012 for the per-file clip fixture'\n+value_013 = 'synthetic filler row 013 for the per-file clip fixture'\n+value_014 = 'synthetic filler row 014 for the per-file clip fixture'\n+value_015 = 'synthetic filler row 015 for the per-file clip fixture'\n+value_016 = 'synthetic filler row 016 for the per-file clip fixture'\n+value_017 = 'synthetic filler row 017 for the per-file clip fixture'\n+value_018 = 'synthetic filler row 018 for the per-file clip fixture'\n+value_019 = 'synthetic filler row 019 for the per-file clip fixture'\n+value_020 = 'synthetic filler row 020 for the per-file clip fixture'\n+value_021 = 'synthetic filler row 021 for the per-file clip fixture'\n+value_022 = 'synthetic filler row 022 for the per-file clip fixture'\n+value_023 = 'synthetic filler row 023 for the per-file clip fixture'\n+value_024 = 'synthetic filler row 024 for the per-file clip fixture'\n+value_025 = 'synthetic filler row 025 for the per-file clip fixture'\n+value_026 = 'synthetic filler row 026 for the per-file clip fixture'\n+value_027 = 'synthetic filler row 027 for the per-file clip fixture'\n+value_028 = 'synthetic filler row 028 for the per-file clip fixture'\n+value_029 = 'synthetic filler row 029 for the per-file clip fixture'\n+value_030 = 'synthetic filler row 030 for the per-file clip fixture'\n+value_031 = 'synthetic filler row 031 for the per-file clip fixture'\n+value_032 = 'synthetic filler row 032 for the per-file clip fixture'\n+value_033 = 'synthetic filler row 033 for the per-file clip fixture'\n+value_034 = 'synthetic filler row 034 for the per-file clip fixture'\n+value_035 = 'synthetic filler row 035 for the per-file clip fixture'\n+value_036 = 'synthetic filler row 036 for the per-file clip fixture'\n+value_037 = 'synthetic filler row 037 for the per-file clip fixture'\n+value_038 = 'synthetic filler row 038 for the per-file clip fixture'\n+value_039 = 'synthetic filler row 039 for the per-file clip fixture'\n+value_040 = 'synthetic filler row 040 for the per-file clip fixture'\n+value_041 = 'synthetic filler row 041 for the per-file clip fixture'\n+value_042 = 'synthetic filler row 042 for the per-file clip fixture'\n",
+                "truncated": true,
+                "diff_source": "derived"
+              },
+              {
+                "path": "/synthetic/root-a/project-red/added.py",
+                "status": "add",
+                "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/added.py\n@@ -0,0 +1,2 @@\n+one\n+two\n",
+                "truncated": false,
+                "diff_source": "derived"
+              },
+              {
+                "path": "/synthetic/root-a/project-red/empty.py",
+                "status": "add",
+                "unified_diff": "--- /dev/null\n+++ /synthetic/root-a/project-red/empty.py\n@@ -0,0 +0,0 @@\n",
+                "truncated": false,
+                "diff_source": "derived"
+              },
+              {
+                "path": "/synthetic/root-a/project-red/removed.py",
+                "status": "delete",
+                "unified_diff": "--- /synthetic/root-a/project-red/removed.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n",
+                "truncated": false,
+                "diff_source": "derived"
+              },
+              {
+                "path": "/synthetic/root-a/project-red/updated.py",
+                "status": "update",
+                "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                "truncated": false,
+                "diff_source": "retained"
+              }
+            ],
+            "success": true,
+            "stdout": "patch ok\n",
+            "stderr": "",
+            "has_diff": true,
+            "truncated": true
+          },
+          "result": {
+            "text": "patch ok\n",
+            "truncated": true,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+        "id": 4218830614
+      },
+      "member_uuids": [
+        "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e"
+      ],
+      "ts": "2026-08-02T09:02:01Z",
+      "text": "Delegate the synthetic search",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Delegate the synthetic search",
+          "block_key": "cbk1_164fbd4071b1d7940671365b38147480a6ba47c0"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d",
+        "id": 1176386869
+      },
+      "member_uuids": [
+        "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d"
+      ],
+      "ts": "2026-08-02T09:02:02Z",
+      "text": "Delegating to the search tool.\n\n[external_agent_tool_call: ToolSearch]\ninput: {\"query\": \"select:SyntheticAlpha,SyntheticBeta\"}\n\nHere is how that marker is written:\n\n```\n[external_agent_tool_call: NotACall]\ninput: {\"query\": \"authored\"}\n```\n",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Delegating to the search tool.",
+          "block_key": "cbk1_e3aedf86278c94bcc915af437ee683b8d57d1438"
+        },
+        {
+          "kind": "external_call",
+          "name": "ToolSearch",
+          "input": {
+            "query": "select:SyntheticAlpha,SyntheticBeta"
+          },
+          "truncated": false,
+          "block_key": "cbk1_e3aedf86278c94bcc915af437ee683b8d57d1438"
+        },
+        {
+          "kind": "text",
+          "text": "Here is how that marker is written:\n\n```\n[external_agent_tool_call: NotACall]\ninput: {\"query\": \"authored\"}\n```\n",
+          "block_key": "cbk1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_3d19ea7038f58fd4d1ee8bdefa88ee510107999d",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da",
+        "id": 1374856726
+      },
+      "member_uuids": [
+        "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da"
+      ],
+      "ts": "2026-08-02T09:03:01Z",
+      "text": "Record the synthetic plan",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Record the synthetic plan",
+          "block_key": "cbk1_743bc02e8c6710f2b8d5ee4839f30e322e5d9711"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_5828d46684c5d6412acc7e3f30af2e8f7333e6da",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+        "id": 3601302069
+      },
+      "member_uuids": [
+        "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa"
+      ],
+      "ts": "2026-08-02T09:03:02Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "update_plan",
+          "input_summary": "{\"explanation\":\"Recording the synthetic plan\",\"plan\":[{\"status\":\"completed\",\"step\":\"Decode the synthetic tool families\"},{\"status\":\"in_progress\",\"step\":\"Apply the synthetic patch\"}]}",
+          "input": {
+            "explanation": "Recording the synthetic plan",
+            "plan": [
+              {
+                "status": "completed",
+                "step": "Decode the synthetic tool families"
+              },
+              {
+                "status": "in_progress",
+                "step": "Apply the synthetic patch"
+              }
+            ]
+          },
+          "preview": "Recording the synthetic plan",
+          "tool_use_id": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70",
+          "block_key": "cbk1_e0a68ebe0e4a13606f81c839f362fb202cf63f70",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "plan",
+            "source": "update_plan",
+            "call_status": "completed",
+            "explanation": "Recording the synthetic plan",
+            "items": [
+              {
+                "step": "Decode the synthetic tool families",
+                "status": "completed"
+              },
+              {
+                "step": "Apply the synthetic patch",
+                "status": "in_progress"
+              }
+            ],
+            "result": {
+              "status": "returned",
+              "value": "Plan updated",
+              "truncated": false
+            }
+          },
+          "outcome": {
+            "status": "unknown",
+            "exit_code": null,
+            "wall_time_seconds": null
+          },
+          "result": {
+            "text": "Plan updated",
+            "truncated": false,
+            "is_error": false
+          }
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_6817a13bb2c9ecf1d20ef83bd68467c2379218aa",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7",
+        "id": 3896205412
+      },
+      "member_uuids": [
+        "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7"
+      ],
+      "ts": "2026-08-02T09:04:01Z",
+      "text": "Run the synthetic command twice under one id",
+      "blocks": [
+        {
+          "kind": "text",
+          "text": "Run the synthetic command twice under one id",
+          "block_key": "cbk1_63f70b2dc603eb0d6b243220298bb3cfbff5b2cc"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_52b4d027799df25ca7a0e61e6d15b2221e0c54a7",
+      "segment_ordinal": 0,
+      "kind": "human"
+    },
+    {
+      "anchor": {
+        "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+        "uuid": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+        "id": 440566535
+      },
+      "member_uuids": [
+        "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1"
+      ],
+      "ts": "2026-08-02T09:04:02Z",
+      "text": "",
+      "blocks": [
+        {
+          "kind": "tool_call",
+          "name": "exec",
+          "input_summary": "{\"commands\":[{\"command\":\"printf first\",\"workdir\":\"/synthetic/root-a/project-red\",\"metadata\":{\"yield_time_ms\":10000}}]}",
+          "input": {
+            "command": "printf first",
+            "workdir": "/synthetic/root-a/project-red"
+          },
+          "preview": "printf first",
+          "tool_use_id": "cbk1_b5ffdfd26c634e1a9777d4c1b1f71f64be8ebad2",
+          "block_key": "cbk1_b5ffdfd26c634e1a9777d4c1b1f71f64be8ebad2",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "terminal",
+            "status": "completed",
+            "commands": [
+              {
+                "command": "printf first",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {
+                  "yield_time_ms": 10000
+                }
+              }
+            ],
+            "truncated": false
+          },
+          "result": null
+        },
+        {
+          "kind": "tool_call",
+          "name": "exec",
+          "input_summary": "{\"commands\":[{\"command\":\"printf second\",\"workdir\":\"/synthetic/root-a/project-red\",\"metadata\":{\"yield_time_ms\":10000}}]}",
+          "input": {
+            "command": "printf second",
+            "workdir": "/synthetic/root-a/project-red"
+          },
+          "preview": "printf second",
+          "tool_use_id": "cbk1_68cae44e514148dca3824072d3b60557eda366a6",
+          "block_key": "cbk1_68cae44e514148dca3824072d3b60557eda366a6",
+          "payload_capable": true,
+          "payload_kind": "call",
+          "native_card": {
+            "schema_version": 1,
+            "type": "terminal",
+            "status": "completed",
+            "commands": [
+              {
+                "command": "printf second",
+                "workdir": "/synthetic/root-a/project-red",
+                "metadata": {
+                  "yield_time_ms": 10000
+                }
+              }
+            ],
+            "truncated": false
+          },
+          "result": null
+        },
+        {
+          "kind": "tool_result",
+          "text": "which call was this\n",
+          "truncated": false,
+          "is_error": true,
+          "tool_use_id": "s3-ambiguous",
+          "block_key": "cbk1_d86da189d8427c7e457808cdc573aeb805a0bade"
+        }
+      ],
+      "is_sidechain": false,
+      "subagent_key": null,
+      "parent_uuid": null,
+      "turn_uuid": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+      "segment_ordinal": 0,
+      "kind": "assistant",
+      "model": "gpt-synthetic-codex",
+      "cost_usd": null
+    }
+  ],
+  "page": {
+    "next_after": null,
+    "has_more": false,
+    "prev_before": null,
+    "has_prev": false
+  },
+  "last_anchor": {
+    "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "uuid": "civ1_bf773a9264689ab95b9ba7e28014b4ac047481c1",
+    "id": 440566535
+  },
+  "session_index": {
+    "sessions": {
+      "1": {
+        "ordinal": 1,
+        "opener_block_key": "cbk1_83b40c8c04f094322045efae67286f28d13d3796"
+      },
+      "2": {
+        "ordinal": 2,
+        "opener_block_key": null
+      },
+      "3": {
+        "ordinal": 3,
+        "opener_block_key": "cbk1_89d5064059545b8fda26c86c107f30faaed413a8"
+      }
+    },
+    "truncated": false
+  },
+  "provider_meta": {
+    "source": "codex",
+    "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "tokens": {
+      "source": "codex",
+      "input": 900,
+      "output": 300,
+      "cache_creation": 0,
+      "cache_read": 0,
+      "cached_input": 200,
+      "reasoning_output": 80
+    },
+    "unattributed_cost_usd": 0,
+    "parent": null,
+    "children": []
+  }
+}

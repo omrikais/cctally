@@ -58,6 +58,26 @@ describe('useConversationSearch', () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversation/search?q=flock');
   });
 
+  it('clears prior-account hits while the next account request is pending', async () => {
+    mockFetchOnce(result1);
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock.mockImplementationOnce(() => new Promise(() => {}));
+    const { result, rerender } = renderHook(
+      ({ accountKey }) => useConversationSearch(
+        'flock', 'all', 'claude', { accountKey },
+      ),
+      { initialProps: { accountKey: 'account-a' } },
+    );
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.hits[0].snippet).toContain('flock');
+
+    rerender({ accountKey: 'account-b' });
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.hits).toEqual([]);
+    expect(fetchMock.mock.calls[1][0]).toContain('account=account-b');
+  });
+
   it('a newer needle wins over an older in-flight response (abort path)', async () => {
     // The first needle's debounce fires and its fetch is in flight when the
     // needle changes; the effect cleanup aborts it (AbortError, swallowed),

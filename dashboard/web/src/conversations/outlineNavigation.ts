@@ -1,5 +1,6 @@
 import type { FocusMode } from './applyFocusMode';
-import type { OutlineTurn } from '../types/conversation';
+import type { OutlineLandmark, OutlineTurn } from '../types/conversation';
+import { landmarkAnchorKey, mergeLandmarks } from './mergeLandmarks';
 
 // #177 S5 §5 — outline-skeleton visibility predicate. The reader's `nodeVisible`
 // (applyFocusMode.ts) decides whether a turn survives a focus mode, but it
@@ -79,17 +80,37 @@ export const PLAN_QUESTION_TOOLS = new Set(['ExitPlanMode', 'AskUserQuestion']);
 //               filters the chip; the reader's `c` key no-ops) so the navigation
 //               and the gating stay self-consistent with deriveOutline.
 //   - indexByUuid: every turn's uuid → its skeleton index, for cursor resolution.
+// #463 S4 §6.3 — one jump target. It used to be a bare numeric index into the
+// array `buildOutlineTargets` was given, and THREE sites dereferenced that
+// against tier-1 `turns`: `JumpCluster`'s `jumpToIndex` and two sites in
+// `ConversationReader`. A tier-2 landmark's jump has to load a SEGMENT while
+// those three still resolve the owning turn, so the target carries both.
+//
+// `ownerTurnIndex` indexes the tier-1 `turns` array this was built from, never
+// a merged list — which is what lets the two arrays have different lengths
+// without any consumer having to know.
+export interface OutlineTarget {
+  anchorKey: string;
+  ownerTurnIndex: number;
+  // #463 S4 F-A — the finer address INSIDE the loaded item. The browser gate
+  // measured a jump putting the right segment at the top of a 635px viewport
+  // with the failure it named up to 6,574px below the fold, because one Codex
+  // segment can be 4,098px tall and hold several failing calls. ABSENT on every
+  // tier-1 target, so the pre-S4 landing is unchanged.
+  innerAnchorKey?: string;
+}
+
 export interface OutlineTargets {
-  error: number[];
-  prompt: number[];
-  subagent: number[];
-  plan: number[];
-  cache: number[];
+  error: OutlineTarget[];
+  prompt: OutlineTarget[];
+  subagent: OutlineTarget[];
+  plan: OutlineTarget[];
+  cache: OutlineTarget[];
   // #217 S3 F8 — turns the parser stamped meta_kind 'compaction' (#191).
-  compaction: number[];
-  // #217 S6 F4 — the bookmarked turn indices in document order. Built from the
-  // client `bookmarks` param (not the skeleton), so it is [] when none are passed.
-  bookmark: number[];
+  compaction: OutlineTarget[];
+  // #217 S6 F4 — the bookmarked turns in document order. Built from the client
+  // `bookmarks` param (not the skeleton), so it is [] when none are passed.
+  bookmark: OutlineTarget[];
   // Every turn's OWN uuid → its skeleton index (cursor resolution).
   indexByUuid: Map<string, number>;
   // #217 S3 E2 (Codex P1) — every MEMBER (folded-fragment) uuid → its owning
@@ -115,18 +136,27 @@ export function buildOutlineTargets(
   // the KEYS matter here; a turn whose own uuid is a bookmark key pushes its
   // index onto the `bookmark` list. Absent → no bookmark targets.
   bookmarks?: Record<string, unknown>,
+  // #463 S4 §3.2 — the tier-2 landmarks. When present, the error and plan
+  // families come from them, so a jump lands on the failing call's segment
+  // rather than on the top of a turn that may hold 142 calls. `deriveOutline`
+  // gates on the same presence, so the rendered rail and the jump stops can
+  // never disagree about which granularity is in force.
+  landmarks?: readonly OutlineLandmark[],
 ): OutlineTargets {
-  const error: number[] = [];
-  const prompt: number[] = [];
-  const subagent: number[] = [];
-  const plan: number[] = [];
-  const cache: number[] = [];
-  const compaction: number[] = [];
-  const bookmark: number[] = [];
+  const error: OutlineTarget[] = [];
+  const prompt: OutlineTarget[] = [];
+  const subagent: OutlineTarget[] = [];
+  const plan: OutlineTarget[] = [];
+  const cache: OutlineTarget[] = [];
+  const compaction: OutlineTarget[] = [];
+  const bookmark: OutlineTarget[] = [];
   const indexByUuid = new Map<string, number>();
   const memberIndex = new Map<string, number>();
   const segmentIndex = new Map<string, number>();
   const seenSub = new Set<string>();
+  // Gated on landmark PRESENCE rather than on a source string, matching
+  // `deriveOutline`: a Claude outline receives none and keeps today's behaviour.
+  const landmarkAware = !!landmarks?.length;
   turns.forEach((t, i) => {
     indexByUuid.set(t.uuid, i);
     // Map each member fragment uuid (falling back to the turn's own uuid for a
@@ -138,23 +168,71 @@ export function buildOutlineTargets(
     for (const u of (t.segment_uuids ?? [])) {
       if (!segmentIndex.has(u)) segmentIndex.set(u, i);
     }
-    if (t.tools?.some((x) => x.is_error)) error.push(i);
-    if (t.kind === 'human') prompt.push(i);
+    const own = { anchorKey: t.uuid, ownerTurnIndex: i };
+    if (!landmarkAware && t.tools?.some((x) => x.is_error)) error.push(own);
+    if (t.kind === 'human') prompt.push(own);
     if (t.subagent_key != null && !seenSub.has(t.subagent_key)) {
       seenSub.add(t.subagent_key);
-      subagent.push(i); // FIRST turn index per distinct subagent_key
+      subagent.push(own); // FIRST turn index per distinct subagent_key
     }
-    if (t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) plan.push(i);
-    if (t.cache_failure) cache.push(i);
+    if (!landmarkAware
+        && t.tools?.some((x) => x.name != null && PLAN_QUESTION_TOOLS.has(x.name))) {
+      plan.push(own);
+    }
+    if (t.cache_failure) cache.push(own);
     // #217 S3 F8 — compaction-summary turns (parser stamp, #191).
-    if (t.kind === 'meta' && t.meta_kind === 'compaction') compaction.push(i);
+    if (t.kind === 'meta' && t.meta_kind === 'compaction') compaction.push(own);
     // #217 S6 F4 — a turn whose own uuid is a bookmark key (client-only).
-    if (bookmarks && t.uuid in bookmarks) bookmark.push(i);
+    if (bookmarks && t.uuid in bookmarks) bookmark.push(own);
   });
+  // Landmark families, in owning-turn order so the stepping math below still
+  // sees an ascending list. The owner comes from the landmark's own
+  // `parent_uuid` rather than from `segmentIndex`, because `parent_uuid` is
+  // authoritative: the server states it, while `segmentIndex` depends on the
+  // owning turn having survived the adapter's navigation filter.
+  for (const { landmark, ownerTurnIndex } of mergeLandmarks(turns, landmarks)) {
+    const target = {
+      anchorKey: landmark.uuid, ownerTurnIndex,
+      innerAnchorKey: landmarkAnchorKey(landmark),
+    };
+    if (landmark.kind === 'tool_error') error.push(target);
+    else if (landmark.kind === 'plan') plan.push(target);
+  }
   return {
     error, prompt, subagent, plan, cache, compaction, bookmark,
     indexByUuid, memberIndex, segmentIndex,
   };
+}
+
+// #184's cursor math, over the S4 target shape. It delegates to `nextTarget` so
+// the two cannot drift, then names the target that index belongs to.
+//
+// RESIDUAL, stated rather than hidden: stepping is TURN-granular, because the
+// cursor is a turn index and several landmarks of one turn share theirs. A
+// forward step lands on the first landmark of the next owning turn and a
+// backward step on the last landmark of the previous one, so a turn holding
+// three failures is one stop rather than three. Every one of the three is still
+// a rail row and still reachable by clicking it, and the chip's primary click
+// lands on the last target directly.
+export function nextTargetEntry(
+  targets: readonly OutlineTarget[], cursor: number, dir: 1 | -1,
+): OutlineTarget | null {
+  const index = nextTarget(targets.map((target) => target.ownerTurnIndex), cursor, dir);
+  if (index == null) return null;
+  const matches = targets.filter((target) => target.ownerTurnIndex === index);
+  return (dir === 1 ? matches[0] : matches[matches.length - 1]) ?? null;
+}
+
+// #463 S4 F-B — how many TURNS a family's targets sit in. Under landmark
+// awareness a family holds one target per failing call, while the chip's
+// wording ("error turns"), the stats card's reconciliation phrase ("14 errors
+// in 13 turns") and the stepping this module offers are all turn-granular. The
+// browser gate saw a chip reading `error turns 17` on a conversation whose
+// headline read "2 turns", because the two numbers had become equal by
+// construction. For a Claude family — one target per turn — this returns the
+// array length, so nothing on that side moves.
+export function distinctOwnerTurns(targets: readonly OutlineTarget[]): number {
+  return new Set(targets.map((target) => target.ownerTurnIndex)).size;
 }
 
 // #217 S3 E2 (Codex P1) — resolve a (possibly folded-fragment) uuid to its
@@ -174,6 +252,28 @@ export function resolveTurnIndex(targets: OutlineTargets, uuid: string): number 
   // `loadToTarget` needs to choose a paging direction; the drain then stops
   // once the segment's own key appears in a loaded item's `member_uuids`.
   return targets.segmentIndex.get(uuid);
+}
+
+// #463 S4 remediation — the cursor a step counts from, for EVERY entry point.
+//
+// The browser gate found forward stepping re-landing on the first target
+// forever and backward stepping finding nothing at all. Both entry points that
+// step — the outline's jump chip and the reader's e/E,u/U,b/B,p/P keys — read
+// `indexByUuid` directly, and that map holds a turn's OWN uuid only. A landmark
+// jump pins the SEGMENT it landed on, so the lookup missed, the cursor stayed
+// at -1, and `nextTarget` answered "the first target" forward and "none"
+// backward on every press. The prompt family kept stepping correctly through
+// all of it, because its anchors are turn uuids, which is why every unit gate
+// stayed green.
+//
+// `resolveTurnIndex` already consults own uuids, then member uuids, then
+// segment keys. This wraps it in the "no cursor at all" convention `nextTarget`
+// documents, so no caller has to re-derive either half.
+export function cursorIndex(
+  targets: OutlineTargets, uuid: string | null | undefined,
+): number {
+  if (uuid == null) return -1;
+  return resolveTurnIndex(targets, uuid) ?? -1;
 }
 
 // #177 S5 §4 — jump-to-next cursor math, shared by the reader's e/u/b/p keys and

@@ -23,9 +23,10 @@ in ``quota_window_snapshots`` moving at all:
    and becomes eligible when wall time passes it with no mutation to observe.
    Persisting that boundary and treating ``now >= boundary`` as dirty is what
    closes it. Unlike axes 2 and 3 this one fires on WALL CLOCK rather than on a
-   configuration change, which is why the hook path defers it
-   (``defer_scheduled``) instead of paying an unannounced whole-history pass on
-   a blocking tick.
+   configuration change. An ownership schedule lets the hook evaluate only the
+   complete roots whose deadlines matured; scalar-only legacy state still
+   defers rather than paying an unannounced whole-history pass on a blocking
+   tick.
 5. **Durable lifecycle state** — the existing arming rows and terminal events,
    unchanged. Represented here only as the fingerprints axis 2 compares.
 
@@ -80,6 +81,7 @@ def alert_dirty_scope(
     gate_after: bool,
     now: dt.datetime,
     next_evaluation_at: "dt.datetime | None",
+    scheduled_roots: "Iterable[str] | None" = None,
     defer_scheduled: bool = False,
 ) -> AlertDirtyScope:
     """Resolve the five axes into one decision.
@@ -89,14 +91,11 @@ def alert_dirty_scope(
     observed_slot, window_minutes)``; the ROOT is element 1, which is what an
     exact-rule change is scoped to.
 
-    ``defer_scheduled`` is the hook path's (``full_pass="defer"``). Axes 2 and 3
-    are driven by a configuration change the user just made, so widening for
-    them is bounded and expected; axis 4 is driven by WALL CLOCK, which makes it
-    the one route into a whole-history pass that can land on a blocking hook
-    tick with nothing to have predicted it. Under this flag it is recorded as
-    ``REASON_SCHEDULED_DEFERRED`` and does NOT strengthen the scope — and the
-    caller owes the stored boundary a carry-through, because a deferral that
-    lets the boundary be recomputed is a silent drop.
+    ``scheduled_roots`` is the validated ownership retained with axis 4. When
+    present, a matured instant scopes to those roots even on the hook path.
+    ``None`` is the legacy/unavailable-ownership shape; only that shape needs
+    ``defer_scheduled`` to avoid an unannounced whole-history hook pass, and the
+    caller then owes the scalar boundary a carry-through.
     """
     reasons: list[str] = []
     if not gate_after:
@@ -132,11 +131,19 @@ def alert_dirty_scope(
         reasons.append("rule_changed")
 
     if next_evaluation_at is not None and now >= next_evaluation_at:
-        # A future-clocked observation just became eligible. Which identity it
-        # belongs to is not recorded — only the instant — so the honest scope is
-        # everything, and on the hook path "everything" is precisely what may
-        # not run.
-        if defer_scheduled:
+        # Epoch 1007 records the roots owning each scheduled instant. A complete
+        # semantic pass over those roots is bounded enough for the hook path and
+        # is all axis 4 needs. ``None`` means legacy/unavailable ownership, where
+        # the only honest scope remains everything (and therefore deferral on a
+        # hook tick). An empty known set means the owning roots are not lifecycle
+        # eligible on this tick; the stored axis remains due for a later tick.
+        if scheduled_roots is not None:
+            due_roots = {str(root) for root in scheduled_roots if str(root)}
+            if due_roots:
+                scope = _strongest(scope, SCOPE_ROOTS)
+                roots |= due_roots
+                reasons.append("scheduled")
+        elif defer_scheduled:
             reasons.append(REASON_SCHEDULED_DEFERRED)
         else:
             scope = _strongest(scope, SCOPE_ALL)
@@ -154,12 +161,12 @@ def next_evaluation_boundary(
 ) -> "dt.datetime | None":
     """The earliest still-future capture the projector must come back for.
 
-    A bounded pass only sees the dirty windows, so the STORED boundary is
+    This is the legacy scalar helper. A bounded pass only sees dirty windows, so
+    the STORED boundary is
     retained whenever it is still in the future: dropping it would forget a
     future-clocked observation sitting in a window this pass never loaded. Once
-    wall time passes it the axis fires, the pass widens to everything, and the
-    boundary is recomputed from complete evidence — so a retained value can only
-    ever cost one extra pass, never a missed one.
+    wall time passes it the axis fires and the caller decides whether it has
+    enough ownership to scope the pass.
 
     ``retain_due`` keeps a boundary that is ALREADY due, which is the case where
     "recomputed from complete evidence" is a lie: a reporting-only pass never
@@ -167,20 +174,10 @@ def next_evaluation_boundary(
     the widening deliberately did not look. Either would otherwise retire the
     axis on behalf of an evaluation nobody performed.
 
-    A due value sorts before every future candidate, so it stays until a pass
-    that genuinely looked at everything retires it — in practice a hook tick
-    that widened to whole-history for axis 2 or 3, since carrying alert
-    eligibility is what separates such a pass from a reporting-only one and the
-    hook is the only production caller that carries it.
-
-    It does NOT stay "until a pass that can act on it does", and that gap is
-    open rather than closed: on a hook-only install with a steady enabled gate,
-    unchanged rules and a quiet ledger, no qualifying pass ever runs and the
-    instant is retained indefinitely. The cost is bounded — the tick stays
-    bounded and fast, and the window is re-evaluated as soon as it goes
-    ledger-dirty again, which for a live window is continuous — so the exposure
-    is a future-clocked capture in a window that then goes permanently quiet
-    never qualifying a threshold. Under-alerting, never a stall or a burst.
+    Epoch 1007's per-root map is maintained by the projector rather than this
+    helper. It closes the quiet-window gap by letting a hook tick replace only
+    the roots it evaluated; scalar-only legacy state still uses ``retain_due``
+    and the conservative full/deferred path.
     """
     candidates = [value for value in capture_times if value > now]
     if stored is not None and (retain_due or stored > now):

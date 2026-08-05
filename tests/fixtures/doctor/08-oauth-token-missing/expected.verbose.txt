@@ -74,7 +74,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1006, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1007, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 41, 'ahead': False}
   ✓ Migrations               0/54 applied
       details:
@@ -154,6 +154,10 @@ Data
         missing_conversation_key_rows: 0
         missing_thread_join_rows: 0
         incomplete_rows: 0
+  ✓ Codex orphan pruning     no refused prune
+      details:
+        refusalCount: 0
+        stores: []
   ✓ Codex transcript replay  none pending
       details:
         pending: False
@@ -254,4 +258,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 49 OK · 7 WARN · 1 FAIL
+Summary: 50 OK · 7 WARN · 1 FAIL

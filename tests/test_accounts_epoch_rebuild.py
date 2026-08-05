@@ -245,7 +245,7 @@ def test_legacy_rebuild_partitions_all_families(ns):
     jr.append_accounts_cutover_op(cutover)
     _seed_legacy_journal(jr, J)
 
-    jr.rebuild_stats_index()  # must not raise despite the effects-only wce leg
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))  # must not raise despite the effects-only wce leg
 
     part = _partition(ns)
     # Real-account families -> the cutover account.
@@ -269,7 +269,7 @@ def test_legacy_rebuild_all_children_agree_with_parent(ns):
     cutover = acc.account_key("claude", "uuid-CUT")
     jr.append_accounts_cutover_op(cutover)
     _seed_legacy_journal(jr, J)
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
 
     conn = ns["open_db"]()
     try:

@@ -5,13 +5,17 @@ import { useDisplayTz } from '../hooks/useDisplayTz';
 import { deriveOutline, type OutlineEntry } from './deriveOutline';
 import {
   buildOutlineTargets,
-  nextTarget,
+  cursorIndex,
+  distinctOwnerTurns,
+  nextTargetEntry,
   outlineTurnVisible,
+  resolveTurnIndex,
   type JumpKind,
+  type OutlineTarget,
 } from './outlineNavigation';
 import type { FocusMode } from './applyFocusMode';
 import { FilesTab } from './FilesTab';
-import { fmt, type FmtCtx } from '../lib/fmt';
+import { fmt, plural, type FmtCtx } from '../lib/fmt';
 import {
   ChatIcon,
   PlanIcon,
@@ -21,6 +25,7 @@ import {
   WarningIcon,
 } from './ConvIcons';
 import {
+  buildConversationJump,
   normalizeConversationRef,
   type CacheRebuild,
   type ConversationOutline,
@@ -43,6 +48,12 @@ type JumpLists = ReturnType<typeof buildOutlineTargets>;
 // The error chip is labeled "error turns" so it never reads as a third
 // disagreeing error number beside the "14 errors in 13 turns" line (Codex P2b) —
 // it navigates the 13 error TURNS, which is its count.
+//
+// #463 S4 F-B — that count is `distinctOwnerTurns(lists.error)`, NOT the
+// length of the target list. Under landmark awareness the list holds one entry
+// per failing CALL, so the length made the chip read `error turns 17` on a
+// conversation whose headline read "2 turns". Every other family is one target
+// per turn, where the two agree.
 function JumpCluster({
   sessionId,
   turns,
@@ -70,22 +81,36 @@ function JumpCluster({
 }) {
   const qualifiedInput = typeof sessionId !== 'string';
   const conversationRef = normalizeConversationRef(sessionId);
-  const { indexByUuid, memberIndex: _memberIndex, ...targets } = lists;
+  // #463 S4 remediation C-1 — the WHOLE targets object stays in hand (`lists`).
+  // It used to be destructured down to the family lists plus a bare
+  // `indexByUuid`, and `resolveTurnIndex` needs all three maps (own uuids,
+  // member uuids, segment keys) to resolve the segment key a landmark jump pins.
 
-  // Dispatch the OPEN_CONVERSATION jump for a resolved target turn index, after
-  // the focus-mode-unhide check. Shared by both the primary-click jump-to-last
-  // and the shift-click step (and the miss-pulse on an empty step).
-  const jumpToIndex = (targetIdx: number) => {
-    const turn = turns[targetIdx];
+  // Dispatch the OPEN_CONVERSATION jump for a resolved target, after the
+  // focus-mode-unhide check. Shared by both the primary-click jump-to-last and
+  // the shift-click step (and the miss-pulse on an empty step).
+  //
+  // #463 S4 §6.3 — the jump loads `anchorKey`, which for a tier-2 landmark is
+  // the SEGMENT holding the failure rather than the top of its turn, while the
+  // visibility test still resolves the OWNING turn through `ownerTurnIndex`.
+  // `turns` stays the tier-1 array that built these targets, so that index is
+  // correct by construction.
+  const jumpToTarget = (target: OutlineTarget) => {
+    const turn = turns[target.ownerTurnIndex];
     // Reset to `all` IF the current focus mode would hide the target turn (never
     // a silent jump behind a focus filter); mirrors the entry-click path.
-    if (focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
+    if (turn && focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
       dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
     }
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef,
-      jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid: turn.uuid },
+      // #463 S4 F-A — the second argument is the segment the target names and
+      // the third the block inside it. Round 3 routes this through the shared
+      // builder rather than a literal object, so the payload cannot drift from
+      // the rail row's or the reader key's.
+      jump: buildConversationJump(conversationRef, target.anchorKey, qualifiedInput,
+                                  { innerAnchorKey: target.innerAnchorKey }),
     });
   };
 
@@ -97,23 +122,26 @@ function JumpCluster({
   };
 
   // #217 S3 E8 — the chip PRIMARY click jumps to the MOST-RECENT occurrence
-  // (targets.<kind>.at(-1)) — the keyboard `a`/`L` keys' twin. A direct landing,
+  // (lists.<kind>.at(-1)) — the keyboard `a`/`L` keys' twin. A direct landing,
   // not a step. Empty family → a graceful no-op (no pulse).
   const jumpToLast = (kind: JumpKind) => {
-    const targetIdx = targets[kind].at(-1);
-    if (targetIdx == null) return;
-    jumpToIndex(targetIdx);
+    const target = lists[kind].at(-1);
+    if (target == null) return;
+    jumpToTarget(target);
   };
 
   // The existing next/prev STEPPING (shift-click → previous; the reader's
   // e/E,u/U,b/B,p/P,c/C keys mirror this), cursor-relative with the pin
   // preferred over the lagging scroll cursor (#187).
   const jump = (kind: JumpKind, dir: 1 | -1, btn: HTMLElement) => {
-    const cursorUuid = pinned ?? currentUuid;
-    const cursor = cursorUuid != null && indexByUuid.has(cursorUuid) ? indexByUuid.get(cursorUuid)! : -1;
-    const targetIdx = nextTarget(targets[kind], cursor, dir);
-    if (targetIdx == null) { missPulse(btn); return; }
-    jumpToIndex(targetIdx);
+    // #463 S4 remediation C-1 — through the shared `cursorIndex`, which resolves
+    // a segment key as well as a turn uuid. The raw `indexByUuid` lookup this
+    // replaces missed every pin a landmark jump had left, so the cursor was -1
+    // and the chip stepped from the start of the conversation on every press.
+    const cursor = cursorIndex(lists, pinned ?? currentUuid);
+    const target = nextTargetEntry(lists[kind], cursor, dir);
+    if (target == null) { missPulse(btn); return; }
+    jumpToTarget(target);
   };
 
   // `label` is the visible chip text; `aria` keeps the descriptive screen-reader
@@ -136,8 +164,16 @@ function JumpCluster({
   // A def is shown when it has targets AND (for cache) markers are on — the
   // opt-out suppresses the chip even when flagged turns exist.
   const shown = defs.filter(
-    (d) => targets[d.kind].length > 0 && (d.kind !== 'cache' || markersEnabled),
+    (d) => lists[d.kind].length > 0 && (d.kind !== 'cache' || markersEnabled),
   );
+  // ONLY the error chip counts turns, because only its label says "turns". A
+  // chip labelled "plans" is read as how many plans there are, and a Codex
+  // conversation with nine plan landmarks in two turns has nine; answering 2
+  // there would be the same conflation with the words exchanged. The residual
+  // §8.2 already records — stepping is turn-granular, so nine plan rows are two
+  // shift-click stops — is unchanged by either count.
+  const stops = (kind: JumpKind) =>
+    (kind === 'error' ? distinctOwnerTurns(lists[kind]) : lists[kind].length);
   if (shown.length === 0) return null;
   return (
     <div className="conv-outline-jump">
@@ -152,14 +188,14 @@ function JumpCluster({
             // #217 S3 E8 — primary click jumps to the LATEST occurrence;
             // shift-click steps to the previous one (the reader keys mirror both).
             title={`Latest ${d.aria} (${d.key}) · shift-click for previous`}
-            aria-label={`Latest ${d.aria}, ${targets[d.kind].length} total`}
+            aria-label={`Latest ${d.aria}, ${stops(d.kind)} total`}
             onClick={(ev) =>
               ev.shiftKey ? jump(d.kind, -1, ev.currentTarget) : jumpToLast(d.kind)
             }
           >
             <span className="conv-jump-cluster-glyph" aria-hidden="true">{d.glyph}</span>
             <span className="conv-jump-cluster-text">{d.label}</span>
-            <span className="conv-jump-cluster-count">{targets[d.kind].length}</span>
+            <span className="conv-jump-cluster-count">{stops(d.kind)}</span>
           </button>
         ))}
       </div>
@@ -248,16 +284,25 @@ function OutlineStatsCard({
 
   // The reconciled error phrase: "14 errors in 13 turns" when the server total
   // exceeds the error-turn count; "5 errors" when they agree.
+  //
+  // #463 S4 §6.5 — THREE states, because `0` and `null` are different claims.
+  // A positive count renders the row; `0` HIDES it, matching the Claude side,
+  // because hiding is not a claim; `null` renders an explicit declined state,
+  // because rendering `0` would assert an absence nobody proved. The server
+  // sends null when a conversation has outcome-bearing rows and no verdict on
+  // any of them — its retained event payloads are gone or unparseable.
   const errorPhrase = (() => {
     const n = stats.error_count;
-    const base = `${n} ${n === 1 ? 'error' : 'errors'}`;
-    return errorTurns !== n ? `${base} in ${errorTurns} turns` : base;
+    if (n == null) return 'not reported';
+    const base = plural(n, 'error');
+    return errorTurns !== n ? `${base} in ${plural(errorTurns, 'turn')}` : base;
   })();
 
   return (
     <div className="conv-outline-stats-body">
       <div className="conv-outline-stats-headline">
-        <span className="conv-outline-stats-strong">{stats.turns.total}</span> turns
+        <span className="conv-outline-stats-strong">{stats.turns.total}</span>
+        {stats.turns.total === 1 ? ' turn' : ' turns'}
         {' · '}
         <span className="conv-outline-stats-strong">{yours}</span> yours
       </div>
@@ -303,8 +348,14 @@ function OutlineStatsCard({
           </span>
         </div>
       )}
-      {stats.error_count > 0 && (
-        <div className="conv-outline-stat-kv conv-outline-stat-kv--errors">
+      {(stats.error_count == null || stats.error_count > 0) && (
+        <div
+          className={`conv-outline-stat-kv conv-outline-stat-kv--errors${
+            stats.error_count == null ? ' conv-outline-stat-kv--declined' : ''}`}
+          title={stats.error_count == null
+            ? 'This conversation has tool results, but nothing that could say whether any of them failed.'
+            : undefined}
+        >
           <span className="conv-outline-stat-kv-glyph" aria-hidden="true">⚠</span>
           <span className="conv-outline-stat-kv-label">Errors</span>
           <span className="conv-outline-stat-kv-value">{errorPhrase}</span>
@@ -339,16 +390,19 @@ function OutlineStatsCard({
 // modal. Each row's primary action is the same OPEN_CONVERSATION jump every
 // other outline jump uses; a stale uuid jumps as a graceful no-op.
 function OutlineCacheRebuilds({
-  sessionId, rebuilds, turnByUuid, indexByUuid, fmtCtx,
+  rebuilds, turnByUuid, indexByUuid, fmtCtx, onJump,
 }: {
-  sessionId: ConversationRefInput;
   rebuilds: CacheRebuild[];
   turnByUuid: Map<string, OutlineTurn>;
   indexByUuid: Map<string, number>;
   fmtCtx: FmtCtx;
+  // #463 S4 remediation — the rail's ONE jump dispatcher. This list used to
+  // build its own OPEN_CONVERSATION inline, which made it the single rail row
+  // that skipped the focus-mode unhide check every other rail row performs: a
+  // click while a focus mode hid the flagged turn loaded a key mounted nowhere
+  // and the jump exhausted silently. Same payload, one code path.
+  onJump: (uuid: string) => void;
 }) {
-  const qualifiedInput = typeof sessionId !== 'string';
-  const conversationRef = normalizeConversationRef(sessionId);
   const [expanded, setExpanded] = useState(false);
   const CAP = 3;
   const shown = expanded ? rebuilds : rebuilds.slice(0, CAP);
@@ -367,11 +421,7 @@ function OutlineCacheRebuilds({
                 type="button"
                 className="conv-rebuild-jump"
                 aria-label={`Jump to cache rebuild: ~${fmt.usd2(r.est_wasted_usd)} wasted`}
-                onClick={() => dispatch({
-                  type: 'OPEN_CONVERSATION',
-                  conversationRef,
-                  jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid: r.uuid },
-                })}
+                onClick={() => onJump(r.uuid)}
               >
                 <span className="rb-cost">{fmt.usd2(r.est_wasted_usd)}</span>
                 <span className="rb-label">{label}</span>
@@ -411,6 +461,12 @@ export function OutlinePanel({
   // (exact, no section fallback) + the jump-to-next cursor; null falls back to
   // today's scroll-sync behavior.
   const pinned = useSyncExternalStore(subscribeStore, () => getState().convPinnedUuid);
+  // #463 S4 remediation C-3 — the inner anchor that pin landed on, when the
+  // jump named one. Written by the reader's landing bookkeeping for EVERY
+  // entry point, which is what lets the rail mark one landmark row rather than
+  // every row sharing the segment.
+  const pinnedAnchorKey = useSyncExternalStore(
+    subscribeStore, () => getState().convPinnedAnchorKey);
   const focusMode = useSyncExternalStore(subscribeStore, () => getState().convFocusMode);
   // #217 S5 F2 — the [Outline] [Files] tab selection (transient per-session).
   const outlineTab = useSyncExternalStore(subscribeStore, () => getState().convOutlineTab);
@@ -435,7 +491,7 @@ export function OutlinePanel({
 
   const { entries, sectionByUuid } = useMemo(
     () => (outline ? deriveOutline(outline.turns, outline.subagent_meta, markersEnabled,
-                                   outline.task_completion, bookmarks)
+                                   outline.task_completion, bookmarks, outline.landmarks)
                    : { entries: [], sectionByUuid: new Map<string, string>() }),
     [outline, markersEnabled, bookmarks],
   );
@@ -447,10 +503,13 @@ export function OutlinePanel({
 
   // #186 §4.3 — lift the shared jump-target builder so the stats card's "N error
   // turns", the error chip count, and the navigation stops are provably one
-  // source. `lists.error.length` is the error-TURN count (13), distinct from the
-  // server's `error_count` total (14).
+  // source. #463 S4 F-B — the error-TURN count is
+  // `distinctOwnerTurns(lists.error)`, because a landmark-aware `lists.error`
+  // holds one entry per failing CALL; `lists.error.length` is the server's
+  // `error_count` by construction, which made the reconciliation phrase
+  // unreachable for Codex.
   const lists = useMemo(
-    () => buildOutlineTargets(outline?.turns ?? [], bookmarks),
+    () => buildOutlineTargets(outline?.turns ?? [], bookmarks, outline?.landmarks),
     [outline, bookmarks],
   );
 
@@ -471,15 +530,28 @@ export function OutlinePanel({
     return m;
   }, [outline]);
 
-  const jumpTo = (uuid: string) => {
-    const turn = turnByUuid.get(uuid);
+  // The rail's ONE jump dispatcher: every row in this panel — an outline entry,
+  // a Files-tab file or touch, a cache-rebuild row — goes through it, so the
+  // focus-mode unhide check cannot be true of some rows and not others.
+  //
+  // #463 S4 F-C — the owning turn is resolved through `resolveTurnIndex`, not
+  // through a map of tier-1 uuids. Several callers pass a SEGMENT key: a tier-2
+  // landmark row, and a Codex file touch, whose anchor is the segment holding
+  // the change. A tier-1 lookup returned `undefined` for both, the `turn &&`
+  // guard short-circuited, and the focus-mode reset never ran — so clicking a
+  // reasoning landmark while focus mode was `edits` loaded a key mounted
+  // nowhere and the jump exhausted silently. `resolveTurnIndex` consults the
+  // own-uuid map, then member uuids, then segment keys.
+  const jumpTo = (uuid: string, innerAnchorKey?: string) => {
+    const ownerIndex = resolveTurnIndex(lists, uuid);
+    const turn = ownerIndex !== undefined ? (outline?.turns ?? [])[ownerIndex] : undefined;
     if (turn && focusMode !== 'all' && !outlineTurnVisible(turn, focusMode)) {
       dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'all' });
     }
     dispatch({
       type: 'OPEN_CONVERSATION',
       conversationRef,
-      jump: { ...(qualifiedInput ? { conversation_ref: conversationRef } : {}), session_id: conversationRef.key, uuid },
+      jump: buildConversationJump(conversationRef, uuid, qualifiedInput, { innerAnchorKey }),
     });
   };
 
@@ -487,6 +559,45 @@ export function OutlinePanel({
   // landmarks, including subagent bucket-root uuids). Used to suppress the
   // section-prompt fallback below when the cursor already matches an exact entry.
   const entryUuids = useMemo(() => new Set(entries.map((e) => e.uuid)), [entries]);
+
+  // #463 S4 F-G, reworked by the remediation (C-3) — WHICH ROW the rail marks.
+  // Several tier-2 rows can share one segment anchor, so the uuid alone marked
+  // all of them. F-G answered that by remembering the entry the rail's own row
+  // click named, which left the highlight behind on a chip jump or a keyboard
+  // jump — the rail was the only writer of that memory. The answer now comes
+  // from the pin itself, which the reader writes when a jump LANDS and which
+  // carries the inner anchor that jump aligned. One mechanism, and it serves
+  // whichever entry point issued the jump.
+  //
+  // An inner-anchor pin names one exact tier-2 landmark. A bare pin names only
+  // the landed item, so it may select a tier-1 row with that uuid but must not
+  // claim a finer landmark inside the item. If the landed item has no row of
+  // its own, resolve the nearest semantic ancestor: its subagent bucket first,
+  // then its enclosing prompt. This keeps aria-current truthful for saved
+  // positions and for jumps to generic/sidechain members (#492).
+  const activeEntryId = useMemo(() => {
+    if (pinned == null) return null;
+    const owned = entries.filter((e) => e.uuid === pinned);
+    if (pinnedAnchorKey != null) {
+      return (owned.find((e) => e.innerAnchorKey === pinnedAnchorKey) ?? owned[0])
+        ?.entryId ?? null;
+    }
+    const direct = owned.find((e) => !e.landmark);
+    if (direct) return direct.entryId;
+
+    const ownerIndex = resolveTurnIndex(lists, pinned);
+    const owner = ownerIndex != null ? outline?.turns[ownerIndex] : undefined;
+    if (owner?.subagent_key != null) {
+      const bucket = entries.find(
+        (e) => e.type === 'subagent' && e.subagentKey === owner.subagent_key,
+      );
+      if (bucket) return bucket.entryId;
+    }
+
+    const sectionUuid = sectionByUuid.get(pinned)
+      ?? (owner ? sectionByUuid.get(owner.uuid) : undefined);
+    return entries.find((e) => e.type === 'human' && e.uuid === sectionUuid)?.entryId ?? null;
+  }, [entries, lists, outline?.turns, pinned, pinnedAnchorKey, sectionByUuid]);
 
   // The section prompt uuid the scroll-sync cursor currently sits inside (via
   // sectionByUuid). Used to highlight the always-meaningful spine prompt when the
@@ -521,17 +632,17 @@ export function OutlinePanel({
       ) : (
         <>
           <div className="conv-outline-stats">
-            <OutlineStatsCard stats={outline.stats} errorTurns={lists.error.length} markersEnabled={markersEnabled} />
+            <OutlineStatsCard stats={outline.stats} errorTurns={distinctOwnerTurns(lists.error)} markersEnabled={markersEnabled} />
             {/* #217 S6 F3 — expand the scalar Cache stat into a per-rebuild jump
                 list. Gated on the same markersEnabled opt-out + count > 0 as the
                 stats row above it. */}
             {markersEnabled && outline.stats.cache_failures && outline.stats.cache_failures.count > 0 && (
               <OutlineCacheRebuilds
-                sessionId={sessionId}
                 rebuilds={outline.stats.cache_failures.rebuilds}
                 turnByUuid={turnByUuid}
                 indexByUuid={indexByUuid}
                 fmtCtx={fmtCtx}
+                onJump={jumpTo}
               />
             )}
             <JumpCluster
@@ -589,7 +700,7 @@ export function OutlinePanel({
               // match OR the spine prompt of the current section).
               const isCurrent =
                 pinned != null
-                  ? e.uuid === pinned
+                  ? activeEntryId != null && e.entryId === activeEntryId
                   : currentUuid != null &&
                     (e.uuid === currentUuid || (e.type === 'human' && e.uuid === currentSection));
               // #217 S3 E6(c) — tree indentation. depth 0 = spine, 1 = section
@@ -606,6 +717,12 @@ export function OutlinePanel({
                       e.depth ? 'conv-outline-entry--nested' : '',
                       // ≥2 = a tree child; drives the extra-indent rule.
                       e.depth >= 2 ? 'conv-outline-entry--subnested' : '',
+                      // #463 S4 §6.7 — a tier-2 landmark row. It is already a
+                      // button (the row-to-cell-button pattern this list has
+                      // always used), so this only carries the indent rule and
+                      // the wrapping label; the severity colour comes from the
+                      // existing `--error` modifier below.
+                      e.landmark ? 'conv-outline-entry--landmark' : '',
                       e.error ? 'conv-outline-entry--error' : '',
                       // cache-failure-markers spec §4 — flagged rows (standalone
                       // OR coinciding) take the cache modifier for the amber cue.
@@ -616,7 +733,7 @@ export function OutlinePanel({
                     data-depth={e.depth}
                     style={e.depth >= 2 ? ({ ['--conv-outline-depth' as string]: String(e.depth) }) : undefined}
                     aria-current={isCurrent ? 'true' : undefined}
-                    onClick={() => jumpTo(e.uuid)}
+                    onClick={() => jumpTo(e.uuid, e.innerAnchorKey)}
                     title={e.label}
                   >
                     <span className="conv-outline-entry-glyph" aria-hidden="true">

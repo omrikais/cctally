@@ -1,0 +1,269 @@
+{
+  "outline": {
+    "session_id": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+    "stats": {
+      "turns": {
+        "total": 4,
+        "human": 2,
+        "assistant": 1,
+        "tool_result": 0,
+        "meta": 1
+      },
+      "tool_counts": {
+        "fixture_custom": 1,
+        "fixture_function": 1,
+        "tool_search_call": 1,
+        "web_search_call": 1
+      },
+      "error_count": 0,
+      "models": {
+        "gpt-synthetic-codex": 1
+      },
+      "duration_seconds": 600,
+      "tokens": {
+        "source": "codex",
+        "input": 1200,
+        "output": 400,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "cached_input": 300,
+        "reasoning_output": 100
+      },
+      "cost_usd": 0.0051625,
+      "cache_saved_usd": 0
+    },
+    "files": [
+      {
+        "path": "synthetic.txt",
+        "add": null,
+        "del": null,
+        "touches": [
+          {
+            "uuid": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+            "tool_use_id": null,
+            "op": null,
+            "add": null,
+            "del": null
+          }
+        ]
+      }
+    ],
+    "turns": [
+      {
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "kind": "human",
+        "ts": "2026-07-14T12:03:00Z",
+        "label": "Synthetic first meaningful user prompt",
+        "member_uuids": [
+          "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+        ],
+        "segment_uuids": [
+          "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false
+      },
+      {
+        "uuid": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+        "kind": "assistant",
+        "ts": "2026-07-14T12:03:10Z",
+        "label": "Synthetic assistant response",
+        "member_uuids": [
+          "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+          "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e"
+        ],
+        "segment_uuids": [
+          "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false,
+        "tools": [
+          {
+            "is_error": false,
+            "name": "fixture_function"
+          },
+          {
+            "is_error": false,
+            "name": "fixture_custom"
+          },
+          {
+            "is_error": false,
+            "name": "tool_search_call"
+          },
+          {
+            "is_error": false,
+            "name": "web_search_call"
+          }
+        ],
+        "tool_call_count": 4,
+        "first_failure_name": null,
+        "thinking": [
+          "Synthetic summary"
+        ],
+        "model": "gpt-synthetic-codex"
+      },
+      {
+        "uuid": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+        "kind": "meta",
+        "ts": "2026-07-14T12:09:00Z",
+        "label": "context_compacted",
+        "member_uuids": [
+          "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+        ],
+        "segment_uuids": [
+          "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false,
+        "meta_kind": "compaction"
+      },
+      {
+        "uuid": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+        "kind": "human",
+        "ts": "2026-07-14T12:13:00Z",
+        "label": "Synthetic user event",
+        "member_uuids": [
+          "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+        ],
+        "segment_uuids": [
+          "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+        ],
+        "subagent_key": null,
+        "parent_uuid": null,
+        "is_sidechain": false
+      }
+    ],
+    "landmarks": [
+      {
+        "landmark_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+        "uuid": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+        "parent_uuid": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+        "kind": "reasoning",
+        "label": "Synthetic summary",
+        "ts": "2026-07-14T12:03:20Z"
+      }
+    ],
+    "positionByKey": {
+      "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+      "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6": 1,
+      "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e": 1,
+      "civ1_057462c17ca43c2918526886f6f6a7f0ce5c70b3": 2,
+      "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427": 3,
+      "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983": 4,
+      "civ1_a95002d577138d681f720af29a266fdc3fda0c91": 5,
+      "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e": 6,
+      "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de": 7
+    }
+  },
+  "chrome": {
+    "entries": [
+      {
+        "entryId": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "uuid": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+        "type": "human",
+        "label": "Synthetic first meaningful user prompt",
+        "depth": 0,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "thinkingCount": 1,
+        "toolCount": 0,
+        "turnIndex": 0
+      },
+      {
+        "entryId": "lm:cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "uuid": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+        "type": "heading",
+        "label": "Synthetic summary",
+        "depth": 2,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "landmark": true,
+        "innerAnchorKey": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 1
+      },
+      {
+        "entryId": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+        "uuid": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+        "type": "compaction",
+        "label": "context_compacted",
+        "depth": 1,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 2
+      },
+      {
+        "entryId": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+        "uuid": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+        "type": "human",
+        "label": "Synthetic user event",
+        "depth": 0,
+        "error": false,
+        "plan": false,
+        "question": false,
+        "thinkingCount": 0,
+        "toolCount": 0,
+        "turnIndex": 3
+      }
+    ],
+    "sectionByUuid": {
+      "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+    },
+    "targets": {
+      "error": [],
+      "prompt": [
+        {
+          "anchorKey": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+          "ownerTurnIndex": 0
+        },
+        {
+          "anchorKey": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+          "ownerTurnIndex": 3
+        }
+      ],
+      "subagent": [],
+      "plan": [],
+      "cache": [],
+      "compaction": [
+        {
+          "anchorKey": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+          "ownerTurnIndex": 2
+        }
+      ],
+      "bookmark": [],
+      "indexByUuid": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6": 1,
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427": 2,
+        "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de": 3
+      },
+      "memberIndex": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6": 1,
+        "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e": 1,
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427": 2,
+        "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de": 3
+      },
+      "segmentIndex": {
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36": 0,
+        "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6": 1,
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427": 2,
+        "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de": 3
+      }
+    }
+  }
+}

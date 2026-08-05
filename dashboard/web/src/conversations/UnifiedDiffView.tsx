@@ -7,6 +7,7 @@
 import type { FileDiff } from './contextDiff';
 import { HunkEl } from './diffPrimitives';
 import { langFromExtension } from './toolLang';
+import type { ExactLeafTarget } from './findMark';
 
 function splitPath(path: string): { dir: string; base: string } {
   const slash = path.lastIndexOf('/');
@@ -27,7 +28,10 @@ function statOf(hunks: FileDiff['hunks']): { add: number; del: number } {
   return { add, del };
 }
 
-export function UnifiedDiffView({ files }: { files: FileDiff[] }) {
+export function UnifiedDiffView({ files, exactTargetsForRow }: {
+  files: FileDiff[];
+  exactTargetsForRow?: (fileIndex: number, hunkIndex: number, rowIndex: number) => ExactLeafTarget[];
+}) {
   if (files.length === 0) return null;
   return (
     <div className="conv-ctx-diff">
@@ -50,7 +54,12 @@ export function UnifiedDiffView({ files }: { files: FileDiff[] }) {
               </span>
             </div>
             {file.hunks.map((rows, hi) => (
-              <HunkEl key={hi} rows={rows} lang={lang} />
+              <HunkEl
+                key={hi}
+                rows={rows}
+                lang={lang}
+                exactTargetsForRow={(rowIndex) => exactTargetsForRow?.(fi, hi, rowIndex) ?? []}
+              />
             ))}
           </div>
         );

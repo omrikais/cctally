@@ -52,6 +52,73 @@ cp "$RUNTIME/codex-task-a/rollout-2026-07-07T12-00-00-32900000-0000-4000-8000-00
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 cp "$RUNTIME/codex-task-b/session-b-card-wire.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
+cp "$RUNTIME/codex-find/occurrence-find.jsonl" \
+   "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
+
+# #463 S5 — append an injected-context bundle to the RUNTIME COPY of the Session
+# D rollout. Before this the whole e2e corpus produced only `notification` meta
+# rows, so no browser test could observe the `context` kind, which is the kind
+# that renders both a `.conv-meta-label` ("SESSION CONTEXT") and a
+# `.conv-meta-name` ("· agents, environment") — the two elements #493 reports
+# shattering on a phone. The committed fixture is left untouched, because the
+# frontend harness byte-compares wire fixtures regenerated from it; only the
+# scratch copy is extended, and the message is appended at the END so the rail
+# title and every existing find/count assertion stay as they were.
+SESSION_D_ROLLOUT="$CODEX_ROOT_MAIN/sessions/2026/07/20/session-d-reasoning-lifecycle-markers.jsonl"
+# Open-for-append would CREATE a missing file, so a renamed or unstaged fixture
+# would silently produce an empty rollout under `set -e` instead of failing.
+[ -f "$SESSION_D_ROLLOUT" ] || {
+  echo "e2e/serve.sh: expected Session D rollout is missing: $SESSION_D_ROLLOUT" >&2
+  exit 1
+}
+python3 - "$SESSION_D_ROLLOUT" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+bundle = (
+    "# AGENTS.md instructions for /synthetic/root-a/project-red\n"
+    "<INSTRUCTIONS>Synthetic agent instructions for the injected context bundle."
+    "</INSTRUCTIONS>\n"
+    "<environment_context>Synthetic environment context.</environment_context>"
+)
+
+# Derive the timestamp from the file's own maximum rather than hardcoding one.
+# A hardcoded value only worked because it happened to land in the gap between
+# two neighbouring fixture records; re-timing either neighbour would have
+# silently reordered the rail with nothing failing.
+path = sys.argv[1]
+latest = None
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        line = line.strip()
+        if not line:
+            continue
+        stamp = json.loads(line).get("timestamp")
+        if not isinstance(stamp, str):
+            continue
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if latest is None or parsed > latest:
+            latest = parsed
+if latest is None:
+    raise SystemExit(f"e2e/serve.sh: no timestamped record in {path}")
+appended_at = (latest + timedelta(seconds=1)).astimezone(timezone.utc)
+
+record = {
+    "payload": {
+        "content": [{"text": bundle, "type": "input_text"}],
+        "phase": "input",
+        "role": "user",
+        "type": "message",
+    },
+    "timestamp": appended_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "type": "response_item",
+}
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, sort_keys=True) + "\n")
+PY
 
 # Shared native UUID across Claude, Codex root A, and Codex root B. The UI must
 # keep all three qualified identities distinct through open/persist/compare.

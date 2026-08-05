@@ -20,14 +20,20 @@ const FACETS_RETRY_MS = 700;
 // empty immediately, leaving the popover option-less until it was reopened. It
 // now retries ONCE after a short backoff before settling empty (bounded so a
 // persistently-down endpoint can't spin). Helps the Project axis identically.
-export function useConversationFacets(source: ConversationSource = 'claude'): ConversationFacets {
+export function useConversationFacets(
+  source: ConversationSource = 'claude', accountKey?: string,
+): ConversationFacets {
   const [facets, setFacets] = useState<ConversationFacets>({ projects: [], models: [] });
   useEffect(() => {
     const ctl = new AbortController();
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    setFacets({ projects: [], models: [] });
     const load = (attempt: number): void => {
       fetchJson<ConversationFacets | QualifiedFacetsEnvelope>(
-        source === 'codex' ? qualifiedFacetsUrl('codex') : '/api/conversations/facets', ctl.signal)
+        source === 'codex'
+          ? qualifiedFacetsUrl('codex', accountKey)
+          : `/api/conversations/facets${accountKey ? `?account=${encodeURIComponent(accountKey)}` : ''}`,
+        ctl.signal)
         // #278 Theme C — normalize on the SUCCESS path, not just initial/error
         // state: an older or mocked response carrying only `{ projects }` would
         // otherwise set `models: undefined` and crash the popover's `.map`.
@@ -53,6 +59,6 @@ export function useConversationFacets(source: ConversationSource = 'claude'): Co
     };
     load(0);
     return () => { ctl.abort(); if (retryTimer) clearTimeout(retryTimer); };
-  }, [source]);
+  }, [source, accountKey]);
   return facets;
 }

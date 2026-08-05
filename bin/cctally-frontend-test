@@ -47,6 +47,15 @@
 #      `diff -u <(…)`). The test itself owns no golden logic, which is why it can
 #      also run as an ordinary member of the estate above.
 #
+# #463 S4 extended legs 3 and 4 from the DETAIL envelope to the OUTLINE envelope
+# as well: three more `wire-outline-<scenario>.json` byte comparisons and three
+# more adapted goldens, produced by the same builder and the same golden test.
+# Before that, no committed byte anywhere described a server outline envelope and
+# no test ran one through `adaptQualifiedOutline`, so the whole navigation
+# chrome — the surface S4 rewrites — was outside the gate. The adapted outline
+# golden also serializes the `deriveOutline` / `buildOutlineTargets` PROJECTION,
+# which is the chrome's input model and NOT a component render.
+#
 # Parallelism: serial. Both test legs invoke vitest, which runs its own worker pool;
 # a second concurrent vitest would oversubscribe the shared xargs -P pool that
 # bin/cctally-test-all fans the harnesses out through.
@@ -147,7 +156,11 @@ mkdir -p "$wire_dir"
 
 if python3 "$REPO_ROOT/bin/build-codex-reader-fixtures.py" --out-dir "$wire_dir" \
         >"$wire_log" 2>&1; then
-    for wire_name in wire-detail.json wire-detail-segmented.json; do
+    for wire_name in wire-detail.json wire-detail-segmented.json \
+                     wire-detail-tool-legibility.json \
+                     wire-outline-modern-full.json \
+                     wire-outline-segmented-turn.json \
+                     wire-outline-tool-legibility.json; do
         produced="$wire_dir/$wire_name"
         committed="$REPO_ROOT/tests/fixtures/codex-reader/$wire_name"
         if [[ ! -f "$produced" ]]; then
@@ -174,10 +187,14 @@ else
     tail -60 "$wire_log"
 fi
 
-# Two reader-path goldens, one per wire scenario. modern-full covers every
+# Three reader-path goldens, one per wire scenario. modern-full covers every
 # record family but carries no turn near the segment budget, so every item in it
 # has segment_ordinal 0; segmented-turn carries several segments of one turn, so
-# the pin actually moves when segment boundaries or block accounting change.
+# the pin actually moves when segment boundaries or block accounting change;
+# tool-legibility (#463 S3) carries the tool shapes neither of the other two
+# holds — a dict-shaped patch event, a mixed exec program, the five
+# function_call families, every output preamble grammar, two shell sessions and
+# the external-agent marker.
 adapted_dir="$GOLDEN_DIFF_TMPDIR/adapted"
 golden_log="$GOLDEN_DIFF_TMPDIR/golden.log"
 mkdir -p "$adapted_dir"
@@ -186,7 +203,11 @@ if (cd "$WEB_DIR" && CCTALLY_READER_GOLDEN_OUT_DIR="$adapted_dir" \
         npx vitest run --maxWorkers="${CCTALLY_TEST_JOBS:-2}" \
         src/conversations/readerGolden.test.ts) >"$golden_log" 2>&1; then
     for pair in "codex-reader-golden:adapted.json:golden-adapted.json" \
-                "codex-reader-golden-segmented:adapted-segmented.json:golden-adapted-segmented.json"; do
+                "codex-reader-golden-segmented:adapted-segmented.json:golden-adapted-segmented.json" \
+                "codex-reader-golden-tool-legibility:adapted-tool-legibility.json:golden-adapted-tool-legibility.json" \
+                "codex-outline-golden:adapted-outline-modern-full.json:golden-adapted-outline-modern-full.json" \
+                "codex-outline-golden-segmented:adapted-outline-segmented-turn.json:golden-adapted-outline-segmented-turn.json" \
+                "codex-outline-golden-tool-legibility:adapted-outline-tool-legibility.json:golden-adapted-outline-tool-legibility.json"; do
         name="${pair%%:*}"
         rest="${pair#*:}"
         produced="$adapted_dir/${rest%%:*}"

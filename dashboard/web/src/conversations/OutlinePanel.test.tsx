@@ -845,3 +845,535 @@ describe('outline coverage pins — no visual change (#304 S3 Q5)', () => {
     expect(count.textContent).toBe('0'); // empty files → the "0" affordance still renders
   });
 });
+
+// #463 S4 §6.5 — the ERRORS row is THREE-state, because `0` and `null` are
+// different claims. A positive count renders; `0` hides the row, matching the
+// Claude side, because hiding is not a claim; `null` renders an explicit
+// declined state, because rendering `0` would assert an absence nobody proved —
+// the literal defect F13 names.
+describe('#463 S4 — the three-state ERRORS row', () => {
+  const errorsRow = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('.conv-outline-stat-kv'))
+      .find((kv) => /error/i.test(kv.textContent ?? '')) ?? null;
+
+  it('renders an explicit declined state for a null error count', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: null }) })} />,
+    );
+    const row = errorsRow(container);
+    expect(row).not.toBeNull();
+    expect(row!.textContent).toMatch(/not reported/i);
+    expect(row!.textContent).not.toMatch(/\b0 errors\b/);
+  });
+
+  it('still hides the row at a determinable zero', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 0 }) })} />,
+    );
+    expect(errorsRow(container)).toBeNull();
+  });
+
+  it('still renders a positive count', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({ stats: stats({ error_count: 2 }) })} />,
+    );
+    expect(errorsRow(container)!.textContent).toMatch(/2 errors/);
+  });
+});
+
+// #463 S4 §6.7 — the tier-2 rows in the rendered rail. JSDOM cannot evaluate the
+// indent, the wrap or the severity colour; what it CAN pin is that the landmark
+// reaches the rail at all, as a button, carrying its own class, and jumping to
+// the SEGMENT anchor rather than to its turn. The real-browser gate covers the
+// rest.
+describe('#463 S4 — tier-2 landmark rows', () => {
+  const withLandmarks = () => outline({
+    stats: stats({ error_count: 1 }),
+    turns: [
+      turn({ uuid: 'h1', kind: 'human', label: 'fix the build' }),
+      turn({ uuid: 'a1', kind: 'assistant', label: 'working on it' }),
+    ],
+    landmarks: [
+      {
+        landmark_key: 'cbk1.e#tool_error', block_key: 'cbk1.e', uuid: 'seg-15',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      },
+      {
+        landmark_key: 'cbk1.r#0', block_key: 'cbk1.r', uuid: 'seg-2',
+        parent_uuid: 'a1', kind: 'reasoning',
+        label: 'Reading the failing case before touching anything', ts: null,
+      },
+    ],
+  });
+
+  it('renders each landmark as its own button, indented under its turn', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={withLandmarks()} />);
+    const rows = Array.from(container.querySelectorAll('.conv-outline-entry--landmark'));
+    expect(rows).toHaveLength(2);
+    // The row-to-cell-button pattern: the row IS the button, rather than a
+    // clickable row with interactive children.
+    expect(rows.every((row) => row.tagName === 'BUTTON')).toBe(true);
+    expect(rows.map((row) => row.getAttribute('data-depth'))).toEqual(['2', '2']);
+    expect(rows[0].className).toContain('conv-outline-entry--error');
+    expect(rows[0].textContent).toContain('tool error · exec');
+    expect(rows[1].textContent).toContain('Reading the failing case');
+  });
+
+  it('jumps to the landmark segment rather than to its owning turn', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={withLandmarks()} />);
+    const row = container.querySelector('.conv-outline-entry--landmark')!;
+    act(() => { fireEvent.click(row); });
+    // #463 S4 F-A — the segment is the item the jump LOADS; `inner_anchor_key`
+    // is the block inside it the jump ALIGNS. This case renders under focus
+    // mode `all`, so it cannot observe the focus-mode reset — the remediation
+    // describe below covers that.
+    expect(getState().conversationJump).toEqual({
+      session_id: 's1', uuid: 'seg-15', inner_anchor_key: 'cbk1.e',
+    });
+  });
+});
+
+
+// #463 S4 remediation — the three defects the S4 gates found in the landmark
+// chrome. Each case below is one the shipped code passed while being wrong, so
+// each fixture is built to make the wrong answer visible rather than incidental.
+describe('#463 S4 remediation — landmark counts, jumps and focus mode', () => {
+  // ONE turn owning THREE failures, which is the shape the gate measured on the
+  // real store: nine error landmarks, all nine parented to a single turn.
+  const threeFailuresOneTurn = (over: Partial<ConversationOutline> = {}) => outline({
+    stats: stats({ error_count: 3 }),
+    turns: [
+      turn({ uuid: 'h1', kind: 'human', label: 'run the suite' }),
+      turn({
+        uuid: 'a1', kind: 'assistant', label: 'running it',
+        segment_uuids: ['a1', 'seg-2', 'seg-9'],
+        tools: [{ name: 'exec', is_error: true }],
+      }),
+    ],
+    landmarks: [
+      {
+        landmark_key: 'cbk1.e1#tool_error', block_key: 'cbk1.e1', uuid: 'a1',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      },
+      {
+        landmark_key: 'cbk1.e2#tool_error', block_key: 'cbk1.e2', uuid: 'seg-2',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      },
+      {
+        landmark_key: 'cbk1.e3#tool_error', block_key: 'cbk1.e3', uuid: 'seg-9',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      },
+    ],
+    ...over,
+  });
+
+  // ── F-A ───────────────────────────────────────────────────────────────────
+  it('carries the failing block, not only its segment, on a rail-row jump', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const rows = container.querySelectorAll('.conv-outline-entry--landmark');
+    act(() => { fireEvent.click(rows[2]); });
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's1', uuid: 'seg-9', inner_anchor_key: 'cbk1.e3' });
+  });
+
+  it('carries the failing block on the error CHIP jump too', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const chip = container.querySelector('[data-jump-kind="error"]')!;
+    act(() => { fireEvent.click(chip); });
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's1', uuid: 'seg-9', inner_anchor_key: 'cbk1.e3' });
+  });
+
+  // ── F-B ───────────────────────────────────────────────────────────────────
+  it('counts error TURNS on the chip, not failing calls', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const chip = container.querySelector('[data-jump-kind="error"]')!;
+    expect(chip.textContent).toContain('error turns');
+    expect(chip.querySelector('.conv-jump-cluster-count')!.textContent).toBe('1');
+    expect(chip.getAttribute('aria-label')).toBe('Latest error turn, 1 total');
+  });
+
+  it('leaves the plan chip counting plans, whose label does not say turns', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline({
+      turns: [turn({ uuid: 'a1', kind: 'assistant', label: 'planning' })],
+      landmarks: [
+        {
+          landmark_key: 'cbk1.p1#plan', block_key: 'cbk1.p1', uuid: 'a1',
+          parent_uuid: 'a1', kind: 'plan', label: 'update_plan', ts: null,
+        },
+        {
+          landmark_key: 'cbk1.p2#plan', block_key: 'cbk1.p2', uuid: 'a1',
+          parent_uuid: 'a1', kind: 'plan', label: 'update_plan', ts: null,
+        },
+      ],
+    })} />);
+    const chip = container.querySelector('[data-jump-kind="plan"]')!;
+    expect(chip.querySelector('.conv-jump-cluster-count')!.textContent).toBe('2');
+  });
+
+  it('reconciles "3 errors in 1 turn" on the stats card', () => {
+    // The phrase pluralized `error` and not `turn`, so this assertion pinned
+    // "in 1 turns" until the remediation round fixed the noun it missed.
+    // Round 3 — with the negative guard the positive one needs: "in 1 turns"
+    // CONTAINS "in 1 turn", so `toContain` alone passes against the defect this
+    // test names.
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const row = container.querySelector('.conv-outline-stat-kv--errors')!;
+    expect(row.textContent).toContain('3 errors in 1 turn');
+    expect(row.textContent).not.toContain('1 turns');
+  });
+
+  it('still says a bare count when every failure is its own turn', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline({
+      stats: stats({ error_count: 1 }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'ok',
+               tools: [{ name: 'Bash', is_error: true }] }),
+      ],
+    })} />);
+    const row = container.querySelector('.conv-outline-stat-kv--errors')!;
+    // Round 3 — "1 errors" contains "1 error", so the positive assertion alone
+    // could not see a singular-noun defect. The QA sweep of 45 Claude and 60
+    // Codex conversations found none with exactly one error turn, so nothing
+    // rendered this branch in the browser either.
+    expect(row.textContent).toContain('1 error');
+    expect(row.textContent).not.toMatch(/1 errors/);
+    expect(row.textContent).not.toContain('in 1 turns');
+  });
+
+  // The other singular: the count inside the RECONCILED phrase, where the noun
+  // that must not gain an `s` is `error` rather than `turn`. The pairing is
+  // deliberate rather than natural — the server counts error events and the
+  // client counts landmark-owning turns, so one event over two turns is a real
+  // disagreement the phrase exists to report, and it is the only shape that
+  // reaches `plural(1, 'error')` with the "in N turns" tail attached.
+  it('says "1 error in 2 turns" rather than "1 errors in 2 turns"', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline({
+      stats: stats({ error_count: 1 }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+        turn({ uuid: 'a1', kind: 'assistant', label: 'first',
+               tools: [{ name: 'Bash', is_error: true }] }),
+        turn({ uuid: 'a2', kind: 'assistant', label: 'second',
+               tools: [{ name: 'Bash', is_error: true }] }),
+      ],
+    })} />);
+    const row = container.querySelector('.conv-outline-stat-kv--errors')!;
+    expect(row.textContent).toContain('1 error in 2 turns');
+    expect(row.textContent).not.toMatch(/1 errors/);
+  });
+
+  // ── F-C ───────────────────────────────────────────────────────────────────
+  it('resets a focus mode that would hide a tier-2 row it is jumping to', () => {
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'edits' }); });
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const rows = container.querySelectorAll('.conv-outline-entry--landmark');
+    act(() => { fireEvent.click(rows[1]); });
+    // The owning turn carries an `exec` call and no edit, so `edits` hides it;
+    // without the reset the jump would load a key mounted nowhere.
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's1', uuid: 'seg-2', inner_anchor_key: 'cbk1.e2' });
+  });
+
+  it('resets the focus mode for a Codex file touch on a segment key', () => {
+    act(() => {
+      dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'edits' });
+      dispatch({ type: 'SET_CONV_OUTLINE_TAB', tab: 'files' });
+    });
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn({
+        files: [{
+          path: 'bin/x.py', add: 3, del: 1,
+          touches: [{ uuid: 'seg-9', tool_use_id: null, op: 'update', add: null, del: null }],
+        }],
+      })} />,
+    );
+    act(() => { fireEvent.click(container.querySelector('.conv-files-file')!); });
+    act(() => { fireEvent.click(container.querySelector('.conv-files-touch')!); });
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'seg-9' });
+  });
+
+  it('leaves a focus mode that already shows the target turn alone', () => {
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'errors' }); });
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={threeFailuresOneTurn()} />,
+    );
+    const rows = container.querySelectorAll('.conv-outline-entry--landmark');
+    act(() => { fireEvent.click(rows[0]); });
+    expect(getState().convFocusMode).toBe('errors');
+  });
+
+  // ── F-G ───────────────────────────────────────────────────────────────────
+  it('labels a plan landmark rather than repeating the bare word', () => {
+    const { container } = render(<OutlinePanel sessionId="s1" outline={outline({
+      turns: [turn({ uuid: 'a1', kind: 'assistant', label: 'planning' })],
+      landmarks: [
+        {
+          landmark_key: 'cbk1.p1#plan', block_key: 'cbk1.p1', uuid: 'a1',
+          parent_uuid: 'a1', kind: 'plan', label: 'update_plan', ts: null,
+        },
+        {
+          landmark_key: 'cbk1.p2#plan', block_key: 'cbk1.p2', uuid: 'a1',
+          parent_uuid: 'a1', kind: 'plan', label: 'update_plan', ts: null,
+        },
+      ],
+    })} />);
+    const rows = Array.from(container.querySelectorAll('.conv-outline-entry--landmark'));
+    expect(rows.map((row) => row.textContent!.trim())).toEqual(['plan 1', 'plan 2']);
+  });
+});
+
+// The remediation round the browser gate forced. Every unit gate on S4 passed
+// while landmark stepping was dead in the browser, because each of the three
+// entry points into the jump pipeline was tested only on its FIRST jump, which
+// is the one jump that works from a cold cursor. These tests exercise the state
+// the browser reached: a landmark jump has already landed and pinned a SEGMENT
+// key, and the next press has to continue from there.
+describe('#463 S4 remediation round 2 — the landmark navigation entry points', () => {
+  // Two owning turns, each holding one failing call inside a follower segment.
+  // Two owners is the minimum shape that can observe stepping at all: stepping
+  // is turn-granular, so a single-owner fixture makes every target one stop and
+  // a forward press has nowhere to go whether the cursor resolved or not.
+  const twoOwners = (over: Partial<ConversationOutline> = {}) => outline({
+    stats: stats({ error_count: 2 }),
+    turns: [
+      turn({ uuid: 'h1', kind: 'human', label: 'run the suite' }),
+      turn({
+        uuid: 'a1', kind: 'assistant', label: 'first attempt',
+        segment_uuids: ['a1', 'seg-a'], tools: [{ name: 'exec', is_error: true }],
+      }),
+      turn({ uuid: 'h2', kind: 'human', label: 'try again' }),
+      turn({
+        uuid: 'a2', kind: 'assistant', label: 'second attempt',
+        segment_uuids: ['a2', 'seg-b'], tools: [{ name: 'exec', is_error: true }],
+      }),
+    ],
+    landmarks: [
+      {
+        landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'seg-a',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      },
+      {
+        landmark_key: 'cbk.e2#tool_error', block_key: 'cbk.e2', uuid: 'seg-b',
+        parent_uuid: 'a2', kind: 'tool_error', label: 'exec', ts: null,
+      },
+    ],
+    ...over,
+  });
+
+  // C-1 — the pin a landmark jump leaves behind is a SEGMENT key, and the chip
+  // resolved its cursor through the own-uuid map alone, which does not hold
+  // segment keys. The cursor therefore stayed at -1 and a backward step found
+  // nothing at all, which is what the browser saw.
+  it('steps backward from a pin left by a previous landmark jump', () => {
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-b', anchorKey: 'cbk.e2' }); });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={twoOwners()} />);
+    const chip = container.querySelector<HTMLElement>('[data-jump-kind="error"]')!;
+    act(() => { fireEvent.click(chip, { shiftKey: true }); });
+    expect(getState().conversationJump)
+      .toEqual({ session_id: 's1', uuid: 'seg-a', inner_anchor_key: 'cbk.e1' });
+  });
+
+  // The same defect seen from the other side: with the cursor stuck at -1 a
+  // backward step is not merely wrong, it reports "no such target" by pulsing.
+  it('does not report an empty family when a landmark pin is set', () => {
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-b', anchorKey: 'cbk.e2' }); });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={twoOwners()} />);
+    const chip = container.querySelector<HTMLElement>('[data-jump-kind="error"]')!;
+    act(() => { fireEvent.click(chip, { shiftKey: true }); });
+    expect(chip.classList.contains('conv-pulse-disabled')).toBe(false);
+  });
+
+  // C-3 — the rail's pinned highlight followed only its own row click, so a
+  // chip or keyboard jump left the highlight where the last CLICK put it. The
+  // pin now carries the inner anchor the jump actually used, so the rail marks
+  // the row that jump landed on whichever entry point issued it.
+  const twoLandmarksOneSegment = () => outline({
+    stats: stats({ error_count: 2 }),
+    turns: [
+      turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+      turn({
+        uuid: 'a1', kind: 'assistant', label: 'working',
+        segment_uuids: ['a1', 'seg-2'], tools: [{ name: 'exec', is_error: true }],
+      }),
+    ],
+    landmarks: [
+      {
+        landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'seg-2',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'first', ts: null,
+      },
+      {
+        landmark_key: 'cbk.e2#tool_error', block_key: 'cbk.e2', uuid: 'seg-2',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'second', ts: null,
+      },
+    ],
+  });
+
+  it('marks the row a chip or keyboard jump landed on, not every row sharing its segment', () => {
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-2', anchorKey: 'cbk.e2' }); });
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={twoLandmarksOneSegment()} />,
+    );
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain('second');
+  });
+
+  it('still marks exactly the row the rail itself was clicked on', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={twoLandmarksOneSegment()} />,
+    );
+    const rows = container.querySelectorAll('.conv-outline-entry--landmark');
+    act(() => { fireEvent.click(rows[0]); });
+    // The reader owns the pin, so mirror what its landing bookkeeping writes.
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-2', anchorKey: 'cbk.e1' }); });
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain('first');
+  });
+
+  // A pin with no inner anchor (a prompt jump, a deep link, a reading-position
+  // restore) still marks the entry that owns the uuid.
+  it('falls back to the uuid when the pin names no inner anchor', () => {
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'h2' }); });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={twoOwners()} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain('try again');
+  });
+
+  // #492 case 1 — a saved reading position carries only the segment key. It
+  // restores the segment itself, not the finer failing call that an earlier
+  // landmark jump used inside that segment. The rail must therefore mark the
+  // containing prompt, not claim that the off-screen call is current.
+  it('a bare segment restore marks its section prompt, not an unaligned landmark', () => {
+    const o = outline({
+      stats: stats({ error_count: 1 }),
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'run the suite' }),
+        turn({
+          uuid: 'a1', kind: 'assistant', label: 'working',
+          segment_uuids: ['a1', 'seg-2'], tools: [{ name: 'exec', is_error: true }],
+        }),
+      ],
+      landmarks: [{
+        landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'seg-2',
+        parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+      }],
+    });
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'seg-2' }); });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current).toHaveLength(1);
+    expect(current[0].textContent).toContain('run the suite');
+    expect(current[0].textContent).not.toContain('tool error');
+  });
+
+  // #492 case 2 — a cache-rebuild jump can land on a later member of a
+  // sidechain bucket. That member has no row of its own, but its bucket is the
+  // nearest outline ancestor and must keep the one-current-row invariant.
+  it('a pin on a non-root sidechain member marks its subagent bucket', () => {
+    const o = outline({
+      subagent_meta: { sk1: { kind: 'implementer', description: 'Server work' } },
+      turns: [
+        turn({ uuid: 'h1', kind: 'human', label: 'build it' }),
+        turn({
+          uuid: 'sa-root', kind: 'human', label: 'task', subagent_key: 'sk1',
+          is_sidechain: true,
+        }),
+        turn({
+          uuid: 'sa-target', kind: 'assistant', label: '', subagent_key: 'sk1',
+          parent_uuid: 'sa-parent-member', is_sidechain: true,
+        }),
+      ],
+    });
+    act(() => { dispatch({ type: 'SET_CONV_PINNED_TURN', uuid: 'sa-target' }); });
+    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
+    const current = container.querySelectorAll('[aria-current="true"]');
+    expect(current).toHaveLength(1);
+    expect(current[0].classList.contains('conv-outline-entry--subagent')).toBe(true);
+    expect(current[0].textContent).toContain('Server work');
+  });
+
+  // C-8 — the noun the phrase pluralized and the noun it did not.
+  it('says "in 1 turn" rather than "in 1 turns"', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({
+        stats: stats({ error_count: 3 }),
+        turns: [
+          turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+          turn({
+            uuid: 'a1', kind: 'assistant', label: 'working',
+            segment_uuids: ['a1', 'seg-2'], tools: [{ name: 'exec', is_error: true }],
+          }),
+        ],
+        landmarks: [
+          {
+            landmark_key: 'cbk.e1#tool_error', block_key: 'cbk.e1', uuid: 'a1',
+            parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+          },
+          {
+            landmark_key: 'cbk.e2#tool_error', block_key: 'cbk.e2', uuid: 'seg-2',
+            parent_uuid: 'a1', kind: 'tool_error', label: 'exec', ts: null,
+          },
+        ],
+      })} />,
+    );
+    const row = container.querySelector('.conv-outline-stat-kv--errors')!;
+    expect(row.textContent).toContain('3 errors in 1 turn');
+    expect(row.textContent).not.toContain('1 turns');
+  });
+
+  it('says "1 turn · 1 yours" in the headline of a one-turn conversation', () => {
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({
+        stats: stats({
+          turns: { total: 1, human: 1, assistant: 0, tool_result: 0, meta: 0 },
+        }),
+        turns: [turn({ uuid: 'h1', kind: 'human', label: 'go' })],
+      })} />,
+    );
+    const headline = container.querySelector('.conv-outline-stats-headline')!;
+    expect(headline.textContent).toContain('1 turn ·');
+    expect(headline.textContent).not.toContain('1 turns');
+  });
+
+  // A sibling entry point the enumeration did not name: the per-rebuild jump
+  // list dispatched its own OPEN_CONVERSATION inline, so it was the one rail row
+  // that skipped the focus-mode unhide check every other rail row performs.
+  it('resets a focus mode that would hide the turn a cache-rebuild row jumps to', () => {
+    act(() => { dispatch({ type: 'SET_CONV_FOCUS_MODE', mode: 'edits' }); });
+    const { container } = render(
+      <OutlinePanel sessionId="s1" outline={outline({
+        stats: stats({
+          cache_failures: {
+            count: 1, tokens_recreated: 10, est_wasted_usd: 0.12,
+            rebuilds: [{ uuid: 'a1', ts: null, tokens_recreated: 10, est_wasted_usd: 0.12, subagent_key: null }],
+          },
+        }),
+        turns: [
+          turn({ uuid: 'h1', kind: 'human', label: 'go' }),
+          turn({ uuid: 'a1', kind: 'assistant', label: 'working',
+                 cache_failure: { tokens_recreated: 10, prev_cached: 100, est_wasted_usd: 0.12 },
+                 tools: [{ name: 'exec', is_error: false }] }),
+        ],
+      })} />,
+    );
+    act(() => { fireEvent.click(container.querySelector('.conv-rebuild-jump')!); });
+    expect(getState().convFocusMode).toBe('all');
+    expect(getState().conversationJump).toEqual({ session_id: 's1', uuid: 'a1' });
+  });
+});

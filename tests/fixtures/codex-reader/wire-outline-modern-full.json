@@ -1,0 +1,190 @@
+{
+  "children": [],
+  "conversation_key": "v1.fixturec81204807dbe20903e1834a35f6dadc0",
+  "files": [
+    {
+      "added": null,
+      "count": 1,
+      "file_path": "synthetic.txt",
+      "removed": null,
+      "tool": "apply_patch",
+      "touches": [
+        {
+          "item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+          "op": null,
+          "timestamp_utc": "2026-07-14T12:10:00Z"
+        }
+      ]
+    }
+  ],
+  "landmarks": [
+    {
+      "block_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4",
+      "item_key": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+      "kind": "reasoning",
+      "label": "Synthetic summary",
+      "landmark_key": "cbk1_46f768a23b6b2c7a19ee418601f113eb72a2d9d4#0",
+      "parent_item_key": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+      "timestamp_utc": "2026-07-14T12:03:20Z"
+    }
+  ],
+  "stats": {
+    "cost_usd": 0.0051625,
+    "duration_seconds": 600,
+    "error_count": 0,
+    "items": 8,
+    "kinds": {
+      "assistant": 2,
+      "event": 6,
+      "reasoning": 2,
+      "tool_call": 4,
+      "tool_output": 3,
+      "user": 2
+    },
+    "models": {
+      "gpt-synthetic-codex": 1
+    },
+    "tokens": {
+      "cached_input": 300,
+      "input": 1200,
+      "output": 400,
+      "reasoning_output": 100,
+      "source": "codex"
+    },
+    "tool_counts": {
+      "fixture_custom": 1,
+      "fixture_function": 1,
+      "tool_search_call": 1,
+      "web_search_call": 1
+    }
+  },
+  "status": "ok",
+  "turns": [
+    {
+      "item_key": "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Synthetic first meaningful user prompt",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_18c2d72bdc13e2f3877da3afc24918c530aaab36"
+      ],
+      "timestamp_utc": "2026-07-14T12:03:00Z"
+    },
+    {
+      "first_failure_name": null,
+      "item_key": "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6",
+      "kinds": {
+        "assistant": 2,
+        "event": 1,
+        "reasoning": 2,
+        "tool_call": 4,
+        "tool_output": 3
+      },
+      "label": "Synthetic assistant response",
+      "member_item_keys": [
+        "civ1_aeca72557d48349c1ffb7fef62c3a9d4896a514e"
+      ],
+      "model": "gpt-synthetic-codex",
+      "segment_item_keys": [
+        "civ1_53a0f7d7fabb59f2f5b4c52906928136ed7648f6"
+      ],
+      "thinking": [
+        "Synthetic summary"
+      ],
+      "timestamp_utc": "2026-07-14T12:03:10Z",
+      "tool_call_count": 4,
+      "tools": [
+        {
+          "is_error": false,
+          "name": "fixture_function"
+        },
+        {
+          "is_error": false,
+          "name": "fixture_custom"
+        },
+        {
+          "is_error": false,
+          "name": "tool_search_call"
+        },
+        {
+          "is_error": false,
+          "name": "web_search_call"
+        }
+      ]
+    },
+    {
+      "item_key": "civ1_057462c17ca43c2918526886f6f6a7f0ce5c70b3",
+      "kinds": {
+        "event": 1
+      },
+      "label": "task_complete done",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_057462c17ca43c2918526886f6f6a7f0ce5c70b3"
+      ],
+      "timestamp_utc": "2026-07-14T12:08:00Z"
+    },
+    {
+      "item_key": "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427",
+      "kinds": {
+        "event": 1
+      },
+      "label": "context_compacted",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_280b76eb0c12c9f70fc8b63c71bb9be38f197427"
+      ],
+      "timestamp_utc": "2026-07-14T12:09:00Z"
+    },
+    {
+      "item_key": "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983",
+      "kinds": {
+        "event": 1
+      },
+      "label": "patch_apply synthetic.txt",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_3aa0bb4b2787fab736a2fafa4c90cc8fea248983"
+      ],
+      "timestamp_utc": "2026-07-14T12:10:00Z"
+    },
+    {
+      "item_key": "civ1_a95002d577138d681f720af29a266fdc3fda0c91",
+      "kinds": {
+        "event": 1
+      },
+      "label": "mcp_tool_call fixture",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_a95002d577138d681f720af29a266fdc3fda0c91"
+      ],
+      "timestamp_utc": "2026-07-14T12:11:00Z"
+    },
+    {
+      "item_key": "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e",
+      "kinds": {
+        "event": 1
+      },
+      "label": "web_search synthetic",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_f0962598873efd21cf808ee861d8cd27e5b74c9e"
+      ],
+      "timestamp_utc": "2026-07-14T12:12:00Z"
+    },
+    {
+      "item_key": "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de",
+      "kinds": {
+        "user": 1
+      },
+      "label": "Synthetic user event",
+      "member_item_keys": [],
+      "segment_item_keys": [
+        "civ1_d67c74b6dc0bd7876389d5cf137e2676c33752de"
+      ],
+      "timestamp_utc": "2026-07-14T12:13:00Z"
+    }
+  ]
+}

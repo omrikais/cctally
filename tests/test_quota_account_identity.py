@@ -334,7 +334,7 @@ def test_qaa_arming_survives_rebuild_verbatim(tmp_path, monkeypatch):
     finally:
         conn.close()
     # Rebuild the stats index from the journal and compare the arming row verbatim.
-    jr.rebuild_stats_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = ns["open_db"]()
     try:
         rebuilt = conn.execute(

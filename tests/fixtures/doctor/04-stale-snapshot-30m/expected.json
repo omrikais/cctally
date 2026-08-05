@@ -214,7 +214,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1006,
+                            "epoch": 1007,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -721,6 +721,16 @@
                 },
                 {
                     "details": {
+                        "refusalCount": 0,
+                        "stores": []
+                    },
+                    "id": "data.codex_prune_safety",
+                    "severity": "ok",
+                    "summary": "no refused prune",
+                    "title": "Codex orphan pruning"
+                },
+                {
+                    "details": {
                         "blocked_at": null,
                         "deferred_at": null,
                         "deferred_since": null,
@@ -985,7 +995,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 49,
+            "ok": 50,
             "warn": 8
         },
         "severity": "warn"

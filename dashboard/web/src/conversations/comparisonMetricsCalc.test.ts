@@ -45,3 +45,31 @@ describe('metricsFromOutline', () => {
     expect(m.files).toBe(0);
   });
 });
+
+// #463 S4 §6.5 — `errors` becomes nullable, following `duration_seconds` on the
+// same object, and the files precedence stops preferring an EMPTY array.
+describe('#463 S4 — Compare declines rather than reporting a false zero', () => {
+  it('preserves a null error_count instead of reporting 0 errors', () => {
+    // `?? 0` turned "nobody could tell" into "nothing failed". Compare then
+    // rendered a confident zero for a Codex conversation whose retained event
+    // payloads are gone.
+    const m = metricsFromOutline(outline({ error_count: null }), 3);
+    expect(m.errors).toBeNull();
+  });
+
+  it('prefers a populated files[] over an EMPTY provider_files[]', () => {
+    // The precedence read `provider_files?.length ?? files?.length`, which is 0
+    // — not nullish — for an empty array, so an empty provider list MASKED a
+    // populated rich one. §6.2 omits provider_files for Codex so the mask does
+    // not fire today; the precedence is wrong either way.
+    const o = outline({}, 4);
+    o.provider_files = [];
+    expect(metricsFromOutline(o, 0).files).toBe(4);
+  });
+
+  it('still prefers a populated provider_files[] when there are no rich files', () => {
+    const o = outline({}, 0);
+    o.provider_files = [{ path: 'a.py', tool: 'apply_patch', count: 2 }];
+    expect(metricsFromOutline(o, 0).files).toBe(1);
+  });
+});

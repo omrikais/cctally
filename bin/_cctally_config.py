@@ -307,6 +307,7 @@ ALLOWED_CONFIG_KEYS = (
     "dashboard.expose_transcripts",
     "dashboard.cache_failure_markers",
     "dashboard.live_tail",
+    "dashboard.lan_auth",
     "update.check.enabled",
     "update.check.ttl_hours",
     "update.channel",
@@ -1028,6 +1029,22 @@ def _config_known_value(config: dict, key: str) -> "object":
             except ValueError:
                 return True
         return True
+    if key == "dashboard.lan_auth":
+        # Boolean opt-OUT (issue #282). Default TRUE — non-loopback dashboard
+        # runs require their per-run access token unless the user explicitly
+        # disables the gate. Invalid hand edits fail safe to authentication ON.
+        block = config.get("dashboard") if isinstance(config, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        stored = block.get("lan_auth")
+        if stored is None:
+            return True
+        if isinstance(stored, bool):
+            return stored
+        # The config command normalizes accepted text spellings before write.
+        # A persisted string is therefore a hand edit, not an explicit opt-out;
+        # accept only the JSON boolean false at this security boundary.
+        return True
     if key == "telemetry.enabled":
         # Boolean opt-OUT (anonymous install-count telemetry, spec 2026-07-07).
         # Default TRUE — absence is ON. A hand-edited junk value surfaces the
@@ -1622,6 +1639,34 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
             print(json.dumps({"dashboard": {"live_tail": canonical}}, indent=2))
         else:
             print(f"dashboard.live_tail={'true' if canonical else 'false'}")
+        return 0
+    if key == "dashboard.lan_auth":
+        try:
+            canonical = c._normalize_alerts_enabled_value(raw)
+        except ValueError:
+            print(
+                f"cctally: invalid boolean value for dashboard.lan_auth: "
+                f"{raw!r} (expected true|false|yes|no|1|0|on|off)",
+                file=sys.stderr,
+            )
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing = config.get("dashboard")
+            if existing is not None and not isinstance(existing, dict):
+                print(
+                    "cctally: dashboard config error: dashboard must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            block = dict(existing or {})
+            block["lan_auth"] = canonical
+            config["dashboard"] = block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps({"dashboard": {"lan_auth": canonical}}, indent=2))
+        else:
+            print(f"dashboard.lan_auth={'true' if canonical else 'false'}")
         return 0
     if key == "telemetry.enabled":
         # Anonymous install-count telemetry opt-out (spec 2026-07-07). Mirror
@@ -2236,6 +2281,18 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                     config.pop("dashboard", None)
                 save_config(config)
             # idempotent: silent on missing key
+        return 0
+    if key == "dashboard.lan_auth":
+        # Restart-only opt-out. Removing the leaf restores the safe True
+        # default while preserving all sibling dashboard preferences.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("dashboard")
+            if isinstance(block, dict) and "lan_auth" in block:
+                del block["lan_auth"]
+                if not block:
+                    config.pop("dashboard", None)
+                save_config(config)
         return 0
     if key == "telemetry.enabled":
         # Mirror the dashboard.live_tail unset branch: drop only the enabled

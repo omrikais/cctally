@@ -3,6 +3,7 @@ import { MessageItem } from './MessageItem';
 import { sidechainIndentClass } from './sidechainIndent';
 import { SubagentIcon } from './ConvIcons';
 import { fmt } from '../lib/fmt';
+import { FAILED_STATUSES } from '../lib/conversationAdapters';
 import { abbreviateModel } from '../lib/modelName';
 import { planSubagentWindow, centeredWindow, resolveSubagentAnchorIndex, SUBAGENT_WINDOW_CAP, SUBAGENT_WINDOW_CHUNK } from './subagentWindow';
 import { reassertCenter } from './reassertCenter';
@@ -27,11 +28,70 @@ const MOBILE_LABEL_MAX = 120;
 // word "completed" would be noise); the word is spelled out only on failure
 // (✕ error) or any other non-completed terminal state (⚠ <status>). null when
 // the result carried no status field.
+//
+// #463 S4 remediation round 5 — the failure branch reads the shared
+// `FAILED_STATUSES` rather than the bare literal `'error'` it recognised
+// before. A subagent whose terminal status is the other member of that set
+// (`failed`) took the neutral ⚠ warn treatment, so the same verdict the rest of
+// the client calls an error read here as a merely-unusual terminal state.
+//
+// That defect is OBSERVED, not latent, and it is rare. A real `failed` subagent
+// exists in the store: agentId `aae67241b53c1de3f`, tool_use_id
+// `toolu_015tHCdqZwRGenff6BtHSPSm`, in session
+// `4f9bef57-34af-4043-9d51-c04ea9856f1c`. Before this change it rendered
+// `⚠ failed` while every Errors surface called it an error; it now renders
+// `✕ error`. That instance is cited instead of a rate deliberately — see below.
+//
+// HOW TO MEASURE THIS, because three attempts got it wrong in three different
+// ways. `subagent_meta` is DERIVED at read time and stored in no column, so a
+// column query cannot see this status and answers "never" — that is how two
+// rounds concluded the defect was latent. Simulate the derivation instead:
+// `_SUBAGENT_META_KEYS` carries `status` from the spawn result, and
+// `_lib_conversation_query.py:2059-2060` overwrites it verbatim from the
+// `<status>` of a `<task-notification>` that JOINS the spawn on its tool-use id.
+// Two further traps: a raw scan for the status tag also matches regex and
+// template text quoted inside transcripts, and a raw count ignores the join, so
+// it counts notifications belonging to Bash and Monitor tasks that never reach a
+// subagent at all.
+//
+// NO RATE IS QUOTED HERE ON PURPOSE. Every attempt to state one was wrong,
+// because the natural corpus ("the newest N session files") slides: the same
+// query answers differently within hours, and the per-window rate differs from
+// the whole-store rate by roughly a factor of six. A number in a permanent
+// comment cannot stay true. If you need a current figure, measure it by the
+// method above and date it where you record it.
+//
+// The remaining gap is UPSTREAM: raw session files carry `failed` far more often
+// than the derivation surfaces it, because a spawn result's own status is
+// `async_launched` and only a joining notification upgrades it. That is expected
+// rather than broken — most raw `failed` notifications belong to background
+// tasks that are not subagents (investigated and closed as invalid, #495).
+//
+// This component is CLAUDE-ONLY, so none of the above is a statement about both
+// stores. The Codex adapter hardcodes `subagent_key: null`
+// (`conversationAdapters.ts:964,1227`) and `_lib_codex_conversation_query.py`
+// publishes no `subagent_meta` at all, so no Codex conversation ever reaches a
+// `SidechainGroup`.
+//
+// The ⚠ branch's examples, stated by mechanism rather than by count so they stay
+// true: `async_launched` is the resting value of EVERY spawn result, so it is the
+// status an in-flight background spawn shows until a notification joins it —
+// making it the branch's most common occupant by construction. `killed` reaches
+// this component but is vanishingly rare. `running` NEVER reaches it: every
+// occurrence belongs to a Bash or Monitor background-task notification whose
+// tool-use id is absent from `agent_link`, so none joins a subagent.
+//
+// `killed` is deliberately neutral: `FAILED_STATUSES` is the single client-side
+// definition of a failing status and mirrors the server kernel byte for byte, so
+// calling `killed` an error here would recreate exactly the cross-surface
+// disagreement this round closed. If a killed run should count as a failure,
+// that decision belongs in `_lib_codex_landmarks._FAILED_STATUSES`, not in this
+// badge.
 function statusBadge(status?: string) {
   if (status == null) return null;
   if (status === 'completed')
     return <span className="conv-subagent-ok" aria-label="completed" title="completed">✓</span>;
-  if (status === 'error')
+  if (FAILED_STATUSES.has(status))
     return <span className="conv-subagent-err"><span aria-hidden="true">✕</span> error</span>;
   return <span className="conv-subagent-warn"><span aria-hidden="true">⚠</span> {status}</span>;
 }

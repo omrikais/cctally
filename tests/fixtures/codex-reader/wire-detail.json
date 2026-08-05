@@ -65,6 +65,7 @@
           "output": {
             "detail": {
               "card": {
+                "exit_code": null,
                 "is_error": false,
                 "parts": [
                   {
@@ -76,7 +77,8 @@
                 "schema_version": 1,
                 "status": "unknown",
                 "truncated": false,
-                "type": "terminal_output"
+                "type": "terminal_output",
+                "wall_time_seconds": null
               }
             },
             "text": "{\"ok\":true}"
@@ -95,6 +97,7 @@
           "output": {
             "detail": {
               "card": {
+                "exit_code": null,
                 "is_error": false,
                 "parts": [
                   {
@@ -106,7 +109,8 @@
                 "schema_version": 1,
                 "status": "unknown",
                 "truncated": false,
-                "type": "terminal_output"
+                "type": "terminal_output",
+                "wall_time_seconds": null
               }
             },
             "text": "{\"answer\":\"synthetic\"}"
@@ -125,6 +129,7 @@
           "output": {
             "detail": {
               "card": {
+                "exit_code": null,
                 "is_error": false,
                 "parts": [
                   {
@@ -136,7 +141,8 @@
                 "schema_version": 1,
                 "status": "completed",
                 "truncated": false,
-                "type": "terminal_output"
+                "type": "terminal_output",
+                "wall_time_seconds": null
               }
             },
             "text": "{\"name\":\"fixture-search\"}"
@@ -283,7 +289,8 @@
             "card": {
               "files": [
                 {
-                  "path": "synthetic.txt"
+                  "path": "synthetic.txt",
+                  "truncated": false
                 }
               ],
               "has_diff": false,
@@ -415,6 +422,10 @@
     "total": 8
   },
   "parent": null,
+  "session_index": {
+    "sessions": {},
+    "truncated": false
+  },
   "status": "ok",
   "title": "Synthetic first meaningful user prompt",
   "tokens": {

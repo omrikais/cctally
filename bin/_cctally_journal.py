@@ -35,7 +35,7 @@ import signal
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 
 import _cctally_core
 import _lib_accounts
@@ -1345,7 +1345,8 @@ def _report_file_account_conflicts(conflicts: int) -> None:
 # forever, for every provider, not just Codex.
 _QUOTA_SNAPSHOT_UPSERT_CLAUSE = (
     " ON CONFLICT(source, source_path, line_offset, logical_limit_key) "
-    "DO UPDATE SET account_key = excluded.account_key"
+    "DO UPDATE SET account_key = excluded.account_key "
+    "WHERE quota_window_snapshots.account_key IS NOT excluded.account_key"
 )
 
 _QUOTA_SNAPSHOT_UPSERT = _QUOTA_SNAPSHOT_INSERT + _QUOTA_SNAPSHOT_UPSERT_CLAUSE
@@ -1667,6 +1668,8 @@ def _cache_applier(decoded) -> int | None:
       `decoded[stop]`'s offset, retrying the remainder next cycle (the scalar
       cursor never advances past an unmaterialized record — spec §5.2 step 3).
     - Flock acquired + everything upserted → return None (full consumption).
+      A quota-row change advances ``codex_physical_mutation_seq`` in the same
+      transaction; an idempotent replay leaves the sequence unchanged.
     """
     quota_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
                  if _is_codex_quota_obs(rec)]
@@ -1706,7 +1709,14 @@ def _cache_applier(decoded) -> int | None:
             # must already govern the observations it covers.
             _, _file_conflicts = _apply_file_account_records(
                 cache, [decoded[i][0] for i in file_idx])
+            quota_changes_before = cache.total_changes
             _apply_quota_records(cache, [decoded[i][0] for i in quota_idx])
+            if cache.total_changes != quota_changes_before:
+                # #457: this path is independent of the fused rollout writer,
+                # but its quota rows feed the same certificate and dashboard
+                # signatures.  Keep the token atomic with the materialization.
+                import _cctally_cache
+                _cctally_cache._bump_codex_physical_mutation_seq(cache)
             cache.commit()
             _report_file_account_conflicts(_file_conflicts)
         except sqlite3.Error as exc:
@@ -4027,7 +4037,12 @@ def _recover_completed_correction(
                 "maintenance-correction-rebuild",
                 ingest_lock=True,
             ):
-                rebuild_stats_index(high_water=signal.high_water)
+                rebuild_stats_index(
+                    context=RebuildContext(
+                        trigger="correction-recovery-in-band"
+                    ),
+                    high_water=signal.high_water,
+                )
         except BaseException as exc:
             _cleanup_new_correction_scratches(scratches_before)
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -4174,6 +4189,55 @@ _REBUILD_COUNT_TABLES = (
 )
 
 
+#: Every production path that reaches `rebuild_stats_index` against the live
+#: destination, plus one test-only identity. Closed by construction: a value
+#: outside this set is rejected by `RebuildContext.validate` (#496 S1 F3).
+#: `test-fixture` is for harnesses only, and
+#: `tests/test_stats_incident_identity.py` asserts no shipped call site emits it.
+REBUILD_TRIGGERS = frozenset({
+    "corruption-heal",
+    "interrupted-rebuild-recovery",
+    "db-rebuild",
+    "journal-repair-acknowledge",
+    "journal-repair-recovery",
+    "rederive-apply",
+    "rederive-recovery",
+    "correction-recovery-in-band",
+    "epoch-transition",
+    "test-fixture",
+})
+
+
+@dataclass(frozen=True)
+class RebuildContext:
+    """Why this rebuild ran, and what evidence preceded it (#496 S1 F3).
+
+    A bare identifier would not be enough: `trigger_error` and `forensics_path`
+    cannot be derived from it, and both are what tie a quarantine incident to
+    the forensics bundle written moments earlier.
+
+    `record_path` is resolved by `rebuild_stats_index` itself, never by a
+    caller, so preservation and the rebuild record name the same file.
+    """
+
+    trigger: str
+    trigger_error: "str | None" = None
+    forensics_path: "str | None" = None
+    record_path: "str | None" = None
+
+    def validate(self) -> "RebuildContext":
+        if self.trigger not in REBUILD_TRIGGERS:
+            raise ValueError(f"unknown rebuild trigger: {self.trigger!r}")
+        if self.record_path is not None:
+            # `rebuild_stats_index` overwrites this field unconditionally, so a
+            # caller-supplied value would be silently discarded.
+            raise ValueError(
+                "record_path is resolved by rebuild_stats_index; callers must "
+                "leave it unset"
+            )
+        return self
+
+
 @dataclass
 class RebuildResult:
     """Outcome of a `rebuild_stats_index` call (spec §5.4)."""
@@ -4299,7 +4363,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "1e0a8cc22b3dc754cb8a6074ff9d2ef28df77b656dfc65347e4afbcb6edfdfae"
+    "47bbbfde25fe4e4d40cb39671cf0c6c8fe2d8e9a7a5ce276927b410b916afd54"
 )
 
 
@@ -4532,8 +4596,15 @@ def stats_index_matches_journal_prefix(
         return False
 
 
-def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> None:
-    """Checkpoint a readable old index so removing its sidecars is kill-safe."""
+def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> str:
+    """Checkpoint a readable old index so removing its sidecars is kill-safe.
+
+    Returns what it actually did, so the incident manifest can say whether the
+    explicit checkpoint ran (#496 S1 F8). Failure still RAISES rather than
+    returning an outcome — the caller records `failed` and re-raises, because
+    proceeding past an undrained WAL would pair stale sidecars with the
+    replacement main file.
+    """
     import _cctally_db
 
     try:
@@ -4551,11 +4622,281 @@ def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> None:
         # Auto-heal necessarily starts from an unreadable family. Preserve its
         # exact bytes below, then publish the already-validated replacement.
         if _cctally_db._is_sqlite_corruption_error(exc):
-            return
+            return "skipped_corrupt"
         raise
+    return "checkpointed"
 
 
-def _preserve_stats_family_for_cutover(path: pathlib.Path) -> pathlib.Path:
+def _utc_iso_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+
+def validate_published_stats_index(
+    path, high_water: "tuple[str, int] | None"
+) -> "str | None":
+    """Validate an index on a FRESH read-only connection (#496 S1 F1).
+
+    Returns None on success, or a short failure reason. The building
+    connection wrote the pages it then validated, so it is not an independent
+    witness to what reached the disk; this reopens the file instead. The
+    mechanism is already proven by `stats_index_matches_journal_prefix`, which
+    runs the same check on the same kind of connection.
+
+    Public because `stats_open_guarded` runs exactly this check when it
+    resolves a pending publication marker.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            _validate_rebuilt_stats_index(conn, high_water)
+        finally:
+            conn.close()
+    except BaseException as exc:
+        return f"{type(exc).__name__}: {exc}"[:500]
+    return None
+
+
+def _publication_marker_path(destination) -> pathlib.Path:
+    return pathlib.Path(str(destination) + ".publication")
+
+
+def _write_publication_marker(
+    destination, record_path, *, started_at: str, scratch_path,
+    status: str = "pending", error: "str | None" = None,
+    prior: "dict | None" = None,
+) -> None:
+    """Publish the durable marker a later opener honours (#496 S1 F1).
+
+    Mirrors the existing `cache.db.repairing` marker idiom.
+    `_atomic_write_private_json` writes at mode 0600 and fsyncs both the file
+    and its parent directory.
+
+    `scratchPath` records the exact index this publication was about to install.
+    Across processes `os.replace` is the only thing that consumes a scratch, so
+    its presence or absence on disk is an exact answer to "did this run replace
+    the destination?" — which is what interrupted-rebuild recovery needs in
+    order to tell a marker it supersedes from one whose verdict is still owed.
+    (Within one process the claim is weaker; see
+    `_cctally_store._pending_stats_publication_never_replaced`.)
+
+    `priorFailure` carries a settled verdict this publication is about to
+    overwrite, so a crash before `os.replace` cannot discard it — see
+    `_settle_prior_publication_verdict`.
+    """
+    import _cctally_db
+
+    payload = {
+        "schemaVersion": 1,
+        "status": status,
+        "recordPath": str(record_path),
+        "startedAtUtc": started_at,
+        "scratchPath": str(scratch_path),
+    }
+    if error is not None:
+        payload["error"] = error
+    if prior:
+        payload["priorFailure"] = prior
+    _cctally_db._atomic_write_private_json(
+        _publication_marker_path(destination), payload
+    )
+    _fsync_dir(pathlib.Path(destination).parent)
+
+
+def _read_publication_marker(destination) -> "dict | None":
+    """The marker's state as a MAPPING, or None when no marker exists.
+
+    Present-but-unusable bytes read as an empty mapping, for the reason given
+    in `_cctally_store._read_stats_publication_marker`.
+    """
+    try:
+        state = json.loads(_publication_marker_path(destination).read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _settle_prior_publication_verdict(destination) -> "dict | None":
+    """Settle the verdict a PREVIOUS publication still owes, before this one
+    overwrites the single marker slot (#496 S1 F1).
+
+    `<db>.publication` is one file, so Phase 1 of a new publication destroys
+    whatever the last one left there. `cmd_db_rebuild` takes maintenance
+    EXCLUSIVE without opening the live database through `stats_open_guarded`,
+    so a rebuild can legitimately begin while a pending marker still owes a
+    verdict on an already-published, never-validated index. If this run then
+    dies between its own marker write and its `os.replace`, the next opener
+    sees a pending marker beside this run's own scratch, discards it as
+    never-replaced, and accepts the earlier index having never validated it.
+
+    Resolving is preferred over refusing to overwrite, because a refusal would
+    wedge the one operation that repairs a bad index behind the marker that
+    reports it. Returns the verdict to CARRY into this run's marker, or None
+    when nothing is owed:
+
+    - a `failed` marker is already settled and is carried verbatim;
+    - a `pending` marker whose own scratch is still on disk never replaced
+      anything, so it owes nothing about the live bytes of its own — but it may
+      still be CARRYING an older run's verdict, which is passed through so a
+      third consecutive crashed run cannot drop it;
+    - a `pending` marker whose scratch is gone is settled HERE, by validating
+      the destination against its record's pinned high-water — the same check
+      the opener would have run. Success clears it; failure is written to both
+      the marker and the record before this run touches the destination, and is
+      then carried forward.
+
+    A marker that cannot be judged (no record, or no pinned high-water) is left
+    to the opener's existing discard policy rather than wedging the rebuild.
+    """
+    import _cctally_db
+
+    state = _read_publication_marker(destination)
+    if not state:
+        return None
+    status = str(state.get("status") or "")
+    if status == "failed":
+        return state
+    if status != "pending":
+        return None
+    scratch = state.get("scratchPath")
+    if isinstance(scratch, str) and scratch and pathlib.Path(scratch).exists():
+        # This marker owes nothing itself, but dropping what it carries would
+        # lose an older run's verdict once a third run crashes the same way.
+        carried = state.get("priorFailure")
+        return carried if isinstance(carried, dict) and carried else None
+    record_path = state.get("recordPath")
+    record = None
+    if isinstance(record_path, str):
+        try:
+            record = json.loads(pathlib.Path(record_path).read_text())
+        except (OSError, ValueError):
+            record = None
+    if not isinstance(record, dict) or "highWater" not in record:
+        return None
+    raw = record.get("highWater")
+    high_water = (
+        (str(raw[0]), int(raw[1]))
+        if isinstance(raw, (list, tuple)) and len(raw) == 2
+        else None
+    )
+    error = validate_published_stats_index(destination, high_water)
+    if error is None:
+        _remove_publication_marker(destination)
+        return None
+    settled = dict(state)
+    settled.update({"status": "failed", "error": error})
+    # Durable BEFORE this run touches the destination: a crash between here and
+    # the marker this run is about to write must still leave the verdict.
+    _cctally_db._atomic_write_private_json(
+        _publication_marker_path(destination), settled
+    )
+    _fsync_dir(pathlib.Path(destination).parent)
+    record.update({
+        "status": "failed",
+        "postPublicationValidation": {"ok": False, "error": error},
+    })
+    try:
+        _write_rebuild_record(record_path, record)
+    except OSError:
+        pass
+    print(
+        "[stats] an earlier stats.db publication was interrupted before it "
+        f"could validate what it published, and it FAILED that check: {error}. "
+        f"Rebuild record: {record_path}.",
+        file=sys.stderr,
+    )
+    return settled
+
+
+def _remove_publication_marker(destination) -> None:
+    try:
+        _publication_marker_path(destination).unlink()
+    except FileNotFoundError:
+        pass
+    _fsync_dir(pathlib.Path(destination).parent)
+
+
+def _write_rebuild_record(path, payload: dict) -> None:
+    import _cctally_db
+
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _cctally_db._atomic_write_private_json(path, payload)
+
+
+def _forensics_shape_token(forensics_path) -> "str | None":
+    if not forensics_path:
+        return None
+    try:
+        bundle = json.loads(pathlib.Path(forensics_path).read_text())
+    except (OSError, ValueError):
+        return None
+    damage = bundle.get("damage")
+    return damage.get("shapeToken") if isinstance(damage, dict) else None
+
+
+def _scan_stats_damage(path) -> dict:
+    """Describe one stats family member by reading its bytes. Never raises."""
+    try:
+        import _lib_stats_damage
+
+        return _lib_stats_damage.describe_damage(integrity_rows=None, path=path)
+    except Exception as exc:  # noqa: BLE001 — enrichment never breaks a rebuild
+        return {
+            "schemaVersion": 1,
+            "method": "unavailable",
+            "findings": [],
+            "shapeToken": "none",
+            "reason": f"{type(exc).__name__}: {exc}"[:200],
+        }
+
+
+def _record_post_checkpoint_damage(
+    incident: pathlib.Path, destination: pathlib.Path, outcome: str,
+) -> "dict | None":
+    """Add the post-checkpoint scan to an already-written incident manifest.
+
+    A second `_atomic_write_private_json` to the same path is safe: the write
+    is atomic and nothing references the incident yet. It has to be a second
+    write because preservation runs BEFORE the explicit checkpoint, so the
+    outcome this records does not exist when the manifest is first written.
+    """
+    import _cctally_db
+
+    try:
+        manifest_path = incident / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        damage = manifest.get("damage") or {}
+        damage["postCheckpoint"] = _scan_stats_damage(destination)
+        damage["checkpointOutcome"] = outcome
+        manifest["damage"] = damage
+        _cctally_db._atomic_write_private_json(manifest_path, manifest)
+        return damage
+    except Exception as exc:  # noqa: BLE001 — enrichment never breaks a rebuild
+        print(
+            f"[rebuild] post-checkpoint damage scan failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _binary_version() -> "str | None":
+    """The running binary's released version, or None when it cannot be read."""
+    try:
+        import _lib_changelog
+
+        value = _lib_changelog._read_latest_changelog_version()
+    except Exception:  # pragma: no cover — a missing CHANGELOG is not fatal
+        return None
+    return value[0] if value else None
+
+
+def _preserve_stats_family_for_cutover(
+    path: pathlib.Path, *, context: RebuildContext,
+) -> pathlib.Path:
     """Durably copy the old family into quarantine without removing the main."""
     import _cctally_db
 
@@ -4580,9 +4921,21 @@ def _preserve_stats_family_for_cutover(path: pathlib.Path) -> pathlib.Path:
     ]
     if not members:
         raise OSError(f"no database family exists to preserve at {path}")
+    # Observed sizes are read BEFORE the copy, so the empty-WAL case in the
+    # routine corruption heal is evidenced rather than assumed (#496 S1 F2).
+    family_sizes = {}
+    for name in members:
+        try:
+            family_sizes[name] = path.with_name(name).stat().st_size
+        except OSError:
+            family_sizes[name] = None
+    # Read from the raw header rather than by opening the file: the file this
+    # is asked about is typically one SQLite refuses to open, which is exactly
+    # when the epoch it carried is worth recording (#496 S1).
+    preserved_user_version = _cctally_db._read_user_version_header(path)
     _cctally_db._copy_db_family(path, destination)
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "quarantinedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(
             timespec="seconds"
         ).replace("+00:00", "Z"),
@@ -4590,6 +4943,25 @@ def _preserve_stats_family_for_cutover(path: pathlib.Path) -> pathlib.Path:
         "movedFiles": members,
         "complete": True,
         "cutoverProtocol": "preserve-then-atomic-replace-v1",
+        # #496 S1 additive fields. Every key above keeps its v1 name and
+        # meaning, so a v1 reader is unaffected by the bump.
+        "trigger": context.trigger,
+        "triggerError": context.trigger_error,
+        "forensicsPath": context.forensics_path,
+        "rebuildRecordPath": context.record_path,
+        "binaryVersion": _binary_version(),
+        "binaryEpoch": _cctally_core.STATS_INDEX_EPOCH,
+        "preservedUserVersion": preserved_user_version,
+        "familySizes": family_sizes,
+        # The retained COPY is described, not the live file, because the copy
+        # is the artifact that actually survives. `postCheckpoint` and
+        # `checkpointOutcome` are filled in by the caller once the explicit
+        # checkpoint has run (#496 S1 F8 section 6.3).
+        "damage": {
+            "preserved": _scan_stats_damage(destination),
+            "postCheckpoint": None,
+            "checkpointOutcome": None,
+        },
     }
     _cctally_db._atomic_write_private_json(incident / "manifest.json", manifest)
     _fsync_dir(incident)
@@ -4602,16 +4974,35 @@ def _publish_rebuilt_stats_index(
     scratch: pathlib.Path,
     destination: pathlib.Path,
     preserve_existing: bool,
+    context: RebuildContext,
+    high_water: "tuple[str, int] | None",
+    record: dict,
     before_swap=None,
 ) -> "pathlib.Path | None":
-    """Publish one validated, closed, sidecar-free scratch index atomically."""
+    """Publish one validated, closed, sidecar-free scratch index atomically.
+
+    Publication is a two-phase durable transaction (#496 S1 F1). After
+    `os.replace` no scratch pathname remains, so interrupted-rebuild recovery
+    cannot activate, and the published file carries the current epoch so
+    `open_db`'s zero-DDL fast path returns it with no validation. A
+    post-publication failure that only RAISED would therefore leave a known-bad
+    index accepted by every later command. The record and the marker are what
+    make the verdict outlive this process.
+    """
     import _cctally_store
+
+    # A marker already beside the destination may still owe a verdict on bytes
+    # that are live right now. Settle it BEFORE Phase 1 overwrites the only
+    # marker slot, while the destination is still exactly what that publication
+    # left there.
+    prior = _settle_prior_publication_verdict(destination)
 
     family_exists = any(
         pathlib.Path(str(destination) + suffix).exists()
         for suffix in ("", "-wal", "-shm")
     )
     incident = None
+    damage_tokens = None
     if family_exists:
         blocked = _cctally_store._stats_family_drained(destination)
         if blocked is not None:
@@ -4620,20 +5011,102 @@ def _publish_rebuilt_stats_index(
         if preserve_existing:
             # Preserve the exact pre-cutover family, including a committed WAL
             # and SHM, before checkpointing mutates or removes those sidecars.
-            incident = _preserve_stats_family_for_cutover(destination)
+            incident = _preserve_stats_family_for_cutover(
+                destination, context=context
+            )
+        checkpoint_outcome = "skipped_absent"
         if destination.exists():
-            _prepare_existing_stats_for_cutover(destination)
+            try:
+                checkpoint_outcome = _prepare_existing_stats_for_cutover(
+                    destination
+                )
+            except BaseException:
+                if incident is not None:
+                    _record_post_checkpoint_damage(
+                        incident, destination, "failed"
+                    )
+                raise
+        if incident is not None:
+            # Scanned BEFORE the sidecars are removed, so this and the
+            # preserved scan bracket the explicit checkpoint.
+            damage = _record_post_checkpoint_damage(
+                incident, destination, checkpoint_outcome
+            )
+            if damage:
+                damage_tokens = {
+                    "forensics": _forensics_shape_token(context.forensics_path),
+                    "preserved": (damage.get("preserved") or {}).get(
+                        "shapeToken"
+                    ),
+                    "postCheckpoint": (damage.get("postCheckpoint") or {}).get(
+                        "shapeToken"
+                    ),
+                    "checkpointOutcome": damage.get("checkpointOutcome"),
+                }
         # The old main stays present and, when it was readable, fully
         # checkpointed. A kill from here until os.replace therefore still
         # leaves a usable old destination while preventing stale sidecars from
         # being paired with the replacement main.
         _remove_db_sidecars_strict(destination)
+        _cctally_store._stats_storm_test_pause("stats_replace_sidecars_removed")
 
     if before_swap is not None:
         before_swap()
+
+    # Phase 1 of the publication transaction: the record and then the marker,
+    # each fsynced, BEFORE the replacement becomes visible.
+    started_at = _utc_iso_now()
+    record = dict(record)
+    record.update({
+        "status": "pending",
+        "startedAtUtc": started_at,
+        "completedAtUtc": None,
+        "incidentPath": str(incident) if incident is not None else None,
+        "damageShapeTokens": damage_tokens,
+        "postPublicationValidation": None,
+    })
+    record_path = pathlib.Path(context.record_path)
+    _write_rebuild_record(record_path, record)
+    _write_publication_marker(
+        destination, record_path, started_at=started_at, scratch_path=scratch,
+        prior=prior,
+    )
+
     _stats_rebuild_test_pause("rebuild_before_cutover")
     os.replace(str(scratch), str(destination))
     _fsync_dir(destination.parent)
+    _stats_rebuild_test_pause("rebuild_after_publication_replace")
+
+    # Phase 2: validate the bytes that are now live, on a connection that never
+    # saw them being written.
+    post_error = validate_published_stats_index(destination, high_water)
+    # The read-only open above creates a zero-byte WAL and a 32 KiB SHM.
+    # Remove them so the documented no-post-publication-stale-sidecar end state
+    # still holds; an empty WAL is consistent with the freshly published main,
+    # so a crash between validation and removal is harmless.
+    _remove_db_sidecars_strict(destination)
+
+    record["postPublicationValidation"] = {
+        "ok": post_error is None,
+        "error": post_error,
+    }
+    record["completedAtUtc"] = _utc_iso_now()
+    record["status"] = "ok" if post_error is None else "failed"
+    _write_rebuild_record(record_path, record)
+    if post_error is not None:
+        # No rollback is possible: the old family is already quarantined, and
+        # restoring it would republish a file known to be corrupt. Any carried
+        # prior verdict is dropped here on purpose: `os.replace` succeeded, so
+        # the bytes it judged are gone and THIS failure is the live one.
+        _write_publication_marker(
+            destination, record_path, started_at=started_at,
+            scratch_path=scratch, status="failed", error=post_error,
+        )
+        raise JournalError(
+            "published stats index failed post-publication validation: "
+            f"{post_error}; rebuild record: {record_path}"
+        )
+    _remove_publication_marker(destination)
     return incident
 
 
@@ -4707,6 +5180,7 @@ def _rebuild_quota_cache_leg(records) -> None:
 
 def rebuild_stats_index(
     *,
+    context: RebuildContext,
     target_path=None,
     high_water: "tuple[str, int] | None" = None,
     update_quota_cache: bool = True,
@@ -4721,6 +5195,10 @@ def rebuild_stats_index(
     no alerts, no `reconcile_config` (see the module note above). Post-rebuild the
     cursor equals the journal high-water.
 
+    `context` states WHY this rebuild ran (#496 S1 F3). It is keyword-only with
+    no default, so a future call site cannot silently produce an unattributed
+    quarantine incident; omitting it raises `TypeError` at the call.
+
     `target_path` selects the destination (default `DB_PATH`). `high_water`
     optionally pins the exact inclusive journal prefix; later bytes stay beyond
     the rebuilt cursor. `update_quota_cache=False` is the Task-C Claude-only
@@ -4731,6 +5209,17 @@ def rebuild_stats_index(
     publication but does not create a live-family quarantine incident.
     """
     start = time.monotonic()
+    context = context.validate()
+    # Resolve the rebuild record's path ONCE, here, because preservation runs
+    # long before the record is written and both must name the same file
+    # (#496 S1). Callers never supply it.
+    record_stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+    context = _dc_replace(
+        context,
+        record_path=str(
+            _cctally_core.LOG_DIR / f"stats-rebuild-{record_stamp}.json"
+        ),
+    )
     dest = (pathlib.Path(target_path) if target_path is not None
             else pathlib.Path(_cctally_core.DB_PATH))
 
@@ -4907,11 +5396,44 @@ def rebuild_stats_index(
     with scratch.open("rb") as handle:
         os.fsync(handle.fileno())
     _fsync_dir(scratch.parent)
+
+    # First fresh-connection validation (#496 S1 F1). A failure here raises
+    # BEFORE any preservation, so no incident is created and the old family
+    # stays live — the existing contract is preserved exactly.
+    pre_error = validate_published_stats_index(scratch, hw)
+    if pre_error is not None:
+        raise JournalError(
+            f"rebuilt stats index failed pre-publication validation: {pre_error}"
+        )
+    # That read-only open recreated the scratch sidecars; publication requires
+    # a sidecar-free scratch, and a leftover pair would also survive the
+    # `os.replace` as a stray artifact.
+    _remove_db_sidecars_strict(scratch)
+
     incident = _publish_rebuilt_stats_index(
         scratch=scratch,
         destination=dest,
         preserve_existing=target_path is None,
         before_swap=before_swap,
+        context=context,
+        high_water=hw,
+        record={
+            "schemaVersion": 1,
+            "trigger": context.trigger,
+            "triggerError": context.trigger_error,
+            "forensicsPath": context.forensics_path,
+            "binaryVersion": _binary_version(),
+            "binaryEpoch": _cctally_core.STATS_INDEX_EPOCH,
+            "highWater": [hw[0], hw[1]] if hw is not None else None,
+            "destination": str(dest),
+            "targetPath": str(target_path) if target_path is not None else None,
+            "segmentsRead": len(segments),
+            "linesFolded": lines_folded,
+            "malformed": malformed,
+            "rowsByTable": rows_by_table,
+            "buildSeconds": round(time.monotonic() - start, 3),
+            "prePublicationValidation": {"ok": True, "error": None},
+        },
     )
 
     return RebuildResult(
@@ -5386,5 +5908,5 @@ def run_epoch_transition(*, claude_json_path=None) -> str:
     preserves the old index only after the replacement is validated."""
     claude_key = _resolve_claude_cutover_identity(claude_json_path)
     recorded = append_accounts_cutover_op(claude_key)
-    rebuild_stats_index()
+    rebuild_stats_index(context=RebuildContext(trigger="epoch-transition"))
     return recorded
