@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.92.2] - 2026-08-06
+
+### Changed
+- Rebuilding the stats index now uses about half the memory it used to. On a 1.7 GB journal the rebuild's peak memory dropped from 9.0 GB to 4.6 GB, and the memory Python itself holds dropped from 6.5 GB to 2.1 GB. The rebuild used to read the whole journal twice — once to hold every raw line and once to hold every parsed record — and then read it a third time from the beginning to find one operator record; it now reads each byte at most once and keeps only the records it actually replays. Reading and decoding the journal got faster (12.2 s to 9.5 s), the separate search for that operator record disappeared entirely (6.3 s to none), and a whole rebuild finished in 62.9 s instead of 68.9 s. Nothing about the resulting index changed: the same records are selected, the same rows are written, and the same corrections win. One thing did get worse, and you may notice it: while a rebuild replays Codex quota history it now blocks other commands from writing the Codex cache for longer than before — about 38% longer on a run whose data is already in memory (16.7 s to 23.0 s) and about 18% longer on a cold one (41.6 s to 48.9 s) — because the quota records are now decoded while that lock is held instead of before it is taken (#496).
+
+### Fixed
+- A readable but structurally damaged stats index no longer traps an upgrade or recovery in an endless rebuild loop. Version 1.92.1 could copy a healthy rebuilt generation into a file that still contained unreferenced pages, preserve those pages because no schema object named them, fail its post-publication integrity check, and leave the dashboard at `server sync error`; CLI block reports then lost their authoritative reset anchors and marked every block approximate. Publication now checks the destination before mutating it and uses the validated replacement path when the existing file fails integrity, while healthy files keep the in-place transactional path (#496).
+
 ## [1.92.1] - 2026-08-06
 
 ### Changed

@@ -549,6 +549,7 @@ def test_explicit_claude_current_week_retains_actual_and_digests_hero_freshness(
 def test_source_less_current_week_keeps_legacy_shape_when_hero_is_stale(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-08-01T12:00:00Z")
     ns = load_script()
     monkeypatch.setitem(
         ns, "_share_now_utc_iso", lambda: "2026-08-01T12:00:00Z"

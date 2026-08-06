@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace as _dc_replace
 import _cctally_core
 import _lib_accounts
 import _lib_journal
+import _lib_journal_router
 import _lib_record
 
 
@@ -178,12 +179,10 @@ def _repair_torn_tail(fd: int) -> None:
 # public append surface
 # --------------------------------------------------------------------------
 
-def _is_codex_quota_obs(record: dict) -> bool:
-    return (
-        record.get("t") == "obs"
-        and record.get("provider") == "codex"
-        and (record.get("payload") or {}).get("kind") == "quota_window_snapshot"
-    )
+# NOTE: `_is_codex_quota_obs` is defined ONCE, further down beside
+# `_QUOTA_OBS_KIND`. A duplicate definition used to sit here and was shadowed by
+# that one at import time, so it was dead code an edit here would silently not
+# reach (#496 S4). Do not reintroduce a second definition.
 
 
 def _codex_quota_natural_key(record: dict) -> str | None:
@@ -952,11 +951,18 @@ def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
 _SEGMENT_READ_CHUNK = 256 * 1024
 
 
-def _iter_segment_lines(seg_path, lo: int, hi: int):
+def _iter_segment_lines(seg_path, lo: int, hi: int, *, on_bytes=None):
     """Stream `(basename, absolute-offset, raw-line-without-newline)` for every
     complete line in `[lo, hi)`, holding at most one chunk plus one partial line
     in memory. `hi` is a line boundary (a HW snapshot size or an immutable prior
-    segment's full size), so no partial trailing line appears."""
+    segment's full size), so no partial trailing line appears.
+
+    `on_bytes` receives each chunk exactly as it is read, before any line
+    splitting. It exists so a caller can reproduce `journal_prefix_hash` from
+    the bytes this pass is already reading (#496 S4 §5.2) rather than re-reading
+    the segment; it must therefore see the raw `[lo, hi)` range verbatim,
+    including a torn trailing partial line that is never yielded.
+    """
     name = seg_path.name
     with open(seg_path, "rb") as fh:
         fh.seek(lo)
@@ -968,6 +974,8 @@ def _iter_segment_lines(seg_path, lo: int, hi: int):
             if not data:
                 break
             pos += len(data)
+            if on_bytes is not None:
+                on_bytes(data)
             buf = buf + data if buf else data
             start = 0
             while True:
@@ -979,14 +987,6 @@ def _iter_segment_lines(seg_path, lo: int, hi: int):
             if start:
                 buf = buf[start:]
                 buf_at += start
-
-
-def _read_segment_lines(seg_path, lo: int, hi: int) -> list[tuple[str, int, bytes]]:
-    """Materialized form of :func:`_iter_segment_lines` (see it for the
-    contract). Callers that walk a whole range at once should prefer
-    :func:`iter_range`; this list form is retained for the ingest cycle, which
-    needs the batch as an indexable sequence."""
-    return list(_iter_segment_lines(seg_path, lo, hi))
 
 
 def iter_range(cursor, hw):
@@ -1002,8 +1002,26 @@ def iter_range(cursor, hw):
     materialized form for the ingest cycle, which genuinely needs the batch as
     an indexable sequence (prefix-stop indices address into it).
     """
+    yield from _iter_range_with_segments(cursor, hw, list_segments())
+
+
+def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
+                              on_bytes=None):
+    """`iter_range` over a segment list the CALLER snapshotted (#496 S4 §4).
+
+    `list_segments()` enumerates the journal directory at call time and orders
+    bootstrap segments before observation segments, so a bootstrap segment
+    appearing mid-rebuild would insert ahead of the high-water segment and shift
+    the indices this function addresses by. A rebuild takes ONE snapshot at its
+    pinned high-water and drives every pass from it, so two passes of the same
+    rebuild cannot disagree about the journal's shape.
+
+    `on_segment` is called for EVERY segment in the range, including one this
+    function then skips because it holds no bytes in range: `journal_prefix_hash`
+    frames a zero-byte segment, so a hash accumulator has to be told it exists.
+    `on_bytes` is forwarded to `_iter_segment_lines`.
+    """
     hw_seg, hw_size = hw
-    segments = list_segments()
     if hw_seg not in segments:
         return
     hw_idx = segments.index(hw_seg)
@@ -1020,9 +1038,11 @@ def iter_range(cursor, hw):
         seg_path = _cctally_core.JOURNAL_DIR / seg
         lo = start_off if idx == start_idx else 0
         hi = hw_size if idx == hw_idx else os.path.getsize(seg_path)
+        if on_segment is not None:
+            on_segment(seg)
         if lo >= hi:
             continue
-        yield from _iter_segment_lines(seg_path, lo, hi)
+        yield from _iter_segment_lines(seg_path, lo, hi, on_bytes=on_bytes)
 
 
 def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
@@ -1057,20 +1077,28 @@ def journal_prefix_hash(high_water) -> "str | None":
     return "sha256:" + digest.hexdigest()
 
 
-def _capture_protocol_prefix_evidence(record, prior_high_water, evidence) -> None:
-    """Capture the actual raw prefix immediately preceding one audit record."""
+def _capture_protocol_prefix_evidence(
+    record, prior_high_water, evidence, hasher=None
+) -> None:
+    """Capture the actual raw prefix immediately preceding one audit record.
+
+    `hasher` is a `_lib_journal_router.PrefixHashAccumulator` fed by the caller's
+    streaming pass. When supplied, the digest comes from bytes that pass has
+    already read; otherwise `journal_prefix_hash` re-reads the whole prefix from
+    disk, which is what the streaming callers exist to avoid (#496 S4 §5.2). The
+    two produce the identical durable digest.
+    """
     if (
         record.get("t") == "op"
         and isinstance(record.get("payload"), dict)
         and record["payload"].get("kind")
         == _lib_journal._PROTOCOL_RESOLUTION_KIND
     ):
-        evidence.append(
-            (
-                prior_high_water,
-                journal_prefix_hash(prior_high_water),
-            )
+        digest = (
+            hasher.digest_at(prior_high_water) if hasher is not None
+            else journal_prefix_hash(prior_high_water)
         )
+        evidence.append((prior_high_water, digest))
 
 
 # --------------------------------------------------------------------------
@@ -2017,6 +2045,8 @@ def _derive_account_last_seen(conn, records) -> None:
     prior observe already created (never invents an account row)."""
     latest: dict = {}
     for rec in records:
+        if rec is None:
+            continue
         key = _account_of(rec)
         at = rec.get("at")
         if not key or not at:
@@ -2024,6 +2054,17 @@ def _derive_account_last_seen(conn, records) -> None:
         prev = latest.get(key)
         if prev is None or at > prev:
             latest[key] = at
+    _apply_account_last_seen(conn, latest)
+
+
+def _apply_account_last_seen(conn, latest) -> None:
+    """Apply a precomputed `{account_key: max_at}` map.
+
+    Split out so the rebuild can accumulate the map during its single streaming
+    pass (#496 S4 §4.2) instead of walking every record again inside the
+    publication transaction. The rebuild's retained list no longer contains
+    observations at all, so calling `_derive_account_last_seen` over it would
+    silently drop every observation's contribution."""
     for key, at in latest.items():
         conn.execute(
             "UPDATE accounts SET last_seen_utc = ? WHERE account_key = ? "
@@ -3428,6 +3469,10 @@ def _correction_commit_high_water(batch_id, hw=None):
     selector or by the live metadata row that names it. The earliest matching
     commit is the narrowest complete prefix and remains stable even when later
     journal bytes or crash-replayed duplicate markers exist.
+
+    Streams rather than materializing (#496 S4): the previous form built the
+    whole prefix through `_read_range` before its first-match return, so a
+    marker in the first segment still paid for every later one.
     """
     if not batch_id:
         return None
@@ -3435,7 +3480,7 @@ def _correction_commit_high_water(batch_id, hw=None):
         hw = journal_high_water()
     if hw is None:
         return None
-    for segment, offset, raw in _read_range(None, hw):
+    for segment, offset, raw in iter_range(None, hw):
         record = _lib_journal.decode_line(raw)
         if (
             record is not None
@@ -4259,6 +4304,25 @@ class RebuildResult:
     # batches remain tainted; this is diagnostic/audit state, never validity.
     acknowledged_protocol_violations: tuple = ()
     quarantine_dir: "pathlib.Path | None" = None
+    # #496 S4 §8.7 — ADDITIVE instrumentation. Names, units and pass boundaries
+    # are fixed by the spec so the gate's assertions are unambiguous; adding
+    # them does not bump the rebuild record's `schemaVersion` and no existing
+    # field changes meaning.
+    #: float seconds per phase. Keys: journal_read_decode, cutover_suffix,
+    #: protocol_evidence, effective_selection, quota_cache_leg, stats_fold,
+    #: scratch_validate, publication. The phases are DISJOINT — evidence hashing
+    #: happens inside the read loop and is subtracted from journal_read_decode.
+    phase_seconds: dict = field(default_factory=dict)
+    #: per named pass, `{lines, bytes, decodes}`. Passes: stats_prefix (the
+    #: router), cutover_suffix (zero unless the §5.1 fallback ran),
+    #: protocol_evidence (`bytes` hashed and `lines` digests computed, both zero
+    #: on a journal with no resolution op), quota_replay (the in-leg decode,
+    #: where `bytes` is the retained byte total and `lines` equals `decodes`).
+    traversal: dict = field(default_factory=dict)
+    #: `tracemalloc` peak over the pre-publication window; 0 when not tracing.
+    peak_heap_bytes: int = 0
+    #: cache writer flock acquisition to release, in seconds.
+    quota_lock_hold_seconds: float = 0.0
 
 
 def _remove_db_sidecars_strict(path) -> None:
@@ -4482,26 +4546,56 @@ def stats_index_matches_journal_prefix(
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             _validate_rebuilt_stats_index(conn, high_water)
-            decoded: list[dict] = []
+            # Same streaming router as the rebuild (#496 S4 §7). This function's
+            # only output is a selection compared against
+            # `journal_effective_events`, so it needs the decision records and
+            # nothing else: no observation retention, no quota bytes, no second
+            # from-byte-zero cutover scan. The `None` placeholders keep every
+            # `enumerate` sequence — and therefore every violation fingerprint —
+            # identical to what the rebuild wrote.
+            decoded: list = []
             protocol_evidence = []
             prior_high_water = None
+            cutover_captured = _CUTOVER_UNSEEN
+            all_segments = list_segments()
+            segments = all_segments
+            hasher = _lib_journal_router.PrefixHashAccumulator()
             if high_water is not None:
-                for segment, offset, raw in _read_range(None, high_water):
+                if high_water[0] in segments:
+                    segments = segments[:segments.index(high_water[0]) + 1]
+                for segment, offset, raw in _iter_range_with_segments(
+                    None, high_water, segments,
+                    on_segment=lambda name: hasher.begin_segment(
+                        name, prior_high_water),
+                    on_bytes=hasher.extend,
+                ):
                     record = _lib_journal.decode_line(raw)
                     if record is not None:
                         _capture_protocol_prefix_evidence(
                             record,
                             prior_high_water,
                             protocol_evidence,
+                            hasher=hasher,
                         )
-                        decoded.append(record)
+                        if (cutover_captured is _CUTOVER_UNSEEN
+                                and record.get("id") == CUTOVER_OP_ID):
+                            cutover_captured = _cutover_value_of(record)
+                        decoded.append(
+                            record
+                            if record.get("t")
+                            in _lib_journal_router.RETAINED_RECORD_TYPES
+                            else None
+                        )
                     prior_high_water = (
                         segment,
                         offset + len(raw) + 1,
                     )
-            cutover_claude = resolve_cutover_claude_account()
+            hasher = None
+            cutover_claude = _resolve_cutover_for_rebuild(
+                cutover_captured, high_water, all_segments)
             for record in decoded:
-                _normalize_legacy_account_stamp(record, cutover_claude)
+                if record is not None:
+                    _normalize_legacy_account_stamp(record, cutover_claude)
             selection = _lib_journal.resolve_effective_events(
                 decoded,
                 protocol_prefix_evidence=protocol_evidence,
@@ -5449,6 +5543,51 @@ def _publish_stats_index_in_place(
             return _FALL_BACK
         raise
 
+    # Readability is not structural health. An integrity failure may consist
+    # only of pages which no sqlite_schema object and no freelist entry names.
+    # The table-by-table in-place swap cannot discover or reclaim such pages,
+    # so publishing into that file would preserve the damage and fail its
+    # post-publication verdict forever. Use the independently validated scratch
+    # as a physical replacement before any live mutation instead.
+    try:
+        destination_integrity = [
+            str(row[0]) for row in conn.execute("PRAGMA integrity_check")
+        ]
+    except BaseException as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if sp.may_fall_back_to_replacement(exc):
+            print(
+                "[rebuild] the live stats index failed its integrity probe "
+                f"({exc}); publishing by replacement instead",
+                file=sys.stderr,
+            )
+            record["inPlaceAttempt"] = {
+                "phase": sp.PRE_COMMIT,
+                "stage": "destination_integrity",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+            return _FALL_BACK
+        raise
+    if destination_integrity != ["ok"]:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        print(
+            "[rebuild] the live stats index failed integrity_check; "
+            "publishing by replacement instead",
+            file=sys.stderr,
+        )
+        record["inPlaceAttempt"] = {
+            "phase": sp.PRE_COMMIT,
+            "stage": "destination_integrity",
+            "error": "destination failed integrity_check",
+        }
+        return _FALL_BACK
+
     started_at = _utc_iso_now()
     record_path = pathlib.Path(context.record_path)
     live = dict(record)
@@ -5559,9 +5698,10 @@ def _publish_rebuilt_stats_index(
 
     In-place transactional publication is the mechanism (#496 S3). Physical
     replacement is the fallback, taken when the destination cannot be operated
-    on structurally. The mechanism is chosen against the destination in front
-    of this run, not by the trigger that reached it: corruption is not uniform,
-    and a readable-but-damaged destination publishes in place like any other.
+    on structurally or fails an integrity check. The mechanism is chosen
+    against the destination in front of this run, not by the trigger that
+    reached it: readability alone does not prove that an object-level swap can
+    reclaim every damaged page.
 
     Publication is a two-phase durable transaction (#496 S1 F1) under either
     mechanism. A published file carries the current epoch, so `open_db`'s
@@ -5714,9 +5854,36 @@ def _publish_rebuilt_stats_index(
     return incident
 
 
-def _rebuild_quota_cache_leg(records) -> None:
+def _decoded_quota_stream(quota_raw, cutover_claude, counters=None):
+    """Decode and normalize retained observation bytes ONE AT A TIME.
+
+    Peak heap therefore holds one record rather than the whole population.
+    Normalization runs HERE, on the record decoded from the retained bytes: a
+    dict normalized during the router pass is discarded with the pass, so
+    stamping it there would be lost and every legacy observation would
+    re-materialize with a NULL account_key. A Codex legacy line maps to
+    `unattributed` regardless of the cutover value, so this does not depend on
+    capture ordering (#496 S4 §6.3).
+    """
+    for raw in quota_raw:
+        if counters is not None:
+            counters["lines"] += 1
+            counters["bytes"] += len(raw) + 1
+        record = _lib_journal.decode_line(raw)
+        if record is None:  # pragma: no cover — retained bytes decoded once already
+            continue
+        if counters is not None:
+            counters["decodes"] += 1
+        _normalize_legacy_account_stamp(record, cutover_claude)
+        yield record
+
+
+def _rebuild_quota_cache_leg_raw(
+    quota_raw, decoded, cutover_claude, counters=None
+) -> float:
     """Re-materialize cache.db `quota_window_snapshots` AND the #416 Codex
-    attribution map from the journal (spec §5.4 + #416 spec §3.4).
+    attribution map from the journal (spec §5.4 + #416 spec §3.4), fed RAW
+    ENCODED LINES for the observations instead of decoded dicts.
 
     The journal records are the DURABLE source (§1 latent data-loss hole — the
     rollout JSONL evaporates); this INSERT-OR-IGNOREs the quota obs on their
@@ -5730,14 +5897,31 @@ def _rebuild_quota_cache_leg(records) -> None:
     followed by the `cache.db.codex.lock` provider flock (lock-order law).
     Best-effort: a missing/busy cache.db is a clean skip (the records stay
     durable in the journal; the stats quota projection pass then degrades
-    cleanly)."""
-    quota_obs = [r for r in records if _is_codex_quota_obs(r)]
-    file_accounts = [r for r in records if _is_codex_file_account_op(r)]
-    if not quota_obs and not file_accounts:
-        return
+    cleanly).
+
+    Taking raw bytes is what makes the rebuild affordable. 1.81M decoded
+    observation dictionaries are roughly six gigabytes against 1.64 GB of raw
+    bytes, so retaining bytes removes about four gigabytes of peak heap while
+    adding NO file input and NO second traversal — only the JSON decode of
+    records already in memory moves inside the flocks (#496 S4 §6.3). That
+    decode is why the measured hold is longer than it was before S4; see the
+    spec's §6.3 for the measured figures.
+
+    Ordering is preserved: file-account decisions are ops, so the router already
+    retains them decoded and they are available before the observation loop
+    begins, exactly as the §3.5 precedence rule requires.
+
+    Returns the measured flock hold in seconds, which acceptance criterion 7
+    caps.
+    """
+    file_accounts = [
+        r for r in decoded if r is not None and _is_codex_file_account_op(r)
+    ]
+    if not quota_raw and not file_accounts:
+        return 0.0
     cache_path = _cctally_core.CACHE_DB_PATH
     if not cache_path.exists():
-        return
+        return 0.0
     from _lib_cache_writer_lock import (
         acquire_cache_writer_flocks,
         release_cache_writer_flocks,
@@ -5752,22 +5936,26 @@ def _rebuild_quota_cache_leg(records) -> None:
         )
     except OSError as exc:
         print(f"[rebuild] quota cache leg lock failed: {exc}", file=sys.stderr)
-        return
+        return 0.0
     if held is None:
         print("[rebuild] quota cache leg locks busy; skipping", file=sys.stderr)
-        return
+        return 0.0
+    held_from = time.monotonic()
     try:
         try:
             cache = sqlite3.connect(str(cache_path), timeout=15.0)
         except sqlite3.Error as exc:  # pragma: no cover — cache.db unopenable
             print(f"[rebuild] quota cache leg connect failed: {exc}", file=sys.stderr)
-            return
+            return time.monotonic() - held_from
         try:
             cache.execute("PRAGMA busy_timeout=15000")
             cache.execute("BEGIN IMMEDIATE")
             # Decisions FIRST — same §3.5 precedence ordering as `_cache_applier`.
             _, _file_conflicts = _apply_file_account_records(cache, file_accounts)
-            _apply_quota_records(cache, quota_obs)
+            _apply_quota_records(
+                cache,
+                _decoded_quota_stream(quota_raw, cutover_claude, counters),
+            )
             cache.commit()
             _report_file_account_conflicts(_file_conflicts)
         except sqlite3.Error as exc:
@@ -5780,6 +5968,66 @@ def _rebuild_quota_cache_leg(records) -> None:
             cache.close()
     finally:
         release_cache_writer_flocks(held)
+    return time.monotonic() - held_from
+
+
+#: `_resolve_cutover_for_rebuild` distinguishes "the streaming pass never saw the
+#: op" from "it saw the op and the op recorded no account". `find_accounts_cutover_op`
+#: makes the same distinction by returning at the first matching RECORD id, so a
+#: plain `None` cannot stand in for both without changing which answer wins.
+_CUTOVER_UNSEEN = object()
+
+
+def _cutover_value_of(record) -> "str | None":
+    """The cutover op's recorded `claude_legacy_account`, or None when this
+    record is not the canonical cutover op. Shared by the rebuild's inline
+    capture and `find_accounts_cutover_op` so the two cannot disagree."""
+    if record is None or record.get("id") != CUTOVER_OP_ID:
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("claude_legacy_account")
+
+
+def _resolve_cutover_for_rebuild(captured, hw, segments, counters=None) -> str:
+    """The cutover account for one rebuild, reading each byte at most once.
+
+    `captured` is what the streaming pass saw inside the pinned prefix, or
+    `_CUTOVER_UNSEEN`. When the prefix did not contain the op — reachable,
+    because correction recovery, journal repair and rederive all pin
+    high-waters, and the op sits at 92.9% of a production journal — scan ONLY
+    the unvisited suffix, from the pinned high-water to the current one,
+    stopping at the first match. Resolving from the prefix alone would flip
+    those rebuilds to `unattributed` and restamp every legacy Claude
+    observation, moving `accounts.last_seen_utc` with it (#496 S4 §5.1).
+    """
+    if captured is not _CUTOVER_UNSEEN:
+        return captured if captured is not None else _lib_accounts.UNATTRIBUTED
+    if hw is None or not segments:
+        return _lib_accounts.UNATTRIBUTED
+    current = journal_high_water()
+    if current is None or current == hw:
+        return _lib_accounts.UNATTRIBUTED
+    if current[0] not in segments:
+        # A segment appended after this rebuild's snapshot. Every pass of one
+        # rebuild reads the same snapshot (§4), so the suffix stops at its end
+        # rather than silently adopting a different journal shape.
+        last = segments[-1]
+        current = (last, os.path.getsize(_cctally_core.JOURNAL_DIR / last))
+        if current == hw:
+            return _lib_accounts.UNATTRIBUTED
+    for _segment, _offset, raw in _iter_range_with_segments(hw, current, segments):
+        if counters is not None:
+            counters["lines"] += 1
+            counters["bytes"] += len(raw) + 1
+        record = _lib_journal.decode_line(raw)
+        if counters is not None and record is not None:
+            counters["decodes"] += 1
+        if record is not None and record.get("id") == CUTOVER_OP_ID:
+            value = _cutover_value_of(record)
+            return value if value is not None else _lib_accounts.UNATTRIBUTED
+    return _lib_accounts.UNATTRIBUTED
 
 
 def rebuild_stats_index(
@@ -5812,6 +6060,11 @@ def rebuild_stats_index(
     replaces the main file. A `target_path` build uses the same atomic
     publication but does not create a live-family quarantine incident.
     """
+    # Imported HERE, not at module scope: `_cctally_journal` is on the ingest
+    # path every status-line tick reaches, and `import tracemalloc` measured
+    # 2.9 ms. Only a rebuild reads the peak, so only a rebuild pays for it.
+    import tracemalloc
+
     start = time.monotonic()
     context = context.validate()
     # Resolve the rebuild record's path ONCE, here, because preservation runs
@@ -5831,7 +6084,13 @@ def rebuild_stats_index(
     # and belong to the next ingest cycle (they replay idempotently); mirrors the
     # live cycle's §5.2.1 HW-prefix rule.
     hw = high_water if high_water is not None else journal_high_water()
-    segments = list_segments()
+    # ONE segment snapshot for the whole rebuild (#496 S4 §4). `list_segments()`
+    # re-enumerates the directory at call time and orders bootstrap segments
+    # first, so a bootstrap segment appearing mid-rebuild would shift the indices
+    # `iter_range` addresses by; before this, the read pass and the cutover scan
+    # each listed separately and could already disagree about the journal's shape.
+    all_segments = list_segments()
+    segments = all_segments
     if hw is not None:
         if hw[0] not in segments:
             raise JournalError(
@@ -5854,12 +6113,42 @@ def rebuild_stats_index(
     conn = _cctally_core.open_db(_target_path=str(scratch))
     malformed = 0
     lines_folded = 0
+    phase_seconds: dict = {}
+    traversal = {
+        name: {"lines": 0, "bytes": 0, "decodes": 0}
+        for name in ("stats_prefix", "cutover_suffix", "protocol_evidence",
+                     "quota_replay")
+    }
+    quota_lock_hold = 0.0
+    tracing = tracemalloc.is_tracing()
+    if tracing:
+        tracemalloc.reset_peak()
     try:
+        # ONE streaming pass. Decode each line once, feed the account last-seen
+        # accumulator, capture the cutover inline, and retain only what a
+        # consumer actually needs: the decision records decoded (5.08% of a
+        # production journal) and the Codex quota observations as RAW BYTES
+        # (1.64 GB against roughly six gigabytes of dicts). Everything else is
+        # dropped as soon as it has contributed (#496 S4 §4).
         decoded: list = []
+        quota_raw: list = []
         protocol_evidence = []
         prior_high_water = None
+        cutover_captured = _CUTOVER_UNSEEN
+        last_seen = _lib_journal_router.LastSeenAccumulator()
+        hasher = _lib_journal_router.PrefixHashAccumulator()
+        evidence_seconds = 0.0
+        prefix = traversal["stats_prefix"]
+        read_started = time.monotonic()
         if hw is not None:
-            for segment, offset, raw in _read_range(None, hw):
+            for segment, offset, raw in _iter_range_with_segments(
+                None, hw, segments,
+                on_segment=lambda name: hasher.begin_segment(
+                    name, prior_high_water),
+                on_bytes=hasher.extend,
+            ):
+                prefix["lines"] += 1
+                prefix["bytes"] += len(raw) + 1
                 rec = _lib_journal.decode_line(raw)
                 if rec is None:
                     malformed += 1
@@ -5868,46 +6157,104 @@ def rebuild_stats_index(
                         offset + len(raw) + 1,
                     )
                     continue
-                _capture_protocol_prefix_evidence(
-                    rec,
-                    prior_high_water,
-                    protocol_evidence,
-                )
-                decoded.append(rec)
+                prefix["decodes"] += 1
+                # `_capture_protocol_prefix_evidence` returns immediately for
+                # anything that is not an op, so this guard changes nothing it
+                # does — it moves the phase attribution's two clock reads from
+                # every record to every op. That is 195 ops against 1,954,007
+                # lines on a production journal, where the phase itself measures
+                # zero because the journal carries no resolution operation.
+                if rec.get("t") == "op":
+                    evidence_started = time.monotonic()
+                    _capture_protocol_prefix_evidence(
+                        rec,
+                        prior_high_water,
+                        protocol_evidence,
+                        hasher=hasher,
+                    )
+                    evidence_seconds += time.monotonic() - evidence_started
+                # First cutover op wins, exactly as `find_accounts_cutover_op`
+                # scans — captured here so the rebuild reads the journal once.
+                if (cutover_captured is _CUTOVER_UNSEEN
+                        and rec.get("id") == CUTOVER_OP_ID):
+                    cutover_captured = _cutover_value_of(rec)
+                last_seen.observe(rec, classify_legacy_provider)
+                if rec.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES:
+                    decoded.append(rec)
+                else:
+                    if update_quota_cache and _is_codex_quota_obs(rec):
+                        quota_raw.append(raw)
+                    # A PLACEHOLDER, not a dropped element. `resolve_effective_events`
+                    # numbers candidates with `enumerate(records)`, and three of the
+                    # seven structural violation kinds put that number inside
+                    # `ProtocolViolation.evidence` — which the fingerprint hashes.
+                    # That fingerprint is durable: it lands in
+                    # `journal_protocol_violations` and is referenced by name from a
+                    # `journal_protocol_resolution` op, which `_cctally_journal_repair`
+                    # mints from the UNFILTERED record list. Renumbering here would
+                    # therefore make a previously acknowledged violation unresolvable
+                    # and raise on every later rebuild. The selector skips a non-dict
+                    # element, so this costs one pointer and keeps every sequence
+                    # identical to the pre-change numbering (#496 S4; corrects §4.7).
+                    decoded.append(None)
                 prior_high_water = (
                     segment,
                     offset + len(raw) + 1,
                 )
+        phase_seconds["journal_read_decode"] = round(
+            max(0.0, time.monotonic() - read_started - evidence_seconds), 6)
+        phase_seconds["protocol_evidence"] = round(evidence_seconds, 6)
+        traversal["protocol_evidence"]["bytes"] = hasher.bytes_hashed
+        traversal["protocol_evidence"]["lines"] = hasher.digests_computed
+        hasher = None
 
         # Legacy account normalisation (#341, spec §2 / handoff item 2): a
         # pre-#341 real-account line lacks an account stamp — inject the cutover
         # mapping BEFORE the fold (Claude legacy -> the cutover op's account;
         # Codex legacy -> unattributed). `*`-families + already-stamped lines are
-        # untouched. Resolved once from the journal's own cutover op (falls back
-        # to `unattributed` when none is present), so a fresh single-account
-        # rebuild is byte-neutral (everything is already `unattributed`).
-        cutover_claude = resolve_cutover_claude_account()
+        # untouched. Resolved from the journal's own cutover op — inline when the
+        # streamed prefix contained it, otherwise from the unvisited suffix alone
+        # (falls back to `unattributed` when neither has it), so a fresh
+        # single-account rebuild is byte-neutral.
+        cutover_started = time.monotonic()
+        cutover_claude = _resolve_cutover_for_rebuild(
+            cutover_captured, hw, all_segments, traversal["cutover_suffix"])
+        phase_seconds["cutover_suffix"] = round(
+            time.monotonic() - cutover_started, 6)
         for rec in decoded:
-            _normalize_legacy_account_stamp(rec, cutover_claude)
+            if rec is not None:
+                _normalize_legacy_account_stamp(rec, cutover_claude)
 
         # Resolve corrections BEFORE either disposable index is mutated. A
         # malformed revision, divergent same-revision candidate, or invalid
         # committed manifest leaves the existing destination untouched.
+        selection_started = time.monotonic()
         effective = _lib_journal.resolve_effective_events(
             decoded,
             protocol_prefix_evidence=protocol_evidence,
         )
+        phase_seconds["effective_selection"] = round(
+            time.monotonic() - selection_started, 6)
 
         # Cache leg BEFORE any stats txn (provider-flock lock-order): journal
-        # Codex quota obs -> cache.db quota_window_snapshots.
+        # Codex quota obs -> cache.db quota_window_snapshots. The retained bytes
+        # are decoded inside the leg's existing transaction and freed here, so
+        # the SQLite fold never runs on top of them.
+        leg_started = time.monotonic()
         if update_quota_cache:
-            _rebuild_quota_cache_leg(decoded)
+            quota_lock_hold = _rebuild_quota_cache_leg_raw(
+                quota_raw, decoded, cutover_claude, traversal["quota_replay"])
+        quota_raw = []
+        phase_seconds["quota_cache_leg"] = round(
+            time.monotonic() - leg_started, 6)
 
         # One ordered fold stream: op-folds (order 5) + evts, keyed by
         # (fold_order, canonical seq) so referenced families resolve before
         # referencing ones and crash-replay duplicates fold idempotently.
         stream: list = []
         for seq, rec in enumerate(decoded):
+            if rec is None:
+                continue
             t = rec.get("t")
             kind = (rec.get("payload") or {}).get("kind")
             if t == "op" and kind in FOLD_APPLIERS:
@@ -5919,6 +6266,7 @@ def rebuild_stats_index(
         tail = [s for s in stream if s[0] >= _REBUILD_MILESTONE_ORDER]
 
         _stats_rebuild_test_pause("rebuild_fold_started")
+        fold_started = time.monotonic()
 
         # Phase 1 (txn A) — structural folds: op floors, snapshot_accept, cost
         # snapshots, resets+suppression, block_close, arming, credit effects.
@@ -5966,9 +6314,14 @@ def rebuild_stats_index(
                 _apply_evt(conn, rec)
                 lines_folded += 1
             # Fold-time `last_seen_utc` derivation (#341): re-derive each
-            # account's last-seen from the whole journal (the observe ops folded
-            # in the structural phase already created the rows).
-            _derive_account_last_seen(conn, decoded)
+            # account's last-seen from the whole journal. The map was
+            # accumulated during the single read pass — `decoded` no longer
+            # contains observations, so deriving from it here would silently
+            # drop every observation's contribution (#496 S4 §4.6).
+            _apply_account_last_seen(
+                conn,
+                last_seen.resolve(cutover_claude, _lib_accounts.UNATTRIBUTED),
+            )
             if hw is not None:
                 _write_cursor(conn, hw[0], hw[1])
             conn.commit()
@@ -5978,7 +6331,9 @@ def rebuild_stats_index(
             except Exception:
                 pass
             raise
+        phase_seconds["stats_fold"] = round(time.monotonic() - fold_started, 6)
 
+        validate_started = time.monotonic()
         rows_by_table = {}
         for tbl in _REBUILD_COUNT_TABLES:
             try:
@@ -5992,6 +6347,8 @@ def rebuild_stats_index(
             raise JournalError("rebuilt stats index WAL could not be drained")
         _validate_rebuilt_stats_index(conn, hw)
         _stats_rebuild_test_pause("rebuild_scratch_complete")
+        phase_seconds["scratch_validate"] = round(
+            time.monotonic() - validate_started, 6)
     finally:
         conn.close()
 
@@ -6009,8 +6366,13 @@ def rebuild_stats_index(
     conflicts = effective.conflicts
     protocol_violations = effective.protocol_violations
     acknowledged = effective.acknowledged_protocol_violations
+    # The pre-publication window is what F9's memory acceptance is measured
+    # over: everything after this point is publication, whose own WAL cost S3
+    # already accounts for.
+    peak_heap_bytes = (
+        tracemalloc.get_traced_memory()[1] if tracing else 0)
     decoded = effective = stream = structural = tail = None
-    segments = protocol_evidence = None
+    segments = protocol_evidence = last_seen = None
 
     # First fresh-connection validation (#496 S1 F1). A failure here raises
     # BEFORE any preservation, so no incident is created and the old family
@@ -6025,6 +6387,7 @@ def rebuild_stats_index(
     # `os.replace` as a stray artifact.
     _remove_db_sidecars_strict(scratch)
 
+    publication_started = time.monotonic()
     incident = _publish_rebuilt_stats_index(
         scratch=scratch,
         destination=dest,
@@ -6048,8 +6411,21 @@ def rebuild_stats_index(
             "rowsByTable": rows_by_table,
             "buildSeconds": round(time.monotonic() - start, 3),
             "prePublicationValidation": {"ok": True, "error": None},
+            # Additive instrumentation (#496 S4 §8.7). Additive keys do not bump
+            # `schemaVersion` and no existing field changes meaning. `publication`
+            # is absent HERE and present on `RebuildResult`: publication copies
+            # this dict before it writes it, so its own duration cannot be known
+            # at the time the record is written.
+            "phaseSeconds": dict(phase_seconds),
+            "traversal": {
+                name: dict(counts) for name, counts in traversal.items()
+            },
+            "peakHeapBytes": peak_heap_bytes,
+            "quotaLockHoldSeconds": round(quota_lock_hold, 6),
         },
     )
+    phase_seconds["publication"] = round(
+        time.monotonic() - publication_started, 6)
 
     return RebuildResult(
         rows_by_table=rows_by_table, malformed=malformed,
@@ -6058,6 +6434,10 @@ def rebuild_stats_index(
         protocol_violations=protocol_violations,
         acknowledged_protocol_violations=acknowledged,
         quarantine_dir=incident,
+        phase_seconds=phase_seconds,
+        traversal=traversal,
+        peak_heap_bytes=peak_heap_bytes,
+        quota_lock_hold_seconds=round(quota_lock_hold, 6),
     )
 
 
@@ -6472,17 +6852,24 @@ def _resolve_claude_cutover_identity(claude_json_path=None) -> str:
 def find_accounts_cutover_op():
     """Scan the journal for the canonical cutover op; return its recorded
     ``claude_legacy_account`` (spec §2 payload), or None when it has not been
-    appended yet. Cheap enough for the one-time transition + the retry check."""
+    appended yet. Cheap enough for the one-time transition + the retry check.
+
+    Streams rather than materializing (#496 S4): the previous form built each
+    segment's whole line list before its first-match return, so the early exit
+    could not stop reading inside the containing segment. The None-on-absence
+    contract is UNCHANGED — the cache and conversations migrations depend on it
+    to defer their backfill.
+    """
     for seg in list_segments():
         seg_path = _cctally_core.JOURNAL_DIR / seg
         try:
             size = os.path.getsize(seg_path)
         except OSError:
             continue
-        for _name, _off, raw in _read_segment_lines(seg_path, 0, size):
+        for _name, _off, raw in _iter_segment_lines(seg_path, 0, size):
             rec = _lib_journal.decode_line(raw)
             if rec is not None and rec.get("id") == CUTOVER_OP_ID:
-                return (rec.get("payload") or {}).get("claude_legacy_account")
+                return _cutover_value_of(rec)
     return None
 
 

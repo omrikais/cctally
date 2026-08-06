@@ -783,13 +783,22 @@ def test_cache_applier_is_wired_to_the_ingest_seam(ns):
 
 
 def test_rebuild_cache_leg_materializes_file_account_ops(ns):
-    """Spec section 3.4: `_rebuild_quota_cache_leg` must materialize the map
-    too, or the rebuild rehydration has nothing to rehydrate FROM."""
+    """Spec section 3.4: the rebuild's cache leg must materialize the map too,
+    or the rebuild rehydration has nothing to rehydrate FROM.
+
+    Driven through `_rebuild_quota_cache_leg_raw`, which is the leg the rebuild
+    actually calls (#496 S4 §6.3): observations arrive as raw encoded lines and
+    the file-account ops arrive in the router's decoded list.
+    """
     import _cctally_journal as jr
     import _lib_journal as jl
     ns["open_cache_db"]().close()
     records = [_quota_obs(jl), _file_account_op(jl)]
-    jr._rebuild_quota_cache_leg(records)
+    quota_raw = [
+        jl.encode_line(r).rstrip(b"\n") for r in records
+        if jr._is_codex_quota_obs(r)
+    ]
+    jr._rebuild_quota_cache_leg_raw(quota_raw, records, "unattributed")
     conn = ns["open_cache_db"]()
     try:
         assert _map_rows(conn) == [("fid-1", 1, 0, "root-a", KEY_A)]

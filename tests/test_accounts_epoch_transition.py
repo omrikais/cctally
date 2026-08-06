@@ -111,7 +111,7 @@ def test_second_transition_does_not_duplicate_op(ns, tmp_path):
         seg_path = _cctally_core.JOURNAL_DIR / seg
         import os
         size = os.path.getsize(seg_path)
-        for _n, _o, raw in jr._read_segment_lines(seg_path, 0, size):
+        for _n, _o, raw in jr._iter_segment_lines(seg_path, 0, size):
             rec = J.decode_line(raw)
             if rec is not None and rec.get("id") == jr.CUTOVER_OP_ID:
                 count += 1

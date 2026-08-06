@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import sqlite3
+import struct
 import sys
 
 import pytest
@@ -413,6 +414,28 @@ def _publisher_connection(path, *, busy_timeout_ms=15000):
     conn = sqlite3.connect(pathlib.Path(path).resolve().as_uri(), uri=True)
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+def _append_unreferenced_page(path: pathlib.Path) -> int:
+    """Leave one page outside every B-tree and the freelist.
+
+    The database stays readable, but both SQLite integrity pragmas report the
+    exact production damage shape: ``Page N: never used``.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    finally:
+        conn.close()
+
+    with path.open("r+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.write(b"\x00" * page_size)
+        handle.seek(28)  # database-header page count, big-endian uint32
+        handle.write(struct.pack(">I", page_count + 1))
+    return page_count + 1
 
 
 def test_in_place_publish_carries_sqlite_sequence(ns, tmp_path):
@@ -837,6 +860,51 @@ def test_a_rebuild_publishes_into_the_live_file_without_replacing_it(ns):
         conn.close()
     assert len(stamp) == 1
     assert stamp[0][0].endswith(".json")
+
+
+def test_readable_destination_with_an_orphan_page_publishes_by_replacement(ns):
+    """An in-place object swap cannot heal pages no schema object references.
+
+    The destination still opens and serves rows, so readability alone selects
+    the wrong mechanism. Publication must inspect structural integrity before
+    mutating it and use the validated scratch as a physical replacement when
+    the old file contains an unreferenced page.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    old_inode = db.stat().st_ino
+    orphan_page = _append_unreferenced_page(db)
+
+    before = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert before.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots"
+        ).fetchall() == [(7.0,)]
+        check = [str(row[0]) for row in before.execute("PRAGMA quick_check")]
+    finally:
+        before.close()
+    assert check == [f"*** in database main ***\nPage {orphan_page}: never used"]
+
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="db-rebuild")
+    )
+
+    assert result.quarantine_dir is not None
+    assert db.stat().st_ino != old_inode
+    after = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert after.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert after.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots"
+        ).fetchall() == [(7.0,)]
+    finally:
+        after.close()
+    record = _newest_record(_cctally_core.LOG_DIR)
+    assert record["status"] == "ok"
+    assert record["publicationMechanism"] == "replace"
 
 
 def test_interrupted_recovery_registers_its_hold_for_the_publisher(ns, monkeypatch):
