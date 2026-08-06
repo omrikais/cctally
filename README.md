@@ -30,9 +30,11 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.90.1** (2026-08-02)
+**Latest stable: v1.92.0** (2026-08-05)
 
-- Internal (maintainer-only): the public release snapshot no longer ships the issue-triage pytest modules without the private workflow implementation they import. Those tests now stay behind the same mirror boundary as their `.agent-workflows` dependencies, preventing collection failures across the public Python matrix.
+- Add per-run bearer authentication for non-loopback dashboards, with fragment-to-HttpOnly-cookie browser bootstrap and a restart-only Settings/CLI opt-out (#282).
+- Add account-scoped conversation browsing, search, reading, export, and permalinks to the dashboard and `cctally transcript`, while preserving the existing all-account and single-account output shapes (#347).
+- Long Codex conversations now open with two concurrent data requests instead of issuing a third detail request just to repeat totals already available from the outline. On the same 3,733-row conversation, the first painted row improved from 784 ms to 421, 429 ms while live-tail streaming remained connected (#477).
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
