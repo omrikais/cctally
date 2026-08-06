@@ -367,7 +367,15 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # 1006 -> 1007 (#460): scheduled quota-alert ownership. Adds the per-root
 # future-capture schedule that lets a matured boundary widen to its owning root
 # instead of deferring forever on a quiet hook-only install.
-STATS_INDEX_EPOCH = 1007
+# 1007 -> 1008 (#496 S3): in-place transactional publication. Adds
+# `stats_publication_stamp`, the publication identity written inside the
+# publication transaction. It replaces the marker's `scratchPath` crash
+# discriminator, which an in-place publish inverts because it attaches the
+# scratch read-only and leaves it on disk whether the transaction committed or
+# rolled back. A stats schema change is an epoch bump and never a migration;
+# the 13-migration registry stays frozen. Each install pays one rebuild on
+# upgrade, deferred to the background worker by #453.
+STATS_INDEX_EPOCH = 1008
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -382,6 +390,21 @@ STATS_PUBLICATION_FAILED_MSG = (
     "The rebuild record naming the failing check is at {record}. The damaged "
     "predecessor was preserved under quarantine/ with a forensics bundle in "
     "logs/. Recovery: run `cctally db rebuild --db stats`."
+)
+
+#: #496 S3. The text above describes PHYSICAL replacement, which is now the
+#: fallback. In-place publication drops the live generation and installs the
+#: scratch's inside one transaction, so it preserves nothing and allocates no
+#: quarantine directory — and the sentence about a preserved predecessor would
+#: send a user whose index is already known bad to a directory that does not
+#: exist. Selected by the mechanism the publication marker records.
+STATS_PUBLICATION_FAILED_IN_PLACE_MSG = (
+    "stats.db published a rebuilt index that then FAILED validation, so the "
+    "live index is known bad and cctally refuses to use it. path: {path}. "
+    "The rebuild record naming the failing check is at {record}. This index "
+    "was published in place, so no copy of the previous index was kept; every "
+    "row it holds is derived from the append-only journal, which the "
+    "publication did not touch. Recovery: run `cctally db rebuild --db stats`."
 )
 
 
@@ -722,18 +745,27 @@ def ensure_dirs() -> None:
 # before returning does not, and must not — see `stats_open_guarded`):
 #   bin/_cctally_journal.py  _acquire_maintenance_{shared,exclusive} / _release
 #   bin/_cctally_store.py    _heal_flock_blocking, reached through
-#                            _acquire_stats_maintenance_reentrant by the heal
-#                            hook and the epoch resolver
+#                            _acquire_stats_maintenance_reentrant by the epoch
+#                            resolver
+#   bin/_cctally_store.py    _acquire_stats_maintenance_for_heal, the corruption
+#                            heal's ownership-first BOUNDED acquire (#496 S3)
 #   bin/_cctally_db.py       cmd_db_rebuild, _acquire_db_admin_writer_flocks
 #                            (db skip / db unskip), _cmd_db_repair_exclusive,
 #                            _vacuum_one_db
 #   bin/_cctally_rederive.py _rederive_locks
+#   bin/_cctally_store.py    stats_open_guarded's interrupted-rebuild-recovery
+#                            branch, which upgrades to EXCLUSIVE and then calls
+#                            rebuild_stats_index (#496 S3)
 # Adding another acquisition site without noting it here reintroduces the hang.
 #
-# The opener (`_cctally_store.stats_open_guarded`) takes the lock SHARED and
-# releases it before handing the connection back, so it deliberately does NOT
-# note a hold — but it DOES consult `holds_stats_maintenance()` to skip the
-# acquire entirely when this context already owns the exclusive side.
+# The opener (`_cctally_store.stats_open_guarded`) takes the lock SHARED around
+# an ordinary open and releases it before handing the connection back, so that
+# acquire deliberately does NOT note a hold — but it DOES consult
+# `holds_stats_maintenance()` to skip the acquire entirely when this context
+# already owns the exclusive side. Its interrupted-rebuild-recovery branch is
+# the exception: that one upgrades to EXCLUSIVE and holds it across a rebuild,
+# whose in-place publisher opens the destination through `stats_open_guarded`
+# again, so it notes the hold like every other exclusive site.
 
 _STATS_MAINTENANCE_HELD = contextvars.ContextVar(
     "cctally_stats_maintenance_held", default=0
@@ -2474,6 +2506,23 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "batch_id TEXT NOT NULL, "
             "kind TEXT NOT NULL, "
             "violation_json TEXT NOT NULL)"
+        )
+        # In-place publication identity (#496 S3 §5). An in-place publish
+        # attaches the scratch read-only and detaches it, so the scratch
+        # survives commit and rollback identically and the publication marker's
+        # `scratchPath` proxy inverts. This row is written INSIDE the
+        # publication transaction, so it commits atomically with the content
+        # and the `user_version` it describes and a crash before the commit
+        # rolls it back. The opener compares it against the marker's
+        # `recordPath` and knows without inference whether that publication
+        # committed. Holds at most one row; single-row-ness is deliberately not
+        # enforced structurally, because a duplicated row is one of the states
+        # that must resolve INDETERMINATE rather than be made impossible.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stats_publication_stamp ("
+            "record_path TEXT NOT NULL, "
+            "started_at_utc TEXT NOT NULL, "
+            "stamped_at_utc TEXT NOT NULL)"
         )
 
         # §6.2 backfill gate (Task 8): stamp the one-shot marker AFTER the three

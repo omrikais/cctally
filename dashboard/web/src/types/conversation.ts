@@ -722,6 +722,10 @@ export interface ConversationSummary {
 
 export interface ConversationsPage {
   conversations: ConversationSummary[];
+  // #501 — an exact selected conversation projected independently of the
+  // paginated/filter-derived rows. The client pins it only when no user filter
+  // is active and deduplicates it when the ordinary page already contains it.
+  selected?: ConversationSummary;
   // `filter_degraded` (filters spec §1 dual-branch parity) is present ONLY when a
   // project/cost/rebuild filter was requested but the rollup was non-authoritative
   // (the live `GROUP BY` fallback can only filter by date). `sort_degraded` (#217

@@ -6,7 +6,7 @@ import { useSnapshot } from './useSnapshot';
 import { filterParams } from './conversationFilterParams';
 import { adaptQualifiedBrowse } from '../lib/conversationAdapters';
 import { qualifiedBrowseUrl, type QualifiedBrowseEnvelope } from '../lib/conversationTransport';
-import { conversationSummaryRef, type ConversationSource, type ConversationSummary, type ConversationsPage } from '../types/conversation';
+import { conversationRefKey, conversationSummaryRef, sameConversationRef, type ConversationRef, type ConversationSource, type ConversationSummary, type ConversationsPage } from '../types/conversation';
 
 // Browse-rail list. Offset-paginated, accumulating. Revalidates the
 // FIRST page when the shared change signal (`revalToken(env)` — the
@@ -56,10 +56,14 @@ const PAGE = 50;
 
 export function useConversations(
   source: ConversationSource = 'claude',
-  options: { qualified?: boolean; accountKey?: string } = {},
+  options: { qualified?: boolean; accountKey?: string; selectedRef?: ConversationRef | null } = {},
 ): UseConversations {
   const qualified = options.qualified === true || source === 'codex';
   const accountKey = options.accountKey;
+  const selectedKey = options.selectedRef?.source === source
+    && !Object.values(getState().conversationFilters).some((value) => Array.isArray(value) ? value.length > 0 : value != null)
+    ? options.selectedRef.key
+    : undefined;
   const [rows, setRows] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +75,8 @@ export function useConversations(
   qualifiedRef.current = qualified;
   const accountRef = useRef(accountKey);
   accountRef.current = accountKey;
+  const selectedKeyRef = useRef(selectedKey);
+  selectedKeyRef.current = selectedKey;
   const [filterDegraded, setFilterDegraded] = useState(false);
   const [sortDegraded, setSortDegraded] = useState(false);
   // Active browse filters from the store (filters spec §4). A `filtersRef` mirror
@@ -98,8 +104,7 @@ export function useConversations(
   // suppression predicate WITHOUT closing over rows.length — that would
   // recreate the callback on every row update and could re-trigger the
   // change-signal effect (Codex gate, MAJOR 5: loadFirstPage must be ref-stable).
-  const rowsLenRef = useRef(0);
-  useEffect(() => { rowsLenRef.current = rows.length; }, [rows.length]);
+  const loadedTailRef = useRef(false);
   // Single in-flight controller: each invocation aborts the prior before
   // starting a new one, so a refocus burst (the visibilitychange listener +
   // the [revalTok] change-signal effect) collapses to a single completing
@@ -123,19 +128,21 @@ export function useConversations(
     // Revalidate page 1 ONLY while the user is still on the first page; once
     // they've paged (rows beyond PAGE) we must not clobber the accumulated
     // tail or rewind the cursor. A fresh load happens on remount.
-    if (loadingMoreRef.current || rowsLenRef.current > PAGE) return;
+    if (loadingMoreRef.current || loadedTailRef.current) return;
     ctlRef.current?.abort();
     const ctl = new AbortController();
     ctlRef.current = ctl;
     const activeSource = sourceRef.current;
     const activeQualified = qualifiedRef.current;
     const activeAccount = accountRef.current;
+    const activeSelected = selectedKeyRef.current;
     const url = activeQualified
       ? qualifiedBrowseUrl(activeSource, {
           accountKey: activeAccount,
           projectKey: filtersRef.current.projects[0], model: filtersRef.current.models[0], limit: PAGE,
+          selected: activeSelected,
         })
-      : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}${activeAccount ? `&account=${encodeURIComponent(activeAccount)}` : ''}`;
+      : `/api/conversations?sort=${sortRef.current}&limit=${PAGE}&offset=0${filterParams(filtersRef.current)}${activeAccount ? `&account=${encodeURIComponent(activeAccount)}` : ''}${activeSelected ? `&selected=${encodeURIComponent(activeSelected)}` : ''}`;
     fetchJson<ConversationsPage | QualifiedBrowseEnvelope>(url, ctl.signal)
       .then((raw) => {
         if (sourceRef.current !== activeSource
@@ -143,16 +150,23 @@ export function useConversations(
           || accountRef.current !== activeAccount) return;
         if (activeQualified) {
           const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
-          setRows(body.rows); setNextOffset(body.cursor); setPending(body.pending);
+          setRows(prependSelected(body.rows, body.selected)); setNextOffset(body.cursor); setPending(body.pending);
           setFilterDegraded(false); setSortDegraded(false);
         } else {
           const body = raw as ConversationsPage;
-          setRows(activeAccount
+          const pageRows = activeAccount
             ? body.conversations.map((row) => ({
                 ...row,
                 conversation_ref: { source: activeSource, key: row.session_id, account_key: activeAccount },
               }))
-            : body.conversations);
+            : body.conversations;
+          const selected = body.selected
+            ? (activeAccount ? {
+                ...body.selected,
+                conversation_ref: { source: activeSource, key: body.selected.session_id, account_key: activeAccount },
+              } : body.selected)
+            : undefined;
+          setRows(prependSelected(pageRows, selected));
           setNextOffset(body.page.next_offset);
           setFilterDegraded(body.page.filter_degraded === true);
           setSortDegraded(body.page.sort_degraded === true);
@@ -187,7 +201,7 @@ export function useConversations(
   // effect below (now keyed on the `revalToken` change signal, #305) already
   // issues the initial page-1 load; double-firing here would re-fetch page 1
   // and, mid-paging, clobber the accumulated tail.
-  const queryKey = JSON.stringify({ source, qualified, accountKey, filters, sort });
+  const queryKey = JSON.stringify({ source, qualified, accountKey, selectedKey, filters, sort });
   const mountQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (mountQueryKeyRef.current === null) {
@@ -208,7 +222,7 @@ export function useConversations(
     setLoadingMore(false);
     setRows([]);
     setNextOffset(0);
-    rowsLenRef.current = 0;
+    loadedTailRef.current = false;
     loadFirstPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryKey]);
@@ -266,7 +280,7 @@ export function useConversations(
         || accountRef.current !== activeAccount) return;
       if (activeQualified) {
         const body = adaptQualifiedBrowse(activeSource, raw as QualifiedBrowseEnvelope, activeAccount);
-        setRows((prev) => [...prev, ...body.rows]); setNextOffset(body.cursor); setPending(body.pending);
+        setRows((prev) => appendUnique(prev, body.rows)); setNextOffset(body.cursor); setPending(body.pending);
       } else {
         const body = raw as ConversationsPage;
         const nextRows = activeAccount
@@ -275,11 +289,12 @@ export function useConversations(
               conversation_ref: { source: activeSource, key: row.session_id, account_key: activeAccount },
             }))
           : body.conversations;
-        setRows((prev) => [...prev, ...nextRows]);
+        setRows((prev) => appendUnique(prev, nextRows));
         setNextOffset(body.page.next_offset);
         setFilterDegraded(body.page.filter_degraded === true);
         setSortDegraded(body.page.sort_degraded === true);
       }
+      loadedTailRef.current = true;
     } catch {
       /* keep what we have; a transient blip shouldn't wipe the list */
     } finally {
@@ -299,4 +314,19 @@ export function useConversations(
   }, [rows]);
 
   return { rows, loading, error, hasMore: nextOffset != null, loadMore, loadingMore, filterDegraded, sortDegraded, retry, pending };
+}
+
+function prependSelected(rows: ConversationSummary[], selected?: ConversationSummary): ConversationSummary[] {
+  if (!selected || rows.some((row) => sameConversationRef(conversationSummaryRef(row), conversationSummaryRef(selected)))) return rows;
+  return [selected, ...rows];
+}
+
+function appendUnique(current: ConversationSummary[], next: ConversationSummary[]): ConversationSummary[] {
+  const seen = new Set(current.map((row) => conversationRefKey(conversationSummaryRef(row))));
+  return [...current, ...next.filter((row) => {
+    const key = conversationRefKey(conversationSummaryRef(row));
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  })];
 }

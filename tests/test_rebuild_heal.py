@@ -27,6 +27,7 @@ import multiprocessing as mp
 import os
 import pathlib
 import sqlite3
+import time
 
 import pytest
 
@@ -474,9 +475,29 @@ def _seed_one_snapshot(jr, J):
     jr.run_stats_ingest(mode="authoritative")
 
 
-def test_corrupt_stats_db_auto_heals_transparently(ns, tmp_path):
+@pytest.fixture
+def no_spawn(monkeypatch):
+    """Record the detached spawn instead of launching a real background process."""
+    import _cctally_update
+
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        _cctally_update,
+        "_spawn_detached",
+        lambda command: spawned.append(command) or True,
+    )
+    return spawned
+
+
+def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
+    ns, tmp_path, no_spawn,
+):
+    """#496 S3 §6: the heal writes forensics and files a request; the caller
+    degrades immediately, and a detached worker does the rebuild."""
     jr, J = _jr(), _jlib()
     import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
     _seed_one_snapshot(jr, J)
     _pre = _cctally_core.open_db()
     try:
@@ -490,21 +511,239 @@ def test_corrupt_stats_db_auto_heals_transparently(ns, tmp_path):
     with open(_cctally_core.DB_PATH, "r+b") as f:
         f.write(b"not a database " * 200)
 
-    healed = _cctally_core.open_db()  # auto-heals on this next open
+    with pytest.raises(_cctally_db.StatsHealDeferred) as deferred:
+        _cctally_core.open_db()
+    assert deferred.value.outcome == "spawned"
+    assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
+
+    logs = _cctally_core.LOG_DIR
+    forensics = [p for p in logs.iterdir() if "corruption-forensics" in p.name]
+    assert forensics, "the forensics bundle is written first, in the hook"
+    qdir = _cctally_core.APP_DIR / "quarantine"
+    assert not qdir.exists(), (
+        "the caller's thread must not replace anything — the worker owns that"
+    )
+
+    request = st._read_stats_heal_request()
+    assert request["healId"] == deferred.value.heal_id
+    assert request["probeKind"] == st._STATS_HEAL_PROBE_READABILITY
+    assert request["forensicsPath"] == deferred.value.forensics_path
+    assert pathlib.Path(request["forensicsPath"]).is_absolute()
+    assert request["journalHighWater"] is not None
+
+    import types as _types
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+
+    healed = _cctally_core.open_db()
     try:
         after = [dict(r) for r in healed.execute(
             "SELECT weekly_percent, journal_id FROM weekly_usage_snapshots ORDER BY id")]
     finally:
         healed.close()
-    assert after == before, "auto-heal must recover journal-covered facts"
+    assert after == before, "the worker must recover journal-covered facts"
 
-    qdir = _cctally_core.APP_DIR / "quarantine"
     incidents = list(qdir.iterdir()) if qdir.exists() else []
     assert len(incidents) == 1, "the damaged family is quarantined into an incident dir"
     assert (incidents[0] / "manifest.json").exists()
-    logs = _cctally_core.LOG_DIR
-    forensics = [p for p in logs.iterdir() if "corruption-forensics" in p.name]
-    assert forensics, "the forensics bundle is written first"
+    assert st._read_stats_heal_request() is None, (
+        "a completed worker clears its own request"
+    )
+    log = (_cctally_core.LOG_DIR / "stats-corruption-heal.log").read_text()
+    assert "result=success" in log
+    assert request["healId"] in log
+
+
+def _readable_but_quick_check_corrupt(core):
+    """Damage one index B-tree page: the file opens, `quick_check` does not.
+
+    This is the population the architecture exists to serve — 26 of the 87
+    quarantined production indexes opened without raising — so the probe the
+    worker runs has to be the one the DETECTION established.
+    """
+    name = "s3_task10_probe_index"
+    conn = core.open_db()
+    try:
+        conn.execute(
+            f"CREATE INDEX {name} ON weekly_usage_snapshots("
+            "week_start_at, week_end_at, week_start_date, captured_at_utc)"
+        )
+        conn.commit()
+        root_page = int(
+            conn.execute(
+                "SELECT rootpage FROM sqlite_schema WHERE name = ?", (name,),
+            ).fetchone()[0]
+        )
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    finally:
+        conn.close()
+    with pathlib.Path(core.DB_PATH).open("r+b", buffering=0) as handle:
+        handle.seek((root_page - 1) * page_size)
+        handle.write(b"\x00")
+    return name
+
+
+def test_worker_runs_the_integrity_probe_for_a_post_query_detection(
+    ns, tmp_path, no_spawn,
+):
+    """A readable-but-`quick_check`-corrupt index must not be declined.
+
+    The cheap readability probe answers "ok" on exactly this shape, so a worker
+    that always used it would exit without replacing the population this
+    architecture exists to serve.
+    """
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    import types as _types
+    _seed_one_snapshot(jr, J)
+    index_name = _readable_but_quick_check_corrupt(_cctally_core)
+
+    assert st._probe_stats_ok(_cctally_core.DB_PATH) is True, (
+        "this fixture is only meaningful while the cheap probe still passes"
+    )
+    assert st._probe_stats_integrity_ok(_cctally_core.DB_PATH) is False
+
+    with pytest.raises(_cctally_db.StatsHealDeferred):
+        st.HEAL_HOOK(
+            "stats",
+            sqlite3.DatabaseError("database disk image is malformed"),
+            post_query=True,
+        )
+    assert st._read_stats_heal_request()["probeKind"] == (
+        st._STATS_HEAL_PROBE_INTEGRITY
+    )
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+    conn = _cctally_core.open_db()
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = ?", (index_name,),
+        ).fetchone() is None, "the worker declined the readable-but-corrupt index"
+    finally:
+        conn.close()
+
+
+def test_worker_rechecks_the_journal_high_water_under_its_own_lock(
+    ns, tmp_path, no_spawn,
+):
+    """`rebuild_stats_index` accepts a None high-water and would build EMPTY.
+
+    The hook checked the guard before spawning; the worker runs later, so it
+    re-checks under the lock rather than rebuilding a pre-cutover index to
+    nothing.
+    """
+    import shutil
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    import types as _types
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"not a database " * 200)
+    with pytest.raises(_cctally_db.StatsHealDeferred):
+        _cctally_core.open_db()
+
+    shutil.rmtree(_cctally_core.APP_DIR / "journal")
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+
+    qdir = _cctally_core.APP_DIR / "quarantine"
+    assert not qdir.exists(), (
+        "a vanished journal must not authorize a rebuild-to-empty"
+    )
+    log = (_cctally_core.LOG_DIR / "stats-corruption-heal.log").read_text()
+    assert "result=declined-no-journal" in log
+
+
+def test_heal_admission_spawns_once_and_coalesces_later_detections(
+    ns, tmp_path, no_spawn,
+):
+    """Repeated detections must not create a detached-process storm."""
+    import _cctally_store as st
+
+    request = {"schemaVersion": 1, "healId": "a", "probeKind": "readability"}
+    assert st.defer_stats_corruption_heal(request) == "spawned"
+    assert st.defer_stats_corruption_heal(
+        {**request, "healId": "b"}
+    ) == "pending"
+    assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
+    assert st._read_stats_heal_request()["healId"] == "a", (
+        "a coalesced detection must not overwrite the request in flight"
+    )
+
+
+def test_heal_admission_refreshes_while_a_long_worker_holds_its_flock(
+    ns, tmp_path, no_spawn,
+):
+    """A real rebuild outliving the marker TTL must not spawn a duplicate."""
+    import fcntl
+    import _cctally_store as st
+    import _cctally_core
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    marker = st._stats_heal_marker_path()
+    marker.write_text("{}")
+    stale = time.time() - st._STATS_HEAL_RETRY_SECONDS - 1
+    os.utime(marker, (stale, stale))
+    held = os.open(st._stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert st.defer_stats_corruption_heal({"healId": "z"}) == "pending"
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    assert no_spawn == []
+    assert time.time() - marker.stat().st_mtime < 5
+
+
+def test_heal_admission_and_epoch_admission_cannot_suppress_each_other(
+    ns, tmp_path, no_spawn,
+):
+    """The two deferrals own disjoint admission, marker and worker files."""
+    import _cctally_store as st
+
+    paths = {
+        st._stats_heal_marker_path(),
+        st._stats_heal_admission_path(),
+        st._stats_heal_worker_path(),
+        st._stats_heal_log_path(),
+    }
+    epoch_paths = {
+        st._stats_epoch_rebuild_marker_path(),
+        st._stats_epoch_rebuild_admission_path(),
+        st._stats_epoch_rebuild_worker_path(),
+        st._stats_epoch_rebuild_log_path(),
+    }
+    assert paths.isdisjoint(epoch_paths)
+    assert st.defer_stats_epoch_rebuild() == "spawned"
+    assert st.defer_stats_corruption_heal({"healId": "q"}) == "spawned"
+
+
+def test_deferred_heal_worker_flock_prevents_a_concurrent_rebuild(
+    ns, tmp_path, no_spawn, monkeypatch,
+):
+    import fcntl
+    import types as _types
+    import _cctally_store as st
+    import _cctally_core
+
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    st._stats_heal_marker_path().write_text('{"healId": "held"}')
+    held = os.open(st._stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(
+        st,
+        "_run_stats_corruption_heal",
+        lambda _request: pytest.fail("a duplicate worker entered the heal"),
+    )
+    try:
+        assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
 
 
 def test_deleted_stats_db_recovers_via_reingest(ns):
@@ -563,35 +802,510 @@ def test_locked_recheck_rejects_lazy_open_corruption(monkeypatch, tmp_path):
     assert st._probe_stats_ok(path) is False
 
 
+# --- #496 S3 Task 11: the F4 gate, the F6 ring, the F15 message ---------
+
+def test_an_unconfirmed_probe_declines_and_never_defers(
+    ns, tmp_path, no_spawn, capsys,
+):
+    """F4, first point. Classifier gating stays a precondition; this narrows
+    WITHIN classified triggers exactly as the cache path does."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"not a database " * 200)
+
+    real = _cctally_db.write_corruption_forensics
+
+    def unconfirmed(*args, **kwargs):
+        result = real(*args, **kwargs)
+        return _cctally_db.CorruptionForensicsResult(
+            path=result.path,
+            disposition=_cctally_db.CorruptionProbeDisposition.UNCONFIRMED,
+            reason="integrity_check_ok",
+            integrity_check=result.integrity_check,
+        )
+
+    _cctally_db.write_corruption_forensics = unconfirmed
+    try:
+        assert st.HEAL_HOOK(
+            "stats", sqlite3.DatabaseError("database disk image is malformed")
+        ) is False
+    finally:
+        _cctally_db.write_corruption_forensics = real
+
+    assert no_spawn == [], "an unconfirmed probe must not admit a worker"
+    assert st._read_stats_heal_request() is None
+    assert not (_cctally_core.APP_DIR / "quarantine").exists()
+    err = capsys.readouterr().err
+    assert "declined" in err and "integrity_check_ok" in err
+    bundles = sorted(_cctally_core.LOG_DIR.glob(
+        "stats.db-corruption-forensics-*.json"))
+    assert str(bundles[-1]) in err, "the decline must name the bundle path"
+
+    events = st.read_stats_heal_events()
+    assert [e["disposition"] for e in events] == ["unconfirmed"]
+    assert [e["outcome"] for e in events] == ["declined-unconfirmed"]
+
+
+def test_the_worker_declines_a_readable_index_under_its_own_lock(
+    ns, tmp_path, no_spawn,
+):
+    """F4, second point, and it is DISJOINT from the hook's.
+
+    The hook judged an integrity probe taken at detection; the worker judges
+    the file under a lock the hook never held. A sibling that republished in
+    between must not be replaced again.
+    """
+    import types as _types
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_store as st
+    _seed_one_snapshot(jr, J)
+
+    st._cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    request = {
+        "schemaVersion": 1,
+        "healId": "readable-under-lock",
+        "detectedAtUtc": _cctally_core.now_utc_iso(),
+        "probeKind": st._STATS_HEAL_PROBE_READABILITY,
+        "triggerError": "database disk image is malformed",
+    }
+    st.append_stats_heal_event(st.build_stats_heal_event(request, "confirmed"))
+    import _cctally_db
+    _cctally_db._atomic_write_private_json(
+        st._stats_heal_marker_path(), request
+    )
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+    assert not (_cctally_core.APP_DIR / "quarantine").exists(), (
+        "a re-probe that finds the index readable must not replace it"
+    )
+    log = (_cctally_core.LOG_DIR / "stats-corruption-heal.log").read_text()
+    assert "result=declined-readable" in log
+    events = st.read_stats_heal_events()
+    assert [e["healId"] for e in events] == ["readable-under-lock"]
+    assert events[0]["outcome"] == "declined-readable"
+    assert events[0]["incidentPath"] is None
+
+
+def test_the_ring_records_the_detection_and_the_worker_updates_its_entry(
+    ns, tmp_path, no_spawn,
+):
+    """The hook appends at detection; the worker updates the entry MATCHING its
+    heal id, so admission coalescing several detections into one run cannot
+    make the worker update the wrong record."""
+    import types as _types
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"not a database " * 200)
+
+    with pytest.raises(_cctally_db.StatsHealDeferred) as deferred:
+        _cctally_core.open_db()
+    heal_id = deferred.value.heal_id
+
+    events = st.read_stats_heal_events()
+    assert [e["healId"] for e in events] == [heal_id]
+    detected = events[0]
+    assert detected["outcome"] == "detected"
+    assert detected["disposition"] == "confirmed"
+    assert detected["forensicsPath"] == deferred.value.forensics_path
+    assert detected["incidentPath"] is None, (
+        "preservation has not allocated an incident directory at detection"
+    )
+    assert detected["changed"] == "unknown"
+
+    # A second detection while the first is still in flight coalesces: it gets
+    # its own ring entry, and the worker must not settle THAT one.
+    st.append_stats_heal_event(
+        st.build_stats_heal_event({"healId": "coalesced"}, "confirmed")
+    )
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+
+    events = {e["healId"]: e for e in st.read_stats_heal_events()}
+    assert events[heal_id]["outcome"] == "rebuilt"
+    assert events[heal_id]["incidentPath"] is not None
+    assert pathlib.Path(events[heal_id]["incidentPath"]).is_dir()
+    assert events[heal_id]["publicationMechanism"] == "replace"
+    assert events[heal_id]["changed"] == "unknown", (
+        "`conflicts` and `protocol_violations` mean replay ambiguity, not a "
+        "comparison against the index that was replaced"
+    )
+    assert events[heal_id]["conflicts"] == 0
+    assert events[heal_id]["protocolViolations"] == 0
+    assert events["coalesced"]["outcome"] == "detected", (
+        "a heal whose worker never ran must stay visible as incomplete"
+    )
+
+
+def test_a_contended_ring_writer_does_not_drop_its_event(ns, tmp_path):
+    """A non-blocking acquire would make the accountability claim false.
+
+    The writer-guard log may drop a line under contention because it is
+    advisory; this ring is the only durable notification that a heal happened.
+    """
+    import threading
+    import _cctally_store as st
+
+    errors: list[BaseException] = []
+
+    def writer(prefix: str):
+        try:
+            for i in range(12):
+                st.append_stats_heal_event(
+                    st.build_stats_heal_event(
+                        {"healId": f"{prefix}-{i}"}, "confirmed"
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=(name,))
+        for name in ("a", "b", "c")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert errors == []
+    ids = {e["healId"] for e in st.read_stats_heal_events()}
+    expected = {f"{p}-{i}" for p in ("a", "b", "c") for i in range(12)}
+    assert ids == expected, f"lost events: {sorted(expected - ids)}"
+
+
+def test_the_ring_is_bounded_by_count_and_stays_private(ns, tmp_path):
+    import _cctally_store as st
+
+    total = st._STATS_HEAL_RING_CAPACITY + 7
+    for i in range(total):
+        st.append_stats_heal_event(
+            st.build_stats_heal_event({"healId": f"h{i:03d}"}, "confirmed")
+        )
+    events = st.read_stats_heal_events()
+    assert len(events) == st._STATS_HEAL_RING_CAPACITY
+    assert events[-1]["healId"] == f"h{total - 1:03d}"
+    assert events[0]["healId"] == f"h{total - st._STATS_HEAL_RING_CAPACITY:03d}"
+    mode = st._stats_heal_ring_path().stat().st_mode & 0o777
+    assert mode == 0o600, f"the ring holds absolute paths; mode is {oct(mode)}"
+
+
+def test_a_verdict_that_reaches_no_ring_entry_is_reported_not_dropped(
+    ns, tmp_path,
+):
+    """A lost detection append must not make the worker's verdict silent.
+
+    `update_stats_heal_event` settles the entry MATCHING the heal id and
+    returns False when there is none — which is exactly what a detection that
+    lost the ring lock leaves behind. The worker's stdout and stderr are
+    `/dev/null`, so the durable heal log is the only channel that can report it.
+    """
+    import _cctally_core
+    import _cctally_store as st
+
+    assert st.read_stats_heal_events() == []
+    st._record_stats_heal_outcome("never-appended", "rebuilt")
+
+    log = (_cctally_core.LOG_DIR / "stats-corruption-heal.log").read_text()
+    assert "result=ring-update-lost-rebuilt heal=never-appended" in log, log
+
+
+def test_a_ring_file_that_cannot_be_read_is_reported_not_treated_as_empty(
+    ns, tmp_path, capsys,
+):
+    """A malformed ring reads as an empty ring, and the next writer overwrites
+    it, so the accountability history would disappear with nothing said."""
+    import _cctally_core
+    import _cctally_store as st
+
+    st.append_stats_heal_event(
+        st.build_stats_heal_event({"healId": "before-damage"}, "confirmed")
+    )
+    ring = st._stats_heal_ring_path()
+    ring.write_text("{ this is not json")
+
+    assert st.read_stats_heal_events() == []
+
+    err = capsys.readouterr().err
+    assert str(ring) in err
+    assert "could not be read" in err
+    log_path = _cctally_core.LOG_DIR / "stats-corruption-heal.log"
+    assert "result=ring-unreadable-JSONDecodeError" in log_path.read_text()
+
+    # Valid JSON that is not a ring is the same loss and reports the same way.
+    ring.write_text('{"schemaVersion": 1}')
+    assert st.read_stats_heal_events() == []
+    assert "result=ring-unreadable-NoEventList" in log_path.read_text()
+
+
+def test_the_detection_message_names_the_bundle_and_id_but_no_incident(
+    ns, tmp_path, no_spawn, capsys,
+):
+    """F15. The quarantine directory is allocated only during preservation,
+    after the worker has chosen physical fallback and begun it, so the
+    detection message CANNOT name an incident path."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"not a database " * 200)
+
+    with pytest.raises(_cctally_db.StatsHealDeferred) as deferred:
+        _cctally_core.open_db()
+    err = capsys.readouterr().err
+
+    assert deferred.value.heal_id in err
+    assert deferred.value.forensics_path in err
+    assert pathlib.Path(deferred.value.forensics_path).is_absolute()
+    assert "quarantine/" not in err, (
+        "no incident directory exists at detection time"
+    )
+    assert "background" in err
+
+
+def test_recurrence_escalates_by_reporting_and_never_halts_the_heal(
+    ns, tmp_path, no_spawn, capsys,
+):
+    """Escalation is report-only: no halt, and no throttle beyond admission's
+    existing retry interval."""
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    jr, J = _jr(), _jlib()
+    _seed_one_snapshot(jr, J)
+
+    for i in range(st._STATS_HEAL_RECURRENCE_THRESHOLD):
+        st.append_stats_heal_event(
+            st.build_stats_heal_event({"healId": f"prior-{i}"}, "confirmed")
+        )
+    assert st.stats_heal_recurrence() >= st._STATS_HEAL_RECURRENCE_THRESHOLD
+
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"not a database " * 200)
+    with pytest.raises(_cctally_db.StatsHealDeferred) as deferred:
+        _cctally_core.open_db()
+
+    err = capsys.readouterr().err
+    assert "recurring" in err
+    assert deferred.value.outcome == "spawned", (
+        "escalation must not halt or throttle the heal"
+    )
+
+
 # --- concurrent heal serialization (spawn multiprocess) ---
 
 def _corrupt_and_open_worker(bin_dir, home_dir, data_dir, q):
+    """Meet the corrupt index from a separate process and report the deferral.
+
+    The detached spawn is neutralized: a real background process would race
+    the in-process worker the test drives afterwards, and the property under
+    test is admission, not process launching.
+    """
+    try:
+        _load_cctally_in_child(bin_dir, home_dir, data_dir)
+        import _cctally_core
+        import _cctally_db
+        import _cctally_update
+
+        _cctally_update._spawn_detached = lambda _command: True
+        try:
+            conn = _cctally_core.open_db()
+        except _cctally_db.StatsHealDeferred as deferred:
+            q.put(("deferred", deferred.outcome))
+            return
+        n = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
+        conn.close()
+        q.put(("ok", n))
+    except BaseException as exc:  # pragma: no cover
+        q.put(("ERR", f"{type(exc).__name__}:{exc}"))
+
+
+# --- #496 S3 Task 9: mode-aware maintenance ownership -------------------
+
+def _load_cctally_in_child(bin_dir, home_dir, data_dir):
     import os as _os
     import sys as _sys
+
     _os.environ["CCTALLY_DATA_DIR"] = data_dir
     _os.environ["HOME"] = home_dir
     _os.environ["TZ"] = "Etc/UTC"
     _sys.path.insert(0, bin_dir)
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("cctally", _os.path.join(bin_dir, "cctally"))
+    spec = importlib.util.spec_from_loader("cctally", loader)
+    mod = importlib.util.module_from_spec(spec)
+    _sys.modules["cctally"] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+def _heal_owning_maintenance_worker(bin_dir, home_dir, data_dir, q):
+    """Call the heal while THIS process already holds maintenance EXCLUSIVE."""
+    import fcntl as _fcntl
+    import os as _os
+    import sqlite3 as _sqlite3
+
     try:
-        import importlib.util
-        from importlib.machinery import SourceFileLoader
-        loader = SourceFileLoader("cctally", _os.path.join(bin_dir, "cctally"))
-        spec = importlib.util.spec_from_loader("cctally", loader)
-        mod = importlib.util.module_from_spec(spec)
-        _sys.modules["cctally"] = mod
-        loader.exec_module(mod)
+        _load_cctally_in_child(bin_dir, home_dir, data_dir)
         import _cctally_core
-        conn = _cctally_core.open_db()  # both racers hit the corrupt DB + heal
-        n = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()[0]
-        conn.close()
-        q.put(("ok", n))
-    except Exception as exc:  # pragma: no cover
+        import _cctally_store
+
+        fd = _os.open(
+            str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),
+            _os.O_RDWR | _os.O_CREAT,
+            0o600,
+        )
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        _cctally_core.note_stats_maintenance_acquired()
+        try:
+            outcome = _cctally_store.HEAL_HOOK(
+                "stats",
+                _sqlite3.DatabaseError("database disk image is malformed"),
+            )
+            q.put(("returned", repr(outcome)))
+        except BaseException as exc:  # noqa: BLE001 — a deferral is a result
+            q.put(("raised", type(exc).__name__))
+    except BaseException as exc:  # pragma: no cover
         q.put(("ERR", f"{type(exc).__name__}:{exc}"))
 
 
-def test_concurrent_heal_serializes_under_maintenance_lock(ns, tmp_path):
+def _heal_under_foreign_holder_worker(bin_dir, home_dir, data_dir, q):
+    """Call the heal while ANOTHER process holds maintenance EXCLUSIVE."""
+    import sqlite3 as _sqlite3
+
+    try:
+        _load_cctally_in_child(bin_dir, home_dir, data_dir)
+        import _cctally_store
+
+        try:
+            outcome = _cctally_store.HEAL_HOOK(
+                "stats",
+                _sqlite3.DatabaseError("database disk image is malformed"),
+            )
+            q.put(("returned", repr(outcome)))
+        except BaseException as exc:  # noqa: BLE001 — a deferral is a result
+            q.put(("raised", type(exc).__name__))
+    except BaseException as exc:  # pragma: no cover
+        q.put(("ERR", f"{type(exc).__name__}:{exc}"))
+
+
+def _run_heal_child(target, tmp_path, *, timeout: float):
+    """Drive one heal in a real subprocess; a deadlock FAILS instead of hangs."""
+    import _cctally_core
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(
+        target=target,
+        args=(
+            _BIN_DIR,
+            os.environ["HOME"],
+            str(_cctally_core.APP_DIR),
+            q,
+        ),
+    )
+    proc.start()
+    proc.join(timeout=timeout)
+    alive = proc.is_alive()
+    if alive:
+        proc.terminate()
+        proc.join(timeout=15)
+        if proc.is_alive():  # pragma: no cover
+            proc.kill()
+            proc.join(timeout=15)
+        return None
+    return q.get(timeout=10)
+
+
+def _corrupt_stats_with_journal(ns, tmp_path):
     jr, J = _jr(), _jlib()
     import _cctally_core
+
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as f:
+        f.write(b"garbage garbage " * 200)
+    return _cctally_core
+
+
+def test_heal_under_an_exclusive_holder_does_not_self_deadlock(ns, tmp_path):
+    """flock conflicts per open-file-description WITHIN a process: LOCK_EX on
+    one fd then LOCK_SH on a second blocks forever, and run_stats_ingest can
+    hold exclusive when it calls open_db().
+
+    Ownership-first is the rule: an existing hold is REUSED whatever its mode,
+    and nothing is acquired a second time.
+    """
+    _corrupt_stats_with_journal(ns, tmp_path)
+    result = _run_heal_child(
+        _heal_owning_maintenance_worker, tmp_path, timeout=90
+    )
+    assert result is not None, (
+        "the corruption heal requested stats.db.maintenance.lock a second "
+        "time while this process already held it exclusive, and blocked"
+    )
+    assert result[0] != "ERR", result
+    # A bounded second acquire would not hang, but it would time out against
+    # this process's own hold and DECLINE. Ownership-first is what makes the
+    # heal proceed, so the decline is what this test has to exclude.
+    assert result != ("returned", "False"), (
+        "the heal declined instead of reusing the maintenance hold this "
+        "process already owns"
+    )
+
+
+def test_heal_does_not_block_a_caller_behind_a_foreign_maintenance_holder(
+    ns, tmp_path,
+):
+    """A detached heal worker owns maintenance EXCLUSIVE for the whole rebuild.
+
+    An ordinary open that meets corruption while that worker runs must not
+    wait for it: an unbounded acquire inside the hook is exactly the blocking
+    the detached architecture exists to remove.
+    """
+    core = _corrupt_stats_with_journal(ns, tmp_path)
+    lock_fd = os.open(
+        str(core.STATS_LOCK_MAINTENANCE_PATH), os.O_RDWR | os.O_CREAT, 0o600
+    )
+    import fcntl
+
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        result = _run_heal_child(
+            _heal_under_foreign_holder_worker, tmp_path, timeout=90
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    assert result is not None, (
+        "the corruption heal blocked indefinitely on a foreign holder of "
+        "stats.db.maintenance.lock instead of giving up within a bound"
+    )
+    assert result[0] != "ERR", result
+
+
+def test_concurrent_detections_coalesce_into_one_deferred_heal(ns, tmp_path):
+    """Three processes meeting the same corrupt index admit ONE heal.
+
+    Before #496 S3 each racer healed inline and the maintenance lock plus the
+    locked re-check kept them to one incident. The heal is detached now, so
+    admission is what has to hold the line: one request is filed, later
+    detections coalesce onto it, and the single worker leaves one incident.
+    """
+    jr, J = _jr(), _jlib()
+    import types as _types
+    import _cctally_core
+    import _cctally_store as st
     _seed_one_snapshot(jr, J)
     data_dir = str(_cctally_core.APP_DIR)
     home_dir = os.environ["HOME"]
@@ -607,18 +1321,40 @@ def test_concurrent_heal_serializes_under_maintenance_lock(ns, tmp_path):
     results = [q.get(timeout=120) for _ in procs]
     for p in procs:
         p.join(timeout=60)
-    assert all(r[0] == "ok" for r in results), results
-    assert all(r[1] == 1 for r in results), f"every racer sees the healed data: {results}"
-    # The maintenance lock + locked re-check mean EXACTLY ONE quarantine incident.
+    assert all(r[0] == "deferred" for r in results), results
+    outcomes = sorted(r[1] for r in results)
+    assert outcomes == ["pending", "pending", "spawned"], (
+        f"admission must file exactly one request: {outcomes}"
+    )
+    assert not (_cctally_core.APP_DIR / "quarantine").exists(), (
+        "no racer may replace the family on its own thread"
+    )
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
     incidents = list((_cctally_core.APP_DIR / "quarantine").iterdir())
-    assert len(incidents) == 1, f"concurrent healers must serialize: {incidents}"
+    assert len(incidents) == 1, f"one admitted heal, one incident: {incidents}"
+    conn = _cctally_core.open_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 # ==========================================================================
 # Item 4 — db rebuild --db stats operator command
 # ==========================================================================
 
-def test_db_rebuild_command_quarantines_and_rebuilds(ns, capsys):
+def test_db_rebuild_command_publishes_in_place_and_rebuilds(ns, capsys):
+    """#496 S3: a readable index is published transactionally into the live
+    file, so the operator rebuild reproduces the journal-covered state without
+    destroying anything.
+
+    The quarantine copy and the line announcing it are gone on this path,
+    because preservation is a consequence of destroying a file and nothing is
+    destroyed. `db backup --db stats` is the supported snapshot command.
+    """
     jr, J = _jr(), _jlib()
     import _cctally_core
     _seed_one_snapshot(jr, J)
@@ -633,7 +1369,7 @@ def test_db_rebuild_command_quarantines_and_rebuilds(ns, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "rebuilt stats.db" in out
-    assert "quarantined" in out
+    assert "quarantined" not in out
 
     _post = _cctally_core.open_db()
     try:
@@ -641,8 +1377,8 @@ def test_db_rebuild_command_quarantines_and_rebuilds(ns, capsys):
     finally:
         _post.close()
     assert after == before, "operator rebuild reproduces the journal-covered state"
-    incidents = list((_cctally_core.APP_DIR / "quarantine").iterdir())
-    assert len(incidents) == 1
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
 def test_db_rebuild_command_json_envelope(ns, capsys):

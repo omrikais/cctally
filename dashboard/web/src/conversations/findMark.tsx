@@ -264,10 +264,26 @@ export function applyExactMarksToHast(
     byLeaf.set(target.leafKey, list);
   }
   const textNodes: Text[] = [];
+  // react-markdown keeps provider-authored HTML-like context wrappers as HAST
+  // `raw` nodes and escapes them at render time. They are visible text, so the
+  // exact-find walk must count and split them just like ordinary text nodes.
+  // The official HAST RootContent union does not include the pre-sanitization
+  // `raw` extension, hence the narrow structural check instead of a cast of the
+  // whole tree.
+  const rawValue = (node: RootContent): string | null => {
+    const candidate = node as RootContent & { type?: string; value?: unknown };
+    return candidate.type === 'raw' && typeof candidate.value === 'string'
+      ? candidate.value
+      : null;
+  };
   const collect = (children: RootContent[]) => {
     for (const child of children) {
       if (child.type === 'element') collect(child.children);
       else if (child.type === 'text' && child.value) textNodes.push(child);
+      else {
+        const raw = rawValue(child);
+        if (raw) textNodes.push({ type: 'text', value: raw });
+      }
     }
   };
   collect(tree.children);
@@ -304,11 +320,13 @@ export function applyExactMarksToHast(
         out.push(child);
         continue;
       }
-      if (child.type !== 'text' || !child.value) {
+      const raw = rawValue(child);
+      const value = child.type === 'text' ? child.value : raw;
+      if (!value) {
         out.push(child);
         continue;
       }
-      const length = [...child.value].length;
+      const length = [...value].length;
       const local = globalTargets
         .filter((target) => target.start < domCursor + length && target.end > domCursor)
         .map((target) => ({
@@ -316,7 +334,7 @@ export function applyExactMarksToHast(
           start: Math.max(0, target.start - domCursor),
           end: Math.min(length, target.end - domCursor),
         }));
-      out.push(...exactHastNodes(child.value, local));
+      out.push(...exactHastNodes(value, local));
       domCursor += length;
     }
     return out;

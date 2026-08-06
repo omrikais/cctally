@@ -18,6 +18,7 @@ import {
 } from './TranscriptContext';
 import { segmentContextBody, parseUnifiedDiff } from './contextDiff';
 import { UnifiedDiffView } from './UnifiedDiffView';
+import { splitToExactNodes, useExactSurfaceTargets } from './findMark';
 import type { ConversationItem } from '../types/conversation';
 
 // #228 S3 B2 — below this per-turn cost the verbose `$… · in … · out … · cache …`
@@ -33,18 +34,39 @@ const COST_TEXT_FLOOR_USD = 0.05;
 // render prose as Markdown (unchanged) and diff segments as a UnifiedDiffView.
 // A body with no `diff --git` marker is a single prose segment → all Markdown,
 // exactly as before.
-function ContextBody({ text }: { text: string }) {
+function ContextBody({ text, blockKey }: { text: string; blockKey?: string }) {
   const segments = segmentContextBody(text);
+  const exact = useExactSurfaceTargets(blockKey, 'body');
   return (
     <>
       {segments.map((seg, i) =>
         seg.kind === 'diff' ? (
-          <UnifiedDiffView key={i} files={parseUnifiedDiff(seg.text)} />
+          <UnifiedDiffView
+            key={i}
+            files={parseUnifiedDiff(seg.text)}
+            exactTargetsForRow={(fileIndex, hunkIndex, rowIndex) =>
+              exact.get(`segments.${i}.files.${fileIndex}.hunks.${hunkIndex}.rows.${rowIndex}`) ?? []}
+          />
         ) : (
-          <Markdown key={i}>{seg.text}</Markdown>
+          <Markdown
+            key={i}
+            findBlockKey={blockKey}
+            findSurface="body"
+            findLeafPrefix={`segments.${i}.prose`}
+          >{seg.text}</Markdown>
         ),
       )}
     </>
+  );
+}
+
+function MetaCommandBody({ text, blockKey }: { text: string; blockKey?: string }) {
+  const exact = useExactSurfaceTargets(blockKey, 'body');
+  const targets = exact.get('t0') ?? [];
+  return (
+    <pre className="conv-meta-body conv-meta-body--pre">
+      {targets.length ? splitToExactNodes(text, targets) : text}
+    </pre>
   );
 }
 
@@ -342,6 +364,7 @@ function MessageItemImpl(
     const providerLabel = qualifiedMetaLabel(item.meta_label);
     const notificationLabel = providerLabel ?? 'Background task';
     const sections = item.meta_sections?.filter(Boolean).join(', ');
+    const blockKey = item.blocks.find((block) => block.kind === 'text')?.block_key;
     const head =
       mk === 'skill' ? (
         <>
@@ -370,20 +393,26 @@ function MessageItemImpl(
       );
     return (
       <div ref={ref} className={cls('conv-item--meta')} style={style} data-uuid={item.anchor.uuid}>
-        <details className={`conv-meta conv-meta--${mk}`}>
+        <details
+          className={`conv-meta conv-meta--${mk}`}
+          {...(blockKey ? {
+            'data-block-key': blockKey,
+            'data-disclosure-key': blockKey,
+          } : {})}
+        >
           <summary>
             <span className="conv-chev" aria-hidden="true" />
             {head}
             {eyebrow}
           </summary>
           {mk === 'command' ? (
-            <pre className="conv-meta-body conv-meta-body--pre">{item.text}</pre>
+            <MetaCommandBody text={item.text} blockKey={blockKey} />
           ) : mk === 'context' ? (
             // #217 S5 F6 — render the injected context body as prose + any
             // unfenced git diff (ContextBody splits + routes diff segments
             // through UnifiedDiffView). No `diff --git` marker → all prose.
             <div className="conv-meta-body">
-              <ContextBody text={item.text} />
+              <ContextBody text={item.text} blockKey={blockKey} />
             </div>
           ) : (
             <div className="conv-meta-body">

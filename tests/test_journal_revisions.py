@@ -1212,10 +1212,18 @@ def test_live_malformed_revision_does_not_mutate_or_advance_cursor(ns):
         conn.close()
 
 
-@pytest.mark.parametrize("crash_point", ["fold", "swap"])
+@pytest.mark.parametrize("crash_point", ["fold", "publish"])
 def test_completed_correction_rebuild_crash_preserves_old_index_and_retries(
     ns, monkeypatch, crash_point
 ):
+    """A crash at either seam leaves the old generation live and converges.
+
+    `publish` was `swap` until #496 S3 replaced `os.replace` with a
+    transactional publish, at which point patching `jr.os.replace` stopped
+    intercepting anything. The seam is now the publication transaction itself,
+    and the property is unchanged: the destination still carries the
+    pre-correction value, and an identical retry lands the correction.
+    """
     core, jr, lib = _siblings()
     base = lib.make_evt(
         kind="snapshot_accept",
@@ -1252,14 +1260,16 @@ def test_completed_correction_rebuild_crash_preserves_old_index_and_retries(
 
         monkeypatch.setattr(jr, "_apply_evt", crash_apply)
     else:
-        real_replace = jr.os.replace
+        real_publish = jr._publish_generation_in_place
 
-        def crash_replace(source, destination):
-            if ".rebuilding-" in str(source):
-                raise RuntimeError("simulated correction swap crash")
-            return real_replace(source, destination)
+        def crash_publish(conn, scratch, **kwargs):
+            # Raised BEFORE any statement runs, so the phase machine sees
+            # PRE_COMMIT. The message is not a structural one, so the failure
+            # is refused rather than authorizing physical replacement: the old
+            # generation stays live, which is what this test is about.
+            raise RuntimeError("simulated correction publish crash")
 
-        monkeypatch.setattr(jr.os, "replace", crash_replace)
+        monkeypatch.setattr(jr, "_publish_generation_in_place", crash_publish)
 
     with pytest.raises(RuntimeError, match="simulated correction"):
         jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
@@ -1276,7 +1286,7 @@ def test_completed_correction_rebuild_crash_preserves_old_index_and_retries(
     if crash_point == "fold":
         monkeypatch.setattr(jr, "_apply_evt", real_apply)
     else:
-        monkeypatch.setattr(jr.os, "replace", real_replace)
+        monkeypatch.setattr(jr, "_publish_generation_in_place", real_publish)
     jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = core.open_db()
     try:

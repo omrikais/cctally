@@ -49,6 +49,9 @@ export interface Manifest {
   occurrence_find_case_query: string;
   occurrence_find_regex_query: string;
   occurrence_find_reasoning_query: string;
+  rail_page_conversation_count: number;
+  rail_page_inside_title: string;
+  rail_page_outside_title: string;
 }
 
 /** Read the fixture manifest the launcher's builder wrote into e2e/.runtime/. */

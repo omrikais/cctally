@@ -967,7 +967,9 @@ ProdMigrationRefused = _cctally_db.ProdMigrationRefused
 StatsDbCorruptError = _cctally_db.StatsDbCorruptError
 StatsDbMaintenanceError = _cctally_db.StatsDbMaintenanceError
 StatsEpochMismatchError = _cctally_db.StatsEpochMismatchError
+StatsRebuildDeferred = _cctally_db.StatsRebuildDeferred
 StatsEpochRebuildDeferred = _cctally_db.StatsEpochRebuildDeferred
+StatsHealDeferred = _cctally_db.StatsHealDeferred
 _is_sqlite_corruption_error = _cctally_db._is_sqlite_corruption_error
 _stats_corruption_guidance = _cctally_db._stats_corruption_guidance
 _STATS_MIGRATIONS = _cctally_db._STATS_MIGRATIONS
@@ -996,6 +998,9 @@ _BANNER_SUPPRESSED_COMMANDS = _cctally_db._BANNER_SUPPRESSED_COMMANDS
 _cctally_store = _load_sibling("_cctally_store")
 cmd_stats_epoch_rebuild_internal = (
     _cctally_store.cmd_stats_epoch_rebuild_internal
+)
+cmd_stats_corruption_heal_internal = (
+    _cctally_store.cmd_stats_corruption_heal_internal
 )
 _print_migration_error_banner_if_needed = _cctally_db._print_migration_error_banner_if_needed
 cmd_db_status = _cctally_db.cmd_db_status
@@ -3355,7 +3360,10 @@ def main(argv: list[str] | None = None) -> int:
         # generic DatabaseError so it never renders as a raw traceback.
         eprint(f"cctally: {exc}")
         return 3
-    except StatsEpochRebuildDeferred as exc:
+    except StatsRebuildDeferred as exc:
+        # One catch for both deferral classes (#496 S3 §6): the epoch worker
+        # and the corruption-heal worker both mean "a rebuild is running; do
+        # not print a partial report".
         eprint(f"cctally: {exc}")
         return 3
     except AccountAttributionUnavailable as exc:
@@ -3477,8 +3485,9 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         # still cctally-dev at this point). Same rationale class as doctor.
         return
     if command in ("_update-check", "_telemetry-beat", "_codex-quota-verify",
-                   "_stats-epoch-rebuild", "_codex-replay-drain"):
-        # All five hidden workers are detached and have already done their one job
+                   "_stats-epoch-rebuild", "_stats-corruption-heal",
+                   "_codex-replay-drain"):
+        # All six hidden workers are detached and have already done their one job
         # in their own command handler; none must re-enter this hook.
         # Without the guard the ``_update-check`` worker would fall through to
         # the telemetry gate below and (throttle-bounded) spawn a

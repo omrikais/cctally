@@ -771,7 +771,7 @@ def _read_db_projection_stable(*, attempts: int = 3) -> "_candidates.DbProjectio
         before = _db_file_fingerprint()
         try:
             projection = _read_db_projection_once()
-        except _cctally().StatsEpochRebuildDeferred:
+        except _cctally().StatsRebuildDeferred:
             return _candidates.DbProjection(None, None, db_files=before)
         after = _db_file_fingerprint()
         if before == after and after["main"] is not None:
@@ -1012,7 +1012,7 @@ def _authoritative_record_usage(
 
     try:
         rc = _cctally().cmd_record_usage(args)
-    except _cctally().StatsEpochRebuildDeferred as exc:
+    except _cctally().StatsRebuildDeferred as exc:
         return _AuthoritativeRecordResult("record_failed", str(exc))
     except Exception as exc:
         return _AuthoritativeRecordResult("record_failed", str(exc))
@@ -1172,7 +1172,7 @@ def _statusline_reduce_and_publish() -> "_candidates.ReductionDecision | None":
         record_rc = _cctally().cmd_record_usage(
             args, ingest_mode="opportunistic"
         )
-    except _cctally().StatsEpochRebuildDeferred:
+    except _cctally().StatsRebuildDeferred:
         return decision
     if record_rc != 0:
         return decision
@@ -1597,7 +1597,7 @@ def _build_statusline_injections(warn_once):
                     range_start - c.BLOCK_DURATION, now + c.BLOCK_DURATION,
                 )
             )
-        except c.StatsEpochRebuildDeferred:
+        except c.StatsRebuildDeferred:
             recorded_windows, block_start_overrides, canonical_intervals = (
                 [], {}, {},
             )
@@ -1637,7 +1637,7 @@ def _build_statusline_injections(warn_once):
         _acct_params = () if _sl_account is None else (_sl_account,)
         try:
             conn = open_db()
-        except c.StatsEpochRebuildDeferred:
+        except c.StatsRebuildDeferred:
             return (None, None)
         except Exception:
             return (None, None)
@@ -1724,7 +1724,7 @@ def _build_statusline_injections(warn_once):
     def _db_latest_rate_limits():
         try:
             conn = open_db()
-        except _cctally().StatsEpochRebuildDeferred:
+        except _cctally().StatsRebuildDeferred:
             return None
         except Exception:
             return None

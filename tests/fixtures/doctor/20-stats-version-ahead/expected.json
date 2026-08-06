@@ -196,7 +196,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1007,
+                            "epoch": 1008,
                             "journal_has_bytes": false,
                             "journal_present": false,
                             "legacy_head": 13,
@@ -207,7 +207,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`",
                     "severity": "warn",
-                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1007) \u2014 no journal data available",
+                    "summary": "stats.db index mismatch (v99 \u2260 epoch v1008) \u2014 no journal data available",
                     "title": "Version ahead"
                 },
                 {

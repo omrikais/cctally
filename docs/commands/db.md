@@ -115,11 +115,21 @@ Rebuilds `stats.db` from the append-only journal (DB journal redesign
 §9). Since the journal redesign, `stats.db` is a **disposable index**
 materialized from `~/.local/share/cctally/journal/` — the durable truth
 is the journal, not the SQLite file. `db rebuild` is the explicit
-remediation surface: it forensics-quarantines the current `stats.db`
-(the same forensics-first way auto-heal does, even when the DB is
-healthy — this is a deliberate operator reset) and replays the whole
-journal into a fresh index, then reports per-table row counts, lines
+remediation surface: it replays the whole journal into a fresh scratch
+index, validates it, and then **publishes it transactionally into the
+live `stats.db`** (#496 S3), reporting per-table row counts, lines
 folded, and duration.
+
+Publication is chosen by whether the destination can be operated on, not
+by what triggered the rebuild. The normal case is the in-place publish
+above, and it **leaves no quarantined copy** — preservation is a
+consequence of destroying a file, and an in-place publish destroys
+nothing. Use `cctally db backup --db stats` when you want a snapshot
+before rebuilding. Physical replacement is the fallback, taken only when
+the destination is structurally unusable (`SQLITE_CORRUPT` /
+`SQLITE_NOTADB`); that path still forensics-quarantines the old family
+first, and only then does the command print the "previous stats.db
+quarantined" line and fill in `quarantineDir`.
 
 It is held under the stats **maintenance lock** and takes the bounded
 **ingest lock**, so it serializes with a concurrent auto-heal and with a

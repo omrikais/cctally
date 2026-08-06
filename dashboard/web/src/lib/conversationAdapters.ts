@@ -27,7 +27,7 @@ import type {
   CodexLifecycleState,
 } from '../types/conversation';
 import type { ConversationSource } from '../types/conversation';
-import type { QualifiedBrowseEnvelope, QualifiedSearchEnvelope } from './conversationTransport';
+import type { QualifiedBrowseEnvelope, QualifiedBrowseRow, QualifiedSearchEnvelope } from './conversationTransport';
 // #463 S3 §5.4 — one vocabulary for naming a session reference, shared with the
 // card components so the collapsed row and the card body cannot drift apart.
 import {
@@ -1084,24 +1084,26 @@ export function adaptQualifiedBrowse(
   body: QualifiedBrowseEnvelope,
   accountKey?: string,
 ): {
-  rows: ConversationSummary[]; cursor: string | null; total: number; pending: boolean;
+  rows: ConversationSummary[]; selected?: ConversationSummary; cursor: string | null; total: number; pending: boolean;
 } {
   if (body.status === 'normalization_pending') return { rows: [], cursor: null, total: 0, pending: true };
+  const adaptRow = (row: QualifiedBrowseRow): ConversationSummary => ({
+    conversation_ref: accountKey
+      ? { source, key: row.conversation_key, account_key: accountKey }
+      : { source, key: row.conversation_key },
+    session_id: row.conversation_key,
+    title: cleanQualifiedTitle(row.title) || 'Untitled conversation',
+    project_label: row.project_label || '—',
+    git_branch: row.parent ? 'child thread' : row.is_fork ? 'fork' : null,
+    started_utc: row.started_utc || row.last_activity_utc || '',
+    last_activity_utc: row.last_activity_utc || row.started_utc || '',
+    msg_count: row.count,
+    cost_usd: row.cost_usd,
+    models: row.models,
+  });
   return {
-    rows: body.rows.map((row) => ({
-      conversation_ref: accountKey
-        ? { source, key: row.conversation_key, account_key: accountKey }
-        : { source, key: row.conversation_key },
-      session_id: row.conversation_key,
-      title: cleanQualifiedTitle(row.title) || 'Untitled conversation',
-      project_label: row.project_label || '—',
-      git_branch: row.parent ? 'child thread' : row.is_fork ? 'fork' : null,
-      started_utc: row.started_utc || row.last_activity_utc || '',
-      last_activity_utc: row.last_activity_utc || row.started_utc || '',
-      msg_count: row.count,
-      cost_usd: row.cost_usd,
-      models: row.models,
-    })),
+    rows: body.rows.map(adaptRow),
+    ...(body.selected ? { selected: adaptRow(body.selected) } : {}),
     cursor: body.page.cursor ?? null,
     total: body.page.total,
     pending: false,

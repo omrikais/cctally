@@ -11,9 +11,9 @@ test('qualified Codex browse and shared reader preserve native meaning', async (
 
   const sourceSwitch = page.locator('.conv-rail-source');
   await sourceSwitch.getByRole('button', { name: 'Codex', exact: true }).click();
-  // Eight canonical reader/card fixtures plus #482's isolated occurrence-find
-  // conversation.
-  await expect(page.locator('.conv-rail-row')).toHaveCount(9);
+  // The nine canonical reader/search fixtures remain newest; #501 adds enough
+  // deliberately old qualified conversations to fill the first browse page.
+  await expect(page.locator('.conv-rail-row')).toHaveCount(50);
 
   const modern = page.locator('.conv-rail-row').filter({ hasText: 'Synthetic first meaningful user prompt' });
   await modern.click();
@@ -92,8 +92,8 @@ test('All composes qualified sources locally and collision state stays isolated'
   await page.goto('/#/conversations');
   await page.locator('.conv-rail-source').getByRole('button', { name: 'All', exact: true }).click();
 
-  // Eight Claude fixtures plus the nine Codex fixtures above.
-  await expect(page.locator('.conv-rail-row')).toHaveCount(17);
+  // Eight Claude fixtures plus Codex's full first page.
+  await expect(page.locator('.conv-rail-row')).toHaveCount(58);
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root A red prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Root B blue prompt' })).toBeVisible();
   await expect(page.locator('.conv-rail-row').filter({ hasText: 'Claude seed user prompt distinct from codex' })).toBeVisible();

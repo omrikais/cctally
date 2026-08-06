@@ -5,6 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.92.1] - 2026-08-06
+
+### Changed
+- A rebuilt stats index is now published into the existing database file inside a single transaction, instead of being written to a scratch file that is then renamed over the live one. Reports and the dashboard keep working while a rebuild publishes, rather than being refused because a connection is open, and a reader that is mid-query keeps seeing the data it started with. Because nothing is destroyed, `cctally db rebuild --db stats` no longer leaves a quarantined copy of the previous index and no longer prints the line saying it did; use `cctally db backup --db stats` when you want a snapshot beforehand. If a published index then fails its own validation, the refusal explains that no copy of the previous index was kept, instead of directing you to a quarantine directory that was never created. A database the tool cannot open at all is still replaced the old way, with the previous copy preserved. This upgrade rebuilds the stats index once (#496).
+- Recovering a corrupt stats index no longer makes you wait for it. Previously the command that first met the damage — a status line render, a dashboard start, any report — replayed the whole journal on its own thread before returning. That recovery now runs in the background: the command that found the damage writes the evidence, schedules the rebuild, tells you where the evidence is and that a rebuild is running, and exits without replacing anything. The dashboard and the terminal dashboard show a "rebuilding" frame and fill in on a later refresh, and `cctally db rebuild --db stats` is still the command to run when you want to wait for it. Repeated detections while a rebuild is in flight collapse into that one rebuild rather than starting more. A recovery also no longer runs unless a second check confirms the index really is damaged, and every recovery is now recorded in a small private log of the last 50 events, so a fault that keeps coming back is visible instead of only being repaired. That log does not report whether any recorded value changed, because the rebuild has no way to know (#496).
+
+### Fixed
+- The Codex Current Cycle modal no longer presents its native-quota label as a second provider identity, keeping Codex on its single app-wide identity accent while preserving the modal's section and state colors (#498).
+- Account-filtered Codex conversation lists now retain each conversation's project grouping and badge instead of relabelling every scoped row as `(unassigned)` (#497).
+- Conversation permalinks now keep the selected conversation visible and marked current even when it falls beyond the rail's first 50 rows, without changing the saved search and filter behavior of browser history traversal (#501).
+- Conversation Viewer find now counts and reaches text inside Codex injected-context, skill, command, compaction, and notification bodies. Selecting a match opens only its owning disclosure and marks the exact visible text, including provider-tagged context prose and rendered context diffs; existing stores rebuild the disposable find projection in bounded resumable batches (#499).
+
 ## [1.92.0] - 2026-08-05
 
 ### Added
@@ -22,7 +34,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Stats damage characterization now detects a table or index whose root page holds the wrong kind of b-tree page. The previous check accepted any valid page type, so the damage shape that actually occurs — a table rooted at an index leaf — was reported as healthy (#496).
 - A detached Codex quota verification can no longer make the following hook tick acknowledge success without evaluating its budget alerts. If the verifier still owns the stats ingest lock, the tick remains due and retries as soon as that lock is released (#461).
 - Cache Report no longer warns that net cache spend is negative when savings and write costs cancel to an effectively zero floating-point residue (#471).
-- Fix `cctally setup` npm installs repeatedly adding duplicate Codex Stop/SubagentStop hooks instead of reconciling them (#458).
+- Fix `cctally setup` npm installs repeatedly adding duplicate Codex Stop/SubagentStop hooks instead of reconciling them (#458; reported independently by @darlingm, who also supplied a regression patch).
 - Cache Report charts now announce one consistent window size to screen readers and identify unobserved days as a measured subset (#469).
 - Codex quota rows restored from the journal or repaired during migration now invalidate cached dashboard and projection state immediately, instead of waiting for an unrelated later Codex mutation (#457).
 - Codex file-path search now indexes the dict-shaped patch events the provider actually records, and upgrades backfill retained history so existing conversations become searchable by touched file (#489).

@@ -54,11 +54,12 @@ def _projection(
         "INSERT INTO codex_find_projection "
         "(message_id,conversation_key,item_key,block_key,container_block_key,"
         "surface,render_order,projected_text,leaves_json,disclosure_json,"
-        "projection_version) VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+        "projection_version) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             message_id, "conv", item, block, f"container-{block}", surface,
             order, text, json.dumps(leaves),
             json.dumps([f"details-{block}"] if surface != "body" else []),
+            query.CODEX_FIND_PROJECTION_VERSION,
         ),
     )
 

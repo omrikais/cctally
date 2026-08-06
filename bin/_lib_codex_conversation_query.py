@@ -34,11 +34,13 @@ import _lib_codex_conversation as kern
 import _lib_codex_landmarks as landmarks
 import _lib_codex_segments as segkern
 from _lib_codex_find_projection import (
+    CODEX_FIND_PROJECTION_VERSION,
     ProjectedLeaf,
     RenderLeaf,
     iter_literal_ranges,
     iter_regex_ranges,
     literal_ranges,
+    project_context,
     project_markdown,
     project_plain,
     regex_ranges,
@@ -3006,6 +3008,7 @@ def list_codex_conversations(
     model: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
+    selected: str | None = None,
 ) -> dict:
     """Browse envelope (§5.6 / §6.1): a page of conversation rows ordered by last
     activity, with project/model facets. Dual-branch — the stored rollup fast
@@ -3021,7 +3024,13 @@ def list_codex_conversations(
         page_rows, page = _stored_browse_page(
             conn, effective_speed=effective_speed, project_key=project_key,
             model=model, limit=limit, cursor=cursor)
-        return {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+        result = {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+        if selected is not None:
+            fields = _rollup_fields(conn, selected)
+            if fields is not None:
+                result["selected"] = _browse_row(
+                    conn, selected, effective_speed, fields)
+        return result
 
     fields_rows = _live_browse_fields(conn)
     rows = [
@@ -3034,7 +3043,13 @@ def list_codex_conversations(
                 and (model is None or model in (row["models"] or []))]
     filtered.sort(key=_recent_sort_key, reverse=True)
     page_rows, page = _paginate_rows(filtered, cursor=cursor, limit=limit)
-    return {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+    result = {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+    if selected is not None:
+        selected_row = next(
+            (row for row in rows if row["conversation_key"] == selected), None)
+        if selected_row is not None:
+            result["selected"] = selected_row
+    return result
 
 
 # ── search (§6.2) ─────────────────────────────────────────────────────────────
@@ -3111,7 +3126,6 @@ def _pos_to_item_key(conn: sqlite3.Connection, conversation_key: str) -> dict:
 
 # ── #482 visible render-leaf projection ─────────────────────────────────────
 
-CODEX_FIND_PROJECTION_VERSION = 1
 _COMPLETION_EVENT_TYPES = {
     "patch_apply_end",
     "web_search_end",
@@ -3120,7 +3134,7 @@ _COMPLETION_EVENT_TYPES = {
 
 
 def _find_surface(row) -> str | None:
-    if row.kind in {"user", "assistant", "reasoning"}:
+    if row.kind in {"user", "assistant", "reasoning", "meta"}:
         return "body"
     if row.kind == "tool_call":
         return "call"
@@ -3252,6 +3266,17 @@ def _project_find_row(row, *, payload: dict | None = None, block: dict | None = 
     text = _row_display(row)
     if not text:
         return None
+    if row.kind == "meta":
+        try:
+            detail = json.loads(row.detail_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            detail = {}
+        meta_kind = detail.get("meta_kind") if isinstance(detail, dict) else None
+        if meta_kind == "command":
+            return project_plain((RenderLeaf("t0", text),))
+        if meta_kind == "context":
+            return project_context(text)
+        return project_markdown(text)
     if row.kind == "reasoning" and isinstance(block, dict):
         detail = block.get("detail")
         reasoning = detail.get("reasoning") if isinstance(detail, dict) else None
@@ -3397,7 +3422,7 @@ def materialize_codex_find_projection(
                 return
             disclosure = (
                 [container_block_key]
-                if row.kind == "reasoning" or surface != "body"
+                if row.kind in {"reasoning", "meta"} or surface != "body"
                 else []
             )
             conn.execute(

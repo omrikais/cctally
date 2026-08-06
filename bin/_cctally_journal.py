@@ -4315,6 +4315,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "schema_migrations",
         "schema_migrations_skipped",
         "stats_open_fixups",
+        "stats_publication_stamp",
         "week_reset_events",
         "weekly_cost_snapshots",
         "weekly_credit_floors",
@@ -4363,7 +4364,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "47bbbfde25fe4e4d40cb39671cf0c6c8fe2d8e9a7a5ce276927b410b916afd54"
+    "7dde5a7995f441558d08b0204136824d6ff7208b221e576c79a76854b76aa178"
 )
 
 
@@ -4633,8 +4634,89 @@ def _utc_iso_now() -> str:
     ).replace("+00:00", "Z")
 
 
+def read_publication_stamp(path):
+    """Read `stats_publication_stamp` from ``path`` on a fresh read-only conn.
+
+    Never raises. Returns the input `_lib_stats_publish.resolve_stamp` expects:
+
+    - the exception that prevented the read, which resolves INDETERMINATE;
+    - `None` when the read succeeded and named no publication;
+    - the list of row mappings the table held.
+
+    **A destination whose `user_version` is not this binary's
+    `STATS_INDEX_EPOCH` returns `None`, and that is a proof rather than a
+    convenience.** Every scratch eligible for publication has already been
+    validated at `STATS_INDEX_EPOCH`, and the publication transaction stamps
+    that epoch onto the destination in the same commit as the stamp row, so a
+    committed publication always leaves the destination at this epoch. A
+    destination at any other epoch therefore proves this publication did not
+    commit — which is exactly what makes an interrupted upgrade rebuild
+    recoverable: the epoch-1007 index it was publishing into has no stamp
+    table at all, and reading that absence as INDETERMINATE would condemn a
+    perfectly healthy index instead of discarding a marker that never became
+    live. When the epochs differ in the other direction, a newer binary reading
+    an older destination, the same conclusion holds and the epoch gate refuses
+    the destination anyway.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            epoch = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if epoch != _cctally_core.STATS_INDEX_EPOCH:
+                return None
+            rows = conn.execute(
+                "SELECT record_path FROM stats_publication_stamp"
+            ).fetchall()
+        finally:
+            conn.close()
+    except BaseException as exc:
+        return exc
+    if not rows:
+        return None
+    return [{"record_path": row[0]} for row in rows]
+
+
+def in_place_publication_proven_predecessor(destination, state) -> bool:
+    """Whether a PENDING in-place marker's publication provably never committed.
+
+    True only on `PROVEN_PREDECESSOR`: the stamp was read and does not name
+    this marker's record, so the live bytes are the untouched predecessor and
+    the marker may be discarded. `MATCH` means the verdict is still owed, and
+    `INDETERMINATE` fails closed — it must never collapse into either of the
+    other two states, because discarding on an unreadable stamp is exactly the
+    silent-acceptance class the publication transaction exists to close.
+
+    Public because both discriminator sites consume it: the opener's
+    `_cctally_store._pending_stats_publication_never_replaced` and this
+    module's `_settle_prior_publication_verdict`.
+    """
+    import _lib_stats_publish as sp
+
+    record_path = state.get("recordPath")
+    verdict = sp.resolve_stamp(
+        read_publication_stamp(destination),
+        record_path if isinstance(record_path, str) else None,
+    )
+    return verdict == sp.STAMP_PROVEN_PREDECESSOR
+
+
+def _stamp_identity_error(path, expected_record_path: str) -> "str | None":
+    import _lib_stats_publish as sp
+
+    verdict = sp.resolve_stamp(
+        read_publication_stamp(path), expected_record_path
+    )
+    if verdict == sp.STAMP_MATCH:
+        return None
+    return (
+        "published stats index does not carry this publication's stamp "
+        f"({verdict}); expected {expected_record_path}"
+    )
+
+
 def validate_published_stats_index(
-    path, high_water: "tuple[str, int] | None"
+    path, high_water: "tuple[str, int] | None", *,
+    expected_record_path: "str | None" = None,
 ) -> "str | None":
     """Validate an index on a FRESH read-only connection (#496 S1 F1).
 
@@ -4643,6 +4725,16 @@ def validate_published_stats_index(
     witness to what reached the disk; this reopens the file instead. The
     mechanism is already proven by `stats_index_matches_journal_prefix`, which
     runs the same check on the same kind of connection.
+
+    ``expected_record_path`` names the publication whose bytes these are meant
+    to be, and the stamp row is verified against it (#496 S3 §5): the
+    high-water alone answers "is this index a correct materialization of the
+    journal prefix", not "is this index the generation THIS publication just
+    installed". The in-place publisher passes it because it has just written
+    that identity inside the publication transaction. The opener deliberately
+    does NOT: it has already resolved the stamp as a three-state question, and
+    folding that into a boolean validation error would turn an INDETERMINATE
+    read into a settled `failed` verdict.
 
     Public because `stats_open_guarded` runs exactly this check when it
     resolves a pending publication marker.
@@ -4655,6 +4747,8 @@ def validate_published_stats_index(
             conn.close()
     except BaseException as exc:
         return f"{type(exc).__name__}: {exc}"[:500]
+    if expected_record_path is not None:
+        return _stamp_identity_error(path, expected_record_path)
     return None
 
 
@@ -4665,7 +4759,7 @@ def _publication_marker_path(destination) -> pathlib.Path:
 def _write_publication_marker(
     destination, record_path, *, started_at: str, scratch_path,
     status: str = "pending", error: "str | None" = None,
-    prior: "dict | None" = None,
+    prior: "dict | None" = None, mechanism: str = "replace",
 ) -> None:
     """Publish the durable marker a later opener honours (#496 S1 F1).
 
@@ -4681,6 +4775,14 @@ def _write_publication_marker(
     (Within one process the claim is weaker; see
     `_cctally_store._pending_stats_publication_never_replaced`.)
 
+    `mechanism` states which publication protocol this marker belongs to, so
+    the opener SELECTS its discriminator instead of inferring one (#496 S3 §5).
+    `replace` keeps the `scratchPath` proxy above, which remains exactly
+    correct there. `in_place` attaches the scratch read-only and leaves it on
+    disk whether the transaction committed or rolled back, so the proxy
+    inverts and the publication's own `stats_publication_stamp` row answers
+    instead.
+
     `priorFailure` carries a settled verdict this publication is about to
     overwrite, so a crash before `os.replace` cannot discard it — see
     `_settle_prior_publication_verdict`.
@@ -4693,6 +4795,7 @@ def _write_publication_marker(
         "recordPath": str(record_path),
         "startedAtUtc": started_at,
         "scratchPath": str(scratch_path),
+        "mechanism": mechanism,
     }
     if error is not None:
         payload["error"] = error
@@ -4719,6 +4822,30 @@ def _read_publication_marker(destination) -> "dict | None":
     return state if isinstance(state, dict) else {}
 
 
+def _pending_publication_owes_nothing(destination, state) -> bool:
+    """Whether a PENDING marker's own publication never reached the live bytes.
+
+    The marker STATES its mechanism, so the discriminator is selected rather
+    than inferred (#496 S3 §5). `replace` keeps the `scratchPath` proxy, which
+    is exactly correct there because across processes `os.replace` is the only
+    thing that consumes a scratch. `in_place` attaches its scratch read-only
+    and leaves it on disk whether the transaction committed or rolled back, so
+    that proxy INVERTS and the publication's own stamp answers instead. Neither
+    is generalized over the other.
+
+    A marker written before the mechanism field existed reads as `replace`,
+    which is what those binaries did.
+    """
+    if str(state.get("mechanism") or "replace") == "in_place":
+        return in_place_publication_proven_predecessor(destination, state)
+    scratch = state.get("scratchPath")
+    return (
+        isinstance(scratch, str)
+        and bool(scratch)
+        and pathlib.Path(scratch).exists()
+    )
+
+
 def _settle_prior_publication_verdict(destination) -> "dict | None":
     """Settle the verdict a PREVIOUS publication still owes, before this one
     overwrites the single marker slot (#496 S1 F1).
@@ -4738,15 +4865,15 @@ def _settle_prior_publication_verdict(destination) -> "dict | None":
     when nothing is owed:
 
     - a `failed` marker is already settled and is carried verbatim;
-    - a `pending` marker whose own scratch is still on disk never replaced
-      anything, so it owes nothing about the live bytes of its own — but it may
-      still be CARRYING an older run's verdict, which is passed through so a
-      third consecutive crashed run cannot drop it;
-    - a `pending` marker whose scratch is gone is settled HERE, by validating
-      the destination against its record's pinned high-water — the same check
-      the opener would have run. Success clears it; failure is written to both
-      the marker and the record before this run touches the destination, and is
-      then carried forward.
+    - a `pending` marker whose own publication provably never became live owes
+      nothing about the live bytes of its own — but it may still be CARRYING an
+      older run's verdict, which is passed through so a third consecutive
+      crashed run cannot drop it;
+    - any other `pending` marker is settled HERE, by validating the destination
+      against its record's pinned high-water — the same check the opener would
+      have run. Success clears it; failure is written to both the marker and
+      the record before this run touches the destination, and is then carried
+      forward.
 
     A marker that cannot be judged (no record, or no pinned high-water) is left
     to the opener's existing discard policy rather than wedging the rebuild.
@@ -4761,8 +4888,7 @@ def _settle_prior_publication_verdict(destination) -> "dict | None":
         return state
     if status != "pending":
         return None
-    scratch = state.get("scratchPath")
-    if isinstance(scratch, str) and scratch and pathlib.Path(scratch).exists():
+    if _pending_publication_owes_nothing(destination, state):
         # This marker owes nothing itself, but dropping what it carries would
         # lose an older run's verdict once a third run crashes the same way.
         carried = state.get("priorFailure")
@@ -4802,12 +4928,30 @@ def _settle_prior_publication_verdict(destination) -> "dict | None":
         _write_rebuild_record(record_path, record)
     except OSError:
         pass
-    print(
-        "[stats] an earlier stats.db publication was interrupted before it "
-        f"could validate what it published, and it FAILED that check: {error}. "
-        f"Rebuild record: {record_path}.",
-        file=sys.stderr,
+    # #496 exists partly because corruption gets MISATTRIBUTED, so the wording
+    # must not accuse an earlier publication of failing a check that never ran.
+    # A destination that cannot be read fails this validation for a reason that
+    # is not evidence about the publication: the stamp read is INDETERMINATE
+    # and the high-water check then trips on the unrelated damage.
+    unreadable = _cctally_db._is_sqlite_corruption_error(error) or error.startswith(
+        ("DatabaseError:", "OperationalError:", "InterfaceError:", "sqlite3.")
     )
+    if unreadable:
+        print(
+            "[stats] an earlier stats.db publication was interrupted before it "
+            "could validate what it published, and that check could not be "
+            f"completed because the index could not be read: {error}. The read "
+            "failure is not evidence about that publication. Rebuild record: "
+            f"{record_path}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[stats] an earlier stats.db publication was interrupted before it "
+            f"could validate what it published, and it FAILED that check: "
+            f"{error}. Rebuild record: {record_path}.",
+            file=sys.stderr,
+        )
     return settled
 
 
@@ -4969,6 +5113,438 @@ def _preserve_stats_family_for_cutover(
     return incident
 
 
+#: Set on the exception a failed in-place publication raises, so the caller can
+#: read the phase it had reached. "The transaction raised" is not a safe
+#: discriminator: a failure before the commit can roll back while a failure
+#: after it cannot, and a commit-time I/O error leaves the outcome unknown.
+_PUBLICATION_PHASE_ATTR = "_cctally_publication_phase"
+
+
+def publication_phase_of(exc) -> "str | None":
+    """The publication phase ``exc`` was raised in, or None when unrecorded."""
+    return getattr(exc, _PUBLICATION_PHASE_ATTR, None)
+
+
+def _open_publication_connection(destination) -> sqlite3.Connection:
+    """Open the LIVE destination for an in-place publish.
+
+    `stats_open_guarded` skips its own flock when the caller already holds
+    stats maintenance, which every production trigger does. Interrupted-rebuild
+    recovery is suppressed because this run's own `.rebuilding-*` scratch is on
+    disk right now and is not an interruption to recover from.
+
+    `stats_open_guarded` does NOT apply connection policy — `open_db` does that
+    separately — so the busy timeout, journal mode and WAL size limit are
+    applied here rather than assumed.
+
+    The connection is opened with `uri=True` because the publisher ATTACHes the
+    scratch through a `file:...?mode=ro` URI. SQLite honours a URI filename in
+    `ATTACH` only when the main connection carries `SQLITE_OPEN_URI`, or when
+    the library happens to be built with `SQLITE_USE_URI`. Relying on the
+    latter would make the read-only attach ambient rather than guaranteed.
+    """
+    import _cctally_store
+
+    conn = _cctally_store.stats_open_guarded(
+        pathlib.Path(destination),
+        connect=lambda path: sqlite3.connect(
+            pathlib.Path(path).resolve().as_uri(), uri=True
+        ),
+        recover_interruptions=False,
+    )
+    try:
+        _cctally_store.apply_policy(conn, "stats")
+    except BaseException:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    return conn
+
+
+def _carry_sqlite_sequence(conn: sqlite3.Connection) -> None:
+    """Install the scratch's AUTOINCREMENT watermarks, not the copy's.
+
+    A table-by-table row copy sets each counter to `max(rowid)`, whereas
+    `os.replace` publishes the scratch's `sqlite_sequence` verbatim. Measured on
+    SQLite 3.53.4: a scratch with `max(id)=6` and a counter of 10 — the shape
+    produced whenever the fold inserts rows and later deletes them, as the
+    `five_hour_block_close` fold's exact-child DELETE/INSERT does — published a
+    counter of 6, and the next insert took id 7, an id a deleted row had
+    already used.
+
+    Delete-then-insert rather than update, because `DROP TABLE` removes the
+    table's `sqlite_sequence` row and `CREATE TABLE` does not put one back, so
+    an UPDATE has nothing of its own to act on. Measured on SQLite 3.53.4, a
+    zero-row `INSERT ... SELECT` does create the row with seq 0 — so on that
+    version an UPDATE would in fact land — but that is an undocumented
+    implementation detail rather than a contract, and silently losing an
+    AUTOINCREMENT watermark hands out an id a deleted row already used.
+    """
+    present = conn.execute(
+        "SELECT (SELECT 1 FROM src.sqlite_schema WHERE type = 'table' "
+        "AND name = 'sqlite_sequence'), "
+        "(SELECT 1 FROM main.sqlite_schema WHERE type = 'table' "
+        "AND name = 'sqlite_sequence')"
+    ).fetchone()
+    if present is None or present[0] is None or present[1] is None:
+        return
+    rows = conn.execute("SELECT name, seq FROM src.sqlite_sequence").fetchall()
+    for name, seq in rows:
+        conn.execute("DELETE FROM main.sqlite_sequence WHERE name = ?", (name,))
+        conn.execute(
+            "INSERT INTO main.sqlite_sequence (name, seq) VALUES (?, ?)",
+            (name, seq),
+        )
+
+
+def _publish_generation_in_place(
+    conn: sqlite3.Connection, scratch, *, record_path, started_at: str
+) -> str:
+    """Install the validated scratch's generation into the LIVE database.
+
+    Returns the terminating phase. The whole swap is ONE `BEGIN IMMEDIATE`, so
+    a reader inside a transaction keeps the generation it opened on, an
+    abandoned attempt leaves the prior generation live and sound, and
+    `PRAGMA user_version` flips atomically at the commit.
+    """
+    import _lib_stats_publish as sp
+
+    if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 0:
+        # `apply_policy` never enables foreign keys and the schema documents
+        # them as enforcement-off, so the derived-FK seam for
+        # `five_hour_milestones.block_id` is a fold ordering contract rather
+        # than an enforced constraint. Assert that rather than depend on it
+        # silently, so a future change that turns them on fails loudly here.
+        raise JournalError(
+            "stats publication requires foreign_keys=0; the schema's derived-FK "
+            "seam is a fold ordering contract, not an enforced constraint"
+        )
+    resolved = pathlib.Path(scratch).resolve()
+    conn.execute("ATTACH DATABASE ? AS src", (resolved.as_uri() + "?mode=ro",))
+    attached = conn.execute(
+        "SELECT file FROM pragma_database_list WHERE name = 'src'"
+    ).fetchone()
+    if attached is None or pathlib.Path(str(attached[0])) != resolved:
+        # A connection without SQLITE_OPEN_URI treats the URI as a literal
+        # filename and silently attaches a new, EMPTY database under that name.
+        # Publishing from it would install an empty generation, so the identity
+        # of what was attached is checked rather than assumed.
+        try:
+            conn.execute("DETACH DATABASE src")
+        except Exception:
+            pass
+        raise JournalError(
+            "stats publication attached the wrong file as its scratch: "
+            f"expected {resolved}, got {attached[0] if attached else '<none>'}"
+        )
+    phase = sp.PRE_COMMIT
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Both schemas are read INSIDE the transaction, so the drop list
+            # describes the generation actually being retired.
+            src_objects = conn.execute(
+                "SELECT type, name, sql FROM src.sqlite_schema"
+            ).fetchall()
+            dest_objects = conn.execute(
+                "SELECT type, name, sql FROM main.sqlite_schema"
+            ).fetchall()
+            plan = sp.plan_generation_swap(dest_objects, src_objects)
+            if plan.rejected:
+                raise JournalError(
+                    "stats publication cannot copy unsupported object(s): "
+                    + ", ".join(plan.rejected)
+                )
+            for statement in plan.drop_statements:
+                conn.execute(statement)
+            for statement in plan.create_table_statements:
+                conn.execute(statement)
+            for name in plan.copy_tables:
+                conn.execute(
+                    f'INSERT INTO main."{name}" SELECT * FROM src."{name}"'
+                )
+            for statement in plan.create_index_statements:
+                conn.execute(statement)
+            _carry_sqlite_sequence(conn)
+            epoch = int(conn.execute("PRAGMA src.user_version").fetchone()[0])
+            if epoch != _cctally_core.STATS_INDEX_EPOCH:
+                # `read_publication_stamp`'s entire short-circuit rests on the
+                # claim that a committed publication always leaves the
+                # destination at THIS binary's epoch. Upstream validation
+                # already guarantees the scratch carries it; asserting it here
+                # costs nothing and turns the argument into an invariant.
+                raise JournalError(
+                    "stats publication refuses to stamp a scratch at index "
+                    f"epoch {epoch}; this binary builds "
+                    f"{_cctally_core.STATS_INDEX_EPOCH}"
+                )
+            conn.execute(f"PRAGMA main.user_version={epoch:d}")
+            # The publication's own identity, committed atomically with the
+            # content and the epoch it describes (#496 S3 §5).
+            conn.execute("DELETE FROM main.stats_publication_stamp")
+            conn.execute(
+                "INSERT INTO main.stats_publication_stamp "
+                "(record_path, started_at_utc, stamped_at_utc) VALUES (?, ?, ?)",
+                (str(record_path), started_at, _utc_iso_now()),
+            )
+            phase = sp.COMMIT_UNKNOWN
+            conn.commit()
+            phase = sp.COMMITTED
+            _stats_rebuild_test_pause("publication_after_commit_before_detach")
+        except BaseException as exc:
+            if phase == sp.PRE_COMMIT:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            try:
+                setattr(exc, _PUBLICATION_PHASE_ATTR, phase)
+            except Exception:  # pragma: no cover — some exceptions are frozen
+                pass
+            raise
+    finally:
+        # DETACH cannot run inside a transaction, so this is best-effort: a
+        # failure that left one open is already being raised.
+        try:
+            conn.execute("DETACH DATABASE src")
+        except Exception:
+            pass
+    return phase
+
+
+def _checkpoint_after_publication(conn: sqlite3.Connection) -> str:
+    """Drain the WAL after a committed in-place publish — BEST EFFORT.
+
+    `wal_checkpoint(TRUNCATE)` returns a busy ROW rather than raising, and this
+    repository has measured it taking about 16 seconds against a 15-second
+    `busy_timeout` under a pinned reader. Its result is recorded and never
+    interpreted as a transaction failure, and it is never a reason to fall back
+    after a commit.
+    """
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as exc:
+        return f"error:{type(exc).__name__}"
+    if row is None:
+        return "unknown"
+    return "checkpointed" if int(row[0]) == 0 else "busy"
+
+
+def _remove_empty_db_sidecars(path) -> None:
+    """Remove the sidecars a read-only validation open leaves behind.
+
+    Unlike the physical path, an in-place publish leaves a LEGITIMATE WAL: it
+    belongs to the live database, and deleting a non-empty one would discard
+    committed frames. Only a zero-length WAL is removed — the state a
+    successful TRUNCATE checkpoint and a clean last close leave — so the
+    documented sidecar-free end state still holds without ever risking data.
+    """
+    path = pathlib.Path(path)
+    wal = pathlib.Path(str(path) + "-wal")
+    try:
+        if wal.stat().st_size:
+            return
+    except OSError:
+        pass
+    for suffix in ("-wal", "-shm"):
+        try:
+            pathlib.Path(str(path) + suffix).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+    _fsync_dir(path.parent)
+
+
+#: Probe 2 measured the live WAL peaking at 1.01x the main file across five
+#: successive in-place publishes, so the projection is that plus a margin.
+_PUBLICATION_WAL_PROJECTION = 1.05
+#: Headroom for the rollback journal and freelist churn of an abandoned attempt.
+_PUBLICATION_ROLLBACK_MARGIN = 0.25
+
+
+def _free_disk_bytes(directory) -> int:
+    """Free bytes on the filesystem holding ``directory`` (mockable in tests)."""
+    import _cctally_db
+
+    return _cctally_db._free_disk_bytes(directory)
+
+
+def _db_family_bytes(path) -> int:
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += pathlib.Path(str(path) + suffix).stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _publication_required_free_bytes(scratch, destination) -> int:
+    """Conservative free-space floor for publishing ``scratch``.
+
+    The live attempt adds a database-sized WAL while the scratch still exists,
+    and a physical fallback would then add a full quarantine copy of the old
+    family on top of that. All three are counted, because the run cannot know
+    at this point which mechanism it will end up using.
+    """
+    scratch_bytes = _db_family_bytes(scratch)
+    projected = _PUBLICATION_WAL_PROJECTION + _PUBLICATION_ROLLBACK_MARGIN
+    return int(scratch_bytes * projected) + _db_family_bytes(destination)
+
+
+def _preflight_publication_space(scratch, destination) -> None:
+    """Abort before any live mutation when the disk cannot hold the publish.
+
+    Aborting is deliberately NOT a reason to fall back to replacement: a full
+    disk leaves a perfectly good generation live, and physically replacing it
+    is exactly the outcome §12 refuses.
+    """
+    parent = pathlib.Path(destination).parent
+    needed = _publication_required_free_bytes(scratch, destination)
+    try:
+        free = _free_disk_bytes(parent)
+    except OSError as exc:  # pragma: no cover — statvfs failing is exotic
+        raise JournalError(
+            f"could not determine free space on {parent} before publishing "
+            f"the rebuilt stats index: {exc}"
+        ) from exc
+    if free < needed:
+        raise JournalError(
+            "publishing the rebuilt stats index needs about "
+            f"{needed / (1024 * 1024):.1f} MB free on {parent}, but only "
+            f"{free / (1024 * 1024):.1f} MB is available. The existing index "
+            "is untouched; free space and retry."
+        )
+
+
+#: Returned by the in-place publisher when the destination cannot be operated
+#: on structurally and physical replacement is the sanctioned fallback.
+_FALL_BACK = object()
+
+
+def _publish_stats_index_in_place(
+    *, scratch, destination, context, high_water, record, fire_before_swap,
+    prior,
+):
+    """Publish transactionally into the live file (#496 S3 §4).
+
+    Returns `None` on success (an in-place publish never preserves, so there is
+    no incident directory), or `_FALL_BACK` when physical replacement is the
+    sanctioned response.
+    """
+    import _lib_stats_publish as sp
+
+    try:
+        conn = _open_publication_connection(destination)
+    except BaseException as exc:
+        if sp.may_fall_back_to_replacement(exc):
+            print(
+                "[rebuild] the live stats index cannot be opened "
+                f"({exc}); publishing by replacement instead",
+                file=sys.stderr,
+            )
+            return _FALL_BACK
+        raise
+
+    started_at = _utc_iso_now()
+    record_path = pathlib.Path(context.record_path)
+    live = dict(record)
+    live.update({
+        "status": "pending",
+        "startedAtUtc": started_at,
+        "completedAtUtc": None,
+        # An in-place publish never preserves. Preservation is a consequence of
+        # destroying a file; `db backup --db stats` is the supported snapshot.
+        "incidentPath": None,
+        "damageShapeTokens": None,
+        "postPublicationValidation": None,
+        "publicationMechanism": "in_place",
+    })
+    try:
+        fire_before_swap()
+        # Phase 1 of the publication transaction: the record and then the
+        # marker, each fsynced, BEFORE any live byte changes.
+        _write_rebuild_record(record_path, live)
+        _stats_rebuild_test_pause("publication_before_marker")
+        _write_publication_marker(
+            destination, record_path, started_at=started_at,
+            scratch_path=scratch, prior=prior, mechanism="in_place",
+        )
+        _stats_rebuild_test_pause("rebuild_before_cutover")
+        _publish_generation_in_place(
+            conn, scratch, record_path=record_path, started_at=started_at,
+        )
+    except BaseException as exc:
+        # Rollback, detach and CLOSE are all mandatory before any fallback: the
+        # drain gate is a whole-system handle scan, and this connection would
+        # either fail it or hollow out the invariant it exists to enforce.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        phase = publication_phase_of(exc)
+        if phase == sp.PRE_COMMIT and sp.may_fall_back_to_replacement(exc):
+            print(
+                "[rebuild] the in-place stats publication rolled back "
+                f"({exc}); publishing by replacement instead",
+                file=sys.stderr,
+            )
+            record["inPlaceAttempt"] = {
+                "phase": phase, "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+            return _FALL_BACK
+        raise
+
+    checkpoint_outcome = _checkpoint_after_publication(conn)
+    try:
+        conn.close()
+    except Exception:
+        pass
+    _stats_rebuild_test_pause("rebuild_after_publication_replace")
+
+    # Phase 2: validate the bytes that are now live, on a connection that never
+    # saw them being written. The expected publication identity goes with it:
+    # the high-water alone cannot distinguish this generation from an equally
+    # journal-consistent one some other run installed.
+    post_error = validate_published_stats_index(
+        destination, high_water, expected_record_path=str(record_path),
+    )
+    _remove_empty_db_sidecars(destination)
+
+    live["publicationCheckpoint"] = checkpoint_outcome
+    live["postPublicationValidation"] = {
+        "ok": post_error is None, "error": post_error,
+    }
+    live["completedAtUtc"] = _utc_iso_now()
+    live["status"] = "ok" if post_error is None else "failed"
+    _write_rebuild_record(record_path, live)
+    if post_error is not None:
+        # The scratch is deliberately NOT removed here: it is the last
+        # independently validated copy of this generation, and the live bytes
+        # just failed.
+        _write_publication_marker(
+            destination, record_path, started_at=started_at,
+            scratch_path=scratch, status="failed", error=post_error,
+            mechanism="in_place",
+        )
+        raise JournalError(
+            "published stats index failed post-publication validation: "
+            f"{post_error}; rebuild record: {record_path}"
+        )
+    _stats_rebuild_test_pause("publication_after_verdict_before_marker_removal")
+    _remove_publication_marker(destination)
+    # Removal follows verdict settlement. A surviving `.rebuilding-*` family is
+    # classified FIRST by the next opener and would route this healthy index
+    # through interrupted-rebuild recovery.
+    _stats_rebuild_test_pause("publication_before_scratch_removal")
+    _remove_db_family(scratch)
+    _fsync_dir(pathlib.Path(destination).parent)
+    return None
+
+
 def _publish_rebuilt_stats_index(
     *,
     scratch: pathlib.Path,
@@ -4979,23 +5555,50 @@ def _publish_rebuilt_stats_index(
     record: dict,
     before_swap=None,
 ) -> "pathlib.Path | None":
-    """Publish one validated, closed, sidecar-free scratch index atomically.
+    """Publish one validated, closed, sidecar-free scratch index.
 
-    Publication is a two-phase durable transaction (#496 S1 F1). After
-    `os.replace` no scratch pathname remains, so interrupted-rebuild recovery
-    cannot activate, and the published file carries the current epoch so
-    `open_db`'s zero-DDL fast path returns it with no validation. A
-    post-publication failure that only RAISED would therefore leave a known-bad
-    index accepted by every later command. The record and the marker are what
-    make the verdict outlive this process.
+    In-place transactional publication is the mechanism (#496 S3). Physical
+    replacement is the fallback, taken when the destination cannot be operated
+    on structurally. The mechanism is chosen against the destination in front
+    of this run, not by the trigger that reached it: corruption is not uniform,
+    and a readable-but-damaged destination publishes in place like any other.
+
+    Publication is a two-phase durable transaction (#496 S1 F1) under either
+    mechanism. A published file carries the current epoch, so `open_db`'s
+    zero-DDL fast path returns it with no validation and a post-publication
+    failure that only RAISED would leave a known-bad index accepted by every
+    later command. The record and the marker are what make the verdict outlive
+    this process.
     """
     import _cctally_store
+
+    # Read-only, and first: a short disk must abort while the destination is
+    # still untouched, not part-way through a publication.
+    _preflight_publication_space(scratch, destination)
 
     # A marker already beside the destination may still owe a verdict on bytes
     # that are live right now. Settle it BEFORE Phase 1 overwrites the only
     # marker slot, while the destination is still exactly what that publication
     # left there.
     prior = _settle_prior_publication_verdict(destination)
+
+    # The `before_swap` seam fires ONCE, for either mechanism: it is the
+    # `db rederive` crash seam, and a fallback must not re-enter it.
+    fired = []
+
+    def fire_before_swap() -> None:
+        if before_swap is not None and not fired:
+            fired.append(True)
+            before_swap()
+
+    if pathlib.Path(destination).exists():
+        published = _publish_stats_index_in_place(
+            scratch=scratch, destination=destination, context=context,
+            high_water=high_water, record=record,
+            fire_before_swap=fire_before_swap, prior=prior,
+        )
+        if published is not _FALL_BACK:
+            return published
 
     family_exists = any(
         pathlib.Path(str(destination) + suffix).exists()
@@ -5050,8 +5653,7 @@ def _publish_rebuilt_stats_index(
         _remove_db_sidecars_strict(destination)
         _cctally_store._stats_storm_test_pause("stats_replace_sidecars_removed")
 
-    if before_swap is not None:
-        before_swap()
+    fire_before_swap()
 
     # Phase 1 of the publication transaction: the record and then the marker,
     # each fsynced, BEFORE the replacement becomes visible.
@@ -5064,12 +5666,13 @@ def _publish_rebuilt_stats_index(
         "incidentPath": str(incident) if incident is not None else None,
         "damageShapeTokens": damage_tokens,
         "postPublicationValidation": None,
+        "publicationMechanism": "replace",
     })
     record_path = pathlib.Path(context.record_path)
     _write_rebuild_record(record_path, record)
     _write_publication_marker(
         destination, record_path, started_at=started_at, scratch_path=scratch,
-        prior=prior,
+        prior=prior, mechanism="replace",
     )
 
     _stats_rebuild_test_pause("rebuild_before_cutover")
@@ -5101,6 +5704,7 @@ def _publish_rebuilt_stats_index(
         _write_publication_marker(
             destination, record_path, started_at=started_at,
             scratch_path=scratch, status="failed", error=post_error,
+            mechanism="replace",
         )
         raise JournalError(
             "published stats index failed post-publication validation: "
@@ -5397,6 +6001,17 @@ def rebuild_stats_index(
         os.fsync(handle.fileno())
     _fsync_dir(scratch.parent)
 
+    # Extract the compact result data and RELEASE the replay structures before
+    # publication begins (#496 S3 §4.2). The in-place attempt adds a
+    # database-sized WAL while the scratch still exists, so the measured
+    # multi-gigabyte replay peak must not still be resident on top of it.
+    segments_read = len(segments)
+    conflicts = effective.conflicts
+    protocol_violations = effective.protocol_violations
+    acknowledged = effective.acknowledged_protocol_violations
+    decoded = effective = stream = structural = tail = None
+    segments = protocol_evidence = None
+
     # First fresh-connection validation (#496 S1 F1). A failure here raises
     # BEFORE any preservation, so no incident is created and the old family
     # stays live — the existing contract is preserved exactly.
@@ -5427,7 +6042,7 @@ def rebuild_stats_index(
             "highWater": [hw[0], hw[1]] if hw is not None else None,
             "destination": str(dest),
             "targetPath": str(target_path) if target_path is not None else None,
-            "segmentsRead": len(segments),
+            "segmentsRead": segments_read,
             "linesFolded": lines_folded,
             "malformed": malformed,
             "rowsByTable": rows_by_table,
@@ -5438,12 +6053,10 @@ def rebuild_stats_index(
 
     return RebuildResult(
         rows_by_table=rows_by_table, malformed=malformed,
-        duration_s=time.monotonic() - start, segments_read=len(segments),
-        lines_folded=lines_folded, conflicts=effective.conflicts,
-        protocol_violations=effective.protocol_violations,
-        acknowledged_protocol_violations=(
-            effective.acknowledged_protocol_violations
-        ),
+        duration_s=time.monotonic() - start, segments_read=segments_read,
+        lines_folded=lines_folded, conflicts=conflicts,
+        protocol_violations=protocol_violations,
+        acknowledged_protocol_violations=acknowledged,
         quarantine_dir=incident,
     )
 

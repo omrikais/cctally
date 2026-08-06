@@ -71,6 +71,7 @@ export type QualifiedBrowseEnvelope =
   | {
       status: 'ok';
       rows: QualifiedBrowseRow[];
+      selected?: QualifiedBrowseRow;
       facets: QualifiedConversationFacets;
       page: { total: number; returned: number; cursor?: ConversationBrowseCursor | null };
     }
@@ -120,6 +121,7 @@ export interface QualifiedBrowseOptions {
   model?: string;
   limit?: number;
   cursor?: ConversationBrowseCursor;
+  selected?: string;
 }
 
 export interface QualifiedSearchOptions {
@@ -145,6 +147,7 @@ export function qualifiedBrowseUrl(
   append(params, 'model', options.model);
   append(params, 'limit', options.limit);
   append(params, 'cursor', options.cursor);
+  append(params, 'selected', options.selected);
   return `/api/conversations?${params.toString()}`;
 }
 

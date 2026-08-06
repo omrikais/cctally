@@ -860,14 +860,18 @@ def _discard_pending_stats_publication_marker(db_path) -> None:
 
 
 def _pending_stats_publication_never_replaced(db_path) -> bool:
-    """Whether a PENDING marker's own scratch index is still on disk.
+    """Whether a PENDING marker's own publication never became live.
 
-    `os.replace` is the only thing that consumes ANOTHER run's scratch, so a
-    marker still naming a live scratch pathname proves that run never reached
-    publication: the live destination is the untouched predecessor and the
-    marker is stale. When the scratch is gone the replacement DID happen and
-    the verdict on the published bytes is still owed, so the marker must be
-    resolved rather than discarded.
+    The marker STATES which protocol it belongs to, so the discriminator is
+    selected rather than inferred (#496 S3 §5), and the two never generalize
+    over each other.
+
+    **Physical replacement** answers with the scratch. `os.replace` is the only
+    thing that consumes ANOTHER run's scratch, so a marker still naming a live
+    scratch pathname proves that run never reached publication: the live
+    destination is the untouched predecessor and the marker is stale. When the
+    scratch is gone the replacement DID happen and the verdict on the published
+    bytes is still owed, so the marker must be resolved rather than discarded.
 
     The stronger form of that claim — that `os.replace` is the only consumer of
     any scratch — is false, and the difference is confined to the run's OWN
@@ -878,18 +882,32 @@ def _pending_stats_publication_never_replaced(db_path) -> bool:
     reads that as "replaced". The proxy is used only across processes, where
     that cleanup cannot reach, so the weaker property is the one it needs.
 
-    Must be consulted BEFORE stale-artifact cleanup removes the scratch.
-
     A marker carrying no `scratchPath` cannot prove it published, so it is
     treated as never-replaced. No released binary has ever written one — the
     marker and this field ship together — so the branch exists only to keep an
     unreadable marker from wedging every open.
+
+    **In-place publication** answers with the publication's own stamp, because
+    it attaches the scratch read-only and the scratch survives commit and
+    rollback identically. Only `PROVEN_PREDECESSOR` discards; `INDETERMINATE`
+    fails closed and the marker is resolved instead.
+
+    Must be consulted BEFORE stale-artifact cleanup removes the scratch. It is
+    also what makes artifact-first recovery stamp-aware: a scratch surviving a
+    COMMITTED in-place publish is a spent artifact beside an owed verdict, not
+    an interrupted rebuild.
     """
     state = _read_stats_publication_marker(db_path)
     if not state:
         return True
     if str(state.get("status") or "") != "pending":
         return False
+    if str(state.get("mechanism") or "replace") == "in_place":
+        import _cctally_journal
+
+        return _cctally_journal.in_place_publication_proven_predecessor(
+            db_path, state
+        )
     scratch = state.get("scratchPath")
     if not isinstance(scratch, str) or not scratch:
         return True
@@ -897,12 +915,23 @@ def _pending_stats_publication_never_replaced(db_path) -> bool:
 
 
 def _stats_publication_failed_error(
-    db_path, record_path,
+    db_path, record_path, mechanism=None,
 ) -> _cctally_db.StatsPublicationFailedError:
+    """The guided error for a settled publication failure.
+
+    The wording is selected by the mechanism the marker RECORDS, because the two
+    mechanisms leave different things on disk: physical replacement preserves
+    the damaged predecessor under `quarantine/`, and an in-place publication
+    preserves nothing at all. A marker written before the field existed reads as
+    `replace`, which is what those markers describe.
+    """
+    template = (
+        _cctally_core.STATS_PUBLICATION_FAILED_IN_PLACE_MSG
+        if str(mechanism or "replace") == "in_place"
+        else _cctally_core.STATS_PUBLICATION_FAILED_MSG
+    )
     return _cctally_db.StatsPublicationFailedError(
-        _cctally_core.STATS_PUBLICATION_FAILED_MSG.format(
-            path=db_path, record=record_path or "<unrecorded>",
-        )
+        template.format(path=db_path, record=record_path or "<unrecorded>")
     )
 
 
@@ -916,7 +945,9 @@ def _raise_settled_publication_failure(db_path) -> None:
     if not state:
         return
     if str(state.get("status") or "") == "failed":
-        raise _stats_publication_failed_error(db_path, state.get("recordPath"))
+        raise _stats_publication_failed_error(
+            db_path, state.get("recordPath"), state.get("mechanism")
+        )
 
 
 def _resolve_stats_publication_marker(db_path: pathlib.Path) -> None:
@@ -941,11 +972,26 @@ def _resolve_stats_publication_marker(db_path: pathlib.Path) -> None:
         return
     status = str(state.get("status") or "")
     record_path = state.get("recordPath")
+    mechanism = state.get("mechanism")
 
     if status == "failed":
-        raise _stats_publication_failed_error(db_path, record_path)
+        raise _stats_publication_failed_error(db_path, record_path, mechanism)
     if status != "pending":
         _remove_stats_publication_marker(db_path)
+        return
+
+    # The discriminator runs on EVERY path into this function, not only the
+    # one the opener reaches with a surviving `.rebuilding-*` family beside
+    # the marker. For a `replace` marker the two agree — a missing scratch
+    # proves `os.replace` ran, so this returns False and resolution proceeds
+    # exactly as before. For an `in_place` marker scratch absence proves
+    # NOTHING, and without this the record's pinned high-water would be
+    # validated against a generation that was never published: a publication
+    # the stamp shows never committed would condemn its own healthy
+    # predecessor and refuse every ordinary open. `INDETERMINATE` still fails
+    # closed, so an unreadable stamp resolves rather than discards.
+    if _pending_stats_publication_never_replaced(db_path):
+        _discard_pending_stats_publication_marker(db_path)
         return
 
     record = None
@@ -987,7 +1033,7 @@ def _resolve_stats_publication_marker(db_path: pathlib.Path) -> None:
         )
     except OSError:
         pass
-    raise _stats_publication_failed_error(db_path, record_path)
+    raise _stats_publication_failed_error(db_path, record_path, mechanism)
 
 
 def _resume_pending_quarantine(db_path: pathlib.Path) -> None:
@@ -1329,6 +1375,13 @@ def stats_open_guarded(
                     raise _cctally_db.StatsDbMaintenanceError(
                         _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
                     )
+                # Recovery calls `rebuild_stats_index`, whose in-place publisher
+                # reopens the live destination through `stats_open_guarded`.
+                # `flock` conflicts are per open-file-DESCRIPTION and apply
+                # WITHIN a process, so without this the nested SHARED request
+                # would conflict with the EXCLUSIVE hold taken on the line
+                # above and time out against the branch's own lock.
+                _cctally_core.note_stats_maintenance_acquired()
                 recovered = False
                 try:
                     current_artifacts = _stats_rebuild_artifact_bases(db_path)
@@ -1358,6 +1411,7 @@ def stats_open_guarded(
                             "`cctally db rebuild --db stats`."
                         ) from exc
                 finally:
+                    _cctally_core.note_stats_maintenance_released()
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 if recovered:
                     continue
@@ -1441,9 +1495,11 @@ def _acquire_stats_maintenance_reentrant(path) -> "int | None":
     and apply WITHIN a process: holding SHARED on one fd and then requesting
     EXCLUSIVE on a second fd of the same file blocks the process against itself,
     indefinitely. ``run_stats_ingest`` holds maintenance SHARED across its entire
-    cycle, and both callers of this helper — the heal hook and the epoch resolver
-    — are reachable from a nested ``open_db()`` inside that cycle. Without this
-    check that nested open is an unconditional self-deadlock.
+    cycle, and this helper's caller — the epoch resolver — is reachable from a
+    nested ``open_db()`` inside that cycle. Without this check that nested open
+    is an unconditional self-deadlock. The corruption heal applies the same
+    ownership-first rule through ``_acquire_stats_maintenance_for_heal``, which
+    additionally BOUNDS the acquire.
 
     Proceeding on a shared hold is a deliberate, narrow weakening: the caller
     still runs ``_stats_family_drained`` before any physical replacement, which
@@ -1491,6 +1547,54 @@ def _heal_release_maintenance_flock(fd: int) -> None:
         _cctally_core.note_stats_maintenance_released()
     finally:
         _heal_release_flock(fd)
+
+
+_HEAL_MAINTENANCE_WAIT_S = 5.0
+
+
+def _acquire_stats_maintenance_for_heal(
+    timeout_s: float = _HEAL_MAINTENANCE_WAIT_S,
+) -> "tuple[int | None, bool]":
+    """Ownership-first, mode-aware maintenance for the corruption heal (§6).
+
+    Returns ``(fd, True)`` when the heal may proceed — ``fd`` is ``None`` when
+    an existing hold was REUSED and nothing was acquired — and ``(None,
+    False)`` when the bounded acquire expired.
+
+    **Ownership-first, not mode-first.** ``flock`` conflicts are per open-file-
+    description and apply WITHIN a process, so requesting the lock a second
+    time on a second descriptor blocks this process against itself whenever the
+    hold it already owns is EXCLUSIVE (`_cctally_core` documents that at the
+    maintenance tracker, and ``run_stats_ingest`` can hold exclusive when it
+    calls ``open_db()``). The tracker is a depth counter that records THAT a
+    hold exists and never which mode, and it does not need to: the rule reuses
+    any hold whatever its mode, so the two cases never have to be told apart.
+    Upgrading a shared hold to exclusive is the one operation that would need
+    the mode, and it is exactly the second acquire that deadlocks.
+
+    **Bounded, never blocking, when nothing is held.** The heal runs inside an
+    ordinary open, and the detached worker owns maintenance EXCLUSIVE for the
+    whole of its rebuild. An unbounded acquire here would make every statusline
+    and dashboard open that meets corruption wait out that rebuild — the
+    blocking this architecture exists to remove. A timeout means some OTHER
+    holder owns it, and failing soft is correct: decline, and let a later open
+    retry.
+    """
+    if _cctally_core.holds_stats_maintenance():
+        return (None, True)
+    fd = _heal_flock_bounded(
+        _cctally_core.STATS_LOCK_MAINTENANCE_PATH, timeout_s
+    )
+    if fd is None:
+        return (None, False)
+    _cctally_core.note_stats_maintenance_acquired()
+    return (fd, True)
+
+
+def _release_stats_maintenance_for_heal(fd: "int | None") -> None:
+    """Release what ``_acquire_stats_maintenance_for_heal`` took, if anything."""
+    if fd is not None:
+        _heal_release_maintenance_flock(fd)
 
 
 def _heal_flock_bounded(path, timeout_s: float) -> "int | None":
@@ -1666,8 +1770,24 @@ def _stats_heal_hook(
         return False
     _HEAL_ACTIVE = True
     try:
-        maint_fd = _acquire_stats_maintenance_reentrant(
-            _cctally_core.STATS_LOCK_MAINTENANCE_PATH)
+        # Ownership-first and BOUNDED (#496 S3 §6). A hold this context already
+        # owns is reused whatever its mode; otherwise exclusive is acquired
+        # within a bound, because the detached worker owns maintenance for the
+        # whole of its rebuild and an ordinary open must never wait that out.
+        maint_fd, acquired = _acquire_stats_maintenance_for_heal()
+        if not acquired:
+            probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
+            if probe(path):
+                # Some other maintenance owner already republished a readable
+                # index while we waited — retry the open rather than decline.
+                return True
+            print(
+                "[heal] stats.db auto-heal declined: another maintenance "
+                "owner holds stats.db.maintenance.lock; a later open will "
+                "retry.",
+                file=sys.stderr,
+            )
+            return False
         try:
             probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
             if probe(path):
@@ -1677,9 +1797,6 @@ def _stats_heal_hook(
             # and what lets the quarantine incident name the bundle that
             # preceded it.
             #
-            # The typed result is CAPTURED but deliberately NOT gated on:
-            # refusing the heal on an UNCONFIRMED disposition is F4 and belongs
-            # to S3. S1 only makes the evidence available at this call site.
             forensics = _cctally_db.write_corruption_forensics(
                 path,
                 db_label="stats",
@@ -1687,52 +1804,85 @@ def _stats_heal_hook(
                 trigger_exception=exc,
                 return_result=True,
             )
-            if holds_ingest_lock():
-                ingest_fd = None       # this context IS the serialized writer
-            else:
-                ingest_fd = _heal_flock_bounded(
-                    _cctally_core.JOURNAL_INGEST_LOCK_PATH, 5.0)
-                if ingest_fd is None:
-                    print(
-                        "[heal] stats.db auto-heal declined: another ingest "
-                        "holds journal.ingest.lock; a later open will retry.",
-                        file=sys.stderr,
-                    )
-                    return False
-            try:
-                # #386: the rebuild writes the fresh scratch index through
-                # `open_db(_target_path=...)`, whose connection carries the
-                # authorizer. Declare the sanctioned maintenance regime for the
-                # whole replacement — we hold (or already held) maintenance
-                # exclusive, which is exactly what spec §3.1 sanctions.
-                with stats_write_scope("maintenance-heal"):
-                    import _cctally_journal
-                    _cctally_journal.rebuild_stats_index(
-                        context=_cctally_journal.RebuildContext(
-                            trigger="corruption-heal",
-                            trigger_error=_cctally_db._bounded_forensics_text(
-                                exc,
-                                _cctally_db._FORENSICS_EXCEPTION_MESSAGE_MAX,
-                            ),
-                            forensics_path=(
-                                str(forensics.path)
-                                if forensics.path is not None
-                                else None
-                            ),
-                        )
-                    )
-            finally:
-                if ingest_fd is not None:
-                    _heal_release_flock(ingest_fd)
+            request = _build_stats_heal_request(
+                exc, forensics, post_query=post_query, high_water=hw,
+            )
+            # F4, first point (#496 S3 §7). Classifier gating stays a
+            # PRECONDITION; this narrows within classified triggers exactly as
+            # the cache path does at `_cctally_cache.py`. A disposition other
+            # than CONFIRMED declines: no deferral, no worker, no replacement,
+            # and a printed reason naming the bundle.
+            confirmed = (
+                forensics is not None
+                and forensics.disposition
+                is _cctally_db.CorruptionProbeDisposition.CONFIRMED
+                and forensics.path is not None
+            )
+            if not confirmed:
+                bundle = (
+                    str(forensics.path)
+                    if forensics is not None and forensics.path is not None
+                    else "unavailable"
+                )
+                reason = (
+                    forensics.reason if forensics is not None else "unavailable"
+                )
+                append_stats_heal_event({
+                    **build_stats_heal_event(request, "unconfirmed"),
+                    "outcome": "declined-unconfirmed",
+                    "declineReason": reason,
+                })
+                print(
+                    "[heal] stats.db auto-heal declined for classified "
+                    f"trigger: corruption was not confirmed ({reason}; "
+                    f"forensics: {bundle}); leaving the stats.db file family "
+                    "untouched.",
+                    file=sys.stderr,
+                )
+                return False
+            append_stats_heal_event(build_stats_heal_event(request, "confirmed"))
+        finally:
+            # Released BEFORE deferring: the worker takes maintenance
+            # EXCLUSIVE as a fresh process holding nothing, and a caller still
+            # holding it here would make that acquire wait for a request it is
+            # itself in the middle of filing.
+            _release_stats_maintenance_for_heal(maint_fd)
+        outcome = defer_stats_corruption_heal(request)
+        # F15 (#496 S3 §7). Detachment supplies the timing for free: report at
+        # DETECTION, naming the absolute forensics path and the heal id. It
+        # cannot name an incident path, because the quarantine directory is
+        # allocated only during preservation, after the worker has chosen
+        # physical fallback and begun it; the worker adds that to the ring.
+        bundle = request.get("forensicsPath") or "unavailable"
+        print(
+            f"[heal] stats.db is corrupt ({exc}); nothing was replaced by this "
+            f"command. A rebuild from the journal was scheduled to run in the "
+            f"background as heal {request['healId']}. Forensics: {bundle}.",
+            file=sys.stderr,
+        )
+        # Escalation is REPORT-ONLY: no halt, and no throttle beyond the
+        # admission marker's existing retry interval. Halting auto-heal after
+        # N occurrences was considered and rejected (§3 Q4).
+        recurrence = stats_heal_recurrence()
+        if recurrence >= _STATS_HEAL_RECURRENCE_THRESHOLD:
+            days = int(_STATS_HEAL_RECURRENCE_WINDOW_S // 86400)
             print(
-                f"[heal] stats.db was corrupt ({exc}); quarantined its file family "
-                "under quarantine/ (forensics in logs/) and rebuilt a fresh index "
-                "from the journal.",
+                f"[heal] this is a recurring stats.db corruption: "
+                f"{recurrence} heals in the last {days} days. The heal still "
+                f"runs; the bundles in {_cctally_core.LOG_DIR} and the events "
+                f"in {_stats_heal_ring_path()} are the evidence to report.",
                 file=sys.stderr,
             )
-            return True
-        finally:
-            _release_stats_maintenance_reentrant(maint_fd)
+        # The heal no longer runs on the caller's thread, so it no longer has
+        # a boolean to return. The signal derives from `BaseException` for the
+        # reason `StatsRebuildDeferred` records: a broad `except Exception`
+        # fallback would turn "the index is being rebuilt" into a misleading
+        # partial report.
+        raise _cctally_db.StatsHealDeferred(
+            outcome,
+            heal_id=request["healId"],
+            forensics_path=request.get("forensicsPath"),
+        )
     except Exception as heal_exc:
         print(f"[heal] stats.db auto-heal failed: {heal_exc}", file=sys.stderr)
         # A post-publication validation failure has ALREADY replaced the index.
@@ -1750,6 +1900,572 @@ def _stats_heal_hook(
 
 
 HEAL_HOOK = _stats_heal_hook
+
+
+# --------------------------------------------------------------------------
+# #496 S3 §6 — the detached corruption heal
+# --------------------------------------------------------------------------
+#
+# The hook writes forensics and files a REQUEST; a detached worker does the
+# rebuild. Admission copies the three layers of `defer_stats_epoch_rebuild` — a
+# non-blocking admission flock whose loser returns immediately, a pending
+# marker with a retry window, and a worker-active probe that refreshes the
+# marker instead of spawning a duplicate — over its OWN files, so the two
+# deferrals can never suppress each other.
+#
+# The epoch path's marker is an empty touched file. This one is a durable JSON
+# document, because the worker runs later and in another process and needs
+# facts the hook established at detection: the heal id that correlates the
+# durable event record, the trigger evidence, the forensics bundle, the
+# journal information to revalidate, and — load-bearing — WHICH PROBE to run.
+# A `post_query` detection was established by a failed `quick_check` against a
+# file SQLite opens happily, so a worker that always used the cheap readability
+# probe would exit on exactly the readable-but-corrupt population this
+# architecture exists to serve.
+
+STATS_CORRUPTION_HEAL_COMMAND = "_stats-corruption-heal"
+_STATS_HEAL_RETRY_SECONDS = 60.0
+_STATS_HEAL_WORKER_MAINTENANCE_WAIT_S = 120.0
+_STATS_HEAL_PROBE_INTEGRITY = "integrity"
+_STATS_HEAL_PROBE_READABILITY = "readability"
+
+
+def _stats_heal_path(name: str) -> pathlib.Path:
+    return pathlib.Path(_cctally_core.APP_DIR) / name
+
+
+def _stats_heal_marker_path() -> pathlib.Path:
+    return _stats_heal_path("stats-corruption-heal.pending")
+
+
+def _stats_heal_admission_path() -> pathlib.Path:
+    return _stats_heal_path("stats-corruption-heal.admission.lock")
+
+
+def _stats_heal_worker_path() -> pathlib.Path:
+    return _stats_heal_path("stats-corruption-heal.worker.lock")
+
+
+def _stats_heal_log_path() -> pathlib.Path:
+    return pathlib.Path(_cctally_core.LOG_DIR) / "stats-corruption-heal.log"
+
+
+def _new_heal_id() -> str:
+    """A collision-free correlation id readable in a log line."""
+    return (
+        dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + os.urandom(4).hex()
+    )
+
+
+def _build_stats_heal_request(
+    exc: BaseException,
+    forensics,
+    *,
+    post_query: bool,
+    high_water,
+) -> dict:
+    """The durable request the worker acts on (#496 S3 §6)."""
+    return {
+        "schemaVersion": 1,
+        "healId": _new_heal_id(),
+        "detectedAtUtc": _cctally_core.now_utc_iso(),
+        "postQuery": bool(post_query),
+        "probeKind": (
+            _STATS_HEAL_PROBE_INTEGRITY
+            if post_query
+            else _STATS_HEAL_PROBE_READABILITY
+        ),
+        "triggerError": _cctally_db._bounded_forensics_text(
+            exc, _cctally_db._FORENSICS_EXCEPTION_MESSAGE_MAX
+        ),
+        "triggerType": type(exc).__name__,
+        "forensicsPath": (
+            str(forensics.path)
+            if forensics is not None and forensics.path is not None
+            else None
+        ),
+        "forensicsDisposition": (
+            forensics.disposition.value if forensics is not None else None
+        ),
+        "journalHighWater": (
+            [str(high_water[0]), int(high_water[1])]
+            if high_water is not None
+            else None
+        ),
+    }
+
+
+def _read_stats_heal_request() -> "dict | None":
+    try:
+        payload = json.loads(_stats_heal_marker_path().read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _unlink_stats_heal_marker() -> None:
+    try:
+        _stats_heal_marker_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _stats_heal_worker_active() -> bool:
+    """Probe the worker flock without waiting or disturbing its owner."""
+    try:
+        fd = os.open(
+            _stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600
+        )
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+def _log_stats_heal(
+    outcome: str, *, heal_id: "str | None" = None,
+    error: BaseException | None = None,
+) -> None:
+    """Append one path-safe worker result line.
+
+    Follows `stats-epoch-rebuild.log`'s restraint for exception text: the class
+    plus a numeric SQLite/OS code, never free-form message text that may carry
+    private paths. The heal id is our own generated token and carries nothing.
+    """
+    try:
+        log_path = _stats_heal_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        detail = ""
+        if heal_id:
+            detail += f" heal={heal_id}"
+        if error is not None:
+            code = getattr(error, "sqlite_errorcode", None)
+            if code is None:
+                code = getattr(error, "errno", None)
+            detail += f" error={type(error).__name__}"
+            if code is not None:
+                detail += f" code={int(code)}"
+        line = (
+            f"{_cctally_core.now_utc_iso()} worker=stats-corruption-heal "
+            f"result={outcome}{detail}\n"
+        ).encode("utf-8")
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def defer_stats_corruption_heal(request: dict) -> str:
+    """Schedule one retryable detached corruption heal without blocking."""
+    try:
+        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
+        admission_fd = os.open(
+            _stats_heal_admission_path(), os.O_WRONLY | os.O_CREAT, 0o600
+        )
+    except OSError:
+        return "failed"
+    try:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "pending"
+        marker = _stats_heal_marker_path()
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except FileNotFoundError:
+            age = None
+        except OSError:
+            return "failed"
+        if age is not None and age < _STATS_HEAL_RETRY_SECONDS:
+            return "pending"
+        if _stats_heal_worker_active():
+            # A real rebuild outlives the marker retry interval. Refresh the
+            # admission stamp instead of launching a process that can only lose
+            # the worker flock and exit.
+            try:
+                os.utime(marker, None)
+            except OSError:
+                pass
+            return "pending"
+        try:
+            _cctally_db._atomic_write_private_json(marker, request)
+        except OSError:
+            return "failed"
+        from _cctally_update import _spawn_detached
+        if _spawn_detached(STATS_CORRUPTION_HEAL_COMMAND):
+            return "spawned"
+        _unlink_stats_heal_marker()
+        return "failed"
+    finally:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(admission_fd)
+
+
+def _run_stats_corruption_heal(request: dict) -> str:
+    """The worker's body, under its own maintenance-EXCLUSIVE hold.
+
+    Three orderings here are load-bearing (#496 S3 §6):
+
+    * the authoritative probe runs UNDER exclusive, not before it, because
+      epoch rebuilds, operator rebuilds and other maintenance classes hold
+      distinct worker flocks and would otherwise race it;
+    * the no-journal guard is re-checked under the lock, because the hook
+      checked it before spawning and `rebuild_stats_index` accepts a `None`
+      high-water and would build an EMPTY scratch — rebuilding a pre-cutover
+      index to empty is exactly the silent data loss that guard exists to
+      prevent;
+    * the probe is the one the DETECTION established, carried in the request.
+    """
+    import _cctally_journal
+
+    path = _cctally_core.DB_PATH
+    heal_id = str(request.get("healId") or "")
+    if _cctally_db._would_block_prod_stats(path):
+        return "prod-refused"
+    maint_fd = _heal_flock_bounded(
+        _cctally_core.STATS_LOCK_MAINTENANCE_PATH,
+        _STATS_HEAL_WORKER_MAINTENANCE_WAIT_S,
+    )
+    if maint_fd is None:
+        return "maintenance-busy"
+    _cctally_core.note_stats_maintenance_acquired()
+    try:
+        probe = (
+            _probe_stats_integrity_ok
+            if str(request.get("probeKind") or "")
+            == _STATS_HEAL_PROBE_INTEGRITY
+            else _probe_stats_ok
+        )
+        if probe(path):
+            # F4's second point: a re-probe under a lock the hook never held
+            # finds the index intact, so nothing is replaced.
+            return "declined-readable"
+        high_water = _cctally_journal.journal_high_water()
+        if high_water is None or high_water[1] == 0:
+            return "declined-no-journal"
+        if holds_ingest_lock():
+            ingest_fd = None
+        else:
+            ingest_fd = _heal_flock_bounded(
+                _cctally_core.JOURNAL_INGEST_LOCK_PATH, 10.0
+            )
+            if ingest_fd is None:
+                return "ingest-busy"
+        try:
+            with stats_write_scope("maintenance-heal"):
+                result = _cctally_journal.rebuild_stats_index(
+                    context=_cctally_journal.RebuildContext(
+                        trigger="corruption-heal",
+                        trigger_error=str(request.get("triggerError") or ""),
+                        forensics_path=request.get("forensicsPath"),
+                    ),
+                    high_water=high_water,
+                )
+        finally:
+            if ingest_fd is not None:
+                _heal_release_flock(ingest_fd)
+        _record_stats_heal_outcome(heal_id, "rebuilt", result=result)
+        return "success"
+    finally:
+        _heal_release_maintenance_flock(maint_fd)
+
+
+def cmd_stats_corruption_heal_internal(args) -> int:
+    """Hidden detached worker: heal one corrupt stats index exactly once."""
+    del args
+    try:
+        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
+        worker_fd = os.open(
+            _stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600
+        )
+    except OSError as exc:
+        _log_stats_heal("error", error=exc)
+        return 0
+    try:
+        try:
+            fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        request = _read_stats_heal_request()
+        if not request:
+            _unlink_stats_heal_marker()
+            _log_stats_heal("no-request")
+            return 0
+        heal_id = str(request.get("healId") or "")
+        try:
+            outcome = _run_stats_corruption_heal(request)
+        except Exception as exc:
+            # Retryable: the marker stays so a later detection is admitted
+            # once its retry window expires.
+            _record_stats_heal_outcome(heal_id, "failed", error=exc)
+            _log_stats_heal("error", heal_id=heal_id, error=exc)
+            return 0
+        if outcome in ("maintenance-busy", "ingest-busy"):
+            _log_stats_heal(outcome, heal_id=heal_id)
+            return 0
+        if outcome != "success":
+            _record_stats_heal_outcome(heal_id, outcome)
+        _unlink_stats_heal_marker()
+        _log_stats_heal(outcome, heal_id=heal_id)
+        return 0
+    finally:
+        try:
+            fcntl.flock(worker_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(worker_fd)
+
+
+# --------------------------------------------------------------------------
+# F6 — the bounded durable heal ring (#496 S3 §7)
+# --------------------------------------------------------------------------
+#
+# Stderr alone does not work as the accountability channel: the statusline's
+# background writer forks with stderr at `/dev/null` and wraps its body in
+# `except BaseException: pass`, so a heal firing from there is invisible. The
+# ring is the durable channel; the stderr line remains for interactive callers.
+#
+# **A non-blocking flock is wrong here and would defeat the guarantee.** The
+# writer-guard log may drop a line under contention because it is advisory;
+# this ring is the only durable notification that a heal happened, so a loser
+# that silently discarded its event would make the accountability claim false.
+# The acquire is therefore a BOUNDED WAIT, and an expiry is reported rather
+# than swallowed.
+#
+# It holds absolute paths because F15 requires the user be told them, so it
+# stays a private `0600` file in the user's own data directory, like the
+# incident `manifest.json` beside it. Bounded by COUNT so it cannot grow, which
+# is also what makes it survive S6's retention by construction.
+
+_STATS_HEAL_RING_CAPACITY = 50
+_STATS_HEAL_RING_WAIT_S = 10.0
+_STATS_HEAL_RECURRENCE_THRESHOLD = 3
+_STATS_HEAL_RECURRENCE_WINDOW_S = 7 * 86400.0
+
+
+def _stats_heal_ring_path() -> pathlib.Path:
+    return pathlib.Path(_cctally_core.LOG_DIR) / "stats-heal-events.json"
+
+
+def _stats_heal_ring_lock_path() -> pathlib.Path:
+    return pathlib.Path(_cctally_core.LOG_DIR) / "stats-heal-events.lock"
+
+
+def build_stats_heal_event(request: dict, disposition: str) -> dict:
+    """One ring entry, as the DETECTION knows it.
+
+    `changed` is `unknown` and stays that way. `RebuildResult` carries row
+    counts and replay diagnostics but no comparison against the index it
+    replaced, and `conflicts` / `protocol_violations` report replay ambiguity
+    and omitted correction batches — which is not "the rebuilt index differs
+    from the live one". Recording them is still required, because a user is
+    entitled to know a rebuild reported conflicts.
+
+    `incidentPath` is `None` here and can only be `None` here: the quarantine
+    directory is allocated during preservation, after the worker has chosen
+    physical fallback and begun it (#496 S3 §7 F15).
+    """
+    return {
+        "schemaVersion": 1,
+        "healId": str(request.get("healId") or ""),
+        "detectedAtUtc": str(
+            request.get("detectedAtUtc") or _cctally_core.now_utc_iso()
+        ),
+        "updatedAtUtc": _cctally_core.now_utc_iso(),
+        "trigger": {
+            "origin": "corruption-heal",
+            "type": request.get("triggerType"),
+            "error": request.get("triggerError"),
+            "postQuery": bool(request.get("postQuery")),
+        },
+        "disposition": disposition,
+        "forensicsPath": request.get("forensicsPath"),
+        "incidentPath": None,
+        "publicationMechanism": None,
+        "outcome": "detected",
+        "changed": "unknown",
+    }
+
+
+def _report_unreadable_stats_heal_ring(reason: str) -> None:
+    """Report a ring file that exists but cannot be read as a ring.
+
+    A ring that reads as empty is indistinguishable from a ring that never
+    recorded anything, and the next writer overwrites it — so without this the
+    accountability history would disappear with nothing said. Both channels are
+    used because neither reaches every caller: the worker's streams are
+    `/dev/null`, and an interactive caller does not read the heal log.
+    """
+    _log_stats_heal(f"ring-unreadable-{reason}")
+    print(
+        f"[heal] the stats.db heal event log at {_stats_heal_ring_path()} "
+        f"could not be read ({reason}) and reports no history; the next "
+        "recorded heal replaces it.",
+        file=sys.stderr,
+    )
+
+
+def _read_stats_heal_ring() -> list:
+    try:
+        payload = json.loads(_stats_heal_ring_path().read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        _report_unreadable_stats_heal_ring(type(exc).__name__)
+        return []
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        _report_unreadable_stats_heal_ring("NoEventList")
+        return []
+    return [e for e in events if isinstance(e, dict)]
+
+
+def read_stats_heal_events() -> list:
+    """Every retained heal event, oldest first. Public: S6's F14 reads this."""
+    return _read_stats_heal_ring()
+
+
+def _write_stats_heal_ring(events: list) -> None:
+    _cctally_db._atomic_write_private_json(
+        _stats_heal_ring_path(),
+        {"schemaVersion": 1, "events": events[-_STATS_HEAL_RING_CAPACITY:]},
+    )
+
+
+def _mutate_stats_heal_ring(mutate) -> bool:
+    """Read-modify-write the ring under a BOUNDED wait for its lock."""
+    try:
+        pathlib.Path(_cctally_core.LOG_DIR).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    fd = _heal_flock_bounded(
+        _stats_heal_ring_lock_path(), _STATS_HEAL_RING_WAIT_S
+    )
+    if fd is None:
+        # Loud, never silent: the ring is the accountability guarantee, so a
+        # writer that could not take the lock says so rather than discarding
+        # its event.
+        print(
+            "[heal] could not record a stats.db heal event: the heal event "
+            "log stayed locked; the heal itself is unaffected.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        events = _read_stats_heal_ring()
+        mutated = mutate(events)
+        if mutated is None:
+            return False
+        _write_stats_heal_ring(mutated)
+        return True
+    except OSError:
+        return False
+    finally:
+        _heal_release_flock(fd)
+
+
+def append_stats_heal_event(entry: dict) -> bool:
+    """Append one detection entry. Bounded by count, oldest dropped first."""
+    def mutate(events):
+        events.append(entry)
+        return events
+
+    return _mutate_stats_heal_ring(mutate)
+
+
+def update_stats_heal_event(heal_id: str, **fields) -> bool:
+    """Update the entry MATCHING ``heal_id``, and no other.
+
+    Admission coalesces several detections into one run, so an update keyed by
+    anything else (position, recency) would settle a heal whose worker never
+    ran and hide the one that died.
+    """
+    if not heal_id:
+        return False
+
+    def mutate(events):
+        for event in events:
+            if event.get("healId") == heal_id:
+                event.update(fields)
+                event["updatedAtUtc"] = _cctally_core.now_utc_iso()
+                return events
+        return None
+
+    return _mutate_stats_heal_ring(mutate)
+
+
+def stats_heal_recurrence(
+    window_s: float = _STATS_HEAL_RECURRENCE_WINDOW_S,
+) -> int:
+    """How many heals were detected inside the trailing window."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=window_s)
+    count = 0
+    for event in _read_stats_heal_ring():
+        try:
+            detected = dt.datetime.fromisoformat(
+                str(event.get("detectedAtUtc") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if detected.tzinfo is None:
+            detected = detected.replace(tzinfo=dt.timezone.utc)
+        if detected >= cutoff:
+            count += 1
+    return count
+
+
+def _record_stats_heal_outcome(
+    heal_id: str, outcome: str, *, result=None, error: BaseException | None = None,
+) -> None:
+    """Settle the durable heal event this worker owns."""
+    fields: dict = {"outcome": outcome}
+    if result is not None:
+        incident = getattr(result, "quarantine_dir", None)
+        fields["incidentPath"] = str(incident) if incident is not None else None
+        # An in-place publish never preserves, so `quarantine_dir is None` is
+        # an exact discriminator for which mechanism published (#496 S3 §4.1).
+        fields["publicationMechanism"] = (
+            "replace" if incident is not None else "in_place"
+        )
+        fields["conflicts"] = len(getattr(result, "conflicts", ()) or ())
+        fields["protocolViolations"] = len(
+            getattr(result, "protocol_violations", ()) or ()
+        )
+        fields["rowsTotal"] = sum(
+            int(v) for v in (getattr(result, "rows_by_table", {}) or {}).values()
+        )
+    if error is not None:
+        # Structural only, like `stats-epoch-rebuild.log`: never free-form
+        # exception text, which can carry private paths.
+        fields["error"] = type(error).__name__
+    if not update_stats_heal_event(heal_id, **fields):
+        # The ring is the accountability record this session added, so a
+        # verdict that never reached it must not vanish silently. The durable
+        # log is the channel that works here: this runs only in the detached
+        # worker, whose stdout and stderr are `/dev/null`.
+        _log_stats_heal(f"ring-update-lost-{outcome}", heal_id=heal_id)
 
 
 # --------------------------------------------------------------------------

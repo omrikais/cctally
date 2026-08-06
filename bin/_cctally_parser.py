@@ -3382,6 +3382,25 @@ def _build_stats_epoch_rebuild_parser(subparsers, name, *, help_text, xref=None)
     )
     worker.set_defaults(func=c.cmd_stats_epoch_rebuild_internal)
 
+def _build_stats_corruption_heal_parser(subparsers, name, *, help_text, xref=None):
+    """Build the #496 S3 detached stats corruption-heal worker parser."""
+    c = _cctally()
+    worker = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: rebuild a corrupt stats index from the
+                    journal under its own maintenance-exclusive hold. Spawned by
+                    the classifier-gated corruption heal so no statusline render
+                    and no dashboard start blocks on the rebuild. Always returns
+                    0; failures are logged and remain retryable.
+                    """
+                ),
+    )
+    worker.set_defaults(func=c.cmd_stats_corruption_heal_internal)
+
 def _build_codex_replay_drain_parser(subparsers, name, *, help_text, xref=None):
     """Build the `_codex-replay-drain` parser (public #5 §4)."""
     c = _cctally()
@@ -3484,6 +3503,7 @@ _REGISTRATION = (
     _Reg('_telemetry-beat', _build_telemetry_beat_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-quota-verify', _build_codex_quota_verify_parser, argparse.SUPPRESS, None, None),
     _Reg('_stats-epoch-rebuild', _build_stats_epoch_rebuild_parser, argparse.SUPPRESS, None, None),
+    _Reg('_stats-corruption-heal', _build_stats_corruption_heal_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-replay-drain', _build_codex_replay_drain_parser, argparse.SUPPRESS, None, None),
     _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
 )

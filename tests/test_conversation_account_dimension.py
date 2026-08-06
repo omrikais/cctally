@@ -3,6 +3,8 @@ import pathlib
 import sqlite3
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 
@@ -139,7 +141,7 @@ def test_account_b_scope_excludes_account_a_from_same_session(tmp_path):
 
 
 def _open_scoped_codex_fixture(
-    tmp_path: pathlib.Path, account_key: str,
+    tmp_path: pathlib.Path, account_key: str, *, drop_persisted_rollup: bool = False,
 ) -> sqlite3.Connection:
     cache_path = tmp_path / "cache-codex.db"
     cache_conn = sqlite3.connect(cache_path)
@@ -155,6 +157,13 @@ def _open_scoped_codex_fixture(
             ("shared-codex.jsonl", 20, "2026-08-04T10:01:00Z", "shared-thread",
              "gpt-5.6", 300, 0, 40, 0, 340, ACCOUNT_B),
         ],
+    )
+    cache_conn.execute(
+        "INSERT INTO codex_conversation_threads "
+        "(conversation_key,source_root_key,native_thread_id,root_thread_id,"
+        " source_path,cwd) VALUES(?,?,?,?,?,?)",
+        ("v1.shared", "root", "shared-thread", "shared-thread",
+         "shared-codex.jsonl", "/work/cctally-dev"),
     )
     cache_conn.commit()
     cache_conn.close()
@@ -188,6 +197,8 @@ def _open_scoped_codex_fixture(
     )
     conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
     cache._recompute_codex_rollups(conn, {"v1.shared"})
+    if drop_persisted_rollup:
+        conn.execute("DELETE FROM codex_conversation_rollups")
     conn.commit()
     cache.scope_conversations_db_to_account(conn, account_key)
     return conn
@@ -225,6 +236,72 @@ def test_account_scope_filters_every_codex_leaf_in_shared_conversation(tmp_path)
         assert exported["status"] == "ok"
         assert "alpha codex private" in exported["markdown"]
         assert "bravo codex private" not in exported["markdown"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("account_key", "own_text", "other_text"),
+    [
+        (ACCOUNT_A, "alpha codex private", "bravo codex private"),
+        (ACCOUNT_B, "bravo codex private", "alpha codex private"),
+    ],
+)
+def test_account_scope_preserves_safe_codex_project_attribution(
+    tmp_path, account_key, own_text, other_text,
+):
+    fixture_dir = tmp_path / account_key
+    fixture_dir.mkdir()
+    conn = _open_scoped_codex_fixture(fixture_dir, account_key)
+    try:
+        unscoped_project = conn.execute(
+            "SELECT project_key,project_label "
+            "FROM main.codex_conversation_rollups "
+            "WHERE conversation_key='v1.shared'"
+        ).fetchone()
+        scoped_project = conn.execute(
+            "SELECT project_key,project_label "
+            "FROM codex_conversation_rollups "
+            "WHERE conversation_key='v1.shared'"
+        ).fetchone()
+
+        assert unscoped_project[1] == "cctally-dev"
+        assert scoped_project == unscoped_project
+
+        detail = codex_query.get_codex_conversation(
+            conn, "v1.shared", effective_speed="standard"
+        )
+        assert own_text in str(detail)
+        assert other_text not in str(detail)
+
+        # Project identity is safe derived enrichment. The underlying
+        # conversation-level cwd/git and source-root metadata stay hidden from
+        # every account-scoped query kernel.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_threads"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_source_roots"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_account_scope_derives_codex_project_while_rollup_is_bootstrapping(
+    tmp_path,
+):
+    conn = _open_scoped_codex_fixture(
+        tmp_path, ACCOUNT_A, drop_persisted_rollup=True,
+    )
+    try:
+        project = conn.execute(
+            "SELECT project_key,project_label "
+            "FROM codex_conversation_rollups "
+            "WHERE conversation_key='v1.shared'"
+        ).fetchone()
+        assert project is not None
+        assert project[0].startswith("project:")
+        assert project[1] == "cctally-dev"
     finally:
         conn.close()
 

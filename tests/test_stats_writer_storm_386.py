@@ -481,6 +481,60 @@ def _hold_open_handle(db: pathlib.Path) -> subprocess.Popen:
     return holder
 
 
+def _hold_raw_open_handle(db: pathlib.Path) -> subprocess.Popen:
+    """A second process holding a plain file handle on the main file.
+
+    Deliberately NOT a SQLite connection: the drain gate is a whole-system
+    handle scan, and after #496 S3 the destinations that still reach physical
+    replacement are exactly the ones SQLite refuses to open. A holder that
+    could only hold a readable database could no longer exercise that gate.
+    """
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "fh = open(sys.argv[1], 'rb')\n"
+            "print('held', flush=True)\n"
+            "time.sleep(120)\n",
+            str(db),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+#: Pins a read snapshot, re-reads it once a gate file appears, then ends the
+#: transaction and reads again. Three numbers from ONE process are what make
+#: cross-process snapshot isolation observable.
+_SNAPSHOT_READER = """
+import pathlib, sqlite3, sys, time
+db, gate = sys.argv[1:3]
+conn = sqlite3.connect(db)
+conn.execute('BEGIN DEFERRED')
+print('pinned %d' % conn.execute(
+    'SELECT count(*) FROM weekly_usage_snapshots').fetchone()[0], flush=True)
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline and not pathlib.Path(gate).exists():
+    time.sleep(0.05)
+print('during %d' % conn.execute(
+    'SELECT count(*) FROM weekly_usage_snapshots').fetchone()[0], flush=True)
+conn.rollback()
+print('after %d' % conn.execute(
+    'SELECT count(*) FROM weekly_usage_snapshots').fetchone()[0], flush=True)
+"""
+
+
+def _snapshot_reader(db: pathlib.Path, gate: pathlib.Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _SNAPSHOT_READER, str(db), str(gate)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+
 def test_stats_open_respects_quarantine_pending_record(tmp_path):
     """A pending quarantine record must block a new stats opener.
 
@@ -627,14 +681,23 @@ def test_quarantine_declines_when_family_has_live_handles(tmp_path):
     exactly the point at which SQLite's crash guarantees stop applying
     (spec 1.2). ``db rebuild --db stats`` is the one of the three an operator can
     trigger deterministically, so it is the one under test.
+
+    #496 S3 narrowed WHEN physical replacement runs, not what it must do when
+    it does. A readable destination now publishes in place and correctly does
+    NOT decline (see ``test_h4_live_handle_spans_rebuild_swap``), so the
+    destination is corrupted first to reach the fallback the drain gate still
+    guards. Without that the property would silently stop being tested.
     """
     env = _storm_env(tmp_path / "data")
     _seed_journal(env, 3)
     app = _resolved_app_dir(env)
     db = app / "stats.db"
+    _drain_wal(db)
+    _corrupt_header(db)
     before_ino = db.stat().st_ino
+    before_bytes = db.read_bytes()
 
-    holder = _hold_open_handle(db)
+    holder = _hold_raw_open_handle(db)
     try:
         res = _cctally(env, "db", "rebuild", "--db", "stats")
         assert res.returncode != 0, (
@@ -645,18 +708,24 @@ def test_quarantine_declines_when_family_has_live_handles(tmp_path):
         assert db.stat().st_ino == before_ino, (
             "rebuild replaced the live stats.db inode under an open handle"
         )
+        assert db.read_bytes() == before_bytes, (
+            "a declined replacement still mutated the family"
+        )
+        assert _quarantine_incidents(app) == [], (
+            "a declined replacement still preserved: "
+            + str(_quarantine_incidents(app))
+        )
     finally:
         holder.send_signal(signal.SIGKILL)
         holder.wait(timeout=30)
         if holder.stdout is not None:
             holder.stdout.close()
 
-    ok, text = _integrity_ok(db)
-    assert ok, text
-
     # Control: with the handle gone the SAME command must succeed, so the
     # assertion above is about the live handle and not about `db rebuild` being
-    # broken outright.
+    # broken outright. It also proves the publisher's own descriptor is absent
+    # from the drain scan, because the run would otherwise decline against
+    # itself.
     res = _cctally(env, "db", "rebuild", "--db", "stats")
     assert res.returncode == 0, res.stderr
     ok, text = _integrity_ok(_resolved_app_dir(env) / "stats.db")
@@ -1136,6 +1205,11 @@ def test_h4_new_opener_after_pid_scan(tmp_path):
     said "drained" and before any file moved. A new opener must NOT reach the
     live family while it is parked there.
 
+    #496 S3: a readable destination publishes in place and never reaches that
+    seam, so the destination is corrupted first to reach the physical fallback
+    the seam belongs to. Without that the test would pass while exercising
+    nothing.
+
     **The property is EXCLUSION, not blocking.** Stage 2 asserted the opener
     stayed at `poll() is None` for 3 s, which pinned the UNBOUNDED wait as
     intended behaviour — the very P1 Task 12.5 fixed. Post-fix the opener waits
@@ -1147,6 +1221,8 @@ def test_h4_new_opener_after_pid_scan(tmp_path):
     _seed_journal(env, 4)
     app = _resolved_app_dir(env)
     db = app / "stats.db"
+    _drain_wal(db)
+    _corrupt_header(db)
     marker = tmp_path / "paused.pid"
 
     rebuild = subprocess.Popen(
@@ -1218,6 +1294,11 @@ def test_contender_after_sidecar_removal_is_excluded(tmp_path, record_property):
     `stats_replace_drained`, which is earlier: before the preservation copy,
     before the checkpoint and before the sidecar removal. Nothing pinned this
     later point, which is the one S2's file-ordering analysis names.
+
+    #496 S3: a readable destination publishes in place and never reaches this
+    seam, so the destination is corrupted first to reach the physical fallback
+    it belongs to. The spec keeps both pause points on that path precisely so
+    this test stays meaningful rather than vacuous.
     """
     sys.path.insert(0, str(ROOT / "bin"))
     import _lib_stats_damage as dmg
@@ -1226,6 +1307,8 @@ def test_contender_after_sidecar_removal_is_excluded(tmp_path, record_property):
     _seed_journal(env, 4)
     app = _resolved_app_dir(env)
     db = app / "stats.db"
+    _drain_wal(db)
+    _corrupt_header(db)
     marker = tmp_path / "paused.pid"
 
     rebuild = subprocess.Popen(
@@ -1409,36 +1492,72 @@ def test_h4_resume_of_partial_quarantine(tmp_path):
 
 
 def test_h4_live_handle_spans_rebuild_swap(tmp_path):
-    """A reader held open across the rebuild swap + sidecar cleanup.
+    """A reader held open across a rebuild keeps the generation it opened on.
 
-    Post-fix the correct outcome is that the swap never happens while the handle
-    is live: `rebuild_stats_index`'s `os.replace` of the scratch main and its
+    Before #496 S3 the correct outcome was that the swap never happened while
+    the handle was live, because `os.replace` of the scratch main and the
     sidecar `unlink` are exactly the surgery that invalidates a live mapping.
+    In-place publication removes that surgery, so the rebuild now SUCCEEDS
+    under the live reader and the destination's inode never changes.
+
+    This is the CROSS-PROCESS snapshot-isolation claim, which the design
+    deliberately refused to inherit from its single-process probe. It is
+    non-vacuous because the generation actually differs: two further ticks land
+    between the pin and the rebuild, so a reader that saw the publish would
+    report a different number from the one it pinned.
     """
     env = _storm_env(tmp_path / "data")
     _seed_journal(env, 4)
     app = _resolved_app_dir(env)
     db = app / "stats.db"
     ino_before = db.stat().st_ino
+    gate = tmp_path / "published.gate"
 
-    holder = _hold_open_handle(db)
+    reader = _snapshot_reader(db, gate)
     try:
+        pinned = reader.stdout.readline().strip()
+        assert pinned.startswith("pinned "), pinned
+        pinned_rows = int(pinned.split()[1])
+        assert pinned_rows > 0, "the reader pinned an empty index"
+
+        # Change the generation the rebuild will publish. The tick indices
+        # CONTINUE from the seed: `_seed_journal` always restarts at 0, and
+        # replaying a lower 7d percent adds no snapshot row at all.
+        for i in range(4, 6):
+            res = _cctally(env, *_tick_args(i))
+            assert res.returncode == 0, res.stderr
+
         for _ in range(3):
             res = _cctally(env, "db", "rebuild", "--db", "stats")
-            assert res.returncode != 0, (
-                "rebuild swapped the main file under a live read transaction"
+            assert res.returncode == 0, (
+                "an in-place publish must not decline under a live reader: "
+                + res.stderr
             )
-            assert db.stat().st_ino == ino_before
-            ok, text = _integrity_ok(db)
-            assert ok, text
+            assert db.stat().st_ino == ino_before, (
+                "the destination inode changed, so the file was replaced"
+            )
+        gate.write_text("go\n")
+
+        during = reader.stdout.readline().strip()
+        assert during == f"during {pinned_rows}", (
+            f"the pinned reader observed the swap: {during!r} "
+            f"(pinned {pinned_rows})"
+        )
+        after = reader.stdout.readline().strip()
+        after_rows = int(after.split()[1])
+        assert after_rows > pinned_rows, (
+            "the published generation is identical to the pinned one, so the "
+            f"isolation assertion proves nothing: {after!r}"
+        )
     finally:
-        holder.send_signal(signal.SIGKILL)
-        holder.wait(timeout=30)
-        if holder.stdout is not None:
-            holder.stdout.close()
+        if reader.poll() is None:
+            reader.send_signal(signal.SIGKILL)
+        reader.wait(timeout=30)
+        if reader.stdout is not None:
+            reader.stdout.close()
 
     assert _quarantine_incidents(app) == [], (
-        "a declined rebuild still quarantined the family: "
+        "an in-place publish never preserves: "
         + str(_quarantine_incidents(app))
     )
     res = _cctally(env, "db", "rebuild", "--db", "stats")
@@ -1468,11 +1587,26 @@ def test_h4_two_concurrent_heals(tmp_path):
     for p in procs:
         p.wait(timeout=180)
 
+    # #496 S3: both detections DEFER, and admission admits exactly one of them.
+    # The replacement itself happens in the detached worker that admission
+    # spawned, so wait for it to converge before judging how many replacements
+    # occurred. A poll rather than a fixed sleep: the property is "exactly one",
+    # and reading it before the worker finishes would assert nothing.
+    db = _resolved_app_dir(env) / "stats.db"
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        try:
+            ok, _text = _integrity_ok(db)
+        except sqlite3.DatabaseError:
+            ok = False  # still the corrupt original
+        if ok and _quarantine_incidents(app):
+            break
+        time.sleep(0.5)
+
     incidents = _quarantine_incidents(app)
     assert len(incidents) == 1, (
         f"two heals both replaced the family: {incidents}"
     )
-    db = _resolved_app_dir(env) / "stats.db"
     ok, text = _integrity_ok(db)
     assert ok, text
     assert _no_orphan_sidecars(db)
@@ -1886,7 +2020,10 @@ try:
         conn = _cctally_core.open_db()
         conn.close()
         print("OPENED", flush=True)
-    except Exception as exc:
+    except BaseException as exc:
+        # #496 S3: the heal DEFERS, and its signal derives from BaseException
+        # so no broad reporting fallback can swallow it. Terminating with that
+        # signal is the property under test; hanging is the failure.
         print("RAISED %s: %s" % (type(exc).__name__, exc), flush=True)
 finally:
     _cctally_journal._release_maintenance_shared(fd)

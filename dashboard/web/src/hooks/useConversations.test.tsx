@@ -61,6 +61,33 @@ describe('useConversations', () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain('offset=');
   });
 
+  it('#501 prepends an exact selected qualified row outside the first page', async () => {
+    mockFetchOnce({
+      status: 'ok',
+      rows: [{ conversation_key: 'v1.page', title: 'Page row', project_key: 'p1', project_label: 'proj', started_utc: '2026-07-02T00:00:00Z', last_activity_utc: '2026-07-02T01:00:00Z', count: 2, cost_usd: 0.25, models: ['gpt-5.6-codex'], parent: null, is_fork: false }],
+      selected: { conversation_key: 'v1.selected', title: 'Selected row', project_key: 'p2', project_label: 'other', started_utc: '2026-06-01T00:00:00Z', last_activity_utc: '2026-06-01T01:00:00Z', count: 3, cost_usd: 0.5, models: ['gpt-5.5'], parent: null, is_fork: false },
+      facets: { projects: [], models: [] },
+      page: { total: 51, returned: 1, cursor: 'next' },
+    });
+    const selectedRef = { source: 'codex', key: 'v1.selected' } as const;
+    const { result } = renderHook(() => useConversations('codex', { selectedRef }));
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+    expect(result.current.rows.map((row) => row.title)).toEqual(['Selected row', 'Page row']);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('selected=v1.selected');
+  });
+
+  it('#501 does not request a selected-row pin while a filter is active', async () => {
+    act(() => dispatch({ type: 'SET_CONVERSATION_FILTERS', patch: { models: ['gpt-5.5'] } }));
+    mockFetchOnce({
+      status: 'ok', rows: [], facets: { projects: [], models: [] },
+      page: { total: 0, returned: 0, cursor: null },
+    });
+    const selectedRef = { source: 'codex', key: 'v1.selected' } as const;
+    renderHook(() => useConversations('codex', { selectedRef }));
+    await waitFor(() => expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1));
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toContain('selected=');
+  });
+
   it('loads the first page on mount', async () => {
     mockFetchOnce(page1);
     const { result } = renderHook(() => useConversations());

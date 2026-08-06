@@ -22,6 +22,7 @@ engaged (len(_STATS_MIGRATIONS) == 13).
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sqlite3
 
 import pytest
@@ -342,7 +343,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1007  # #460 scheduled-boundary ownership
+    assert core.STATS_INDEX_EPOCH == 1008  # #496 S3 publication stamp
     assert core.LEGACY_STATS_HEAD == 13
 
 
@@ -732,6 +733,7 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
     conn.execute(f"PRAGMA user_version = {core.STATS_INDEX_EPOCH + 1}")
     conn.commit()
     conn.close()
+    inode_before = pathlib.Path(core.DB_PATH).stat().st_ino
     import _cctally_store as store
     healed = store.resolve_stats_epoch_mismatch()
     try:
@@ -740,8 +742,13 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
         assert _canonical_dump(healed) == before, "rebuild lost data"
     finally:
         healed.close()
-    incidents = list((core.APP_DIR / "quarantine").iterdir())
-    assert len(incidents) == 1, "the version-ahead DB is preserved in quarantine"
+    # #496 S3: the version-ahead index is READABLE, so it is republished
+    # transactionally into the same file rather than preserved and replaced.
+    # Preservation is a consequence of destroying a file, and nothing is
+    # destroyed; `db backup --db stats` is the supported snapshot command.
+    assert pathlib.Path(core.DB_PATH).stat().st_ino == inode_before
+    quarantine = core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
 def test_epoch_mismatch_without_journal_hard_errors(ns):

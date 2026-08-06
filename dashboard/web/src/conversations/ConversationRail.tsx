@@ -411,14 +411,14 @@ function pickOr(
 interface RailCtx { tz: string; offsetLabel: string }
 
 function BrowseList({ source, accountKey, selectedId, ctx, pickAnchor }: { source: ConversationSource; accountKey?: string; selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
-  const data = useConversations(source, { accountKey });
+  const data = useConversations(source, { accountKey, selectedRef: selectedId });
   return <BrowseResults data={data} selectedId={selectedId} ctx={ctx} pickAnchor={pickAnchor} />;
 }
 
 function AllBrowseList({ selectedId, ctx, pickAnchor }: { selectedId: ConversationRef | null; ctx: RailCtx; pickAnchor: ConversationRef | null }) {
   // Both requests are qualified. S7 deliberately has no source=all route.
-  const claude = useConversations('claude', { qualified: true });
-  const codex = useConversations('codex', { qualified: true });
+  const claude = useConversations('claude', { qualified: true, selectedRef: selectedId });
+  const codex = useConversations('codex', { qualified: true, selectedRef: selectedId });
   const data: UseConversations = {
     rows: mergeConversationRows(claude.rows, codex.rows),
     loading: claude.loading || codex.loading,

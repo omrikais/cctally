@@ -1439,10 +1439,65 @@ def list_conversation_facets(conn) -> dict:
     return {"projects": projects, "models": models}
 
 
+def _selected_conversation_summary(conn, session_id):
+    """One exact browse-row projection, independent of the current page.
+
+    Mirrors ``list_conversations``' authoritative/live shaping so #501 can pin
+    the selected conversation without paging an unbounded corpus.
+    """
+    if _rollup_authoritative(conn):
+        row = conn.execute(
+            "SELECT session_id, msg_count, started_utc, last_activity_utc, "
+            "cost_usd, project_label, git_branch, models_json, title "
+            "FROM conversation_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        (sid, msg_count, started, last_activity, cost_usd, project_label,
+         git_branch, models_json, rollup_title) = row
+        ai = _session_ai_titles_map(conn, [sid])
+        return {
+            "session_id": sid,
+            "title": ai.get(sid) or rollup_title or project_label or sid,
+            "project_label": project_label,
+            "git_branch": git_branch,
+            "started_utc": started,
+            "last_activity_utc": last_activity,
+            "msg_count": msg_count,
+            "cost_usd": round(cost_usd or 0.0, 6),
+            "models": _json.loads(models_json) if models_json else [],
+        }
+    row = conn.execute(
+        "SELECT session_id, COUNT(*), MIN(timestamp_utc), MAX(timestamp_utc) "
+        "FROM conversation_messages WHERE session_id=? GROUP BY session_id",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    sid, msg_count, started, last_activity = row
+    costs = _session_cost_map(conn, [sid])
+    models = _session_models_map(conn, [sid])
+    meta = _session_latest_meta_map(conn, [sid])
+    titles = _session_titles_map(conn, [sid])
+    project_label = _project_label(meta.get(sid, (None, None))[0])
+    return {
+        "session_id": sid,
+        "title": titles.get(sid) or project_label or sid,
+        "project_label": project_label,
+        "git_branch": meta.get(sid, (None, None))[1],
+        "started_utc": started,
+        "last_activity_utc": last_activity,
+        "msg_count": msg_count,
+        "cost_usd": round(costs.get(sid, 0.0), 6),
+        "models": models.get(sid, []),
+    }
+
+
 def list_conversations(conn, *, sort="recent", limit=50, offset=0,
                        date_from=None, date_to=None, projects=None,
                        cost_min=None, cost_max=None, rebuild_min=None,
-                       models=None) -> dict:
+                       models=None, selected=None) -> dict:
     """All-history per-session browse rows (spec §3.1). NOT 365-day bounded.
 
     Reads the conversation_sessions rollup (Task A) when it is authoritative —
@@ -1565,10 +1620,15 @@ def list_conversations(conn, *, sort="recent", limit=50, offset=0,
         # The rail surfaces this: cost/project ordering becomes available once
         # the rollup finishes indexing; this page fell back to recent order.
         page["sort_degraded"] = True
-    return {
+    result = {
         "conversations": conversations,
         "page": page,
     }
+    if selected is not None:
+        selected_row = _selected_conversation_summary(conn, selected)
+        if selected_row is not None:
+            result["selected"] = selected_row
+    return result
 
 
 def _turn_cost_map(conn, turn_keys):

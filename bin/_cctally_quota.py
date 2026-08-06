@@ -717,7 +717,7 @@ def _blocks_missing_reverse_map(stats_conn: sqlite3.Connection) -> bool:
 
     A scoped sweep matches on ``physical_group_key``, so a NULL there would
     silently escape it and the stale block would survive indefinitely. The
-    epoch rebuild (1005 introduced the column; current epoch 1007) stamps every row, and
+    epoch rebuild (1005 introduced the column; current epoch 1008) stamps every row, and
     this is the guard that turns the
     one shape it cannot reach — a block written by an older binary against an
     already-current index — into a full pass rather than a missed one.
@@ -2129,7 +2129,7 @@ def _apply_quota_projection_rows(
     schedule_boundary = min(stored_schedule.values(), default=None)
     # A scalar-only boundary is a legacy/fail-safe state with unknown ownership.
     # Keep the prior behavior until a qualifying whole-history pass can retire
-    # it; epoch-1007 indexes normally never enter this branch.
+    # it; current-epoch indexes normally never enter this branch.
     legacy_boundary = stored_boundary if not stored_next_evaluation_by_root else None
     boundary = (
         None if schedule_boundary is None

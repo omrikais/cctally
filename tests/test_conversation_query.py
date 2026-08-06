@@ -132,6 +132,19 @@ def test_list_conversations_pagination():
     assert last["page"]["has_more"] is False
 
 
+def test_list_conversations_projects_selected_row_outside_page():
+    c = _conn()
+    for i in range(5):
+        _msg(c, session_id=f"s{i}", uuid=f"u{i}", source_path=f"{i}.jsonl",
+             byte_offset=0, timestamp_utc=f"2026-06-0{i+1}T00:00:00Z",
+             entry_type="human", text=f"prompt {i}")
+    page = _list_conversations(
+        c, sort="recent", limit=2, offset=0, selected="s0")
+    assert [row["session_id"] for row in page["conversations"]] == ["s4", "s3"]
+    assert page["selected"]["session_id"] == "s0"
+    assert page["selected"]["title"] == "prompt 0"
+
+
 # ---------------------------------------------------------------------------
 # #217 S4 / I-2.1: rail sort keys (cost / messages / project) + sort_degraded
 # ---------------------------------------------------------------------------

@@ -329,7 +329,10 @@ def test_next_open_recovers_partial_destination_with_complete_metadata(
     assert opened.returncode == 0, opened.stderr
     assert json.loads(opened.stdout)["current"]["weeklyPercent"] == 7.0
     assert _read_usage_rows(db)[0][0] == 7.0
-    assert db.stat().st_ino != inode_before
+    # #496 S3: a readable destination is published transactionally into the
+    # live file, so the recovery repairs these bytes rather than renaming a
+    # scratch over them. The missing row above is what proves the rebuild ran.
+    assert db.stat().st_ino == inode_before
     assert not list(db.parent.glob("stats.db.rebuilding-????????T??????_??????*"))
 
 
@@ -353,14 +356,42 @@ def _cutover_manifests(app_dir: pathlib.Path) -> list[dict]:
     return out
 
 
+def _force_physical_publication(db_path: pathlib.Path) -> None:
+    """Make the destination one SQLite refuses to open.
+
+    #496 S3 made in-place transactional publication the mechanism, and an
+    in-place publish never preserves — preservation is a consequence of
+    destroying a file. A test about the preservation manifest therefore has to
+    reach the physical fallback, which only a structurally unopenable
+    destination does. The magic string and the `user_version` at byte 60 are
+    both left intact, because `_read_user_version_header` needs the first and
+    the manifest records the second; the file-format version bytes at 18-19 are
+    what SQLite rejects as NOTADB.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = pathlib.Path(str(db_path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    with db_path.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
+
+
 def test_recovery_rebuild_incident_records_its_trigger_identity(
     tmp_path: pathlib.Path,
 ) -> None:
     """#496 S1 F3, driven through a real kill and a real next open.
 
-    The partial-destination shape is used deliberately: it is the branch that
-    actually calls `rebuild_stats_index`, so it is the only interrupted-rebuild
-    path that preserves a family and therefore writes a manifest at all.
+    The destination is made structurally unopenable so publication takes the
+    physical fallback, because that is now the only mechanism that preserves a
+    family and therefore writes a manifest at all (#496 S3). An unopenable
+    destination is also still the branch that calls `rebuild_stats_index`:
+    `stats_index_matches_journal_prefix` returns False for it.
     """
     env = _isolated_env(tmp_path)
     db = _seed(env)
@@ -374,6 +405,7 @@ def test_recovery_rebuild_incident_records_its_trigger_identity(
         conn.commit()
     finally:
         conn.close()
+    _force_physical_publication(db)
     data = pathlib.Path(env["CCTALLY_DATA_DIR"])
     assert _cutover_manifests(data) == []
 
@@ -574,7 +606,10 @@ def test_recovery_taints_structural_batch_and_restores_best_index(
     opened = _cli(env, "report", "--json")
     assert opened.returncode == 0, opened.stderr
     assert json.loads(opened.stdout)["current"]["weeklyPercent"] == 7.0
-    assert db.stat().st_ino != inode_before
+    # #496 S3: the readable-but-empty destination is republished in place, so
+    # its inode survives. The restored row and the recorded violation below are
+    # what prove the rebuild ran.
+    assert db.stat().st_ino == inode_before
     assert _read_usage_rows(db)[0][0] == 7.0
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:

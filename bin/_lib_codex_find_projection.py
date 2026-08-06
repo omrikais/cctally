@@ -12,6 +12,9 @@ import re
 from typing import Iterable, Iterator, Sequence
 
 
+CODEX_FIND_PROJECTION_VERSION = 2
+
+
 @dataclass(frozen=True)
 class RenderLeaf:
     key: str
@@ -301,6 +304,148 @@ def project_plain(leaves: Sequence[RenderLeaf]) -> tuple[str, tuple[ProjectedLea
     return builder.value()
 
 
+_CONTEXT_DIFF_GIT_RE = re.compile(r"diff --git a/\S+ b/\S+")
+_CONTEXT_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_CONTEXT_EXTENDED_HEADER_PREFIXES = (
+    "old mode ", "new mode ", "new file mode ", "deleted file mode ",
+    "rename from ", "rename to ", "copy from ", "copy to ",
+    "similarity index ", "dissimilarity index ", "index ",
+)
+
+
+def _context_is_diff_line(line: str) -> bool:
+    if _CONTEXT_DIFF_GIT_RE.search(line):
+        return True
+    if line.startswith(("--- ", "+++ ", "@@")):
+        return True
+    if line.startswith(_CONTEXT_EXTENDED_HEADER_PREFIXES):
+        return True
+    return line == "" or line[0] in "+- \\"
+
+
+def _segment_context_body(text: str) -> list[tuple[str, str]]:
+    """Mirror ``contextDiff.ts::segmentContextBody`` without rendering HTML."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    segments: list[tuple[str, str]] = []
+    prose: list[str] = []
+    diff: list[str] = []
+    in_diff = False
+
+    def flush(kind: str, values: list[str]) -> None:
+        if values:
+            segments.append((kind, "\n".join(values)))
+            values.clear()
+
+    for line in lines:
+        if not in_diff:
+            match = _CONTEXT_DIFF_GIT_RE.search(line)
+            if match is None:
+                prose.append(line)
+                continue
+            before = line[:match.start()].rstrip()
+            if before:
+                prose.append(before)
+            flush("prose", prose)
+            in_diff = True
+            diff.append(line[match.start():])
+        elif _context_is_diff_line(line):
+            diff.append(line)
+        else:
+            flush("diff", diff)
+            in_diff = False
+            prose.append(line)
+    flush("prose", prose)
+    flush("diff", diff)
+    return segments
+
+
+def _context_diff_rows(text: str) -> list[tuple[int, int, int, str]]:
+    """Mirror the visible row walk in ``contextDiff.ts::parseUnifiedDiff``."""
+    rows: list[tuple[int, int, int, str]] = []
+    file_index = -1
+    hunk_index = -1
+    row_index = 0
+    in_hunk = False
+    for line in text.split("\n"):
+        if _CONTEXT_DIFF_GIT_RE.search(line):
+            file_index += 1
+            hunk_index = -1
+            row_index = 0
+            in_hunk = False
+            continue
+        if _CONTEXT_HUNK_RE.match(line):
+            hunk_index += 1
+            row_index = 0
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith(("--- ", "+++ ")) or line.startswith(
+            _CONTEXT_EXTENDED_HEADER_PREFIXES
+        ):
+            continue
+        if line == "" or line.startswith("\\"):
+            continue
+        rows.append((file_index, hunk_index, row_index, line[1:]))
+        row_index += 1
+    return rows
+
+
+def _append_projected(
+    builder: _ProjectionBuilder,
+    projected: tuple[str, tuple[ProjectedLeaf, ...]],
+    *,
+    prefix: str,
+) -> None:
+    text, leaves = projected
+    if not text:
+        return
+    start = builder.length
+    builder.parts.append(text)
+    builder.length += len(text)
+    builder.boundary()
+    builder.leaves.extend({
+        "key": f"{prefix}/{leaf.key}",
+        "start": start + leaf.start,
+        "end": start + leaf.end,
+    } for leaf in leaves)
+
+
+def project_context(source: str) -> tuple[str, tuple[ProjectedLeaf, ...]]:
+    """Project visible prose and diff-row leaves from one context body.
+
+    File headers and +/- statistics are derived card chrome, matching #482's
+    rule that only provider-authored render leaves enter the search surface.
+    """
+    builder = _ProjectionBuilder()
+    for segment_index, (kind, text) in enumerate(_segment_context_body(source)):
+        if kind == "prose":
+            projected = project_markdown(text)
+            if not projected[0]:
+                continue
+            if builder.parts:
+                builder.separator("\n")
+            _append_projected(
+                builder, projected, prefix=f"segments.{segment_index}.prose"
+            )
+            continue
+        for file_index, hunk_index, row_index, row_text in _context_diff_rows(text):
+            if not row_text:
+                continue
+            if builder.parts:
+                builder.separator("\n")
+            builder.emit(
+                row_text,
+                key=(
+                    f"segments.{segment_index}.files.{file_index}."
+                    f"hunks.{hunk_index}.rows.{row_index}"
+                ),
+            )
+    return builder.value()
+
+
 def _single_scalar_lower(value: str) -> str:
     return "".join((lowered if len(lowered := scalar.lower()) == 1 else scalar) for scalar in value)
 
@@ -356,6 +501,7 @@ def slice_range_to_leaves(
 
 
 __all__ = [
+    "CODEX_FIND_PROJECTION_VERSION",
     "FindRange",
     "LeafFragment",
     "ProjectedLeaf",
@@ -364,6 +510,7 @@ __all__ = [
     "iter_literal_ranges",
     "iter_regex_ranges",
     "project_markdown",
+    "project_context",
     "project_plain",
     "regex_ranges",
     "slice_range_to_leaves",

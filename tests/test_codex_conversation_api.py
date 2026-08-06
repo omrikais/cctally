@@ -832,6 +832,83 @@ def test_account_qualifier_reaches_collection_and_entity_queries(
         srv.shutdown()
 
 
+def test_account_scoped_browse_keeps_unscoped_codex_project_identity(
+        tmp_path, monkeypatch):
+    """#497 HTTP regression: account focus partitions leaves, not projects."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch,
+        codex_scenarios=("modern-full", "secret-canary"),
+        claude_sids=(),
+    )
+    account_a = "a" * 32
+    account_b = "b" * 32
+    assignments = {
+        keys["modern-full"]: account_a,
+        keys["secret-canary"]: account_b,
+    }
+    conversations = ns["open_conversations_db"]()
+    try:
+        for conversation_key, account_key in assignments.items():
+            conversations.execute(
+                "UPDATE codex_conversation_messages SET account_key=? "
+                "WHERE conversation_key=?",
+                (account_key, conversation_key),
+            )
+        conversations.commit()
+    finally:
+        conversations.close()
+    accounting = ns["open_cache_db"]()
+    try:
+        for conversation_key, account_key in assignments.items():
+            accounting.execute(
+                "UPDATE codex_session_entries SET account_key=? "
+                "WHERE conversation_key=?",
+                (account_key, conversation_key),
+            )
+        accounting.commit()
+    finally:
+        accounting.close()
+
+    try:
+        port = srv.server_address[1]
+        status, merged, _ctype = _get_json(
+            port, "/api/conversations?source=codex"
+        )
+        assert status == 200
+        merged_projects = {
+            row["conversation_key"]: (row["project_key"], row["project_label"])
+            for row in merged["rows"]
+        }
+
+        for conversation_key, account_key in assignments.items():
+            status, scoped, _ctype = _get_json(
+                port,
+                "/api/conversations?source=codex&account=" + account_key,
+            )
+            assert status == 200
+            assert [row["conversation_key"] for row in scoped["rows"]] == [
+                conversation_key
+            ]
+            assert (
+                scoped["rows"][0]["project_key"],
+                scoped["rows"][0]["project_label"],
+            ) == merged_projects[conversation_key]
+            status, facets, _ctype = _get_json(
+                port,
+                "/api/conversations/facets?source=codex&account=" + account_key,
+            )
+            assert status == 200
+            assert facets["facets"]["projects"] == [{
+                "project_key": merged_projects[conversation_key][0],
+                "project_label": merged_projects[conversation_key][1],
+                "count": 1,
+            }]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 # ── §6.1 two-page browse pagination over real HTTP (both providers) ──────────
 
 

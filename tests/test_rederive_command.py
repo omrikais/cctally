@@ -278,6 +278,29 @@ def _cutover_manifests(app_dir) -> list:
     return out
 
 
+def _fail_in_place_pre_commit(monkeypatch):
+    """Force the physical fallback while leaving the destination READABLE.
+
+    #496 S3 publishes a readable destination in place, and an in-place publish
+    never preserves, so the preservation manifest under test is only written by
+    the physical fallback. A structural failure raised in the `PRE_COMMIT`
+    phase is the one way to reach that fallback without also making the
+    destination unreadable, which the apply's own rebuild would then report
+    differently.
+    """
+    import sqlite3
+
+    import _cctally_journal as jr
+    import _lib_stats_publish as sp
+
+    def stub(conn, scratch, **kwargs):
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        setattr(exc, "_cctally_publication_phase", sp.PRE_COMMIT)
+        raise exc
+
+    monkeypatch.setattr(jr, "_publish_generation_in_place", stub)
+
+
 def test_rederive_apply_incident_records_the_rederive_apply_trigger(
     tmp_path, monkeypatch, capsys
 ):
@@ -295,6 +318,7 @@ def test_rederive_apply_incident_records_the_rederive_apply_trigger(
     # The fixture rebuild above already preserved one family under the
     # test-only identity, so the assertion is about the LAST incident.
     before = [m["trigger"] for m in _cutover_manifests(mod.APP_DIR)]
+    _fail_in_place_pre_commit(monkeypatch)
 
     assert mod.cmd_db_rederive(_args(yes=True)) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "applied"

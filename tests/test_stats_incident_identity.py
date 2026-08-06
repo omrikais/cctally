@@ -315,6 +315,33 @@ def _page_size_of(path: pathlib.Path) -> int:
     return 65536 if raw == 1 else raw
 
 
+def _force_physical_publication(db_path) -> None:
+    """Make the destination one SQLite refuses to open.
+
+    #496 S3 made in-place transactional publication the mechanism, and an
+    in-place publish NEVER preserves — preservation is a consequence of
+    destroying a file. A test about the preservation manifest therefore has to
+    reach the physical fallback, which only a structurally unopenable
+    destination does. The magic string and the `user_version` at byte 60 are
+    both left intact, because `_read_user_version_header` needs the first and
+    the manifest records the second; the file-format version bytes at 18-19 are
+    what SQLite rejects as NOTADB.
+    """
+    db = pathlib.Path(db_path)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = pathlib.Path(str(db) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    with db.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
+
+
 def test_preservation_manifest_is_schema_version_2_with_trigger_identity(ns):
     import _cctally_core
 
@@ -325,6 +352,7 @@ def test_preservation_manifest_is_schema_version_2_with_trigger_identity(ns):
         / "stats.db-corruption-forensics-20260805T052635Z.json"
     )
     forensics.write_text("{}\n")
+    _force_physical_publication(_cctally_core.DB_PATH)
 
     result = jr.rebuild_stats_index(
         context=jr.RebuildContext(
@@ -471,12 +499,29 @@ def test_corruption_heal_manifest_names_its_error_and_its_forensics_bundle(ns):
 
     This is the pairing nothing else pins: `triggerError` and `forensicsPath`
     must be populated FROM the forensics result the heal just produced, rather
-    than left null.
+    than left null. #496 S3 split the two halves across two processes — the
+    hook writes the bundle, the detached worker writes the incident — so the
+    pairing now has to survive travelling through the durable request.
     """
+    import types
     import _cctally_core
+    import _cctally_db
+    import _cctally_store
+    import _cctally_update
 
     _seed_live_index()
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
+
+    prior_spawn = _cctally_update._spawn_detached
+    _cctally_update._spawn_detached = lambda _command: True
+    try:
+        with pytest.raises(_cctally_db.StatsHealDeferred):
+            _cctally_core.open_db()
+    finally:
+        _cctally_update._spawn_detached = prior_spawn
+    assert _cctally_store.cmd_stats_corruption_heal_internal(
+        types.SimpleNamespace()
+    ) == 0
 
     conn = _cctally_core.open_db()
     try:
@@ -547,9 +592,14 @@ def _seed_cli(env: dict) -> pathlib.Path:
 
 
 def test_db_rebuild_cli_manifest_records_the_db_rebuild_trigger(tmp_path):
-    """#496 S1 F3, driven through the real `cctally db rebuild --db stats`."""
+    """#496 S1 F3, driven through the real `cctally db rebuild --db stats`.
+
+    The destination is made unopenable first, because #496 S3 publishes a
+    readable one in place and an in-place publish never preserves.
+    """
     env = _isolated_env(tmp_path)
-    _seed_cli(env)
+    db = _seed_cli(env)
+    _force_physical_publication(db)
 
     result = subprocess.run(
         [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],

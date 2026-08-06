@@ -75,6 +75,7 @@ LIVE_ITEMS = 40                   # tall enough to scroll up, < PAGE (live-tail 
 # actually scroll — so the "parked at top" assertion is non-vacuous AND flips RED
 # under the invert-has_prev lever (which would open it at the bottom instead).
 SINGLE_ITEMS = 30
+RAIL_PAGE_CONVERSATIONS = 55  # > browse PAGE=50; issue #501 deep-link regression
 
 MODEL = "claude-opus-4-8"         # a real CLAUDE_MODEL_PRICING key (non-zero cost)
 CWD = "/e2e/reader"
@@ -769,6 +770,78 @@ def build_codex_occurrence_find(out: pathlib.Path) -> dict:
     }
 
 
+def build_codex_rail_page(out: pathlib.Path) -> dict:
+    """Build more than one browse page of tiny qualified Codex conversations.
+
+    The existing reader fixtures remain newer, so this corpus cannot push their
+    named rows out of page 1.  The oldest synthetic row is nevertheless beyond
+    index 49 and gives the browser suite a deterministic permalink target that
+    the ordinary rail request does not return.
+    """
+    target = out / "codex-rail-page"
+    target.mkdir(parents=True, exist_ok=True)
+    # Old enough to sort after every canonical reader fixture, but still inside
+    # the transcript-retention horizon at the harness's frozen 2026-07-14 clock.
+    newest = dt.datetime(2026, 7, 1, 12, tzinfo=dt.timezone.utc)
+    titles = []
+    for index in range(RAIL_PAGE_CONVERSATIONS):
+        title = f"Rail page fixture {index:02d}"
+        titles.append(title)
+        native_id = f"50100000-0000-4000-8000-{index:012d}"
+        stamp = newest - dt.timedelta(minutes=index)
+
+        def at(seconds: int) -> str:
+            return (stamp + dt.timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+        rows = [
+            {
+                "payload": {
+                    "context_window": 272000,
+                    "cwd": "/synthetic/rail-page",
+                    "id": native_id,
+                    "model": "gpt-synthetic-codex",
+                    "model_context_window": 272000,
+                    "model_provider": "fixture-provider",
+                    "session_id": native_id,
+                    "source": "codex",
+                    "thread_source": "user",
+                    "tools": [],
+                },
+                "timestamp": at(0),
+                "type": "session_meta",
+            },
+            {
+                "payload": {
+                    "model": "gpt-synthetic-codex",
+                    "model_context_window": 272000,
+                    "turn_id": f"rail-page-{index:02d}",
+                },
+                "timestamp": at(1),
+                "type": "turn_context",
+            },
+            {
+                "payload": {
+                    "content": [{"text": title, "type": "input_text"}],
+                    "phase": "input",
+                    "role": "user",
+                    "type": "message",
+                },
+                "timestamp": at(2),
+                "type": "response_item",
+            },
+        ]
+        path = target / f"rail-page-{index:02d}.jsonl"
+        path.write_text("".join(
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            for value in rows
+        ))
+    return {
+        "rail_page_conversation_count": RAIL_PAGE_CONVERSATIONS,
+        "rail_page_inside_title": titles[0],
+        "rail_page_outside_title": titles[-1],
+    }
+
+
 def build(out: pathlib.Path) -> dict:
     scratch = out / "scratch"
     data = scratch / "data"
@@ -788,6 +861,7 @@ def build(out: pathlib.Path) -> dict:
     manifest.update(build_codex_task_a(out))
     manifest.update(build_codex_task_b(out))
     manifest.update(build_codex_occurrence_find(out))
+    manifest.update(build_codex_rail_page(out))
     manifest["project_dir"] = PROJECT_DIR
     manifest["cwd"] = CWD
     manifest["page_size"] = PAGE

@@ -91,7 +91,7 @@ def test_conversations_migration_registers_projection_and_fresh_store_is_complet
             "disclosure_json",
             "projection_version",
         }
-        assert _meta(conn, "codex_find_projection_complete_version") == "1"
+        assert _meta(conn, "codex_find_projection_complete_version") == "2"
         assert _meta(conn, "codex_find_projection_backfill_pending") is None
     finally:
         conn.close()
@@ -151,6 +151,66 @@ def test_materializer_keeps_physical_surfaces_and_cross_leaf_markdown(tmp_path, 
         assert rows[2][1] != rows[2][2], "output retains physical identity"
         assert rows[1][1] == rows[2][2], "output shares its proven visual owner"
         assert rows[3][1] == rows[3][2], "payload-less completion remains standalone"
+    finally:
+        conn.close()
+
+
+def test_materializer_projects_every_visible_meta_body(tmp_path, monkeypatch):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _lib_codex_conversation_query as query
+
+    conn = ns["open_conversations_db"]()
+    try:
+        meta_kinds = ("context", "skill", "command", "compaction", "notification")
+        for offset, meta_kind in enumerate(meta_kinds, start=1):
+            conversation_key = f"conv-meta-{meta_kind}"
+            body = f"{meta_kind} body contains meta-needle-{meta_kind}"
+            _insert_message(
+                conn,
+                conversation_key=conversation_key,
+                offset=offset,
+                kind="meta",
+                text=body,
+            )
+            conn.execute(
+                "UPDATE codex_conversation_messages SET detail_json=? "
+                "WHERE conversation_key=?",
+                (json.dumps({"meta_kind": meta_kind}), conversation_key),
+            )
+
+        query.materialize_codex_find_projection(
+            conn, {f"conv-meta-{meta_kind}" for meta_kind in meta_kinds}
+        )
+        rows = conn.execute(
+            "SELECT conversation_key,surface,container_block_key,projected_text,"
+            "leaves_json,disclosure_json FROM codex_find_projection "
+            "WHERE conversation_key LIKE 'conv-meta-%' ORDER BY conversation_key"
+        ).fetchall()
+
+        assert {row[0] for row in rows} == {
+            f"conv-meta-{meta_kind}" for meta_kind in meta_kinds
+        }
+        for conversation_key, surface, container, text, leaves_json, disclosure_json in rows:
+            meta_kind = conversation_key.removeprefix("conv-meta-")
+            assert surface == "body"
+            assert text == f"{meta_kind} body contains meta-needle-{meta_kind}"
+            expected_key = "segments.0.prose/t0" if meta_kind == "context" else "t0"
+            assert json.loads(leaves_json) == [
+                {"key": expected_key, "start": 0, "end": len(text)}
+            ]
+            assert json.loads(disclosure_json) == [container]
+            result = query.find_occurrences_in_codex_conversation(
+                conn,
+                conversation_key,
+                f"meta-needle-{meta_kind}",
+                regex=False,
+                case_sensitive=True,
+                kind="all",
+            )
+            assert result["status"] == "ready"
+            assert result["total"] == 1
+            assert result["page"]["occurrences"][0]["disclosure"] == [container]
     finally:
         conn.close()
 
@@ -257,7 +317,7 @@ def test_backfill_is_bounded_resumable_and_certifies_only_after_last_conversatio
         assert conn.execute(
             "SELECT COUNT(DISTINCT conversation_key) FROM codex_find_projection"
         ).fetchone()[0] == 2
-        assert _meta(conn, "codex_find_projection_complete_version") == "1"
+        assert _meta(conn, "codex_find_projection_complete_version") == "2"
         assert _meta(conn, "codex_find_projection_backfill_pending") is None
         assert cache.run_codex_find_projection_backfill(conn, batch_size=1) == {
             "processed": 0,
@@ -308,7 +368,7 @@ def test_backfill_cursor_does_not_skip_an_interleaved_conversation(
 
         third = cache.run_codex_find_projection_backfill(conn, batch_size=1)
         assert third == {"processed": 1, "complete": True}
-        assert _meta(conn, "codex_find_projection_complete_version") == "1"
+        assert _meta(conn, "codex_find_projection_complete_version") == "2"
     finally:
         conn.close()
 

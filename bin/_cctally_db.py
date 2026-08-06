@@ -99,6 +99,7 @@ from _cctally_core import (
 # the migration gate-defer diagnostic routes through _lib_log so
 # CCTALLY_DEBUG verbosity is decided in one place.
 import _lib_log
+from _lib_codex_find_projection import CODEX_FIND_PROJECTION_VERSION
 
 
 # Production cache dispatchers hold maintenance-exclusive + the global cache
@@ -312,31 +313,84 @@ class StatsEpochMismatchError(sqlite3.DatabaseError):
     DB failure; ``main()`` maps it to a staged exit 3."""
 
 
-class StatsEpochRebuildDeferred(BaseException):
-    """A readable wrong-epoch stats index is rebuilding out of process.
+class StatsRebuildDeferred(BaseException):
+    """A stats.db rebuild this caller must not perform inline runs detached.
 
-    Ordinary callers must not read the schema-incompatible old index or pay
-    whole-journal replay latency inline. ``outcome`` records whether this
-    caller spawned the worker, observed an existing attempt, or could not
-    spawn it; ``main()`` maps every case to prompt retry guidance and exit 3.
+    The shared parent of both deferral signals (#496 S3 §6), so every catch
+    site is widened ONCE rather than growing a second name each time a rebuild
+    class is detached. ``outcome`` records whether this caller spawned the
+    worker, observed an existing attempt, or could not spawn it.
+
     This deliberately derives directly from ``BaseException``: reporting
     kernels contain many broad ``Exception`` / ``sqlite3.DatabaseError``
     fallbacks that turn missing optional data into ``n/a``. Swallowing this
     control signal there would publish a misleading partial report. The CLI
     boundary, dashboard, and statusline catch it explicitly; ``finally``
     cleanup still runs normally.
+
+    The two subclasses are NOT interchangeable at the degrade sites: the epoch
+    path describes a readable index at the wrong version and reports
+    ``corruption=False``, while a deferred heal describes an index that could
+    not be read and must report ``corruption=True``. Flattening them makes the
+    dashboard name the wrong fault.
+    """
+
+    def __init__(self, outcome: str, message: str) -> None:
+        self.outcome = str(outcome)
+        super().__init__(message)
+
+
+class StatsEpochRebuildDeferred(StatsRebuildDeferred):
+    """A readable wrong-epoch stats index is rebuilding out of process.
+
+    Ordinary callers must not read the schema-incompatible old index or pay
+    whole-journal replay latency inline; ``main()`` maps every case to prompt
+    retry guidance and exit 3.
     """
 
     def __init__(self, outcome: str) -> None:
-        self.outcome = str(outcome)
+        outcome = str(outcome)
         message = (
             "could not start the stats.db index epoch rebuild; retry this "
             "command shortly"
-            if self.outcome == "failed"
+            if outcome == "failed"
             else "stats.db index epoch rebuild is running in the background; "
                  "retry shortly"
         )
-        super().__init__(message)
+        super().__init__(outcome, message)
+
+
+class StatsHealDeferred(StatsRebuildDeferred):
+    """A corrupt stats index is being rebuilt by the detached heal worker.
+
+    Replaces the inline heal's return value on the path where it used to
+    quarantine and rebuild while the caller waited (#496 S3 §6). The caller
+    degrades where it already degrades; it never blocks on the rebuild.
+
+    ``heal_id`` correlates this signal with the durable heal event the hook
+    recorded at detection, and ``forensics_path`` is the absolute bundle the
+    user was told about. Both are attributes rather than message text so a
+    consumer can use them without parsing.
+    """
+
+    def __init__(
+        self,
+        outcome: str,
+        *,
+        heal_id: "str | None" = None,
+        forensics_path: "str | None" = None,
+    ) -> None:
+        outcome = str(outcome)
+        self.heal_id = heal_id
+        self.forensics_path = forensics_path
+        message = (
+            "could not start the stats.db corruption rebuild; retry this "
+            "command shortly"
+            if outcome == "failed"
+            else "stats.db corruption rebuild is running in the background; "
+                 "retry shortly"
+        )
+        super().__init__(outcome, message)
 
 
 _SQLITE_CORRUPTION_MESSAGES = (
@@ -4407,7 +4461,11 @@ def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
     if has_state is None and conn.execute(
         "SELECT 1 FROM codex_conversation_messages LIMIT 1"
     ).fetchone() is None:
-        _set_cache_meta(conn, "codex_find_projection_complete_version", "1")
+        _set_cache_meta(
+            conn,
+            "codex_find_projection_complete_version",
+            str(CODEX_FIND_PROJECTION_VERSION),
+        )
         _set_cache_meta(conn, "codex_find_projection_generation", "0")
 
 
@@ -4561,13 +4619,19 @@ def _conv_004_codex_find_projection(conn: sqlite3.Connection) -> None:
         _apply_codex_find_projection_schema(conn)
         complete = conn.execute(
             "SELECT 1 FROM cache_meta "
-            "WHERE key='codex_find_projection_complete_version' AND value='1'"
+            "WHERE key='codex_find_projection_complete_version' AND value=?",
+            (str(CODEX_FIND_PROJECTION_VERSION),),
         ).fetchone()
         if complete is None:
             _set_cache_meta(conn, "codex_find_projection_backfill_pending", "1")
             conn.execute(
                 "INSERT OR IGNORE INTO cache_meta(key,value) VALUES"
                 "('codex_find_projection_backfill_cursor','0')"
+            )
+            _set_cache_meta(
+                conn,
+                "codex_find_projection_backfill_version",
+                str(CODEX_FIND_PROJECTION_VERSION),
             )
             _set_cache_meta(conn, "codex_find_projection_generation", "0")
         conn.commit()
@@ -4673,6 +4737,42 @@ def _conv_006_backfill_codex_file_touches(conn: sqlite3.Connection) -> None:
                 "VALUES(?,?,?,?,?)",
                 pending,
             )
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("007_codex_find_projection_v2_meta")
+def _conv_007_codex_find_projection_v2_meta(conn: sqlite3.Connection) -> None:
+    """Arm a bounded v2 rebuild so retained visible meta bodies become findable.
+
+    The projection is disposable. Preserve a markerless retry's v2 cursor, but
+    restart a v1/incompletely-versioned backfill at zero so no conversation
+    already passed by that older walk keeps stale rows.
+    """
+    held = _acquire_conversations_db_codex_provider_flock(
+        conn, migration="conversations 007 Codex find projection v2 meta")
+    try:
+        target = str(CODEX_FIND_PROJECTION_VERSION)
+        complete = conn.execute(
+            "SELECT 1 FROM cache_meta "
+            "WHERE key='codex_find_projection_complete_version' AND value=?",
+            (target,),
+        ).fetchone()
+        if complete is not None:
+            return
+        pending_version = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_find_projection_backfill_version'"
+        ).fetchone()
+        _set_cache_meta(conn, "codex_find_projection_backfill_pending", "1")
+        if pending_version is None or pending_version[0] != target:
+            _set_cache_meta(conn, "codex_find_projection_backfill_cursor", "0")
+        _set_cache_meta(conn, "codex_find_projection_backfill_version", target)
+        conn.execute(
+            "DELETE FROM cache_meta "
+            "WHERE key='codex_find_projection_complete_version'"
+        )
         conn.commit()
     finally:
         _release_cache_db_writer_flocks(held)

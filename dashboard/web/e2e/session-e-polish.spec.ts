@@ -11,6 +11,27 @@ async function openSessionD(page: Page) {
   await expect(page.locator('.conv-reader-body')).toBeVisible();
 }
 
+for (const viewport of [
+  { label: 'desktop', width: 1440, height: 900 },
+  { label: 'mobile', width: 390, height: 844 },
+]) {
+  test(`#499 — find reaches an injected-context body on ${viewport.label}`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await openSessionD(page);
+    await page.getByRole('button', { name: 'Find in conversation' }).click();
+    await page.locator('.conv-findbar-input').fill('Synthetic agent instructions');
+    await expect(page.locator('.conv-findbar-count')).toHaveText('1 / 1 matches');
+
+    const context = page.locator('details.conv-meta--context');
+    await expect(context).toHaveCount(1);
+    await expect(context).toHaveAttribute('open', '');
+    const current = context.locator('mark[data-find-current="true"]');
+    await expect(current).toHaveCount(1);
+    await expect(current).toHaveText('Synthetic agent instructions');
+    await expect(current).toBeVisible();
+  });
+}
+
 // #463 S5 (F18, #493) — bring the injected-context meta row into the reader.
 // It is the only kind that renders BOTH a `.conv-meta-label` ("SESSION CONTEXT")
 // and a `.conv-meta-name` ("· agents, environment"), which are the two elements

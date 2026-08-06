@@ -165,6 +165,15 @@ os.kill(os.getpid(), signal.SIGSTOP)
 def test_kill_during_real_operator_rebuild_preserves_old_then_retries(
     tmp_path: pathlib.Path, pause_point: str
 ) -> None:
+    """A kill at any pause point leaves the old family intact and converges.
+
+    #496 S3 publishes a readable destination transactionally into the live
+    file, so `rebuild_before_cutover` no longer quarantines anything either: it
+    now fires just before the publication transaction, with the old family and
+    its committed WAL still exactly where they were. The preservation protocol
+    itself is only reached by the physical fallback and is covered by
+    `test_physical_fallback_preserves_the_committed_wal_family` below.
+    """
     env = _isolated_env(tmp_path)
     db = _seed(env)
     before = _read_destination_in_separate_process(db)
@@ -200,31 +209,12 @@ def test_kill_during_real_operator_rebuild_preserves_old_then_retries(
     scratches = sorted(db.parent.glob("stats.db.rebuilding-*"))
     assert scratches, f"{pause_point} did not leave the expected scratch artifact"
     incidents = sorted((db.parent / "quarantine").glob("stats.db-*"))
-    if pause_point == "rebuild_before_cutover":
-        assert incidents
-        incident = incidents[-1]
-        manifest = json.loads((incident / "manifest.json").read_text())
-        assert manifest["cutoverProtocol"] == "preserve-then-atomic-replace-v1"
-        assert manifest["complete"] is True
-        assert manifest["movedFiles"] == [
-            "stats.db",
-            "stats.db-wal",
-            "stats.db-shm",
-        ]
-        assert (incident / "stats.db-wal").read_bytes() == wal_bytes
-        # SQLite may update SHM reader marks merely by opening the old family;
-        # preservation must retain a non-empty SHM, while the committed WAL is
-        # the byte-exact durable-content assertion.
-        assert len((incident / "stats.db-shm").read_bytes()) == len(shm_bytes)
-        assert not pathlib.Path(f"{db}-wal").exists()
-        assert not pathlib.Path(f"{db}-shm").exists()
-    else:
-        assert not incidents, (
-            f"{pause_point} preserved/quarantined the old family before the "
-            "scratch was eligible for cutover"
-        )
-        assert pathlib.Path(f"{db}-wal").read_bytes() == wal_bytes
-        assert len(pathlib.Path(f"{db}-shm").read_bytes()) == len(shm_bytes)
+    assert not incidents, (
+        f"{pause_point} preserved/quarantined a readable old family, which an "
+        "in-place publication never does"
+    )
+    assert pathlib.Path(f"{db}-wal").read_bytes() == wal_bytes
+    assert len(pathlib.Path(f"{db}-shm").read_bytes()) == len(shm_bytes)
 
     after_kill = _read_destination_in_separate_process(db)
     assert after_kill == before, (
@@ -248,3 +238,93 @@ def test_kill_during_real_operator_rebuild_preserves_old_then_retries(
     assert after_retry["rows"] == before["rows"]
     assert after_retry["cursor"] == pinned_high_water
     assert (alerts.read_bytes() if alerts.exists() else b"") == alert_bytes
+
+
+_FORCED_PHYSICAL_REBUILD = """
+import argparse, importlib.util, pathlib, sqlite3, sys
+from importlib.machinery import SourceFileLoader
+
+root = sys.argv[1]
+bin_dir = pathlib.Path(root) / "bin"
+sys.path.insert(0, str(bin_dir))
+loader = SourceFileLoader("cctally", str(bin_dir / "cctally"))
+spec = importlib.util.spec_from_loader("cctally", loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules["cctally"] = module
+loader.exec_module(module)
+
+import _cctally_journal as jr
+import _lib_stats_publish as sp
+
+
+def _fail_structurally(conn, scratch, **kwargs):
+    exc = sqlite3.DatabaseError("database disk image is malformed")
+    setattr(exc, "_cctally_publication_phase", sp.PRE_COMMIT)
+    raise exc
+
+
+jr._publish_generation_in_place = _fail_structurally
+raise SystemExit(
+    module.cmd_db_rebuild(argparse.Namespace(db="stats", json=False))
+)
+"""
+
+
+def test_physical_fallback_preserves_the_committed_wal_family(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The physical fallback still preserves the family it finds, and what it
+    finds no longer includes a stranded WAL.
+
+    S1 ran preservation before the checkpoint so a committed WAL reached the
+    incident. #496 S3 attempts an in-place publish first, and closing that
+    attempt's connection checkpoints and removes the WAL, so a family preserved
+    after a failed attempt is the old generation logically but is not
+    byte-identical to the pre-attempt evidence — which the design states
+    explicitly (§4.1). The pristine WAL evidence now comes only from the heal
+    hook's own forensics bundle, captured before the rebuild starts. The
+    manifest below is what shows this: preservation still runs before the
+    fallback's own checkpoint, so a WAL missing from `movedFiles` was drained
+    by something earlier, and the in-place attempt is the only thing there.
+
+    The fallback is forced by a structural failure raised in the `PRE_COMMIT`
+    phase rather than by corrupting the destination, because a stranded WAL
+    holds page 1 and would mask a corrupted header in the main file.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed(env)
+    wal_bytes, _shm_bytes = _strand_committed_wal_family(db, tmp_path)
+    assert wal_bytes
+
+    rebuilt = subprocess.run(
+        [sys.executable, "-c", _FORCED_PHYSICAL_REBUILD, str(ROOT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert rebuilt.returncode == 0, rebuilt.stderr
+
+    incidents = sorted((db.parent / "quarantine").glob("stats.db-*"))
+    assert len(incidents) == 1
+    incident = incidents[-1]
+    manifest = json.loads((incident / "manifest.json").read_text())
+    assert manifest["cutoverProtocol"] == "preserve-then-atomic-replace-v1"
+    assert manifest["complete"] is True
+    assert manifest["movedFiles"] == ["stats.db"]
+    assert manifest["familySizes"]["stats.db"] == (
+        (incident / "stats.db").stat().st_size
+    )
+    assert manifest["familySizes"]["stats.db"] > 0
+    # The preserved main file carries the drained WAL's committed content, so
+    # the generation survived even though its sidecars did not.
+    preserved = _read_destination_in_separate_process(incident / "stats.db")
+    assert preserved["ok"] is True
+    assert preserved["rows"] == [[7.0, preserved["rows"][0][1]]]
+    assert not pathlib.Path(f"{db}-wal").exists()
+    assert not pathlib.Path(f"{db}-shm").exists()
+
+    after = _read_destination_in_separate_process(db)
+    assert after["ok"] is True
+    assert after["integrity"] == "ok"
+    assert after["rows"] == [[7.0, after["rows"][0][1]]]

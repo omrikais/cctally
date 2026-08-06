@@ -72,6 +72,7 @@ def test_post_fixture_arms_bounded_backfill_without_touching_transcripts():
         assert post.execute("PRAGMA user_version").fetchone()[0] == 4
         assert _meta(post, "codex_find_projection_backfill_pending") == ("1",)
         assert _meta(post, "codex_find_projection_backfill_cursor") == ("0",)
+        assert _meta(post, "codex_find_projection_backfill_version") == ("2",)
         assert _meta(post, "codex_find_projection_generation") == ("0",)
         assert _meta(post, "codex_find_projection_complete_version") is None
         assert post.execute("SELECT COUNT(*) FROM codex_find_projection").fetchone()[0] == 0

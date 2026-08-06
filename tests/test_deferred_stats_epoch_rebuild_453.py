@@ -224,6 +224,153 @@ def test_spawn_failure_message_does_not_claim_worker_is_running(runtime):
     assert "running in the background" not in str(exc)
 
 
+def test_both_deferral_signals_share_one_base(runtime):
+    """#496 S3 §6: one parent, so every catch site is widened exactly once."""
+    _ns, _core, db, _store = runtime
+
+    assert issubclass(db.StatsEpochRebuildDeferred, db.StatsRebuildDeferred)
+    assert issubclass(db.StatsHealDeferred, db.StatsRebuildDeferred)
+    assert issubclass(db.StatsRebuildDeferred, BaseException)
+    assert not issubclass(db.StatsRebuildDeferred, Exception), (
+        "a broad `except Exception` reporting fallback must not swallow either "
+        "control signal and publish a misleading partial report"
+    )
+    heal = db.StatsHealDeferred("spawned", heal_id="h1", forensics_path="/a/b")
+    assert heal.outcome == "spawned"
+    assert heal.heal_id == "h1" and heal.forensics_path == "/a/b"
+    assert "corruption rebuild is running in the background" in str(heal)
+    assert "could not start" in str(db.StatsHealDeferred("failed"))
+
+
+@pytest.mark.parametrize(
+    ("factory", "want_corruption", "want_kind"),
+    (
+        ("StatsEpochRebuildDeferred", False, "maintenance_active"),
+        ("StatsHealDeferred", True, "stats_corruption"),
+    ),
+)
+def test_widening_the_catches_does_not_flatten_the_two_cases(
+    runtime, monkeypatch, factory, want_corruption, want_kind,
+):
+    """A wrong EPOCH is a readable index; a deferred heal is an unreadable one.
+
+    Reporting a deferred corruption heal as `corruption=False` makes the
+    dashboard name the wrong fault and lands back in the class F16 closes.
+    """
+    ns, _core, db, _store = runtime
+    initial = ns["_empty_dashboard_snapshot"]()
+    initial.hydrating = True
+    ref = ns["_SnapshotRef"](initial)
+
+    class Hub:
+        def __init__(self):
+            self.published = []
+
+        def publish(self, snapshot):
+            self.published.append(snapshot)
+
+    hub = Hub()
+
+    def deferred(**_kwargs):
+        raise getattr(db, factory)("pending")
+
+    monkeypatch.setitem(ns, "_tui_build_snapshot", deferred)
+    locked = ns["_make_run_sync_now_locked"](
+        ref=ref,
+        hub=hub,
+        pinned_now=dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc),
+        display_tz_pref_override=None,
+    )
+    locked(skip_sync=True)
+
+    published = hub.published[-1]
+    assert published.sync_failures[0].database == "stats"
+    assert published.sync_failures[0].corruption is want_corruption
+    envelope = ns["snapshot_to_envelope"](
+        published,
+        now_utc=dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    assert envelope["sync_failure"]["kind"] == want_kind
+
+
+def test_dashboard_cold_bind_hydrates_when_the_heal_defers(
+    runtime, monkeypatch,
+):
+    """The cold-bind heal call sits INSIDE an `except` handler.
+
+    A `BaseException` raised there escapes past the sibling `except` and fails
+    dashboard startup, so the shared base is caught at the heal-call boundary
+    and the corruption-typed degraded frame is built directly.
+    """
+    ns, _core, db, _store = runtime
+    import _cctally_dashboard as dashboard
+    import _cctally_tui as tui
+
+    monkeypatch.setattr(
+        dashboard,
+        "_dashboard_initial_snapshot_once",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            tui._StatsSnapshotCorruption(
+                sqlite3.DatabaseError("database disk image is malformed")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        tui,
+        "_tui_heal_post_query_stats",
+        lambda _cause: (_ for _ in ()).throw(db.StatsHealDeferred("spawned")),
+    )
+    monkeypatch.setattr(
+        tui,
+        "_tui_precompute_doctor_payload",
+        lambda *_a, **_kw: pytest.fail("deferred bind reopened stats"),
+    )
+
+    snapshot = dashboard._dashboard_initial_snapshot(
+        SimpleNamespace(no_sync=False, host="127.0.0.1"),
+        pinned_now=dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc),
+        display_tz_pref_override=None,
+    )
+
+    assert snapshot.hydrating is True
+    assert snapshot.sync_failures[0].corruption is True
+    assert "corruption rebuild is running" in snapshot.last_sync_error
+
+
+def test_tui_snapshot_degrades_typed_when_the_post_query_heal_defers(
+    runtime, monkeypatch,
+):
+    """The TUI calls the heal BEFORE entering its retry catch, and must not
+    spin: after deferral the index is still corrupt."""
+    ns, _core, db, _store = runtime
+    import _cctally_tui as tui
+
+    builds = 0
+
+    def once(**_kwargs):
+        nonlocal builds
+        builds += 1
+        raise tui._StatsSnapshotCorruption(
+            sqlite3.DatabaseError("database disk image is malformed")
+        )
+
+    monkeypatch.setattr(tui, "_tui_build_snapshot_once", once)
+    monkeypatch.setattr(
+        tui,
+        "_tui_heal_post_query_stats",
+        lambda _cause: (_ for _ in ()).throw(db.StatsHealDeferred("pending")),
+    )
+
+    snapshot = tui._tui_build_snapshot(
+        now_utc=dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc),
+        skip_sync=True,
+    )
+
+    assert builds == 1, "the retry must not spin against a still-corrupt index"
+    assert snapshot.sync_failures[0].database == "stats"
+    assert snapshot.sync_failures[0].corruption is True
+
+
 def test_worker_closes_resolver_connection_and_clears_marker_on_success(
     runtime, monkeypatch,
 ):
@@ -409,6 +556,52 @@ def test_stats_commands_return_retry_guidance_instead_of_partial_output(
     assert elapsed < 3.0
     assert result.stdout == ""
     assert "rebuild is running in the background; retry shortly" in result.stderr
+
+
+def test_cli_exits_3_while_a_corruption_heal_runs_in_the_background(runtime):
+    """The widened CLI boundary must give retry guidance, not a raw traceback
+    and not the pre-#496 "Not auto-recreated — run db repair" wording, which is
+    false once a worker is running."""
+    ns, core, _db, _store = runtime
+    import _cctally_journal as journal
+    import _lib_journal as wire
+
+    ns["open_db"]().close()
+    journal.append_record(
+        wire.make_obs(
+            at="2026-08-02T12:00:00Z",
+            src="statusline",
+            provider="claude",
+            payload={
+                "weekly_percent": 12.0,
+                "resets_at": int(
+                    dt.datetime(2026, 8, 6, tzinfo=dt.timezone.utc).timestamp()
+                ),
+                "source": "statusline",
+                "captured_at": "2026-08-02T12:00:00Z",
+            },
+        )
+    )
+    journal.run_stats_ingest(mode="authoritative")
+    with open(core.DB_PATH, "r+b") as handle:
+        handle.write(b"not a database " * 200)
+
+    env = _subprocess_env(core)
+    started = time.monotonic()
+    result = subprocess.run(
+        [str(BIN), "report"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=60,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 3, result.stderr
+    assert elapsed < 30.0
+    assert result.stdout == ""
+    assert "corruption rebuild is running in the background" in result.stderr
+    assert "Not auto-recreated" not in result.stderr
 
 
 @pytest.mark.parametrize(

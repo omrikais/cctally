@@ -91,20 +91,6 @@ const ACCENT_TAG =
   /<[a-zA-Z][^<>]*?accent-(?:amber|blue|codex|cyan|green|indigo|magenta|orange|pink|purple|red|teal)[^<>]*>([^<]*)</g;
 const NAMES_A_PROVIDER = /\b(Codex|Claude)\b/;
 
-// #463 S5 / #498 — the two sites the widened alternation flags, deferred with a
-// recorded reason rather than left to a regex that happened not to look. Both
-// are `<span className="m-pill accent-orange">Codex · native 7-day quota</span>`
-// in the Codex arm of the current-week modal, whose whole section is painted in
-// a per-section orange palette. Recolouring just these two provider-naming pills
-// would leave them disagreeing with four non-naming siblings in the same rows,
-// so #498 owns restyling the section as a unit.
-//
-// The count is the tripwire in both directions: a third such pill fails this
-// test, and so does #498 landing and leaving a stale exemption behind.
-const DEFERRED_GENERIC_ACCENT_SITES: Array<{ file: string; text: string; count: number }> = [
-  { file: join('modals', 'CurrentWeekModal.tsx'), text: 'Codex · native 7-day quota', count: 2 },
-];
-
 describe('#463 S5 — provider identity is rendered through one owner', () => {
   const files = productionSources(SRC);
 
@@ -133,7 +119,6 @@ describe('#463 S5 — provider identity is rendered through one owner', () => {
     // even when a sibling branch keeps a generic accent (TrendModal's "All
     // sources" arm names no provider and correctly stays generic).
     const offenders: string[] = [];
-    const deferredSeen = DEFERRED_GENERIC_ACCENT_SITES.map(() => 0);
     for (const file of files) {
       const source = readFileSync(file, 'utf8');
       for (const match of source.matchAll(ACCENT_TAG)) {
@@ -141,18 +126,10 @@ describe('#463 S5 — provider identity is rendered through one owner', () => {
         if (tag.includes('providerAccentClass')) continue;
         if (!NAMES_A_PROVIDER.test(match[1])) continue;
         const text = match[1].trim();
-        const deferred = DEFERRED_GENERIC_ACCENT_SITES.findIndex(
-          (site) => file.endsWith(site.file) && text === site.text,
-        );
-        if (deferred >= 0) { deferredSeen[deferred] += 1; continue; }
         offenders.push(`${file}:${source.slice(0, match.index).split('\n').length} ${text}`);
       }
     }
     expect(offenders, 'name a provider but paint themselves with a generic accent').toEqual([]);
-    expect(
-      deferredSeen,
-      'a #498 exemption no longer matches its site — close the exemption or widen it deliberately',
-    ).toEqual(DEFERRED_GENERIC_ACCENT_SITES.map((site) => site.count));
   });
 
   it('the pill scan is non-vacuous — it does find accent-classed elements to judge', () => {

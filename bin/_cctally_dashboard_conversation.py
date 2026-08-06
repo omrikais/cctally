@@ -223,12 +223,12 @@ def _conversation_query_impl():
 # are deliberately absent — they are meaningless on a collection route, so they
 # fall to "genuinely unknown → ignored".
 _RECOGNIZED_CONVERSATION_PARAMS = (
-    "source", "account", "project_key", "model", "limit", "cursor", "q", "kind",
+    "source", "account", "project_key", "model", "limit", "cursor", "selected", "q", "kind",
     "sort", "offset", "date_from", "date_to", "projects",
     "cost_min", "cost_max", "rebuild_min", "models",
 )
 _QUALIFIED_BROWSE_ACCEPTED = (
-    "source", "account", "project_key", "model", "limit", "cursor")
+    "source", "account", "project_key", "model", "limit", "cursor", "selected")
 _QUALIFIED_SEARCH_ACCEPTED = (
     "source", "account", "q", "kind", "limit", "cursor")
 _QUALIFIED_FACETS_ACCEPTED = ("source", "account")
@@ -364,12 +364,14 @@ def _handle_qualified_browse(handler, qs_raw, source):
         return
     project_key = (parsed.get("project_key", [None])[0] or None)
     model = (parsed.get("model", [None])[0] or None)
+    selected = (parsed.get("selected", [None])[0] or None)
     speed = _resolve_effective_speed()
     disp = _conversation_dispatch()
     ok, body = handler._run_conversation_query(
         lambda conn: disp.neutral_browse(
             conn, source=source, effective_speed=speed,
-            project_key=project_key, model=model, limit=limit, cursor=cursor),
+            project_key=project_key, model=model, limit=limit, cursor=cursor,
+            selected=selected),
         "/api/conversations")
     if not ok:
         return
@@ -604,12 +606,14 @@ def _handle_get_conversations_impl(handler) -> None:
     sort = _qs_str(q, "sort", "recent")
     limit = _qs_int(q, "limit", 50)
     offset = _qs_int(q, "offset", 0)
+    selected = _qs_str(q, "selected", None)
     filters = handler._parse_conversation_filters(q)
     if filters is None:
         return  # a 400 has already been sent
     ok, body = handler._run_conversation_query(
         lambda conn: handler._conversation_query().list_conversations(
-            conn, sort=sort, limit=limit, offset=offset, **filters),
+            conn, sort=sort, limit=limit, offset=offset, selected=selected,
+            **filters),
         "/api/conversations")
     if not ok:
         return

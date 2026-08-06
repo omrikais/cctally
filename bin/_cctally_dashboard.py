@@ -4353,12 +4353,40 @@ def _debug_source_state_wire(bundle, source: str) -> dict:
     }
 
 
-def _debug_source_counts(cache_conn, bundle) -> dict:
+def _debug_stats_fault(exc: BaseException, leg: str) -> dict:
+    """The wire form of a stats attribution these debug reads may report.
+
+    #496 S3 §8 records a DELIBERATE deviation from F16's literal wording. F16
+    asks that every path meeting a corrupt index produce a typed attribution
+    AND reach the heal. The two debug helpers deliver the attribution WITHOUT
+    the heal: they are short-lived diagnostic reads that bypass the corruption
+    boundary for cost, and making a debug endpoint able to trigger a rebuild is
+    a worse outcome than making it honest. The dashboard's main build path
+    already reaches the heal, so a fault attributed here is healed on the next
+    tick.
+
+    The shape is exactly the mapping `_sync_failure_envelope`'s attribution
+    reader already accepts, so this travels on the established vocabulary
+    rather than inventing a second one. No database probe is needed: the
+    connection these helpers were opening is the stats index by construction.
+    """
+    return {
+        "leg": leg,
+        "database": "stats",
+        "corruption": bool(_cctally()._is_sqlite_corruption_error(exc)),
+    }
+
+
+def _debug_source_counts(cache_conn, bundle, *, faults=None) -> dict:
     """Bounded, source-owned counts and opaque state for the debug endpoint.
 
     Every table and predicate is fixed here.  This deliberately reports no
     values from rows: roots, paths, logical limits, conversation IDs, and
     project labels never cross the diagnostic boundary.
+
+    ``faults`` collects `_debug_stats_fault` mappings for a stats read this
+    diagnostic could not complete, so the endpoint reports the fault instead of
+    silently degrading a stats failure into a missing count.
     """
     result = {
         source: _debug_source_state_wire(bundle, source)
@@ -4388,8 +4416,9 @@ def _debug_source_counts(cache_conn, bundle) -> dict:
                     result[source]["tables"][table] = int(row[0])
                 except sqlite3.Error:
                     pass
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as exc:
+        if faults is not None:
+            faults.append(_debug_stats_fault(exc, "debug-source-counts"))
     finally:
         if stats_conn is not None:
             stats_conn.close()
@@ -4419,7 +4448,7 @@ def _stats_ro_guarded():
     )
 
 
-def _debug_cache_state(cache_conn) -> dict:
+def _debug_cache_state(cache_conn, *, faults=None) -> dict:
     """On-demand signature legs + pending-reingest flags + generation.
 
     The signature legs are the canonical ``compute_signature`` fields (ints /
@@ -4433,8 +4462,10 @@ def _debug_cache_state(cache_conn) -> dict:
     stats_conn = None
     try:
         stats_conn = _stats_ro_guarded()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
         stats_conn = None
+        if faults is not None:
+            faults.append(_debug_stats_fault(exc, "debug-cache-state"))
     try:
         if stats_conn is not None:
             sig = sc.compute_signature(
@@ -5061,13 +5092,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             source_bundle = self.snapshot_ref.get().source_bundle
         except Exception:  # noqa: BLE001 -- diagnostics fail closed.
             source_bundle = None
-        sources = _debug_source_counts(None, source_bundle)
+        stats_faults: list[dict] = []
+        sources = _debug_source_counts(None, source_bundle, faults=stats_faults)
         try:
             conn = open_cache_db()
             try:
                 dataset = _debug_cache_table_counts(conn)
-                cache_state = _debug_cache_state(conn)
-                sources = _debug_source_counts(conn, source_bundle)
+                cache_state = _debug_cache_state(conn, faults=stats_faults)
+                sources = _debug_source_counts(
+                    conn, source_bundle, faults=stats_faults
+                )
             finally:
                 conn.close()
         except Exception:  # noqa: BLE001 -- a diagnostic must not expose raw errors.
@@ -5080,6 +5114,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             "phases": (last or {}).get("phases"),
             "cache_state": cache_state,
             "sources": sources,
+            # Additive, and named rather than folded into `cache_state`: a
+            # stats fault is not cache state, and #496 S3 §8 exists because a
+            # stats failure reported as a cache one sends the user to
+            # `cctally cache-sync --rebuild`.
+            "stats_faults": stats_faults,
         }
         if body["phases"] is None:
             body["note"] = "tracing_disabled"
@@ -7033,15 +7072,28 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
             display_tz_pref_override=display_tz_pref_override,
             stats_heal_attempted=False,
         )
-    except c.StatsEpochRebuildDeferred as exc:
-        return _dashboard_stats_epoch_deferred_snapshot(
+    except c.StatsRebuildDeferred as exc:
+        return _dashboard_stats_deferred_snapshot(
             args,
             pinned_now=pinned_now,
             exc=exc,
         )
     except tui._StatsSnapshotCorruption as fault:
         # The once-builder's finally has closed the cheap-seed stats handle.
-        tui._tui_heal_post_query_stats(fault.cause)
+        #
+        # #496 S3 §6: this call is made from INSIDE an `except` handler, so a
+        # `BaseException` raised by the heal would escape past the sibling
+        # `except` above and fail dashboard startup instead of hydrating it.
+        # The shared deferral base is therefore caught AT the heal-call
+        # boundary, and the correctly typed degraded frame is built directly.
+        try:
+            tui._tui_heal_post_query_stats(fault.cause)
+        except c.StatsRebuildDeferred as deferred:
+            return _dashboard_stats_deferred_snapshot(
+                args,
+                pinned_now=pinned_now,
+                exc=deferred,
+            )
         return _dashboard_initial_snapshot_once(
             args,
             pinned_now=pinned_now,
@@ -7050,8 +7102,13 @@ def _dashboard_initial_snapshot(args, *, pinned_now, display_tz_pref_override):
         )
 
 
-def _dashboard_stats_epoch_deferred_snapshot(args, *, pinned_now, exc):
-    """Bind promptly with a typed degraded frame while replay runs detached."""
+def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
+    """Bind promptly with a typed degraded frame while a rebuild runs detached.
+
+    Serves both deferral classes and keeps them distinct: a wrong EPOCH is a
+    readable index, while a deferred corruption heal is an index that could not
+    be read, and the attribution must say which (#496 S3 §6).
+    """
 
     import time as _time
 
@@ -7085,7 +7142,7 @@ def _dashboard_stats_epoch_deferred_snapshot(args, *, pinned_now, exc):
             tui.SyncFailureAttribution(
                 leg="stats-open",
                 database="stats",
-                corruption=False,
+                corruption=isinstance(exc, c.StatsHealDeferred),
             ),
         ),
         "doctor_payload": doctor_payload,

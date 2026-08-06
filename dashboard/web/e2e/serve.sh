@@ -54,6 +54,8 @@ cp "$RUNTIME/codex-task-b/session-b-card-wire.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 cp "$RUNTIME/codex-find/occurrence-find.jsonl" \
    "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
+cp "$RUNTIME/codex-rail-page/"*.jsonl \
+   "$CODEX_ROOT_MAIN/sessions/2026/07/20/"
 
 # #463 S5 — append an injected-context bundle to the RUNTIME COPY of the Session
 # D rollout. Before this the whole e2e corpus produced only `notification` meta

@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import {
   literalRanges,
+  projectContext,
   projectMarkdown,
   projectPlain,
   sliceRangeToLeaves,
@@ -10,7 +11,7 @@ import {
 
 interface ProjectionCase {
   name: string;
-  kind: 'markdown' | 'plain';
+  kind: 'markdown' | 'plain' | 'context';
   source?: string;
   leaves?: Array<{ key: string; text: string }>;
   expected: unknown;
@@ -45,7 +46,9 @@ describe('canonical Codex find projection', () => {
     test(fixture.name, () => {
       const actual = fixture.kind === 'markdown'
         ? projectMarkdown(fixture.source ?? '')
-        : projectPlain(fixture.leaves ?? []);
+        : fixture.kind === 'context'
+          ? projectContext(fixture.source ?? '')
+          : projectPlain(fixture.leaves ?? []);
       expect(actual).toEqual(fixture.expected);
     });
   }

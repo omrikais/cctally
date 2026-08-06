@@ -6744,6 +6744,117 @@ def build_per_migration_conversations_006_backfill_codex_file_touches(
             lock.unlink()
 
 
+def build_per_migration_conversations_007_codex_find_projection_v2_meta(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #499's visible-meta projection rebuild."""
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "007_codex_find_projection_v2_meta"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute(
+            "INSERT INTO codex_conversation_messages "
+            "(conversation_key,source_root_key,source_path,line_offset,kind,"
+            "record_family,text,content_digest,content_len,detail_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "codex-key", "fixture-root", "/codex.jsonl", 1, "user",
+                "response_item", "legacy projected text", "user-digest", 21,
+                "{}",
+            ),
+        )
+        projected_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO codex_conversation_messages "
+            "(conversation_key,source_root_key,source_path,line_offset,kind,"
+            "record_family,text,content_digest,content_len,detail_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "codex-key", "fixture-root", "/codex.jsonl", 2, "meta",
+                "response_item", "Synthetic agent instructions", "meta-digest",
+                28, json.dumps({"meta_kind": "context"}, separators=(",", ":")),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO codex_find_projection "
+            "(message_id,conversation_key,item_key,block_key,container_block_key,"
+            "surface,render_order,projected_text,leaves_json,disclosure_json,"
+            "projection_version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                projected_id, "codex-key", "item-user", "block-user",
+                "block-user", "body", 1, "legacy projected text",
+                '[{"key":"t0","start":0,"end":21}]', "[]", 1,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM cache_meta WHERE key LIKE 'codex_find_projection_%'"
+        )
+        conn.executemany(
+            "INSERT INTO cache_meta(key,value) VALUES(?,?)",
+            (
+                ("codex_find_projection_complete_version", "1"),
+                ("codex_find_projection_generation", "9"),
+            ),
+        )
+        conn.execute("PRAGMA user_version=6")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=7")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
 
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
     scenario_dir: Path,
@@ -7445,6 +7556,10 @@ def main() -> int:
     build_per_migration_conversations_006_backfill_codex_file_touches(
         FIXTURES_ROOT / "per-migration"
         / "conversations_006_backfill_codex_file_touches"
+    )
+    build_per_migration_conversations_007_codex_find_projection_v2_meta(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_007_codex_find_projection_v2_meta"
     )
     build_per_migration_036_codex_quota_window_identity_index(
         FIXTURES_ROOT / "per-migration"

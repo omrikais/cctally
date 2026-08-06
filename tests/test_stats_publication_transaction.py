@@ -202,6 +202,60 @@ def _latest_bundle(log_dir: pathlib.Path) -> dict:
     return json.loads(bundles[-1].read_text())
 
 
+# --- #496 S3 §6: the heal is DETACHED ------------------------------------
+#
+# These are S1 regressions about what the HOOK captures and what the REBUILD
+# produces. Both halves still happen, in two processes instead of one, so the
+# helpers below drive both and each test keeps its own assertions.
+
+
+def _stats_heal_marker(app_dir):
+    return pathlib.Path(app_dir) / "stats-corruption-heal.pending"
+
+
+def _run_heal_worker():
+    import types
+    import _cctally_store
+
+    assert _cctally_store.cmd_stats_corruption_heal_internal(
+        types.SimpleNamespace()
+    ) == 0
+
+
+def _defer_without_spawning(call):
+    """Run ``call``, requiring it to defer, without launching a real process."""
+    import _cctally_db
+    import _cctally_update
+
+    prior = _cctally_update._spawn_detached
+    _cctally_update._spawn_detached = lambda _command: True
+    try:
+        call()
+    except _cctally_db.StatsHealDeferred:
+        return
+    finally:
+        _cctally_update._spawn_detached = prior
+    raise AssertionError("the corruption heal did not defer")
+
+
+def _post_query_heal_then_worker(exc) -> bool:
+    import _cctally_tui
+
+    _defer_without_spawning(
+        lambda: _cctally_tui._tui_heal_post_query_stats(exc)
+    )
+    _run_heal_worker()
+    return True
+
+
+def _open_db_through_the_deferred_heal():
+    import _cctally_core
+
+    _defer_without_spawning(_cctally_core.open_db)
+    _run_heal_worker()
+    return _cctally_core.open_db()
+
+
 # ==========================================================================
 # F2 — forensics-time WAL capture
 # ==========================================================================
@@ -231,10 +285,9 @@ def test_forensics_captures_the_wal_bytes_present_when_the_damage_was_found(
     _zero_main_data_pages(db)
     assert pathlib.Path(f"{db}-wal").stat().st_size == len(wal_bytes)
 
-    healed = _cctally_tui._tui_heal_post_query_stats(
+    assert _post_query_heal_then_worker(
         sqlite3.DatabaseError("database disk image is malformed")
-    )
-    assert healed is True
+    ) is True
 
     conn = _cctally_core.open_db()
     try:
@@ -269,7 +322,7 @@ def test_an_empty_wal_records_skipped_empty_and_writes_no_evidence_file(ns):
     assert not pathlib.Path(f"{db}-wal").exists()
     _destroy_header_magic(db)
 
-    healed = _cctally_core.open_db()
+    healed = _open_db_through_the_deferred_heal()
     healed.close()
 
     bundle = _latest_bundle(_cctally_core.LOG_DIR)
@@ -303,7 +356,7 @@ def test_forensics_bundle_carries_a_structured_damage_description(ns):
     db = pathlib.Path(_cctally_core.DB_PATH)
     _destroy_header_magic(db)
 
-    healed = _cctally_core.open_db()
+    healed = _open_db_through_the_deferred_heal()
     healed.close()
 
     bundle = _latest_bundle(_cctally_core.LOG_DIR)
@@ -326,7 +379,7 @@ def test_a_failing_damage_scan_never_breaks_the_heal(ns, monkeypatch):
 
     monkeypatch.setattr(_lib_stats_damage, "describe_damage", _boom)
 
-    healed = _cctally_core.open_db()
+    healed = _open_db_through_the_deferred_heal()
     try:
         rows = healed.execute(
             "SELECT weekly_percent FROM weekly_usage_snapshots"
@@ -358,7 +411,7 @@ def test_damage_description_names_the_implicated_object(ns, tmp_path):
     db = pathlib.Path(_cctally_core.DB_PATH)
     _clobber_table_root_page(db, "quota_projection_state")
 
-    assert _cctally_tui._tui_heal_post_query_stats(
+    assert _post_query_heal_then_worker(
         sqlite3.DatabaseError("database disk image is malformed")
     ) is True
 
@@ -386,7 +439,7 @@ def test_corrupt_old_family_records_a_skipped_checkpoint(ns):
     _seed_live_index()
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
 
-    healed = _cctally_core.open_db()
+    healed = _open_db_through_the_deferred_heal()
     healed.close()
 
     damage = _incident_manifest(_cctally_core.APP_DIR)["damage"]
@@ -395,10 +448,31 @@ def test_corrupt_old_family_records_a_skipped_checkpoint(ns):
     assert damage["postCheckpoint"]["schemaVersion"] == 1
 
 
-def test_healthy_old_family_records_a_completed_checkpoint(ns):
+def _fail_in_place_pre_commit(monkeypatch):
+    """Force the physical fallback while leaving the destination READABLE.
+
+    #496 S3 publishes a readable destination in place and never preserves, so
+    the preservation path is now reached either by a destination SQLite cannot
+    open — which is never a healthy family — or by an in-place attempt that
+    rolled back on a structural error. Only the second keeps a healthy old
+    family, which is what a test about checkpointing one needs.
+    """
+    import _cctally_journal as jr
+    import _lib_stats_publish as sp
+
+    def stub(conn, scratch, **kwargs):
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        setattr(exc, "_cctally_publication_phase", sp.PRE_COMMIT)
+        raise exc
+
+    monkeypatch.setattr(jr, "_publish_generation_in_place", stub)
+
+
+def test_healthy_old_family_records_a_completed_checkpoint(ns, monkeypatch):
     import _cctally_core
 
     _seed_live_index()
+    _fail_in_place_pre_commit(monkeypatch)
     assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=False)) == 0
 
     damage = _incident_manifest(_cctally_core.APP_DIR)["damage"]
@@ -423,7 +497,7 @@ def test_preserved_and_post_checkpoint_scans_name_the_damaged_object(ns):
     db = pathlib.Path(_cctally_core.DB_PATH)
     _clobber_table_root_page(db, "quota_projection_state")
 
-    assert _cctally_tui._tui_heal_post_query_stats(
+    assert _post_query_heal_then_worker(
         sqlite3.DatabaseError("database disk image is malformed")
     ) is True
 
@@ -460,6 +534,62 @@ def _latest_record(log_dir: pathlib.Path) -> dict:
     records = _rebuild_records(log_dir)
     assert records, "no rebuild record was written"
     return json.loads(records[-1].read_text())
+
+
+def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
+    """#496 S3: the stamp is written INSIDE the publication transaction, so it
+    has to be a real table in the epoch's schema.
+
+    `_validate_rebuilt_stats_index` enforces an exact user-table set against a
+    separately maintained required list, so the table has to be added to that
+    list and to the fingerprint together; a stats schema change is an epoch
+    bump, never a migration.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    assert _cctally_core.STATS_INDEX_EPOCH == 1008
+    assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
+
+    _seed_live_index()
+    conn = _cctally_core.open_db()
+    try:
+        names = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        assert "stats_publication_stamp" in names
+        columns = [
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(stats_publication_stamp)"
+            )
+        ]
+        assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1008
+    finally:
+        conn.close()
+
+
+def test_a_rebuild_still_validates_with_the_stamp_table_present(ns):
+    """A table missing from `_REBUILD_REQUIRED_TABLES` is reported as
+    `unexpected` and refuses the rebuild, so this fails loudly rather than
+    subtly if the contract and the schema drift apart."""
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+
+    conn = sqlite3.connect(f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True)
+    try:
+        assert conn.execute(
+            "SELECT name FROM sqlite_schema WHERE name = 'stats_publication_stamp'"
+        ).fetchone() is not None
+    finally:
+        conn.close()
 
 
 def test_a_scratch_damaged_after_the_build_is_refused_before_publication(ns):
@@ -513,13 +643,13 @@ def test_a_successful_rebuild_records_both_verdicts_and_leaves_no_marker(ns):
     assert record["binaryEpoch"] == _cctally_core.STATS_INDEX_EPOCH
     assert record["prePublicationValidation"] == {"ok": True, "error": None}
     assert record["postPublicationValidation"] == {"ok": True, "error": None}
-    assert record["incidentPath"]
+    # #496 S3: an in-place publish never preserves, because preservation is a
+    # consequence of destroying a file and nothing is destroyed.
+    assert record["publicationMechanism"] == "in_place"
+    assert record["incidentPath"] is None
     assert not _publication_marker(_cctally_core.APP_DIR).exists()
-
-    manifest = _incident_manifest(_cctally_core.APP_DIR)
-    assert manifest["rebuildRecordPath"] == str(
-        _rebuild_records(_cctally_core.LOG_DIR)[-1]
-    )
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
 def test_a_published_family_ends_with_no_sidecars(ns):
@@ -568,6 +698,7 @@ def test_a_failed_post_publication_verdict_is_durable_and_refuses_the_next_open(
     marker_path = _publication_marker(_cctally_core.APP_DIR)
     marker = json.loads(marker_path.read_text())
     assert marker["status"] == "failed"
+    assert marker["mechanism"] == "in_place"
     record_path = marker["recordPath"]
     record = json.loads(pathlib.Path(record_path).read_text())
     assert record["status"] == "failed"
@@ -579,7 +710,15 @@ def test_a_failed_post_publication_verdict_is_durable_and_refuses_the_next_open(
 
     with pytest.raises(_cctally_db.StatsPublicationFailedError) as caught:
         _cctally_core.open_db()
-    assert record_path in str(caught.value)
+    message = str(caught.value)
+    assert record_path in message
+    # An in-place publication preserves nothing, so the message must not send a
+    # user whose index is already known bad to a directory that was never
+    # created. It must still say what to do.
+    quarantine = pathlib.Path(_cctally_core.APP_DIR) / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
+    assert "quarantine" not in message, message
+    assert "db rebuild --db stats" in message
 
 
 # ==========================================================================
@@ -654,30 +793,101 @@ def _kill_rebuild_at(env: dict, tmp_path: pathlib.Path, point: str) -> None:
     assert rebuild.returncode == -signal.SIGKILL
 
 
-def test_a_kill_between_replace_and_the_verdict_is_resolved_by_the_next_open(
+def _stamp_rows(db: pathlib.Path) -> list:
+    """The record paths the destination's publication stamp names."""
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT record_path FROM stats_publication_stamp"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _desynchronize_the_live_cursor(db: pathlib.Path) -> None:
+    """Make the live index disagree with the pinned journal high-water.
+
+    Nothing on the ordinary open path notices, because the file carries the
+    current epoch and `open_db`'s zero-DDL fast path returns it unvalidated.
+    Only a publication verdict that actually validates the destination catches
+    it, so this is what separates "the marker was resolved" from "the marker
+    was discarded" observably.
+    """
+    raw = sqlite3.connect(str(db))
+    try:
+        raw.execute("UPDATE journal_cursor SET offset = offset + 1 WHERE id = 1")
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def test_a_kill_between_the_commit_and_the_verdict_is_resolved_by_the_next_open(
     tmp_path,
 ):
-    """No scratch remains, so interrupted recovery structurally cannot fire.
+    """#496 S3 §5, crash point "after commit before the verdict".
 
-    The pending marker is the only thing that tells a later process the
-    publication outcome is unknown.
+    An in-place publish leaves its scratch on disk until the verdict settles,
+    so BOTH artifacts are present: a `.rebuilding-*` family that artifact-first
+    recovery classifies first, and a pending marker whose publication is
+    already live. The `scratchPath` proxy reads that state as "this run never
+    replaced anything" and discards the marker, which accepts the published
+    bytes without ever validating them. The stamp names the marker's record, so
+    the verdict is still owed and must be rendered.
     """
     env = _isolated_env(tmp_path)
     db = _seed_cli(env)
     _kill_rebuild_at(env, tmp_path, "rebuild_after_publication_replace")
 
-    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == []
+    scratches = sorted(db.parent.glob("stats.db.rebuilding-*"))
+    assert scratches, (
+        "an in-place publish does not consume its scratch, so the state this "
+        "crash point produces carries both artifacts"
+    )
     publication = db.parent / "stats.db.publication"
     state = json.loads(publication.read_text())
     assert state["status"] == "pending"
+    assert state["mechanism"] == "in_place"
     record = json.loads(pathlib.Path(state["recordPath"]).read_text())
     assert record["status"] == "pending"
+    assert _stamp_rows(db) == [state["recordPath"]], (
+        "the publication committed, so its stamp is in the live bytes"
+    )
+
+    _desynchronize_the_live_cursor(db)
+
+    result = _record_usage(env)
+    assert result.returncode != 0, (
+        "the owed verdict must be rendered against the live bytes, not "
+        "discarded because a scratch happens to survive an in-place publish"
+    )
+    resolved = json.loads(publication.read_text())
+    assert resolved["status"] == "failed"
+    settled = json.loads(pathlib.Path(state["recordPath"]).read_text())
+    assert settled["status"] == "failed"
+    assert settled["postPublicationValidation"]["ok"] is False
+
+
+def test_a_kill_between_the_commit_and_the_verdict_clears_a_sound_index(
+    tmp_path,
+):
+    """The same crash point, with the published bytes intact: the verdict is
+    rendered, passes, and clears the marker and the spent scratch."""
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _kill_rebuild_at(env, tmp_path, "rebuild_after_publication_replace")
+
+    publication = db.parent / "stats.db.publication"
+    assert json.loads(publication.read_text())["status"] == "pending"
 
     result = _record_usage(env)
     assert result.returncode == 0, result.stderr
     assert not publication.exists(), (
         "the next open must validate the destination and clear the marker"
     )
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == []
     probe = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -686,7 +896,13 @@ def test_a_kill_between_replace_and_the_verdict_is_resolved_by_the_next_open(
 
 
 def test_a_kill_before_replace_lets_interrupted_recovery_win(tmp_path):
-    """A scratch artifact still takes precedence, and clears the stale marker."""
+    """#496 S3 §5, crash point "after the marker before commit".
+
+    A scratch artifact still takes precedence, and clears the stale marker.
+    Both discriminators agree here — the scratch exists AND the stamp does not
+    name this record — so this is a regression guard rather than the case that
+    separates them.
+    """
     env = _isolated_env(tmp_path)
     db = _seed_cli(env)
     _kill_rebuild_at(env, tmp_path, "rebuild_before_cutover")
@@ -695,7 +911,12 @@ def test_a_kill_before_replace_lets_interrupted_recovery_win(tmp_path):
         "the kill must leave the scratch artifact this branch is gated on"
     )
     publication = db.parent / "stats.db.publication"
-    assert json.loads(publication.read_text())["status"] == "pending"
+    state = json.loads(publication.read_text())
+    assert state["status"] == "pending"
+    assert state["mechanism"] == "in_place"
+    assert state["recordPath"] not in _stamp_rows(db), (
+        "the transaction rolled back, so nothing may name this record"
+    )
 
     result = _record_usage(env)
     assert result.returncode == 0, result.stderr
@@ -706,6 +927,116 @@ def test_a_kill_before_replace_lets_interrupted_recovery_win(tmp_path):
         assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         probe.close()
+
+
+def test_a_kill_before_the_marker_leaves_an_orphan_scratch_only(tmp_path):
+    """#496 S3 §5, crash point "before the marker".
+
+    No marker exists, so nothing owes a verdict; the destination is untouched
+    and the existing interrupted-rebuild recovery reclaims the scratch.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _kill_rebuild_at(env, tmp_path, "publication_before_marker")
+
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")), (
+        "the kill must leave the scratch this branch is gated on"
+    )
+    publication = db.parent / "stats.db.publication"
+    assert not publication.exists()
+    assert _stamp_rows(db) == [], "the destination was never written to"
+
+    result = _record_usage(env)
+    assert result.returncode == 0, result.stderr
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == []
+    assert not publication.exists()
+
+
+def test_a_kill_between_the_commit_and_the_detach_still_owes_its_verdict(
+    tmp_path,
+):
+    """#496 S3 §5, crash point "between commit and detach".
+
+    `DETACH` cannot run inside a transaction, so the scratch is still attached
+    when the commit lands. The stamp is already durable at that point, which is
+    what makes this indistinguishable from the later crash points to a resolver
+    that reads it — and unrecoverable to one that reads `scratchPath`.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _kill_rebuild_at(env, tmp_path, "publication_after_commit_before_detach")
+
+    publication = db.parent / "stats.db.publication"
+    state = json.loads(publication.read_text())
+    assert state["status"] == "pending"
+    assert _stamp_rows(db) == [state["recordPath"]]
+    assert sorted(db.parent.glob("stats.db.rebuilding-*"))
+
+    _desynchronize_the_live_cursor(db)
+
+    result = _record_usage(env)
+    assert result.returncode != 0, (
+        "a committed publication still owes a verdict on the bytes it installed"
+    )
+    assert json.loads(publication.read_text())["status"] == "failed"
+
+
+def test_a_kill_after_the_verdict_before_marker_removal_resolves_the_same_way(
+    tmp_path,
+):
+    """#496 S3 §5, crash point "after the verdict before marker removal".
+
+    The record already says `ok`, but the marker slot has not been cleared, so
+    a later opener still finds a pending marker over a committed publication.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _kill_rebuild_at(
+        env, tmp_path, "publication_after_verdict_before_marker_removal"
+    )
+
+    publication = db.parent / "stats.db.publication"
+    state = json.loads(publication.read_text())
+    assert state["status"] == "pending"
+    assert _stamp_rows(db) == [state["recordPath"]]
+    assert json.loads(pathlib.Path(state["recordPath"]).read_text())[
+        "status"
+    ] == "ok"
+
+    _desynchronize_the_live_cursor(db)
+
+    result = _record_usage(env)
+    assert result.returncode != 0
+    assert json.loads(publication.read_text())["status"] == "failed"
+
+
+def test_a_kill_before_scratch_removal_reclaims_it_without_rebuilding(tmp_path):
+    """#496 S3 §5, crash point "after commit before scratch removal".
+
+    The marker is already gone and the verdict is settled, so the surviving
+    scratch is spent. Artifact-first recovery must reclaim it and must not
+    rebuild a healthy index it happens to sit beside.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _kill_rebuild_at(env, tmp_path, "publication_before_scratch_removal")
+
+    assert sorted(db.parent.glob("stats.db.rebuilding-*"))
+    publication = db.parent / "stats.db.publication"
+    assert not publication.exists()
+    stamped = _stamp_rows(db)
+    assert len(stamped) == 1, "the publication committed and stamped itself"
+
+    log_dir = pathlib.Path(env["CCTALLY_DATA_DIR"]) / "logs"
+    before = sorted(log_dir.glob("stats-rebuild-*.json"))
+
+    result = _record_usage(env)
+    assert result.returncode == 0, result.stderr
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == []
+    assert sorted(log_dir.glob("stats-rebuild-*.json")) == before, (
+        "a spent scratch beside a healthy index must not trigger a rebuild"
+    )
+    assert _stamp_rows(db) == stamped
 
 
 # ==========================================================================
@@ -756,14 +1087,19 @@ def test_a_later_scratch_must_not_discard_an_earlier_pending_verdict(ns):
         jr._stats_rebuild_test_pause = real_pause
 
     marker_path = _publication_marker(_cctally_core.APP_DIR)
-    assert json.loads(marker_path.read_text())["status"] == "pending"
-    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == [], (
-        "os.replace consumed run A's scratch, so none can remain"
-    )
+    run_a = json.loads(marker_path.read_text())
+    assert run_a["status"] == "pending"
+    # #496 S3: an in-place publish attaches its scratch read-only, so run A's
+    # own scratch survives its commit too. Removing it here isolates the
+    # property under test — a scratch belonging to a STRICTLY LATER run — from
+    # the crash point covered by
+    # `test_a_kill_between_the_commit_and_the_verdict_is_resolved_by_the_next_open`.
+    for stale in sorted(db.parent.glob("stats.db.rebuilding-*")):
+        stale.unlink()
 
     # What run A published is bad. Nothing on the ordinary open path notices:
     # the file carries the current epoch, so `open_db`'s zero-DDL fast path
-    # returns it, and no scratch exists for interrupted recovery to find.
+    # returns it, and no scratch of run A's own remains.
     raw = sqlite3.connect(str(db))
     try:
         raw.execute("UPDATE journal_cursor SET offset = offset + 1 WHERE id = 1")
@@ -806,13 +1142,27 @@ def _age_quarantine_incidents(app_dir: pathlib.Path, minutes: int) -> None:
     stamp = (
         dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
     ).strftime("%Y%m%dT%H%M%S_%f")
-    for incident in sorted((app_dir / "quarantine").iterdir()):
+    quarantine = app_dir / "quarantine"
+    if not quarantine.is_dir():
+        # #496 S3: an in-place publish never preserves, so a run that published
+        # into a readable destination leaves no incident to restamp.
+        return
+    for incident in sorted(quarantine.iterdir()):
         incident.rename(incident.with_name(f"stats.db-{stamp}"))
 
 
 def test_a_later_publication_must_not_destroy_an_earlier_owed_verdict(ns):
     """#496 S1 F1. Two runs interleave, and the SECOND one destroys the first
     one's owed verdict by overwriting the single marker slot.
+
+    KNOWN FAILING, owned by the stamp-resolution task (#496 S3 §5). Run A now
+    publishes in place, which leaves its scratch on disk after a COMMITTED
+    publication, so `_settle_prior_publication_verdict`'s `scratchPath` proxy
+    (`bin/_cctally_journal.py`, the `scratch exists -> owes nothing` branch)
+    and `_cctally_store._pending_stats_publication_never_replaced` both read a
+    committed publication as one that never replaced anything. Making them
+    mechanism-aware — resolving through `stats_publication_stamp` instead — is
+    exactly what that task ships, and this scenario is its acceptance.
 
     Run A dies between `os.replace` and its verdict, so the marker beside the
     destination still owes a verdict on bytes that are already live. Run B then
@@ -884,6 +1234,217 @@ def test_a_later_publication_must_not_destroy_an_earlier_owed_verdict(ns):
     assert record["postPublicationValidation"]["ok"] is False
 
 
+# ==========================================================================
+# #496 S3 §5 — which discriminator, and the three states it resolves to
+# ==========================================================================
+
+def _fake_scratch(db: pathlib.Path) -> pathlib.Path:
+    scratch = db.with_name(f"{db.name}.rebuilding-20260805T120000_000000")
+    scratch.write_bytes(b"")
+    return scratch
+
+
+def test_an_unreadable_stamp_never_discards_a_pending_in_place_marker(
+    ns, monkeypatch
+):
+    """#496 S3 §5. The three states must stay three.
+
+    Collapsing INDETERMINATE into PROVEN_PREDECESSOR discards a verdict owed on
+    bytes that may well be live; collapsing it into MATCH condemns an index on
+    no evidence. Only a stamp that was READ and names another record discards.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store as st
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    record_path = "/nonexistent/stats-rebuild-run-a.json"
+    jr._write_publication_marker(
+        db, record_path, started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(_fake_scratch(db)), mechanism="in_place",
+    )
+
+    monkeypatch.setattr(
+        jr, "read_publication_stamp",
+        lambda *_a, **_k: sqlite3.DatabaseError(
+            "database disk image is malformed"
+        ),
+    )
+    assert st._pending_stats_publication_never_replaced(db) is False, (
+        "an unreadable stamp proves nothing and must not discard the marker"
+    )
+
+    monkeypatch.setattr(jr, "read_publication_stamp", lambda *_a, **_k: None)
+    assert st._pending_stats_publication_never_replaced(db) is True
+
+    monkeypatch.setattr(
+        jr, "read_publication_stamp",
+        lambda *_a, **_k: [{"record_path": record_path}],
+    )
+    assert st._pending_stats_publication_never_replaced(db) is False
+
+
+def test_a_replace_marker_keeps_its_scratch_proxy_when_a_stamp_would_disagree(
+    ns,
+):
+    """The marker STATES its mechanism and the opener selects on it. Neither
+    discriminator is generalized over the other: the same marker beside the
+    same files resolves opposite ways depending only on which protocol it
+    declares."""
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store as st
+
+    _seed_live_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    stamped = _stamp_rows(db)
+    assert len(stamped) == 1, "the in-place publish must have stamped itself"
+    scratch = str(_fake_scratch(db))
+
+    jr._write_publication_marker(
+        db, stamped[0], started_at="2026-08-05T12:00:00Z",
+        scratch_path=scratch,
+    )
+    assert st._pending_stats_publication_never_replaced(db) is True, (
+        "a `replace` marker answers with its scratch, whatever the stamp says"
+    )
+
+    jr._write_publication_marker(
+        db, stamped[0], started_at="2026-08-05T12:00:00Z",
+        scratch_path=scratch, mechanism="in_place",
+    )
+    assert st._pending_stats_publication_never_replaced(db) is False, (
+        "an `in_place` marker answers with the stamp, whatever the scratch says"
+    )
+
+
+def test_a_crash_publishing_into_a_pre_stamp_epoch_discards_the_marker(ns):
+    """#496 S3 §5, the upgrade path.
+
+    The first 1008 binary publishes into a readable epoch-1007 index, which has
+    no `stats_publication_stamp` table at all. Reading that absence as a failed
+    query — INDETERMINATE — would resolve the marker instead of discarding it,
+    the validation would fail on the epoch, and an interrupted upgrade rebuild
+    would condemn a perfectly healthy index. The destination's epoch settles it
+    instead: a committed publication always leaves the current epoch behind, so
+    any other epoch proves this publication never committed.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store as st
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    raw = sqlite3.connect(str(db))
+    try:
+        raw.execute("DROP TABLE stats_publication_stamp")
+        raw.execute("PRAGMA user_version=1007")
+        raw.commit()
+    finally:
+        raw.close()
+
+    jr._write_publication_marker(
+        db, "/nonexistent/stats-rebuild-upgrade.json",
+        started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(_fake_scratch(db)), mechanism="in_place",
+    )
+    assert jr.read_publication_stamp(db) is None
+    assert st._pending_stats_publication_never_replaced(db) is True
+
+
+def test_post_publication_validation_verifies_the_publication_identity(ns):
+    """#496 S3 §5. The pinned high-water answers "is this a correct
+    materialization of the journal prefix", which an equally journal-consistent
+    generation installed by some other run also satisfies. The stamp is what
+    says these bytes are the ones THIS publication installed."""
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    stamped = _stamp_rows(db)
+    assert len(stamped) == 1
+    high_water = jr.journal_high_water()
+
+    assert jr.validate_published_stats_index(db, high_water) is None
+    assert jr.validate_published_stats_index(
+        db, high_water, expected_record_path=stamped[0]
+    ) is None
+    error = jr.validate_published_stats_index(
+        db, high_water, expected_record_path="/nonexistent/another-record.json"
+    )
+    assert error is not None
+    assert "PROVEN_PREDECESSOR" in error
+
+
+# ==========================================================================
+# #496 S3 §5 — cross-version pending-marker behaviour (Task 8)
+# ==========================================================================
+
+def test_an_old_binary_misreads_an_in_place_marker_but_cannot_act_on_it(
+    ns, monkeypatch
+):
+    """#496 S3 §5, cross-version. The misreading is real; it is also inert.
+
+    A pre-1008 binary does not know the `mechanism` field, so it applies the
+    `scratchPath` proxy to a pending in-place publication and concludes "never
+    replaced" for one that has already committed. The field cannot be hidden
+    from it — an in-place publish genuinely leaves its scratch on disk between
+    the commit and the verdict, and the physical fallback still needs
+    `scratchPath` — so the marker is not made safe by shaping it differently.
+
+    It is safe for a structural reason instead. A committed in-place
+    publication always leaves the destination at the publishing binary's
+    `STATS_INDEX_EPOCH`, because every scratch eligible for publication was
+    validated at that epoch and the publication transaction stamps it. So the
+    only window in which the old proxy answers wrongly is one where the
+    destination carries an epoch the old binary refuses to use: it rebuilds the
+    whole index from the journal rather than accepting the bytes whose verdict
+    it discarded. In the window where the old binary WOULD use the destination
+    — an epoch it recognizes — the publication provably did not commit and the
+    proxy's answer is correct.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store as st
+
+    _seed_live_index()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    stamped = _stamp_rows(db)
+    assert len(stamped) == 1
+
+    # Reconstruct the post-commit, pre-verdict state a crash leaves behind.
+    jr._write_publication_marker(
+        db, stamped[0], started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(_fake_scratch(db)), mechanism="in_place",
+    )
+    marker_path = _publication_marker(_cctally_core.APP_DIR)
+    assert st._pending_stats_publication_never_replaced(db) is False, (
+        "this binary resolves the committed publication through its stamp"
+    )
+
+    legacy = json.loads(marker_path.read_text())
+    legacy.pop("mechanism")
+    marker_path.write_text(json.dumps(legacy))
+    assert st._pending_stats_publication_never_replaced(db) is True, (
+        "an older reader really does misread this state; the test exists to "
+        "pin that, not to deny it"
+    )
+
+    # And that misreading cannot reach the bytes: the destination carries an
+    # epoch such a binary refuses to accept.
+    assert st.stats_epoch_rebuild_pending(db) is False
+    monkeypatch.setattr(_cctally_core, "STATS_INDEX_EPOCH", 1007)
+    assert st.stats_epoch_rebuild_pending(db) is True, (
+        "a binary that would apply the old proxy must first find the whole "
+        "index unusable at its own epoch"
+    )
+
+
 def test_a_marker_holding_valid_json_that_is_not_an_object_is_not_a_traceback(
     ns, monkeypatch
 ):
@@ -907,29 +1468,66 @@ def test_a_marker_holding_valid_json_that_is_not_an_object_is_not_a_traceback(
     _seed_live_index()
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
 
-    def refuse(**_kwargs):
-        _publication_marker(_cctally_core.APP_DIR).write_text("null")
-        raise RuntimeError("injected rebuild failure")
+    real_rebuild = jr.rebuild_stats_index
+    refused = []
+
+    def refuse(**kwargs):
+        if not refused:
+            refused.append(True)
+            _publication_marker(_cctally_core.APP_DIR).write_text("null")
+            raise RuntimeError("injected rebuild failure")
+        return real_rebuild(**kwargs)
 
     monkeypatch.setattr(jr, "rebuild_stats_index", refuse)
 
-    with pytest.raises(_cctally_db.StatsDbCorruptError):
-        _cctally_core.open_db()
+    # S3 moved the rebuild into the worker, so the worker is where a marker
+    # holding `null` is first read back. It must survive that and stay
+    # retryable, and a later heal must still converge rather than surfacing an
+    # `AttributeError` from calling `.get(...)` on `null`.
+    _defer_without_spawning(_cctally_core.open_db)
+    _run_heal_worker()
+    assert refused == [True]
+
+    _stats_heal_marker(_cctally_core.APP_DIR).unlink(missing_ok=True)
+    _defer_without_spawning(_cctally_core.open_db)
+    _run_heal_worker()
+    conn = _cctally_core.open_db()
+    try:
+        assert [
+            r[0] for r in conn.execute(
+                "SELECT weekly_percent FROM weekly_usage_snapshots"
+            )
+        ] == [7.0]
+    finally:
+        conn.close()
 
 
 # ==========================================================================
 # F1 — the process that CAUSES the failure must not print the false message
 # ==========================================================================
 
-def test_the_failing_heal_reports_the_publication_guidance_not_db_repair(ns):
-    """#496 S1 F1. Replacement has already occurred, so the pre-existing
-    "Not auto-recreated … run `cctally db repair --db stats --yes`" text is
-    false. Only the NEXT process used to see the correct guidance, because the
-    heal hook's broad `except Exception` swallowed the publication failure.
+def test_a_failed_publication_in_the_worker_reports_publication_guidance(ns):
+    """#496 S1 F1, re-homed by S3's detachment.
+
+    Replacement has already occurred, so the pre-existing "Not auto-recreated …
+    run `cctally db repair --db stats --yes`" text is false. The process that
+    CAUSES the failure is now the detached worker, whose streams are
+    `/dev/null`, so it can only record the verdict durably and log it; the
+    guidance therefore reaches the user on the next open, from the marker. What
+    must NOT happen is either half going missing, or the worker crashing.
+
+    Both halves of that argument are asserted here. The durable half is the ring
+    entry the worker settles, not merely the marker: the ring is what a later
+    reader consults, and asserting only the marker would leave the durability
+    claim untested. The destination's header is destroyed, so publication falls
+    back to physical replacement — which is the mechanism whose message really
+    does name a preserved predecessor, so this also pins that wording against
+    the quarantine directory it promises.
     """
     import _cctally_core
     import _cctally_db
     import _cctally_journal as jr
+    import _cctally_store as st
 
     _seed_live_index()
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
@@ -943,8 +1541,8 @@ def test_the_failing_heal_reports_the_publication_guidance_not_db_repair(ns):
 
     jr._validate_rebuilt_stats_index = fail_on_the_destination
     try:
-        with pytest.raises(_cctally_db.StatsPublicationFailedError) as caught:
-            _cctally_core.open_db()
+        _defer_without_spawning(_cctally_core.open_db)
+        _run_heal_worker()
     finally:
         jr._validate_rebuilt_stats_index = real_validate
 
@@ -952,9 +1550,29 @@ def test_the_failing_heal_reports_the_publication_guidance_not_db_repair(ns):
         _publication_marker(_cctally_core.APP_DIR).read_text()
     )
     assert marker["status"] == "failed"
-    assert marker["recordPath"] in str(caught.value)
-    assert "db repair --db stats" not in str(caught.value), (
-        "the causing process must not send the user down the pre-cutover path"
+    assert marker["mechanism"] == "replace"
+
+    # The durable half: the worker settled the ring entry it owns.
+    events = st.read_stats_heal_events()
+    assert len(events) == 1, events
+    assert events[0]["outcome"] == "failed"
+    assert events[0]["error"] == "JournalError"
+    assert events[0]["healId"]
+
+    with pytest.raises(_cctally_db.StatsPublicationFailedError) as caught:
+        _cctally_core.open_db()
+    message = str(caught.value)
+    assert marker["recordPath"] in message
+    assert "db repair --db stats" not in message, (
+        "a settled publication verdict must not send the user down the "
+        "pre-cutover path"
+    )
+    # This mechanism DID preserve the predecessor, so the message says so and
+    # the directory it names is really there.
+    quarantine = pathlib.Path(_cctally_core.APP_DIR) / "quarantine"
+    assert "preserved under quarantine/" in message
+    assert sorted(quarantine.glob("stats.db-*")), sorted(
+        quarantine.iterdir() if quarantine.exists() else []
     )
 
 
@@ -1021,10 +1639,9 @@ def test_a_non_oserror_from_the_wal_capture_never_breaks_the_heal(
 
     monkeypatch.setattr(_cctally_db, "_copy_db_family", copy_or_boom)
 
-    healed = _cctally_tui._tui_heal_post_query_stats(
+    assert _post_query_heal_then_worker(
         sqlite3.DatabaseError("database disk image is malformed")
-    )
-    assert healed is True
+    ) is True
 
     conn = _cctally_core.open_db()
     try:
@@ -1038,6 +1655,194 @@ def test_a_non_oserror_from_the_wal_capture_never_breaks_the_heal(
     evidence = _latest_bundle(_cctally_core.LOG_DIR)["walEvidence"]
     assert evidence["disposition"] == "failed"
     assert "injected WAL evidence copy failure" in evidence["reason"]
+
+
+def test_the_publisher_refuses_a_scratch_at_the_wrong_index_epoch(ns, tmp_path):
+    """`read_publication_stamp`'s short-circuit rests on the claim that a
+    committed publication always leaves the destination at THIS binary's epoch.
+
+    The publisher stamped `main.user_version` from `PRAGMA src.user_version`
+    on trust. Upstream validation does guarantee they are equal; asserting it
+    here converts that argument into an invariant.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    scratch = tmp_path / "wrong-epoch-scratch.db"
+    src = sqlite3.connect(str(scratch))
+    try:
+        src.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        src.execute(
+            f"PRAGMA user_version = {_cctally_core.STATS_INDEX_EPOCH - 1}"
+        )
+        src.commit()
+    finally:
+        src.close()
+
+    dest = tmp_path / "destination.db"
+    conn = sqlite3.connect(str(dest))
+    try:
+        conn.execute("PRAGMA foreign_keys = 0")
+        with pytest.raises(jr.JournalError, match="index epoch"):
+            jr._publish_generation_in_place(
+                conn,
+                scratch,
+                record_path="/nonexistent/record.json",
+                started_at="2026-08-05T12:00:00Z",
+            )
+        assert int(
+            conn.execute("PRAGMA main.user_version").fetchone()[0]
+        ) == 0, "the refused publication must not have stamped the destination"
+    finally:
+        conn.close()
+
+
+def test_the_opener_consults_the_stamp_when_no_scratch_family_survives(ns):
+    """A pending `in_place` marker with NO surviving `.rebuilding-*` family.
+
+    `stats_open_guarded` has two marker paths. The artifact-present one asks
+    `_pending_stats_publication_never_replaced` and is correct. The one taken
+    when nothing survives beside the marker called
+    `_resolve_stats_publication_marker` directly, which validates against the
+    record's PINNED HIGH-WATER and never asked the stamp anything. For a
+    `replace` marker scratch absence proved `os.replace` had run; for an
+    `in_place` marker scratch absence proves NOTHING, so a publication that
+    provably never committed was validated against a high-water describing an
+    index that does not exist, promoted to `failed`, and every ordinary open
+    refused until `db rebuild --db stats` — which is exactly the failure this
+    epic exists to eliminate.
+
+    Reachable in production: `_recover_completed_correction`'s error path calls
+    `_cleanup_new_correction_scratches` when a `COMMIT_UNKNOWN`-phase error
+    leaves the marker `pending`, and a kill inside
+    `_recover_or_reclaim_interrupted_stats_rebuild` between artifact removal
+    and the marker decision lands in the same state.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+    import _lib_stats_publish as sp
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    before = _logical_rows(db)
+
+    record = pathlib.Path(_cctally_core.APP_DIR) / "stats-rebuild-never-live.json"
+    record.write_text(json.dumps({"highWater": ["seg-9999.jsonl", 999999]}))
+    scratch = db.with_name(f"{db.name}.rebuilding-20260805T120000_000000")
+    assert not scratch.exists(), "this test is about the NO-artifact path"
+    jr._write_publication_marker(
+        db,
+        str(record),
+        started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(scratch),
+        mechanism="in_place",
+    )
+    # The stamp is the evidence: it does not name this record, so the live
+    # bytes are the untouched predecessor.
+    assert sp.resolve_stamp(
+        jr.read_publication_stamp(db), str(record)
+    ) == sp.STAMP_PROVEN_PREDECESSOR
+
+    conn = _cctally_core.open_db()
+    try:
+        assert _logical_rows_from(conn) == before, (
+            "the healthy predecessor must still be readable"
+        )
+    finally:
+        conn.close()
+    assert not _publication_marker(_cctally_core.APP_DIR).exists(), (
+        "a publication that provably never became live must have its marker "
+        "discarded, not promoted to `failed`"
+    )
+
+
+def _logical_rows_from(conn):
+    return [
+        tuple(r) for r in conn.execute(
+            "SELECT weekly_percent, journal_id FROM weekly_usage_snapshots "
+            "ORDER BY id"
+        )
+    ]
+
+
+def _logical_rows(db):
+    import _cctally_core
+
+    conn = _cctally_core.open_db()
+    try:
+        return _logical_rows_from(conn)
+    finally:
+        conn.close()
+
+
+def test_an_unreadable_destination_is_not_reported_as_a_failed_check(
+    ns, capsys,
+):
+    """#496 exists partly because corruption gets MISATTRIBUTED.
+
+    On a corrupt destination the stamp read is INDETERMINATE, and the
+    high-water validation then fails for the UNRELATED damage — so stating
+    that an earlier publication "FAILED that check" accuses it of something
+    the evidence does not support.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    record = pathlib.Path(_cctally_core.APP_DIR) / "stats-rebuild-prior.json"
+    record.write_text(json.dumps({"highWater": ["seg-1.jsonl", 4096]}))
+    scratch = db.with_name(f"{db.name}.rebuilding-20260805T120000_000000")
+    jr._write_publication_marker(
+        db,
+        str(record),
+        started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(scratch),
+        mechanism="in_place",
+    )
+    _destroy_header_magic(db)
+    capsys.readouterr()
+
+    settled = jr._settle_prior_publication_verdict(db)
+
+    assert settled is not None and settled["status"] == "failed"
+    err = capsys.readouterr().err
+    assert "could not be read" in err
+    assert "not evidence about that publication" in err
+    assert "FAILED that check" not in err
+
+
+def test_a_content_mismatch_is_still_reported_as_a_failed_check(ns, capsys):
+    """The softening must be scoped to READ failures, not applied to every
+    validation error — a genuine content mismatch is a real failed check."""
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    record = pathlib.Path(_cctally_core.APP_DIR) / "stats-rebuild-prior.json"
+    # A high-water the healthy destination provably does not materialize.
+    record.write_text(json.dumps({"highWater": ["seg-9999.jsonl", 999999]}))
+    # A physically-replaced publication whose scratch is gone: `os.replace`
+    # consumed it, so the verdict on the live bytes is still owed and the
+    # high-water check actually runs.
+    scratch = db.with_name(f"{db.name}.rebuilding-20260805T120000_000000")
+    assert not scratch.exists()
+    jr._write_publication_marker(
+        db,
+        str(record),
+        started_at="2026-08-05T12:00:00Z",
+        scratch_path=str(scratch),
+        mechanism="replace",
+    )
+    capsys.readouterr()
+
+    settled = jr._settle_prior_publication_verdict(db)
+
+    assert settled is not None and settled["status"] == "failed"
+    err = capsys.readouterr().err
+    assert "FAILED that check" in err
+    assert "could not be read" not in err
 
 
 def test_a_third_crashed_run_must_not_drop_a_carried_verdict(ns):

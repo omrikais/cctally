@@ -59,13 +59,14 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 42 known
   · 041_codex_quota_unresolved_model_index         pending
   · 042_test_cache_migration                       pending
 
-conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 6 known
+conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 7 known
   · 001_adopt_schema_version_marker                pending
   · 002_codex_thread_source_inference_replay       pending
   · 003_background_mcp_result_replay               pending
   · 004_codex_find_projection                      pending
   · 005_conversation_account_dimension             pending
   · 006_backfill_codex_file_touches                pending
+  · 007_codex_find_projection_v2_meta              pending
 ## stderr
 
 ## exit

@@ -127,6 +127,7 @@ def _cctally():
 # for ``eprint`` is deleted.
 import _cctally_core
 from _cctally_core import eprint
+from _lib_codex_find_projection import CODEX_FIND_PROJECTION_VERSION
 from _lib_source_identity import source_root_key
 # #416 spec §4.2: the pure tolerance-anchored reset kernel. `_lib_quota` imports
 # only `_lib_accounts` (a stdlib leaf), so binding it here is circular-safe.
@@ -2076,7 +2077,8 @@ def run_codex_find_projection_backfill(
     if pending is None:
         complete = conn.execute(
             "SELECT 1 FROM cache_meta "
-            "WHERE key='codex_find_projection_complete_version' AND value='1'"
+            "WHERE key='codex_find_projection_complete_version' AND value=?",
+            (str(CODEX_FIND_PROJECTION_VERSION),),
         ).fetchone() is not None
         return {"processed": 0, "complete": complete}
     row = conn.execute(
@@ -2113,13 +2115,17 @@ def run_codex_find_projection_backfill(
     complete = remaining is None
     if complete:
         conn.execute(
-            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES"
-            "('codex_find_projection_complete_version','1')"
+            "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
+            (
+                "codex_find_projection_complete_version",
+                str(CODEX_FIND_PROJECTION_VERSION),
+            ),
         )
         conn.execute(
             "DELETE FROM cache_meta WHERE key IN "
             "('codex_find_projection_backfill_pending',"
-            " 'codex_find_projection_backfill_cursor')"
+            " 'codex_find_projection_backfill_cursor',"
+            " 'codex_find_projection_backfill_version')"
         )
     conn.commit()
     return {"processed": len(selected), "complete": complete}
@@ -8699,7 +8705,41 @@ def scope_conversations_db_to_account(
         )
         if row[0]
     }
+    safe_project_attribution: dict[str, tuple[str | None, str | None]] = {}
+    for conversation_key in codex_keys:
+        persisted = conn.execute(
+            "SELECT project_key,project_label "
+            "FROM main.codex_conversation_rollups WHERE conversation_key=?",
+            (conversation_key,),
+        ).fetchone()
+        if persisted is not None:
+            safe_project_attribution[conversation_key] = persisted
+            continue
+        thread = conn.execute(
+            "SELECT source_root_key,cwd,git_json "
+            "FROM cache_db.codex_conversation_threads WHERE conversation_key=?",
+            (conversation_key,),
+        ).fetchone()
+        if thread is not None:
+            safe_project_attribution[conversation_key] = (
+                _codex_conversation_project_attribution(*thread)
+            )
     _recompute_codex_rollups(conn, codex_keys)
+    # Project identity is safe conversation-level enrichment: it is already
+    # visible on the unqualified rail and contains only an opaque key plus the
+    # derived display label. Preserve those two fields for conversations that
+    # survived the physical-row account predicate, without exposing the
+    # conversation-level cwd/git, source-root path, title, or thread topology
+    # that produced them (#497).
+    conn.executemany(
+        "UPDATE codex_conversation_rollups SET project_key=?,project_label=? "
+        "WHERE conversation_key=?",
+        [
+            (project_key, project_label, conversation_key)
+            for conversation_key, (project_key, project_label)
+            in safe_project_attribution.items()
+        ],
+    )
     # TEMP rollup writes open a transaction. Close it before a long-lived
     # account-scoped SSE reader starts watching so later provider-writer commits
     # are visible to the dynamic leaf views and never contend on this setup work.

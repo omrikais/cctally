@@ -3850,6 +3850,9 @@ def test_browse_rollup_fast_path_equals_live_recompute(tmp_path, monkeypatch):
             cursor=fast_page_1["page"]["cursor"])
         fast_invalid_cursor = q.list_codex_conversations(
             conn, effective_speed="standard", limit=2, cursor="not-present")
+        selected_key = fast["rows"][-1]["conversation_key"]
+        fast_selected = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2, selected=selected_key)
         # Force the live-recompute branch by deleting the stored rollups.
         conn.execute("DELETE FROM codex_conversation_rollups")
         live = q.list_codex_conversations(conn, effective_speed="standard")
@@ -3860,10 +3863,14 @@ def test_browse_rollup_fast_path_equals_live_recompute(tmp_path, monkeypatch):
             cursor=live_page_1["page"]["cursor"])
         live_invalid_cursor = q.list_codex_conversations(
             conn, effective_speed="standard", limit=2, cursor="not-present")
+        live_selected = q.list_codex_conversations(
+            conn, effective_speed="standard", limit=2, selected=selected_key)
         assert fast == live
         assert fast_page_1 == live_page_1
         assert fast_page_2 == live_page_2
         assert fast_invalid_cursor == live_invalid_cursor == live_page_1
+        assert fast_selected == live_selected
+        assert fast_selected["selected"]["conversation_key"] == selected_key
     finally:
         conn.close()
 
@@ -4448,6 +4455,12 @@ def test_neutral_browse_claude_same_basename_distinct_project_key():
         pk = projects[0]["project_key"]
         filtered = disp.neutral_browse(conn, source="claude", project_key=pk)
         assert [r["project_key"] for r in filtered["rows"]] == [pk]
+        selected = disp.neutral_browse(
+            conn, source="claude", limit=1,
+            selected="aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        assert selected["selected"]["title"] == "prompt A"
+        assert selected["selected"]["conversation_key"] != \
+            "aaaa1111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     finally:
         conn.close()
 

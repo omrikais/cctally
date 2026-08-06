@@ -13,6 +13,7 @@ from _lib_codex_find_projection import (  # noqa: E402
     ProjectedLeaf,
     RenderLeaf,
     literal_ranges,
+    project_context,
     project_markdown,
     project_plain,
     regex_ranges,
@@ -40,6 +41,8 @@ def test_shared_projection_cases_match_hand_checked_visible_text():
     for case in CASES["projectionCases"]:
         if case["kind"] == "markdown":
             actual = project_markdown(case["source"])
+        elif case["kind"] == "context":
+            actual = project_context(case["source"])
         else:
             actual = project_plain(tuple(RenderLeaf(**leaf) for leaf in case["leaves"]))
         assert _projection_value(actual) == case["expected"], case["name"]

@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageItem } from './MessageItem';
 import { TranscriptContext } from './TranscriptContext';
+import { ExactFindContext } from './HighlightContext';
 import type { FmtCtx } from '../lib/fmt';
 import type { ConversationItem } from '../types/conversation';
 
@@ -627,7 +628,7 @@ describe('MessageItem (message-text copy, G2)', () => {
     member_uuids: ['m1'],
     ts: 't',
     text: 'Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas',
-    blocks: [{ kind: 'text', text: 'Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas' }],
+    blocks: [{ kind: 'text', text: 'Base directory for this skill: /x/skills/brainstorming\n\n# Brainstorming Ideas', block_key: 'bk-skill' }],
     is_sidechain: false,
     subagent_key: null,
     parent_uuid: null,
@@ -735,6 +736,121 @@ describe('MessageItem (message-text copy, G2)', () => {
     const eventRender = render(<MessageItem item={started} />);
     expect(eventRender.container.textContent).toContain('Task started');
     expect(eventRender.container.textContent).not.toContain('Background task');
+  });
+
+  it('renders exact selected marks in every visible meta body kind', () => {
+    const cases = [
+      { metaKind: 'context', text: 'visible context needle', leafKey: 'segments.0.prose/t0' },
+      { metaKind: 'skill', text: 'visible skill needle', leafKey: 't0' },
+      { metaKind: 'command', text: 'visible command needle', leafKey: 't0' },
+      { metaKind: 'compaction', text: 'visible compaction needle', leafKey: 't0' },
+      { metaKind: 'notification', text: 'visible notification needle', leafKey: 't0' },
+    ] as const;
+
+    for (const [index, fixture] of cases.entries()) {
+      const blockKey = `bk-meta-${fixture.metaKind}`;
+      const occurrenceId = `occ-meta-${fixture.metaKind}`;
+      const start = fixture.text.indexOf('needle');
+      const item = {
+        kind: 'meta',
+        anchor: { session_id: 's', uuid: `meta-${index}`, id: 100 + index },
+        member_uuids: [`meta-${index}`], ts: 't', text: fixture.text,
+        blocks: [{ kind: 'text', text: fixture.text, block_key: blockKey }],
+        is_sidechain: false, subagent_key: null, parent_uuid: null,
+        meta_kind: fixture.metaKind, skill_name: null,
+      } as ConversationItem;
+      const occurrence = {
+        occurrence_id: occurrenceId,
+        item_key: `meta-${index}`,
+        uuid: `meta-${index}`,
+        block_key: blockKey,
+        container_block_key: blockKey,
+        surface: 'body' as const,
+        match_kinds: [],
+        disclosure: [blockKey],
+        fragments: [{ leaf_key: fixture.leafKey, start, end: start + 6 }],
+      };
+      const rendered = render(
+        <ExactFindContext.Provider value={{
+          occurrences: [occurrence], selectedOccurrenceId: occurrenceId,
+        }}>
+          <MessageItem item={item} />
+        </ExactFindContext.Provider>,
+      );
+      const details = rendered.container.querySelector(`details.conv-meta--${fixture.metaKind}`)!;
+      expect(details.getAttribute('data-disclosure-key')).toBe(blockKey);
+      expect(details.querySelector(`mark[data-find-occurrence-id="${occurrenceId}"]`)?.textContent)
+        .toBe('needle');
+      rendered.unmount();
+    }
+  });
+
+  it('maps an exact context-diff occurrence onto its rendered diff row', () => {
+    const text = [
+      'diff --git a/x.py b/x.py',
+      '--- a/x.py',
+      '+++ b/x.py',
+      '@@ -1 +1 @@',
+      '-old value',
+      '+new needle',
+    ].join('\n');
+    const blockKey = 'bk-context-diff';
+    const item = {
+      kind: 'meta', anchor: { session_id: 's', uuid: 'meta-diff', id: 120 },
+      member_uuids: ['meta-diff'], ts: 't', text,
+      blocks: [{ kind: 'text', text, block_key: blockKey }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'context', skill_name: null,
+    } as ConversationItem;
+    const occurrence = {
+      occurrence_id: 'occ-context-diff', item_key: 'meta-diff', uuid: 'meta-diff',
+      block_key: blockKey, container_block_key: blockKey, surface: 'body' as const,
+      match_kinds: [], disclosure: [blockKey],
+      fragments: [{
+        leaf_key: 'segments.0.files.0.hunks.0.rows.1', start: 4, end: 10,
+      }],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{
+        occurrences: [occurrence], selectedOccurrenceId: 'occ-context-diff',
+      }}>
+        <MessageItem item={item} />
+      </ExactFindContext.Provider>,
+    );
+    expect(container.querySelector('.conv-diff-row--add mark[data-find-current="true"]')?.textContent)
+      .toBe('needle');
+  });
+
+  it('maps an exact occurrence through provider-tagged context prose', () => {
+    const text = [
+      '# AGENTS.md instructions for /synthetic/root-a/project-red',
+      '<INSTRUCTIONS>Synthetic agent instructions for the injected context bundle.</INSTRUCTIONS>',
+      '<environment_context>Synthetic environment context.</environment_context>',
+    ].join('\n');
+    const blockKey = 'bk-context-provider-tags';
+    const item = {
+      kind: 'meta', anchor: { session_id: 's', uuid: 'meta-provider-tags', id: 121 },
+      member_uuids: ['meta-provider-tags'], ts: 't', text,
+      blocks: [{ kind: 'text', text, block_key: blockKey }],
+      is_sidechain: false, subagent_key: null, parent_uuid: null,
+      meta_kind: 'context', skill_name: null,
+    } as ConversationItem;
+    const occurrence = {
+      occurrence_id: 'occ-context-provider-tags', item_key: 'meta-provider-tags',
+      uuid: 'meta-provider-tags', block_key: blockKey,
+      container_block_key: blockKey, surface: 'body' as const,
+      match_kinds: [], disclosure: [blockKey],
+      fragments: [{ leaf_key: 'segments.0.prose/t1', start: 14, end: 42 }],
+    };
+    const { container } = render(
+      <ExactFindContext.Provider value={{
+        occurrences: [occurrence], selectedOccurrenceId: occurrence.occurrence_id,
+      }}>
+        <MessageItem item={item} />
+      </ExactFindContext.Provider>,
+    );
+    expect(container.querySelector('mark[data-find-current="true"]')?.textContent)
+      .toBe('Synthetic agent instructions');
   });
 
   it('gives a meta row no spine role-dot class (--human/--assistant only)', () => {

@@ -223,27 +223,6 @@ def _doctor_check(payload: dict, check_id: str) -> dict:
     raise AssertionError(f"missing doctor check {check_id}")
 
 
-def _hold_stats_handle(db: pathlib.Path) -> subprocess.Popen:
-    holder = subprocess.Popen(
-        [
-            os.environ.get("PYTHON", "python3"),
-            "-c",
-            "import sqlite3, sys, time\n"
-            "c = sqlite3.connect(sys.argv[1])\n"
-            "c.execute('BEGIN')\n"
-            "c.execute('SELECT count(*) FROM weekly_usage_snapshots').fetchone()\n"
-            "print('held', flush=True)\n"
-            "time.sleep(120)\n",
-            str(db),
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-    )
-    assert holder.stdout is not None
-    assert holder.stdout.readline().strip() == "held"
-    return holder
-
-
 def _await_marker(
     marker: pathlib.Path,
     process: subprocess.Popen,
@@ -525,6 +504,32 @@ def _cutover_manifests(app_dir: pathlib.Path) -> list:
     return out
 
 
+def _force_physical_publication(db_path: pathlib.Path) -> None:
+    """Make the destination one SQLite refuses to open.
+
+    #496 S3 made in-place transactional publication the mechanism, and an
+    in-place publish never preserves — preservation is a consequence of
+    destroying a file. A test about the preservation manifest therefore has to
+    reach the physical fallback, which only a structurally unopenable
+    destination does. The magic string and the `user_version` at byte 60 are
+    both left intact, because `_read_user_version_header` needs the first and
+    the manifest records the second; the file-format version bytes at 18-19 are
+    what SQLite rejects as NOTADB.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = pathlib.Path(str(db_path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    with db_path.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
+
+
 def test_acknowledge_apply_incident_records_its_trigger_identity(tmp_path):
     """#496 S1 F3, driven through the real `db journal-repair --yes` CLI.
 
@@ -553,6 +558,12 @@ def test_acknowledge_apply_incident_records_its_trigger_identity(tmp_path):
     preview = json.loads(_run(app_dir, "--json").stdout)
     fingerprint = preview["unacknowledgedViolations"][0]["fingerprint"]
     before = len(_cutover_manifests(app_dir))
+    # #496 S3: a readable destination is published in place and an in-place
+    # publish never preserves, so the manifest under test is only written by
+    # the structural fallback. Corrupting the destination after the preview is
+    # safe because the apply path never opens stats.db before it rebuilds — it
+    # goes straight from `_repair_locks` to `rebuild_stats_index`.
+    _force_physical_publication(app_dir / "stats.db")
 
     applied = _run(app_dir, "--violation", fingerprint, "--yes", "--json")
 
@@ -1255,8 +1266,48 @@ def test_dashboard_reports_durable_audit_after_next_rebuild(tmp_path):
         dashboard.stdout.close()
 
 
-def test_live_dashboard_refusal_then_identical_retry_converges(tmp_path):
-    """Repair must never replace stats.db beneath the usual live reader."""
+_PINNED_READER = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('BEGIN')
+
+
+def snapshot():
+    row = conn.execute(
+        "SELECT segment || '@' || offset FROM journal_cursor WHERE id = 1"
+    ).fetchone()
+    return str(row[0])
+
+
+print(snapshot(), flush=True)
+sys.stdin.readline()
+print(snapshot(), flush=True)
+sys.stdin.readline()
+"""
+
+
+def _live_cursor(db: pathlib.Path) -> str:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return str(
+            conn.execute(
+                "SELECT segment || '@' || offset FROM journal_cursor WHERE id = 1"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_live_dashboard_reader_keeps_its_snapshot_then_retry_converges(tmp_path):
+    """Repair must never replace stats.db beneath the usual live reader.
+
+    #496 S3 delivers that by publishing transactionally into the live file
+    instead of refusing while a reader holds it open. The repair therefore
+    completes with the dashboard running and a pinned read transaction open;
+    the pinned reader keeps the generation it opened on, a fresh reader sees
+    the repaired one, no scratch survives, and an identical retry is still
+    idempotent against the single audit.
+    """
     app_dir = tmp_path / "data"
     journal_dir = app_dir / "journal"
     journal_dir.mkdir(parents=True)
@@ -1312,27 +1363,49 @@ def test_live_dashboard_refusal_then_identical_retry_converges(tmp_path):
         else:
             raise AssertionError("dashboard did not start")
 
-        holder = _hold_stats_handle(app_dir / "stats.db")
-        refused = _run(
+        holder = subprocess.Popen(
+            [
+                os.environ.get("PYTHON", "python3"),
+                "-c",
+                _PINNED_READER,
+                str(app_dir / "stats.db"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        assert holder.stdout is not None
+        assert holder.stdin is not None
+        pinned = holder.stdout.readline().strip()
+        assert pinned == _live_cursor(app_dir / "stats.db")
+
+        applied = _run(
             app_dir,
             "--violation",
             fingerprint,
             "--yes",
             "--json",
         )
-        assert refused.returncode == 3, refused.stderr
-        refusal = json.loads(refused.stdout)
-        assert refusal["status"] == "failed"
-        assert "dashboard" in " ".join(refusal["errors"]).lower()
-        assert refusal["unacknowledgedViolations"] == []
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        payload = json.loads(applied.stdout)
+        assert payload["status"] == "applied"
+        assert payload["unacknowledgedViolations"] == []
         assert [
-            item["fingerprint"]
-            for item in refusal["acknowledgedViolations"]
+            item["fingerprint"] for item in payload["acknowledgedViolations"]
         ] == [fingerprint]
-        assert refusal["auditId"] == refusal["acknowledgedViolations"][0][
+        assert payload["auditId"] == payload["acknowledgedViolations"][0][
             "auditId"
         ]
-        assert (app_dir / "stats.db").exists()
+
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == pinned, (
+            "the pinned reader must keep the generation it opened on"
+        )
+        assert _live_cursor(app_dir / "stats.db") != pinned, (
+            "a fresh reader must see the repaired generation"
+        )
+        assert sorted(app_dir.glob("stats.db.rebuilding-*")) == []
         conn = sqlite3.connect(app_dir / "stats.db")
         try:
             assert conn.execute(
@@ -1344,6 +1417,8 @@ def test_live_dashboard_refusal_then_identical_retry_converges(tmp_path):
         if holder is not None:
             holder.send_signal(signal.SIGKILL)
             holder.wait(timeout=20)
+            if holder.stdin is not None:
+                holder.stdin.close()
             assert holder.stdout is not None
             holder.stdout.close()
         dashboard.terminate()
@@ -1360,7 +1435,7 @@ def test_live_dashboard_refusal_then_identical_retry_converges(tmp_path):
     )
     assert retried.returncode == 0, retried.stdout + retried.stderr
     retry_payload = json.loads(retried.stdout)
-    assert retry_payload["status"] == "recovered"
-    assert retry_payload["auditId"] == refusal["auditId"]
+    assert retry_payload["status"] == "already-resolved"
+    assert retry_payload["auditId"] == payload["auditId"]
     audits = [record for _segment, record in _journal_repair_audits(journal_dir)]
     assert len(audits) == 1

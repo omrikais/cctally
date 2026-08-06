@@ -817,7 +817,7 @@ function CodexCurrentCycleModal({
         <section className="modal-current-week" data-source="codex" data-per-account="">
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>All accounts</span>
-            <span className="m-pill accent-orange">Codex · native 7-day quota</span>
+            <span className="m-pill accent-orange">native 7-day quota</span>
           </div>
           <CodexIngestBacklogDisclosure note={ingestBacklogNote} />
           <CodexPerAccountCycleTable accounts={codex!.accounts!} codex={codex!} ctx={ctx} />
@@ -839,7 +839,7 @@ function CodexCurrentCycleModal({
         ) : (
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>{pill}</span>
-            <span className="m-pill accent-orange">Codex · native 7-day quota</span>
+            <span className="m-pill accent-orange">native 7-day quota</span>
           </div>
         )}
         {/* #350 — this modal renders cost, percent and cycle bounds without

@@ -1,3 +1,6 @@
+import { decodeString } from 'micromark-util-decode-string';
+import { parseUnifiedDiff, segmentContextBody } from './contextDiff';
+
 export interface RenderLeaf {
   key: string;
   text: string;
@@ -276,6 +279,52 @@ export function projectPlain(leaves: RenderLeaf[]): Projection {
   return builder.value();
 }
 
+export function projectContext(source: string): Projection {
+  const parts: string[] = [];
+  const leaves: ProjectedLeaf[] = [];
+  let cursor = 0;
+  const separator = () => {
+    if (!parts.length) return;
+    parts.push('\n');
+    cursor += 1;
+  };
+  const appendProjection = (projection: Projection, prefix: string) => {
+    if (!projection.text) return;
+    separator();
+    const start = cursor;
+    parts.push(projection.text);
+    cursor += scalarLength(projection.text);
+    leaves.push(...projection.leaves.map((leaf) => ({
+      key: `${prefix}/${leaf.key}`,
+      start: start + leaf.start,
+      end: start + leaf.end,
+    })));
+  };
+  segmentContextBody(source).forEach((segment, segmentIndex) => {
+    if (segment.kind === 'prose') {
+      appendProjection(projectMarkdown(segment.text), `segments.${segmentIndex}.prose`);
+      return;
+    }
+    parseUnifiedDiff(segment.text).forEach((file, fileIndex) => {
+      file.hunks.forEach((rows, hunkIndex) => {
+        rows.forEach((row, rowIndex) => {
+          if (!row.text) return;
+          separator();
+          const start = cursor;
+          parts.push(row.text);
+          cursor += scalarLength(row.text);
+          leaves.push({
+            key: `segments.${segmentIndex}.files.${fileIndex}.hunks.${hunkIndex}.rows.${rowIndex}`,
+            start,
+            end: cursor,
+          });
+        });
+      });
+    });
+  });
+  return { text: parts.join(''), leaves };
+}
+
 function scalarLower(value: string): string {
   return Array.from(value, (scalar) => {
     const lowered = scalar.toLowerCase();
@@ -319,4 +368,3 @@ export function sliceRangeToLeaves(match: FindRange, leaves: ProjectedLeaf[]): L
   }
   return fragments;
 }
-import { decodeString } from 'micromark-util-decode-string';

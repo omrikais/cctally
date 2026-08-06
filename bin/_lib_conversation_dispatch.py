@@ -266,6 +266,7 @@ def _claude_browse(
     model: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
+    selected: str | None = None,
 ) -> dict:
     """Claude browse envelope (§5.6 / §6.1). Claude is always authoritative — the
     status is always ``ok`` (never ``normalization_pending``). Facets are built
@@ -296,7 +297,13 @@ def _claude_browse(
     ]
     filtered.sort(key=q._recent_sort_key, reverse=True)
     page_rows, page = q._paginate_rows(filtered, cursor=cursor, limit=limit)
-    return {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+    result = {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
+    if selected is not None:
+        selected_row = next(
+            (row for row in rows if row["conversation_key"] == selected), None)
+        if selected_row is not None:
+            result["selected"] = selected_row
+    return result
 
 
 # ── Claude adapter: detail with cursor translation (§5.6) ─────────────────────
@@ -620,6 +627,13 @@ def neutral_browse(
     migration 025 has not run); Claude routes to the adapter (always ``ok``).
     ``filters``: ``project_key``, ``model``, ``limit``, ``cursor``."""
     speed = effective_speed or _DEFAULT_SPEED
+    selected = filters.pop("selected", None)
+    if selected is not None:
+        selected_ref = resolve_conversation_ref(selected)
+        selected = (selected_ref.conversation_key
+                    if selected_ref is not None and selected_ref.source == source
+                    else None)
+    filters["selected"] = selected
     if source == "codex":
         return q.list_codex_conversations(conn, effective_speed=speed, **filters)
     if source == "claude":

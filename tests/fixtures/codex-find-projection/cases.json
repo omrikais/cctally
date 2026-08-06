@@ -114,6 +114,37 @@
         "text": "café Καλημέρα 😀",
         "leaves": [{"key": "t0", "start": 0, "end": 15}]
       }
+    },
+    {
+      "name": "context prose and visible diff rows",
+      "kind": "context",
+      "source": "Intro **needle**\n- Unstaged changes: diff --git a/src/x.py b/src/x.py\nindex a..b 100644\n--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1 @@\n-old needle\n+new needle\nAfter",
+      "expected": {
+        "text": "Intro needle\nUnstaged changes:\nold needle\nnew needle\nAfter",
+        "leaves": [
+          {"key": "segments.0.prose/t0", "start": 0, "end": 6},
+          {"key": "segments.0.prose/t1", "start": 6, "end": 12},
+          {"key": "segments.0.prose/t2", "start": 13, "end": 30},
+          {"key": "segments.1.files.0.hunks.0.rows.0", "start": 31, "end": 41},
+          {"key": "segments.1.files.0.hunks.0.rows.1", "start": 42, "end": 52},
+          {"key": "segments.2.prose/t0", "start": 53, "end": 58}
+        ]
+      }
+    },
+    {
+      "name": "context bundle provider tags",
+      "kind": "context",
+      "source": "# AGENTS.md instructions for /synthetic/root-a/project-red\n<INSTRUCTIONS>Synthetic agent instructions for the injected context bundle.</INSTRUCTIONS>\n<environment_context>Synthetic environment context.</environment_context>",
+      "expected": {
+        "text": "AGENTS.md instructions for /synthetic/root-a/project-red\n<INSTRUCTIONS>Synthetic agent instructions for the injected context bundle.</INSTRUCTIONS>\n<environmentcontext>Synthetic environment context.</environmentcontext>",
+        "leaves": [
+          {"key": "segments.0.prose/t0", "start": 0, "end": 56},
+          {"key": "segments.0.prose/t1", "start": 57, "end": 147},
+          {"key": "segments.0.prose/t2", "start": 148, "end": 160},
+          {"key": "segments.0.prose/t3", "start": 160, "end": 211},
+          {"key": "segments.0.prose/t4", "start": 211, "end": 219}
+        ]
+      }
     }
   ],
   "literalCases": [

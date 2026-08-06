@@ -401,25 +401,46 @@ def test_sibling_won_recovery_skips_redundant_publication(ns, monkeypatch):
     assert _live_state(core, jr) == (20.0, correction_high_water, "ok")
 
 
+_PINNED_READER = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('BEGIN')
+
+
+def snapshot():
+    row = conn.execute(
+        "SELECT (SELECT weekly_percent FROM weekly_usage_snapshots "
+        "        WHERE journal_id = 'sa:394'), "
+        "       (SELECT segment || '@' || offset FROM journal_cursor "
+        "        WHERE id = 1)"
+    ).fetchone()
+    return "%s|%s" % (row[0], row[1])
+
+
+print(snapshot(), flush=True)
+sys.stdin.readline()
+print(snapshot(), flush=True)
+sys.stdin.readline()
+"""
+
+
 @pytest.mark.parametrize("mode", ["authoritative", "opportunistic"])
-def test_live_reader_refusal_names_holder_and_leaves_no_scratch(
-    ns, mode
-):
+def test_live_reader_keeps_its_snapshot_and_leaves_no_scratch(ns, mode):
+    """#496 S3 replaced the refusal with snapshot isolation.
+
+    The correction rebuild used to be declined outright while any other
+    process held stats.db open, because the physical protocol renamed a scratch
+    over the live file. It now publishes transactionally into that file, so the
+    recovery completes, a reader pinned to a read transaction keeps the
+    generation it opened on, and — as before — no correction scratch survives.
+    """
     core, jr, journal = _siblings()
-    cursor_before, _commit = _strand_completed_correction(jr, journal)
+    cursor_before, correction_high_water = _strand_completed_correction(
+        jr, journal
+    )
+    pinned = "10.0|%s@%d" % (cursor_before[0], cursor_before[1])
     holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sqlite3,sys;"
-                "c=sqlite3.connect(sys.argv[1]);"
-                "c.execute('SELECT COUNT(*) FROM sqlite_master').fetchone();"
-                "print('READY',flush=True);"
-                "sys.stdin.read();c.close()"
-            ),
-            str(core.DB_PATH),
-        ],
+        [sys.executable, "-c", _PINNED_READER, str(core.DB_PATH)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -427,17 +448,18 @@ def test_live_reader_refusal_names_holder_and_leaves_no_scratch(
     )
     try:
         assert holder.stdout is not None
-        assert holder.stdout.readline().strip() == "READY"
-        if mode == "authoritative":
-            with pytest.raises(jr.CorrectionRecoveryError) as caught:
-                jr.run_stats_ingest(mode=mode)
-            message = str(caught.value)
-        else:
-            result = jr.run_stats_ingest(mode=mode)
-            message = str(result.error)
-        assert "stop the dashboard or other process" in message
-        assert "cctally db rebuild --db stats" in message
-        assert _live_state(core, jr) == (10.0, cursor_before, "ok")
+        assert holder.stdin is not None
+        assert holder.stdout.readline().strip() == pinned
+
+        result = jr.run_stats_ingest(mode=mode)
+
+        assert result.error is None
+        assert _live_state(core, jr) == (20.0, correction_high_water, "ok")
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == pinned, (
+            "the pinned reader must keep the generation it opened on"
+        )
         assert jr._correction_scratch_mains() == set()
     finally:
         if holder.stdin is not None:

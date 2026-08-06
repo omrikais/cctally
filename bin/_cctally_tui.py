@@ -2966,7 +2966,22 @@ def _tui_build_snapshot(
         # ``_tui_build_snapshot_once`` closes its live stats connection before
         # this boundary. The replacement-capable hook can therefore satisfy
         # the whole-family drain gate, and the retry opens the published family.
-        _tui_heal_post_query_stats(fault.cause)
+        #
+        # #496 S3 §6: the heal now DEFERS, and its signal is a
+        # `BaseException`. This call sits before the retry's own `except`, so
+        # the shared deferral base is caught AT the heal-call boundary and the
+        # corruption-typed degraded frame is built directly. The retry must not
+        # spin: after deferral the index is still corrupt, so a second attempt
+        # would only fail again, and the frame converges on a later tick.
+        try:
+            _tui_heal_post_query_stats(fault.cause)
+        except _cctally().StatsRebuildDeferred as deferred:
+            return _tui_stats_retry_degraded_snapshot(
+                now_utc=now_utc or dt.datetime.now(dt.timezone.utc),
+                exc=deferred,
+                precompute_envelope=precompute_envelope,
+                runtime_bind=runtime_bind,
+            )
         try:
             return _tui_build_snapshot_once(
                 now_utc=now_utc,
@@ -3279,6 +3294,8 @@ def _tui_build_snapshot_once(
                             runtime_bind=runtime_bind, raw_config=raw_config,
                             display_tz_pref_override=display_tz_pref_override,
                             source_stats_conn=conn,
+                            failures=sync_failures,
+                            stats_heal_attempted=stats_heal_attempted,
                             source_display_tz_name=(
                                 getattr(_build_display_tz, "key", None)
                                 if _build_display_tz is not None else None
@@ -4068,7 +4085,9 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                              codex_ingest_contended=False,
                              codex_ingest_failed=False,
                              claude_ingest_contended=False,
-                             claude_ingest_failed=False):
+                             claude_ingest_failed=False,
+                             failures=None,
+                             stats_heal_attempted=False):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
     time-derived fields + the doctor payload / envelope precompute on each idle
     tick (spec §3 idle path).
@@ -4108,6 +4127,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             envelope_precompute = _tui_precompute_envelope_config(raw_config)
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
             errors.append(f"envelope-precompute: {exc}")
+    idle_failures = failures if failures is not None else []
     source_bundle = prior.source_bundle
     if source_bundle is not None:
         try:
@@ -4180,15 +4200,36 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                     prior_bundle=source_bundle,
                     raw_config=raw_config,
                 )
+        except _StatsSnapshotCorruption:
+            raise
         except Exception as exc:  # noqa: BLE001 — retain prior complete bundle
-            errors.append(f"source-clock-refresh: {exc}")
+            # #496 S3 §8 (F16). This branch read stats through
+            # `source_stats_conn` and swallowed the failure into a plain
+            # string, so it built no `SyncFailureAttribution`, never raised
+            # `_StatsSnapshotCorruption`, and never reached the heal — and
+            # `_sync_failure_envelope`, finding no typed attribution, fell to
+            # its raw-text matcher and told the user to run
+            # `cctally cache-sync --rebuild` for a STATS fault. Classify it at
+            # the catch site instead, against the connection that faulted.
+            if source_stats_conn is not None:
+                _tui_capture_sync_failure(
+                    source_stats_conn,
+                    errors,
+                    idle_failures,
+                    leg="source-clock-refresh",
+                    database="stats_or_cache",
+                    exc=exc,
+                    stats_heal_attempted=stats_heal_attempted,
+                )
+            else:
+                errors.append(f"source-clock-refresh: {exc}")
             source_bundle = prior.source_bundle
     return dataclasses.replace(
         prior,
         generated_at=now_utc,
         last_sync_at=time.monotonic(),
         last_sync_error=("; ".join(errors) if errors else None),
-        sync_failures=(),
+        sync_failures=tuple(idle_failures),
         doctor_payload=doctor_payload,
         envelope_precompute=envelope_precompute,
         source_bundle=source_bundle,
@@ -6611,12 +6652,17 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             snap = dataclasses.replace(snap, last_sync_at=None, hydrating=False)
             ref.set(snap)
             hub.publish(snap)
-        except _cctally().StatsEpochRebuildDeferred as exc:
+        except _cctally().StatsRebuildDeferred as exc:
             # #453: the first periodic tick runs before HTTP bind. Preserve the
             # initial hydrating/degraded frame while the dedicated replay owns
             # stats maintenance; a generic crash frame would clear the latch
             # before any client could observe it. The loop retries normally on
             # its next cadence and publishes a full frame after convergence.
+            #
+            # #496 S3: the two deferral classes must NOT flatten here. A wrong
+            # EPOCH is a readable index (`corruption=False`); a deferred heal is
+            # an index that could not be read, and reporting that as
+            # non-corruption makes the envelope name the wrong fault.
             prev = ref.get()
             pending = dataclasses.replace(
                 prev,
@@ -6625,7 +6671,9 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     SyncFailureAttribution(
                         leg="stats-open",
                         database="stats",
-                        corruption=False,
+                        corruption=isinstance(
+                            exc, _cctally().StatsHealDeferred
+                        ),
                     ),
                 ),
                 generated_at=dt.datetime.now(dt.timezone.utc),
