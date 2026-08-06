@@ -242,6 +242,46 @@ def bootstrap_id(table: str, rowid: int) -> str:
     return f"b:{table}:{rowid}"
 
 
+def reusable_bootstrap_name(candidate_digest, candidate_size, existing):
+    """The already-published bootstrap segment a cutover may reuse verbatim.
+
+    `existing` is `(name, byte_length_or_None, sha256_hex_or_None)` for EVERY
+    published segment the caller found. A `None` digest means the caller did not
+    read that segment, which it does only when the length already differs; a
+    `None` length means it could not stat the file at all. Neither can match, and
+    reporting the segment anyway is required — see the ordering rule below.
+
+    Reuse requires the CANONICALLY NEWEST bootstrap to be the exact match, on
+    both length and digest. A crash-after-rename retry re-exports byte-identical
+    lines, so reusing that orphan makes the retry idempotent on disk instead of
+    only idempotent on fold (#496 S5 §3), and timestamps increase monotonically,
+    so the orphan an immediately-prior attempt left IS the newest bootstrap.
+
+    Reusing an older match instead would stamp the cursor behind a bootstrap the
+    cursor does not cover, and the next ingest would fold that stale bootstrap's
+    records into stats.db. Writing a fresh segment is the pre-reuse behaviour and
+    restores the pre-reuse invariant, because a minted name always sorts last.
+
+    Returns None when the newest bootstrap does not match, which covers the
+    ordinary first-cutover path, the genuinely-differing-export path, and the
+    stale-match path alike.
+    """
+    bootstraps = [
+        (name, size, digest)
+        for name, size, digest in existing
+        if name.startswith(BOOTSTRAP_PREFIX)
+    ]
+    if not bootstraps:
+        return None
+    name, size, digest = max(
+        bootstraps, key=lambda entry: segment_sort_key(entry[0]))
+    if size is None or digest is None:
+        return None
+    if size == candidate_size and digest == candidate_digest:
+        return name
+    return None
+
+
 def evt_id(kind: str, *parts: object) -> str:
     """Natural-key id for an evt line: ``"<kind>:" + ":".join(str(p) …)``.
 

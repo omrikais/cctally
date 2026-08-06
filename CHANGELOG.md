@@ -5,6 +5,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.92.3] - 2026-08-06
+
+### Changed
+- `cctally db journal-repair` and `cctally db rederive` now read the journal once per pass instead of two to four times, which lowers their memory use and start-up time on large journals. Their output is unchanged (#496).
+
+### Fixed
+- A crash while cctally was first converting its database to the journal format could leave a duplicate copy of the conversion file behind, and every later rebuild then read both copies. On one real install two such duplicates accounted for 366 MB, about a fifth of the journal. The conversion now reuses the most recent conversion file when that file is byte for byte what it was about to write, instead of writing a second copy; when the most recent file differs in any way it still writes its own. Existing duplicates are left untouched, because the journal is never rewritten (#496).
+
 ## [1.92.2] - 2026-08-06
 
 ### Changed

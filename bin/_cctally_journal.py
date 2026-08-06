@@ -243,7 +243,7 @@ def _load_quota_dedup_keys() -> None:
         _QUOTA_DEDUP_KEYS.clear()
 
     for name in list_segments():
-        with (journal_dir / name).open("rb") as fh:
+        with _open_segment_for_read(journal_dir / name) as fh:
             for raw in fh:
                 if not raw.endswith(b"\n"):
                     break
@@ -951,6 +951,24 @@ def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
 _SEGMENT_READ_CHUNK = 256 * 1024
 
 
+def _open_segment_for_read(seg_path):
+    """The single physical read boundary for a journal segment.
+
+    Both read routes go through here — the streaming line reader and the
+    prefix hasher — so a test can observe the exact sequence of segment opens
+    a pass performs. A per-pass line or byte counter cannot: it stays correct
+    while an implementation reopens a segment behind it, which is precisely the
+    hidden re-read this session removes (#496 S5 §4.2).
+
+    The cutover's bootstrap-reuse digest and the quota dedupe-index rebuild are
+    the module's other two read-only segment scans, and they come through here
+    as well, so "every physical read of a segment" is a property a test can
+    check rather than a claim in prose. The append path is deliberately NOT
+    routed here: it holds a read-write handle of its own for the torn-tail scan.
+    """
+    return open(seg_path, "rb")
+
+
 def _iter_segment_lines(seg_path, lo: int, hi: int, *, on_bytes=None):
     """Stream `(basename, absolute-offset, raw-line-without-newline)` for every
     complete line in `[lo, hi)`, holding at most one chunk plus one partial line
@@ -964,7 +982,7 @@ def _iter_segment_lines(seg_path, lo: int, hi: int, *, on_bytes=None):
     including a torn trailing partial line that is never yielded.
     """
     name = seg_path.name
-    with open(seg_path, "rb") as fh:
+    with _open_segment_for_read(seg_path) as fh:
         fh.seek(lo)
         pos = lo
         buf = b""
@@ -1051,7 +1069,13 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
 
 
 def journal_prefix_hash(high_water) -> "str | None":
-    """Hash exact raw segment bytes through one canonical high-water."""
+    """Hash exact raw segment bytes through one canonical high-water.
+
+    The framing is durable: per segment, the 4-byte big-endian name length, the
+    name, the 8-byte big-endian data length, then the data. These digests are
+    recorded inside `journal_protocol_resolution` payloads, so a change to the
+    framing invalidates every acknowledgement already written.
+    """
     if high_water is None:
         return None
     digest = hashlib.sha256()
@@ -1059,7 +1083,8 @@ def journal_prefix_hash(high_water) -> "str | None":
     for segment in list_segments():
         path = _cctally_core.JOURNAL_DIR / segment
         size = high_water[1] if segment == high_water[0] else path.stat().st_size
-        data = path.read_bytes()[:size]
+        with _open_segment_for_read(path) as handle:
+            data = handle.read(size)
         if len(data) != size:
             raise OSError(f"journal segment changed while reading: {segment}")
         name = segment.encode("utf-8")
@@ -6706,19 +6731,14 @@ def _cutover_segment_name(now_utc: dt.datetime) -> str:
     return f"{_lib_journal.BOOTSTRAP_PREFIX}{ts}.jsonl"
 
 
-def _write_bootstrap_segment(seg_name: str, lines: list) -> int:
-    """Materialize the bootstrap segment atomically (spec §8 rename-then-stamp):
-    encode all lines, write to a `.partial` sibling, fsync file + dir, verify the
-    line count, then `os.replace` into `seg_name`. Returns the final byte size.
-    Every line must fit the torn-tail window (append discipline)."""
-    journal_dir = _cctally_core.JOURNAL_DIR
-    dir_created = not journal_dir.exists()
-    journal_dir.mkdir(parents=True, exist_ok=True)
-    if dir_created:
-        try:
-            os.chmod(journal_dir, 0o700)
-        except OSError:
-            pass
+def _encode_bootstrap_lines(lines: list) -> bytes:
+    """The cutover export as one verified blob (spec §8 verify step).
+
+    Encoding is separated from writing because `run_cutover` digests the blob
+    before it decides whether a byte-identical segment already exists (#496 S5
+    §3). Encoding twice would compute the reuse digest over a different object
+    than the one written, so this is the single encode both uses.
+    """
     encoded = []
     for rec in lines:
         data = _lib_journal.encode_line(rec)
@@ -6731,6 +6751,81 @@ def _write_bootstrap_segment(seg_name: str, lines: list) -> int:
     if blob.count(b"\n") != len(lines):
         raise JournalError(
             "cutover export line count mismatch (spec §8 verify step)")
+    return blob
+
+
+def _reusable_bootstrap(candidate_digest: str, candidate_size: int):
+    """`(name, size)` of a published bootstrap identical to the candidate blob.
+
+    Every published bootstrap is REPORTED, because `reusable_bootstrap_name`
+    refuses a match that is not the canonically newest one; only segments whose
+    byte length already equals the candidate's are READ, so the comparison costs
+    one pass over the same-size candidates rather than one over the journal.
+    `list_segments` excludes `.partial` files, so a cutover that is still writing
+    can never be reused (#496 S5 §3). A segment whose length cannot be read is
+    reported with a `None` length rather than dropped, which refuses reuse
+    instead of promoting an older segment to canonically newest.
+    """
+    journal_dir = _cctally_core.JOURNAL_DIR
+    if not journal_dir.exists():
+        return None
+    existing = []
+    for name in list_segments():
+        if not name.startswith(_lib_journal.BOOTSTRAP_PREFIX):
+            continue
+        path = journal_dir / name
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            # Report it anyway. Dropping the entry would let an OLDER match
+            # look canonically newest, which is the reuse this scan refuses.
+            existing.append((name, None, None))
+            continue
+        if size != candidate_size:
+            existing.append((name, size, None))
+            continue
+        digest = hashlib.sha256()
+        with _open_segment_for_read(path) as handle:
+            while True:
+                chunk = handle.read(_SEGMENT_READ_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        existing.append((name, size, digest.hexdigest()))
+    name = _lib_journal.reusable_bootstrap_name(
+        candidate_digest, candidate_size, existing)
+    return None if name is None else (name, candidate_size)
+
+
+def _fsync_published_segment(seg_name: str) -> None:
+    """Make an already-renamed segment and its directory entry durable.
+
+    `_write_bootstrap_segment` establishes this for a segment it writes itself.
+    A reused segment was published by a different attempt, which may have
+    crashed anywhere in that sequence, so the reuse path repeats the file and
+    directory fsyncs before anything durable is allowed to name the file.
+    """
+    journal_dir = _cctally_core.JOURNAL_DIR
+    fd = os.open(str(journal_dir / seg_name), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir(journal_dir)
+
+
+def _write_bootstrap_segment(seg_name: str, blob: bytes) -> int:
+    """Materialize the bootstrap segment atomically (spec §8 rename-then-stamp):
+    write the verified blob to a `.partial` sibling, fsync file + dir, then
+    `os.replace` into `seg_name`. Returns the final byte size."""
+    journal_dir = _cctally_core.JOURNAL_DIR
+    dir_created = not journal_dir.exists()
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    if dir_created:
+        try:
+            os.chmod(journal_dir, 0o700)
+        except OSError:
+            pass
     partial = journal_dir / (seg_name + ".partial")
     fd = os.open(str(partial), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -6759,7 +6854,14 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
     commit rolls the whole thing back (the legacy DB stays fully usable); the
     next open retries idempotently (stable bootstrap ids). A truly empty install
     (nothing to export) just stamps the epoch — no bootstrap file. Returns the
-    bootstrap segment basename, or None when nothing was exported."""
+    bootstrap segment basename, or None when nothing was exported.
+
+    A crash between the `os.replace` and the commit leaves a published segment
+    the rolled-back transaction never referenced. The retry re-exports the same
+    rows byte for byte, so it reuses that orphan rather than publishing a twin
+    (#496 S5 §3) — the retry is now idempotent on disk, not only on fold. When
+    the retry's export genuinely differs, no digest matches and a new segment is
+    written exactly as before."""
     if now_utc is None:
         now_utc = dt.datetime.now(dt.timezone.utc)
     epoch = _cctally_core.STATS_INDEX_EPOCH
@@ -6781,8 +6883,19 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
             conn.commit()
             return None
 
-        seg_name = _cutover_segment_name(now_utc)
-        seg_size = _write_bootstrap_segment(seg_name, lines)
+        blob = _encode_bootstrap_lines(lines)
+        reuse = _reusable_bootstrap(
+            hashlib.sha256(blob).hexdigest(), len(blob))
+        if reuse is None:
+            seg_name = _cutover_segment_name(now_utc)
+            seg_size = _write_bootstrap_segment(seg_name, blob)
+        else:
+            seg_name, seg_size = reuse
+            # The adopted segment was renamed by ANOTHER attempt, whose rename
+            # may still be only in the page cache. The cursor stamped below is
+            # made durable by SQLite's own commit fsync, so without this the
+            # index could name a bootstrap that a power loss then leaves absent.
+            _fsync_published_segment(seg_name)
 
         for table, rowid in stamp:
             conn.execute(

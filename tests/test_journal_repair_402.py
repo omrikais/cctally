@@ -1,6 +1,7 @@
 """#402 Task B — audited append-only structural protocol repair."""
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -11,9 +12,13 @@ import sqlite3
 import subprocess
 import time
 import urllib.request
+import weakref
 
 import _lib_journal as journal
+import journal_fixture_496_s5 as S5
 import pytest
+
+from conftest import load_script, redirect_paths
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -1439,3 +1444,383 @@ def test_live_dashboard_reader_keeps_its_snapshot_then_retry_converges(tmp_path)
     assert retry_payload["auditId"] == payload["auditId"]
     audits = [record for _segment, record in _journal_repair_audits(journal_dir)]
     assert len(audits) == 1
+
+
+# ==========================================================================
+# #496 S5 — the streaming prefix conversion
+#
+# `_read_prefix` materialized every raw line and then every decoded record,
+# `_prefix_hash` traversed the prefix a second time, each resolution op made
+# `journal_prefix_hash` traverse it again, and the already-resolved recovery
+# branch traversed it once more through `_audit_high_water`. The conversion
+# folds all of that into one pinned streaming pass, so nothing about the
+# command's output may move.
+# ==========================================================================
+
+#: `db journal-repair --json` over `journal_fixture_496_s5.build_tainted`,
+#: captured from the PRE-CHANGE implementation at a48ff6b3b. Written out as a
+#: literal rather than recomputed, because a value recomputed by the code under
+#: test proves only that the code agrees with itself. Every acknowledgement
+#: fingerprint here hashes the selector's `enumerate` sequence numbers, and each
+#: is named by name from a durable `journal_protocol_resolution` op, so a shift
+#: in any of them would make an acknowledged violation unresolvable forever.
+S5_BASELINE_PREVIEW = {
+    "acknowledgedViolations": [
+        {
+            "auditId": "o:164552927507c250",
+            "batchId": "batch:ack-one",
+            "evidence": {
+                "commitRecordHash": (
+                    "sha256:35897a1a574e43647e417eed774635fd2ec96cb2840db35c"
+                    "302e183cecc3164e"
+                ),
+                "commitSequence": 4,
+            },
+            "fingerprint": (
+                "sha256:afcc566bae2a0a9493b27307684e1e2d455adb7c2aac2366d703"
+                "a8e3175c12d2"
+            ),
+            "journalHighWater": {
+                "offset": 492,
+                "segment": "observations-2026-08.jsonl",
+            },
+            "journalPrefixHash": (
+                "sha256:842c1a606f53b7cb758690f01cd0e316aae8fd59658d6453152d"
+                "198bea754156"
+            ),
+            "kind": "commit_without_begin",
+        },
+        {
+            "auditId": "o:688ae94a78b63582",
+            "batchId": "batch:ack-two",
+            "evidence": {
+                "commitRecordHash": (
+                    "sha256:e22dd608fa2bf093c30039c23c87827c4b983afc27e70596"
+                    "6971dc7b57767078"
+                ),
+                "commitSequence": 6,
+            },
+            "fingerprint": (
+                "sha256:d2a3c3a6d518a501257cf1b146766c57d7bdbcd15d7b76a47470"
+                "1cbc1a5db504"
+            ),
+            "journalHighWater": {
+                "offset": 968,
+                "segment": "observations-2026-08.jsonl",
+            },
+            "journalPrefixHash": (
+                "sha256:09e0adafcd83ed4e160d1bbbdcac6f97ad2832c289b0c0ab89fc"
+                "32d985d9a94f"
+            ),
+            "kind": "commit_without_begin",
+        },
+    ],
+    "auditId": None,
+    "errors": [],
+    "journalHighWater": {
+        "offset": 1116,
+        "segment": "observations-2026-09.jsonl",
+    },
+    "journalPrefixHash": (
+        "sha256:092e517cd9560221590ff91264300a94f4895fe914ff8f55970cadc51b8e"
+        "d472"
+    ),
+    "rebuild": None,
+    "schemaVersion": 1,
+    "selectedViolations": [],
+    "status": "preview",
+    "unacknowledgedViolations": [
+        {
+            "batchId": "batch:unack",
+            "evidence": {
+                "commitRecordHash": (
+                    "sha256:4d75179a0565d5509b6389a013f525b5fa4e9f3c6df446a3"
+                    "e9774378fdea2857"
+                ),
+                "commitSequence": 9,
+            },
+            "fingerprint": (
+                "sha256:4b3bd585f4189e9ea6b79f33c3971953b526b9b7801f31ba0b9d"
+                "9a8fdc40500a"
+            ),
+            "kind": "commit_without_begin",
+        },
+    ],
+}
+
+#: The requested order the baseline used: the unacknowledged fingerprint first,
+#: then the two acknowledged ones. `selectedViolations` preserves request order,
+#: so this pins the ordering too.
+S5_REQUESTED_FINGERPRINTS = (
+    S5_BASELINE_PREVIEW["unacknowledgedViolations"][0]["fingerprint"],
+    S5_BASELINE_PREVIEW["acknowledgedViolations"][0]["fingerprint"],
+    S5_BASELINE_PREVIEW["acknowledgedViolations"][1]["fingerprint"],
+)
+
+#: The pre-change `_audit_high_water` answer for both audit records, and for
+#: each one alone. The conversion derives these from the streaming pass instead
+#: of re-reading the prefix, so they are pinned separately from the payload.
+S5_RECOVERY_HIGH_WATER = ("observations-2026-09.jsonl", 476)
+S5_RECOVERY_HIGH_WATER_BY_AUDIT = {
+    "o:164552927507c250": ("observations-2026-08.jsonl", 968),
+    "o:688ae94a78b63582": ("observations-2026-09.jsonl", 476),
+}
+
+
+def _selected_violation(fingerprint):
+    for item in (
+        *S5_BASELINE_PREVIEW["unacknowledgedViolations"],
+        *S5_BASELINE_PREVIEW["acknowledgedViolations"],
+    ):
+        if item["fingerprint"] == fingerprint:
+            return {
+                key: value
+                for key, value in item.items()
+                if key not in ("auditId", "journalHighWater",
+                               "journalPrefixHash")
+            }
+    raise AssertionError(fingerprint)
+
+
+def test_s5_repair_preview_is_byte_identical_to_the_pre_change_baseline(
+    tmp_path,
+):
+    app_dir = tmp_path / "s5-equivalence"
+    S5.build_tainted(app_dir, seed_cache=False)
+
+    result = _run(app_dir, "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == S5_BASELINE_PREVIEW
+
+    selected = _run(
+        app_dir,
+        "--json",
+        *(arg for fp in S5_REQUESTED_FINGERPRINTS
+          for arg in ("--violation", fp)),
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert json.loads(selected.stdout) == {
+        **S5_BASELINE_PREVIEW,
+        "selectedViolations": [
+            _selected_violation(fp) for fp in S5_REQUESTED_FINGERPRINTS
+        ],
+    }
+
+
+@pytest.fixture
+def s5_repair(tmp_path, monkeypatch):
+    """The S5 fixture in-process, with every segment open recorded in order."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_journal_repair as repair
+
+    built = S5.build_tainted(_cctally_core.APP_DIR, seed_cache=False)
+    real = jr._open_segment_for_read
+    opened: list[str] = []
+
+    def record(seg_path):
+        opened.append(pathlib.Path(seg_path).name)
+        return real(seg_path)
+
+    monkeypatch.setattr(jr, "_open_segment_for_read", record)
+    return {"built": built, "opened": opened, "repair": repair, "jr": jr}
+
+
+def test_one_selection_snapshot_opens_each_segment_exactly_once(s5_repair):
+    """Before the conversion this snapshot opened the three segments ten times:
+    once each for the materialized read, twice more for each of the two
+    resolution ops' `journal_prefix_hash` re-reads, and three more for the
+    separate `_prefix_hash` pass."""
+    repair, opened = s5_repair["repair"], s5_repair["opened"]
+    opened.clear()
+    snapshot = repair._selection_snapshot()
+    selection = snapshot.selection
+
+    assert opened == list(S5.SEGMENTS), (
+        "a selection snapshot must open each segment through the seam exactly "
+        "once, in canonical order"
+    )
+    assert snapshot.high_water == s5_repair["built"]["high_water"]
+    assert snapshot.prefix_hash == S5_BASELINE_PREVIEW["journalPrefixHash"]
+    assert [
+        item.fingerprint for item in selection.protocol_violations
+    ] == [
+        item["fingerprint"]
+        for item in S5_BASELINE_PREVIEW["unacknowledgedViolations"]
+    ]
+    assert [
+        item.fingerprint for item in selection.acknowledged_protocol_violations
+    ] == [
+        item["fingerprint"]
+        for item in S5_BASELINE_PREVIEW["acknowledgedViolations"]
+    ]
+
+    assert snapshot.audit_ends == {
+        audit_id: coordinate
+        for audit_id, coordinate in S5_RECOVERY_HIGH_WATER_BY_AUDIT.items()
+    }
+
+
+def test_the_prefix_hasher_is_released_before_the_normalization_loop(
+    tmp_path, monkeypatch
+):
+    """`PrefixHashAccumulator` buffers the segment it is reading — 410 MB on the
+    maintainer's journal — and `rebuild_stats_index` drops it the moment its pass
+    ends, before it walks the decoded records. This pass must do the same, or
+    that buffer stays resident across the whole normalization loop.
+
+    Residency is not visible in any output, so this asserts it structurally: by
+    the time the first record is normalized, the accumulator must already be
+    unreachable.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_journal_repair as repair
+    import _lib_journal_router as router
+
+    S5.build_tainted(_cctally_core.APP_DIR, seed_cache=False)
+
+    class _Tracked(router.PrefixHashAccumulator):
+        """A weak-referenceable accumulator, otherwise the real one."""
+
+    made: list = []
+
+    def _factory(*args, **kwargs):
+        accumulator = _Tracked(*args, **kwargs)
+        made.append(weakref.ref(accumulator))
+        return accumulator
+
+    monkeypatch.setattr(router, "PrefixHashAccumulator", _factory)
+
+    live: list = []
+    real_normalize = jr._normalize_legacy_account_stamp
+
+    def _normalize(record, account):
+        live.append([ref() is not None for ref in made])
+        return real_normalize(record, account)
+
+    monkeypatch.setattr(jr, "_normalize_legacy_account_stamp", _normalize)
+
+    records, _evidence, prefix_hash, _ends = repair._read_prefix(
+        repair._read_only_high_water())
+    assert records and prefix_hash, "the pass must have produced both"
+    assert made, "the accumulator factory was never reached"
+    assert live, "no record was normalized, so nothing was observed"
+    assert all(alive == [False] * len(made) for alive in live), (
+        "the prefix hasher was still reachable while records were normalized"
+    )
+
+
+def test_a_cutover_op_in_the_prefix_resolves_the_same_legacy_account(
+    tmp_path, monkeypatch
+):
+    """The streaming pass captures the cutover op inline instead of calling
+    `resolve_cutover_claude_account`, which scanned every segment again.
+
+    COVERAGE BOUND: this exercises AGREEMENT over one pinned prefix — the op is
+    appended before `_read_only_high_water` pins the high-water, so both readers
+    see it. It cannot observe the one residual divergence, the TOCTOU window
+    between pinning the high-water and the streaming loop, where an op appended
+    inside that window used to be found by the whole-journal scan and now is
+    not. That case is accepted behaviour (see `_read_prefix`), so this test is
+    not evidence for the general equivalence of the two readers."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_journal_repair as repair
+
+    S5.build_tainted(_cctally_core.APP_DIR, seed_cache=False)
+    cutover = journal.make_op(
+        at="2026-07-27T05:00:00Z",
+        src="accounts-cutover",
+        payload={"kind": "accounts_cutover",
+                 "claude_legacy_account": "acct-legacy-claude"},
+    )
+    cutover["id"] = jr.CUTOVER_OP_ID
+    legacy = journal.make_obs(
+        at="2026-07-27T05:30:00Z", src="record-usage", provider="claude",
+        payload={"captured_at": "2026-07-27T05:30:00Z", "source": "statusline",
+                 "weekly_percent": 5.0},
+    )
+    with open(_cctally_core.JOURNAL_DIR / S5.SEG_C, "ab") as handle:
+        handle.write(journal.encode_line(cutover))
+        handle.write(journal.encode_line(legacy))
+
+    assert jr.resolve_cutover_claude_account() == "acct-legacy-claude"
+    records, _evidence, _hash, _ends = repair._read_prefix(
+        repair._read_only_high_water())
+    stamped = [
+        record for record in records if record.get("id") == legacy["id"]
+    ]
+    assert len(stamped) == 1
+    assert stamped[0]["account"] == "acct-legacy-claude"
+
+
+def test_the_recovery_coordinate_costs_no_further_traversal(s5_repair):
+    repair, opened = s5_repair["repair"], s5_repair["opened"]
+    snapshot = repair._selection_snapshot()
+    opened.clear()
+    assert repair._recovery_high_water(
+        set(S5_RECOVERY_HIGH_WATER_BY_AUDIT), snapshot.audit_ends
+    ) == S5_RECOVERY_HIGH_WATER
+    assert opened == [], (
+        "the recovery coordinate must come from the pass that already ran"
+    )
+
+
+class _StubRebuildResult:
+    """Just enough of a `RebuildResult` for `_rebuild_dict` to render."""
+
+    segments_read = 0
+    lines_folded = 0
+    malformed = 0
+    duration_s = 0.0
+    rows_by_table: dict = {}
+    conflicts: tuple = ()
+    protocol_violations: tuple = ()
+    acknowledged_protocol_violations: tuple = ()
+
+
+def test_the_whole_recovery_command_takes_no_extra_prefix_traversal(
+    s5_repair, monkeypatch, capsys
+):
+    """Criterion 6 counts EVERY traversal the command performs, not one per
+    snapshot. A per-snapshot phrasing is exactly what would have let
+    `_audit_high_water`'s fourth traversal survive unnoticed, so this drives the
+    already-resolved recovery branch end to end and counts every open.
+
+    The rebuild itself is stubbed: it is a separate concern with its own pinned
+    read pass, and leaving it in would attribute its opens to this command's
+    prefix handling.
+    """
+    repair, opened, jr = (
+        s5_repair["repair"], s5_repair["opened"], s5_repair["jr"])
+    rebuilt = []
+
+    def _stub_rebuild(*, context, high_water, update_quota_cache,
+                      before_swap=None):
+        rebuilt.append(high_water)
+        return _StubRebuildResult()
+
+    monkeypatch.setattr(jr, "rebuild_stats_index", _stub_rebuild)
+
+    fingerprint = S5_BASELINE_PREVIEW["acknowledgedViolations"][1][
+        "fingerprint"]
+    audit_id = S5_BASELINE_PREVIEW["acknowledgedViolations"][1]["auditId"]
+    opened.clear()
+    returncode = repair.cmd_db_journal_repair(
+        argparse.Namespace(violation=[fingerprint], yes=True, json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert returncode == 0, payload
+    assert payload["status"] == "recovered"
+    assert payload["auditId"] == audit_id
+    assert rebuilt == [S5_RECOVERY_HIGH_WATER_BY_AUDIT[audit_id]]
+    # Three legitimate selection snapshots: the unlocked preview, the revalidated
+    # preview under the repair lock, and the final preview after the rebuild.
+    assert opened == list(S5.SEGMENTS) * 3, opened

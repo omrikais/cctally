@@ -1086,3 +1086,211 @@ def test_rederive_clears_quarantined_same_revision_conflicts(
     noop = json.loads(capsys.readouterr().out)
     assert noop["status"] == "no-op"
     assert noop["journalConflicts"] == []
+
+
+# ==========================================================================
+# #496 S5 — the streaming prefix conversion
+#
+# `read_rederive_journal_prefix` materialized every raw line and then every
+# decoded record, and `_protocol_prefix_evidence` then walked the result again,
+# making `journal_prefix_hash` re-read the whole prefix once per resolution op.
+# The conversion folds all of that into one pinned streaming pass. Retention is
+# deliberately unchanged: the planner needs every decoded record.
+# ==========================================================================
+
+#: `db rederive --family claude-usage --json` over the two S5 fixtures,
+#: captured from the PRE-CHANGE implementation at a48ff6b3b. Literals, not
+#: recomputations: a value the code under test produced for both sides of an
+#: equality proves only that it agrees with itself.
+S5_CLEAN_BASELINE = {
+    "actionCounts": {"add": 6, "retain": 0, "supersede": 0, "tombstone": 0},
+    "batchId": (
+        "rederive:claude-usage:d871795ee622ea4c0133faf20d0ce81d0f7cbd9bcba413"
+        "d9e48c9e43d5ebe280"
+    ),
+    "conflicts": [],
+    "dataGaps": [],
+    "errors": [],
+    "family": "claude-usage",
+    "journalConflicts": [],
+    "journalHighWater": {
+        "offset": 248,
+        "segment": "observations-2026-08.jsonl",
+    },
+    "noOp": False,
+    "planHash": (
+        "sha256:67d494243ccd64b24dcfdfb193f440645ab8ecb788451d9c0833d57d0eb28"
+        "b1d"
+    ),
+    "preservedEventCount": 0,
+    "rebuild": None,
+    "schemaVersion": 1,
+    "status": "preview",
+}
+
+S5_TAINTED_BASELINE = {
+    "actionCounts": {"add": 0, "retain": 0, "supersede": 0, "tombstone": 0},
+    "batchId": None,
+    "conflicts": [
+        "journal contains tainted correction batch(es): "
+        "batch:unack:commit_without_begin, "
+        "batch:ack-one:commit_without_begin, "
+        "batch:ack-two:commit_without_begin"
+    ],
+    "dataGaps": [],
+    "errors": [],
+    "family": "claude-usage",
+    "journalConflicts": [],
+    "journalHighWater": {
+        "offset": 1116,
+        "segment": "observations-2026-09.jsonl",
+    },
+    "noOp": False,
+    "planHash": None,
+    "preservedEventCount": 0,
+    "rebuild": None,
+    "schemaVersion": 1,
+    "status": "conflict",
+}
+
+
+def _s5_module(tmp_path, monkeypatch, builder):
+    """The isolated CLI module over one S5 fixture, plus an open recorder."""
+    import journal_fixture_496_s5 as S5
+
+    mod = _isolated(tmp_path, monkeypatch)
+    import _cctally_core
+    import _cctally_journal as jr
+
+    built = builder(_cctally_core.APP_DIR)
+    real = jr._open_segment_for_read
+    opened: list[str] = []
+
+    def record(seg_path):
+        opened.append(pathlib.Path(seg_path).name)
+        return real(seg_path)
+
+    monkeypatch.setattr(jr, "_open_segment_for_read", record)
+    return mod, opened, built, S5
+
+
+def test_s5_rederive_plan_is_byte_identical_to_the_pre_change_baseline(
+    tmp_path, monkeypatch, capsys
+):
+    import journal_fixture_496_s5 as S5
+
+    mod, opened, _built, _S5 = _s5_module(tmp_path, monkeypatch, S5.build_clean)
+    assert mod.cmd_db_rederive(_args()) == 0
+    assert json.loads(capsys.readouterr().out) == S5_CLEAN_BASELINE
+
+
+def test_s5_rederive_refuses_the_tainted_prefix_identically(
+    tmp_path, monkeypatch, capsys
+):
+    import journal_fixture_496_s5 as S5
+
+    mod, _opened, _built, _S5 = _s5_module(
+        tmp_path, monkeypatch, S5.build_tainted)
+    assert mod.cmd_db_rederive(_args()) == 2
+    assert json.loads(capsys.readouterr().out) == S5_TAINTED_BASELINE
+
+
+def test_a_rederive_preview_opens_each_segment_exactly_once(
+    tmp_path, monkeypatch, capsys
+):
+    """Before the conversion each of the fixture's two resolution ops made
+    `journal_prefix_hash` re-read the prefix from byte zero, so this preview
+    opened the three segments seven times rather than three."""
+    import journal_fixture_496_s5 as S5
+
+    mod, opened, _built, _S5 = _s5_module(
+        tmp_path, monkeypatch, S5.build_tainted)
+    opened.clear()
+    assert mod.cmd_db_rederive(_args()) == 2
+    capsys.readouterr()
+    assert opened == list(S5.SEGMENTS), (
+        "a rederive preview must open each segment through the seam exactly "
+        "once, in canonical order"
+    )
+
+
+def test_rederive_keeps_every_decoded_record(tmp_path, monkeypatch):
+    """The rebuild drops all but the decision records and substitutes `None`
+    placeholders. Rederive must NOT: its planner reads the observations for
+    cache validation and desired-event derivation, and walks the list in
+    parallel with `record_ends`."""
+    import journal_fixture_496_s5 as S5
+
+    mod, _opened, built, _S5 = _s5_module(
+        tmp_path, monkeypatch, S5.build_tainted)
+    records, high_water, record_ends = mod.read_rederive_journal_prefix()[:3]
+    assert high_water == built["high_water"]
+    assert len(records) == len(built["records"])
+    assert all(isinstance(record, dict) for record in records)
+    assert [record["id"] for record in records] == [
+        record["id"] for record in built["records"]
+    ]
+    assert len(record_ends) == len(records)
+    # The last record ends at the pinned high-water, which is what makes
+    # `record_ends` usable as a commit coordinate.
+    assert record_ends[-1] == built["high_water"]
+
+
+class _StubRebuildResult:
+    """Just enough of a `RebuildResult` for `_rebuild_dict` to render."""
+
+    segments_read = 0
+    lines_folded = 0
+    malformed = 0
+    duration_s = 0.0
+    rows_by_table: dict = {}
+
+
+def test_a_rederive_preview_that_produces_a_plan_opens_each_segment_once(
+    tmp_path, monkeypatch, capsys
+):
+    """The traversal test above drives the TAINTED fixture, where
+    `plan_claude_usage` returns 2 straight after the read, so it never reaches
+    the path that produces a plan. This one does."""
+    import journal_fixture_496_s5 as S5
+
+    mod, opened, built, _S5 = _s5_module(tmp_path, monkeypatch, S5.build_clean)
+    opened.clear()
+    assert mod.cmd_db_rederive(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "preview"
+    assert payload["actionCounts"]["add"] == 6, payload
+    assert opened == list(built["segments"]), opened
+
+
+def test_the_whole_rederive_apply_takes_one_prefix_traversal(
+    tmp_path, monkeypatch, capsys
+):
+    """`apply_db_rederive` takes its OWN selection snapshot, which no preview
+    test reaches. Counting the whole command is what the spec's criterion 6
+    asks for, so this drives `--yes` end to end and counts every open.
+
+    The rebuild is stubbed: it pins its own high-water and reads the prefix
+    again by design, and leaving it in would attribute its opens to this
+    command's prefix handling."""
+    import journal_fixture_496_s5 as S5
+
+    mod, opened, built, _S5 = _s5_module(tmp_path, monkeypatch, S5.build_clean)
+    import _cctally_journal as jr
+
+    rebuilt = []
+
+    def _stub_rebuild(*, context, high_water, update_quota_cache,
+                      before_swap=None):
+        rebuilt.append(high_water)
+        return _StubRebuildResult()
+
+    monkeypatch.setattr(jr, "rebuild_stats_index", _stub_rebuild)
+    opened.clear()
+    assert mod.cmd_db_rederive(_args(yes=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "applied", payload
+    assert len(rebuilt) == 1, rebuilt
+    # One snapshot: the apply path's own. The correction append writes through
+    # the leaf lock's read-write handle, which is deliberately not this seam.
+    assert opened == list(built["segments"]), opened

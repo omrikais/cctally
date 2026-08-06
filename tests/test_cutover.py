@@ -22,6 +22,7 @@ engaged (len(_STATS_MIGRATIONS) == 13).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
 import sqlite3
 
@@ -45,6 +46,12 @@ def _core():
 def _jr():
     import _cctally_journal
     return _cctally_journal
+
+
+def _lib_journal():
+    """The pure journal kernel, imported the way `_core()` and `_jr()` do."""
+    import _lib_journal as module
+    return module
 
 
 class _TrackedConnection(sqlite3.Connection):
@@ -575,6 +582,74 @@ def test_reader_output_byte_identical_pre_post_cutover_broadened(
 
 
 # ==========================================================================
+# #496 S5 — exact-equivalent bootstrap reuse (the pure predicate)
+# ==========================================================================
+
+def test_reusable_bootstrap_name_returns_none_without_an_exact_match():
+    jl = _lib_journal()
+    existing = [
+        ("bootstrap-20260101T000000_000000.jsonl", 100, "a" * 64),
+        ("bootstrap-20260102T000000_000000.jsonl", 200, "b" * 64),
+    ]
+    # Only the newest entry is ever considered, so each refusal below is decided
+    # against the 200-byte "b" segment and never against the older "a" one.
+    assert jl.reusable_bootstrap_name("c" * 64, 100, existing) is None
+    # the newest length differs, so the digest is never reached
+    assert jl.reusable_bootstrap_name("b" * 64, 100, existing) is None
+    # the newest length agrees and the digest does not
+    assert jl.reusable_bootstrap_name("a" * 64, 200, existing) is None
+
+
+def test_reusable_bootstrap_name_returns_the_newest_bootstrap_when_it_matches():
+    jl = _lib_journal()
+    existing = [
+        ("bootstrap-20260101T000000_000000.jsonl", 100, "a" * 64),
+        ("bootstrap-20260103T000000_000000.jsonl", 100, "a" * 64),
+        ("bootstrap-20260102T000000_000000.jsonl", 100, "a" * 64),
+    ]
+    assert jl.reusable_bootstrap_name("a" * 64, 100, existing) == (
+        "bootstrap-20260103T000000_000000.jsonl"
+    )
+
+
+def test_reusable_bootstrap_name_ignores_non_bootstrap_entries():
+    jl = _lib_journal()
+    existing = [("observations-2026-01.jsonl", 100, "a" * 64)]
+    assert jl.reusable_bootstrap_name("a" * 64, 100, existing) is None
+
+
+def test_reusable_bootstrap_name_refuses_a_match_behind_a_newer_bootstrap():
+    """Reuse is refused unless the match is also the canonically NEWEST
+    bootstrap on disk.
+
+    Stamping the cursor at an older match would leave the newer bootstrap
+    outside the cursor, and the next ingest would then fold that stale
+    bootstrap's records into stats.db. Writing a fresh segment instead restores
+    the pre-reuse invariant, where the minted name always sorted last.
+
+    The caller reports EVERY published bootstrap, using `None` as the digest for
+    one it did not read because the length already differed.
+    """
+    jl = _lib_journal()
+    older = "bootstrap-20260101T000000_000000.jsonl"
+    newer = "bootstrap-20260102T000000_000000.jsonl"
+    existing = [(older, 100, "a" * 64), (newer, 55, None)]
+    assert jl.reusable_bootstrap_name("a" * 64, 100, existing) is None
+    # The identical older segment IS reused once it is the newest on disk, so
+    # the refusal above is about the ordering and not about the match itself.
+    assert jl.reusable_bootstrap_name("a" * 64, 100, existing[:1]) == older
+    # A newer bootstrap that DOES match is reused, digest and length agreeing.
+    assert jl.reusable_bootstrap_name(
+        "b" * 64, 55, [(older, 100, "a" * 64), (newer, 55, "b" * 64)]
+    ) == newer
+    # A newer bootstrap the caller could not stat carries a `None` length, and
+    # refuses reuse for the same reason: it is unknown, not absent.
+    assert jl.reusable_bootstrap_name(
+        "a" * 64, 100, [(older, 100, "a" * 64), (newer, None, None)]
+    ) is None
+
+
+# ==========================================================================
 # ITEM 3.4 — retry-safety at each crash point
 # ==========================================================================
 
@@ -649,16 +724,29 @@ def test_crash_after_rename_mid_txn_rolls_back_and_retries(ns, monkeypatch):
         core.open_db()
     # the bootstrap file was renamed into place (a harmless orphan), but the
     # journal_id stamps + epoch bump rolled back.
-    assert any(s.startswith("bootstrap-") for s in jr.list_segments())
+    orphans = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(orphans) == 1, orphans
     _legacy_still_functional(core)
     monkeypatch.setattr(jr, "_write_cursor", real_write_cursor)
-    conn = core.open_db()  # retry -> a second bootstrap, idempotent
+    conn = core.open_db()  # retry -> reuses the orphan, writes no second file
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == \
             core.STATS_INDEX_EPOCH
         assert conn.execute(
             "SELECT COUNT(*) FROM percent_milestones "
             "WHERE journal_id IS NULL").fetchone()[0] == 0
+        # #496 S5 §3: the retry re-exports the same rows byte for byte, so it
+        # adopts the orphan rather than publishing a byte-identical twin. The
+        # cursor it stamps therefore names that same segment.
+        assert [
+            s for s in jr.list_segments() if s.startswith("bootstrap-")
+        ] == orphans
+        cursor = conn.execute(
+            "SELECT segment, offset FROM journal_cursor WHERE id = 1"
+        ).fetchone()
+        assert cursor[0] == orphans[0]
+        assert cursor[1] == (core.JOURNAL_DIR / orphans[0]).stat().st_size
+        assert not list(core.JOURNAL_DIR.glob("*.partial"))
     finally:
         conn.close()
 
@@ -672,6 +760,8 @@ def test_double_cutover_is_idempotent(ns, tmp_path):
         d1 = _canonical_dump(_c1)
     finally:
         _c1.close()
+    first = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(first) == 1, first
     # force a SECOND cutover by reverting the epoch stamp (simulates a stray
     # re-trigger); bootstrap ids are stable so the second export is idempotent.
     conn = sqlite3.connect(core.DB_PATH)
@@ -684,7 +774,12 @@ def test_double_cutover_is_idempotent(ns, tmp_path):
         assert d1 == d2, "second cutover changed the logical state"
     finally:
         live.close()
-    # a rebuild over BOTH bootstrap segments folds idempotently.
+    # #496 S5 §3: idempotent on disk too — the identical export reuses the
+    # segment cutover #1 published instead of adding a second one.
+    assert [
+        s for s in jr.list_segments() if s.startswith("bootstrap-")
+    ] == first
+    # a rebuild over the single bootstrap segment still reproduces the DB.
     jr.rebuild_stats_index(
         context=jr.RebuildContext(trigger="test-fixture"),
         target_path=str(tmp_path / "rb.db"),
@@ -692,6 +787,243 @@ def test_double_cutover_is_idempotent(ns, tmp_path):
     rb = core.open_db(_target_path=str(tmp_path / "rb.db"))
     try:
         assert _canonical_dump(rb) == d1
+    finally:
+        rb.close()
+
+
+def test_the_reused_segment_is_made_durable_before_the_cursor_names_it(
+    ns, monkeypatch
+):
+    """Reuse must not stamp a cursor at a segment it never made durable.
+
+    `_write_bootstrap_segment` fsyncs the file, fsyncs the directory, renames,
+    and fsyncs the directory again, so the segment a fresh cutover names is on
+    disk before the transaction that names it commits. The reuse branch adopts a
+    file some OTHER attempt renamed, and that rename can still be only in the
+    page cache: the retry would commit, SQLite's commit would make the cursor and
+    the epoch stamp durable, and a power loss before the kernel flushed the
+    directory entry would leave a cursor naming a bootstrap that does not exist.
+
+    The ordering is not visible in any output, so this asserts it structurally:
+    the reused segment's inode must be fsynced and the journal directory must be
+    fsynced, both before `_write_cursor` runs.
+    """
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    real_write_cursor = jr._write_cursor
+    monkeypatch.setattr(
+        jr, "_write_cursor",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash mid-txn")))
+    with pytest.raises(RuntimeError):
+        core.open_db()
+    orphans = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(orphans) == 1, orphans
+    orphan_inode = (core.JOURNAL_DIR / orphans[0]).stat().st_ino
+
+    events = []
+    real_fsync = jr.os.fsync
+    real_fsync_dir = jr._fsync_dir
+
+    def fsync(fd):
+        try:
+            events.append(("fsync", jr.os.fstat(fd).st_ino))
+        except OSError:  # pragma: no cover — a closed fd would raise below too
+            pass
+        return real_fsync(fd)
+
+    def fsync_dir(path):
+        events.append(("fsync_dir", str(path)))
+        return real_fsync_dir(path)
+
+    def write_cursor(*a, **k):
+        events.append(("write_cursor", None))
+        return real_write_cursor(*a, **k)
+
+    monkeypatch.setattr(jr.os, "fsync", fsync)
+    monkeypatch.setattr(jr, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(jr, "_write_cursor", write_cursor)
+    core.open_db().close()  # the retry, which reuses the orphan
+
+    assert [
+        s for s in jr.list_segments() if s.startswith("bootstrap-")
+    ] == orphans, "the retry wrote a segment instead of reusing the orphan"
+    stamps = [i for i, (kind, _v) in enumerate(events) if kind == "write_cursor"]
+    assert stamps, events
+    before = events[: stamps[0]]
+    assert ("fsync", orphan_inode) in before, (
+        "the reused segment must be fsynced before the cursor names it; "
+        f"events before the cursor stamp were {before!r}"
+    )
+    assert ("fsync_dir", str(core.JOURNAL_DIR)) in before, (
+        "the journal directory entry must be fsynced before the cursor names "
+        f"the segment; events before the cursor stamp were {before!r}"
+    )
+
+
+def test_a_genuinely_differing_retry_writes_a_new_segment(ns, monkeypatch):
+    """Reuse is exact-equivalence only. An export that actually changed between
+    the attempts must still publish its own segment, or the cursor would name a
+    file that does not contain the rows just stamped."""
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    real_write_cursor = jr._write_cursor
+    monkeypatch.setattr(
+        jr, "_write_cursor",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash mid-txn")))
+    with pytest.raises(RuntimeError):
+        core.open_db()
+    first = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(first) == 1, first
+
+    conn = sqlite3.connect(core.DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots (captured_at_utc, "
+            "week_start_date, week_end_date, week_start_at, week_end_at, "
+            "weekly_percent, page_url, source, payload_json, "
+            "five_hour_percent, five_hour_resets_at, five_hour_window_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-01-05T09:00:00Z", "2026-01-01", "2026-01-08", _WSA, _WEA,
+             70.0, None, "statusline", "{}", 30.0, "2026-01-05T14:00:00Z",
+             333))
+        conn.execute("UPDATE weekly_usage_snapshots SET journal_id = NULL")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(jr, "_write_cursor", real_write_cursor)
+    core.open_db().close()
+    after = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(after) == 2, after
+    assert first[0] in after
+
+
+def test_a_size_matching_but_byte_differing_segment_is_never_reused(ns):
+    core, jr = _core(), _jr()
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    name = "bootstrap-20260101T000000_000000.jsonl"
+    candidate = b'{"a":1}\n'
+    published = b'{"a":2}\n'
+    assert len(candidate) == len(published)
+    (core.JOURNAL_DIR / name).write_bytes(published)
+    assert jr._reusable_bootstrap(
+        hashlib.sha256(candidate).hexdigest(), len(candidate)) is None
+    # The same call with the PUBLISHED bytes does match, so the refusal above
+    # is about the digest and not about the lookup finding nothing.
+    assert jr._reusable_bootstrap(
+        hashlib.sha256(published).hexdigest(), len(published)
+    ) == (name, len(published))
+
+
+def test_a_newer_non_matching_bootstrap_refuses_reuse(ns):
+    """The scan must report every published bootstrap, not only the same-size
+    ones, or the pure predicate cannot see that its match is stale.
+
+    Reading is still bounded to the same-size candidates: a segment whose length
+    already differs is reported with no digest.
+    """
+    core, jr = _core(), _jr()
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    blob = b'{"a":1}\n'
+    digest = hashlib.sha256(blob).hexdigest()
+    older = "bootstrap-20260101T000000_000000.jsonl"
+    newer = "bootstrap-20260102T000000_000000.jsonl"
+    (core.JOURNAL_DIR / older).write_bytes(blob)
+    assert jr._reusable_bootstrap(digest, len(blob)) == (older, len(blob))
+    (core.JOURNAL_DIR / newer).write_bytes(b'{"different":true,"bb":2}\n')
+    assert jr._reusable_bootstrap(digest, len(blob)) is None
+
+
+def test_an_unreadable_newest_bootstrap_refuses_reuse(ns, monkeypatch):
+    """A bootstrap whose length cannot be read must be REPORTED, not dropped.
+
+    Dropping it promotes the older byte-identical segment to canonically newest,
+    and reuse then stamps a cursor that does not cover the newer bootstrap —
+    the exact divergence the newest-only rule exists to refuse.
+    """
+    import os.path
+
+    core, jr = _core(), _jr()
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    blob = b'{"a":1}\n'
+    digest = hashlib.sha256(blob).hexdigest()
+    older = "bootstrap-20260101T000000_000000.jsonl"
+    newer = "bootstrap-20260102T000000_000000.jsonl"
+    (core.JOURNAL_DIR / older).write_bytes(blob)
+    assert jr._reusable_bootstrap(digest, len(blob)) == (older, len(blob))
+    (core.JOURNAL_DIR / newer).write_bytes(b'{"different":true,"bb":2}\n')
+
+    real_getsize = os.path.getsize
+
+    def _getsize(path):
+        if str(path).endswith(newer):
+            raise OSError(13, "Permission denied")
+        return real_getsize(path)
+
+    monkeypatch.setattr(os.path, "getsize", _getsize)
+    assert jr._reusable_bootstrap(digest, len(blob)) is None
+
+
+def test_a_partial_cutover_file_is_never_a_reuse_candidate(ns):
+    core, jr = _core(), _jr()
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    name = "bootstrap-20260101T000000_000000.jsonl"
+    blob = b'{"a":1}\n'
+    digest = hashlib.sha256(blob).hexdigest()
+    (core.JOURNAL_DIR / (name + ".partial")).write_bytes(blob)
+    assert jr._reusable_bootstrap(digest, len(blob)) is None
+    # Once the same bytes are published under the final name, they ARE reused.
+    (core.JOURNAL_DIR / name).write_bytes(blob)
+    assert jr._reusable_bootstrap(digest, len(blob)) == (name, len(blob))
+
+
+def test_two_bootstrap_segments_fold_idempotently(ns, tmp_path):
+    """The two-bootstrap fold property, constructed directly.
+
+    Reuse means the natural path no longer produces two bootstrap segments, so
+    `test_double_cutover_is_idempotent` no longer covers this. Real installs
+    still carry duplicate bootstraps a pre-reuse binary wrote — the journal is
+    append-only and nothing removes them — so a rebuild must keep folding both
+    to the same state (#496 S5 §5 criterion 3).
+    """
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    live = core.open_db()  # cutover
+    try:
+        d1 = _canonical_dump(live)
+    finally:
+        live.close()
+    single = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "one.db"),
+    )
+    assert single.segments_read >= 1
+    one = core.open_db(_target_path=str(tmp_path / "one.db"))
+    try:
+        d_single = _canonical_dump(one)
+    finally:
+        one.close()
+    # The comparison below is against the SINGLE-bootstrap rebuild, which is
+    # what makes the two-bootstrap fold idempotent rather than merely
+    # self-consistent. It is non-vacuous only if that dump carries rows.
+    assert any(d_single.values()), d_single
+    assert d_single == d1, "the single-bootstrap rebuild did not reproduce the DB"
+
+    bootstraps = [s for s in jr.list_segments() if s.startswith("bootstrap-")]
+    assert len(bootstraps) == 1, bootstraps
+    twin = "bootstrap-29991231T235959_999999.jsonl"
+    (core.JOURNAL_DIR / twin).write_bytes(
+        (core.JOURNAL_DIR / bootstraps[0]).read_bytes())
+    assert jr.list_segments()[:2] == [bootstraps[0], twin]
+
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "two.db"),
+    )
+    rb = core.open_db(_target_path=str(tmp_path / "two.db"))
+    try:
+        assert _canonical_dump(rb) == d_single, (
+            "folding a duplicated bootstrap segment changed the logical state")
     finally:
         rb.close()
 

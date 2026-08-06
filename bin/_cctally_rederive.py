@@ -27,6 +27,7 @@ import _cctally_core
 import _cctally_journal as _journal
 import _cctally_record as _record
 import _lib_journal
+import _lib_journal_router
 import _lib_json_envelope
 import _lib_rederive
 
@@ -441,40 +442,74 @@ def owned_conflicted_event_ids(selection) -> frozenset:
 
 def read_rederive_journal_prefix(
     high_water: "tuple[str, int] | None" = None,
-) -> tuple[list[dict], "tuple[str, int] | None", list[tuple[str, int]]]:
-    """Read and strictly decode one canonical journal prefix."""
+):
+    """Stream and strictly decode one canonical journal prefix.
+
+    Returns `(records, high_water, record_ends, protocol_prefix_evidence)`.
+    The evidence digests come from a `PrefixHashAccumulator` fed by the bytes
+    this pass is already reading. Before this, the prefix was materialized as
+    raw lines, materialized again as decoded records while the first form was
+    still referenced, walked a third time to produce the evidence, and re-read
+    from byte zero by `journal_prefix_hash` once per
+    `journal_protocol_resolution` op (#496 S5 §4).
+
+    Retention is DELIBERATELY unfiltered, unlike the rebuild's. The rebuild
+    keeps only the decision records and substitutes `None` placeholders for
+    everything else; the planner here reads every observation for cache
+    validation, desired-event derivation and preservation decisions, and walks
+    `records` in parallel with `record_ends`. Both lists stay complete and
+    aligned, so the win in this file is the removed double materialization and
+    the removed hash traversals, not reduced retention.
+    """
     if high_water is None:
         high_water = _journal.journal_high_water()
     if high_water is None:
-        return [], None, []
+        return [], None, [], ()
+    segments = _journal.list_segments()
+    if high_water[0] not in segments:
+        raise OSError(
+            f"journal high-water segment is unavailable: {high_water[0]}"
+        )
     records: list[dict] = []
     record_ends: list[tuple[str, int]] = []
+    evidence: list = []
     malformed = 0
-    for segment, offset, raw in _journal._read_range(None, high_water):
+    prior_high_water = None
+    hasher = _lib_journal_router.PrefixHashAccumulator()
+    for segment, offset, raw in _journal._iter_range_with_segments(
+        None,
+        high_water,
+        segments,
+        on_segment=lambda name: hasher.begin_segment(name, prior_high_water),
+        on_bytes=hasher.extend,
+    ):
         record = _lib_journal.decode_line(raw)
+        record_end = (segment, offset + len(raw) + 1)
         if record is None:
             malformed += 1
+            prior_high_water = record_end
             continue
+        if record.get("t") == "op":
+            _journal._capture_protocol_prefix_evidence(
+                record,
+                prior_high_water,
+                evidence,
+                hasher=hasher,
+            )
         records.append(record)
-        record_ends.append((segment, offset + len(raw) + 1))
+        record_ends.append(record_end)
+        prior_high_water = record_end
+    # Released before the raise below, so a malformed prefix does not pin the
+    # accumulator's buffered segment — 410 MB on the maintainer's journal — on
+    # the traceback while the exception unwinds. On the success path the frame
+    # dies two statements later, so this mirrors the repair reader, where the
+    # release genuinely precedes a loop over every decoded record.
+    hasher = None
     if malformed:
         raise _lib_rederive.RederiveConflict(
             f"journal prefix contains {malformed} malformed line(s)"
         )
-    return records, high_water, record_ends
-
-
-def _protocol_prefix_evidence(records, record_ends):
-    evidence = []
-    prior_high_water = None
-    for record, record_end in zip(records, record_ends):
-        _journal._capture_protocol_prefix_evidence(
-            record,
-            prior_high_water,
-            evidence,
-        )
-        prior_high_water = record_end
-    return tuple(evidence)
+    return records, high_water, record_ends, tuple(evidence)
 
 
 def _read_only_journal_high_water() -> "tuple[str, int] | None":
@@ -603,12 +638,11 @@ def _preview_from_snapshot(
     if journal_high_water is None:
         journal_high_water = _read_only_journal_high_water()
     if journal_high_water is None:
-        records, high_water, record_ends = [], None, []
+        records, high_water, record_ends, protocol_evidence = [], None, [], ()
     else:
-        records, high_water, record_ends = read_rederive_journal_prefix(
-            journal_high_water
+        records, high_water, record_ends, protocol_evidence = (
+            read_rederive_journal_prefix(journal_high_water)
         )
-    protocol_evidence = _protocol_prefix_evidence(records, record_ends)
     with _open_cache_read_view() as cache:
         plan = plan_claude_usage(
             records,
