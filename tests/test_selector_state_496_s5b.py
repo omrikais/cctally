@@ -1690,15 +1690,22 @@ def test_dynamic_target_read_sites_are_frozen():
     `tests/test_stats_writer_surface_386.py`.
     """
     quota = _quota()
+    paths = list(_projection_scan_paths())
+    source_names = {path.name for path in paths}
+    expected = {
+        name: count
+        for name, count in quota.PROJECTION_DYNAMIC_READ_SITES.items()
+        if name in source_names
+    }
     observed = {}
-    for path in _projection_scan_paths():
+    for path in paths:
         count = _scan_text_for_dynamic_reads(
             path.read_text(encoding="utf-8", errors="replace"))
         if count:
             observed[path.name] = count
-    assert observed == quota.PROJECTION_DYNAMIC_READ_SITES, (
+    assert observed == expected, (
         "dynamic-target read sites changed:\n"
-        f"  frozen={quota.PROJECTION_DYNAMIC_READ_SITES}\n"
+        f"  frozen={expected}\n"
         f"  found={observed}\n"
         "A dynamic target is invisible to the literal scan AND to lexical "
         "review. Decide whether the new site reaches `quota_window_blocks` or "

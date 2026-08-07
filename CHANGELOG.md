@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.93.1] - 2026-08-07
+
+### Fixed
+- The public source-distribution test suite now freezes dynamic SQL reads against the runtime files that actually ship in that distribution, rather than expecting the private release module to exist in the public mirror. This restores the Linux multi-version release gate without weakening the private runtime-surface check.
+
 ## [1.93.0] - 2026-08-07
 
 ### Added
