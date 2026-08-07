@@ -1036,3 +1036,195 @@ def test_share_post_body_cap(dashboard_server, endpoint):
     assert exc.value.code == 400
     body = json.loads(exc.value.read())
     assert "too large" in body["error"].lower()
+
+
+# ---------- #503 S1 F3 — an omitted `reveal_projects` must fail closed ------
+#
+# The point of these tests is that they OMIT the field. No test in this file
+# did, which is exactly why `/api/share/render` shipped defaulting it OPEN
+# while `/api/share/compose` defaulted it closed — the two endpoints
+# disagreed and nothing noticed.
+
+
+def _render_request(port: int, *, panel: str, template_id: str, options: dict):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/render",
+        data=json.dumps({
+            "panel": panel, "template_id": template_id, "options": options,
+        }).encode(),
+        method="POST", headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def test_render_anonymizes_when_reveal_projects_is_absent(dashboard_server):
+    port, _ = dashboard_server
+    body = _render_request(
+        port, panel="weekly", template_id="weekly-recap",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 5, "period": {"kind": "current"},
+                 "project_allowlist": None},
+    )["body"]
+    assert "anonymized: true" in body
+
+
+def test_render_projects_panel_claims_anonymized_when_the_field_is_absent(
+        dashboard_server):
+    port, _ = dashboard_server
+    body = _render_request(
+        port, panel="projects", template_id="projects-recap",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 5, "period": {"kind": "current"},
+                 "project_allowlist": None},
+    )["body"]
+    assert "projects anonymized" in body
+    assert "real projects" not in body
+
+
+@pytest.fixture
+def dashboard_server_with_projects(tmp_path, monkeypatch):
+    """A server whose snapshot carries REAL project rows.
+
+    The default fixture boots on `_empty_dashboard_snapshot()`, which has no
+    projects at all — so a mode assertion is the only thing an anonymization
+    test can make against it, and F3 is about a silent REVEAL. This fixture
+    supplies labels that would be visible if the endpoint's default resolved
+    open.
+    """
+    ns = load_script()
+    srv = _start_share_dashboard_server(ns, tmp_path, monkeypatch)
+    snap = ns["_empty_dashboard_snapshot"]()
+    snap.projects_envelope = {
+        "current_week": {
+            "rows": [
+                {"key": "cctally-dev", "bucket_path": "/repos/cctally-dev",
+                 "cost_usd": 12.50, "attributed_pct": 4.2, "sessions_count": 7},
+                {"key": "acme-billing", "bucket_path": "/repos/acme-billing",
+                 "cost_usd": 3.25, "attributed_pct": 1.1, "sessions_count": 2},
+            ],
+            "total_cost_usd": 15.75,
+        },
+        "trend": {},
+    }
+    ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](snap)
+    try:
+        yield srv.server_address[1], None
+    finally:
+        srv.shutdown()
+
+
+def test_render_replaces_a_real_project_label_when_reveal_is_absent(
+        dashboard_server_with_projects):
+    """An omitted `reveal_projects` must ANONYMIZE, not merely claim to.
+
+    The mode assertion above proves the default resolves closed. This proves
+    the closed default actually reached the labels: a real project name is
+    replaced by its alias on the render endpoint with the field omitted,
+    which is the disclosure F3 describes.
+    """
+    port, _ = dashboard_server_with_projects
+    body = _render_request(
+        port, panel="projects", template_id="projects-detail",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 50, "period": {"kind": "current"},
+                 "project_allowlist": None},
+    )["body"]
+    assert "project-1" in body
+    assert "project-2" in body
+    assert "cctally-dev" not in body
+    assert "acme-billing" not in body
+
+
+def test_render_reveals_a_real_project_label_when_asked(
+        dashboard_server_with_projects):
+    """Non-vacuity for the test above: the labels ARE reachable."""
+    port, _ = dashboard_server_with_projects
+    body = _render_request(
+        port, panel="projects", template_id="projects-detail",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 50, "period": {"kind": "current"},
+                 "reveal_projects": True,
+                 "project_allowlist": None},
+    )["body"]
+    assert "acme-billing" in body
+
+
+# --- #503 S1 B1: the render response reports whether the export carries
+# project names at all, so the modal's status line can stop over-warning ----
+
+def test_render_reports_no_project_names_for_a_metric_only_template(
+        dashboard_server_with_projects):
+    """`forecast` renders no project name in either privacy mode, so the
+    modal must not claim the export will show real ones. The server derives
+    the flag from the same snapshot it just rendered."""
+    payload = _render_request(
+        dashboard_server_with_projects[0],
+        panel="forecast", template_id="forecast-recap",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 5, "period": {"kind": "current"},
+                 "project_allowlist": None},
+    )
+    assert payload["has_project_names"] is False
+
+
+def test_render_reports_project_names_for_a_project_bearing_template(
+        dashboard_server_with_projects):
+    """Non-vacuity for the assertion above: the flag is not hardcoded False."""
+    payload = _render_request(
+        dashboard_server_with_projects[0],
+        panel="projects", template_id="projects-detail",
+        options={"format": "md", "theme": "light", "no_branding": False,
+                 "top_n": 50, "period": {"kind": "current"},
+                 "project_allowlist": None},
+    )
+    assert payload["has_project_names"] is True
+
+
+def test_the_flag_does_not_depend_on_the_privacy_mode(
+        dashboard_server_with_projects):
+    """It answers "does this export contain project names at all", which is a
+    property of the DATA. Making it mode-dependent would flip the neutral
+    state on toggle, which is exactly the false statement being removed."""
+    port, _ = dashboard_server_with_projects
+    base = {"format": "md", "theme": "light", "no_branding": False,
+            "top_n": 50, "period": {"kind": "current"},
+            "project_allowlist": None}
+    anon = _render_request(port, panel="projects",
+                           template_id="projects-detail", options=dict(base))
+    reveal = _render_request(port, panel="projects",
+                             template_id="projects-detail",
+                             options={**base, "reveal_projects": True})
+    assert anon["has_project_names"] == reveal["has_project_names"] is True
+
+
+def test_compose_anonymizes_when_reveal_projects_is_absent(dashboard_server):
+    port, _ = dashboard_server
+    section = _section_recipe("weekly", "weekly-recap")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/compose",
+        data=json.dumps({
+            "title": "Composite", "theme": "light", "format": "md",
+            "no_branding": False, "sections": [section],
+        }).encode(),
+        method="POST", headers=_csrf_headers(port),
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = json.loads(r.read())["body"]
+    assert "anonymized: true" in body
+
+
+def test_projects_subtitle_anonymizes_when_the_field_is_absent():
+    import importlib.util as _ilu
+    import sys as _sys
+    if "_lib_share_templates" in _sys.modules:
+        _T = _sys.modules["_lib_share_templates"]
+    else:
+        _tpl = pathlib.Path(__file__).resolve().parents[1] / "bin" / "_lib_share_templates.py"
+        _spec = _ilu.spec_from_file_location("_lib_share_templates", _tpl)
+        _T = _ilu.module_from_spec(_spec)
+        _sys.modules["_lib_share_templates"] = _T
+        _spec.loader.exec_module(_T)
+    assert _T._projects_subtitle({}, 3) == "3 projects · projects anonymized"
+    assert _T._projects_subtitle({"reveal_projects": True}, 3) == \
+        "3 projects · real projects"

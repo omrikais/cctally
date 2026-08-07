@@ -2913,7 +2913,8 @@ def _print_project_section_or_note(rows, has_projects, window_resolved, args):
 
 def _append_project_share_rows(snap, rows, has_projects):
     """Append per-project ProjectCell rows to a budget ShareSnapshot so the
-    share-output anonymization chokepoint (``_lib_share._scrub``) rewrites the
+    share-output anonymization chokepoint (the preparation pass
+    ``_lib_share.render()`` runs over the raw snapshot) rewrites the
     basenames under default output and reveals them under ``--reveal-projects``
     (spec §7.5). No-op when projects are empty → existing share goldens stay
     byte-identical. Project names go through ``ProjectCell`` (the single
@@ -3029,7 +3030,8 @@ def _build_budget_snapshot(
 
     This builds the GLOBAL budget rows only; when per-project budgets are
     configured, `_append_project_share_rows` appends ProjectCell rows so
-    `--reveal-projects` reveals (or `_scrub` anonymizes) the per-project
+    `--reveal-projects` reveals (or, by default, `render()`'s preparation
+    pass anonymizes) the per-project
     basenames via the share chokepoint. No parallel renderer; the gate calls
     `_share_render_and_emit(snap, args)`.
 

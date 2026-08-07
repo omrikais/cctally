@@ -94,22 +94,22 @@ def test_render_fragment_svg_returns_inner_xml_and_dims():
 def test_render_dispatch_still_produces_v1_compatible_html():
     """v1 contract: render(format=html) returns a full document."""
     snap = _trivial_snapshot()
-    out = _LS.render(snap, format="html", theme="light", branding=True)
+    out = _LS.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     assert out.startswith("<!DOCTYPE")
     assert out.rstrip().endswith("</html>")
 
 
 def test_render_dispatch_still_produces_v1_compatible_svg():
     snap = _trivial_snapshot()
-    out = _LS.render(snap, format="svg", theme="light", branding=True)
+    out = _LS.render(snap, format="svg", theme="light", branding=True, reveal_projects=True)
     assert out.lstrip().startswith("<svg")
     assert out.rstrip().endswith("</svg>")
 
 
 def test_md_frontmatter_byte_stable_for_identical_input():
     snap = _trivial_snapshot()
-    out_a = _LS.render(snap, format="md", theme="light", branding=True)
-    out_b = _LS.render(snap, format="md", theme="light", branding=True)
+    out_a = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
+    out_b = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
     assert out_a == out_b
     assert out_a.startswith("---\n")
     # Ordered keys per spec §11.5
@@ -125,14 +125,14 @@ def test_md_frontmatter_byte_stable_for_identical_input():
 
 def test_md_frontmatter_includes_template_id_when_present():
     snap = replace(_trivial_snapshot(), template_id="weekly-visual")
-    out = _LS.render(snap, format="md", theme="light", branding=True)
+    out = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
     assert "template_id: weekly-visual\n" in out
 
 
 def test_md_frontmatter_stripped_when_no_branding():
     snap = _trivial_snapshot()
-    with_brand = _LS.render(snap, format="md", theme="light", branding=True)
-    without = _LS.render(snap, format="md", theme="light", branding=False)
+    with_brand = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
+    without = _LS.render(snap, format="md", theme="light", branding=False, reveal_projects=True)
     assert with_brand.startswith("---\n")
     assert not without.startswith("---\n"), (
         "frontmatter should be stripped by --no-branding "
@@ -145,19 +145,22 @@ def test_md_frontmatter_utc_uses_z_suffix(tmp_path):
     `+00:00`. Routes through `_format_generated_at_iso` to match spec §11.5
     and the SVG/HTML chrome (which already emits `Z`)."""
     snap = _trivial_snapshot()
-    out = _LS.render(snap, format="md", theme="light", branding=True)
+    out = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
     assert "generated_at: 2026-05-11T09:30:00Z\n" in out
     assert "period: 2026-05-04T00:00:00Z..2026-05-10T00:00:00Z\n" in out
     assert "+00:00" not in out
 
 
 def _project_snapshot():
-    """A snapshot with two ProjectCell rows so `_scrub` produces project-N labels.
+    """A snapshot with two ProjectCell rows so anonymization produces
+    project-N labels.
 
-    `_snapshot_is_anonymized` is a label-prefix predicate over the
-    ProjectCell rows in `snap.rows` — a snapshot with zero project cells
-    is reported as not anonymized (nothing to anonymize), so testing the
-    anonymized field requires real project labels.
+    `render()`'s preparation pass rewrites typed project display fields, so a
+    snapshot with zero project cells renders identically in both privacy modes
+    apart from the frontmatter line. Testing the rendered labels therefore
+    requires real project labels. (The `anonymized:` frontmatter field itself
+    now reports the MODE — the label-prefix predicate `_snapshot_is_anonymized`
+    that used to guess it was deleted in #503 S1.)
     """
     return _LS.ShareSnapshot(
         cmd="project",
@@ -193,9 +196,9 @@ def _project_snapshot():
 
 def test_md_frontmatter_anonymized_field_reflects_scrub():
     snap = _project_snapshot()
-    scrubbed = _LS._scrub(snap, reveal_projects=False)
-    out_reveal = _LS.render(snap, format="md", theme="light", branding=True)
-    out_anon = _LS.render(scrubbed, format="md", theme="light", branding=True)
+    out_reveal = _LS.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
+    out_anon = _LS.render(snap, format="md", theme="light", branding=True,
+                          reveal_projects=False)
     assert "anonymized: false" in out_reveal
     assert "anonymized: true" in out_anon
 
@@ -359,7 +362,7 @@ def test_html_output_carries_print_stylesheet():
     Print → PDF on a dark-theme export prints as black-on-white instead
     of a solid-black page."""
     snap = _trivial_snapshot()
-    out = _LS.render(snap, format="html", theme="light", branding=True)
+    out = _LS.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     assert "@media print" in out
     assert "color-scheme: light" in out
     assert "page-break-inside: avoid" in out
@@ -370,7 +373,7 @@ def test_print_stylesheet_unaffected_by_no_branding():
     under --no-branding (which only strips footer-link / frontmatter
     branding, not document-level CSS rules)."""
     snap = _trivial_snapshot()
-    out = _LS.render(snap, format="html", theme="light", branding=False)
+    out = _LS.render(snap, format="html", theme="light", branding=False, reveal_projects=True)
     assert "@media print" in out
 
 
@@ -385,3 +388,174 @@ def test_compose_html_carries_print_stylesheet():
     out = _LS.compose(sections, opts=opts)
     assert "@media print" in out
     assert "color-scheme: light" in out
+
+
+# ---- #503 S1 F4 — one alias namespace across a composed document ----------
+
+
+def _project_section(pairs, *, title="S", cmd="weekly"):
+    """A section whose rows are (project label, cost) pairs."""
+    snap = _LS.ShareSnapshot(
+        cmd=cmd, title=title, subtitle=None,
+        period=_LS.PeriodSpec(
+            start=datetime(2026, 5, 4, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 10, tzinfo=timezone.utc),
+            display_tz="Etc/UTC", label="This week",
+        ),
+        columns=(
+            _LS.ColumnSpec(key="project", label="Project", align="left"),
+            _LS.ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=tuple(
+            _LS.Row(cells={
+                "project": _LS.ProjectCell(label=label),
+                "cost": _LS.MoneyCell(cost),
+            })
+            for label, cost in pairs
+        ),
+        chart=None, totals=(), notes=(),
+        generated_at=datetime(2026, 5, 11, 9, 30, tzinfo=timezone.utc),
+        version="1.5.0",
+    )
+    return _LS.ComposedSection(snap=snap, drift_detected=False)
+
+
+def _sections_sharing_a_project():
+    """Two sections, four rows, three distinct projects — `shared` appears in
+    both and must resolve to ONE alias across the composed document."""
+    return (
+        _project_section([("shared", 5.12), ("weekly-only", 9.40)], title="Weekly"),
+        _project_section([("shared", 5.12), ("daily-only", 1.10)], title="Daily"),
+    )
+
+
+def _alias_for_cost(section_body: str, cost: float) -> str:
+    needle = f"${cost:,.2f}"
+    for line in section_body.splitlines():
+        if needle in line and line.startswith("|"):
+            return line.split("|")[1].strip()
+    raise AssertionError(f"no row carrying {needle} in:\n{section_body}")
+
+
+def _split_sections(body: str):
+    head, _, rest = body.partition("## Weekly")
+    weekly, _, daily = rest.partition("## Daily")
+    return weekly, daily
+
+
+def test_composed_document_uses_one_alias_namespace():
+    """project-1 must denote the same project in every section."""
+    body = _LS.compose(_sections_sharing_a_project(),
+                       opts=_LS.ComposeOptions(
+                           title="Combined", theme="light", format="md",
+                           no_branding=False, reveal_projects=False))
+    weekly, daily = _split_sections(body)
+    assert _alias_for_cost(weekly, 5.12) == _alias_for_cost(daily, 5.12)
+
+
+def test_merged_mapping_sums_costs_across_sections():
+    mapping = _LS._merged_anon_mapping(_sections_sharing_a_project())
+    assert len(mapping) == 3  # not 4 — the shared project appears once
+
+
+def test_merged_mapping_ranks_on_the_summed_cost_not_a_single_section():
+    """Summing rather than overwriting is what makes the global rank right:
+    `shared` totals 10.24 across the two sections and outranks `weekly-only`,
+    which wins in its own section alone."""
+    mapping = _LS._merged_anon_mapping(_sections_sharing_a_project())
+    assert mapping[("legacy", "shared")] == "project-1"
+    assert mapping[("legacy", "weekly-only")] == "project-2"
+
+
+def test_compose_keeps_provider_qualified_identities_distinct():
+    """The same directory under Claude and under Codex stays two aliases."""
+    a = _project_section([("app", 5.0)], title="Weekly")
+    b = _project_section([("app", 4.0)], title="Daily")
+    b = _LS.ComposedSection(
+        snap=replace(b.snap, rows=(
+            _LS.Row(cells={
+                "project": _LS.ProjectCell(label="app", identity="codex:app"),
+                "cost": _LS.MoneyCell(4.0),
+            }),
+        )),
+        drift_detected=False,
+    )
+    mapping = _LS._merged_anon_mapping((a, b))
+    assert len(mapping) == 2
+    assert len(set(mapping.values())) == 2
+
+
+def test_drift_digest_is_unchanged_by_preparation():
+    """Digests must be byte-identical, or every basket section reads
+    Outdated. `_share_digest_input` reads only `snapshot.period` off a
+    snapshot, so preparation — which rewrites labels and nothing else in the
+    period — cannot move it."""
+    section = _sections_sharing_a_project()[0]
+    prepared = _LS._prepare(section.snap, reveal_projects=False)
+    assert prepared.period == section.snap.period
+    assert prepared.rows[0].cells["project"].label != \
+        section.snap.rows[0].cells["project"].label
+
+
+# ---- #503 S1 F5 — the anonymization claim reports the mode ----------------
+
+
+def _snapshot_without_projects():
+    return _make_section(title="No projects").snap
+
+
+def _chart_only_snapshot():
+    """The `sessions-visual` shape: empty rows and columns, plus a chart
+    carrying the project. `_snapshot_is_anonymized` early-returned False on
+    this and stamped `anonymized: false` onto a demonstrably scrubbed
+    snapshot."""
+    return replace(
+        _make_section(title="Sessions visual").snap,
+        columns=(), rows=(),
+        chart=_LS.HorizontalBarChart(
+            points=(_LS.ChartPoint(
+                x_label="1", x_value=1.0, y_value=1.0,
+                project_label="alpha", x_label_kind="project",
+                x_label_prefix="1"),),
+            x_label="$", cap=None,
+        ),
+    )
+
+
+def test_anonymized_reports_mode_for_a_project_free_snapshot():
+    out = _LS.render(_snapshot_without_projects(), format="md",
+                     theme="light", branding=True, reveal_projects=False)
+    assert "anonymized: true" in out
+
+
+def test_anonymized_reports_mode_in_reveal_for_a_project_free_snapshot():
+    out = _LS.render(_snapshot_without_projects(), format="md",
+                     theme="light", branding=True, reveal_projects=True)
+    assert "anonymized: false" in out
+
+
+def test_chart_only_snapshot_reports_anonymized_true():
+    out = _LS.render(_chart_only_snapshot(), format="md",
+                     theme="light", branding=True, reveal_projects=False)
+    assert "anonymized: true" in out
+
+
+def test_a_project_literally_named_project_1_is_not_claimed_anonymized():
+    """The old label-shape heuristic reported a real project named
+    `project-1` as anonymized."""
+    section = _project_section([("project-1", 5.0)])
+    out = _LS.render(section.snap, format="md", theme="light", branding=True,
+                     reveal_projects=True)
+    assert "anonymized: false" in out
+
+
+def test_composed_frontmatter_reports_the_composite_mode():
+    out = _LS.compose(_sections_sharing_a_project(),
+                      opts=_LS.ComposeOptions(
+                          title="Combined", theme="light", format="md",
+                          no_branding=False, reveal_projects=False))
+    assert "anonymized: true" in out
+
+
+def test_snapshot_is_anonymized_is_gone():
+    assert not hasattr(_LS, "_snapshot_is_anonymized")

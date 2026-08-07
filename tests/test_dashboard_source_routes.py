@@ -866,3 +866,75 @@ def test_source_route_logs_private_detail_without_returning_it(monkeypatch, tmp_
         assert any(canary in item for item in logged)
     finally:
         _close(server, thread)
+
+
+def test_a_refused_projection_read_answers_503_with_its_remedy(monkeypatch, tmp_path):
+    """#496 S5b. `QuotaProjectionIncomplete` is a RETRY signal over a VALID
+    index, and both routes that can meet it reported a server fault instead —
+    this one as a 400 "source capability unavailable" — while the message
+    naming `cctally cache-sync` reached the server log only.
+
+    The injection is at the REAL seam. An earlier form monkeypatched
+    `build_source_detail` wholesale, which proves the handler branch but not
+    that the route can meet the real signal: the gate lives inside
+    `_build_codex_block_detail`, several frames below that patch, so a route
+    that never reached the gate would have satisfied it just as well. Patching
+    `assert_projection_readable` is the same seam the milestones sibling uses,
+    so both tests exercise the path a real incomplete projection takes.
+    """
+    ns = load_script()
+    import _cctally_quota
+
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+
+    def _refuse(*_args, **_kwargs):
+        raise _cctally_quota.QuotaProjectionIncomplete(
+            "the published quota projection is incomplete; "
+            + _cctally_quota.QUOTA_PROJECTION_REMEDY
+        )
+
+    # The detail builder imports this by name at call time, so patching the
+    # attribute on its home module is what the handler resolves.
+    monkeypatch.setattr(
+        _cctally_quota, "assert_projection_readable", _refuse)
+    try:
+        status, payload = _get(server, "/api/source/codex/block/block%3Acodex")
+        assert status == 503
+        assert payload == {
+            "code": "quota_projection_incomplete",
+            "error": "quota view reconciling",
+            "action": "cctally cache-sync",
+        }
+    finally:
+        _close(server, thread)
+
+
+def test_the_milestones_route_answers_503_rather_than_a_generic_500(
+    monkeypatch, tmp_path,
+):
+    """The same signal on the cycle-detail route, which sent a bare 500."""
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    import _cctally_quota
+
+    def _refuse(_conn):
+        raise _cctally_quota.QuotaProjectionIncomplete(
+            "the published quota projection is incomplete; "
+            + _cctally_quota.QUOTA_PROJECTION_REMEDY
+        )
+
+    # The route imports this by name at call time, so patching the attribute on
+    # its home module is what the handler resolves.
+    monkeypatch.setattr(
+        _cctally_quota, "assert_projection_readable", _refuse)
+    try:
+        status, payload = _get(
+            server, "/api/milestones/codex/week/cycle%3Aanything")
+        assert status == 503
+        assert payload == {
+            "code": "quota_projection_incomplete",
+            "error": "quota view reconciling",
+            "action": "cctally cache-sync",
+        }
+    finally:
+        _close(server, thread)

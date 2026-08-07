@@ -84,6 +84,27 @@ class LastSeenAccumulator:
         if previous is None or at > previous:
             self.stamped[key] = at
 
+    def merge(self, stamped, legacy_claude_at=None, legacy_codex_at=None):
+        """Fold another accumulator's partial state into this one.
+
+        The fold is a per-key MAXIMUM over timestamps, and maximum is
+        associative and commutative, so a segment's partial contribution merges
+        in any order and produces the same map a single pass would. That is what
+        lets #496 S5b Stage 4 import an elided segment's stored contribution
+        instead of reading the segment (spec section 5.4).
+        """
+        for key, at in dict(stamped).items():
+            if isinstance(key, str) and key and isinstance(at, str) and at:
+                self._bump(key, at)
+        if legacy_claude_at is not None and (
+                self.legacy_claude_at is None
+                or legacy_claude_at > self.legacy_claude_at):
+            self.legacy_claude_at = legacy_claude_at
+        if legacy_codex_at is not None and (
+                self.legacy_codex_at is None
+                or legacy_codex_at > self.legacy_codex_at):
+            self.legacy_codex_at = legacy_codex_at
+
     def resolve(self, cutover_claude: str, unattributed: str) -> dict:
         """Apply the deferred legacy buckets and return the final MAX map."""
         out = dict(self.stamped)

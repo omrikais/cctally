@@ -874,7 +874,9 @@ def _sync_failure_envelope(
     if not error:
         return None
 
-    def attributed(database: str, *, corruption: bool = False) -> bool:
+    def attributed(
+        database: str, *, corruption: bool = False, leg: str | None = None,
+    ) -> bool:
         for item in attributions or ():
             item_database = (
                 item.get("database") if isinstance(item, dict)
@@ -884,9 +886,13 @@ def _sync_failure_envelope(
                 item.get("corruption") if isinstance(item, dict)
                 else getattr(item, "corruption", False)
             )
+            item_leg = (
+                item.get("leg") if isinstance(item, dict)
+                else getattr(item, "leg", None)
+            )
             if item_database == database and (
                 not corruption or bool(item_corruption)
-            ):
+            ) and (leg is None or item_leg == leg):
                 return True
         return False
 
@@ -907,6 +913,26 @@ def _sync_failure_envelope(
             "label": "stats index rebuilding",
             "detail": "The dashboard statistics index is rebuilding in the background.",
             "action": None,
+        }
+
+    # #496 S5b. A refused quota-projection read is the one attribution whose
+    # remedy the user can act on immediately, and without this branch it fell
+    # through to the terminal default below: `database="other"` matches nothing
+    # above it, so the chip read "⚠ server sync error" with no action, while
+    # the message naming `cctally cache-sync` sat in `last_sync_error`, which
+    # this module's own contract forbids putting in a visible text, title or
+    # aria surface. Keyed on the leg rather than on the raw text, because
+    # `database="other"` is deliberately generic and text classification is
+    # what the attribution vocabulary exists to replace.
+    if attributed("other", leg="quota-projection"):
+        return {
+            "kind": "quota_projection_incomplete",
+            "label": "quota view reconciling",
+            "detail": (
+                "The quota view is being rebuilt after an interrupted cache "
+                "recovery."
+            ),
+            "action": "cctally cache-sync",
         }
 
     # conversations.db is intentionally outside core dashboard generations.

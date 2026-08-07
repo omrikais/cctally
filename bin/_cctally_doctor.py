@@ -1730,6 +1730,35 @@ def _doctor_gather_state_impl(
                     journal_cursor_lag_bytes = lag
     except Exception:
         pass
+    # #496 S5b: the durable incomplete-quota-projection flag carried inside the
+    # published stats generation. Read-only, and independent of journal presence
+    # because the flag describes the INDEX rather than the journal. None means
+    # "no epoch-1009 index to ask" (absent file, missing table, unreadable DB),
+    # which the pure kernel reports as not applicable rather than as a fault.
+    #
+    # This is a THIRD read-only stats open in this function, and folding it into
+    # the `jc` open above was considered and rejected: that open sits inside
+    # `if journal_present:`, so carrying this SELECT there would make the flag
+    # unreadable on an install whose journal directory is absent — exactly the
+    # independence the paragraph above states. One extra guarded open on the
+    # doctor path is the cheaper of the two.
+    stats_quota_projection_incomplete: "bool | None" = None
+    try:
+        if _cctally_core.DB_PATH.exists():
+            qp = _stats_ro_guarded()   # #386 opener protocol
+            try:
+                row = qp.execute(
+                    "SELECT incomplete FROM stats_quota_projection_state "
+                    "WHERE id = 1").fetchone()
+                if row is not None:
+                    stats_quota_projection_incomplete = bool(int(row[0] or 0))
+            except sqlite3.OperationalError:
+                pass  # pre-1009 index has no stats_quota_projection_state
+            finally:
+                qp.close()
+    except Exception:
+        stats_quota_projection_incomplete = None
+
     # Auto-heal incident history — independent of journal presence (a corruption
     # incident can predate cutover). None only if BOTH dirs were unreadable.
     journal_heal_incidents = None
@@ -1856,6 +1885,8 @@ def _doctor_gather_state_impl(
         journal_protocol_violations=journal_protocol_violations,
         journal_protocol_acknowledged=journal_protocol_acknowledged,
         journal_protocol_error=journal_protocol_error,
+        # #496 S5b: the published generation's incomplete-quota-projection flag.
+        stats_quota_projection_incomplete=stats_quota_projection_incomplete,
         # #315: read-only cache free-page evidence for the reclaim hint.
         cache_db_page_count=cache_db_page_count,
         cache_db_freelist_count=cache_db_freelist_count,

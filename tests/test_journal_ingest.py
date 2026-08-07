@@ -578,7 +578,10 @@ def test_quota_applier_prefix_stop_truncates_cursor(tmp_path, monkeypatch):
 
     # A synthetic cache leg that "found a busy codex flock at index 1": process
     # only decoded[:1], advance the cursor to decoded[1]'s offset.
-    jr.QUOTA_APPLIER = lambda decoded: 1
+    # `**_range` absorbs the cycle's `cursor`/`covered_to` keywords (#496 S5b):
+    # the leg takes them so it can advance the coverage certificate over a batch
+    # it can prove contiguous, and this stand-in ignores them.
+    jr.QUOTA_APPLIER = lambda decoded, **_range: 1
     jr.run_stats_ingest(mode="authoritative")
     assert _usage_count(ns) == 1  # only the prefix consumed
 

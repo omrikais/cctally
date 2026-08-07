@@ -738,8 +738,14 @@ def test_all_source_commands_compose_real_provider_blocks(
     ("argv", "claude_marker", "codex_marker"),
     [
         (
+            # #503 S1 F4: a composed document now uses ONE alias namespace
+            # across all its sections, so an alias is no longer numbered from
+            # 1 inside each section. The Claude row is `project-2` and the
+            # Codex row is `project-1` under the global cost ranking; the
+            # markers still prove each provider's own row stays in its own
+            # section, which is what this test is for.
             ["project", "--source", "all", "--since", "2026-07-14", "--until", "2026-07-15"],
-            "project-1", "project-2",
+            "project-2", "project-1",
         ),
         (
             ["diff", "--source", "all", "--a", "2026-07-14..2026-07-14", "--b", "2026-07-15..2026-07-15"],

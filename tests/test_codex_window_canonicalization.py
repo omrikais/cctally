@@ -1086,11 +1086,13 @@ def test_the_stats_index_epoch_is_unchanged(stats_ns):
     projector adds the reverse map + composable group digest to
     `quota_window_blocks` and the `quota_projection_ledger_state` row, which is
     a stats SCHEMA change against a frozen registry. 1004 -> 1005 -> 1007.
-    #496 S3 is the next such change: `stats_publication_stamp` carries the
+    #496 S3 was the next such change: `stats_publication_stamp` carries the
     publication identity the in-place protocol resolves a pending marker
-    against, so 1007 -> 1008."""
+    against, so 1007 -> 1008. #496 S5b is the current one: durable selector
+    state adds three `journal_selector_*` tables plus the reserved
+    `stats_quota_projection_state`, so 1008 -> 1009."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1008
+    assert _cctally_core.STATS_INDEX_EPOCH == 1009
 
 
 # --------------------------------------------------------------------------

@@ -1024,10 +1024,12 @@ def _build_project_snapshot(
     Privacy invariant (Section 8.4 / Section 5.3): the builder populates
     `ProjectCell.label` AND `ChartPoint.project_label` (and `x_label`,
     which is the project axis on a HorizontalBarChart) with the REAL
-    `display_key`. The `_share_render_and_emit` wrapper then runs
-    `_lib_share._scrub` BEFORE rendering — that's the single chokepoint
-    that rewrites every project label to `project-1` / `project-2` /
-    ... unless `--reveal-projects` is passed. The Section 8.4 canary
+    `display_key`. `_lib_share.render()` is the chokepoint: it prepares
+    the RAW snapshot it is handed, rewriting every project label to
+    `project-1` / `project-2` / ... unless `--reveal-projects` is
+    passed. (It is NOT `_scrub()`: that function is retained for
+    backward compatibility and no production path calls it.) The
+    Section 8.4 canary
     test (`test_anonymized_output_contains_zero_original_tokens`) and
     the wrapper-level regression
     (`test_share_render_and_emit_scrubs_project_labels`) both anchor
@@ -1133,6 +1135,7 @@ def _build_project_snapshot(
             x_value=cost,
             y_value=cost,
             project_label=proj_label,
+            x_label_kind="project",
         ))
     chart = (
         _lib_share.HorizontalBarChart(
@@ -1377,27 +1380,43 @@ def _session_disambiguate_labels(
 
     Sessions without collisions are absent from the returned dict;
     callers fall back to the bare basename.
+
+    #503 S1: the algorithm itself now lives in the share kernel as
+    ``_lib_share.disambiguate_basenames``, because the kernel's reveal-mode
+    preparation needs the same resolution on the dashboard path. This is the
+    delegating wrapper, so "the kernel matches the CLI" is one implementation
+    rather than two that agree by inspection. The kernel additionally widens
+    the qualifier when the parents also repeat, where this function used to
+    emit the same colliding label twice.
+
+    The kernel's input contract is one entry per DISTINCT identity, so this
+    wrapper deduplicates by path before delegating and fans the resulting
+    label back out to every session sharing that path. A session list
+    normally carries one project across several rows, and handing those
+    duplicates to the kernel makes its ordinal fallback invent
+    ``repo (parent) (1)`` / ``(2)`` / ``(3)`` for what is one project — which
+    also splits that project's cost across three alias slots, because a
+    session-derived ``ProjectCell`` carries no ``identity`` and the alias key
+    is therefore the label itself.
     """
-    basenames: list[str] = []
-    for s in sessions:
-        path = s.project_path or ""
-        basenames.append(os.path.basename(path) or path or "(unknown)")
-    counts: dict[str, int] = {}
-    for bn in basenames:
-        counts[bn] = counts.get(bn, 0) + 1
-    augmented: dict[int, str] = {}
-    for idx, s in enumerate(sessions):
-        bn = basenames[idx]
-        # Skip suffixing the literal "(unknown)" bare label even on
-        # collision: `_build_anon_mapping` literal-passthrough-protects
-        # exact "(unknown)" only — a suffixed form like "(unknown) (/)"
-        # would be mapped to a regular `project-N` slot, losing the
-        # (unknown) semantic in the anonymized output.
-        if counts[bn] > 1 and bn != "(unknown)":
-            path = s.project_path or ""
-            parent = os.path.basename(os.path.dirname(path)) or "/"
-            augmented[idx] = f"{bn} ({parent})"
-    return augmented
+    _lib_share = _share_load_lib()
+    paths = [(s.project_path or "") for s in sessions]
+    distinct: list[str] = []
+    index_of: dict[str, int] = {}
+    for p in paths:
+        if p not in index_of:
+            index_of[p] = len(distinct)
+            distinct.append(p)
+    resolved = _lib_share.disambiguate_basenames(distinct)
+    bare = [
+        (os.path.basename(p) or p or "(unknown)") for p in paths
+    ]
+    out: dict[int, str] = {}
+    for idx, p in enumerate(paths):
+        label = resolved[index_of[p]]
+        if label != bare[idx]:
+            out[idx] = label
+    return out
 
 
 def _build_session_snapshot(
@@ -1428,11 +1447,12 @@ def _build_session_snapshot(
 
     Privacy invariant (Section 8.4 / Section 5.3): the builder populates
     `ProjectCell.label`, `ChartPoint.project_label`, and
-    `ChartPoint.x_label` with the REAL `project_path` basename. The
-    `_share_render_and_emit` wrapper runs `_lib_share._scrub` BEFORE
-    rendering — that's the single chokepoint that rewrites every
-    project label to `project-1` / `project-2` / ... unless
-    `--reveal-projects` is passed.
+    `ChartPoint.x_label` with the REAL `project_path` basename.
+    `_lib_share.render()` is the chokepoint: it prepares the RAW
+    snapshot it is handed, rewriting every project label to
+    `project-1` / `project-2` / ... unless `--reveal-projects` is
+    passed. (It is NOT `_scrub()`: that function is retained for
+    backward compatibility and no production path calls it.)
 
     Deviations from the plan sketch (which assumed dict rows with keys
     `session_id` / `started_at` / `project_path` / `cost_usd` /
@@ -1530,6 +1550,7 @@ def _build_session_snapshot(
             x_value=cost_usd,
             y_value=cost_usd,
             project_label=proj_label,
+            x_label_kind="project",
         ))
     chart = (
         _lib_share.HorizontalBarChart(
@@ -1651,7 +1672,7 @@ def _share_iso(value) -> "str | None":
 # control.
 
 def _share_render_and_emit(snap, args) -> None:
-    """End-to-end: scrub -> render -> emit -> optional open.
+    """End-to-end: render -> emit -> optional open.
 
     Lazy-imports `_lib_share` so non-share invocations don't pay the import
     cost. The kernel module stays I/O-pure; this wrapper does all the
@@ -1680,13 +1701,29 @@ def _share_render_and_emit(snap, args) -> None:
     # class-identity invariant this enforces.
     _lib_share = _share_load_lib()
 
-    scrubbed = _lib_share._scrub(snap, reveal_projects=args.reveal_projects)
-    rendered = _lib_share.render(
-        scrubbed,
-        format=args.format,
-        theme=args.theme,
-        branding=not args.no_branding,
-    )
+    # No pre-scrub. `render()` owns the privacy contract and must receive the
+    # RAW snapshot: a second aliasing pass over an already-aliased legacy
+    # label (identity None) renumbers it by re-ranking (#503 S1).
+    #
+    # A privacy refusal is a MESSAGE, not a traceback. `render()` raises
+    # `SharePrivacyViolation` rather than redacting, so this is a reachable
+    # user-facing outcome and the CLI owes the user a sentence naming what it
+    # found. Exit 3 per `docs/cli-contract.md`: the share surface's staged
+    # family already uses 2 for a flag-combo error and 3 for a stage that
+    # failed after the flags validated, which is exactly what this is. The
+    # refusal precedes destination resolution, so nothing is written.
+    try:
+        rendered = _lib_share.render(
+            snap,
+            format=args.format,
+            theme=args.theme,
+            branding=not args.no_branding,
+            reveal_projects=args.reveal_projects,
+        )
+    except _lib_share.SharePrivacyViolation as exc:
+        print(f"cctally: refused to write a share artifact — {exc}",
+              file=sys.stderr)
+        sys.exit(3)
 
     utc_date = snap.generated_at.astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
     kind, value = _resolve_destination(args, cmd=snap.cmd, generated_at_utc_date=utc_date)

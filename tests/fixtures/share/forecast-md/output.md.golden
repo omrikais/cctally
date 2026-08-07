@@ -3,7 +3,7 @@ title: Forecast — week of May 04
 generated_at: 2026-05-09T12:00:00Z
 period: 2026-05-04T15:00:00Z..2026-05-11T15:00:00Z
 panel: forecast
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 # Forecast — week of May 04

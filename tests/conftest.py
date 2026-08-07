@@ -310,6 +310,34 @@ def _reset_perf_state():
     _reset()
 
 
+@pytest.fixture(autouse=True)
+def _reset_quota_projection_reconcile_flag():
+    """Isolate the #496 S5b per-process quota-projection arming between tests.
+
+    ``_cctally_core.QUOTA_PROJECTION_RECONCILE_ENABLED`` is a PROCESS global,
+    deliberately (see `enable_quota_projection_reconciliation`), and
+    ``load_script()`` keeps ``_cctally_core`` across reloads so that module — and
+    therefore the flag — outlives every test that set it. ``cmd_cache_sync``
+    calls the setter for real, so any test exercising `cctally cache-sync` arms
+    the whole worker process; a later test asserting that an UNARMED open never
+    reads the journal then runs against an armed one and fails. That is not
+    hypothetical: `test_an_ordinary_open_never_reads_the_journal_to_reconcile`
+    failed exactly this way when `pytest -n`'s default `--dist load` put
+    `tests/test_cache_sync_cli.py` on the same worker ahead of it.
+
+    Tests that want the flag on still set it with ``monkeypatch``; this fixture
+    only guarantees the starting state.
+    """
+    import _cctally_core
+
+    saved = _cctally_core.QUOTA_PROJECTION_RECONCILE_ENABLED
+    _cctally_core.QUOTA_PROJECTION_RECONCILE_ENABLED = False
+    try:
+        yield
+    finally:
+        _cctally_core.QUOTA_PROJECTION_RECONCILE_ENABLED = saved
+
+
 def load_script():
     """Execute the main script and return its globals dict.
 

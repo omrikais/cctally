@@ -993,6 +993,7 @@ def write_corruption_forensics(
     bundle: dict = {
         "schemaVersion": 1,
         "capturedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+        "sqliteRuntimeVersion": sqlite3.sqlite_version,
         "db": db_label,
         "path": str(db_path),
         "family": {},
@@ -1012,12 +1013,37 @@ def write_corruption_forensics(
     bundle["walEvidence"] = _capture_corruption_wal_evidence(
         db_path, ts, db_label=db_label, trigger_exception=trigger_exception,
     )
+    try:
+        import _lib_stats_wal
+
+        bundle["walIndexEvidence"] = _lib_stats_wal.inspect_wal_index_family(
+            db_path
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment never breaks a heal
+        bundle["walIndexEvidence"] = {
+            "schemaVersion": 1,
+            "verdict": "unavailable",
+            "captureStable": False,
+            "reason": _bounded_forensics_text(
+                exc, _FORENSICS_EXCEPTION_MESSAGE_MAX,
+            ),
+            "wal": None,
+            "shm": None,
+            "frameMapping": {
+                "comparedCount": 0,
+                "mismatchCount": 0,
+                "mismatchSample": [],
+                "truncated": False,
+            },
+        }
     for suffix in ("", "-wal", "-shm"):
         p = pathlib.Path(str(db_path) + suffix)
         try:
             st = p.stat()
             bundle["family"][p.name] = {
-                "bytes": st.st_size, "mtimeUtc": _forensics_iso(st.st_mtime),
+                "bytes": st.st_size,
+                "mtimeUtc": _forensics_iso(st.st_mtime),
+                "inode": int(st.st_ino),
             }
         except OSError:
             bundle["family"][p.name] = None
@@ -1314,6 +1340,30 @@ def quarantine_db_family(
 _REBUILD_CONFLICT_SAMPLE = 10
 
 
+def _cache_recovery_payload(coverage) -> dict:
+    """`db rebuild --json`'s `cacheRecovery` object (#496 S5b §4.7).
+
+    `complete` is NORMALIZED here, and that is the point of the helper. The
+    coverage record starts life as `{"status": "skipped", "reason": None,
+    "replayedObservations": 0}` with no `complete` key at all, and a rebuild run
+    with `update_quota_cache=False` never adds one — so a raw `.get("complete")`
+    emitted `null`, while `_write_quota_projection_state` reads that same
+    absence as COMPLETE. The JSON and the durable flag disagreed about exactly
+    one state, and `if not payload["cacheRecovery"]["complete"]` got the wrong
+    answer for it. The two now agree by construction: an absent key is an absent
+    duty, which is complete, and `phase` says `notRun` so a consumer can still
+    tell "the leg did not run" from "the leg ran and had nothing to do".
+    """
+    coverage = coverage or {}
+    ran = "complete" in coverage
+    return {
+        "phase": coverage.get("status") if ran else "notRun",
+        "complete": bool(coverage.get("complete")) if ran else True,
+        "coveredHighWater": coverage.get("coveredHighWater"),
+        "remainder": coverage.get("remainder"),
+    }
+
+
 def cmd_db_rebuild(args: argparse.Namespace) -> int:
     """``db rebuild --db stats`` — explicit journal replay into a fresh index
     (spec §9). Captures forensics first, builds and validates a fresh index while
@@ -1427,6 +1477,34 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
                 violation.to_dict()
                 for violation in result.acknowledged_protocol_violations
             ],
+            # #496 S5b — the durable selector prefix of the index this rebuild
+            # replaced, when it was behind that index's own applied cursor.
+            # `null` in the healthy case. Reported here and in the rebuild
+            # record only: the live path's own recovery is silent by §6.3.
+            "selectorDesynchronized": result.selector_desynchronized,
+            # #496 S5b F11 — what the quota cache leg did. `covered` is the
+            # intact path: the coverage certificate proved every cache-relevant
+            # journal record in the pinned prefix was already materialized, so
+            # the leg took no cache writer flock and replayed nothing.
+            "quotaCacheCoverage": result.quota_cache_coverage or None,
+            # #496 S5b §4.7 — publication success and cache-recovery
+            # completeness are DISTINCT, and a consumer must not be able to read
+            # one as the other. Reaching this point means the index was built,
+            # validated and published; whether the cache the quota projection
+            # was materialized from had reached its pinned target is a separate
+            # question with a separate answer.
+            "publication": {
+                "ok": True,
+                "statsQuotaProjectionIncomplete": bool(
+                    result.stats_quota_projection_incomplete),
+            },
+            "cacheRecovery": _cache_recovery_payload(
+                result.quota_cache_coverage),
+            # #496 S5b F12 — which journal segments the read pass skipped and,
+            # per segment, why it refused the ones it read. Every refusal is a
+            # silent full read by §6.3, so this and the rebuild record are the
+            # only places that say which state it was.
+            "segmentElision": (result.traversal or {}).get("elision"),
         }
         print(json.dumps(stamp_schema_version(payload, version=1)))
     else:
@@ -6464,6 +6542,16 @@ def _024_codex_fused_ingest_rebuild(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
             )
+            # #496 S5b §4.3, the identical hazard one layer over: this deletes
+            # every Codex `quota_window_snapshots` row while the journal still
+            # retains the observations behind them, and it does NOT bump
+            # `codex_physical_mutation_seq`, so a stored coverage certificate
+            # would stay stale-VALID and the next rebuild's fast path would skip
+            # a replay over a cache holding zero Codex quota rows. Reachable
+            # through `db skip 024` followed by `db unskip 024`. Same
+            # transaction as the deletes.
+            import _cctally_cache
+            _cctally_cache._invalidate_codex_journal_coverage_certificate(conn)
             conn.commit()
         except Exception:
             conn.rollback()

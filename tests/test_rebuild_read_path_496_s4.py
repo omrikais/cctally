@@ -158,10 +158,15 @@ def test_the_quota_replay_decodes_each_retained_observation_once(tier1_dumps):
 
 def test_the_additive_metrics_carry_every_named_phase(tier1_dumps):
     phases = tier1_dumps["full"]["phase_seconds"]
+    # `structural_fold` and `open_block_projection` split `stats_fold`'s first
+    # two spans (#496 S5b). They exist because together they are how long the
+    # retained cache read snapshot pins the cache.db WAL, and a rebuild record
+    # is where that window has to stay measurable.
     assert set(phases) == {
         "journal_read_decode", "cutover_suffix", "protocol_evidence",
-        "effective_selection", "quota_cache_leg", "stats_fold",
-        "scratch_validate", "publication"}
+        "effective_selection", "quota_cache_leg", "structural_fold",
+        "open_block_projection", "stats_fold", "scratch_validate",
+        "publication"}
     assert all(value >= 0 for value in phases.values())
 
 

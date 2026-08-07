@@ -4,7 +4,10 @@
 export type Verdict = 'ok' | 'cap' | 'capped';
 
 export interface SyncFailure {
-  kind: 'cache_corruption' | 'stats_corruption' | 'maintenance_active' | 'maintenance_stale' | 'server_sync';
+  // `quota_projection_incomplete` is #496 S5b's refusal to serve a quota view
+  // published over an interrupted cache recovery. Type-only: SyncChip renders
+  // `label` and joins `detail` + `action`, and nothing switches on `kind`.
+  kind: 'cache_corruption' | 'stats_corruption' | 'maintenance_active' | 'maintenance_stale' | 'quota_projection_incomplete' | 'server_sync';
   label: string;
   detail: string;
   action: string | null;

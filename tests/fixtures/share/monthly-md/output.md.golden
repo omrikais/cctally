@@ -3,7 +3,7 @@ title: Monthly usage — 2020-01 → 2026-05
 generated_at: 2026-05-09T12:00:00Z
 period: 2020-01-01T00:00:00Z..2026-05-09T12:00:00Z
 panel: monthly
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 # Monthly usage — 2020-01 → 2026-05

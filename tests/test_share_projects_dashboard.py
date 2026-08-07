@@ -1,6 +1,7 @@
-"""Section 7.5 contract: dashboard share path strips project labels via
-`_lib_share._scrub` before render. Fail-closed (memory: *Anonymization
-fails closed*): missing keys map to a sentinel, NEVER passthrough.
+"""Section 7.5 contract: the dashboard share path strips project labels in
+`_lib_share.render()`'s preparation pass, the privacy chokepoint since #503
+S1. Fail-closed (memory: *Anonymization fails closed*): missing keys map to a
+sentinel, NEVER passthrough.
 
 Boots the real DashboardHTTPHandler against a tmp HOME but seeds an
 in-memory snapshot whose `projects_envelope` field carries real

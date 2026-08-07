@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from _cctally_core import get_week_start_name
 from _cctally_quota import (
+    assert_projection_readable,
     codex_five_hour_percent_at_crossing,
     codex_quota_breakdown,
     codex_physical_mutation_seq,
@@ -586,6 +587,9 @@ def _codex_weekly_periods(
     # so the sentinel needs no NULL branch here (unlike the cache tables).
     account_predicate = "" if account_key is None else "AND account_key = ? "
     account_params: tuple = () if account_key is None else (account_key,)
+    # BEFORE the `try`, per #496 S5b section 4.7: beneath that handler a denial
+    # would be rendered as empty data rather than as an error.
+    assert_projection_readable(stats_conn)
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, account_key, logical_limit_key, limit_name, "
@@ -931,6 +935,12 @@ def codex_projection_coherence(
     physical signature only after its stats transaction commits, and its cache
     sequence must still match before presentation can use it.
     """
+    # BEFORE the `try`, per #496 S5b section 4.7, and for the same reason every
+    # other gated site places it there: the handler below catches
+    # `ValueError`/`TypeError` as well as `sqlite3.Error`, so a refusal raised
+    # inside it would be rendered as `ProjectionCoherence(False,
+    # "projection_read_failed")` — a degraded-data verdict instead of a denial.
+    assert_projection_readable(context.stats_conn)
     try:
         active_roots = tuple(sorted(
             str(row[0]) for row in context.cache_conn.execute(
@@ -1516,6 +1526,7 @@ def _quota_wire(
     """
     if cycle is None or now_utc is None:
         return ()
+    assert_projection_readable(stats_conn)
     try:
         rows = stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
@@ -3151,6 +3162,7 @@ def _codex_block_account_keys(
     if not root_keys:
         return set()
     placeholders = ",".join("?" for _ in root_keys)
+    assert_projection_readable(stats_conn)
     try:
         return {
             str(row[0] or _lib_accounts.UNATTRIBUTED)

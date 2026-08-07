@@ -103,7 +103,7 @@ def test_legacy_none_identity_snapshot_is_byte_stable():
         version="1.0.0",
     )
 
-    assert ls.render(snap, format="md", theme="light", branding=True) == (
+    assert ls.render(snap, format="md", theme="light", branding=True, reveal_projects=True) == (
         "---\n"
         "title: Legacy share\n"
         "generated_at: 2026-07-02T12:00:00Z\n"
@@ -134,7 +134,7 @@ def test_codex_snapshot_labels_source_and_unavailable_reason_in_every_format():
     assert snap.availability == "unavailable"
     assert snap.availability_reason == "Codex metadata is unavailable."
     for fmt in ("md", "html", "svg"):
-        rendered = ls.render(snap, format=fmt, theme="light", branding=True)
+        rendered = ls.render(snap, format=fmt, theme="light", branding=True, reveal_projects=True)
         assert "Codex" in rendered
         assert "Unavailable: Codex metadata is unavailable." in rendered
 
@@ -198,7 +198,7 @@ def test_range_cost_share_without_breakdown_keeps_truthful_total_in_all_formats(
     assert snap.rows[0].cells["tokens"].text == "1,234"
     assert snap.rows[0].cells["cost"].usd == 4.25
     for fmt in ("md", "html", "svg"):
-        rendered = ls.render(snap, format=fmt, theme="light", branding=True)
+        rendered = ls.render(snap, format=fmt, theme="light", branding=True, reveal_projects=True)
         assert "1,234" in rendered
         assert "$4.25" in rendered
 
@@ -233,9 +233,9 @@ def test_codex_diff_share_keeps_each_native_row_status_and_ab_delta_metrics():
     )
 
     snap = source.build_source_share_snapshot("diff", result, reveal_projects=False)
-    scrubbed = ls._scrub(snap, reveal_projects=False)
     for fmt in ("md", "html", "svg"):
-        rendered = ls.render(scrubbed, format=fmt, theme="light", branding=True)
+        rendered = ls.render(snap, format=fmt, theme="light",
+                             branding=True, reveal_projects=False)
         metrics = (
             ("A $", "B $", "Δ $", "Cost", "A", "B", "Δ", "Tokens")
             if fmt == "svg" else
@@ -381,7 +381,7 @@ def test_default_claude_share_uses_structured_legacy_adapter(
     snap = emitted[0]
     assert snap.source == "claude"
     assert snap.source_label == "Claude"
-    rendered = ls.render(snap, format=fmt, theme="light", branding=True)
+    rendered = ls.render(snap, format=fmt, theme="light", branding=True, reveal_projects=True)
     for value in expected:
         assert value in rendered
 
@@ -427,7 +427,7 @@ def test_claude_legacy_payload_adapters_keep_provider_native_rows(command, paylo
         command, SourceResult("claude", "ok", payload), reveal_projects=False,
     )
 
-    rendered = ls.render(snap, format="md", theme="light", branding=True)
+    rendered = ls.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
     for value in expected:
         assert value in rendered
 
@@ -477,7 +477,7 @@ def test_codex_reports_render_empty_share_before_legacy_no_data_sentinel(
     assert snap.source_label == "Codex"
     assert snap.availability == "empty"
     for fmt in ("md", "html", "svg"):
-        rendered = ls.render(snap, format=fmt, theme="light", branding=True)
+        rendered = ls.render(snap, format=fmt, theme="light", branding=True, reveal_projects=True)
         assert "Codex" in rendered
         assert "No data" in rendered
 

@@ -92,8 +92,116 @@ function mergeOptions(base: ShareOptions, override: Partial<ShareOptions> | unde
   return next;
 }
 
+// #503 S1 F6 — the two-state export-anonymization status line.
+//
+// Three correct-in-isolation decisions combine into a modal that cannot answer
+// its own question. <PreviewPane> forces `reveal_projects: true` (correct per
+// spec §6.3, so you can verify what you are about to share), <ShareModal>
+// defaults the option to `false` (correct — anonymize by default), and <Knobs>
+// binds a checkbox to it (correct). The result is a checkbox that changes
+// nothing visible, next to a preview that always shows real names, on a
+// surface documented as the place to review what you are about to share.
+//
+// The line is ALWAYS present and CHANGES TEXT rather than appearing and
+// disappearing. Two reasons. A line that vanishes in the safe state says
+// nothing, which is the current defect with extra steps — the composer's
+// `composer-anon-banner` is conditional, but it is right to be, because it is
+// a call to action carrying an "Anonymize all" button and F6 asks for
+// something different. And because the text changes rather than appears, a
+// screen-reader user hears the new state announced on toggle, which is the
+// feedback that does not exist today.
+//
+// Severity uses the three-tier vocabulary in
+// dashboard/design-system/components/alert-severity.html. Info and warn,
+// NEVER critical: revealing project names is a legitimate deliberate choice,
+// not an error.
+//
+// #503 S1 B1 — a THIRD, NEUTRAL state, because the two-state line made a false
+// statement on the templates whose artifacts carry no project name at all. The
+// real-browser QA gate measured it: a `trend`, `blocks` or `forecast` export
+// differs between the two privacy modes only in the `anonymized:` frontmatter
+// flag and the timestamp. On those, the reveal state promised real project
+// names the artifact does not contain, and the anonymize state claimed the
+// preview was showing real names when it showed none.
+//
+// This is an over-warning rather than a leak, so it cannot cause the defect
+// class this session exists to prevent. It matters because a line whose entire
+// value is trustworthiness must not be wrong, and a warning a user learns to
+// disregard on Forecast is one they may disregard on Projects.
+//
+// `hasProjectNames` comes from the server's additive `has_project_names`,
+// derived from the same snapshot the renderer used. NOT from a hardcoded list:
+// the property is finer than a panel — one template inside a panel can carry
+// project names while its sibling carries none — and it is not fixed by the
+// code at all, because it depends on the data the panel actually holds. A
+// `daily` panel that happens to hold no project data is the same case.
+//
+// The mechanism, worked through: `sessions-visual` normally reports that
+// project names are present, because its chart is keyed by project. When the
+// user has edited an option before switching archetype, the modal carries
+// `show_chart: false` into that template; the render then genuinely has no
+// chart and therefore no project name, and the neutral state is truthful. No
+// hardcoded list could produce that answer, and no count of "how many
+// templates are neutral" survives contact with a second dataset — three
+// measurements taken during this session disagreed for exactly that reason.
+//
+// `null` means not known yet — an older server, or the interval before the
+// first render resolves. It keeps the two original states, because claiming
+// "no project names" without evidence is the failure this change is removing,
+// only in the more dangerous direction.
+//
+// The neutral sentence is true in BOTH toggle positions, so this state does
+// not change when the user ticks the checkbox. That is intended: there is
+// nothing for the toggle to change.
+function SharePrivacyStatus({
+  revealProjects,
+  hasProjectNames,
+}: {
+  revealProjects: boolean;
+  hasProjectNames: boolean | null;
+}) {
+  const neutral = hasProjectNames === false;
+  const severity = neutral ? 'neutral' : revealProjects ? 'warn' : 'info';
+  // #503 S1 B2 — every string here fits ONE line at 390px.
+  //
+  // The mobile layout pins this line above a preview strip capped at 128px,
+  // so each wrapped line comes straight out of the preview. Measured at
+  // 390x844: the previous info wording took two lines and left 37px of
+  // preview — about two lines of the artifact, on a control whose documented
+  // purpose is letting the user verify what they are about to share. At one
+  // line all three states leave 58px.
+  //
+  // The share modal inherits the monospace stack, so the budget is a
+  // character count: 47 characters at 12px in the 359px column. (Not every
+  // surface in the client is mono — the conversation-viewer prose surfaces in
+  // `index.css` set `font-family: var(--font-prose)`, and the bundle ships
+  // Newsreader for them. None of them is an ancestor of this modal.) Shortening
+  // "Preview shows real project names. Export will be anonymized." (60) to
+  // the 47-character form below is what buys the line back. Check any
+  // rewording against that limit — 48 characters wraps and costs 17px.
+  const text = neutral
+    ? 'This export contains no project names.'
+    : revealProjects
+      ? 'Export will show real project names.'
+      : 'Preview shows real names. Export is anonymized.';
+  return (
+    <p
+      className={`share-privacy-status share-privacy-status--${severity}`}
+      role="status"
+      aria-live="polite"
+    >
+      {text}
+    </p>
+  );
+}
+
 export function ShareModal({ panel, source = 'claude', account = null, onClose, initialParams }: Props) {
   const cardRef = useRef<HTMLDivElement>(null);
+  // #503 S1 B1 — whether the rendered export carries any project name.
+  // Reported by <PreviewPane>, which owns the only /api/share/render call in
+  // this flow; `null` until the first render resolves, and again whenever the
+  // panel or template changes.
+  const [hasProjectNames, setHasProjectNames] = useState<boolean | null>(null);
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -263,12 +371,17 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
       <div className="share-modal-body">
         {isMobile && (
           <div className="share-preview-col share-preview-col--lead" aria-label="Live preview">
+            <SharePrivacyStatus
+              revealProjects={!!options.reveal_projects}
+              hasProjectNames={hasProjectNames}
+            />
             <PreviewPane
               panel={panel}
               source={source}
               account={account}
               templateId={selectedTemplateId}
               options={options}
+              onProjectNamesResolved={setHasProjectNames}
             />
           </div>
         )}
@@ -301,12 +414,17 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
           </div>
           {!isMobile && (
             <div className="share-preview-col" aria-label="Live preview">
+              <SharePrivacyStatus
+                revealProjects={!!options.reveal_projects}
+                hasProjectNames={hasProjectNames}
+              />
               <PreviewPane
                 panel={panel}
                 source={source}
                 account={account}
                 templateId={selectedTemplateId}
                 options={options}
+                onProjectNamesResolved={setHasProjectNames}
               />
             </div>
           )}

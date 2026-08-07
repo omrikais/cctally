@@ -40,9 +40,28 @@ EXPECTED_INPLACE_DIRS = {
     "dashboard", "doctor", "pricing-check", "conversation", "share", "share-v2",
 }
 # The pytest files an overlap would have to deselect (run serially after the
-# pool). Today only one pytest file reads an in-place-rebuilt fixture dir.
+# pool).
 KNOWN_SAFE_DESELECT = {
+    # The three #503 S1 share guards below are mirror-private, so a public
+    # clone does not carry them. Naming them here is safe anyway, and is
+    # waived for tests/test_public_test_dep_closure.py Scope A2 on that basis:
+    # mirror-private-ok — this list is only ever read as a superset of the
+    # readers `_pytest_readers_of` DISCOVERS by globbing, so an entry whose
+    # file is absent is never matched and never asserted about.
     "tests/test_dashboard_responsive_startup.py",
+    # #503 S1: the share privacy detector's negative corpus reads every
+    # committed golden under both share fixture roots, which
+    # bin/cctally-share-test and bin/cctally-share-v2-test rebuild in place.
+    # (Spelling the two directory names out here would make this file itself
+    # match the reader scan below.)
+    "tests/test_share_privacy_detector.py",
+    # #503 S1 B1/B3: reads the panel fixtures and the harness's `--plan` case
+    # list under the share-v2 root, which bin/cctally-share-v2-test rebuilds in
+    # place on every start.
+    "tests/test_share_golden_discipline.py",
+    # #503 S1 B4: the registry/fixture/golden bijection enumerates both share
+    # fixture roots, and both harnesses rebuild theirs in place.
+    "tests/test_share_registry_completeness.py",
 }
 # builder stem -> output roots when NOT tests/fixtures/<stem>.
 BUILDER_ROOT_EXCEPTIONS = {

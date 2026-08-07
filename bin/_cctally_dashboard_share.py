@@ -321,7 +321,8 @@ def _share_apply_content_toggles(snap_built, options: dict):
     The render kernel consumes whatever the template builder emits, so
     chart/table on-off can't be expressed by the builder alone (every
     builder unconditionally emits both). Apply the toggle here, after
-    the builder, before `_scrub` and `render`. ShareSnapshot is frozen;
+    the builder, before `render()` / `compose()` prepare it.
+    ShareSnapshot is frozen;
     `dataclasses.replace` returns a new instance.
 
     Defaults preserve pre-toggle behavior: `show_chart` defaults to
@@ -379,8 +380,11 @@ def _share_top_projects_for_range(
     week, current 5h block).
 
     NULL `project_path` collapses to the `(unknown)` sentinel. Anon
-    happens later in `_scrub()`; builders always emit real names per
-    the kernel's privacy chokepoint contract.
+    happens later, in the preparation pass `render()` and `compose()` run
+    over the raw snapshot; builders always emit real names per the
+    kernel's privacy chokepoint contract. (It is NOT `_scrub()`: that
+    function is retained for backward compatibility and no production
+    path calls it.)
     """
     bucket: dict[str, float] = {}
     try:
@@ -1114,9 +1118,11 @@ def _build_projects_share_panel_data(options: dict,
       }
 
     The Privacy invariant per spec §7.4 lives at the share-render gate
-    (`_lib_share._scrub`), NOT here. This panel_data carries REAL
-    display_keys + bucket_paths; downstream `_scrub` rewrites them
-    when ``reveal_projects=false``.
+    (`_lib_share.render()` / `compose()`), NOT here. This panel_data
+    carries REAL display_keys + bucket_paths; the preparation pass those
+    entry points run over the raw snapshot rewrites them when
+    ``reveal_projects=false``. (It is NOT `_scrub()`: that function is
+    retained for backward compatibility and no production path calls it.)
     """
     env: dict = getattr(snap, "projects_envelope", None) or {} if snap else {}
     if not env:
@@ -1823,7 +1829,24 @@ class _SharePeriodError(ValueError):
 
 def _share_public_failure(handler, exc: Exception, *, phase: str,
                           capability: bool = False) -> None:
-    handler.log_error("/api/share/%s failed: %r", phase, exc)
+    # A privacy refusal is logged by CLASS ONLY (#503 S1 R10). Since the
+    # refusal message widened to name the matched value, a `%r` of the
+    # exception can put an absolute path, a UUID or an email address into the
+    # dashboard log — and a log is a plausible thing to paste into a bug
+    # report. The data is the user's own and the HTTP response below is
+    # generic either way, so nothing reaches a remote client; this is about
+    # what the log file accumulates. Every raise site in `_lib_share` sets
+    # `classes`, and `SharePrivacyViolation` defaults it to a non-empty
+    # sentinel, so this branch cannot fall through to the `%r` for a privacy
+    # refusal even if a future raise site forgets the keyword. Any OTHER
+    # exception is still logged in full, because its repr is the only
+    # diagnostic there is.
+    classes = getattr(exc, "classes", None)
+    if classes:
+        handler.log_error("/api/share/%s failed: %s: %s", phase,
+                          type(exc).__name__, ", ".join(classes))
+    else:
+        handler.log_error("/api/share/%s failed: %r", phase, exc)
     if capability:
         handler._respond_json(400, {
             "code": "source_capability_unavailable",
@@ -1877,9 +1900,10 @@ def _handle_share_render_post_impl(handler) -> None:
     template_id against the registry, dispatches to the per-panel
     `_build_<panel>_share_panel_data` helper to assemble the
     builder-shaped dict from the current dashboard snapshot, runs the
-    template's builder, applies `_scrub` when
-    ``options.reveal_projects`` is False, then renders via
-    `_lib_share.render`. Response: ``{body, content_type, snapshot}``
+    template's builder, then renders via `_lib_share.render`, which
+    prepares the RAW snapshot it is handed — anonymizing project labels
+    when ``options.reveal_projects`` is False. Response:
+    ``{body, content_type, snapshot}``
     where `snapshot` carries `kernel_version` + `data_digest` for the
     v2 composer's drift detection (spec §5.2).
 
@@ -2024,11 +2048,16 @@ def _handle_share_render_post_impl(handler) -> None:
     source_snaps = tuple(
         _share_apply_content_toggles(item, options) for item in source_snaps
     )
-    reveal = bool(options.get("reveal_projects", True))
-    if not reveal:
-        source_snaps = tuple(
-            ls._scrub(item, reveal_projects=False) for item in source_snaps
-        )
+    # FAIL CLOSED (#503 S1 F3). HTTP genuinely has an absent-field case, so
+    # a default belongs here; it must resolve to anonymize, matching
+    # /api/share/compose, which already defaulted closed. The kernel itself
+    # has no default at all, so a fourth site cannot get this wrong.
+    reveal = bool(options.get("reveal_projects", False))
+    # No pre-scrub: the kernel's `render()` / `compose()` own the privacy
+    # contract and require RAW snapshots (#503 S1). Pre-scrubbing here
+    # renumbers aliases on the legacy path, and in the `source=all` branch it
+    # merges two distinct projects that each mapped locally to `project-1`
+    # into a single alias.
     try:
         if source == "all":
             body = ls.compose(
@@ -2049,6 +2078,7 @@ def _handle_share_render_post_impl(handler) -> None:
                 format=fmt,
                 theme=options.get("theme", "light"),
                 branding=not options.get("no_branding", False),
+                reveal_projects=reveal,
             )
     except Exception as exc:
         _share_public_failure(handler, exc, phase="render kernel")
@@ -2093,9 +2123,31 @@ def _handle_share_render_post_impl(handler) -> None:
         if account_label is not None:
             account_meta["account_label"] = account_label
 
+    # #503 S1 B1 — does this export contain project names at all?
+    #
+    # The share modal's status line said "Export will show real project names"
+    # on every panel. Some renders produce artifacts that are byte-identical in
+    # both privacy modes apart from the `anonymized:` frontmatter line, so on
+    # those the line was making a false statement — and a warning users learn to
+    # disregard on Forecast is one they may disregard on Projects. The client
+    # renders a third, neutral state from this flag.
+    #
+    # Which renders those are is derived per render from the snapshot in hand,
+    # never counted or listed: it depends on the data the panel actually holds,
+    # and it varies within a single panel. Do not state a number here.
+    #
+    # ADDITIVE per `docs/cli-contract.md`: an optional key does not bump a
+    # schema version, and consumers must tolerate unknown keys. Derived from
+    # the same RAW snapshots the renderer was just handed, through the kernel's
+    # `_map_project_display` enumeration — never from a panel list, which would
+    # be a second source of truth and wrong at template granularity.
+    has_project_names = any(
+        ls.has_project_identities(item) for item in source_snaps)
+
     handler._respond_json(200, {
         "body": body,
         "content_type": content_type,
+        "has_project_names": has_project_names,
         "snapshot": {
             "kernel_version": ls.KERNEL_VERSION,
             "panel": panel,
@@ -2282,10 +2334,14 @@ def _handle_share_compose_post_impl(handler) -> None:
             _share_apply_content_toggles(item, composite_opts)
             for item in source_snaps
         )
-        if not reveal_projects:
-            source_snaps = tuple(
-                ls._scrub(item, reveal_projects=False) for item in source_snaps
-            )
+        # No pre-scrub (#503 S1): `compose()` prepares every section itself,
+        # under one merged alias namespace. Scrubbing per section here is what
+        # made `project-1` denote a different project in each section.
+        #
+        # The digest below is unaffected by the removal: `_share_digest_input`
+        # reads only `snapshot.period` off each snapshot, never a label, so it
+        # stays byte-identical and no basket section spuriously reads
+        # "Outdated".
 
         # Defensive: digest is non-blocking metadata — fall back to
         # "" on failure rather than 500-ing the whole compose

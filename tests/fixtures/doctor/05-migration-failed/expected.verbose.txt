@@ -73,7 +73,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1008, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1009, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 41, 'ahead': False}
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
@@ -128,6 +128,9 @@ Journal
         scanned: False
         error: None
         violations: None
+  ✓ Quota projection         not applicable
+      details:
+        incomplete: None
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -259,4 +262,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 50 OK · 7 WARN · 1 FAIL
+Summary: 51 OK · 7 WARN · 1 FAIL

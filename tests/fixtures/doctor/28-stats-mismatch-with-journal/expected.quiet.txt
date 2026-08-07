@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1008) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1009) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
   ⚠ Pending migrations       54 pending
       → Run any cctally command — opens the DB and applies pending migrations
@@ -22,4 +22,4 @@ Safety
       → Run `cctally update --check` to populate
 Telemetry
 
-Summary: 52 OK · 6 WARN · 0 FAIL
+Summary: 53 OK · 6 WARN · 0 FAIL

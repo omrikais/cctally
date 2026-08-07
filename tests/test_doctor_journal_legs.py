@@ -292,7 +292,7 @@ def test_both_new_legs_are_registered_in_the_journal_category():
     assert ids == [
         "journal.presence", "journal.integrity", "journal.index_freshness",
         "journal.auto_heal", "journal.writer_guard", "journal.conflicts",
-        "journal.protocol",
+        "journal.protocol", "journal.quota_projection",
     ]
 
 
@@ -425,3 +425,43 @@ def test_writer_guard_gather_reads_only_the_bounded_tail(monkeypatch):
             "action=18\ttable=t59"
         ),
     }
+
+
+# ── quota projection (#496 S5b §4.7) ──────────────────────────────────────
+
+def test_quota_projection_incomplete_warns_and_names_cache_sync():
+    """The flag has exactly two clearers — a reconciliation armed by
+    `cctally cache-sync` or the dashboard, and a later complete rebuild. No
+    ingest path clears it, so a user who never runs either sees every quota
+    surface degrade with no cause and no remedy stated anywhere."""
+    import _lib_doctor
+    r = _lib_doctor._check_journal_quota_projection(
+        _state(stats_quota_projection_incomplete=True))
+    assert (r.id, r.severity) == ("journal.quota_projection", "warn")
+    # The summary is the line a user actually reads, and its two siblings below
+    # pin theirs. Without this the warn arm's wording was pinned by nothing.
+    assert r.summary == "incomplete — quota projection reads are refused"
+    assert "cctally cache-sync" in (r.remediation or "")
+    assert r.details == {"incomplete": True}
+
+
+def test_quota_projection_complete_is_ok():
+    """Non-vacuity: a leg that always warned would also satisfy the case
+    above."""
+    import _lib_doctor
+    r = _lib_doctor._check_journal_quota_projection(
+        _state(stats_quota_projection_incomplete=False))
+    assert (r.id, r.severity) == ("journal.quota_projection", "ok")
+    assert r.summary == "complete"
+    assert r.remediation is None
+
+
+def test_quota_projection_unknown_is_not_applicable():
+    """A pre-1009 index, an absent stats.db and an unreadable one all arrive as
+    None, and none of them is a fault to report."""
+    import _lib_doctor
+    r = _lib_doctor._check_journal_quota_projection(
+        _state(stats_quota_projection_incomplete=None))
+    assert (r.id, r.severity) == ("journal.quota_projection", "ok")
+    assert r.summary == "not applicable"
+    assert r.remediation is None

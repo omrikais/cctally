@@ -375,7 +375,16 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # rolled back. A stats schema change is an epoch bump and never a migration;
 # the 13-migration registry stays frozen. Each install pays one rebuild on
 # upgrade, deferred to the background worker by #453.
-STATS_INDEX_EPOCH = 1008
+# 1008 -> 1009 (#496 S5b): durable replay selection. Adds the three
+# `journal_selector_*` tables reproducing `resolve_effective_events`' six
+# accumulators, `stats_quota_projection_state` (reserved by Stage 1, set by
+# Stage 3), plus `journal_effective_events.winning_sequence` /
+# `.conflict_hashes_json` and `journal_protocol_violations.available_after`.
+# Same mechanical reason as every bump since 1005: an epoch-current open returns
+# before any schema work, so an `add_column_if_missing` would never run on an
+# upgraded install and the column would simply never appear. The registry stays
+# frozen at 13 and an epoch mismatch resolves by rebuild.
+STATS_INDEX_EPOCH = 1009
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -775,6 +784,43 @@ _STATS_MAINTENANCE_HELD = contextvars.ContextVar(
 def holds_stats_maintenance() -> bool:
     """True when THIS execution context already holds stats.db.maintenance.lock."""
     return _STATS_MAINTENANCE_HELD.get() > 0
+
+
+# === #496 S5b §4.7 open-time quota-projection reconciliation (opt-in) ======
+#
+# A rebuild that published a valid index over a cache with an uncovered
+# remainder durably marks its quota projection incomplete, and some later open
+# has to resume that recovery or the gate never lifts. `open_db` is where that
+# resumption lives, but it is NOT something every open may pay: `open_db` runs
+# on `cctally statusline` and on every hook tick, and the resumption reads the
+# journal from zero to the current high water — the 1.64 GB working set the S4
+# measurements describe — before it can apply anything.
+#
+# So the trigger is armed per process rather than unconditional. A maintenance
+# command that is already doing journal-scale work arms it; the interactive
+# render paths never do, and pay only the one indexed flag SELECT that was
+# already there. A process global rather than a ContextVar deliberately: this
+# is a property of the COMMAND that is running, not of one thread inside it,
+# and the dashboard arms it once for the whole server.
+QUOTA_PROJECTION_RECONCILE_ENABLED = False
+
+
+def enable_quota_projection_reconciliation() -> None:
+    """Arm the open-time quota-projection reconciliation for this process.
+
+    A PROCESS global, deliberately, and not a ContextVar or a thread-local: the
+    two armers are `cmd_cache_sync` and `cmd_dashboard`, and the dashboard has
+    no dedicated maintenance thread to hang a thread-local on. So in the
+    dashboard whichever thread reaches `open_db` first runs the attempt, and one
+    attempt can stall that thread while it holds the maintenance flock. That is
+    accepted rather than overlooked: the attempt takes every lock
+    non-blocking and returns immediately when any is busy, the throttle bounds
+    the repeat to one per interval, and the alternative — routing this through a
+    worker the dashboard does not currently have — is a larger change than the
+    contention it would avoid.
+    """
+    global QUOTA_PROJECTION_RECONCILE_ENABLED
+    QUOTA_PROJECTION_RECONCILE_ENABLED = True
 
 
 # === stats.db sanctioned-write scope (#386) =========================
@@ -1537,6 +1583,35 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     _reconcile_durable_applied_migration_errors = (
         c._reconcile_durable_applied_migration_errors
     )
+
+    def _reconcile_incomplete_quota_projection(_conn):
+        """#496 S5b §4.7's open-time gate, reached only on the steady-state path.
+
+        A rebuild that published a valid index over a cache with an uncovered
+        remainder durably marks its quota projection incomplete, and every
+        projection read is then gated. Some open has to be able to resume that
+        recovery, or the gate never lifts. Everything past the flag probe lives
+        in `_cctally_journal`, which owns the recovery leg and the lock order;
+        the reach is call-time for the same reason the opener policy's is.
+
+        ARMED PROCESSES ONLY. The resumption reads the whole journal, and this
+        function is reached by `cctally statusline` and by every hook tick. An
+        unarmed process returns here, before the `_cctally_journal` import — so
+        an interactive render pays neither the import nor the read. See
+        `enable_quota_projection_reconciliation`.
+
+        Any failure is swallowed. This runs on the hot open path, and a
+        reconciliation that cannot proceed must leave the flag set — the
+        fail-closed direction — rather than fail an unrelated command.
+        """
+        if not QUOTA_PROJECTION_RECONCILE_ENABLED:
+            return
+        try:
+            import importlib as _il
+            _il.import_module(
+                "_cctally_journal").reconcile_incomplete_quota_projection(_conn)
+        except Exception:
+            return
     # Unified opener policy (spec §6.1). Call-time import so the shared PRAGMA
     # policy applies without a module-load cycle (_cctally_store imports this
     # module). Routed through importlib.import_module rather than a bare
@@ -1663,6 +1738,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 _reconcile_durable_applied_migration_errors(
                     conn, _STATS_MIGRATIONS, "stats.db"
                 )
+                _reconcile_incomplete_quota_projection(conn)
             return conn
         if _target_path is None:
             if _uv > LEGACY_STATS_HEAD:
@@ -2488,6 +2564,15 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # the append-only journal; rebuild repopulates this table from the shared
         # pure selector. The table lets live replay detect completed corrections
         # without inventing family-specific inverse operations.
+        # `winning_sequence` and `conflict_hashes_json` (#496 S5b §3.2) complete
+        # this table into the selector's whole per-event accumulator, which is
+        # why S5b adds NO per-candidate table: same-revision containment needs
+        # only the winning revision, the lowest-sequence winner and the set of
+        # distinct content hashes observed at that revision, and this table is
+        # already keyed one row per event id. The columns are declared HERE
+        # rather than added by `add_column_if_missing`, because this is an epoch
+        # bump: an epoch-current open returns before any schema work, so a
+        # conditional column addition would never run on an upgraded install.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_effective_events ("
             "event_id TEXT PRIMARY KEY, "
@@ -2495,17 +2580,109 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "status TEXT NOT NULL CHECK (status IN ('active','tombstone')), "
             "content_hash TEXT NOT NULL, "
             "batch_id TEXT, "
-            "event_json TEXT)"
+            "event_json TEXT, "
+            "winning_sequence INTEGER, "
+            "conflict_hashes_json TEXT)"
         )
         # Disposable selector diagnostics (#402 Task A). The append-only journal
         # remains authoritative; rebuild/live preflight replace this bounded
         # summary after a complete correction-prefix selection.
+        #
+        # `available_after` (#496 S5b §3.2) is the selector's per-fingerprint
+        # minimum sequence: a `journal_protocol_resolution` op that precedes it
+        # is fatal, so an incremental pass that cannot re-derive it cannot
+        # decide whether a resolution is legitimate.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_protocol_violations ("
             "fingerprint TEXT PRIMARY KEY, "
             "batch_id TEXT NOT NULL, "
             "kind TEXT NOT NULL, "
-            "violation_json TEXT NOT NULL)"
+            "violation_json TEXT NOT NULL, "
+            "available_after INTEGER)"
+        )
+        # The primary key is the fingerprint, but every scoped selector read
+        # filters `WHERE batch_id IN (...)` — on the status-line path, once per
+        # merge tick. Without this index that is a full table scan, and the
+        # rows-read guard in `tests/test_live_selection_496_s5b.py` cannot see
+        # it: that proxy counts rows RETURNED, not rows scanned.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_journal_protocol_violations_batch "
+            "ON journal_protocol_violations(batch_id)"
+        )
+        # ── Durable selector state (#496 S5b §3.2) ──────────────────────────
+        # `resolve_effective_events` accumulates six things over the record
+        # stream and returns only a summary, so every live tick that meets a
+        # correction record re-derives them from the whole journal prefix. These
+        # three tables reproduce those six accumulators and nothing more, which
+        # is what lets a validated generation seed incrementally instead.
+        #
+        # They are OPERATIONALLY AUTHORITATIVE only inside a validated current
+        # generation. The journal remains ultimate truth: every rebuild, every
+        # stale-generation fallback, Model-A versus harvest emission, bootstrap
+        # handling and correction-batch application still derive from journal
+        # records. Durable selector state may ACCELERATE a validated generation
+        # and may never SUPERSEDE retained truth.
+        #
+        # One row, enforced structurally — unlike `stats_publication_stamp`,
+        # whose duplicate row is a state that must resolve INDETERMINATE and
+        # therefore may not be made impossible.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_selector_state ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "generation_record_path TEXT, "
+            "generation_stamped_at_utc TEXT, "
+            "covered_segment TEXT, "
+            "covered_offset INTEGER, "
+            "next_sequence INTEGER NOT NULL DEFAULT 0, "
+            "selector_version INTEGER NOT NULL, "
+            # `cutover_seen` distinguishes "no cutover op exists" from "the op
+            # exists and recorded no account". A plain NULL cannot carry both
+            # answers, and conflating them re-runs the whole-journal cutover
+            # scan F20 exists to remove.
+            "cutover_seen INTEGER NOT NULL DEFAULT 0, "
+            "cutover_account_key TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_selector_batches ("
+            "batch_id TEXT PRIMARY KEY, "
+            "status TEXT NOT NULL "
+            "  CHECK (status IN ('begin_only','completed','tainted')), "
+            "action_count INTEGER, "
+            "action_set_hash TEXT, "
+            "begin_segment TEXT, begin_offset INTEGER, "
+            "earliest_commit_segment TEXT, earliest_commit_offset INTEGER)"
+        )
+        # One row per marker and per action. A digest alone is not enough: when
+        # a batch completes, the selector rebuilds every action's canonical core
+        # to derive `actual_actions_hash`, and a split cycle — begin and actions
+        # in an earlier generation, commit in this tick — decides completion NOW
+        # from cores captured THEN. `action_core_json` is therefore retained
+        # while the batch is `begin_only` OR `tainted`, and dropped only on
+        # `completed`; an early taint does not end a batch's record stream.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_selector_batch_records ("
+            "batch_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL CHECK (kind IN ('marker','action')), "
+            "key TEXT NOT NULL, "
+            "record_digest TEXT NOT NULL, "
+            "identity_digest TEXT, "
+            "sequence INTEGER NOT NULL, "
+            "action_core_json TEXT, "
+            "PRIMARY KEY (batch_id, kind, key))"
+        )
+        # Set only by Stage 3, reserved here so no stage depends on a table a
+        # later stage creates (#496 S5b §4.7). The stats quota projection is
+        # materialized FROM cache.db, so a partial cache recovery publishes a
+        # semantically partial projection inside the generation; the flag is the
+        # per-transaction gate that keeps that projection from being served. The
+        # target is VERSIONED, not a bare coordinate, so a target written by one
+        # binary is never misread by another.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stats_quota_projection_state ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "incomplete INTEGER NOT NULL DEFAULT 0, "
+            "target_version INTEGER NOT NULL DEFAULT 0, "
+            "recovery_target_json TEXT)"
         )
         # In-place publication identity (#496 S3 §5). An in-place publish
         # attaches the scratch read-only and detaches it, so the scratch

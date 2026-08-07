@@ -57,7 +57,7 @@ Three archetype tiles per panel (spec §9.4):
 
 ## Template inventory
 
-24 templates total — 8 panels x 3 archetypes each.
+27 templates total — 9 panels x 3 archetypes each.
 
 | Panel | Recap | Visual | Detail |
 |---|---|---|---|
@@ -69,6 +69,7 @@ Three archetype tiles per panel (spec §9.4):
 | Blocks | Current block KPI + line | Burndown gauge | Per-block x model/project |
 | Forecast | Projection + budget table | Projection w/ ceilings | Per-day forecast table |
 | Sessions | Top-15 table + total | Top-N hbar | Top-50 + full columns |
+| Projects | Top-N table + KPI + hbar | Top-12 hbar, chart-led | Full table + hbar |
 
 ## Knobs reference
 
@@ -113,7 +114,7 @@ Buttons that don't apply to the selected format are disabled with an explanatory
 ## Privacy & anonymization
 
 - The render kernel anonymizes project paths by default (`project-1`, `project-2`, … cost-descending).
-- The single chokepoint is `_scrub` in `bin/_lib_share.py`. The Layer-A "no original tokens" invariant test guards against leaks.
+- The chokepoints are `render()` and `compose()` in `bin/_lib_share.py` — the only complete-document boundaries. Each runs inventory → prepare → render → verify, and the verify stage **fails the render** rather than redacting when it detects a forbidden identifier class. `_scrub` is no longer the path the entry points use; it remains public for backward compatibility only. Full contract in [`share-gotchas.md`](../share-gotchas.md).
 - The **preview pane always reveals** real names so you can verify what you're sharing. The `Anon on export` checkbox controls only the exported artifact.
 - The mapping is point-in-time; re-rendering tomorrow may shuffle assignments. Uncheck `Anon on export` if you need stable names.
 - See [Privacy](share.md#privacy) in the CLI reference for the full algorithm.
@@ -165,7 +166,7 @@ The composer modal:
 - **Right pane:** live combined preview in a sandboxed iframe.
 - **Top knobs:** title, theme, format, anon-on-export, no-branding. These are composite — they override every section's add-time values per spec §8.5.
 - **Outdated badge:** appears when section data has shifted since add-time OR when the kernel version has changed. Click `Refresh from current data` to re-render.
-- **Real-name banner:** appears at the top of the composed output when at least one section was added with `reveal_projects=true` AND the composite `anon-on-export` is unchecked. Anonymizing at compose time hides the banner.
+- **Real-name banner:** appears at the top of the composed output whenever the composite `anon-on-export` is unchecked and the basket is not empty. Each section's add-time anonymization choice does not enter into it. Anonymizing at compose time hides the banner. (An earlier version of this page said the banner also required at least one section to have been added with `reveal_projects=true`. That condition was retired because it hid a real-name export: compose re-renders every section with the composite value, so a section captured anonymously is revealed anyway, and under the old condition the banner stayed silent about it.)
 
 The basket persists across page reloads in browser localStorage (`cctally:share:basket`). Hard-capped at 20 sections. Cleared via the composer's `Clear all` button (no Undo affordance — refresh is the recovery).
 
@@ -214,7 +215,7 @@ cd dashboard/web && nvm use && npm run dev
 
 ### 1. Per-panel share + export
 
-For each of the 8 share-capable panels (CurrentWeek, Trend, Weekly, Daily, Monthly, Blocks, Forecast, Sessions):
+For each of the 9 share-capable panels (CurrentWeek, Trend, Weekly, Daily, Monthly, Blocks, Forecast, Sessions, Projects):
 
 1. Click the `↗` icon (or focus the panel and press `S`).
 2. In the modal, cycle Recap -> Visual -> Detail.

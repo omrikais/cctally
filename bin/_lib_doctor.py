@@ -232,6 +232,12 @@ class DoctorState:
     # DOCTOR_WAL_WARN_BYTES (2x the WAL cap) — only when the journal_size_limit
     # + forced-checkpoint machinery has genuinely failed to contain the WAL.
     cache_db_wal_bytes: Optional[int] = None
+    # #496 S5b: the durable incomplete-quota-projection flag carried inside the
+    # published stats generation. True = every quota-projection read is refused
+    # until a reconciliation runs; False = the generation is complete; None =
+    # there is no epoch-1009 index to ask (absent file, pre-1009 index, or an
+    # unreadable DB), which the check reports as not applicable.
+    stats_quota_projection_incomplete: Optional[bool] = None
     # #315: read-only PRAGMA page_count/freelist_count evidence. The pure
     # db.reclaimable check warns when free pages reach 25% of cache.db and
     # points at the already-guarded explicit vacuum command. None means the
@@ -923,8 +929,12 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
         if epoch is None:
             # Fallback kept in lockstep with _cctally_core.STATS_INDEX_EPOCH; the
             # gather layer injects the real constant, so this only guards a hand-
-            # built DoctorState that omitted it.
-            epoch = 1000
+            # built DoctorState that omitted it. It sat at 1000 against a current
+            # constant of 1008 for eight epochs, which made this guard report a
+            # current index as a mismatch; corrected with the 1009 bump
+            # (#496 S5b §6.1). It stays a literal because this kernel is pure and
+            # must not import `_cctally_core`.
+            epoch = 1009
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -2702,6 +2712,47 @@ def _check_journal_protocol(s: DoctorState) -> CheckResult:
     )
 
 
+def _check_journal_quota_projection(s: DoctorState) -> CheckResult:
+    """Report a published stats generation whose quota projection is incomplete
+    (#496 S5b §4.7).
+
+    The flag is set by a rebuild whose Codex quota cache recovery stopped short,
+    and only two things clear it: a reconciliation armed by `cctally cache-sync`
+    or the dashboard server, or a later rebuild whose coverage came back
+    complete. No ingest path clears it, so it can stay set indefinitely while
+    every quota-projection read is refused — and every consumer surface renders
+    that refusal as absent or stale data. Nothing else reported it, which is why
+    this leg exists.
+
+    WARN rather than FAIL: the index is valid, the remedy is one ordinary
+    command, and no data is lost. This check is read-only and never reconciles.
+    """
+    incomplete = s.stats_quota_projection_incomplete
+    details = {"incomplete": incomplete}
+    if incomplete is True:
+        return CheckResult(
+            id="journal.quota_projection", title="Quota projection",
+            severity="warn",
+            summary="incomplete — quota projection reads are refused",
+            remediation=(
+                "Run `cctally cache-sync` to reconcile the quota projection "
+                "against the journal"
+            ),
+            details=details,
+        )
+    if incomplete is False:
+        return CheckResult(
+            id="journal.quota_projection", title="Quota projection",
+            severity="ok", summary="complete", remediation=None,
+            details=details,
+        )
+    return CheckResult(
+        id="journal.quota_projection", title="Quota projection",
+        severity="ok", summary="not applicable", remediation=None,
+        details=details,
+    )
+
+
 # Each entry is (category_id, category_title, ((check_id, evaluator_fn_name), ...)).
 # The dotted check_id is the stable JSON-contract ID (spec §5.2) AND the
 # fingerprint identity-slice key (spec §5.5). When an evaluator raises,
@@ -2987,6 +3038,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("journal.writer_guard", "_check_journal_writer_guard"),
         ("journal.conflicts", "_check_journal_conflicts"),
         ("journal.protocol", "_check_journal_protocol"),
+        ("journal.quota_projection", "_check_journal_quota_projection"),
     )),
     ("data", "Data", (
         ("data.latest_snapshot_age", "_check_data_latest_snapshot_age"),

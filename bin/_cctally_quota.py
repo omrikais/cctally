@@ -15,7 +15,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, NoReturn, Sequence
 
 import _cctally_core
 import _lib_accounts
@@ -62,6 +62,354 @@ import _lib_quota_ledger as _ledger
 
 UTC = dt.timezone.utc
 _DASHBOARD_PROJECTION_CERTIFICATE_KEY = "codex_quota_projection_certificate"
+
+
+# --------------------------------------------------------------------------
+# the incomplete-quota-projection read gate (#496 S5b §4.7)
+# --------------------------------------------------------------------------
+#
+# The stats quota projection is materialized FROM cache.db, so a rebuild that
+# could not fully recover the cache publishes a semantically PARTIAL projection
+# inside an otherwise valid generation. Completing the cache later does not by
+# itself reconcile that projection.
+#
+# "The next open reconciles it" is not enforceable: `RebuildResult` is
+# process-local, a current-epoch `open_db` returns early without any
+# reconciliation gate, and — decisively — in-place publication deliberately
+# keeps already-open readers alive, so a connection can finish its old read
+# transaction and observe the incomplete new generation without ever calling
+# `open_db` again. The gate is therefore durable and PER TRANSACTION.
+#
+# Three properties decide its shape:
+#
+# 1. It cannot be an authorizer-style denial, because projection reads are
+#    scattered across the dashboard, milestone-history, quota and library
+#    modules rather than centralized.
+# 2. It must run BEFORE any fallback-catching SQL. Most of those reads sit
+#    inside `except sqlite3.Error` handlers that would render a denial as empty
+#    data instead of as an error.
+# 3. It never acquires a lock. Inside a caller transaction it raises a typed
+#    retry signal rather than starting reconciliation, because taking the
+#    maintenance and cache locks after a SQLite transaction has opened inverts
+#    the repository's lock order. The caller ends its transaction and retries.
+
+#: The one remedy every refusal names. Only two things clear the durable
+#: incomplete flag — a reconciliation, which only `cctally cache-sync` and the
+#: dashboard server arm, and a later rebuild whose coverage came back complete —
+#: so a surface that says only "incomplete" leaves the user with no next step.
+#: It is appended to every `QuotaProjectionIncomplete` message rather than left
+#: to each caller, because the ten raise sites reach surfaces that render the
+#: exception STRING (the TUI's `last_sync_error`, the dashboard's error paths)
+#: and would otherwise each have to restate it.
+QUOTA_PROJECTION_REMEDY = (
+    "run `cctally cache-sync` to reconcile it"
+)
+
+
+class QuotaProjectionIncomplete(Exception):
+    """The published quota projection is incomplete — a RETRY signal.
+
+    Not an error verdict: the projection is reconcilable, and the caller's job
+    is to end its transaction and retry rather than to report a failure. It
+    carries the VERSIONED recovery target rather than a bare coordinate, so a
+    target written by one binary is never misread by another.
+
+    The decided contract for a gated caller is: end the transaction, let a
+    maintenance-capable process reconcile (`cctally cache-sync`, or the
+    dashboard server, which arms
+    `_cctally_journal.reconcile_incomplete_quota_projection` at its own opens),
+    and retry once — render a "reconciling" state naming that remedy rather than
+    empty data if the retry is still refused.
+
+    **Where the contract is implemented, by path rather than by module.** Every
+    message carries `QUOTA_PROJECTION_REMEDY`, so any surface that renders the
+    exception string names the remedy.
+
+    The three handlers in `bin/_cctally_tui.py` catch this ahead of their
+    `except Exception` neighbours, so the refusal is attributed to its own
+    `quota-projection` leg instead of being sanitized into a generic
+    stats-or-cache failure. **Those handlers cover the dashboard's snapshot
+    build too**, and an earlier version of this docstring wrongly said they did
+    not: `bin/_cctally_dashboard.py` builds its snapshot by calling
+    `_tui_build_snapshot(..., precompute_envelope=True)`, and
+    `_tui_build_source_bundle` — which reaches all four
+    `bin/_cctally_dashboard_sources.py` sites — is reachable only under that
+    flag. `_sync_failure_envelope` turns the resulting attribution into a
+    rendered `quota_projection_incomplete` state whose `action` names
+    `cctally cache-sync`, on the existing rendered contract, so no
+    `dashboard/web/` change and no real-browser QA gate is involved.
+
+    The two `bin/_cctally_dashboard.py` HTTP route handlers — `/api/milestones`
+    cycle detail and the `/api/source/…` route that reaches
+    `_build_codex_block_detail`, and through it the two
+    `bin/_cctally_milestone_history.py` sites — are a separate path with no
+    snapshot and no envelope. They answer a typed **503**
+    `quota_projection_incomplete` carrying the same `action`, instead of the
+    generic 500 and 400 that reported a server fault and named no remedy.
+    """
+
+    def __init__(self, message, *, target_version=0, recovery_target=None):
+        super().__init__(message)
+        self.target_version = target_version
+        self.recovery_target = recovery_target
+
+
+#: Every direct read of `quota_window_blocks` or `quota_projection_state` whose
+#: TABLE NAME IS A LITERAL, as `<file>::<function>::<table>`. A static guard
+#: keeps this complete, the same discipline `FROZEN_WRITE_SITES` applies to
+#: writes — a new site has to be a deliberate act rather than a silent one.
+#:
+#: The name says "read sites" and one member is a `DELETE FROM
+#: quota_projection_state`: the scanner resolves a target after `FROM` or
+#: `JOIN`, and a DELETE writes through the same `FROM`. It is classified
+#: `projector` so the outcome is identical either way, and it is left in rather
+#: than special-cased, because a scanner that skipped `DELETE ... FROM` would
+#: also have to decide what to do with every other statement form and would
+#: acquire a blind spot doing it.
+#:
+#: A site whose target is INTERPOLATED is invisible to this set — `FROM {table}`
+#: has no literal table name. `PROJECTION_DYNAMIC_READ_SITES` below freezes
+#: those by count, which is the only property a static scan can freeze.
+PROJECTION_READ_CHOKEPOINTS: "frozenset[str]" = frozenset({
+    "_cctally_dashboard.py::_build_codex_block_detail::quota_window_blocks",
+    "_cctally_dashboard.py::_handle_get_milestones_week::quota_window_blocks",
+    "_cctally_dashboard_sources.py::_codex_weekly_periods::quota_window_blocks",
+    "_cctally_dashboard_sources.py::codex_projection_coherence::"
+    "quota_projection_state",
+    "_cctally_dashboard_sources.py::_quota_wire::quota_window_blocks",
+    "_cctally_dashboard_sources.py::_codex_block_account_keys::"
+    "quota_window_blocks",
+    "_cctally_milestone_history.py::_load_codex_cycles::quota_window_blocks",
+    "_cctally_milestone_history.py::_codex_five_hour_rows::quota_window_blocks",
+    "_lib_dashboard_sources.py::<module>::quota_projection_state",
+    "_lib_dashboard_sources.py::<module>::quota_window_blocks",
+    "_cctally_quota.py::_stats_projection_signatures_match::"
+    "quota_projection_state",
+    "_cctally_quota.py::_blocks_missing_reverse_map::quota_window_blocks",
+    "_cctally_quota.py::_root_group_pairs::quota_window_blocks",
+    "_cctally_quota.py::_root_accounts::quota_window_blocks",
+    "_cctally_quota.py::<module>::quota_window_blocks",
+    "_cctally_quota.py::_orphan_unseen::quota_window_blocks",
+    "_cctally_quota.py::_orphan_unseen_scoped::quota_window_blocks",
+    "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state",
+})
+
+#: What each enumerated site does about the gate.
+#:
+#: `gate` — `assert_projection_readable` runs in that function before its SQL.
+#: `gate_at_caller` — the read is in a pure kernel that may not import this
+#:   module, so its callers gate it instead. Every such site MUST name those
+#:   callers in `PROJECTION_GATE_CALLERS`, and the guard resolves each named
+#:   caller and fails when that function does not call the gate.
+#: `projector` — a read by the projection MACHINERY itself. Gating these would
+#:   deadlock recovery: they are what re-materializes the projection and clears
+#:   the flag, so they must be able to read while it is set.
+#: `diagnostic` — a debug surface that reports a raw row COUNT and renders no
+#:   projection value. Gating one would replace a diagnostic answer with an
+#:   exception at exactly the moment an operator is diagnosing the incomplete
+#:   projection, which inverts what the surface is for.
+PROJECTION_READ_SITE_ACTIONS: "dict[str, str]" = {
+    "_cctally_dashboard.py::_build_codex_block_detail::quota_window_blocks":
+        "gate",
+    "_cctally_dashboard.py::_handle_get_milestones_week::quota_window_blocks":
+        "gate",
+    "_cctally_dashboard_sources.py::_codex_weekly_periods::quota_window_blocks":
+        "gate",
+    "_cctally_dashboard_sources.py::codex_projection_coherence::"
+    "quota_projection_state": "gate",
+    "_cctally_dashboard_sources.py::_quota_wire::quota_window_blocks": "gate",
+    "_cctally_dashboard_sources.py::_codex_block_account_keys::"
+    "quota_window_blocks": "gate",
+    "_cctally_milestone_history.py::_load_codex_cycles::quota_window_blocks":
+        "gate",
+    "_cctally_milestone_history.py::_codex_five_hour_rows::quota_window_blocks":
+        "gate",
+    # `codex_stats_digest`'s relation table is module-level in a pure kernel
+    # that must not import this module, so its callers gate it. They are named
+    # in `PROJECTION_GATE_CALLERS` and the guard verifies each one.
+    "_lib_dashboard_sources.py::<module>::quota_projection_state":
+        "gate_at_caller",
+    "_lib_dashboard_sources.py::<module>::quota_window_blocks":
+        "gate_at_caller",
+    "_cctally_quota.py::_stats_projection_signatures_match::"
+    "quota_projection_state": "projector",
+    "_cctally_quota.py::_blocks_missing_reverse_map::quota_window_blocks":
+        "projector",
+    "_cctally_quota.py::_root_group_pairs::quota_window_blocks": "projector",
+    "_cctally_quota.py::_root_accounts::quota_window_blocks": "projector",
+    # A module-level sweep-scoping SQL constant, not a function body.
+    "_cctally_quota.py::<module>::quota_window_blocks": "projector",
+    "_cctally_quota.py::_orphan_unseen::quota_window_blocks": "projector",
+    "_cctally_quota.py::_orphan_unseen_scoped::quota_window_blocks":
+        "projector",
+    "_cctally_quota.py::_apply_quota_projection_rows::quota_projection_state":
+        "projector",
+}
+
+#: For each `gate_at_caller` site, the `<file>::<function>` callers that run the
+#: gate on its behalf. Naming them is what makes the classification checkable:
+#: an unnamed caller reduces `gate_at_caller` to an assertion nothing tests, and
+#: that is how the first version of this map came to claim a gating caller that
+#: neither called the kernel nor called the gate.
+PROJECTION_GATE_CALLERS: "dict[str, tuple[str, ...]]" = {
+    "_lib_dashboard_sources.py::<module>::quota_projection_state": (
+        "_cctally_tui.py::_tui_build_source_bundle",
+        "_cctally_tui.py::_tui_compute_dispatch_signature",
+    ),
+    "_lib_dashboard_sources.py::<module>::quota_window_blocks": (
+        "_cctally_tui.py::_tui_build_source_bundle",
+        "_cctally_tui.py::_tui_compute_dispatch_signature",
+    ),
+}
+
+#: Dynamic-target read sites per file — a `FROM`/`JOIN` whose target is
+#: interpolated, so only the COUNT can be frozen. `bin/cctally` carries none.
+#:
+#: This exists because `PROJECTION_READ_CHOKEPOINTS`' scanner reads string
+#: LITERALS, and a read written as `f"SELECT COUNT(*) FROM {table} WHERE
+#: {where}"` therefore reaches `quota_window_blocks` while being invisible to
+#: it — which is exactly what happened to `_cctally_dashboard._debug_source_
+#: counts`. The count cannot say which table a site reaches, but it does make a
+#: NEW dynamic read impossible to add silently, and the author then has to
+#: classify it in `PROJECTION_DYNAMIC_READ_ACTIONS` if it reaches a projection
+#: family. It mirrors `FROZEN_DYNAMIC_SITES` in
+#: `tests/test_stats_writer_surface_386.py`, which solved the same problem for
+#: the write surface.
+PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
+    "_cctally_account.py": 1,
+    # Three, all in `_import_legacy_conversation_rows`: `FROM main.{table}`,
+    # `FROM cache_db.{table}` and the `SELECT … FROM cache_db.{table}` of the
+    # copy. They were invisible to BOTH guards until #496 S5b gave the read
+    # patterns the schema-qualifier prefix the write scan already had, which is
+    # the hole `PROJECTION_DYNAMIC_READ_SITES` exists to close. `{table}` there
+    # iterates a hardcoded conversation-table tuple, so none of them reaches a
+    # projection family and none needs an entry below.
+    "_cctally_cache.py": 3,
+    "_cctally_core.py": 2,
+    "_cctally_dashboard.py": 3,
+    "_cctally_dashboard_envelope.py": 5,
+    "_cctally_db.py": 7,
+    "_cctally_doctor.py": 1,
+    "_cctally_five_hour.py": 1,
+    "_cctally_journal.py": 18,
+    "_cctally_pricing_check.py": 1,
+    "_cctally_quota.py": 1,
+    "_cctally_record.py": 1,
+    "_cctally_release.py": 4,
+    "_cctally_setup.py": 3,
+    "_cctally_tui.py": 1,
+    "_lib_conversation_query.py": 1,
+    "_lib_conversation_retention.py": 2,
+    "_lib_doctor.py": 1,
+    "_lib_snapshot_cache.py": 1,
+    "_lib_subscription_weeks.py": 1,
+}
+
+#: The dynamic-target reads that provably reach a projection family, named by
+#: hand as `<file>::<function>`, with the same action vocabulary as
+#: `PROJECTION_READ_SITE_ACTIONS`. The scan cannot resolve `{table}`, so this is
+#: the human half of the count freeze above.
+PROJECTION_DYNAMIC_READ_ACTIONS: "dict[str, str]" = {
+    # `_DEBUG_SOURCE_STATS_TABLES` carries `("quota_window_blocks",
+    # "source='codex'")` and the query is built as
+    # `f"SELECT COUNT(*) FROM {table} WHERE {where}"`. It answers a debug
+    # endpoint with a row count and renders no projection value, so it is
+    # `diagnostic` rather than `gate` — see the vocabulary above.
+    "_cctally_dashboard.py::_debug_source_counts": "diagnostic",
+}
+
+
+def _refuse_unreadable_flag(exc: "sqlite3.Error") -> NoReturn:
+    """Fail closed on an unreadable flag — but never OWN a corrupt index.
+
+    Annotated `NoReturn` because both call sites depend on it: each is an
+    `except sqlite3.Error` arm followed immediately by a statement reading the
+    name the failed query would have bound, so a return here would raise
+    `UnboundLocalError` instead of failing closed. The annotation makes "always
+    raises" checkable rather than a property a reader has to infer.
+
+    A corrupt `stats.db` fails this probe like any other unreadable one, and
+    wrapping it would file it as "the quota projection is incomplete". That is
+    the wrong owner and it costs the right one its signal: `_cctally_tui`
+    catches `QuotaProjectionIncomplete` ahead of the corruption branch, so a
+    wrapped corruption error never became `_StatsSnapshotCorruption` and never
+    reached the #407 heal — the index stayed corrupt while every surface
+    reported a reconcilable quota view. A corruption error is therefore
+    re-raised UNCHANGED, which is still fail-closed: no projection value is
+    served either way, and the caller that owns corruption gets to see it.
+    """
+    import _cctally_db
+
+    if _cctally_db._is_sqlite_corruption_error(exc):
+        raise exc
+    raise QuotaProjectionIncomplete(
+        f"the quota projection flag could not be read ({exc}); "
+        + QUOTA_PROJECTION_REMEDY
+    ) from exc
+
+
+def assert_projection_readable(conn) -> None:
+    """Refuse a projection read while the published projection is incomplete.
+
+    Raises :class:`QuotaProjectionIncomplete`. Acquires no lock and starts no
+    reconciliation, so it is safe inside a caller transaction — which is the
+    only placement that covers a connection opened BEFORE the publication.
+
+    Exactly ONE condition is read as "readable": a MISSING
+    `stats_quota_projection_state` table. That table arrived with the
+    epoch-1009 stats index, so its absence means the index predates the flag
+    and there is no incomplete projection for the flag to describe. Every other
+    `sqlite3.Error` fails CLOSED and raises, because "I could not read the flag"
+    is not "the flag is clear".
+
+    Absence is decided STRUCTURALLY, by asking `sqlite_master`, rather than by
+    matching `no such table` against an error message. The message form has no
+    constructible false negative, but it does have a false POSITIVE — a message
+    embedding that phrase for another reason, such as a view or trigger
+    resolving through a missing table — and a false positive here fails OPEN,
+    which is the direction this gate exists to prevent. The extra query is one
+    cheap lookup, and it still raises in the unreadable-database case because
+    `sqlite_master` is unreadable there too.
+
+    The distinction matters because the old justification — that an epoch-1009
+    index always carries the table, so a failing probe cannot be serving an
+    incomplete projection — is false. A connection can be alive, hold the
+    epoch-1009 index open and still fail its reads for a reason that is not
+    absence, and that connection is exactly the one §4.7's per-transaction gate
+    exists to cover.
+    """
+    if conn is None:
+        return
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='stats_quota_projection_state'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        _refuse_unreadable_flag(exc)
+    if present is None:
+        return
+    try:
+        row = conn.execute(
+            "SELECT incomplete, target_version, recovery_target_json "
+            "FROM stats_quota_projection_state WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        _refuse_unreadable_flag(exc)
+    if row is None or not int(row[0] or 0):
+        return
+    target = None
+    if row[2]:
+        try:
+            target = json.loads(row[2])
+        except ValueError:
+            target = None
+    raise QuotaProjectionIncomplete(
+        "the published quota projection is incomplete; "
+        + QUOTA_PROJECTION_REMEDY,
+        target_version=int(row[1] or 0),
+        recovery_target=target,
+    )
 # 2 -> 3 (public #5): the root physical signature is now COMPOSED from per-group
 # digests instead of digested over a whole root's observation tuples. The
 # semantics are unchanged — still an exact-equality function of the physical
@@ -717,7 +1065,7 @@ def _blocks_missing_reverse_map(stats_conn: sqlite3.Connection) -> bool:
 
     A scoped sweep matches on ``physical_group_key``, so a NULL there would
     silently escape it and the stale block would survive indefinitely. The
-    epoch rebuild (1005 introduced the column; current epoch 1008) stamps every row, and
+    epoch rebuild (1005 introduced the column; current epoch 1009) stamps every row, and
     this is the guard that turns the
     one shape it cannot reach — a block written by an older binary against an
     already-current index — into a full pass rather than a missed one.
@@ -2180,7 +2528,56 @@ def _apply_quota_projection_rows(
         )
 
 
-def rematerialize_quota_projection_for_rebuild(stats_conn, *, now=None) -> None:
+@dataclass(frozen=True)
+class QuotaProjectionBundle:
+    """Everything the rebuild's projection pass reads out of `cache.db`.
+
+    Spec §4.4 requires the rebuild to capture the coverage certificate, the
+    physical mutation sequence, the source roots, the observations and the
+    ledger state from ONE read-only WAL snapshot. Before this existed the leg
+    captured the first two and the projection opened its own connection later,
+    so a destructive clear landing between them published a generation whose
+    quota projection was materialized from a cleared cache while the coverage
+    verdict already read `covered`.
+
+    The projection CERTIFICATE §4.4 also names is not carried here, and that is
+    not an omission: the rebuild pass runs `_apply_quota_projection_rows` with
+    `holder=None`, so it neither reads nor writes that certificate. Adding a
+    field nothing consumes would be the same defect the recovery progress
+    record's applied-count was.
+    """
+
+    active_roots: "set[str]"
+    observations: object
+    watermark: "int | None"
+
+
+def load_quota_projection_bundle(cache_conn) -> QuotaProjectionBundle:
+    """Read the bundle from ``cache_conn``, inside whatever transaction it holds.
+
+    The caller owns the transaction, which is the whole point: on the rebuild's
+    intact path the connection is the one that already read the coverage
+    certificate, and under WAL its read snapshot is fixed at that first read, so
+    these three reads and that certificate describe one cache state.
+    """
+    active_roots = _cache_root_keys(cache_conn)
+    observations = load_codex_quota_observations(
+        source_root_keys=None, cache_conn=cache_conn,
+    )
+    # A rebuild is a whole-history pass by definition, so it also initializes
+    # the watermark: every ledger entry up to here is already reflected in what
+    # it materialized, and leaving the watermark at zero would make the next
+    # tick replay the entire ledger for nothing.
+    watermark = _ledger_max_seq(cache_conn)
+    return QuotaProjectionBundle(
+        active_roots=active_roots, observations=observations,
+        watermark=watermark,
+    )
+
+
+def rematerialize_quota_projection_for_rebuild(
+    stats_conn, *, now=None, bundle=None,
+) -> None:
     """Rebuild path (spec §5.4 / §5.3 "projection"): re-run the Codex quota
     projection over the materialized cache.db ``quota_window_snapshots`` directly
     onto the fresh rebuilt ``stats_conn``, side-effect-free.
@@ -2193,28 +2590,31 @@ def rematerialize_quota_projection_for_rebuild(stats_conn, *, now=None) -> None:
     SAME ``active_roots`` source as the live reconcile (``_cache_root_keys`` over
     the cache) so the materialized projection matches live. A missing cache.db is
     a clean no-op (the journal quota obs remain the durable source; a later
-    ``cache-sync`` + reconcile re-materializes)."""
+    ``cache-sync`` + reconcile re-materializes).
+
+    ``bundle`` is the §4.4 single snapshot. When the caller supplies one this
+    function opens NO cache connection of its own, so the projection is
+    materialized from the same cache state the coverage verdict was decided
+    against. When it is absent — the recovery path, where the leg wrote to the
+    cache and a snapshot taken before those writes would miss them — the
+    function reads its own, which is what it always did."""
     if now is None:
         now = dt.datetime.now(UTC)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     now_iso = _utc_iso(now)
-    try:
-        cache = _cache_connection()
-    except (FileNotFoundError, sqlite3.Error):
-        return
-    try:
-        active_roots = _cache_root_keys(cache)
-        observations = load_codex_quota_observations(
-            source_root_keys=None, cache_conn=cache,
-        )
-        # A rebuild is a whole-history pass by definition, so it also
-        # initializes the watermark: every ledger entry up to here is already
-        # reflected in what it just materialized, and leaving the watermark at
-        # zero would make the next tick replay the entire ledger for nothing.
-        watermark = _ledger_max_seq(cache)
-    finally:
-        cache.close()
+    if bundle is None:
+        try:
+            cache = _cache_connection()
+        except (FileNotFoundError, sqlite3.Error):
+            return
+        try:
+            bundle = load_quota_projection_bundle(cache)
+        finally:
+            cache.close()
+    active_roots = bundle.active_roots
+    observations = bundle.observations
+    watermark = bundle.watermark
     _apply_quota_projection_rows(
         stats_conn, observations=observations, active_roots=active_roots,
         now=now, now_iso=now_iso, sink=None,

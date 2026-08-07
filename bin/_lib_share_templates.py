@@ -36,7 +36,7 @@ from typing import Any
 
 # --- Panel set ---
 #
-# Share-capable panels are the 8 data-view panels in the dashboard.
+# Share-capable panels are the 9 data-view panels in the dashboard.
 # RecentAlertsPanel ('alerts') is intentionally excluded: it's a
 # notification stream, not a data view — shipping share templates over
 # alerts would conflate the two concepts (spec §6.1, §9.5).
@@ -65,8 +65,8 @@ class ShareTemplate:
     builder: Callable[..., Any]  # (panel_data, share_options) -> ShareSnapshot
 
 
-# Filled in subsequent tasks (M1.4 adds the 8 Recap templates;
-# M2.1 adds the 16 Visual + Detail templates).
+# Filled in below: 9 Recap templates, then 9 Visual + 9 Detail, for 27
+# templates across the 9 share-capable panels.
 SHARE_TEMPLATES: tuple[ShareTemplate, ...] = ()
 
 
@@ -198,8 +198,11 @@ def _top_projects_rows(top_projects, cap: int) -> tuple:
     """Build `Row` tuple with ProjectCell + MoneyCell from a list of
     `(project_path, cost_usd)` pairs.
 
-    Anonymization happens later in `_scrub()` — builders always emit real
-    names. Accepts both 2-tuples and `(path, cost, ...)` longer tuples;
+    Anonymization happens later, in the preparation pass `render()` and
+    `compose()` run over the raw snapshot — builders always emit real names.
+    (It is NOT `_scrub()`: that function is retained for backward
+    compatibility and no production path calls it.) Accepts both 2-tuples
+    and `(path, cost, ...)` longer tuples;
     only the first two positional elements are used so callers can pass
     enriched rows without copy-coercion.
     """
@@ -387,7 +390,7 @@ def _display_tz(options) -> str:
     return options.get("display_tz", "Etc/UTC")
 
 
-# --- 8 Recap builders ---
+# --- 9 Recap builders ---
 
 
 def _build_weekly_recap(*, panel_data, options):
@@ -834,7 +837,7 @@ def _build_sessions_recap(*, panel_data, options):
     )
 
 
-# --- 16 Visual + Detail builders ---
+# --- 18 Visual + Detail builders ---
 #
 # Archetype contract (spec §9.4):
 #   - Visual: chart populated (same density as Recap), `rows=()`, `columns=()`,
@@ -1525,10 +1528,19 @@ def _build_sessions_visual(*, panel_data, options):
         chart=_LS.HorizontalBarChart(
             points=tuple(
                 _LS.ChartPoint(
-                    x_label=str(s.get("session_id") or ""),
+                    # #503 S1 P7: the gutter label is RANK + PROJECT. It used
+                    # to be the raw session id, which is a canonical UUID in
+                    # production and was disclosed verbatim next to
+                    # `project-1` in the same anonymized artifact (F1). The
+                    # rank is what correlates a bar with its table row, and it
+                    # carries no identifier. Preparation composes the final
+                    # `x_label` from this prefix and the resolved project.
+                    x_label=str(i + 1),
                     x_value=float(i),
                     y_value=float(s.get("cost_usd") or 0.0),
                     project_label=str(s.get("project_path") or "") or None,
+                    x_label_kind="project",
+                    x_label_prefix=str(i + 1),
                 )
                 for i, s in enumerate(rows_iter)
             ),
@@ -1551,7 +1563,7 @@ def _build_sessions_detail(*, panel_data, options):
     Default `top_n` is 50 (Recap's is 15). Sessions Recap explicitly omits the
     chart (table-first panel); Detail re-introduces a compact horizontal bar
     of the same top-N so the archetype contract (chart populated + rows
-    populated) holds uniformly across all 8 panels' Detail siblings.
+    populated) holds uniformly across all 9 panels' Detail siblings.
     """
     sessions = panel_data.get("sessions") or []
     cap = options.get("top_n", 50)
@@ -1587,10 +1599,19 @@ def _build_sessions_detail(*, panel_data, options):
         chart=_LS.HorizontalBarChart(
             points=tuple(
                 _LS.ChartPoint(
-                    x_label=str(s.get("session_id") or ""),
+                    # #503 S1 P7: the gutter label is RANK + PROJECT. It used
+                    # to be the raw session id, which is a canonical UUID in
+                    # production and was disclosed verbatim next to
+                    # `project-1` in the same anonymized artifact (F1). The
+                    # rank is what correlates a bar with its table row, and it
+                    # carries no identifier. Preparation composes the final
+                    # `x_label` from this prefix and the resolved project.
+                    x_label=str(i + 1),
                     x_value=float(i),
                     y_value=float(s.get("cost_usd") or 0.0),
                     project_label=str(s.get("project_path") or "") or None,
+                    x_label_kind="project",
+                    x_label_prefix=str(i + 1),
                 )
                 for i, s in enumerate(rows_iter)
             ),
@@ -1667,6 +1688,7 @@ def _projects_chart_for_template(rows: list[dict], cap: int):
             x_value=cost,
             y_value=cost,
             project_label=label,
+            x_label_kind="project",
         ))
     return _LS.HorizontalBarChart(
         points=tuple(points), x_label="$", cap=cap,
@@ -1683,7 +1705,9 @@ def _projects_period(panel_data: dict, options: dict):
 
 
 def _projects_subtitle(options: dict, total_rows: int) -> str:
-    reveal = options.get("reveal_projects", True)
+    # FAIL CLOSED (#503 S1 F3): an omitted field made the Projects panel
+    # print the claim "real projects" about its own contents.
+    reveal = options.get("reveal_projects", False)
     return " · ".join([
         f"{total_rows} project{'' if total_rows == 1 else 's'}",
         "real projects" if reveal else "projects anonymized",

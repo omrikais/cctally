@@ -30,7 +30,7 @@ import sys
 from dataclasses import replace
 
 from _cctally_core import make_week_ref, parse_iso_datetime
-from _cctally_quota import codex_quota_breakdown
+from _cctally_quota import assert_projection_readable, codex_quota_breakdown
 from _lib_accounts import UNATTRIBUTED
 from _lib_codex_pools import is_model_scoped_codex_quota
 from _lib_dashboard_sources import dashboard_resource_key
@@ -677,6 +677,8 @@ def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
     # `quota_window_blocks.account_key` is NOT NULL DEFAULT 'unattributed'.
     account_clause = "" if account_key is None else "AND account_key=? "
     account_params = () if account_key is None else (account_key,)
+    # BEFORE the SQL, per #496 S5b section 4.7.
+    assert_projection_readable(stats_conn)
     rows = stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
         "       window_minutes, limit_id, limit_name, account_key, "
@@ -808,6 +810,7 @@ def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
     never-combine rule.
     """
     orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
+    assert_projection_readable(stats_conn)
     return stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
         "       window_minutes, limit_id, limit_name, account_key, "

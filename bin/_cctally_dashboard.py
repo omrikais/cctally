@@ -324,6 +324,40 @@ def _cctally():
     return sys.modules["cctally"]
 
 
+class _QuotaProjectionIncompleteUnavailable(BaseException):
+    """The unmatchable stand-in `_quota_projection_incomplete_cls` falls back to.
+
+    A `BaseException` subclass nothing raises, so an `except` clause given this
+    class matches no exception and the handler below it runs unchanged.
+    """
+
+
+def _quota_projection_incomplete_cls():
+    """`QuotaProjectionIncomplete`, resolved at call time (#496 S5b).
+
+    Call-time for the same reason `assert_projection_readable` is imported
+    inside its handlers: this module reaches `_cctally_quota` lazily, and an
+    `except` clause is evaluated only when an exception is being handled, so a
+    module-level import would buy nothing and add an import-order constraint.
+
+    Resolving it is therefore an import evaluated WHILE another exception is
+    already propagating, and an `ImportError` raised there would replace the
+    original exception and skip the generic handler that owns it. Both failure
+    modes answer with an unmatchable sentinel instead, so a resolution failure
+    degrades to the generic handler rather than to a different exception. The
+    class is deliberately NOT cached across calls: `_cctally_quota` is
+    re-imported into a fresh namespace by the test harness, and a cached class
+    object from an earlier namespace would stop matching the exception the
+    current one raises.
+    """
+    try:
+        import _cctally_quota
+
+        return _cctally_quota.QuotaProjectionIncomplete
+    except (ImportError, AttributeError):
+        return _QuotaProjectionIncompleteUnavailable
+
+
 # === Honest imports from extracted homes ===================================
 # Spec 2026-05-17-cctally-core-kernel-extraction.md §3.3: kernel symbols
 # import from _cctally_core; already-decentralized buckets (X = _lib_*,
@@ -698,7 +732,10 @@ def _build_codex_project_detail(context, qualified, observations, *, key: str) -
 
 def _build_codex_block_detail(context, observations, *, key: str) -> dict[str, Any]:
     from _lib_quota import build_blocks, forecast_quota, percent_milestones, quota_freshness
+    from _cctally_quota import assert_projection_readable
 
+    # BEFORE the SQL, per #496 S5b section 4.7.
+    assert_projection_readable(context.stats_conn)
     rows = context.stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, "
         "limit_name, resets_at_utc, current_percent, orphaned_at "
@@ -2942,7 +2979,8 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
 #                       resolves to `foo (parent_dir)`).
 #   - ``bucket_path`` = canonical equality key (``ProjectKey.bucket_path``)
 #                       — the absolute on-disk path. Privacy-sensitive;
-#                       _lib_share._scrub strips it on the share path.
+#                       _lib_share.render()/compose() prepare it away on
+#                       the share path.
 
 # Per-tick memo (spec §6.4 + memory: *Pre-probe before sync_cache*).
 # Keyed on (max(session_entries.id), current_week.week_start_at,
@@ -6320,6 +6358,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "error": "source capability unavailable",
             })
             return
+        except _quota_projection_incomplete_cls():
+            # #496 S5b, same reason as the `/api/milestones` branch: this route
+            # reaches `_build_codex_block_detail`, whose gate runs before its
+            # SQL, and the generic 400 below reported "capability unavailable"
+            # for a reconcilable state and named no remedy.
+            self._respond_json(503, {
+                "code": "quota_projection_incomplete",
+                "error": "quota view reconciling",
+                "action": "cctally cache-sync",
+            })
+            return
         except Exception as exc:  # noqa: BLE001 — detailed diagnostics stay server-only.
             self.log_error("/api/source/%s/%s failed: %r", source, resource, exc)
             self._respond_json(400, {
@@ -6646,6 +6695,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 # gets the same BEGIN/commit envelope as the stats conn.
                 stats_conn.execute("BEGIN")
                 cache_conn.execute("BEGIN")
+                # The gate acquires no lock, so it is safe INSIDE this
+                # transaction — and inside is the only placement that covers a
+                # connection opened before the publication (#496 S5b section 4.7).
+                from _cctally_quota import assert_projection_readable
+                assert_projection_readable(stats_conn)
                 roots = tuple(sorted({
                     str(r[0]) for r in stats_conn.execute(
                         "SELECT DISTINCT source_root_key FROM quota_window_blocks "
@@ -6688,6 +6742,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 })
                 return
             self._send_milestones_json(200, {**result, "source": "codex", "key": key})
+        except _quota_projection_incomplete_cls():
+            # #496 S5b. A refused projection read is a RETRY signal over a
+            # valid index, not a server fault, and the generic 500 below both
+            # mislabels it and drops the one remedy the user can act on: the
+            # message naming `cctally cache-sync` reached the server log only.
+            self._send_milestones_json(503, {
+                "error": "quota view reconciling",
+                "code": "quota_projection_incomplete",
+                "action": "cctally cache-sync",
+            })
         except Exception as exc:  # noqa: BLE001
             self.log_error("/api/milestones failed: %r", exc)
             self.send_error(500, "milestones detail failed")
@@ -7397,6 +7461,12 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     # self-diagnosing (`kill -USR1 <pid>`) without root py-spy. No-op where
     # SIGUSR1 is unavailable (Windows).
     _register_faulthandler_sigusr1()
+
+    # #496 S5b §4.7: a long-lived server, and the surface on which a gated
+    # quota projection is most visible, so it may resume that recovery. One
+    # attempt per throttle interval — see
+    # `_cctally_journal._PROJECTION_RECONCILE_RETRY_SECONDS`.
+    _cctally_core.enable_quota_projection_reconciliation()
 
     # Spec §5.7: capture the un-mutated argv + PATH-resolved entrypoint
     # at boot so the in-place ``execvp`` after a successful update

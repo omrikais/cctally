@@ -3,7 +3,7 @@ title: Weekly usage — last 2 weeks
 generated_at: 2026-05-09T12:00:00Z
 period: 2020-01-01T00:00:00Z..2026-05-09T12:00:00Z
 panel: weekly
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 # Weekly usage — last 2 weeks

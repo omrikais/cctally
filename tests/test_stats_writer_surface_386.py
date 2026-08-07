@@ -52,6 +52,10 @@ STATS_TABLES = frozenset({
     "schema_migrations_skipped", "quota_window_blocks",
     "quota_percent_milestones", "quota_threshold_events", "quota_alert_arming",
     "quota_projection_state", "quota_projection_ledger_state",
+    # #496 S5b epoch 1009: durable selector state plus the reserved
+    # incomplete-quota-projection gate.
+    "journal_selector_state", "journal_selector_batches",
+    "journal_selector_batch_records", "stats_quota_projection_state",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -69,8 +73,23 @@ _VERB = re.compile(
     r"|ALTER\s+TABLE)\b",
     re.IGNORECASE,
 )
+#: The target, with an optional schema qualifier consumed rather than captured.
+#: `_publish_generation_in_place` writes `main.`-qualified statements while its
+#: scratch is attached as `src`, and without this the scan resolved every one of
+#: them to the literal `main` — so a write to a FROZEN table was invisible
+#: purely because it named its schema (#496 S5b: the generation-identity UPDATE
+#: on `journal_selector_state` was the first such write to a frozen table).
+#:
+#: The qualifier alternatives are the schema NAMES this codebase attaches under,
+#: and `cache_db` belongs there because `ATTACH DATABASE ? AS cache_db` creates
+#: it — `bin/_cctally_cache.py` writes `INSERT OR IGNORE INTO cache_db.{table}`.
+#: `re.IGNORECASE` matches `_VERB`, which has always had it: SQL keywords and
+#: schema names are case-insensitive, so a `MAIN.`-qualified write would
+#: otherwise resolve to the literal `MAIN`.
 _NAME = re.compile(
-    r"[\s\"']*([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_.\[\]']*\})"
+    r"[\s\"']*(?:(?:main|temp|src|cache_db)\s*\.\s*[\s\"']*)?"
+    r"([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_.\[\]']*\})",
+    re.IGNORECASE,
 )
 
 #: The frozen surface: {source file: {stats table: number of write sites}}.
@@ -89,6 +108,14 @@ FROZEN_WRITE_SITES = {
         "journal_cursor": 2,
         "journal_effective_events": 1,
         "journal_protocol_violations": 1,
+        # #496 S5b epoch 1009: the four `CREATE TABLE IF NOT EXISTS` statements
+        # in `open_db`'s stats schema block. They run under
+        # `stats_open_time_guard` (maintenance EX + `stats_write_scope
+        # ("open-time")`) like every other table there.
+        "journal_selector_batch_records": 1,
+        "journal_selector_batches": 1,
+        "journal_selector_state": 1,
+        "stats_quota_projection_state": 1,
         "percent_milestones": 1,
         "project_budget_milestones": 1,
         "projected_milestones": 1,
@@ -127,14 +154,55 @@ FROZEN_WRITE_SITES = {
         "five_hour_blocks": 1,
         "schema_migrations": 1,
     },
+    # #496 S5b: `_write_selector_state` replaced `_write_effective_metadata`
+    # outright — the rebuild was that function's only caller, so it was deleted
+    # rather than left dead. The two legacy tables keep a DELETE+INSERT pair
+    # (now the selector writer's) and the three selector tables arrive with one
+    # pair apiece. All five run inside `rebuild_stats_index`'s phase-1
+    # `BEGIN IMMEDIATE`, under whatever sanctioned scope the rebuild holds.
+    # #496 S5b Stage 2 adds `_write_selector_delta`, which advances durable
+    # selector state inside the ingest cycle's existing `BEGIN IMMEDIATE`. It
+    # contributes one upsert per table rather than a whole-table replace:
+    # `journal_effective_events` holds one row per event id, and rewriting all
+    # of them on every status-line tick would trade the read this session
+    # removes for a write of the same size. Only `journal_protocol_violations`
+    # also gets a DELETE, because it is the only group whose fold WITHDRAWS
+    # rows.
     "_cctally_journal.py": {
         "accounts": 8,
         "five_hour_blocks": 1,
         "journal_cursor": 1,
-        "journal_effective_events": 4,
-        "journal_protocol_violations": 2,
+        "journal_effective_events": 5,
+        # Four: `_replace_protocol_violations`' DELETE + INSERT pair — the ONE
+        # whole-set writer of this table, shared by the rebuild's
+        # whole-generation write and the live path's full-prefix fallback — plus
+        # the delta writer's upsert and its scoped per-fingerprint DELETE. Two
+        # derivations of these rows is how the fallback ended up writing four
+        # columns where the kernel writes five. The DELETE is this table's alone:
+        # a phase-2 verdict is re-derived on every pass and a later record can
+        # WITHDRAW one, and `_check_journal_protocol` FAILs `doctor` over
+        # whatever the table holds.
+        "journal_protocol_violations": 4,
+        "journal_selector_batch_records": 3,
+        "journal_selector_batches": 3,
+        # Four: the selector writer's DELETE+INSERT pair, the delta writer's
+        # upsert, and the UPDATE that stamps the generation identity inside
+        # `_publish_generation_in_place`'s transaction — the same one that
+        # installs the rows and writes `stats_publication_stamp`, so content
+        # and identity commit together. The single-row table needs no removal.
+        "journal_selector_state": 4,
         "quota_alert_arming": 2,
         "quota_threshold_events": 1,
+        # Two, both #496 S5b §4.7 and both sanctioned. `_write_quota_projection_
+        # state`'s upsert runs in the rebuild's second stats transaction, under
+        # the maintenance exclusive that rebuild already holds, in the SAME
+        # transaction that materializes the projection the flag describes.
+        # `_rematerialize_and_clear_projection_gate`'s UPDATE runs inside
+        # `stats_open_time_guard(live=True)`, which is the maintenance-exclusive
+        # regime, in the same transaction that re-materializes the projection —
+        # so a crash between them cannot leave a cleared flag over a projection
+        # that was never rewritten.
+        "stats_quota_projection_state": 2,
         "weekly_credit_floors": 1,
     },
     "_cctally_milestones.py": {
@@ -201,9 +269,16 @@ FROZEN_WRITE_SITES = {
 
 #: Dynamic-SQL sites per file — the target is a variable, so only the COUNT can
 #: be frozen. `bin/cctally` carries none.
+#:
+#: Two of these arrived with the schema-qualifier fix in `_NAME`, not with new
+#: code: `_cctally_cache.py`'s `INSERT OR IGNORE INTO main.{table}` and
+#: `_cctally_journal.py`'s `INSERT INTO main."{name}" SELECT * FROM src."{name}"`
+#: were both resolving to the literal `main` and counting as neither a frozen
+#: table nor a dynamic target.
 FROZEN_DYNAMIC_SITES = {
+    "_cctally_cache.py": 1,
     "_cctally_db.py": 9,
-    "_cctally_journal.py": 8,
+    "_cctally_journal.py": 9,
     "_cctally_store.py": 1,
 }
 

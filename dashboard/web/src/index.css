@@ -188,7 +188,9 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 24px;
+  /* Keep enough desktop slack for live status copy (for example 59s -> 1m)
+     to change without moving the action cluster onto a second row. */
+  gap: 12px;
   margin-bottom: 16px;
 }
 .topbar .stat { display: flex; align-items: center; gap: 8px; font-size: var(--fs-body); color: var(--text-dim); white-space: nowrap; }
@@ -4437,6 +4439,50 @@ mark.current {
 .composer-anon-banner button:hover {
   background: rgba(0, 0, 0, 0.1);
 }
+/* --- #503 S1 F6: the share modal's export-anonymization status line ------
+   ADDITIVELY NAMED so it does not touch any existing share rule — S4 owns the
+   share rules and the modal's mobile geometry, and this element must not
+   collide with that work. The new element IS this session's responsibility at
+   every viewport including 390px; general share-modal mobile geometry stays
+   S4's.
+
+   Three-tier severity vocabulary from
+   dashboard/design-system/components/alert-severity.html: the calm indigo
+   `info` tone when the export will be anonymized, the amber `warn` tone when
+   it will not. Never `critical` — revealing project names is a legitimate
+   deliberate choice, not an error.
+
+   The tinted-surface + left-rule shape (rather than the composer banner's
+   solid amber fill) is deliberate: this line is always present, so a
+   full-bleed fill would compete with the preview it sits above for attention
+   in the ordinary, safe case. */
+.share-privacy-status {
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  border-left: 3px solid currentColor;
+  font-size: var(--fs-meta);
+  line-height: 1.4;
+}
+.share-privacy-status--info {
+  color: var(--accent-indigo);
+  background: color-mix(in srgb, var(--accent-indigo) 10%, transparent);
+}
+.share-privacy-status--warn {
+  color: var(--accent-amber);
+  background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+}
+/* #503 S1 B1 — the neutral state, for an export that carries no project name
+   in either privacy mode. Deliberately the quietest of the three: it reports a
+   fact rather than describing a consequence of the toggle, so it must not
+   compete with the preview it sits above. Muted text on the panel's own
+   border colour, not one of the two severity accents. */
+.share-privacy-status--neutral {
+  color: var(--text-dim, #64748b);
+  border-left-color: var(--border-soft);
+  background: color-mix(in srgb, var(--text-dim, #64748b) 7%, transparent);
+}
+
 .composer-body {
   flex: 1; display: grid; grid-template-columns: minmax(220px, 320px) 1fr;
   gap: 16px; padding: 16px; min-height: 0; overflow: hidden;
@@ -5607,6 +5653,21 @@ mark.current {
     overflow: hidden;
     background: var(--panel-bg);
     border-bottom: 1px solid var(--border-soft);
+  }
+  /* #503 S1 B2 — the privacy status line sits INSIDE that fixed 128px, so
+     every pixel it takes comes out of the preview. Measured at 390x844 with
+     the previous box and wording: 37px of preview in the info state, against
+     91px with the line hidden — the line was taking 42% of the budget on the
+     safe default state.
+
+     Tightened here rather than by raising the cap above, because the cap is
+     #293 S4's rule and its stated purpose is that this strip never eats the
+     viewport. The wording change in `SharePrivacyStatus` does the rest: all
+     three states now render on one line, leaving 58px of preview in every
+     state instead of 37px in the state the user sees first. */
+  .share-privacy-status {
+    padding: 5px 8px;
+    margin-bottom: 6px;
   }
   /* iOS auto-zooms any focused input/select rendered below 16px. */
   .share-knob input[type="number"],

@@ -43,6 +43,7 @@ Journal
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
   ✓ Journal conflicts        not scanned
   ✓ Journal protocol         not scanned
+  ✓ Quota projection         not applicable
 Data
   ✗ Latest snapshot          7200s ago
       → No snapshot in >1h. Hooks may be broken — check `cctally setup --status`.
@@ -79,4 +80,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 47 OK · 8 WARN · 3 FAIL
+Summary: 48 OK · 8 WARN · 3 FAIL

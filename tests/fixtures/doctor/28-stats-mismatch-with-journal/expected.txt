@@ -22,7 +22,7 @@ Database
   ✓ stats.db                 version 99 / 13 known
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1008) — rebuilds from journal
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1009) — rebuilds from journal
       → Auto-heals by journal rebuild on next command; if it persists, run `cctally db rebuild --db stats`
   ✓ Migrations               0/54 applied
   ⚠ Pending migrations       54 pending
@@ -39,6 +39,7 @@ Journal
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
   ✓ Journal conflicts        no quarantined events
   ✓ Journal protocol         no protocol violations
+  ✓ Quota projection         not applicable
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -74,4 +75,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 52 OK · 6 WARN · 0 FAIL
+Summary: 53 OK · 6 WARN · 0 FAIL

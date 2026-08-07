@@ -92,6 +92,15 @@ export interface ShareSnapshot {
 export interface ShareRenderResponse {
   body: string;
   content_type: string;
+  // #503 S1 B1 — whether this export carries any project name at all. The
+  // server derives it from the same snapshot it rendered, through the
+  // kernel's single enumeration of typed project display sites. Optional
+  // because an older server does not send it, and because the additive
+  // envelope rule in `docs/cli-contract.md` means a consumer must tolerate
+  // its absence rather than assume a value. `undefined` keeps the two
+  // original states, which is the safe fallback: never claim "no project
+  // names" without evidence.
+  has_project_names?: boolean;
   snapshot: ShareSnapshot;
 }
 

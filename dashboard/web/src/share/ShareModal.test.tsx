@@ -8,7 +8,7 @@
 // hasTouch Playwright gate); the DOM ORDER is the real, non-vacuous thing to
 // assert here. Non-vacuous: with the reorder absent, the mobile branch renders
 // the desktop knobs-first order and the "preview precedes knobs" case is RED.
-import { render, act, waitFor } from '@testing-library/react';
+import { render, act, waitFor, cleanup } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShareModalRoot } from './ShareModalRoot';
 import { _resetForTests, dispatch } from '../store/store';
@@ -62,6 +62,47 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
 });
+
+// #503 S1 B1 — a fetch stub whose /api/share/render response carries the
+// `has_project_names` flag, so the third status-line state can be exercised.
+// The default `stubFetch` answers every non-preset URL with the template list,
+// which has no such key — that is the "older server / not known yet" path, and
+// the two original states must survive it unchanged.
+function stubFetchWithRender(hasProjectNames: boolean | undefined) {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+    if (typeof url === 'string' && url.includes('/api/share/presets')) {
+      return Promise.resolve(new Response(JSON.stringify({ presets: {} }), { status: 200 }));
+    }
+    if (typeof url === 'string' && url.includes('/api/share/render')) {
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          body: '# Weekly\n',
+          content_type: 'text/markdown',
+          ...(hasProjectNames === undefined
+            ? {}
+            : { has_project_names: hasProjectNames }),
+          snapshot: {
+            kernel_version: '1', panel: 'weekly', template_id: 'weekly-recap',
+            options: {}, generated_at: '2026-05-09T12:00:00Z', data_digest: 'd',
+          },
+        }),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({
+        panel: 'weekly',
+        templates: [{
+          id: 'weekly-recap',
+          label: 'Recap',
+          description: 'Text + tiny chart',
+          default_options: { format: 'md', theme: 'light' },
+        }],
+      }),
+    });
+  }));
+}
 
 async function openShare() {
   render(<ShareModalRoot />);
@@ -157,5 +198,275 @@ describe('#293 S4 SHARE-1 — mobile preview-first render reorder', () => {
       const body = JSON.parse((renderCall?.[1] as RequestInit).body as string);
       expect(body).not.toHaveProperty('account');
     });
+  });
+});
+
+// #503 S1 F6 — the modal must answer its own question.
+//
+// Three correct-in-isolation decisions combine into a modal that cannot:
+// <PreviewPane> forces `reveal_projects: true` (correct per spec §6.3),
+// <ShareModal> defaults the option to `false` (correct), and <Knobs> binds a
+// checkbox to it (correct). The result is a checkbox that changes nothing
+// visible, next to a preview that always shows real names, on a surface
+// documented as the place to review what you are about to share.
+//
+// Asserted at MODAL level, exercising the real modal rather than an extracted
+// helper, because the defect is precisely that the modal's individually
+// correct pieces disagree.
+describe('#503 S1 F6 — the export anonymization status line', () => {
+  function statusLine() {
+    return document.querySelector('.share-privacy-status');
+  }
+
+  it('states that the export will be anonymized when Anon is checked', async () => {
+    stubMatchMedia(false);
+    await openShare();
+    const line = statusLine();
+    expect(line).not.toBeNull();
+    expect(line!.getAttribute('role')).toBe('status');
+    expect(line!.getAttribute('aria-live')).toBe('polite');
+    expect(line!.textContent).toContain(
+      'Preview shows real names. Export is anonymized.');
+  });
+
+  it('warns when the export will show real project names', async () => {
+    stubMatchMedia(false);
+    await openShare();
+    const box = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Anonymize project names on export"]');
+    expect(box).not.toBeNull();
+    expect(box!.checked).toBe(true);
+    await act(async () => {
+      box!.click();
+    });
+    expect(statusLine()!.textContent).toContain(
+      'Export will show real project names.');
+  });
+
+  it('is ALWAYS present and changes text rather than appearing', async () => {
+    // A line that vanishes in the safe state says nothing, which is the
+    // current defect with extra steps. The composer's conditional
+    // `composer-anon-banner` is right there because it carries an
+    // "Anonymize all" call to action; F6 asks for something different.
+    stubMatchMedia(false);
+    await openShare();
+    expect(document.querySelectorAll('.share-privacy-status').length).toBe(1);
+    const box = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Anonymize project names on export"]')!;
+    await act(async () => { box.click(); });
+    expect(document.querySelectorAll('.share-privacy-status').length).toBe(1);
+    await act(async () => { box.click(); });
+    expect(document.querySelectorAll('.share-privacy-status').length).toBe(1);
+  });
+
+  it('carries info severity when anonymized and warn severity when revealing', async () => {
+    // Three-tier vocabulary from dashboard/design-system/components/
+    // alert-severity.html. Info and warn, NEVER critical: revealing is a
+    // legitimate deliberate choice, not an error.
+    stubMatchMedia(false);
+    await openShare();
+    expect(statusLine()!.className).toContain('share-privacy-status--info');
+    const box = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Anonymize project names on export"]')!;
+    await act(async () => { box.click(); });
+    expect(statusLine()!.className).toContain('share-privacy-status--warn');
+    expect(statusLine()!.className).not.toContain('critical');
+  });
+
+  it('renders directly above the preview pane, in both layouts', async () => {
+    // Placement is above the preview because the preview is the misleading
+    // object.
+    for (const mobile of [false, true]) {
+      _resetForTests();
+      _resetKeymap();
+      installGlobalKeydown();
+      stubFetch();
+      stubMatchMedia(mobile);
+      await openShare();
+      const line = statusLine();
+      // The line lives INSIDE the preview column, so compare it against the
+      // preview's own root — comparing against the column would only report
+      // containment.
+      const preview = document.querySelector('.share-preview');
+      expect(line).not.toBeNull();
+      expect(preview).not.toBeNull();
+      expect(line!.closest('.share-preview-col')).not.toBeNull();
+      expect(line!.compareDocumentPosition(preview!) & FOLLOWING).toBeTruthy();
+      document.body.innerHTML = '';
+    }
+  });
+});
+
+
+// #503 S1 B1 — the third, NEUTRAL state.
+//
+// The two-state line was unconditional, and on `trend`, `forecast` and every
+// other template whose artifact carries no project name it made a FALSE
+// statement: the reveal state said "Export will show real project names" while
+// the artifact contained only metric rows, and the anonymize state claimed the
+// preview showed real names when it showed none. This is an over-warning
+// rather than a leak, so it cannot cause the defect class #503 S1 exists to
+// prevent — it matters because a line whose entire value is trustworthiness
+// must not be wrong, and a warning users learn to disregard on Forecast is one
+// they may disregard on Projects.
+//
+// The state is derived from the server's `has_project_names`, which comes from
+// the same snapshot the renderer used, NEVER from a hardcoded panel list — the
+// property is per TEMPLATE, not per panel (`weekly-recap` carries names,
+// `weekly-detail` does not).
+describe('#503 S1 B1 — the neutral no-project-names state', () => {
+  function statusLine() {
+    return document.querySelector('.share-privacy-status');
+  }
+
+  async function anonCheckbox() {
+    return document.querySelector<HTMLInputElement>(
+      'input[aria-label="Anonymize project names on export"]')!;
+  }
+
+  it('states plainly that the export contains no project names', async () => {
+    stubMatchMedia(false);
+    stubFetchWithRender(false);
+    await openShare();
+    await waitFor(() => {
+      expect(statusLine()!.textContent).toContain(
+        'This export contains no project names.');
+    });
+  });
+
+  it('does not change when the user toggles anonymize', async () => {
+    // The sentence is true in both toggle positions, which is the whole point
+    // of a neutral state: there is nothing for the toggle to change.
+    stubMatchMedia(false);
+    stubFetchWithRender(false);
+    await openShare();
+    await waitFor(() => {
+      expect(statusLine()!.className).toContain('share-privacy-status--neutral');
+    });
+    const before = statusLine()!.textContent;
+    await act(async () => { (await anonCheckbox()).click(); });
+    await waitFor(() => {
+      expect(statusLine()!.textContent).toBe(before);
+      expect(statusLine()!.className).toContain('share-privacy-status--neutral');
+    });
+  });
+
+  it('carries neither the warn nor the critical severity', async () => {
+    stubMatchMedia(false);
+    stubFetchWithRender(false);
+    await openShare();
+    await waitFor(() => {
+      const cls = statusLine()!.className;
+      expect(cls).toContain('share-privacy-status--neutral');
+      expect(cls).not.toContain('warn');
+      expect(cls).not.toContain('critical');
+    });
+  });
+
+  it('keeps the two original states when the export DOES carry names', async () => {
+    stubMatchMedia(false);
+    stubFetchWithRender(true);
+    await openShare();
+    await waitFor(() => {
+      expect(statusLine()!.textContent).toContain(
+        'Preview shows real names. Export is anonymized.');
+    });
+    await act(async () => { (await anonCheckbox()).click(); });
+    await waitFor(() => {
+      expect(statusLine()!.textContent).toContain(
+        'Export will show real project names.');
+      expect(statusLine()!.className).toContain('share-privacy-status--warn');
+    });
+  });
+
+  it('falls back to the two original states when the server does not say', async () => {
+    // A server without the additive key, and the interval before the first
+    // render resolves. Never claim "no project names" without evidence: an
+    // absent flag is unknown, not false.
+    stubMatchMedia(false);
+    stubFetchWithRender(undefined);
+    await openShare();
+    await waitFor(() => {
+      expect(statusLine()!.textContent).toContain(
+        'Preview shows real names. Export is anonymized.');
+    });
+    expect(statusLine()!.className).not.toContain('neutral');
+  });
+
+  it('still renders exactly one line, in the mobile layout too', async () => {
+    stubMatchMedia(true);
+    stubFetchWithRender(false);
+    await openShare();
+    await waitFor(() => {
+      expect(document.querySelectorAll('.share-privacy-status').length).toBe(1);
+      expect(statusLine()!.textContent).toContain(
+        'This export contains no project names.');
+    });
+  });
+});
+
+// #503 S1 B2 — the mobile preview budget.
+//
+// The mobile layout pins the status line above a preview strip capped at
+// 128px (`.share-preview-col--lead`), so every line the status text wraps to
+// comes straight out of the preview. Measured in a real browser at 390x844:
+// the two-line info wording left 37px of preview against 91px with the line
+// hidden, i.e. the line took 42% of the budget on the state the user sees
+// first. One line in every state leaves 58px.
+//
+// JSDOM cannot measure the wrap — that is the real-browser gate's job. What
+// it CAN pin, and what actually caused the regression, is the character
+// count: the client renders monospace throughout, and 47 characters is the
+// most that fits one line at 12px in the 359px mobile column. This test is
+// the tripwire on a future rewording; the browser gate confirms the pixels.
+describe('#503 S1 B2 — status-line strings fit one mobile line', () => {
+  const MAX_CHARS = 47; // measured at 390px, 12px monospace, 8px padding
+
+  async function textFor(hasProjectNames: boolean | undefined, reveal: boolean) {
+    // Unmount the previous iteration's tree. `render()` appends a new root to
+    // document.body rather than replacing one, and `document.querySelector`
+    // returns the FIRST match — so without this every iteration after the
+    // first reads the first iteration's modal and the loop silently asserts
+    // the same state four times.
+    cleanup();
+    _resetForTests();
+    _resetKeymap();
+    installGlobalKeydown();
+    stubMatchMedia(true);
+    stubFetchWithRender(hasProjectNames);
+    await openShare();
+    if (reveal) {
+      const box = document.querySelector<HTMLInputElement>(
+        'input[aria-label="Anonymize project names on export"]')!;
+      await act(async () => { box.click(); });
+    }
+    // Wait for the RENDER to resolve, not merely for the line to exist. The
+    // preview debounces 200ms, and the server's `has_project_names` is
+    // reported in the same `.then` that puts the preview into its ready
+    // state — so reading the text before then reads the deliberate
+    // not-known-yet fallback rather than the state under test. That fallback
+    // is correct behavior, and it is what made an earlier version of this
+    // test see the info wording where it expected the neutral one.
+    await waitFor(() => {
+      expect(document.querySelector(
+        '.share-preview-md, .share-preview-iframe')).not.toBeNull();
+    });
+    return document.querySelector('.share-privacy-status')!.textContent!.trim();
+  }
+
+  it('every state renders a string within the one-line budget', async () => {
+    const seen: string[] = [];
+    for (const [flag, reveal] of [
+      [true, false], [true, true], [false, false], [false, true],
+    ] as [boolean, boolean][]) {
+      const text = await textFor(flag, reveal);
+      seen.push(text);
+      expect(text.length,
+        `"${text}" is ${text.length} chars; over ${MAX_CHARS} it wraps to a `
+        + 'second line and costs 17px of the mobile preview').toBeLessThanOrEqual(MAX_CHARS);
+    }
+    // Non-vacuity: the loop must have produced the three distinct states, or
+    // the budget assertion could be passing on one short string four times.
+    expect(new Set(seen).size, JSON.stringify(seen)).toBe(3);
   });
 });

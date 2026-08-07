@@ -32,6 +32,16 @@ interface Props {
   account?: string | null;
   templateId: string | null;
   options: ShareOptions;
+  // #503 S1 B1 — reports the render's `has_project_names` upward so the
+  // modal's privacy status line can state what the export actually contains.
+  // `null` means "not known yet", which the modal treats as the unchanged
+  // two-state behavior rather than claiming there are no project names.
+  //
+  // Reported from HERE rather than fetched again by the modal, because this
+  // component already owns the only `/api/share/render` call in the flow.
+  // A second fetch would be a second source of truth and could disagree with
+  // the preview the user is looking at.
+  onProjectNamesResolved?: (hasProjectNames: boolean | null) => void;
 }
 
 interface PreviewState {
@@ -52,7 +62,8 @@ const initialPreviewState: PreviewState = {
   errorField: null,
 };
 
-export function PreviewPane({ panel, source = 'claude', account = null, templateId, options }: Props) {
+export function PreviewPane({ panel, source = 'claude', account = null, templateId, options,
+                              onProjectNamesResolved }: Props) {
   const [preview, setPreview] = useState<PreviewState>(initialPreviewState);
   // Per-fetch AbortController, set when a fetch starts and aborted when
   // the next fetch starts (or the component unmounts).
@@ -62,6 +73,24 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
   // AbortController; some environments resolve fetch promises even
   // after abort).
   const genRef = useRef(0);
+
+  // Hold the reporter in a ref so it can be called from the fetch effect
+  // without joining its dependency array. An inline arrow prop would change
+  // identity every parent render and re-trigger the debounce cycle, which
+  // would make the preview refetch on every keystroke elsewhere in the modal.
+  const reportRef = useRef(onProjectNamesResolved);
+  reportRef.current = onProjectNamesResolved;
+
+  // Invalidate the reported answer when — and ONLY when — the thing it
+  // describes changes. `has_project_names` is a property of (panel, template,
+  // data); it does not depend on theme, format or the privacy toggle. Resetting
+  // it on every options change would blank the modal's status line for the
+  // 200ms debounce each time the user ticks the anonymize checkbox, which is
+  // precisely the toggle whose effect the line exists to describe — so the
+  // line would flash a statement about project names on a panel that has none.
+  useEffect(() => {
+    reportRef.current?.(null);
+  }, [panel, source, account, templateId]);
 
   useEffect(() => {
     if (!templateId) {
@@ -94,6 +123,13 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
             errorMessage: null,
             errorField: null,
           });
+          // `undefined` from an older server stays `null` — unknown, not
+          // "no project names".
+          reportRef.current?.(
+            typeof resp.has_project_names === 'boolean'
+              ? resp.has_project_names
+              : null,
+          );
         })
         .catch((err: unknown) => {
           if (myGen !== genRef.current) return;

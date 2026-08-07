@@ -22,6 +22,7 @@ engaged (len(_STATS_MIGRATIONS) == 13).
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import pathlib
 import sqlite3
@@ -350,7 +351,7 @@ def test_stats_registry_is_frozen_at_13(ns):
 
 def test_epoch_constants(ns):
     core = _core()
-    assert core.STATS_INDEX_EPOCH == 1008  # #496 S3 publication stamp
+    assert core.STATS_INDEX_EPOCH == 1009  # #496 S5b durable selector state
     assert core.LEGACY_STATS_HEAD == 13
 
 
@@ -1053,10 +1054,24 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
     live = core.open_db()  # cutover -> uv=1000, bootstrap exists
     before = _canonical_dump(live)
     live.close()
-    # A writer can create the next canonical segment before its first append.
-    # Replayable bytes in the older bootstrap still make the journal a valid
-    # rebuild source even though journal_high_water() ends at offset zero.
-    empty_latest = core.JOURNAL_DIR / "observations-9999-12.jsonl"
+    # A writer can create its segment before its first append lands. Replayable
+    # bytes in the older bootstrap still make the journal a valid rebuild source
+    # even though journal_high_water() ends at offset zero.
+    #
+    # The name is the CURRENT UTC month rather than a synthetic far-future one.
+    # Since #511 both appenders revalidate their target under the leaf lock, so
+    # a production writer cannot create a future-dated segment at all — and a
+    # far-future empty segment would make every later append in this test refuse
+    # as non-canonically-last, which is the refusal working correctly against a
+    # premise that no longer describes a reachable state.
+    empty_latest = core.JOURNAL_DIR / _lib_journal().segment_name(
+        dt.datetime.now(dt.timezone.utc))
+    # The premise, stated rather than assumed: this reads the real clock, so it
+    # is only an EMPTY latest segment while the cutover fixture has not itself
+    # written an observation segment for the current month. If it ever does,
+    # `touch()` would leave that content in place and the case under test would
+    # silently become a different one.
+    assert not empty_latest.exists()
     empty_latest.touch()
     assert _jr().journal_high_water() == (empty_latest.name, 0)
     # bump to a FUTURE epoch (a newer binary touched it) — a mismatch on THIS

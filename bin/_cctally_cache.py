@@ -132,6 +132,9 @@ from _lib_source_identity import source_root_key
 # #416 spec §4.2: the pure tolerance-anchored reset kernel. `_lib_quota` imports
 # only `_lib_accounts` (a stdlib leaf), so binding it here is circular-safe.
 import _lib_quota
+# #496 S5b §4: the journal-to-cache coverage certificate kernel. Stdlib-only,
+# so it is circular-safe for the same reason.
+import _lib_cache_coverage
 
 
 # Module-level back-ref shims for the three out-of-scope JSONL/project
@@ -1775,6 +1778,14 @@ def _delete_codex_file_derived_rows(
         "DELETE FROM codex_session_files WHERE path = ?" + root_clause,
         params,
     )
+    # #496 S5b §4.3: this deletes `quota_window_snapshots` rows the journal still
+    # retains, so any stored coverage certificate would assert coverage for
+    # durable observations whose materialization was just removed — the
+    # `journal ⊃ cache` direction the certificate exists to exclude. Invalidate
+    # in the same transaction as the deletes, exactly as `_clear_codex_derived_
+    # rows` does for the projection certificate. This covers `reset_file=True`
+    # in `_write_codex_file_batch` and every other caller alike.
+    _invalidate_codex_journal_coverage_certificate(conn)
 
 
 def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
@@ -1808,6 +1819,10 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
             "SELECT 1 FROM codex_conversation_rollups LIMIT 1",
             "SELECT 1 FROM cache_meta "
             "WHERE key='codex_quota_projection_certificate' LIMIT 1",
+            "SELECT 1 FROM cache_meta "
+            f"WHERE key='{_lib_cache_coverage.CERTIFICATE_KEY}' LIMIT 1",
+            "SELECT 1 FROM cache_meta "
+            f"WHERE key='{_lib_cache_coverage.PROGRESS_KEY}' LIMIT 1",
         )
     )
     conn.execute("DELETE FROM codex_session_entries")
@@ -1824,7 +1839,332 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
     conn.execute(
         "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'"
     )
+    # #496 S5b §4.3, for the identical reason one layer up: this clears the
+    # physical quota state the COVERAGE certificate describes, so leaving it
+    # would make it stale-valid and let a rebuild's fast path skip a replay the
+    # cache now needs. The two certificates have non-overlapping authority —
+    # coverage binds journal-to-cache, projection binds cache-to-stats — and
+    # neither may satisfy the other's gate, so both are deleted here.
+    _invalidate_codex_journal_coverage_certificate(conn)
     return state_changed
+
+
+#: The families the #496 S5b coverage certificate describes: the cache tables a
+#: journal record materializes into. `tests/test_cache_coverage_496_s5b.py`
+#: scans `bin/` for DML against exactly these names, so widening the certificate
+#: to a further family means adding it here and re-running that guard.
+COVERAGE_CACHE_FAMILIES: "tuple[str, ...]" = (
+    "quota_window_snapshots",
+    "codex_file_accounts",
+    "codex_file_incarnations",
+)
+
+#: Every path that mutates or materializes those families, mapped to the ONE
+#: action it takes on the certificate (spec §4.3). `prohibited` is the default
+#: for anything absent: a writer nobody assigned an action to would leave the
+#: certificate stale-valid, which is the failure the certificate exists to
+#: exclude.
+#:
+#: `advance` may only ever move an EXTENDABLE predecessor forward, and it bumps
+#: `codex_physical_mutation_seq` in the same transaction. `mint` is the separate
+#: action for establishing a certificate where none existed, which the rebuild's
+#: recovery pass alone may do because only that pass reads the journal; it makes
+#: no sequence bump. Keeping the two words apart is what stops the inventory
+#: describing a bump the minting path does not make.
+#:
+#: The keys are `module.function`, and the static guard asserts that every
+#: function in `bin/` whose own body issues DML against a covered family appears
+#: here. Two kinds of key are NOT leaves and therefore cannot be scanned for:
+#: the parenthesized `(reset_file=True)` variant, which distinguishes two
+#: branches of one function, and the two composite transaction owners that
+#: delegate their DML to `_apply_quota_records` and `_apply_file_account_records`
+#: while owning the certificate decision. The guard names both sets explicitly so
+#: a key nobody can reach cannot be added either.
+COVERAGE_WRITER_ACTIONS: "dict[str, str]" = {
+    # Ordinary rollout-walk batch: the observations it writes were journaled
+    # (best-effort) immediately before, so the cache stays a superset and
+    # coverage is never BROKEN here.
+    #
+    # DELIBERATE DEVIATION from spec §4.3, which assigns `advance`. Advancing
+    # requires proving that the journal delta between the prior covered boundary
+    # and now contains only records this batch applied, and this function runs
+    # once per rollout file inside one flock hold — a journal range read per file
+    # is the per-file cost issue #297 exists about.
+    #
+    # `preserve` is safe rather than merely cheaper, and the reason is the
+    # UNCONDITIONAL `_bump_codex_physical_mutation_seq` this function makes in
+    # the same transaction as its rows: that bump alone moves the sequence the
+    # certificate is bound to, so any stored certificate goes invalid on the
+    # sequence axis whatever else happened. The journal append is NOT the
+    # reason, and stating it as one would be false: `_append_codex_quota_obs` is
+    # best-effort and swallows every exception, so a batch can write cache rows
+    # while growing no segment at all. A stale certificate is possible; a
+    # stale-VALID one is not. `tests/test_quota_journal.py` pins the sequence
+    # bump, because a future change making it conditional would silently turn
+    # this path into a stale-valid one with a green suite. Coverage is then
+    # re-established by `_cache_applier`, which consumes those same journal
+    # records on the next status-line tick and owns a contiguous batch it can
+    # prove.
+    "_cctally_cache._write_codex_file_batch": "preserve",
+    # `reset_file=True` runs `_delete_codex_file_derived_rows`, which drops
+    # `quota_window_snapshots` rows the journal still retains. Advancing there
+    # would assert coverage for durable observations whose materialization was
+    # just deleted — the `journal ⊃ cache` direction the certificate exists to
+    # exclude. File resets are rare, so paying a recovery pass afterwards is
+    # cheap and unambiguous.
+    "_cctally_cache._write_codex_file_batch(reset_file=True)": "invalidate",
+    "_cctally_cache._clear_codex_derived_rows": "invalidate",
+    "_cctally_cache._delete_codex_file_derived_rows": "invalidate",
+    # `UPDATE quota_window_snapshots SET canonical_resets_at_utc = ?` over rows
+    # already stored. It changes a row VALUE and never the SET of materialized
+    # journal records, and the certificate deliberately promises nothing about
+    # values (§4.1) — `canonical_resets_at_utc` is not even journaled, because
+    # it is a property of the observation's population rather than of the
+    # observation.
+    "_cctally_cache.CodexResetAnchorResolver.apply_pending_merges": "preserve",
+    # The two attribution-map leaves. Both materialize a decision that was
+    # journaled fail-closed before the call, and neither deletes, so no caller
+    # can reach them in a way that breaks coverage. The action belongs to the
+    # transaction owner above them, not here.
+    "_cctally_cache.record_codex_file_account": "preserve",
+    "_cctally_cache.set_codex_file_incarnation": "preserve",
+    # The two journal-to-cache appliers. Same reasoning: INSERT OR IGNORE on the
+    # natural key, no deletes, and the certificate decision belongs to the
+    # composite that owns their transaction.
+    "_cctally_journal._apply_quota_records": "preserve",
+    "_cctally_journal._apply_file_account_records": "preserve",
+    # Two branches, and only the additive one leaves the covered families
+    # untouched. `authoritative=False` replays journaled decisions into
+    # `codex_file_accounts` with an idempotent upsert and writes no quota row at
+    # all, so the coverage statement is unaffected.
+    #
+    # `authoritative=True` runs `DELETE FROM codex_file_accounts`, which IS a
+    # covered family. `preserve` holds there for a reason that lives in the
+    # caller rather than in this function, so it is written down here instead of
+    # left as an ordering nobody stated: `sync_codex_cache` passes
+    # `authoritative=bool(rebuild)`, and that same `rebuild` flag already ran
+    # `_clear_codex_derived_rows` — which invalidates the certificate and the
+    # progress record — and committed, before this call. The certificate is
+    # therefore already gone when the delete runs, and the clear-then-replay
+    # re-derives the whole map from `since=None` to the journal high water. A
+    # second `authoritative=True` caller, or a reordering inside
+    # `sync_codex_cache`, would break that silently, and the static scanner
+    # cannot catch it because this key is already in the inventory with a green
+    # label. `rehydrate_codex_file_accounts` therefore checks the invariant
+    # itself and raises `CoverageInvariantViolation` rather than relying on it.
+    "_cctally_journal.rehydrate_codex_file_accounts": "preserve",
+    # Spec §4.3's migrations row, enumerated rather than named — and enumerated
+    # by the action each one TAKES, not by the action the spec's one-line row
+    # assumed. Only `_024` deletes rows the journal still retains, and it is the
+    # only one that invalidates. `_038_codex_session_files_ingest_complete` is
+    # deliberately ABSENT: the review that asked for this row listed it, but it
+    # adds a column to `codex_session_files`, which is not a covered family —
+    # which is why the guard scans rather than trusts a hand list.
+    #
+    # `DELETE FROM quota_window_snapshots WHERE source = 'codex'` with NO
+    # sequence bump. Left standing, the certificate would be stale-VALID over a
+    # cache holding zero Codex quota rows.
+    "_cctally_db._024_codex_fused_ingest_rebuild": "invalidate",
+    # `UPDATE quota_window_snapshots SET observed_model = ?`, and it bumps
+    # `codex_physical_mutation_seq` in the same transaction whenever it changes
+    # a row. The certificate is left standing and goes invalid on the SEQUENCE
+    # axis, which is a different mechanism from deleting it but the same
+    # outcome, so `preserve` is the honest label for what this path does.
+    "_cctally_db._028_split_conversation_store": "preserve",
+    # Both rewrite `canonical_resets_at_utc` on rows already stored. That is a
+    # row VALUE and never the SET of materialized journal records, and §4.1
+    # excludes values from the promise explicitly — `canonical_resets_at_utc` is
+    # not even journaled, because it is a property of the observation's
+    # population rather than of the observation.
+    "_cctally_db._032_codex_canonical_reset_anchor": "preserve",
+    "_cctally_db._033_codex_reset_anchor_component_closure": "preserve",
+    # `UPDATE quota_window_snapshots SET observed_model = ?` over stored rows.
+    # A value again, and the same §4.1 exclusion applies.
+    "_cctally_db.backfill_codex_quota_observed_model": "preserve",
+    # The composite transaction owners.
+    "_cctally_journal._cache_applier": "advance",
+    # `mint`, not `advance`. §4.3 defines advancing as including a
+    # `codex_physical_mutation_seq` bump, and the rebuild leg never bumps: it
+    # ESTABLISHES a certificate over a prefix it has just read from the journal
+    # rather than extending a predecessor's claim, and the mint reads the
+    # sequence inside its own transaction so the stored value is current
+    # whatever any other writer did. Labelling it `advance` described behaviour
+    # this path does not have.
+    "_cctally_journal._rebuild_quota_cache_leg_raw": "mint",
+}
+
+#: The inventory keys that name no scannable function body, with the reason each
+#: one cannot be found by scanning for DML. The guard asserts this set exactly,
+#: so an unreachable key cannot be parked here either.
+COVERAGE_NON_LEAF_ACTIONS: "frozenset[str]" = frozenset({
+    # One branch of a function that is itself in the inventory.
+    "_cctally_cache._write_codex_file_batch(reset_file=True)",
+    # Transaction owners whose DML lives in the two appliers they call.
+    "_cctally_journal._cache_applier",
+    "_cctally_journal._rebuild_quota_cache_leg_raw",
+})
+
+
+def _advance_codex_journal_coverage(
+    conn: sqlite3.Connection, *, prior: "dict | None", covered, applied_through,
+    pinned_vector, allow_mint: bool = False,
+) -> bool:
+    """Store the advanced certificate in the CALLER's open transaction.
+
+    Returns whether it advanced. `prior` must be the certificate the caller read
+    and validated before opening the transaction: a writer may only move a valid
+    predecessor forward, and an absent one answers False rather than minting,
+    because establishing coverage requires reading the journal and only the
+    rebuild's recovery pass does that.
+
+    ``allow_mint`` is that pass's exemption. It is the one caller that has just
+    read the journal prefix it is about to certify, so it may establish coverage
+    where none existed. Every other writer leaves False.
+
+    The physical-mutation sequence is read HERE rather than passed in, because
+    the caller bumps it in this same transaction and the certificate must carry
+    the post-bump value. Reading it before the bump would store a certificate
+    that `certificate_is_valid` rejects on its first use.
+    """
+    if prior is None and not allow_mint:
+        return False
+    if allow_mint and prior is None:
+        # The mint stores over whatever is present, so it reads what is present
+        # first and refuses to move it backward. Today no other writer can be
+        # inside this transaction — `cmd_db_rebuild` holds the ingest lock
+        # exclusively — but that safety comes from a lock in another module, and
+        # the mint is what has to hold it.
+        stored = load_codex_journal_coverage_certificate(conn)
+        if _lib_cache_coverage.applied_through_regresses(
+            stored, applied_through, pinned_vector
+        ):
+            return False
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key='codex_physical_mutation_seq'"
+    ).fetchone()
+    try:
+        physical_seq = 0 if row is None or row[0] is None else int(row[0])
+    except (TypeError, ValueError):
+        return False
+    try:
+        certificate = _lib_cache_coverage.advance(
+            prior, covered=covered, applied_through=applied_through,
+            pinned_vector=pinned_vector, physical_seq=physical_seq)
+    except (TypeError, ValueError):
+        # The covered boundary is outside the pinned vector, which means the
+        # journal moved under this writer. Leaving the prior certificate is the
+        # safe direction: it describes a smaller prefix, and its identity root
+        # no longer matches, so the next rebuild replays.
+        return False
+    _store_codex_journal_coverage_certificate(conn, certificate)
+    return True
+
+
+def load_codex_journal_coverage_certificate(
+    conn: sqlite3.Connection,
+) -> "dict | None":
+    """The stored coverage certificate, or None when absent or unreadable.
+
+    Unreadable answers None rather than raising, because every degraded state
+    here falls back to a full replay silently (spec §6.3).
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ?",
+            (_lib_cache_coverage.CERTIFICATE_KEY,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_codex_journal_coverage_certificate(
+    conn: sqlite3.Connection, certificate: dict
+) -> None:
+    """Write the certificate inside the CALLER's open transaction.
+
+    It must commit with the rows it describes and with the
+    `codex_physical_mutation_seq` bump, so a rollback leaves the prior
+    certificate unchanged even when the journal appends survived — which is the
+    safe direction.
+    """
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (
+            _lib_cache_coverage.CERTIFICATE_KEY,
+            json.dumps(certificate, separators=(",", ":"), sort_keys=True),
+        ),
+    )
+
+
+def load_codex_recovery_progress(conn: sqlite3.Connection) -> "dict | None":
+    """A recovery pass's stored progress, or None when absent or unreadable."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = ?",
+            (_lib_cache_coverage.PROGRESS_KEY,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_codex_recovery_progress(
+    conn: sqlite3.Connection, progress: dict,
+) -> bool:
+    """Advance progress under the monotonic compare-and-swap, in this txn.
+
+    Returns whether it was written. Refusing rather than overwriting is what
+    keeps an older worker from moving a newer pass's checkpoint backwards.
+    """
+    stored = load_codex_recovery_progress(conn)
+    if not _lib_cache_coverage.progress_supersedes(stored, progress):
+        return False
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (
+            _lib_cache_coverage.PROGRESS_KEY,
+            json.dumps(progress, separators=(",", ":"), sort_keys=True),
+        ),
+    )
+    return True
+
+
+def _invalidate_codex_journal_coverage_certificate(
+    conn: sqlite3.Connection,
+) -> None:
+    """Drop the certificate AND any in-flight recovery progress, in this txn.
+
+    Every destructive or partial mutation of the covered families takes this
+    branch. Re-establishing coverage is recovery's job.
+
+    The two deletes are ONE function rather than two calls a writer could get
+    half right. Spec §4.5 requires that every destructive clear delete the
+    progress record in the same transaction as the certificate, because a
+    recovery pass that resumed from an in-memory cursor over cleared state would
+    eventually mint a certificate claiming coverage the cache does not have.
+    Structuring it as a single call is what makes "in the same transaction"
+    impossible to violate by omission.
+    """
+    conn.execute(
+        "DELETE FROM cache_meta WHERE key IN (?, ?)",
+        (_lib_cache_coverage.CERTIFICATE_KEY,
+         _lib_cache_coverage.PROGRESS_KEY),
+    )
 
 
 def _bump_codex_physical_mutation_seq(conn: sqlite3.Connection) -> None:
@@ -2362,6 +2702,14 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
                     "individual_limit_json": individual_limit_json,
                     "reached_type": reached_type, "observed_model": observed_model,
                 }), dedupe_codex_quota=True)
+        except _jr.JournalAppendTargetStale:
+            # Retryable, NOT best-effort (#511, #496 S5b §2.4). Swallowing this
+            # one lets the file offset advance past bytes whose observation was
+            # never journaled, and the rollout JSONL those bytes came from
+            # evaporates — the exact data-loss hole the quota journal exists to
+            # close. Re-raising leaves the offset where it was, so the next sync
+            # re-reads and re-appends the same bytes.
+            raise
         except Exception as exc:  # best-effort; a journal append must not break sync
             eprint(f"[codex-cache] quota obs journal append failed: {exc}")
 
@@ -10534,6 +10882,12 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     default is 'all'.
     """
     source = getattr(args, "source", "all")
+    # #496 S5b §4.7: this command is the documented remedy for a cache that is
+    # behind its journal, so it is one of the contexts allowed to resume a
+    # gated quota-projection recovery when it opens stats.db. The interactive
+    # render paths (`statusline`, every hook tick) never arm it — the
+    # resumption reads the whole journal.
+    _cctally_core.enable_quota_projection_reconciliation()
     # #276 perf: clear any prior tree on this thread so a leaked root can't be
     # flushed, then (below) time the Claude sync_cache call as the "sync_cache"
     # root phase and flush the tree to stderr when CCTALLY_PERF_TRACE is set.

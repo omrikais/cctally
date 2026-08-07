@@ -7,12 +7,14 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 """
 from __future__ import annotations
 
+import base64
+import dataclasses
 import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
@@ -115,12 +117,23 @@ class PeriodSpec:
 
 @dataclass(frozen=True)
 class ChartPoint:
+    """One chart datum.
+
+    `x_label_kind` is the AXIS DISCRIMINATOR. Privacy preparation rewrites the
+    `x_label` of a `"project"` axis and leaves a `"plain"` axis untouched; it
+    must never infer the axis from `x_label == project_label`, because the two
+    `sessions` builders deliberately break that equality (issue #503 F1).
+    A `"project"` axis composes its label from the resolved project display
+    name, prefixed by `x_label_prefix` (the cost rank) when one is present.
+    """
     x_label: str
     x_value: float
     y_value: float
     project_label: str | None = None
     series_key: str | None = None
     project_identity: str | None = None
+    x_label_kind: Literal["plain", "project"] = "plain"
+    x_label_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -235,8 +248,8 @@ class ComposeOptions:
     theme: str             # "light" | "dark"
     format: str            # "md" | "html" | "svg"
     no_branding: bool
-    # kernel: informational only — actual scrub happens upstream in
-    # the API layer before sections reach `compose()`.
+    # `compose()` reads this to prepare every section itself (#503 S1).
+    # Sections must arrive RAW; callers must not anonymize upstream.
     reveal_projects: bool
 
 
@@ -950,126 +963,17 @@ def _apply_anon_mapping(
 ) -> ShareSnapshot:
     """Return a new ShareSnapshot with project labels replaced everywhere.
 
-    Walks: (a) every Row.cells dict — replaces ProjectCell.label;
-    (b) ChartPoint.project_label AND .x_label (when x_label == project_label,
-    i.e. project-axis charts) on chart.points + multi_series + stacks.
+    Kept for backward compatibility as `_scrub`'s applier. It normalizes the
+    legacy all-string key shape and then delegates to the single project-field
+    walker `_apply_project_mapping`, so there is exactly one implementation of
+    "rewrite every typed project display field" rather than two that have to
+    agree by inspection — which is how the `x_label` fall-through survived.
     """
     tagged_mapping: dict[_ProjectAnonKey, str] = {
         ("legacy", key) if isinstance(key, str) else key: value
         for key, value in mapping.items()
     }
-    new_rows: list[Row] = []
-    for row in snap.rows:
-        new_cells: dict[str, Cell] = {}
-        for key, cell in row.cells.items():
-            if isinstance(cell, ProjectCell):
-                project_key = _project_anon_key(cell.label, cell.identity)
-                new_cells[key] = ProjectCell(
-                    tagged_mapping.get(project_key, "(unknown)"),
-                    rank_cost=cell.rank_cost,
-                    identity=cell.identity,
-                )
-            else:
-                new_cells[key] = cell
-        new_rows.append(Row(cells=new_cells))
-
-    new_chart: ChartSpec | None = snap.chart
-    if snap.chart is not None:
-        def _rewrite_pt(p: ChartPoint) -> ChartPoint:
-            if p.project_label:
-                # Fail-safe: any label not in mapping (e.g., from drift between
-                # _collect and _apply, or a future code path that adds chart
-                # points after gather) is mapped to "(unknown)" rather than
-                # passed through. Privacy invariant: never leak a non-anonymized
-                # label, even if the gather pass missed it.
-                project_key = _project_anon_key(p.project_label, p.project_identity)
-                new_label = tagged_mapping.get(project_key, "(unknown)")
-            else:
-                new_label = None
-            # x_label rewrite stays guarded — only anonymize if x_label is the
-            # project axis AND the label is in mapping (preserves non-project
-            # x_label values like time labels).
-            if (p.project_label
-                    and p.x_label == p.project_label
-                    and project_key in tagged_mapping):
-                new_x = tagged_mapping[project_key]
-            else:
-                new_x = p.x_label
-            return ChartPoint(
-                x_label=new_x,
-                x_value=p.x_value,
-                y_value=p.y_value,
-                project_label=new_label,
-                series_key=p.series_key,
-                project_identity=p.project_identity,
-            )
-
-        if isinstance(snap.chart, LineChart):
-            new_chart = LineChart(
-                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
-                y_label=snap.chart.y_label,
-                reference_lines=snap.chart.reference_lines,
-                multi_series=(
-                    {k: tuple(_rewrite_pt(p) for p in v)
-                     for k, v in snap.chart.multi_series.items()}
-                    if snap.chart.multi_series else None
-                ),
-            )
-        elif isinstance(snap.chart, BarChart):
-            new_chart = BarChart(
-                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
-                y_label=snap.chart.y_label,
-                stacks=(
-                    {k: tuple(_rewrite_pt(p) for p in v)
-                     for k, v in snap.chart.stacks.items()}
-                    if snap.chart.stacks else None
-                ),
-            )
-        elif isinstance(snap.chart, HorizontalBarChart):
-            new_chart = HorizontalBarChart(
-                points=tuple(_rewrite_pt(p) for p in snap.chart.points),
-                x_label=snap.chart.x_label,
-                cap=snap.chart.cap,
-            )
-
-    # Rewrite project-typed column headers (cross-tab Detail templates, issue
-    # #33). Fail-closed: any column.label not in `mapping` maps to "(unknown)",
-    # mirroring the ChartPoint arm above. Frozen-dataclass-compliant — we emit
-    # a new tuple of new ColumnSpec instances, never mutate snap.columns.
-    new_columns: list[ColumnSpec] = []
-    for col in snap.columns:
-        if col.kind == "project":
-            new_label = tagged_mapping.get(
-                _project_anon_key(col.label, col.project_identity), "(unknown)",
-            )
-            new_columns.append(ColumnSpec(
-                key=col.key, label=new_label,
-                align=col.align, emphasis=col.emphasis, kind=col.kind,
-                project_identity=col.project_identity,
-            ))
-        else:
-            new_columns.append(col)
-
-    # When ShareSnapshot grows a new field, add it to this constructor — the
-    # scrubber must thread every field through to preserve frozen semantics.
-    return ShareSnapshot(
-        cmd=snap.cmd,
-        title=snap.title,
-        subtitle=snap.subtitle,
-        period=snap.period,
-        columns=tuple(new_columns),
-        rows=tuple(new_rows),
-        chart=new_chart,
-        totals=snap.totals,
-        notes=snap.notes,
-        generated_at=snap.generated_at,
-        version=snap.version,
-        template_id=snap.template_id,
-        source=snap.source,
-        source_label=snap.source_label,
-        availability=snap.availability,
-        availability_reason=snap.availability_reason,
-    )
+    return _apply_project_mapping(snap, tagged_mapping)
 
 
 def _scrub(snap: ShareSnapshot, *, reveal_projects: bool) -> ShareSnapshot:
@@ -1088,6 +992,993 @@ def _scrub(snap: ShareSnapshot, *, reveal_projects: bool) -> ShareSnapshot:
         return snap
     mapping = _build_anon_mapping(project_costs)
     return _apply_anon_mapping(snap, mapping)
+
+
+# --- Preparation: the privacy contract (#503 S1) ---
+#
+# `_scrub` above is a hand-enumerated field walker: it visits three sites out
+# of a seventeen-field frozen dataclass graph and copies everything else
+# through untouched. A value leaks whenever a builder places it somewhere the
+# enumeration does not reach. Preparation replaces it as the path the entry
+# points use. `_scrub` stays public and identity-preserving for backward
+# compatibility; it is simply no longer how `render()` and `compose()` get
+# their anonymization.
+#
+# Preparation is stage 2 of the four-stage contract the entry points run:
+# inventory -> prepare -> render -> verify. It rewrites ONLY typed project
+# display fields, so a builder that puts a path into `title`, `notes` or
+# `totals` is caught by stage 4 and raises rather than being silently
+# corrected. That is intended: silent correction hides the builder defect.
+
+ANON_UNKNOWN = "(unknown)"
+
+_PREPARED_ATTR = "_share_prepared_provenance"
+
+
+class SharePreparationError(Exception):
+    """Raised when a snapshot reaches an entry point already prepared.
+
+    A second preparation pass is not idempotent. On the legacy path — where
+    `ProjectCell.identity` is None — the alias key of an already-aliased label
+    becomes ``("legacy", "project-1")`` and a second pass RENUMBERS by
+    re-ranking. In compose it is worse: two distinct raw projects that each
+    mapped locally to ``project-1`` collapse into one legacy key before global
+    ranking, merging two projects into a single alias.
+
+    An alias-shape assertion is deliberately NOT the discriminator here — a
+    real project can legitimately be named ``project-1`` — so preparation
+    stamps an explicit provenance marker instead.
+    """
+
+
+@dataclass(frozen=True)
+class _PreparedProvenance:
+    """What preparation did, recorded for the verification stage.
+
+    `originals` are the project display labels preparation consumed;
+    `allowed` are the values it is permitted to have emitted in their place.
+    Verification's provenance half checks the emitted values against
+    `allowed` rather than searching the document for `originals`, because a
+    project legitimately named `cctally` collides with the static branding
+    string this module emits and a text search would fail a correctly
+    anonymized artifact.
+    """
+    reveal_projects: bool
+    originals: frozenset[str]
+    allowed: frozenset[str]
+
+
+def _is_prepared(snap: ShareSnapshot) -> bool:
+    """True when `_prepare` produced this snapshot object."""
+    return isinstance(getattr(snap, _PREPARED_ATTR, None), _PreparedProvenance)
+
+
+def _provenance_of(snap: ShareSnapshot) -> "_PreparedProvenance | None":
+    value = getattr(snap, _PREPARED_ATTR, None)
+    return value if isinstance(value, _PreparedProvenance) else None
+
+
+# --- Reveal-mode display labels ---
+
+def _path_segments(path: str) -> list[str]:
+    return [seg for seg in path.split("/") if seg]
+
+
+def disambiguate_basenames(paths: Sequence[str]) -> dict[int, str]:
+    """Return ``{index: displayed label}`` for a list of project paths.
+
+    INPUT CONTRACT: `paths` is one entry per DISTINCT project identity.
+    Callers holding several rows of the same project must deduplicate first
+    and fan the returned label back out themselves. This function is total —
+    given two identical paths it cannot tell them apart, so it appends a
+    stable ordinal to keep the mapping injective — and that ordinal is wrong
+    output for duplicates of one project: it displays one project under
+    several names, and on the legacy path (where `ProjectCell.identity` is
+    None and the alias key is the label) it also splits that project's cost
+    across several alias slots. Every in-tree caller honors the contract:
+    `_resolved_project_labels` and `_merged_project_mapping` pass one entry
+    per `_ProjectAnonKey`, and `_cctally_share._session_disambiguate_labels`
+    deduplicates by path.
+
+    Reveal mode shows a project's basename, never its full path. Bare
+    ``os.path.basename`` is NOT sufficient and using it would reintroduce a
+    defect the CLI already solved: two ``app`` projects under different
+    parents collapse into one indistinguishable label, and after
+    anonymization into ONE ``project-N`` alias — losing both privacy
+    uniqueness and chart-rank meaning. See the comment at
+    ``bin/_cctally_share.py`` above ``_project_disambiguate_labels``'s call
+    site, which records that reasoning.
+
+    The algorithm is deterministic: basename; on collision a parent-directory
+    suffix ``" (parent)"``; on a repeated parent, progressively more path
+    segments; and a stable ordinal as the last resort when the paths
+    themselves are indistinguishable. A label with no separator (already a
+    basename, or an already-disambiguated ``app (work)`` from the CLI) is its
+    own basename and passes through untouched.
+
+    ``(unknown)`` is never suffixed: ``_build_anon_mapping`` protects only the
+    exact literal, so a suffixed ``(unknown) (/)`` would be numbered like an
+    ordinary project and lose the sentinel's meaning.
+    """
+    segs = [_path_segments(p or "") for p in paths]
+    bases: list[str] = []
+    for i, p in enumerate(paths):
+        bases.append(segs[i][-1] if segs[i] else ((p or "") or ANON_UNKNOWN))
+    labels: dict[int, str] = dict(enumerate(bases))
+    max_depth = max((len(s) for s in segs), default=1)
+    depth = 1
+    while True:
+        groups: dict[str, list[int]] = {}
+        for idx, lab in labels.items():
+            groups.setdefault(lab, []).append(idx)
+        collided = [
+            idxs for lab, idxs in groups.items()
+            if len(idxs) > 1 and lab != ANON_UNKNOWN
+        ]
+        if not collided:
+            return labels
+        if depth > max_depth:
+            # Indistinguishable inputs (identical paths, or paths that differ
+            # only past every segment we can show). Stay total and stay
+            # deterministic rather than emitting duplicates.
+            for idxs in collided:
+                for rank, idx in enumerate(sorted(idxs), 1):
+                    labels[idx] = f"{labels[idx]} ({rank})"
+            return labels
+        for idxs in collided:
+            for idx in idxs:
+                tail = segs[idx][max(0, len(segs[idx]) - 1 - depth):len(segs[idx]) - 1]
+                # `"/"` mirrors the CLI's `os.path.basename(os.path.dirname(p))
+                # or "/"` fallback for a path with no parent segment.
+                qualifier = "/".join(tail) or "/"
+                labels[idx] = f"{bases[idx]} ({qualifier})"
+        depth += 1
+
+
+# --- Inventory ---
+
+@dataclass(frozen=True)
+class SensitiveInventory:
+    """What verification knows about one render's project provenance.
+
+    `project_labels` is what the raw snapshot carried at its typed project
+    display sites, `prepared_labels` what preparation emitted there, and
+    `allowed_labels` what preparation was permitted to emit. All three come
+    from `_map_project_display`, the SINGLE enumeration of those sites.
+
+    `all_strings` is populated only by `_collect_sensitive_inventory`, which
+    is a diagnostic and test helper — NOT part of the render path. It walks
+    the whole dataclass/mapping/sequence graph generically, which is useful
+    for asking "does this snapshot carry X anywhere", but `_verify_output`
+    never reads it, so paying for that walk on every `render()` bought
+    nothing.
+    """
+    project_labels: frozenset[str] = frozenset()
+    prepared_labels: frozenset[str] = frozenset()
+    allowed_labels: frozenset[str] = frozenset()
+    all_strings: frozenset[str] = frozenset()
+
+
+EMPTY_INVENTORY = SensitiveInventory()
+
+
+def _walk_strings(value: object, out: set[str], seen: set[int]) -> None:
+    if isinstance(value, str):
+        if value:
+            out.add(value)
+        return
+    if value is None or isinstance(value, (bool, int, float, bytes, datetime)):
+        return
+    marker = id(value)
+    if marker in seen:
+        return
+    seen.add(marker)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for f in dataclasses.fields(value):
+            _walk_strings(getattr(value, f.name, None), out, seen)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _walk_strings(key, out, seen)
+            _walk_strings(item, out, seen)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _walk_strings(item, out, seen)
+        return
+
+
+def _iter_chart_points(chart: "ChartSpec | None"):
+    if chart is None:
+        return
+    yield from chart.points
+    if isinstance(chart, LineChart) and chart.multi_series:
+        for series in chart.multi_series.values():
+            yield from series
+    elif isinstance(chart, BarChart) and chart.stacks:
+        for series in chart.stacks.values():
+            yield from series
+
+
+def _collect_sensitive_inventory(snap: ShareSnapshot) -> SensitiveInventory:
+    """Walk the whole snapshot graph and record every string it carries.
+
+    A DIAGNOSTIC and test helper, deliberately NOT on the render path. The
+    generic walk answers "does this snapshot carry this token anywhere",
+    which is what a test wants; `_verify_output` reads only the three
+    project-provenance sets, so `render()` no longer pays for the walk.
+    """
+    strings: set[str] = set()
+    _walk_strings(snap, strings, set())
+    return SensitiveInventory(
+        all_strings=frozenset(strings),
+        project_labels=frozenset(_project_display_labels(snap)),
+    )
+
+
+# --- Preparation ---
+
+def _resolved_project_labels(
+    snap: ShareSnapshot, *, reveal_projects: bool,
+) -> dict[_ProjectAnonKey, str]:
+    """Map each project identity to the label the document should show.
+
+    Alias keys are collected from the FULL labels first — before any basename
+    reduction — so two projects sharing a basename stay two identities.
+    """
+    costs = _collect_project_identity_costs(snap)
+    if not costs:
+        return {}
+    if not reveal_projects:
+        return dict(_build_anon_mapping(costs))
+    # Reveal: rank cost-descending (matching the alias ranking) so the
+    # disambiguation order is stable, then reduce to displayed basenames.
+    #
+    # The basename comes from the DISPLAY LABEL, never from the key's second
+    # element: for a legacy key those are the same string, but a qualified
+    # key's second element is the opaque provider identity, and reducing that
+    # would replace the user-facing label with an internal identifier.
+    by_key = _project_label_by_key(snap)
+    ordered = sorted(costs.items(), key=lambda kv: (-kv[1], kv[0]))
+    keys = [key for key, _cost in ordered]
+    display = disambiguate_basenames([by_key.get(key, key[1]) for key in keys])
+    return {key: display[idx] for idx, key in enumerate(keys)}
+
+
+def _merged_project_costs(
+    snaps: "Sequence[ShareSnapshot]",
+) -> dict[_ProjectAnonKey, float]:
+    """Accumulate project-identity costs across every section.
+
+    The `+=` matters: overwriting would let the last section's cost decide the
+    global rank, so a project that appears twice would be ranked on half its
+    spend.
+    """
+    costs: dict[_ProjectAnonKey, float] = {}
+    for snap in snaps:
+        for key, cost in _collect_project_identity_costs(snap).items():
+            costs[key] = costs.get(key, 0.0) + cost
+    return costs
+
+
+def _merged_project_mapping(
+    snaps: "Sequence[ShareSnapshot]", *, reveal_projects: bool,
+) -> dict[_ProjectAnonKey, str]:
+    """One project display mapping shared by every section of a document.
+
+    Provider qualification is preserved deliberately: the same directory used
+    under both Claude and Codex keeps two distinct aliases, which
+    `test_equal_labels_with_distinct_qualified_identities_get_distinct_aliases`
+    pins as a shipped invariant. Within one provider, one alias means one
+    project.
+
+    The map is built BEFORE any basename reduction, so alias keys still derive
+    from the full identities.
+    """
+    costs = _merged_project_costs(snaps)
+    if not costs:
+        return {}
+    if not reveal_projects:
+        return dict(_build_anon_mapping(costs))
+    by_key: dict[_ProjectAnonKey, str] = {}
+    for snap in snaps:
+        for key, label in _project_label_by_key(snap).items():
+            by_key.setdefault(key, label)
+    ordered = sorted(costs.items(), key=lambda kv: (-kv[1], kv[0]))
+    keys = [key for key, _cost in ordered]
+    display = disambiguate_basenames([by_key.get(key, key[1]) for key in keys])
+    return {key: display[idx] for idx, key in enumerate(keys)}
+
+
+def _merged_anon_mapping(
+    sections: "Sequence[ComposedSection]",
+) -> dict[_ProjectAnonKey, str]:
+    """The anonymize-mode alias namespace for a composed document."""
+    return _merged_project_mapping(
+        [sec.snap for sec in sections], reveal_projects=False)
+
+
+# --- The single enumeration of project display sites -----------------------
+#
+# `_scrub` leaked because it hand-enumerated three field sites, and F1, F2
+# and the `x_label` fall-through were three instances of that one shape.
+# Replacing it with a second hand-enumeration would only move the shape:
+# preparation would rewrite a set of fields, provenance collection would read
+# a DIFFERENT set, and the two would drift the first time someone added a
+# project display field to only one of them.
+#
+# So there is exactly ONE enumeration, `_map_project_display`, and every
+# consumer derives from it:
+#
+#   `_apply_project_mapping`  rewrites the sites (preparation)
+#   `_project_display_labels` reads them        (provenance, both halves)
+#   `_project_label_by_key`   reads the KEYED ones (reveal-mode basenames)
+#
+# Adding a project display field therefore means editing `_map_project_display`
+# and nothing else; a field reachable by preparation but invisible to
+# provenance can no longer be constructed.
+
+
+@dataclass(frozen=True)
+class _ProjectDisplaySite:
+    """One typed project display value, as seen by the single enumeration.
+
+    `kind` distinguishes the KEYED sites — whose value is a project label and
+    therefore mints a `_ProjectAnonKey` — from the DERIVED `chart_x_label`
+    site, whose value is composed from another site's resolution and must
+    never be used as a key.
+    """
+    kind: str                       # "cell" | "column" | "chart_project_label"
+                                    # | "chart_x_label"
+    value: "str | None"             # what is at the site right now
+    identity: "str | None" = None   # the project identity governing the site
+    prefix: "str | None" = None     # x_label_prefix (chart_x_label only)
+    resolved: "str | None" = None   # the label already resolved for this point
+
+    @property
+    def keyed(self) -> bool:
+        return self.kind != "chart_x_label"
+
+
+def _map_project_display(
+    snap: ShareSnapshot, visit: "Callable[[_ProjectDisplaySite], str | None]",
+) -> ShareSnapshot:
+    """Walk every typed project display site, replacing each with `visit`.
+
+    THE enumeration. A read-only consumer passes a `visit` that records the
+    site and returns its value unchanged; preparation passes one that resolves
+    from the alias/basename mapping.
+
+    The sites, in full:
+
+      * `ProjectCell.label` for every `ProjectCell` in every row.
+      * `ColumnSpec.label` for every column with `kind == "project"`.
+      * `ChartPoint.project_label` for the chart's points, plus
+        `LineChart.multi_series` and `BarChart.stacks`.
+      * `ChartPoint.x_label` where the axis is project-keyed — derived from
+        the point's resolved `project_label` rather than resolved on its own.
+
+    A `"plain"` axis is preserved untouched.
+    """
+    new_rows: list[Row] = []
+    for row in snap.rows:
+        new_cells: dict[str, Cell] = {}
+        for key, cell in row.cells.items():
+            if isinstance(cell, ProjectCell):
+                new_cells[key] = ProjectCell(
+                    visit(_ProjectDisplaySite(
+                        kind="cell", value=cell.label, identity=cell.identity)),
+                    rank_cost=cell.rank_cost,
+                    identity=cell.identity,
+                )
+            else:
+                new_cells[key] = cell
+        new_rows.append(Row(cells=new_cells))
+
+    def _rewrite_pt(p: ChartPoint) -> ChartPoint:
+        new_label = (
+            visit(_ProjectDisplaySite(
+                kind="chart_project_label", value=p.project_label,
+                identity=p.project_identity))
+            if p.project_label else None
+        )
+        # Two independent triggers. `x_label_kind` is the authoritative one.
+        # String equality is retained only because `_scrub` stays public and
+        # a caller may hand it a hand-built point that predates the
+        # discriminator; it is subsumed by the marker at every shipped
+        # construction site, and it can never widen the leak surface — the
+        # worst it can do is anonymize an axis that already displayed the
+        # project name.
+        is_project_axis = (
+            p.x_label_kind == "project"
+            or bool(p.project_label and p.x_label == p.project_label)
+        )
+        new_x = (
+            visit(_ProjectDisplaySite(
+                kind="chart_x_label", value=p.x_label,
+                identity=p.project_identity, prefix=p.x_label_prefix,
+                resolved=new_label))
+            if is_project_axis else p.x_label
+        )
+        return ChartPoint(
+            x_label=new_x,
+            x_value=p.x_value,
+            y_value=p.y_value,
+            project_label=new_label,
+            series_key=p.series_key,
+            project_identity=p.project_identity,
+            x_label_kind=p.x_label_kind,
+            x_label_prefix=p.x_label_prefix,
+        )
+
+    new_chart: ChartSpec | None = snap.chart
+    if isinstance(snap.chart, LineChart):
+        new_chart = LineChart(
+            points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+            y_label=snap.chart.y_label,
+            reference_lines=snap.chart.reference_lines,
+            multi_series=(
+                {k: tuple(_rewrite_pt(p) for p in v)
+                 for k, v in snap.chart.multi_series.items()}
+                if snap.chart.multi_series else None
+            ),
+        )
+    elif isinstance(snap.chart, BarChart):
+        new_chart = BarChart(
+            points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+            y_label=snap.chart.y_label,
+            stacks=(
+                {k: tuple(_rewrite_pt(p) for p in v)
+                 for k, v in snap.chart.stacks.items()}
+                if snap.chart.stacks else None
+            ),
+        )
+    elif isinstance(snap.chart, HorizontalBarChart):
+        new_chart = HorizontalBarChart(
+            points=tuple(_rewrite_pt(p) for p in snap.chart.points),
+            x_label=snap.chart.x_label,
+            cap=snap.chart.cap,
+        )
+
+    new_columns: list[ColumnSpec] = []
+    for col in snap.columns:
+        if col.kind == "project":
+            new_columns.append(ColumnSpec(
+                key=col.key,
+                label=visit(_ProjectDisplaySite(
+                    kind="column", value=col.label,
+                    identity=col.project_identity)),
+                align=col.align, emphasis=col.emphasis, kind=col.kind,
+                project_identity=col.project_identity,
+            ))
+        else:
+            new_columns.append(col)
+
+    return dataclasses.replace(
+        snap, columns=tuple(new_columns), rows=tuple(new_rows), chart=new_chart,
+    )
+
+
+def _project_display_labels(snap: ShareSnapshot) -> set[str]:
+    """The typed project display values present in one snapshot.
+
+    Derived from `_map_project_display`, so it can never fall behind what
+    preparation rewrites. The returned snapshot is discarded — the visitor
+    returns each value unchanged, so this is a read.
+    """
+    labels: set[str] = set()
+
+    def _record(site: _ProjectDisplaySite) -> "str | None":
+        if site.value:
+            labels.add(site.value)
+        return site.value
+
+    _map_project_display(snap, _record)
+    return labels
+
+
+def _project_label_by_key(snap: ShareSnapshot) -> dict[_ProjectAnonKey, str]:
+    """First-seen display label per project identity key.
+
+    Only the KEYED sites contribute: a project-keyed `x_label` is composed
+    from another site's resolution, so keying on it would mint a bogus
+    `("legacy", "1 · project-1")` entry.
+    """
+    out: dict[_ProjectAnonKey, str] = {}
+
+    def _record(site: _ProjectDisplaySite) -> "str | None":
+        if site.keyed and site.value:
+            out.setdefault(_project_anon_key(site.value, site.identity),
+                           site.value)
+        return site.value
+
+    _map_project_display(snap, _record)
+    return out
+
+
+def _apply_project_mapping(
+    snap: ShareSnapshot, mapping: dict[_ProjectAnonKey, str],
+) -> ShareSnapshot:
+    """Rewrite every typed project display field from `mapping`.
+
+    Fail closed: a key absent from the mapping resolves to `(unknown)` rather
+    than falling through to the original value. The `x_label` arm used to be
+    the one exception — it fell OPEN on a mapping miss while its sibling arms
+    fell closed — which is the asymmetry this replaces.
+
+    A project-keyed axis composes its `x_label` from the resolved label, with
+    the `x_label_prefix` (the cost rank) ahead of it when present.
+    """
+    def _resolve(site: _ProjectDisplaySite) -> str:
+        if site.kind == "chart_x_label":
+            base = site.resolved if site.resolved is not None else ANON_UNKNOWN
+            return f"{site.prefix} · {base}" if site.prefix else base
+        if not site.value:
+            return ANON_UNKNOWN
+        return mapping.get(_project_anon_key(site.value, site.identity),
+                           ANON_UNKNOWN)
+
+    return _map_project_display(snap, _resolve)
+
+
+def _prepare(
+    snap: ShareSnapshot, *, reveal_projects: bool,
+    mapping: "dict[_ProjectAnonKey, str] | None" = None,
+) -> ShareSnapshot:
+    """Resolve every typed project display field and stamp provenance.
+
+    Always returns a NEW object and never marks its input, so the caller's
+    snapshot stays renderable more than once. `mapping` lets `compose()`
+    supply one merged alias namespace shared across all its sections; when
+    omitted the mapping is derived from this snapshot alone.
+    """
+    if _is_prepared(snap):
+        raise SharePreparationError(
+            "snapshot is already prepared; entry points must receive raw "
+            "snapshots (a second pass renumbers aliases on the legacy path "
+            "and merges distinct projects in compose)"
+        )
+    originals = _project_display_labels(snap)
+    resolved = (
+        mapping if mapping is not None
+        else _resolved_project_labels(snap, reveal_projects=reveal_projects)
+    )
+    out = _apply_project_mapping(snap, resolved)
+    allowed = set(resolved.values())
+    allowed.add(ANON_UNKNOWN)
+    # A project-keyed axis emits `f"{prefix} · {resolved}"`, so the composed
+    # forms belong on the allowlist too. They are derived from the RAW
+    # snapshot's prefixes crossed with the mapping's values, never read back
+    # off the prepared output, so the check stays a real comparison against
+    # provenance rather than a tautology.
+    prefixes = {
+        point.x_label_prefix
+        for point in _iter_chart_points(snap.chart)
+        if point.x_label_kind == "project" and point.x_label_prefix
+    }
+    allowed |= {
+        f"{prefix} · {value}" for prefix in prefixes for value in set(allowed)
+    }
+    object.__setattr__(out, _PREPARED_ATTR, _PreparedProvenance(
+        reveal_projects=reveal_projects,
+        originals=frozenset(originals),
+        allowed=frozenset(allowed),
+    ))
+    return out
+
+
+def _inventory_for(
+    raw: ShareSnapshot, prepared: ShareSnapshot,
+) -> SensitiveInventory:
+    """Build the verification inventory from one raw/prepared snapshot pair."""
+    return _merge_inventories([(raw, prepared)])
+
+
+def has_project_identities(snap: ShareSnapshot) -> bool:
+    """True when this snapshot carries a project identity the privacy toggle
+    can act on (#503 S1 B1).
+
+    Public, because the dashboard's render handler surfaces it so the share
+    modal's status line can tell the user what the export will actually
+    contain. Some renders produce artifacts that are byte-identical in both
+    privacy modes apart from the `anonymized:` frontmatter line. Telling that
+    user "Export will show real project names" is a false statement there, and
+    a warning learned to be false on Forecast is one a user may disregard on
+    Projects.
+
+    WHICH renders those are is not a property of the code and is deliberately
+    not enumerated anywhere. It is a property of the snapshot actually built:
+    the same template carries project names over one store and none over
+    another, and the split runs WITHIN a panel as well as between panels, so
+    neither a panel list nor a template list can be right. Three independent
+    counts taken during this session disagreed for exactly that reason — each
+    was measured against a different dataset. Do not restore a number here.
+
+    Derived from `_project_display_labels`, hence from `_map_project_display`,
+    the single enumeration of typed project display sites. A panel list would
+    be a second source of truth and would be wrong at template granularity.
+
+    `(unknown)` does not count: it renders identically in both modes, so a
+    snapshot carrying only it has nothing the toggle can change.
+    """
+    return bool(_project_display_labels(snap) - {ANON_UNKNOWN})
+
+
+def _merge_inventories(
+    pairs: "Sequence[tuple[ShareSnapshot, ShareSnapshot]]",
+) -> SensitiveInventory:
+    """Fold the project provenance of every raw/prepared section pair.
+
+    Deliberately does NOT populate `all_strings`: `_verify_output` never
+    reads it, so walking the whole snapshot graph here made every `render()`
+    pay for a value nothing consumed. `_collect_sensitive_inventory` still
+    offers that walk as a diagnostic.
+    """
+    originals: set[str] = set()
+    prepared_labels: set[str] = set()
+    allowed: set[str] = set()
+    for raw, prepared in pairs:
+        originals |= _project_display_labels(raw)
+        prepared_labels |= _project_display_labels(prepared)
+        prov = _provenance_of(prepared)
+        if prov is not None:
+            allowed |= set(prov.allowed)
+    return SensitiveInventory(
+        project_labels=frozenset(originals),
+        prepared_labels=frozenset(prepared_labels),
+        allowed_labels=frozenset(allowed),
+    )
+
+
+# --- Verification: the forbidden-class detector (#503 S1) ---
+#
+# Stage 4 of the contract. DETECTION ONLY — a finding raises
+# `SharePrivacyViolation` and the render fails. It never redacts and
+# continues, because a redact-and-continue gate hides the builder defect that
+# put the identifier in the document, and the operator's decision is that a
+# share artifact which cannot be produced safely is not produced.
+#
+# Verification has TWO DISJOINT HALVES, and the split is load-bearing.
+#
+# Half one — provenance-checked fields. Preparation knows which fields it
+# rewrote and what it was allowed to write there, so verification compares the
+# emitted values against that allowlist. It never searches the document for
+# original project labels.
+#
+# Half two — unambiguous classes, scanned document-wide. Only identifier
+# classes that cannot plausibly occur as legitimate artifact content.
+#
+# Original project labels are deliberately NOT in half two. A project
+# legitimately named `cctally` collides with the static branding string this
+# module emits, so a whole-document rejected-token set would fail a correctly
+# anonymized artifact; `daily` and `svg` collide with ordinary chrome and
+# markup the same way. Under the fail-the-render decision that is an outage,
+# not a nuisance, so half one covers the real risk without the collision.
+
+
+class SharePrivacyViolation(Exception):
+    """A forbidden identifier class was found in a rendered share artifact.
+
+    `classes` names the finding classes and NOTHING else — the message carries
+    the matched value, this attribute deliberately does not. The two audiences
+    differ: a user staring at a several-hundred-row artifact cannot act on
+    "canonical UUID" alone, so the message names the value; a log line has no
+    such need, and a dashboard log is a plausible thing to paste into a bug
+    report (#503 S1 R10).
+
+    The default is the fail-closed sentinel rather than an empty tuple: a
+    caller that redacts by reading `classes` treats a falsy value as "nothing
+    to redact by" and falls back to the full `repr`, so a raise site that
+    forgot the keyword would put the matched value into the log — the exact
+    outcome this attribute exists to prevent, and silently. With the sentinel
+    the redaction is uninformative instead of unsafe. The structural tripwire
+    `test_every_privacy_raise_site_names_its_classes` keeps raise sites from
+    relying on it.
+    """
+
+    UNCLASSIFIED = "unclassified privacy violation"
+
+    def __init__(
+        self, message: str, *, classes: "Sequence[str]" = (UNCLASSIFIED,),
+    ) -> None:
+        super().__init__(message)
+        self.classes: tuple[str, ...] = tuple(classes) or (self.UNCLASSIFIED,)
+
+
+# Canonical UUID with exact 8-4-4-4-12 hex grouping. Claude session ids are
+# canonical UUIDs, which is what F1 disclosed through the sessions charts.
+_UUID_RE = re.compile(
+    r"(?<![0-9A-Fa-f-])"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"(?![0-9A-Fa-f-])"
+)
+
+# A URI with a scheme and an authority. Stripped BEFORE the absolute-path scan
+# so its path component cannot be read as a filesystem path — the shipped
+# branded goldens carry `https://github.com/omrikais/cctally` and
+# `http://www.w3.org/2000/svg`, and a naive path predicate matches both.
+_URI_RE = re.compile(r"""[A-Za-z][A-Za-z0-9+.\-]*://[^\s"'<>)\]]*""")
+
+# An absolute POSIX path of at least two segments. The lookbehind is the
+# exclusion rule: a `/` preceded by a word character, `:`, `/`, `<` or an
+# attribute quote is a URI or markup component, not a path start. That covers
+# the bare-host form `github.com/omrikais/cctally` (preceded by `m`), the
+# scheme-relative form (preceded by `/`), and closing / self-closing tags
+# (preceded by `<` or forming a single segment).
+_ABS_PATH_RE = re.compile(
+    r"""(?<![A-Za-z0-9._\-:/<"'])(?:/[A-Za-z0-9._~+\-]+){2,}"""
+)
+
+# `~/`, `~user/`, `$HOME/`, `${HOME}/` home expansions. The trailing separator
+# is required so the `~` prefix `blocks` uses for a heuristically-anchored row
+# is not a finding.
+_HOME_EXPANSION_RE = re.compile(
+    r"""(?<![A-Za-z0-9._\-])(?:~[A-Za-z0-9._\-]*|\$\{?HOME\}?)/[A-Za-z0-9._~+\-]"""
+)
+
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9.\-])"
+)
+
+# `source_root_key` / `codex_file_key` are 32-character lowercase hex. The
+# lookarounds keep this from matching inside a 64-character sha256 digest.
+_SOURCE_ROOT_KEY_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9a-f]{32}(?![0-9A-Fa-f])")
+
+# The canonical logical-limit JSON object `_lib_jsonl._codex_logical_limit_key`
+# emits. Matched on the co-occurrence of its identity members rather than on
+# the whole literal, so a member added later still trips it.
+_LOGICAL_LIMIT_MEMBERS = ('"observedSlot"', '"windowMinutes"', '"sourceRootKey"')
+
+_V1_IDENTITY_RE = re.compile(r"(?<![A-Za-z0-9._\-])v1\.[A-Za-z0-9_\-]{16,}")
+_V1_IDENTITY_MEMBERS = frozenset(
+    {"nativeKey", "resourceKind", "source", "version"})
+
+# High-precision credential shapes. These mirror
+# `_lib_conversation_anon.SECRET_PATTERNS`, deliberately COPIED rather than
+# imported: that module's guarantee explicitly excludes emails, session ids and
+# unknown identities, so reusing it here would import a weaker contract than
+# this gate promises. They are used as DETECTION, never as redaction.
+#
+# LEFT BOUNDARY, and why it is mandatory HERE specifically. The source
+# patterns carry no left anchor, so `sk-[A-Za-z0-9_\-]{20,}` matches inside
+# any word ending in `sk` — `flask-restful-api-server-example`,
+# `risk-analysis-toolkit-2026`, `desk-booking-service-frontend` — and
+# `sk-ant-[…]` matches inside `flask-ant-design-theme-kit`. In the source
+# module an unanchored match only OVER-REDACTS. Here detection FAILS the
+# render, so the same regex is a shipping outage: the user cannot rename
+# their repository in order to share a report. `_CRED_LEFT` requires the
+# match to start at a non-word position, which is where a real credential
+# always starts (after whitespace, a quote, `=`, `:` or the string start).
+#
+# WHAT THE ANCHOR GIVES UP. `_CRED_LEFT` excludes `-` and `_` from the
+# preceding position as well as alphanumerics, so a credential glued to a
+# word character on its left — `-sk-ant-api03-…` in a flag-like string, or
+# `KEY_sk-ant-…` — is no longer detected. That narrowing is deliberate and is
+# the price of the anchor: every realistic embedding of a real credential in a
+# rendered artifact (after a space, a quote, `=`, `:`, `/`, or at the start of
+# the string) still fires, while the ordinary-repository-name false positives
+# above, which under the fail-the-render decision leave the user no recourse,
+# do not.
+_CRED_LEFT = r"(?<![A-Za-z0-9_\-])"
+_CREDENTIAL_RES = (
+    ("authorization-header", re.compile(r"\bAuthorization:[ \t]*\S", re.I)),
+    ("bearer-token", re.compile(r"\bBearer[ \t]+[A-Za-z0-9._~+/=-]{16,}", re.I)),
+    ("anthropic-key", re.compile(_CRED_LEFT + r"sk-ant-[A-Za-z0-9_\-]{8,}")),
+    ("generic-sk-key", re.compile(_CRED_LEFT + r"sk-[A-Za-z0-9_\-]{20,}")),
+    ("github-token", re.compile(
+        _CRED_LEFT + r"(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}")),
+    ("aws-access-key", re.compile(_CRED_LEFT + r"AKIA[0-9A-Z]{16}")),
+    ("slack-token", re.compile(_CRED_LEFT + r"xox[baprs]-[A-Za-z0-9\-]{10,}")),
+    ("secret-assignment", re.compile(
+        r"\b(?:api[_-]?key|secret|passwd|password)\b[ \t]*[=:][ \t]*"
+        r"""(?:"[^"\r\n]{6,}"|'[^'\r\n]{6,}'|[^\s"']{6,})""", re.I)),
+)
+
+_NUMERIC_ENTITY_RE = re.compile(r"&#(x[0-9A-Fa-f]+|[0-9]+);")
+_MD_BACKSLASH_RE = re.compile(r"\\([\\|*_`\[\]])")
+
+
+def _decode_entities(text: str) -> str:
+    """Undo the XML/HTML escaping the renderers apply."""
+    def _numeric(m: "re.Match[str]") -> str:
+        token = m.group(1)
+        try:
+            code = int(token[1:], 16) if token[0] in "xX" else int(token)
+        except ValueError:
+            return m.group(0)
+        return chr(code) if 0 < code < 0x110000 else m.group(0)
+
+    out = _NUMERIC_ENTITY_RE.sub(_numeric, text)
+    for entity, char in (("&quot;", '"'), ("&#39;", "'"), ("&lt;", "<"),
+                         ("&gt;", ">"), ("&amp;", "&")):
+        out = out.replace(entity, char)
+    return out
+
+
+def _scan_variants(text: str) -> tuple[str, ...]:
+    """The raw document plus its decoded forms.
+
+    Entity encoding and markdown backslash escaping both split a token across
+    characters the scanners would otherwise not join up, so scanning the raw
+    bytes alone would let an encoded identifier through.
+    """
+    decoded = _decode_entities(text)
+    unescaped = _MD_BACKSLASH_RE.sub(r"\1", decoded)
+    variants = [text]
+    for candidate in (decoded, unescaped):
+        if candidate not in variants:
+            variants.append(candidate)
+    return tuple(variants)
+
+
+def _looks_like_identity_key(token: str) -> bool:
+    """True when a `v1.` token base64url-decodes to a canonical IdentityV1."""
+    body = token[3:]
+    padded = body + "=" * (-len(body) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and _V1_IDENTITY_MEMBERS <= set(payload)
+
+
+# How much of an offending value the refusal message quotes.
+#
+# The message reaches a terminal (`cctally: refused to write a share artifact
+# — …`), so an unbounded value would wrap the refusal off screen. Long enough
+# that a user recognizes which of their directories or identifiers tripped the
+# gate, which is the whole reason the value is named at all.
+_FINDING_SAMPLE_MAX = 48
+
+
+def _finding_sample(value: str) -> str:
+    """A single-line, length-bounded form of a matched value."""
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= _FINDING_SAMPLE_MAX:
+        return collapsed
+    return collapsed[:_FINDING_SAMPLE_MAX] + "…"
+
+
+# The run of characters a path-shaped token may continue with. Used ONLY to
+# widen a match for display: `_HOME_EXPANSION_RE` requires a single character
+# after the separator, which is the right anchor for detection but reports
+# `~/w` as the offending value where the user needs to see `~/work/app`.
+# Widening here rather than in the pattern keeps detection semantics fixed.
+_PATHY_TAIL_RE = re.compile(r"[A-Za-z0-9._~+\-/]*")
+
+
+def _matched_with_pathy_tail(text: str, match: "re.Match[str]") -> str:
+    tail = _PATHY_TAIL_RE.match(text, match.end())
+    return text[match.start():tail.end()]
+
+
+def _scan_forbidden_classes(text: str) -> "list[tuple[str, str]]":
+    """Return `(class label, matched value)` per unambiguous class in `text`.
+
+    The matched value is carried out of the scan, not just the class name.
+    Naming only the class leaves the user nothing to act on: the accepted
+    limitation in `docs/share-gotchas.md` is that a project whose basename is
+    itself a canonical UUID or a 32-character hex token cannot be rendered in
+    reveal mode, and "canonical UUID" alone does not tell that user which of
+    their directories to rename.
+    """
+    findings: list[tuple[str, str]] = []
+    match = _UUID_RE.search(text)
+    if match:
+        findings.append(("canonical UUID", match.group(0)))
+    for token in _V1_IDENTITY_RE.findall(text):
+        if _looks_like_identity_key(token):
+            findings.append(("v1. identity key", token))
+            break
+    without_uris = _URI_RE.sub(" ", text)
+    match = _ABS_PATH_RE.search(without_uris)
+    if match:
+        findings.append(("absolute path", match.group(0)))
+    match = _HOME_EXPANSION_RE.search(text)
+    if match:
+        findings.append(
+            ("home-directory expansion", _matched_with_pathy_tail(text, match)))
+    match = _EMAIL_RE.search(text)
+    if match:
+        findings.append(("email address", match.group(0)))
+    match = _SOURCE_ROOT_KEY_RE.search(text)
+    if match:
+        findings.append(("source-root key", match.group(0)))
+    if all(member in text for member in _LOGICAL_LIMIT_MEMBERS):
+        # No single regex match to quote; the members are what identify it.
+        first = min(_LOGICAL_LIMIT_MEMBERS, key=text.index)
+        findings.append(("logical-limit identity", first))
+    for name, pattern in _CREDENTIAL_RES:
+        match = pattern.search(text)
+        if match:
+            findings.append((f"credential ({name})", match.group(0)))
+    return findings
+
+
+def _describe_findings(findings: "Sequence[tuple[str, str]]") -> str:
+    """Render `label (value)` per class, deduplicated, in a stable order."""
+    seen: dict[str, str] = {}
+    for label, value in findings:
+        seen.setdefault(label, value)
+    parts = [
+        f"{label} ({_finding_sample(seen[label])})" for label in sorted(seen)
+    ]
+    if len(parts) > 5:
+        return ", ".join(parts[:5]) + f", and {len(parts) - 5} more"
+    return ", ".join(parts)
+
+
+def _verify_output(
+    text: str, *, inventory: SensitiveInventory,
+) -> None:
+    """Raise `SharePrivacyViolation` when the rendered document is unsafe.
+
+    Detection only. Callers must let the exception propagate: the dashboard
+    handler's exception converter turns it into the generic 500 envelope and
+    the CLI converts it to a stderr refusal and exit 3.
+
+    Takes NO privacy mode. Both halves are mode-independent — half one
+    compares against the allowlist preparation itself built under whichever
+    mode was asked for, and half two's classes are forbidden in reveal mode
+    too, because reveal discloses a project's basename and never its path.
+    The parameter existed and was read by nothing.
+    """
+    # Half one — provenance. Every project display value the prepared snapshot
+    # carries must be one preparation was allowed to write. This catches a
+    # preparation miss without a text search, so a project whose name happens
+    # to be a common word is checked correctly.
+    #
+    # A CONSTRUCTION INVARIANT, not a runtime check that can fire in the real
+    # pipeline: `_apply_project_mapping` writes every site from
+    # `mapping.get(key, ANON_UNKNOWN)` and composes the axis label from the
+    # same values, and `_prepare` builds `allowed` from that mapping plus the
+    # raw prefixes, so the difference is empty by construction for every
+    # in-tree input. It fires for a snapshot prepared outside `_prepare`, and
+    # it is deliberately NOT strengthened into a document-wide search for
+    # original project labels: a project named `cctally` collides with this
+    # module's own branding string, and under the fail-the-render decision
+    # that collision is an outage.
+    if inventory.allowed_labels or inventory.prepared_labels:
+        escaped = inventory.prepared_labels - inventory.allowed_labels
+        if escaped:
+            raise SharePrivacyViolation(
+                "project display fields escaped preparation: "
+                + ", ".join(sorted(escaped)[:5]),
+                # The escaped values ARE project labels, so they stay out of
+                # `classes` for the same reason a matched value does.
+                classes=("project display fields escaped preparation",),
+            )
+
+    # Half two — unambiguous classes, document-wide, in both privacy modes.
+    for variant in _scan_variants(text):
+        findings = _scan_forbidden_classes(variant)
+        if findings:
+            raise SharePrivacyViolation(
+                "share artifact would disclose: " + _describe_findings(findings),
+                classes=sorted({label for label, _value in findings}),
+            )
+
+
+def _encode_probe_identity_key() -> str:
+    """A syntactically valid IdentityV1 key, for the detector's own tests.
+
+    Kept next to the decoder so the probe cannot drift away from the shape the
+    detector recognizes.
+    """
+    payload = {
+        "nativeKey": "probe",
+        "parentKey": None,
+        "resourceKind": "conversation",
+        "source": "codex",
+        "sourceRootKey": None,
+        "version": 1,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "v1." + base64.urlsafe_b64encode(canonical).decode("ascii").rstrip("=")
 
 
 # --- Format renderers ---
@@ -1746,16 +2637,25 @@ def _build_md_frontmatter(snap: ShareSnapshot) -> str:
     `template_id` is present for dashboard share-v2 snapshots and omitted
     for legacy CLI snapshots that have no template recipe.
 
-    `anonymized` reflects whether `_scrub` has rewritten this snapshot --
-    detected via `_snapshot_is_anonymized` (label-prefix heuristic; see
-    that function for the contract).
+    `anonymized` reports the MODE the document was rendered in, read off the
+    provenance marker preparation stamped: `not reveal_projects`. It used to
+    be INFERRED by regex-matching `project-\\d+` over the labels, which was
+    wrong three ways — it never inspected the chart, so `sessions-visual`
+    stamped `false` onto a demonstrably scrubbed snapshot; a real project
+    named `project-1` reported as anonymized; and a silently failed scrub
+    producing conforming labels was indistinguishable from a successful one.
+
+    An UNPREPARED snapshot never went through the privacy contract, so the
+    document cannot claim anonymization and reports `false`. That reaches
+    only the `_render_md` back-compat shim; `render()` always prepares.
     """
     period = snap.period
     period_iso = (
         f"{_format_generated_at_iso(period.start)}.."
         f"{_format_generated_at_iso(period.end)}"
     )
-    anonymized = "true" if _snapshot_is_anonymized(snap) else "false"
+    prov = _provenance_of(snap)
+    anonymized = "true" if (prov is not None and not prov.reveal_projects) else "false"
     lines = [
         "---",
         f"title: {_yaml_scalar(snap.title)}",
@@ -1788,41 +2688,6 @@ def _yaml_scalar(s: str) -> str:
     if any(c in s for c in ":#&*!|>'\"%@`") or s.strip() != s:
         return "'" + s.replace("'", "''") + "'"
     return s
-
-
-def _snapshot_is_anonymized(snap: ShareSnapshot) -> bool:
-    """Return True if every project label (cell or column) is anon or sentinel.
-
-    `_scrub` rewrites labels to `project-<N>` (1-indexed, cost-descending).
-    A snapshot with no `ProjectCell` rows AND no `kind='project'` columns
-    returns False (nothing was anonymized because there was nothing to
-    anonymize). `(unknown)` is the project-share sentinel for missing
-    project_path (see `cmd_project`'s `_proj_label_for`) — it is never a
-    revealed real name, so it is counted as also-anonymized. Mixed snapshots
-    (some scrubbed, some revealed) are reported False to keep the
-    frontmatter semantic ("are projects revealed in this MD?").
-
-    Cross-tab Detail templates (issue #33) carry project labels in
-    `kind='project'` columns rather than `ProjectCell` rows; we walk both
-    surfaces so MD frontmatter `anonymized:` stays correct for those panels.
-    """
-    cells = [
-        cell
-        for row in snap.rows
-        for cell in row.cells.values()
-        if isinstance(cell, ProjectCell)
-    ]
-    project_cols = [col for col in snap.columns if col.kind == "project"]
-    if not cells and not project_cols:
-        return False
-
-    def _is_anon(label: str) -> bool:
-        return bool(re.fullmatch(r"project-\d+", label)) or label == "(unknown)"
-
-    return (
-        all(_is_anon(c.label) for c in cells)
-        and all(_is_anon(col.label) for col in project_cols)
-    )
 
 
 # --- Fragment + wrap ---
@@ -1906,21 +2771,41 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
     wraps them all in composite chrome (one title, one footer, one outer
     wrapper) per format-specific stitching rules in spec §4.3.
 
-    `opts.reveal_projects` does NOT scrub here — scrubbing must have
-    happened upstream (in the API layer) before the snapshot reaches
-    this function. The kernel is anon-agnostic at compose time; the
-    composer endpoint is the chokepoint.
+    The second complete-document boundary that owns the privacy contract
+    (#503 S1). `sections` must carry RAW snapshots: `compose()` prepares them
+    itself under `opts.reveal_projects`, stitches, and then verifies the whole
+    composed document. Callers must not pre-scrub — a pre-scrubbed section
+    reaching a second aliasing pass merges two distinct projects that each
+    mapped locally to `project-1` into one alias.
     """
     if not sections:
         raise ValueError("compose requires at least one section")
     fmt = opts.format
+    # ONE alias namespace for the whole document (#503 S1 F4). The merged
+    # mapping is built here in the kernel rather than in the handler, because
+    # a handler-only fix would miss the CLI `source=all` path.
+    merged = _merged_project_mapping(
+        [sec.snap for sec in sections], reveal_projects=opts.reveal_projects)
+    prepared = tuple(
+        ComposedSection(
+            snap=_prepare(sec.snap, reveal_projects=opts.reveal_projects,
+                          mapping=merged),
+            drift_detected=sec.drift_detected,
+        )
+        for sec in sections
+    )
     if fmt == "html":
-        return _stitch_html(sections, opts=opts)
-    if fmt == "md":
-        return _stitch_md(sections, opts=opts)
-    if fmt == "svg":
-        return _stitch_svg(sections, opts=opts)
-    raise ValueError(f"unknown format: {fmt!r}")
+        body = _stitch_html(prepared, opts=opts)
+    elif fmt == "md":
+        body = _stitch_md(prepared, opts=opts)
+    elif fmt == "svg":
+        body = _stitch_svg(prepared, opts=opts)
+    else:
+        raise ValueError(f"unknown format: {fmt!r}")
+    _verify_output(body, inventory=_merge_inventories([
+        (raw.snap, out.snap) for raw, out in zip(sections, prepared)
+    ]))
+    return body
 
 
 def _stitch_html(sections: tuple[ComposedSection, ...], *,
@@ -1975,11 +2860,11 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
         # union collapses).
         earliest = min(sec.snap.period.start for sec in sections)
         latest = max(sec.snap.period.end for sec in sections)
-        anon_field = (
-            "true"
-            if all(_snapshot_is_anonymized(s.snap) for s in sections)
-            else "false"
-        )
+        # #503 S1: the composite frontmatter reports the composite MODE.
+        # `compose()` re-renders every section with `opts.reveal_projects`
+        # and discards each section's add-time value, so the composite flag
+        # is the whole truth about what the document contains.
+        anon_field = "false" if opts.reveal_projects else "true"
         parts.append(
             "---\n"
             f"title: {_yaml_scalar(opts.title)}\n"
@@ -2043,16 +2928,39 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
 
 # --- Public dispatch ---
 
-def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool) -> str:
+def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool,
+           reveal_projects: bool) -> str:
     """Render a snapshot to the requested format.
 
     Pure function: no I/O, no DB, no filesystem, no locks. Caller is
     responsible for emitting the result (stdout/file/clipboard/open).
 
-    Thin delegator over `_render_fragment` + `_wrap_document`: separates
-    body-only rendering from document chrome so compose can stitch multiple
-    sections under a single wrapper (M3.x).
+    One of the two complete-document boundaries that own the privacy contract
+    (#503 S1). It runs inventory -> prepare -> render -> verify. The gate goes
+    here and in `compose()`, not in `_render_fragment` and not in
+    `_wrap_document`, because composition bypasses the latter and a fragment
+    is not a complete document.
+
+    `reveal_projects` is a REQUIRED keyword with no default. Three shipped
+    sites had defaulted it open, and fixing three defaults leaves nothing
+    stopping a fourth; a wrong default cannot exist where there is no
+    default, so a caller that omits it raises `TypeError` at its own call
+    site rather than silently revealing.
+
+    `snap` must be RAW. Passing an already-scrubbed or already-prepared
+    snapshot renumbers aliases on the legacy path, so preparation refuses it.
     """
+    inventory_source = snap
+    prepared = _prepare(snap, reveal_projects=reveal_projects)
+    out = _render_prepared(prepared, format=format, theme=theme,
+                           branding=branding)
+    _verify_output(out, inventory=_inventory_for(inventory_source, prepared))
+    return out
+
+
+def _render_prepared(snap: ShareSnapshot, *, format: str, theme: str,
+                     branding: bool) -> str:
+    """Fragment + chrome for one already-prepared snapshot."""
     if format == "md":
         frag = _render_fragment(snap, format="md", palette=PALETTE_LIGHT, branding=branding)
         return _wrap_document(frag, format="md", palette=PALETTE_LIGHT, snap=snap,

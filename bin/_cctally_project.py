@@ -768,12 +768,14 @@ def cmd_project(args: argparse.Namespace) -> int:
     # Shareable-reports gate: --format short-circuits the JSON / table
     # dispatch via `_share_render_and_emit`. The mutex in
     # `_add_share_args` keeps `--format` and `--json` from coexisting.
-    # Privacy invariant (Section 8.4 / 5.3): the wrapper runs `_lib_share._scrub`
-    # before rendering, so default output anonymizes project labels to
-    # `project-1` / `project-2` / ...; `--reveal-projects` opts back in.
-    # The builder populates `ProjectCell.label` / `ChartPoint.project_label`
-    # / `ChartPoint.x_label` with REAL names; the wrapper-level scrubber is
-    # the single chokepoint that rewrites them.
+    # Privacy invariant (Section 8.4 / 5.3): `_lib_share.render()` prepares
+    # the RAW snapshot the wrapper hands it, so default output anonymizes
+    # project labels to `project-1` / `project-2` / ...; `--reveal-projects`
+    # opts back in. The builder populates `ProjectCell.label` /
+    # `ChartPoint.project_label` / `ChartPoint.x_label` with REAL names;
+    # `render()` is the chokepoint that rewrites them. (It is NOT `_scrub()`:
+    # that function is retained for backward compatibility and no production
+    # path calls it.)
     if getattr(args, "format", None):
         # Note: --breakdown is a no-op under --format (snapshot focuses on
         # the headline per-project usage table + HBar chart; per-model

@@ -124,3 +124,82 @@ def test_tui_attribution_preserves_conversations_ownership(ns):
 
     assert database == "conversations"
     assert corruption is True
+
+
+def test_a_refused_quota_projection_is_rendered_with_its_remedy(ns):
+    """#496 S5b. The refusal message names `cctally cache-sync`, but it lands in
+    `last_sync_error`, which this module's contract forbids putting in a
+    visible text, title or aria surface. Without a branch of its own the
+    attribution reached the terminal default — "⚠ server sync error" with no
+    action — because `database="other"` matches nothing above it.
+    """
+    import _cctally_tui as tui
+
+    now = dt.datetime(2026, 7, 24, 8, 0, tzinfo=dt.timezone.utc)
+    snap = dataclasses.replace(
+        ns["_empty_dashboard_snapshot"](),
+        generated_at=now,
+        last_sync_error=(
+            "quota-projection: the published quota projection is incomplete; "
+            "run `cctally cache-sync` to reconcile it"
+        ),
+        sync_failures=(
+            tui.SyncFailureAttribution(
+                leg="quota-projection", database="other", corruption=False,
+            ),
+        ),
+    )
+
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+
+    assert envelope["sync_failure"]["kind"] == "quota_projection_incomplete"
+    assert envelope["sync_failure"]["label"] == "quota view reconciling"
+    assert envelope["sync_failure"]["action"] == "cctally cache-sync"
+
+
+def test_another_other_leg_is_not_captured_by_the_projection_branch(ns):
+    """Non-vacuity: the branch keys on the LEG, not on `database="other"`,
+    which is deliberately generic and carries several unrelated legs."""
+    import _cctally_tui as tui
+
+    now = dt.datetime(2026, 7, 24, 8, 0, tzinfo=dt.timezone.utc)
+    snap = dataclasses.replace(
+        ns["_empty_dashboard_snapshot"](),
+        generated_at=now,
+        last_sync_error="prior-source-bundle: something else went wrong",
+        sync_failures=(
+            tui.SyncFailureAttribution(
+                leg="prior-source-bundle", database="other", corruption=False,
+            ),
+        ),
+    )
+
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+
+    assert envelope["sync_failure"]["kind"] == "server_sync"
+    assert envelope["sync_failure"]["action"] is None
+
+
+def test_a_stats_fault_still_wins_a_mixed_projection_failure(ns):
+    """Ordering: stats ownership is decided above the projection branch, so a
+    tick that met both reports the one with the destructive remedy."""
+    import _cctally_tui as tui
+
+    now = dt.datetime(2026, 7, 24, 8, 0, tzinfo=dt.timezone.utc)
+    snap = dataclasses.replace(
+        ns["_empty_dashboard_snapshot"](),
+        generated_at=now,
+        last_sync_error="stats-open: database disk image is malformed",
+        sync_failures=(
+            tui.SyncFailureAttribution(
+                leg="quota-projection", database="other", corruption=False,
+            ),
+            tui.SyncFailureAttribution(
+                leg="stats-open", database="stats", corruption=True,
+            ),
+        ),
+    )
+
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+
+    assert envelope["sync_failure"]["kind"] == "stats_corruption"

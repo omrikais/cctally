@@ -262,7 +262,8 @@ class TuiSessionRow:
     # Absolute project_path (NULL ⇒ ``(unknown)`` resolved upstream).
     # Carried so the sync-thread builder can compute ``project_key``
     # without re-reading ``session_files`` and so the share path can
-    # privacy-scrub via ``_lib_share._scrub``.
+    # anonymize it in the preparation pass ``_lib_share.render()`` /
+    # ``compose()`` run over the raw snapshot.
     project_path: str | None = None
     # Dashboard/TUI-only: the human-readable session title (AI-generated
     # title when present, else the first non-marker user prompt). Populated

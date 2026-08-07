@@ -3,7 +3,7 @@ title: Codex Token Usage — Weekly
 generated_at: 2026-07-02T12:00:00Z
 period: 2026-07-01T00:00:00Z..2026-07-02T12:00:00Z
 panel: codex-weekly
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 # Codex Token Usage — Weekly

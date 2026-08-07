@@ -3,7 +3,7 @@ title: 'Weekly $ / % trend — last 4 weeks'
 generated_at: 2026-05-09T12:00:00Z
 period: 2026-04-13T00:00:00Z..2026-05-11T00:00:00Z
 panel: report
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 # Weekly $ / % trend — last 4 weeks

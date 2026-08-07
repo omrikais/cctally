@@ -25,6 +25,8 @@ segment files.
 """
 from __future__ import annotations
 
+import collections
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -39,9 +41,12 @@ from dataclasses import dataclass, field, replace as _dc_replace
 
 import _cctally_core
 import _lib_accounts
+import _lib_cache_coverage
 import _lib_journal
 import _lib_journal_router
 import _lib_record
+import _lib_segment_summary
+import _lib_selector_state
 
 
 # Torn-tail scan window (spec §4.3). A single line must fit inside it — a
@@ -65,12 +70,32 @@ class JournalError(Exception):
     """A structural journal-append failure (line too long, unrepairable tail)."""
 
 
+#: A newly completed correction batch whose effect the live index lacks. The
+#: commit marker IS the narrowest complete prefix, and convergence is decided by
+#: the exact `(rev, status, content_hash, batch_id)` the signal carries.
+CORRECTION_KIND_NEWLY_COMPLETED = "newly_completed"
+
+#: A batch whose durable status was `completed` and which a later record
+#: tainted. Its recovery coordinate is the END OFFSET OF THAT RECORD, never the
+#: batch's earliest commit: a rebuild bounded at the commit excludes the
+#: tainting record, faithfully reproduces the completed correction, and meets
+#: the same taint on the next tick — signalling forever instead of converging
+#: (#496 S5b §3.7).
+CORRECTION_KIND_COMPLETED_TO_TAINTED = "completed_to_tainted"
+
+
 class CorrectionRebuildRequired(JournalError):
     """A completed correction cannot be applied incrementally to a live index.
 
     The recovery boundary needs more than a message: it must rebuild through
-    the exact completed-batch commit that triggered the mismatch, then
-    revalidate the exact effective metadata under exclusive ownership.
+    the exact prefix that triggered the mismatch, then revalidate under
+    exclusive ownership.
+
+    `kind` selects WHICH prefix and WHICH revalidation. The two kinds do not
+    share a convergence predicate: after a taint withdraws a completed batch the
+    post-rebuild winner may be an older candidate that durable selector state
+    deliberately does not store, so an exact expected metadata tuple is not
+    computable for it.
     """
 
     def __init__(
@@ -82,6 +107,7 @@ class CorrectionRebuildRequired(JournalError):
         high_water=None,
         expected_metadata=None,
         recovery_eligible=False,
+        kind=CORRECTION_KIND_NEWLY_COMPLETED,
     ):
         super().__init__(message)
         self.batch_id = batch_id
@@ -89,10 +115,24 @@ class CorrectionRebuildRequired(JournalError):
         self.high_water = high_water
         self.expected_metadata = expected_metadata
         self.recovery_eligible = recovery_eligible
+        self.kind = kind
 
 
 class CorrectionRecoveryError(JournalError):
     """Bounded correction recovery could not safely replace the live index."""
+
+
+class JournalAppendTargetStale(JournalError):
+    """The resolved append target is no longer the canonically-last segment.
+
+    Raised when a writer resolved its month segment before taking the leaf lock
+    and the journal moved on underneath it (#511, #496 S5b §2.4). Retryable:
+    the caller re-resolves and appends again. It is a DISTINCT class precisely
+    so `_cctally_cache._append_codex_quota_obs` can re-raise it while still
+    swallowing genuine errors — swallowing this one would advance a file offset
+    past bytes whose observation was never journaled, and the rollout JSONL
+    those bytes came from evaporates.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +316,50 @@ def _load_quota_dedup_keys() -> None:
     _QUOTA_DEDUP_LOADED = True
 
 
+def _utc_now() -> dt.datetime:
+    """The append path's clock, named so both reads are the same call.
+
+    An appender resolves its month segment once before the leaf lock and once
+    again after taking it (#511). Reading the clock through one helper keeps the
+    two reads identical in everything but time.
+    """
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _validate_append_target(journal_dir, seg_name: str) -> None:
+    """Refuse an append whose target is not the canonically-last segment.
+
+    MUST be called with the leaf lock held: the whole point is that the
+    canonical order cannot move between this check and the write. Both
+    appenders route through it rather than duplicating the comparison, because
+    fixing only one leaves the claimed immutability false for exactly the
+    correction and audit group appends the durable selector depends on.
+
+    An EXISTING target must equal the canonically-last segment. An ABSENT
+    target must sort last when provisionally added to the segment list, which
+    is the ordinary month rollover: the new month's file does not exist yet.
+
+    It refuses rather than redirects. Refusal preserves physical order and lets
+    a writer retry against a freshly resolved target, where silently
+    redirecting a planned correction group would move it out from under a
+    caller that had already reasoned about its placement (#496 S5b §2.4).
+    """
+    segments = list_segments()
+    if not segments:
+        return
+    if seg_name == segments[-1]:
+        return
+    if seg_name not in segments:
+        provisional = sorted(
+            [*segments, seg_name], key=_lib_journal.segment_sort_key)
+        if provisional[-1] == seg_name:
+            return
+    raise JournalAppendTargetStale(
+        f"append target {seg_name} is not the canonically-last segment "
+        f"({segments[-1]}) in {journal_dir}; re-resolve and retry"
+    )
+
+
 def _append_quota_dedup_key(natural_key: str) -> None:
     """Journal-first second leg: append+fsync one key to the compact index."""
     index_path = _cctally_core.JOURNAL_DIR / _QUOTA_DEDUP_INDEX_NAME
@@ -306,9 +390,15 @@ def append_record(
     and returns ``None`` on a skip. Otherwise returns ``(segment_basename,
     end_offset)`` where ``end_offset`` is the file size just past the appended
     line — the byte position the ingest cursor advances to when it consumes
-    this line."""
+    this line.
+
+    An explicitly supplied ``now_utc`` is honoured verbatim and NOT validated
+    against canonical order: no production caller supplies one, and roughly a
+    dozen tests pass a fixed timestamp precisely to pin segment placement. A
+    deliberate placement choice is not a stall (#496 S5b §2.4)."""
+    explicit_now = now_utc is not None
     if now_utc is None:
-        now_utc = dt.datetime.now(dt.timezone.utc)
+        now_utc = _utc_now()
     data = _lib_journal.encode_line(record)
     if len(data) > _MAX_LINE_BYTES:
         raise JournalError(
@@ -342,6 +432,15 @@ def append_record(
                 )
             if natural_key in _QUOTA_DEDUP_KEYS:
                 return None
+
+        # ORDER MATTERS (#496 S5b §2.4). The dedupe no-write return above runs
+        # FIRST, because a skipped append writes nothing and so has no target to
+        # validate. Re-resolution and validation then run BEFORE the file is
+        # opened or torn-tail-repaired, so the repair sequence is untouched.
+        if not explicit_now:
+            seg_name = _lib_journal.segment_name(_utc_now())
+            seg_path = journal_dir / seg_name
+            _validate_append_target(journal_dir, seg_name)
 
         seg_created = not seg_path.exists()
         fd = os.open(str(seg_path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -385,11 +484,17 @@ def append_records(
     correction batch remains physically ordered. ``expected_high_water`` is
     checked while holding the same leaf lock that performs the append, closing
     the plan/revalidate/append race.
+
+    That check is NOT a substitute for target validation: it proves nothing
+    about canonical order when ``expected_high_water`` is unset, which is the
+    default. A defaulted ``now_utc`` is therefore re-resolved and validated
+    under the same lock, exactly as in ``append_record`` (#511, #496 S5b §2.4).
     """
     if not isinstance(records, list) or not records:
         raise ValueError("journal record group must be a non-empty list")
+    explicit_now = now_utc is not None
     if now_utc is None:
-        now_utc = dt.datetime.now(dt.timezone.utc)
+        now_utc = _utc_now()
     encoded = []
     for record in records:
         data = _lib_journal.encode_line(record)
@@ -429,6 +534,13 @@ def append_records(
                 "journal high-water changed before correction append "
                 f"(expected {expected_high_water!r}, found {actual_high_water!r})"
             )
+
+        # After the caller's own precondition, and before the file is opened or
+        # torn-tail-repaired (#496 S5b §2.4).
+        if not explicit_now:
+            seg_name = _lib_journal.segment_name(_utc_now())
+            seg_path = journal_dir / seg_name
+            _validate_append_target(journal_dir, seg_name)
 
         seg_created = not seg_path.exists()
         fd = os.open(str(seg_path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -504,6 +616,434 @@ def _journal_rebuild_snapshot() -> tuple[tuple[str, int] | None, bool]:
         )
     finally:
         _release_leaf_lock(lock_fd)
+
+
+#: How far back `_complete_line_offset` will look for the last newline when a
+#: segment does not end on one. A torn tail is one interrupted `write`, so it is
+#: bounded by one record; a megabyte is orders of magnitude beyond any record
+#: this journal produces, and reading the whole segment to answer a question
+#: about its last byte is exactly the cost the coverage certificate exists to
+#: remove.
+_COMPLETE_LINE_TAIL_WINDOW = 1 << 20
+
+
+def _complete_line_offset(path, size: int) -> int:
+    """The offset after the last COMPLETE line in ``path``, given its ``size``.
+
+    The coverage certificate promises decoded records, not bytes, so its covered
+    boundary must be a verified newline boundary — covering a raw torn-tail
+    extent would let `_repair_torn_tail` truncate that suffix and append a
+    complete record ending at the same size, leaving `(segment, size)` identical
+    while the covered contribution changed (spec §4.2).
+
+    Answering costs one `read` of the segment's last byte in the healthy case,
+    because every appender writes a trailing newline. Only a torn tail pays for
+    the bounded backward scan, and a tail longer than
+    `_COMPLETE_LINE_TAIL_WINDOW` answers 0 rather than reading the whole
+    segment: 0 is a valid boundary, it is the conservative direction, and it is
+    computed identically by every caller, so two callers cannot disagree.
+    """
+    if size <= 0:
+        return 0
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return size
+            window = min(size, _COMPLETE_LINE_TAIL_WINDOW)
+            handle.seek(size - window)
+            tail = handle.read(window)
+    except OSError:
+        return 0
+    index = tail.rfind(b"\n")
+    if index < 0:
+        return 0
+    return size - window + index + 1
+
+
+def segment_summary_sidecar_path():
+    """The journal-side segment-summary sidecar (#496 S5b section 5.3).
+
+    Beside the segments it describes rather than in `stats.db`, because a
+    rebuild frequently runs precisely when `stats.db` is absent or unreadable —
+    the one case a summary stored there could never serve.
+    """
+    return _cctally_core.JOURNAL_DIR / _lib_segment_summary.SIDECAR_NAME
+
+
+def read_segment_summaries():
+    """``{segment_name: SegmentSummary}`` from the sidecar, or ``{}``.
+
+    A missing, torn, version-mismatched or checksum-mismatched sidecar answers
+    an EMPTY map rather than raising, which is exactly a pass that elides
+    nothing (spec section 6.3's silent full-replay fallback).
+    """
+    return _lib_segment_summary.read_sidecar(segment_summary_sidecar_path()) or {}
+
+
+class SegmentElisionPlan:
+    """The one elision planner, shared by both whole-prefix readers.
+
+    `rebuild_stats_index` and `stats_index_matches_journal_prefix` construct it
+    the same way from the same inputs, so an eliding rebuild and a prefix
+    validation cannot reach different answers about the same journal (spec
+    §5.6).
+
+    **Constructed BEFORE the pass, from a short-lived read of the coverage
+    certificate.** The certificate has to be consulted before the first segment
+    is reached, and holding a `cache.db` read transaction open across a whole
+    journal traversal would block WAL checkpointing for the length of the
+    rebuild — the bloat issue #297 is about. The leg re-resolves coverage under
+    its own snapshot afterwards and may reach a different verdict, because an
+    ordinary Codex batch landing mid-pass advances the certificate over a
+    journal this pass did not pin. `_refill_elided_quota_raw` is what makes that
+    race cost a read rather than a wrong answer.
+    """
+
+    __slots__ = ("summaries", "covered", "verdict", "resolution_seen",
+                 "elided", "elided_lines", "elided_bytes", "scanned",
+                 "reasons", "quota_gaps")
+
+    def __init__(self, *, summaries, covered, verdict) -> None:
+        self.summaries = summaries
+        #: The certificate's `coveredHighWater`, or None when it is unusable.
+        self.covered = covered
+        self.verdict = verdict
+        #: Set once a `journal_protocol_resolution` op is decoded. From then on
+        #: nothing further is elided and the prefix digest is recomputed from
+        #: disk, because `PrefixHashAccumulator` cannot compose over a gap.
+        self.resolution_seen = False
+        self.elided = 0
+        self.elided_lines = 0
+        self.elided_bytes = 0
+        self.scanned = 0
+        self.reasons: dict = {}
+        #: `(segment, index into quota_raw, summarized_size, summarized line
+        #: count)` per elided segment, so the leg can re-read exactly what
+        #: elision skipped if its own coverage verdict turns out not to be `ok`.
+        #: The line count is carried because `_iter_segment_lines` stops
+        #: SILENTLY at EOF, so a short read is invisible to the re-read's
+        #: `except` clause and can only be caught by counting what came back.
+        self.quota_gaps: list = []
+
+    def decide(self, name, hi, stat_result):
+        """The summary to elide ``name`` with, or None to read it.
+
+        ``hi`` is this pass's pinned raw extent for the segment, which is its
+        `st_size` for every segment the planner is allowed to consider — the
+        canonically-last one is refused by the caller before this runs.
+        """
+        summary = self.summaries.get(name)
+        if summary is None:
+            self.scanned += 1
+            self.reasons.setdefault(name, "summaryAbsent")
+            return None
+        ok, reason = _lib_segment_summary.summary_is_elidable(
+            summary,
+            pinned_raw_extent=hi,
+            is_last=False,
+            certificate_covers=self._covers(name, summary),
+            resolution_seen=self.resolution_seen,
+            stat_identity=(stat_result.st_dev, stat_result.st_ino),
+        )
+        if not ok:
+            self.scanned += 1
+            self.reasons.setdefault(name, reason)
+            return None
+        self.elided += 1
+        self.elided_lines += summary.lines
+        self.elided_bytes += summary.bytes
+        self.reasons.setdefault(name, _lib_segment_summary.REASON_OK)
+        return summary
+
+    def _covers(self, name, summary) -> bool:
+        if self.covered is None:
+            return False
+        return _coordinate_covers(
+            self.covered, (name, int(summary.summarized_size)))
+
+    def counters(self) -> dict:
+        """The additive rebuild-record block (§6.3, "recorded, not silent")."""
+        return {
+            "elidedSegments": self.elided,
+            "elidedLines": self.elided_lines,
+            "elidedBytes": self.elided_bytes,
+            "scannedSegments": self.scanned,
+            "coverage": self.verdict,
+            "resolutionSeen": self.resolution_seen,
+            "refusals": dict(self.reasons),
+        }
+
+
+def plan_segment_elision(segments, high_water):
+    """One `SegmentElisionPlan` for the prefix ``segments`` up to ``high_water``.
+
+    Every failure — no journal, no sidecar, no readable cache, an invalid
+    certificate — answers a plan that elides nothing, which is exactly today's
+    behaviour. Spec §6.3 makes every one of those a SILENT full replay.
+
+    The prefix's own pinned vector is deliberately NOT computed here. Only the
+    WHOLE journal's vector validates a certificate (see below), and the per-
+    segment extents this plan checks arrive from `_iter_range_with_segments`'s
+    own `stat`. Computing a second vector restricted to ``segments`` would cost
+    one `os.stat` plus one `open` per segment — through `_complete_line_offset`'s
+    tail probe — on every plan construction, including inside
+    `stats_index_matches_journal_prefix`, and nothing would read it.
+    """
+    summaries = read_segment_summaries()
+    if not summaries or high_water is None:
+        return SegmentElisionPlan(
+            summaries={}, covered=None,
+            verdict=_lib_cache_coverage.REASON_ABSENT)
+    snapshot = _read_coverage_snapshot(_cctally_core.CACHE_DB_PATH)
+    if snapshot is None:
+        return SegmentElisionPlan(
+            summaries=summaries, covered=None,
+            verdict=_lib_cache_coverage.REASON_ABSENT)
+    try:
+        # The vector the certificate is validated against is the WHOLE journal's,
+        # exactly as `_resolve_quota_cache_coverage` computes it: a root over the
+        # pinned prefix alone would never match one a writer stored over every
+        # segment.
+        full_vector = coverage_pinned_vector()
+        ok, reason = _lib_cache_coverage.certificate_is_valid(
+            snapshot.certificate,
+            pinned_vector=full_vector,
+            physical_seq=snapshot.physical_seq,
+        )
+        covered = (
+            snapshot.certificate.get("coveredHighWater") if ok else None)
+    finally:
+        _close_coverage_snapshot(snapshot)
+    return SegmentElisionPlan(
+        summaries=summaries, covered=covered, verdict=reason)
+
+
+def _refill_elided_quota_raw(quota_raw, gaps):
+    """``(stream, complete)`` — ``quota_raw`` with the elided observations back.
+
+    Reached only when the pass elided and the cache leg's own coverage verdict
+    then came back something other than `ok` — an ordinary Codex batch landing
+    mid-pass is enough. The leg is about to REPLAY, and replaying a stream that
+    is missing the elided segments would leave those observations unmaterialized
+    while the mint asserted coverage over them.
+
+    **Rebuilt in one ascending sweep rather than spliced in place.** An elided
+    segment appends nothing to ``quota_raw``, so every segment of a contiguous
+    elided run records the SAME insertion index, and inserting each one at that
+    shared index pushes its predecessor later — which replays the run backwards.
+    Six of the maintainer's seven bootstrap segments are quota-only and
+    adjacent, so on that journal the whole run reverses. Order is not cosmetic:
+    `_QUOTA_SNAPSHOT_INSERT` is `INSERT OR IGNORE` and resolves first-wins on
+    the natural key, and `CodexResetAnchorResolver` decides per record in stream
+    order.
+
+    ``complete`` is False when any elided segment could not be re-read IN FULL.
+    The caller must then drop its covered boundary: the observations this stream
+    is missing are exactly the ones a minted certificate would claim.
+
+    **A short read is detected by counting, not by catching.**
+    `_iter_segment_lines` reads until its own `read()` returns nothing, so a
+    segment that yields fewer lines than it held ends the loop with no exception
+    at all. Each gap therefore carries the line count its summary recorded, and
+    a re-read that returns a different number reports the shortfall rather than
+    leaving the leg to certify a stream it never saw.
+    """
+    by_index: dict = {}
+    complete = True
+    for name, index, extent, expected_lines in gaps:
+        recovered = []
+        seen = 0
+        try:
+            for _seg, _off, raw in _iter_segment_lines(
+                    _cctally_core.JOURNAL_DIR / name, 0, int(extent)):
+                seen += 1
+                record = _lib_journal.decode_line(raw)
+                if record is not None and _is_codex_quota_obs(record):
+                    recovered.append(raw)
+        except Exception:
+            # A vanished segment self-heals, because the pinned vector no longer
+            # matches the journal and the certificate is invalid the moment it
+            # is read. A transient read error on an UNCHANGED file does not: the
+            # vector still matches, so a certificate minted over this shortened
+            # stream would be valid and would claim observations nobody applied.
+            # Reporting the shortfall is what stops the mint.
+            #
+            # EVERY exception, not just `OSError`: spec §6.3 makes every
+            # degraded state here a silent full-replay fallback, and neither the
+            # call site nor its caller catches anything, so one that escaped
+            # would abort the whole rebuild over a re-derivable optimization.
+            complete = False
+            continue
+        if seen != int(expected_lines):
+            complete = False
+        by_index.setdefault(int(index), []).extend(recovered)
+    out: list = []
+    cursor = 0
+    for index in sorted(by_index):
+        bounded = min(int(index), len(quota_raw))
+        out.extend(quota_raw[cursor:bounded])
+        out.extend(by_index[index])
+        cursor = max(cursor, bounded)
+    out.extend(quota_raw[cursor:])
+    return out, complete
+
+
+class _SegmentSummaryCollector:
+    """Per-segment traversal facts, accumulated as the pass streams.
+
+    The counters are per segment rather than per pass because a later pass has
+    to contribute an ELIDED segment's share of them without reading it, and a
+    whole-pass total cannot be decomposed after the fact.
+
+    The last-seen fold is deliberately accumulated per segment and merged into
+    the caller's running accumulator at each boundary, rather than folded into
+    both. `LastSeenAccumulator.observe` runs once per record on a 1.95-million
+    line journal, and folding twice would double that; merging a small map once
+    per segment does not.
+    """
+
+    __slots__ = ("summaries", "last_seen", "_name", "_lo", "_stat",
+                 "_lines", "_bytes", "_decodes", "_malformed", "_retained",
+                 "_line_end")
+
+    def __init__(self) -> None:
+        self.summaries: dict = {}
+        #: The open segment's own accumulator, or None between segments.
+        self.last_seen = None
+        self._name = None
+        self._reset()
+
+    def _reset(self) -> None:
+        self._lo = 0
+        self._stat = None
+        self._lines = 0
+        self._bytes = 0
+        self._decodes = 0
+        self._malformed = 0
+        self._retained = 0
+        self._line_end = 0
+
+    def begin(self, name, lo, hi, stat_result, running) -> None:
+        """Open ``name``, closing whatever segment was open before it.
+
+        ``hi`` is this pass's pinned READ extent, which for the high-water
+        segment is the pinned high-water rather than the file's size. The
+        summary records `st_size` instead (spec §5.3), so ``hi`` is accepted for
+        the shared `on_extent` signature and deliberately not stored.
+        """
+        self.close(running)
+        self._name = name
+        self._reset()
+        self._lo = int(lo)
+        self._stat = stat_result
+        self._line_end = int(lo)
+        self.last_seen = _lib_journal_router.LastSeenAccumulator()
+
+    def line(self, raw, end_offset) -> None:
+        self._lines += 1
+        self._bytes += len(raw) + 1
+        self._line_end = int(end_offset)
+
+    def decoded(self, retained: bool) -> None:
+        """One decoded record: one traversal decode AND one `decoded` element.
+
+        ONE counter, because the two are the same number by construction — the
+        rebuild appends exactly one element to `decoded` per successfully
+        decoded record, the record itself when retained and a `None` placeholder
+        otherwise. The summary stores it under two names because they answer
+        different questions: `decodes` is the traversal counter the rebuild
+        record reports, and `decoded_entry_count` is the elision contract, which
+        carries a `None` sentinel a counter cannot.
+        """
+        self._decodes += 1
+        if retained:
+            self._retained += 1
+
+    def malformed_line(self) -> None:
+        self._malformed += 1
+
+    def close(self, running) -> None:
+        """Finalize the open segment and merge its last-seen into ``running``."""
+        if self.last_seen is not None and running is not None:
+            running.merge(
+                self.last_seen.stamped,
+                self.last_seen.legacy_claude_at,
+                self.last_seen.legacy_codex_at,
+            )
+        if self._name is not None and self._lo == 0 and self._stat is not None:
+            partial = self.last_seen
+            self.summaries[self._name] = _lib_segment_summary.SegmentSummary(
+                segment_name=self._name,
+                st_dev=int(self._stat.st_dev),
+                st_ino=int(self._stat.st_ino),
+                # The raw `st_size` observed when this summary was written (spec
+                # §5.3), NOT this pass's read extent. They differ only for the
+                # high-water segment, whose extent is the pinned high-water; a
+                # summary claiming that extent as the file's size would let a
+                # later pass elide a segment this one did not read to the end.
+                summarized_size=int(self._stat.st_size),
+                complete_line_covered_offset=self._line_end,
+                lines=self._lines,
+                bytes=self._bytes,
+                decodes=self._decodes,
+                malformed=self._malformed,
+                quota_only=self._retained == 0,
+                decoded_entry_count=self._decodes,
+                last_seen_stamped=(
+                    {} if partial is None else dict(partial.stamped)),
+                last_seen_legacy_claude_at=(
+                    None if partial is None else partial.legacy_claude_at),
+                last_seen_legacy_codex_at=(
+                    None if partial is None else partial.legacy_codex_at),
+            )
+        self._name = None
+        self.last_seen = None
+
+    def adopt(self, summary) -> None:
+        """Carry an ELIDED segment's stored summary forward unchanged.
+
+        The pass did not re-derive it, so re-deriving it here would be inventing
+        it. Carrying it forward is what keeps the sidecar complete across a run
+        of consecutive eliding passes.
+        """
+        self.summaries[summary.segment_name] = summary
+
+
+def coverage_pinned_vector():
+    """The ordered ``(name, raw st_size, complete-line offset)`` triple per segment.
+
+    This is the vector the #496 S5b coverage certificate's identity root binds
+    (spec §4.2), and it is deliberately ONE function rather than two: the writer
+    that advances a certificate and the rebuild that validates it must compute
+    the same triples from the same rules, or the root would differ for reasons
+    that have nothing to do with coverage.
+
+    Both operands are carried because they are independent. `_repair_torn_tail`
+    truncates a partial trailing line before appending, so a segment's size can
+    decrease or return to a previous value — "an append strictly increases
+    `st_size`" is false. A segment whose last newline sits at 100 and whose size
+    is 120 is a different physical state from one where both are 100, and
+    collapsing them would let a permanently torn segment certify as covered.
+
+    It takes no segment list. Every caller wants the WHOLE journal's vector,
+    because that is the only one a stored certificate's identity root can be
+    validated against: a root computed over a prefix would never match one a
+    writer stored over every segment.
+    """
+    vector = []
+    for name in list_segments():
+        path = _cctally_core.JOURNAL_DIR / name
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            # A segment that vanished between the listing and the stat leaves a
+            # vector nothing can match, which falls back to a full replay. That
+            # is the right answer: the journal shape moved under this pass.
+            size = -1
+        vector.append(
+            (name, size, 0 if size < 0 else _complete_line_offset(path, size)))
+    return tuple(vector)
 
 
 def journal_high_water() -> tuple[str, int] | None:
@@ -1024,7 +1564,7 @@ def iter_range(cursor, hw):
 
 
 def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
-                              on_bytes=None):
+                              on_bytes=None, on_extent=None, elide=None):
     """`iter_range` over a segment list the CALLER snapshotted (#496 S4 §4).
 
     `list_segments()` enumerates the journal directory at call time and orders
@@ -1038,6 +1578,18 @@ def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
     function then skips because it holds no bytes in range: `journal_prefix_hash`
     frames a zero-byte segment, so a hash accumulator has to be told it exists.
     `on_bytes` is forwarded to `_iter_segment_lines`.
+
+    `on_extent(seg, lo, hi, stat_result)` is called after this pass has pinned
+    the range it will read from that segment, so a caller building a durable
+    summary records the extent the pass actually covered rather than one it
+    re-stats afterwards (#496 S5b section 5.3).
+
+    `elide(seg, lo, hi, stat_result)` decides whether to SKIP the segment
+    entirely — no `_open_segment_for_read`, no bytes, no lines. It runs after
+    `on_extent` and instead of `on_segment`, because a skipped segment
+    contributes nothing to a hash accumulator that could not compose over it
+    anyway (spec section 5.1). Only #496 S5b Stage 4's elision planner supplies
+    it; every other caller reads every segment exactly as before.
     """
     hw_seg, hw_size = hw
     if hw_seg not in segments:
@@ -1055,7 +1607,20 @@ def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
         seg = segments[idx]
         seg_path = _cctally_core.JOURNAL_DIR / seg
         lo = start_off if idx == start_idx else 0
-        hi = hw_size if idx == hw_idx else os.path.getsize(seg_path)
+        stat_result = None
+        if idx == hw_idx:
+            hi = hw_size
+        else:
+            stat_result = os.stat(seg_path)
+            hi = stat_result.st_size
+        if on_extent is not None or elide is not None:
+            if stat_result is None:
+                stat_result = os.stat(seg_path)
+        if elide is not None and lo == 0 and idx != hw_idx and elide(
+                seg, lo, hi, stat_result):
+            continue
+        if on_extent is not None:
+            on_extent(seg, lo, hi, stat_result)
         if on_segment is not None:
             on_segment(seg)
         if lo >= hi:
@@ -1343,7 +1908,7 @@ def _apply_file_account_records(cache, records) -> "tuple[int, int]":
     return restored, conflicts
 
 
-def _report_file_account_conflicts(conflicts: int) -> None:
+def _report_file_account_conflicts(conflicts: int, *, quiet: bool = False) -> None:
     """One stderr line for a run of replayed decisions that contradicted a
     different account already recorded at the same
     ``(file_identity, incarnation, from_offset)`` and were therefore DECLINED
@@ -1353,8 +1918,13 @@ def _report_file_account_conflicts(conflicts: int) -> None:
 
     Every call site must invoke this AFTER its commit (closeout review C5): a
     rolled-back transaction applied nothing, so reporting from inside it would
-    tell the operator about a decline that did not happen."""
-    if conflicts > 0:
+    tell the operator about a decline that did not happen.
+
+    ``quiet`` is the reconciliation's caller. That path is reachable from an
+    ordinary command, where acceptance criterion 10 requires no new stderr
+    line; the same decline is still reported by the ingest and rebuild paths
+    that own the remedy this line names."""
+    if conflicts > 0 and not quiet:
         print(
             f"[ingest] codex attribution replay declined {conflicts} "
             "contradicting decision(s); the first journalled decision for each "
@@ -1550,11 +2120,27 @@ def _resolve_obs_anchor(resolver, rec: dict) -> "str | None":
         return None
 
 
-def _apply_quota_records(cache, records) -> None:
+def _apply_quota_records(
+    cache, records, *, reported_conflicts=None, quiet=False,
+) -> None:
     """Materialize Codex quota obs into an OPEN cache.db transaction, applying
     the §3.5 precedence rule. Callers must apply the batch's file-account
     decisions FIRST, so a decision arriving in the same batch already governs
-    the observations it covers."""
+    the observations it covers.
+
+    ``reported_conflicts`` lets ONE logical pass thread its conflict-report set
+    across several calls (spec §4.6). The rebuild's recovery pass is chunked into
+    many transactions, and without threading it would emit one line per chunk for
+    a condition a single unchunked call reports once. Every other caller passes
+    None and gets today's per-call set.
+
+    ``quiet`` suppresses the conflict line, for the same reason
+    `_report_file_account_conflicts` takes it: routing
+    `recover_quota_cache_from_journal` through the shared leg made this line
+    reachable from the open-time reconciliation, so `cache-sync` and the
+    dashboard would emit a line they never emitted before, and acceptance
+    criterion 10 requires no new stderr on an ordinary command. Its sibling was
+    guarded and this one was not."""
     oracle = _CodexAttributionOracle(cache)
     # One line per FILE PER BATCH, not per record. A mid-file account switch
     # legitimately produces a run of observations whose first-stamp-wins account
@@ -1566,7 +2152,8 @@ def _apply_quota_records(cache, records) -> None:
     # standing condition a handful of times is the cheaper error. The condition
     # is worth reporting at all because a genuine correction is expressed as an
     # explicit new range decision, never by mutating history.
-    reported_conflicts: set = set()
+    if reported_conflicts is None:
+        reported_conflicts = set()
     # #416 spec §4.2: this leg is a genuine INGEST into cache.db (it materializes
     # observations whose source rollout may have evaporated), so it must resolve
     # the canonical anchor too. Without it, a journal-replayed row lands with a
@@ -1593,18 +2180,72 @@ def _apply_quota_records(cache, records) -> None:
         conflict_key = (payload.get("source_root_key"), payload.get("source_path"))
         if (observed is not None and observed != decided
                 and conflict_key not in reported_conflicts):
+            # The key is recorded even when quiet, so a later non-quiet call
+            # threading the same set still reports each file at most once.
             reported_conflicts.add(conflict_key)
-            print(
-                "[ingest] codex attribution conflict: "
-                f"{payload.get('source_path')}@{payload.get('line_offset')} "
-                f"observation stamped {observed} but the durable decision says "
-                f"{decided if decided is not None else 'unattributed'}; "
-                "keeping the decision",
-                file=sys.stderr,
-            )
+            if not quiet:
+                print(
+                    "[ingest] codex attribution conflict: "
+                    f"{payload.get('source_path')}"
+                    f"@{payload.get('line_offset')} "
+                    "observation stamped "
+                    f"{observed} but the durable decision says "
+                    f"{decided if decided is not None else 'unattributed'}; "
+                    "keeping the decision",
+                    file=sys.stderr,
+                )
         values = list(row_values)
         values[16] = decided
         cache.execute(upsert_sql, tuple(values))
+
+
+class CoverageInvariantViolation(RuntimeError):
+    """A caller reached a covered-family delete without invalidating coverage.
+
+    Raised rather than asserted, because `python -O` strips `assert` and this is
+    the only guard standing between a new `authoritative=True` caller and a
+    certificate left standing over a table that was just emptied.
+    """
+
+
+def _assert_coverage_already_invalidated(cache_conn) -> None:
+    """Refuse an authoritative replay while a coverage certificate stands.
+
+    `rehydrate_codex_file_accounts(authoritative=True)` empties
+    `codex_file_accounts`, a member of `COVERAGE_CACHE_FAMILIES`, before
+    replaying, yet its inventory entry is `preserve`. That holds only because
+    its one caller — `sync_codex_cache` under `--rebuild` — already ran
+    `_clear_codex_derived_rows` and committed, which deleted both the
+    certificate and any recovery progress. A second caller, or a reordering
+    inside `sync_codex_cache`, would break it silently and the writer-surface
+    scanner could not see it, because the key is already in the inventory with a
+    green label. This turns that ordering into a checked precondition.
+
+    **Where to look when it fires.** No legitimate ordering reaches it today,
+    and six were checked. If a future caller does, `sync_codex_cache`'s
+    `except Exception` catches `CoverageInvariantViolation`, rolls back, sets
+    `deferred_reason = "attribution_rehydration"`, prints one line and skips the
+    whole Codex walk — so the symptom is a permanently deferred Codex sync
+    rather than a loud failure. That containment is the right production trade
+    and is not changed here; the note exists so the next debugger looks for the
+    new caller rather than for a broken walk.
+    """
+    try:
+        row = cache_conn.execute(
+            "SELECT key FROM cache_meta WHERE key IN (?, ?) LIMIT 1",
+            (_lib_cache_coverage.CERTIFICATE_KEY,
+             _lib_cache_coverage.PROGRESS_KEY),
+        ).fetchone()
+    except sqlite3.Error:
+        # An unreadable `cache_meta` cannot witness the invariant either way,
+        # and raising here would turn a degraded cache into a failed sync.
+        return
+    if row is not None:
+        raise CoverageInvariantViolation(
+            "rehydrate_codex_file_accounts(authoritative=True) clears a covered "
+            f"family while {row[0]!r} is still stored; the caller must "
+            "invalidate coverage in the transaction that clears"
+        )
 
 
 def rehydrate_codex_file_accounts(
@@ -1674,6 +2315,8 @@ def rehydrate_codex_file_accounts(
     upsert already converges the counter, a clear has no upside and that
     downside.
     """
+    if authoritative:
+        _assert_coverage_already_invalidated(cache_conn)
     hw = journal_high_water()
     if hw is None:
         if authoritative:
@@ -1706,7 +2349,78 @@ def rehydrate_codex_file_accounts(
     return applied, hw, conflicts
 
 
-def _cache_applier(decoded) -> int | None:
+def _bounded_covered_offset(segment, raw_offset, covered_offset, decoded_end):
+    """The covered boundary for ``segment``, bounded by what a pass DECODED.
+
+    Three independent upper bounds, and the smallest wins:
+
+    - ``raw_offset`` — the pass's own high water; nothing past it was read.
+    - ``covered_offset`` — the segment's complete-line offset, so a torn
+      trailing line is never inside the claim.
+    - ``decoded_end`` — the end of the last line the pass CONSUMED, never past
+      it. The two callers supply that operand differently and both are safe.
+      `_coverage_advance_plan` (the ingest cycle) passes the end of the last
+      record it DECODED, so a malformed line the batch skipped is excluded.
+      `rebuild_stats_index` passes `prior_high_water`, which the streaming pass
+      advances for a malformed line too — consumed but not decoded — and that is
+      still an upper bound on what was read, so the claim stays true. Reading
+      the operand as "the last DECODED record" is literally true only of the
+      first caller.
+
+    The third is not redundant with the second, and leaving it out was a real
+    defect. Both other operands are read from the file, and the file is re-stat'd
+    AFTER the pass finished reading: a segment torn at the pinned high water and
+    repaired by a later append has a current complete-line offset at or past that
+    high water, so `min(raw, covered)` returns the raw high water — a boundary
+    whose trailing bytes the traversal never decoded, because the partial line
+    was skipped. A newline-terminated MALFORMED trailing line produces the same
+    divergence without any repair at all. ``decoded_end`` is the only operand
+    the pass observed rather than inferred.
+
+    A ``decoded_end`` in an EARLIER segment answers 0: the pass covered
+    everything before this segment and none of it, which is exactly expressible
+    and stays true.
+    """
+    bound = min(int(raw_offset), int(covered_offset))
+    if decoded_end is None:
+        return bound
+    if str(decoded_end[0]) != str(segment):
+        return 0
+    return min(bound, int(decoded_end[1]))
+
+
+def _coverage_advance_plan(cursor, covered_to, decoded_end=None):
+    """``(pinned_vector, covered, applied_through)`` for an advance, or None.
+
+    Captured BEFORE the cache flocks are acquired, and that ordering is the
+    safety property. A vector captured before a concurrent append describes a
+    SMALLER journal than the one that exists when the certificate is stored, so
+    the stored root stops matching and the next rebuild replays. A vector
+    captured after such an append would match the current journal while a record
+    nobody applied sat inside it — coverage asserted over an unapplied record,
+    which is the one failure the certificate must not produce.
+
+    ``covered`` is bounded by `_bounded_covered_offset`; ``applied_through`` is
+    the raw coordinate the cycle advances its cursor to. The two are returned
+    separately because the certificate stores both: the next writer's contiguity
+    check compares its starting cursor against `appliedThrough`, and comparing
+    it against the clamped boundary instead made a single torn or malformed
+    trailing line freeze the certificate permanently.
+    """
+    if cursor is None or covered_to is None:
+        return None
+    vector = coverage_pinned_vector()
+    segment, offset = str(covered_to[0]), int(covered_to[1])
+    for name, _raw_extent, covered_offset in vector:
+        if name == segment:
+            bounded = _bounded_covered_offset(
+                segment, offset, covered_offset, decoded_end)
+            return vector, (segment, bounded), (segment, offset)
+    return None
+
+
+def _cache_applier(decoded, *, cursor=None, covered_to=None,
+                   decoded_end=None) -> int | None:
     """Composite cache leg (spec §5.2 step 3 + #416 spec §3.4): materialize this
     batch's Codex quota obs into `quota_window_snapshots` AND its
     `codex_file_account` ops into the attribution map, under the NON-BLOCKING
@@ -1723,6 +2437,17 @@ def _cache_applier(decoded) -> int | None:
     - Flock acquired + everything upserted → return None (full consumption).
       A quota-row change advances ``codex_physical_mutation_seq`` in the same
       transaction; an idempotent replay leaves the sequence unchanged.
+
+    ``cursor``, ``covered_to`` and ``decoded_end`` carry the cycle's journal
+    range so this leg can ADVANCE the #496 S5b coverage certificate (spec §4.3).
+    It is the writer that can do so soundly, because it owns a CONTIGUOUS batch:
+    it consumed every record in `[cursor, covered_to]` and applied every
+    cache-relevant one, so a predecessor applied through exactly `cursor`
+    extends to `covered_to`. ``decoded_end`` is the end coordinate of the last
+    record the cycle decoded, and it bounds the covered CLAIM below the raw
+    cursor target whenever the two differ. All three default to None, which
+    advances nothing — the ingest cycle is the only caller that knows the range,
+    and a test calling this directly must not mint coverage it cannot justify.
     """
     quota_idx = [i for i, (rec, _s, _o) in enumerate(decoded)
                  if _is_codex_quota_obs(rec)]
@@ -1730,6 +2455,10 @@ def _cache_applier(decoded) -> int | None:
                 if _is_codex_file_account_op(rec)]
     if not quota_idx and not file_idx:
         return None
+    # BEFORE the flocks, for the reason `_coverage_advance_plan` states, and
+    # before them for a second reason too: it is journal file I/O, and the leg's
+    # whole purpose is to hold the global cache writer lock as briefly as it can.
+    plan = _coverage_advance_plan(cursor, covered_to, decoded_end)
     # All-or-nothing across the two families: one stop, the earliest of either.
     stop_idx = min(quota_idx[0] if quota_idx else file_idx[0],
                    file_idx[0] if file_idx else quota_idx[0])
@@ -1755,7 +2484,25 @@ def _cache_applier(decoded) -> int | None:
             print(f"[ingest] cache leg connect failed: {exc}", file=sys.stderr)
             return stop_idx
         try:
+            import _cctally_cache
             cache.execute("PRAGMA busy_timeout=15000")
+            # Read and check the predecessor BEFORE the transaction opens
+            # (spec §4.3, as corrected). `prior_is_extendable` checks contiguity
+            # against this cycle's STARTING cursor — a predecessor applied
+            # through less leaves a gap nobody applied, and one applied through
+            # more was written by a pass that saw records this batch does not
+            # carry — AND the two version fields, because `advance` re-stamps
+            # the current module constants and discards `prior`, so extending a
+            # certificate written under an older `interpretationVersion` would
+            # launder it into a current-version one. It deliberately does not
+            # run the full `certificate_is_valid`: an advance's predecessor
+            # necessarily describes an older, smaller journal.
+            prior = _cctally_cache.load_codex_journal_coverage_certificate(cache)
+            if plan is not None:
+                extendable, _why = _lib_cache_coverage.prior_is_extendable(
+                    prior, applied_through=(str(cursor[0]), int(cursor[1])))
+                if not extendable:
+                    prior = None
             cache.execute("BEGIN IMMEDIATE")
             # Decisions FIRST: §3.5 makes the file/range decision authoritative
             # over the observation stamp, so a decision arriving in this batch
@@ -1768,8 +2515,15 @@ def _cache_applier(decoded) -> int | None:
                 # #457: this path is independent of the fused rollout writer,
                 # but its quota rows feed the same certificate and dashboard
                 # signatures.  Keep the token atomic with the materialization.
-                import _cctally_cache
                 _cctally_cache._bump_codex_physical_mutation_seq(cache)
+            if plan is not None:
+                # AFTER the bump, so the certificate carries the post-bump
+                # sequence, and inside this transaction so a rollback leaves the
+                # predecessor standing even when the journal appends survived.
+                vector, covered, applied_through = plan
+                _cctally_cache._advance_codex_journal_coverage(
+                    cache, prior=prior, covered=covered,
+                    applied_through=applied_through, pinned_vector=vector)
             cache.commit()
             _report_file_account_conflicts(_file_conflicts)
         except sqlite3.Error as exc:
@@ -3084,64 +3838,479 @@ def _fold_order(evt) -> int:
     return (_EVT_SPECS.get(kind) or _UNKNOWN_EVT_SPEC).order
 
 
-def _write_effective_metadata(conn, selection) -> None:
-    """Replace the disposable effective-event summary from a pure selection."""
-    conn.execute("DELETE FROM journal_effective_events")
-    for event_id, selected in selection.by_id.items():
-        event_json = None
-        if selected.record is not None:
-            event_json = (
-                _lib_journal.encode_line(selected.record)
-                .decode("utf-8")
-                .rstrip("\n")
-            )
-        conn.execute(
-            "INSERT INTO journal_effective_events "
-            "(event_id, rev, status, content_hash, batch_id, event_json) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                selected.rev,
-                selected.status,
-                selected.content_hash,
-                selected.batch_id,
-                event_json,
-            ),
-        )
-    _write_protocol_violations(
-        conn,
-        selection.protocol_violations,
-        selection.acknowledged_protocol_violations,
-    )
+def _replace_protocol_violations(conn, rows) -> None:
+    """Replace the disposable structural-violation summary from kernel rows.
 
-
-def _write_protocol_violations(conn, violations, acknowledged=()) -> None:
-    """Replace the disposable structural-violation summary."""
+    ONE writer, shared by the rebuild's whole-generation write and the live
+    path's full-prefix fallback, because the two must produce IDENTICAL rows.
+    They did not: the fallback wrote four columns and left `available_after`
+    NULL, and it serialized with `ensure_ascii=True` while the kernel uses
+    `ensure_ascii=False`. A fallback tick therefore left rows a fresh derivation
+    would not match — always on `available_after`, and on the JSON bytes for any
+    non-ASCII character in a violation payload — so
+    `stats_index_matches_journal_prefix` answered False afterwards and the
+    incremental path carried the wrong evidence forward verbatim.
+    """
     conn.execute("DELETE FROM journal_protocol_violations")
-    rows = [*violations, *acknowledged]
-    rows.sort(
-        key=lambda violation: (
-            violation.batch_id,
-            violation.kind,
-            violation.fingerprint,
-        )
-    )
-    for violation in rows:
+    for row in rows:
         conn.execute(
             "INSERT INTO journal_protocol_violations "
-            "(fingerprint, batch_id, kind, violation_json) "
-            "VALUES (?, ?, ?, ?)",
+            "(fingerprint, batch_id, kind, violation_json, available_after) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
-                violation.fingerprint,
-                violation.batch_id,
-                violation.kind,
-                json.dumps(
-                    violation.to_dict(),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
+                row.fingerprint,
+                row.batch_id,
+                row.kind,
+                row.violation_json,
+                row.available_after,
             ),
         )
+
+
+def _write_selector_state(conn, rows) -> None:
+    """Replace the whole durable selector generation from pure-kernel rows.
+
+    This took over from `_write_effective_metadata`, which it superseded and
+    which is now deleted: it writes the same `journal_effective_events` and
+    `journal_protocol_violations` content plus the two added columns, the
+    retained violation evidence, and the three selector tables. Everything lands
+    in ONE transaction with the index content, so a generation never publishes
+    selector state describing a different fold.
+    """
+    conn.execute("DELETE FROM journal_effective_events")
+    for row in rows.effective:
+        conn.execute(
+            "INSERT INTO journal_effective_events "
+            "(event_id, rev, status, content_hash, batch_id, event_json, "
+            " winning_sequence, conflict_hashes_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.event_id,
+                row.rev,
+                row.status,
+                row.content_hash,
+                row.batch_id,
+                row.event_json,
+                row.winning_sequence,
+                row.conflict_hashes_json,
+            ),
+        )
+    _replace_protocol_violations(conn, rows.violations)
+    conn.execute("DELETE FROM journal_selector_batch_records")
+    for row in rows.batch_records:
+        conn.execute(
+            "INSERT INTO journal_selector_batch_records "
+            "(batch_id, kind, key, record_digest, identity_digest, sequence, "
+            " action_core_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.batch_id,
+                row.kind,
+                row.key,
+                row.record_digest,
+                row.identity_digest,
+                row.sequence,
+                row.action_core_json,
+            ),
+        )
+    conn.execute("DELETE FROM journal_selector_batches")
+    for row in rows.batches:
+        conn.execute(
+            "INSERT INTO journal_selector_batches "
+            "(batch_id, status, action_count, action_set_hash, begin_segment, "
+            " begin_offset, earliest_commit_segment, earliest_commit_offset) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.batch_id,
+                row.status,
+                row.action_count,
+                row.action_set_hash,
+                row.begin_segment,
+                row.begin_offset,
+                row.earliest_commit_segment,
+                row.earliest_commit_offset,
+            ),
+        )
+    conn.execute("DELETE FROM journal_selector_state")
+    state = rows.state
+    conn.execute(
+        "INSERT INTO journal_selector_state "
+        "(id, generation_record_path, generation_stamped_at_utc, "
+        " covered_segment, covered_offset, next_sequence, selector_version, "
+        " cutover_seen, cutover_account_key) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            state.generation_record_path,
+            state.generation_stamped_at_utc,
+            state.covered_segment,
+            state.covered_offset,
+            state.next_sequence,
+            state.selector_version,
+            1 if state.cutover_seen else 0,
+            state.cutover_account_key,
+        ),
+    )
+
+
+def _write_selector_delta(conn, before, after) -> None:
+    """Advance durable selector state from ``before`` to ``after`` in place.
+
+    A whole-generation replace is what the rebuild does, and it is the wrong
+    shape for an ingest tick: `journal_effective_events` holds one row per event
+    id — 34,644 on the maintainer's production journal — and rewriting all of
+    every status-line tick would trade the read this session removes for a write
+    of the same size. So only the rows that actually changed are written.
+
+    Three of the four groups express upserts only, and the reason is that **the
+    fold emits no removals** for them: `after ⊇ before` in every one. It is NOT
+    that a key missing from ``after`` lies outside the delta's scope — ``after``
+    is computed FROM ``before``, so every key in ``before`` is by construction
+    inside the read scope, and a key the kernel dropped would be a genuine
+    removal. A merged generation keeps every winner and every batch, and a
+    completed batch's action rows keep their keys with a NULL core rather than
+    disappearing.
+
+    Violations are the exception, so that group DOES express removals. A phase-2
+    verdict is re-derived on every pass and a later record can withdraw one — an
+    incomplete action set completed by a late action stops producing
+    `manifest_action_sequence_mismatch` — and `_check_journal_protocol` reads
+    that table, so a stale row makes `doctor` exit 2 and names a fingerprint no
+    fresh derivation reproduces. The removal is safe precisely because it is
+    scoped: ``before.violations`` is the delta's own scoped read, so the
+    difference can only name rows this delta looked at.
+    """
+    state = after.state
+    conn.execute(
+        "INSERT INTO journal_selector_state "
+        "(id, generation_record_path, generation_stamped_at_utc, "
+        " covered_segment, covered_offset, next_sequence, selector_version, "
+        " cutover_seen, cutover_account_key) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "generation_record_path = excluded.generation_record_path, "
+        "generation_stamped_at_utc = excluded.generation_stamped_at_utc, "
+        "covered_segment = excluded.covered_segment, "
+        "covered_offset = excluded.covered_offset, "
+        "next_sequence = excluded.next_sequence, "
+        "selector_version = excluded.selector_version, "
+        "cutover_seen = excluded.cutover_seen, "
+        "cutover_account_key = excluded.cutover_account_key",
+        (
+            state.generation_record_path,
+            state.generation_stamped_at_utc,
+            state.covered_segment,
+            state.covered_offset,
+            state.next_sequence,
+            state.selector_version,
+            1 if state.cutover_seen else 0,
+            state.cutover_account_key,
+        ),
+    )
+
+    # Identity, not equality: `advance_counter` returns the row tuples BY
+    # REFERENCE for a delta the fold does not consume, so a tick that only
+    # moved the counters skips these diffs entirely rather than walking every
+    # durable row to conclude that nothing changed.
+    if before.batches is not after.batches:
+        prior_batches = {row.batch_id: row for row in before.batches}
+        for row in after.batches:
+            if prior_batches.get(row.batch_id) == row:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO journal_selector_batches "
+                "(batch_id, status, action_count, action_set_hash, begin_segment, "
+                " begin_offset, earliest_commit_segment, earliest_commit_offset) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.batch_id,
+                    row.status,
+                    row.action_count,
+                    row.action_set_hash,
+                    row.begin_segment,
+                    row.begin_offset,
+                    row.earliest_commit_segment,
+                    row.earliest_commit_offset,
+                ),
+            )
+
+    if before.batch_records is not after.batch_records:
+        prior_records = {
+            (row.batch_id, row.kind, row.key): row for row in before.batch_records
+        }
+        for row in after.batch_records:
+            key = (row.batch_id, row.kind, row.key)
+            if prior_records.get(key) == row:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO journal_selector_batch_records "
+                "(batch_id, kind, key, record_digest, identity_digest, sequence, "
+                " action_core_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.batch_id,
+                    row.kind,
+                    row.key,
+                    row.record_digest,
+                    row.identity_digest,
+                    row.sequence,
+                    row.action_core_json,
+                ),
+            )
+
+    if before.effective is not after.effective:
+        prior_effective = {row.event_id: row for row in before.effective}
+        for row in after.effective:
+            if prior_effective.get(row.event_id) == row:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO journal_effective_events "
+                "(event_id, rev, status, content_hash, batch_id, event_json, "
+                " winning_sequence, conflict_hashes_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.event_id,
+                    row.rev,
+                    row.status,
+                    row.content_hash,
+                    row.batch_id,
+                    row.event_json,
+                    row.winning_sequence,
+                    row.conflict_hashes_json,
+                ),
+            )
+
+    if before.violations is not after.violations:
+        prior_violations = {row.fingerprint: row for row in before.violations}
+        withdrawn = set(prior_violations) - {
+            row.fingerprint for row in after.violations
+        }
+        for fingerprint in sorted(withdrawn):
+            conn.execute(
+                "DELETE FROM journal_protocol_violations WHERE fingerprint = ?",
+                (fingerprint,),
+            )
+        for row in after.violations:
+            if prior_violations.get(row.fingerprint) == row:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO journal_protocol_violations "
+                "(fingerprint, batch_id, kind, violation_json, available_after) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    row.fingerprint,
+                    row.batch_id,
+                    row.kind,
+                    row.violation_json,
+                    row.available_after,
+                ),
+            )
+
+
+def _read_selector_state(conn):
+    """`journal_selector_state`'s single row as a kernel row, or None.
+
+    Split out of `_read_selector_rows` because the three cheap validity checks —
+    `selector_version`, cursor agreement and generation identity — are decided
+    from this row alone. Materializing the four row groups ahead of them made a
+    degraded tick and a counters-only tick read roughly 100,000 rows to conclude
+    that nothing was needed, on the status-line path.
+
+    Returns None when the table does not hold exactly one row, or is unreadable
+    at all: a stats index predating epoch 1009 has no selector tables, and
+    `open_db` returns a legacy one unchanged until its migration or epoch path
+    runs. Both are degraded states that fall back to full selection, and neither
+    may be mistaken for an empty-but-valid generation.
+    """
+    try:
+        state_rows = conn.execute(
+            "SELECT generation_record_path, generation_stamped_at_utc, "
+            "covered_segment, covered_offset, next_sequence, selector_version, "
+            "cutover_seen, cutover_account_key FROM journal_selector_state"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if len(state_rows) != 1:
+        return None
+    row = state_rows[0]
+    return _lib_selector_state.SelectorStateRow(
+        next_sequence=int(row[4]),
+        selector_version=int(row[5]),
+        covered_segment=row[2],
+        covered_offset=None if row[3] is None else int(row[3]),
+        generation_record_path=row[0],
+        generation_stamped_at_utc=row[1],
+        cutover_seen=bool(row[6]),
+        cutover_account_key=row[7],
+    )
+
+
+def _read_selector_rows(conn, *, batch_ids=None, event_ids=None):
+    """Read one generation's durable selector state back as kernel rows.
+
+    Returns `None` when `journal_selector_state` does not hold exactly one row.
+    A zero-row or unreadable state is one of the degraded cases that falls back
+    to full selection, and it must never be mistaken for an empty-but-valid
+    generation.
+
+    ``batch_ids`` and ``event_ids`` SCOPE the four row groups to what one delta
+    can reach. Both default to None, which reads the whole generation — the
+    shape validation and the rebuild need. The live path always scopes, because
+    the unscoped read materializes 34,644 `journal_effective_events` rows (mean
+    825 bytes of retained JSON) and 64,248 `journal_selector_batch_records` rows
+    on a production journal, on every status-line tick.
+
+    Under a scope the returned rows are a SUBSET, so the caller must not treat a
+    key absent from them as a key that was removed — `_write_selector_delta`
+    documents that consequence at the write end.
+
+    The five reads run inside ONE deferred read transaction, so they share a
+    snapshot. Without it each takes its own, and a publication landing between
+    two of them would return rows from two generations under one state row's
+    identity. Every current caller holds the ingest or maintenance lock, so that
+    interleaving is not reachable today; the transaction is what keeps it
+    unreachable if a future caller does not.
+    """
+    _ks = _lib_selector_state
+
+    with _deferred_read(conn):
+        state = _read_selector_state(conn)
+        if state is None:
+            return None
+        return _ks.SelectorRows(
+            state=state,
+            batches=_read_selector_batch_rows(conn, batch_ids),
+            batch_records=_read_selector_batch_record_rows(conn, batch_ids),
+            effective=_read_selector_effective_rows(conn, event_ids),
+            violations=_read_selector_violation_rows(conn, batch_ids),
+        )
+
+
+@contextlib.contextmanager
+def _deferred_read(conn):
+    """One snapshot across several SELECTs, without disturbing an open txn.
+
+    A caller already inside a transaction keeps it — beginning a second one
+    raises — and the snapshot it holds is the one this block wanted anyway.
+    """
+    if conn.in_transaction:
+        yield
+        return
+    try:
+        conn.execute("BEGIN")
+    except sqlite3.Error:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+
+
+#: SQLite's default parameter ceiling is 999, so a scope wider than this is read
+#: in chunks rather than in one statement.
+_SCOPE_CHUNK = 500
+
+
+def _scoped_query(conn, sql, order_by, column, scope):
+    """Run ``sql`` unscoped, or once per chunk of ``scope`` on ``column``."""
+    if scope is None:
+        yield from conn.execute(f"{sql} ORDER BY {order_by}")
+        return
+    keys = sorted(scope)
+    for start in range(0, len(keys), _SCOPE_CHUNK):
+        chunk = keys[start:start + _SCOPE_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        yield from conn.execute(
+            f"{sql} WHERE {column} IN ({placeholders}) ORDER BY {order_by}",
+            chunk,
+        )
+
+
+def _read_selector_batch_rows(conn, scope):
+    _ks = _lib_selector_state
+    return tuple(
+        _ks.SelectorBatchRow(
+            batch_id=item[0],
+            status=item[1],
+            action_count=None if item[2] is None else int(item[2]),
+            action_set_hash=item[3],
+            begin_segment=item[4],
+            begin_offset=None if item[5] is None else int(item[5]),
+            earliest_commit_segment=item[6],
+            earliest_commit_offset=None if item[7] is None else int(item[7]),
+        )
+        for item in _scoped_query(
+            conn,
+            "SELECT batch_id, status, action_count, action_set_hash, "
+            "begin_segment, begin_offset, earliest_commit_segment, "
+            "earliest_commit_offset FROM journal_selector_batches",
+            "batch_id", "batch_id", scope,
+        )
+    )
+
+
+def _read_selector_batch_record_rows(conn, scope):
+    _ks = _lib_selector_state
+    return tuple(
+        _ks.SelectorBatchRecordRow(
+            batch_id=item[0],
+            kind=item[1],
+            key=item[2],
+            record_digest=item[3],
+            sequence=int(item[5]),
+            identity_digest=item[4],
+            action_core_json=item[6],
+        )
+        for item in _scoped_query(
+            conn,
+            "SELECT batch_id, kind, key, record_digest, identity_digest, "
+            "sequence, action_core_json FROM journal_selector_batch_records",
+            "batch_id, kind, key", "batch_id", scope,
+        )
+    )
+
+
+def _read_selector_effective_rows(conn, scope):
+    _ks = _lib_selector_state
+    return tuple(
+        _ks.SelectorEffectiveRow(
+            event_id=item[0],
+            rev=int(item[1]),
+            status=item[2],
+            content_hash=item[3],
+            batch_id=item[4],
+            event_json=item[5],
+            winning_sequence=None if item[6] is None else int(item[6]),
+            conflict_hashes_json=item[7],
+        )
+        for item in _scoped_query(
+            conn,
+            "SELECT event_id, rev, status, content_hash, batch_id, event_json, "
+            "winning_sequence, conflict_hashes_json "
+            "FROM journal_effective_events",
+            "event_id", "event_id", scope,
+        )
+    )
+
+
+def _read_selector_violation_rows(conn, scope):
+    _ks = _lib_selector_state
+    return tuple(
+        _ks.SelectorViolationRow(
+            fingerprint=item[0],
+            batch_id=item[1],
+            kind=item[2],
+            violation_json=item[3],
+            available_after=None if item[4] is None else int(item[4]),
+        )
+        for item in _scoped_query(
+            conn,
+            "SELECT fingerprint, batch_id, kind, violation_json, "
+            "available_after FROM journal_protocol_violations",
+            "batch_id, kind, fingerprint", "batch_id", scope,
+        )
+    )
 
 
 def _metadata_row(conn, event_id):
@@ -3463,7 +4632,7 @@ def _validate_excluded_derived_fks(conn, spec, row) -> None:
                 f"(re-derived {expected})")
 
 
-def _full_effective_selection(hw):
+def _full_effective_selection(hw, accumulators=None):
     records = []
     evidence = []
     prior_high_water = None
@@ -3484,6 +4653,408 @@ def _full_effective_selection(hw):
     return _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=evidence,
+        accumulators=accumulators,
+    )
+
+
+def _selector_generation_matches(conn, state) -> bool:
+    """Whether ``state`` names the generation this connection is reading.
+
+    `stats_publication_stamp` carries no counter, so this is an IDENTITY
+    comparison rather than an ordering one, and the stamp is re-read on a FRESH
+    read-only connection: `conn` may be sitting on a superseded generation
+    precisely because in-place publication keeps an open reader alive on the one
+    it started with, which is the case this check exists to catch.
+
+    Absent, duplicated, unreadable or mismatched all answer False, which is the
+    fall-back-to-full-selection direction (spec §3.4). A stamp read from a
+    destination at any other epoch also answers False, for the same reason
+    `read_publication_stamp` returns None there.
+    """
+    if state.generation_record_path is None or (
+        state.generation_stamped_at_utc is None
+    ):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    path = None if row is None else row[0]
+    if not path:
+        return False
+    try:
+        probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            epoch = int(probe.execute("PRAGMA user_version").fetchone()[0])
+            if epoch != _cctally_core.STATS_INDEX_EPOCH:
+                return False
+            rows = probe.execute(
+                "SELECT record_path, stamped_at_utc FROM stats_publication_stamp"
+            ).fetchall()
+        finally:
+            probe.close()
+    except BaseException:
+        return False
+    if len(rows) != 1:
+        return False
+    return (str(rows[0][0]), str(rows[0][1])) == (
+        state.generation_record_path,
+        state.generation_stamped_at_utc,
+    )
+
+
+def _cutover_for_selection(seen: bool, account_key, hw):
+    """The cutover account a selection over this prefix must normalize with.
+
+    When durable state SAW the op, the recorded value is exact and no scan
+    happens — which is what removes `resolve_cutover_claude_account()`'s
+    whole-journal traversal from the live path (spec §3.6). When it did not, the
+    answer is `_resolve_cutover_for_rebuild`'s, so the live path and a rebuild
+    pinned at the same high-water cannot disagree; on the live path the pinned
+    high-water IS the current one, so that call returns immediately without
+    opening a segment.
+    """
+    if seen:
+        return (
+            account_key if account_key is not None
+            else _lib_accounts.UNATTRIBUTED
+        )
+    return _resolve_cutover_for_rebuild(_CUTOVER_UNSEEN, hw, list_segments())
+
+
+def _causal_offset_of(sequence, coordinates):
+    """The journal coordinate of the record at ``sequence``, or None.
+
+    A separate function so the fail-closed path has something to exercise. The
+    coordinate is MANDATORY: substituting the pinned high-water is unsafe,
+    because it is `st_size`, `_iter_segment_lines` omits an incomplete trailing
+    line, and `_repair_torn_tail` can truncate below it — so a cursor written
+    there can sit beyond unread data (spec §3.7).
+    """
+    return coordinates.get(sequence)
+
+
+def _prefix_position(coordinate):
+    """A comparable position for a journal prefix; None is the very start.
+
+    Ordered through `segment_sort_key`, because bootstrap segments sort before
+    observation segments and a plain string comparison would get the order
+    wrong across that boundary.
+    """
+    if not coordinate or coordinate[0] is None or coordinate[1] is None:
+        return None
+    return (_lib_journal.segment_sort_key(coordinate[0]), int(coordinate[1]))
+
+
+def _coordinate_covers(covered, target) -> bool:
+    """Whether ``covered`` reaches at least as far as ``target``."""
+    left = _prefix_position(covered)
+    right = _prefix_position(target)
+    if left is None or right is None:
+        return False
+    return left >= right
+
+
+#: The most journal bytes one live tick may re-fold to realign a durable
+#: selector prefix that fell behind the caller's cursor.
+#:
+#: The gap is normally one tick wide and closes on that tick, because the common
+#: transient — a `database is locked` swallowed by `_selector_generation_matches`
+#: — is decided BEFORE the gap read and the next successful tick writes the
+#: realigned prefix. One refusal is not the shape this cap exists for.
+#:
+#: The shape it exists for is a refusal that repeats. `merge_delta`'s
+#: durably-completed-batch shape refusal falls back to
+#: `_full_effective_selection`, whose loop acts only on entries whose `batch_id`
+#: is not `None` — and after a taint the winner reverts to the base journal
+#: event, whose `batch_id` IS `None`. That is issue #510, so no
+#: `CorrectionRebuildRequired` is raised and no rebuild follows to realign the
+#: durable prefix. Every later tick would then re-read and re-decode a
+#: monotonically growing range, which is the whole-prefix read spec §3.3 exists
+#: to prevent under another name.
+#:
+#: Past the cap the tick degrades to full selection like every other degraded
+#: case, and `_observe_selector_desynchronization` reports the gap and this cap
+#: in the structured rebuild record, so the state is observable rather than
+#: silent. Four mebibytes is roughly 4,600 records at the maintainer's measured
+#: mean journal line length; a genuine one-tick gap is a handful.
+_GAP_REFOLD_BYTE_CAP = 4 * 1024 * 1024
+
+
+def _selector_gap_bytes(durable, cursor) -> "int | None":
+    """Journal bytes in ``[durable, cursor)``, from `stat` alone.
+
+    Mirrors `_iter_range_with_segments`' bounds arithmetic without opening a
+    single segment, which is what lets the cap refuse BEFORE the read it caps.
+
+    Returns `None` when the distance cannot be determined — an unreadable
+    segment, or a cursor naming a segment the journal no longer lists. The
+    caller treats that as over the cap, which is the fall-back direction.
+    """
+    if cursor is None or cursor[0] is None or cursor[1] is None:
+        return None
+    segments = list_segments()
+    if cursor[0] not in segments:
+        return None
+    end_idx = segments.index(cursor[0])
+    if (
+        durable is None
+        or durable[0] is None
+        or durable[1] is None
+        or durable[0] not in segments
+    ):
+        start_idx, start_off = 0, 0
+    else:
+        start_idx, start_off = segments.index(durable[0]), int(durable[1])
+    total = 0
+    for idx in range(start_idx, end_idx + 1):
+        lo = start_off if idx == start_idx else 0
+        if idx == end_idx:
+            hi = int(cursor[1])
+        else:
+            try:
+                hi = os.path.getsize(_cctally_core.JOURNAL_DIR / segments[idx])
+            except OSError:
+                return None
+        if hi > lo:
+            total += hi - lo
+    return total
+
+
+def _selector_gap_entries(durable, cursor):
+    """Decoded records in ``[durable, cursor)`` with each one's end offset.
+
+    This is non-empty only after a tick that could not validate the durable
+    generation. `_write_cursor` runs whether or not a selector delta was
+    written, so such a tick advances `journal_cursor` and leaves
+    `journal_selector_state` where the last rebuild put it — and nothing on the
+    live path ever rewrites that table, so an EQUALITY comparison between the
+    two could never hold again and F20 stayed off until a full rebuild.
+
+    Re-folding the gap is what brings them back together. It is correct because
+    the selector fold is independent of application, so folding records the
+    cycle already applied changes only the selector's own accumulators, and the
+    read is bounded by the gap rather than by the whole prefix.
+    """
+    entries = []
+    start = None if _prefix_position(durable) is None else (
+        durable[0], int(durable[1]))
+    for segment, offset, raw in iter_range(start, cursor):
+        record = _lib_journal.decode_line(raw)
+        if record is None:
+            # A malformed line consumes no sequence number, exactly as the
+            # cycle's own read loop and `decoded_entry_count` treat it.
+            continue
+        entries.append((record, segment, offset + len(raw) + 1))
+    return entries
+
+
+def _normalized_for_selection(records, cutover_claude):
+    """Copies of ``records`` with the legacy account stamp applied.
+
+    COPIES, because `_normalize_legacy_account_stamp` mutates in place and these
+    same dicts are what the cycle's pipeline folds; injecting a stamp into them
+    would change what step 4b sees. The payload is copied too, since the evt/op
+    branch writes into it.
+    """
+    copies = []
+    for record in records:
+        if not isinstance(record, dict):
+            copies.append(record)
+            continue
+        copy = dict(record)
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            copy["payload"] = dict(payload)
+        _normalize_legacy_account_stamp(copy, cutover_claude)
+        copies.append(copy)
+    return copies
+
+
+def _incremental_selection(conn, records, entries, cursor, covered):
+    """Continue the durable fold over one cycle's delta, or return None.
+
+    ``entries`` is positionally parallel to ``records``: each element is the
+    ``(segment, end offset)`` of the record that consumed one sequence number.
+    The map from ABSOLUTE sequence to coordinate is built HERE rather than by the
+    caller, because a durable prefix behind the cursor prepends its unfolded gap
+    and shifts every delta record's number.
+
+    None means every degraded case: absent or unreadable selector state, a
+    `selector_version` mismatch, a durable prefix AHEAD of the caller's cursor, a
+    gap wider than `_GAP_REFOLD_BYTE_CAP`, a generation identity that does not
+    match a freshly read publication stamp, a generation that moved while the
+    gap was being read, a cutover operation the durable prefix has not folded,
+    and anything the pure kernel refuses. Every one of them takes the existing
+    full-prefix path unchanged.
+
+    Read order is load-bearing. The three cheap checks are decided from ONE row
+    and run BEFORE any row group is materialized, a delta the fold does not
+    consume reads no group at all, and a delta that does is scoped to the
+    batches and event ids it names. This function is on `cmd_record_usage`'s
+    path, which runs on every Claude Code status-line tick, and an unscoped read
+    materializes 34,644 effective rows and 64,248 batch-record rows on a
+    production journal.
+
+    There are TWO read snapshots rather than one, and the gap re-fold sits
+    between them deliberately: it is arbitrary journal file I/O, and holding a
+    stats.db read snapshot open across it pins the WAL against checkpointing for
+    the whole read, which is the bloat #297 documents. The second snapshot
+    re-reads the one state row and refuses on any difference, which is what
+    keeps the row groups and the state row from coming out of two generations.
+
+    That re-read covers in-place publication and any live delta writer, because
+    both mutate the state row this connection can see. It does NOT cover
+    PHYSICAL replacement: an `os.replace` between the two blocks leaves this
+    connection on the unlinked old inode, whose state row and row groups are
+    mutually consistent but stale. Physical replacement is excluded by the ingest
+    lock the caller already holds, not by this check.
+    """
+    _ks = _lib_selector_state
+    with _deferred_read(conn):
+        state = _read_selector_state(conn)
+        if state is None:
+            return None
+        if state.selector_version != _ks.SELECTOR_VERSION:
+            return None
+        durable = (state.covered_segment, state.covered_offset)
+        durable_at = _prefix_position(durable)
+        cursor_at = _prefix_position(cursor)
+        if durable_at is not None and (
+            cursor_at is None or durable_at > cursor_at
+        ):
+            # The durable prefix has folded records the caller has not applied,
+            # so numbering the delta from `next_sequence` would leave a hole the
+            # size of the overlap. The other direction is recoverable and is
+            # recovered below.
+            return None
+        if not _selector_generation_matches(conn, state):
+            return None
+
+    if durable_at == cursor_at:
+        gap = ()
+    else:
+        gap_bytes = _selector_gap_bytes(durable, cursor)
+        if gap_bytes is None or gap_bytes > _GAP_REFOLD_BYTE_CAP:
+            # Bounded rather than unbounded: a refusal that repeats leaves the
+            # durable prefix behind forever, and an uncapped re-fold would grow
+            # the per-tick read without limit. See `_GAP_REFOLD_BYTE_CAP`.
+            return None
+        gap = _selector_gap_entries(durable, cursor)
+
+    stream = [item[0] for item in gap] + list(records)
+    coordinates = {}
+    for index, item in enumerate(gap):
+        coordinates[state.next_sequence + index] = (item[1], item[2])
+    for index, coordinate in enumerate(entries or ()):
+        coordinates[state.next_sequence + len(gap) + index] = coordinate
+
+    for record in stream:
+        if isinstance(record, dict) and record.get("id") == CUTOVER_OP_ID:
+            if not state.cutover_seen:
+                # A cutover the durable prefix has not folded re-normalizes
+                # every legacy Claude line in that prefix, which changes those
+                # events' `content_hash` and `event_json`. The durable winners
+                # were folded WITHOUT it, and this path normalizes only the
+                # delta, so carrying them forward would diverge from a full
+                # pass. Falling back is provably equivalent to one.
+                return None
+            break
+
+    if not any(
+        isinstance(record, dict)
+        and (
+            record.get("t") in _ks.FOLD_RECORD_TYPES
+            or (
+                record.get("t") == "op"
+                and isinstance(record.get("payload"), dict)
+                and record["payload"].get("kind")
+                == _lib_journal._PROTOCOL_RESOLUTION_KIND
+            )
+        )
+        for record in stream
+    ):
+        # Nothing here changes the fold, so only the counters move — and the
+        # four row groups are not read at all. `advance_counter` returns them
+        # by reference, so an empty placeholder makes the delta writer skip
+        # every group by identity, exactly as a full read would have.
+        placeholder = _ks.SelectorRows(state=state)
+        return {
+            "before": placeholder,
+            "after": _ks.advance_counter(
+                placeholder,
+                consumed=state.next_sequence + len(stream),
+                covered=covered,
+            ),
+            "transitions": [],
+            "coordinates": coordinates,
+        }
+
+    batch_ids = _ks.delta_batch_scope(stream)
+    with _deferred_read(conn):
+        if _read_selector_state(conn) != state:
+            return None
+        batches = _read_selector_batch_rows(conn, batch_ids)
+        batch_records = _read_selector_batch_record_rows(conn, batch_ids)
+        effective = _read_selector_effective_rows(
+            conn, _ks.delta_event_scope(stream, batch_records))
+        violations = _read_selector_violation_rows(conn, batch_ids)
+        # No coordinate widening beyond `batch_ids`, and the reason is a
+        # reachability argument rather than an economy. `_preflight_live_events`
+        # consults a batch row only for a winner whose four-tuple DIFFERS from
+        # `journal_effective_events`. `_read_selector_effective_rows` reads that
+        # same table, so a winner the merge passed through compares equal and is
+        # skipped; and a winner the merge re-decided took a correction candidate
+        # from a batch the delta named, so its batch row is already in `batches`.
+        # A read over `{winner batches} - batch_ids` therefore returned rows the
+        # caller could not reach, on every tick that named any correction batch.
+    rows = _ks.SelectorRows(
+        state=state,
+        batches=batches,
+        batch_records=batch_records,
+        effective=effective,
+        violations=violations,
+    )
+
+    cutover_claude = _cutover_for_selection(
+        state.cutover_seen, state.cutover_account_key, covered)
+
+    try:
+        merged, transitions = _ks.merge_delta(
+            rows,
+            _normalized_for_selection(stream, cutover_claude),
+            next_sequence=state.next_sequence,
+            coordinates=coordinates,
+            covered=covered,
+        )
+    except _ks.IncrementalSelectionUnavailable:
+        return None
+    return {
+        "before": rows,
+        "after": merged,
+        "transitions": transitions,
+        "coordinates": coordinates,
+    }
+
+
+def _raise_taint_transition(transition, coordinates) -> None:
+    """Turn one completed-to-tainted transition into its recovery signal."""
+    coordinate = _causal_offset_of(transition.causal_sequence, coordinates)
+    if coordinate is None:
+        raise JournalError(
+            f"correction batch {transition.batch_id} moved completed -> "
+            "tainted but its causal offset could not be resolved; refusing to "
+            "substitute the pinned high-water"
+        )
+    raise CorrectionRebuildRequired(
+        f"completed correction batch {transition.batch_id} was tainted by a "
+        "later record and requires a stats index rebuild through it",
+        batch_id=transition.batch_id,
+        high_water=coordinate,
+        recovery_eligible=True,
+        kind=CORRECTION_KIND_COMPLETED_TO_TAINTED,
     )
 
 
@@ -3517,8 +5088,22 @@ def _correction_commit_high_water(batch_id, hw=None):
     return None
 
 
+def _has_correction_records(records) -> bool:
+    return any(
+        record.get("t") in {"correction", "correction_batch"}
+        or (
+            record.get("t") == "op"
+            and isinstance(record.get("payload"), dict)
+            and record["payload"].get("kind")
+            == _lib_journal._PROTOCOL_RESOLUTION_KIND
+        )
+        for record in records
+    )
+
+
 def _preflight_live_events(
-    conn, records, hw, conflicts=None, protocol_scan=None
+    conn, records, hw, conflicts=None, protocol_scan=None,
+    selector=None, cursor=None, entries=None,
 ):
     """Validate unread evt/correction records before the stats transaction.
 
@@ -3527,7 +5112,22 @@ def _preflight_live_events(
     every cycle over an already-poisoned journal, exactly like the rebuild. The
     divergent evt is DROPPED from the apply set, the prior effective event
     stands, and the group is appended to `conflicts` when a sink is supplied.
-    `CorrectionRebuildRequired` stays fatal."""
+    `CorrectionRebuildRequired` stays fatal.
+
+    `selector` is an out-dict (#496 S5b §3.3). When supplied and the durable
+    generation validates, it receives the merged selector rows so the caller can
+    advance them inside its own transaction — the delta and the cursor it
+    describes then commit together. When the generation does not validate the
+    dict is left empty and durable state stays where the last rebuild put it,
+    which is the conservative direction: `stats_index_matches_journal_prefix`
+    then answers False and its one caller rebuilds.
+
+    `cursor` is the caller's applied journal cursor. The durable covered prefix
+    must not be ahead of it; a prefix BEHIND it is re-folded from the journal
+    over exactly that gap. `entries` is positionally parallel to `records` and
+    carries each record's `(segment, end offset)`, from which the incremental
+    step derives the absolute-sequence coordinate map.
+    """
     event_records = [record for record in records if record.get("t") == "evt"]
     selected_new = _lib_journal.resolve_effective_events(event_records)
     if conflicts is not None:
@@ -3577,51 +5177,117 @@ def _preflight_live_events(
             ),
         )
 
-    if any(
-        record.get("t") in {"correction", "correction_batch"}
-        or (
-            record.get("t") == "op"
-            and isinstance(record.get("payload"), dict)
-            and record["payload"].get("kind")
-            == _lib_journal._PROTOCOL_RESOLUTION_KIND
-        )
-        for record in records
-    ):
-        full = _full_effective_selection(hw)
-        if protocol_scan is not None:
-            protocol_scan["scanned"] = True
-            protocol_scan["violations"] = full.protocol_violations
-            protocol_scan["acknowledged"] = (
-                full.acknowledged_protocol_violations
-            )
-        for selected in full.by_id.values():
-            if selected.batch_id is None:
+    has_corrections = _has_correction_records(records)
+    incremental = None
+    if selector is not None or has_corrections:
+        incremental = _incremental_selection(conn, records, entries, cursor, hw)
+    if selector is not None and incremental is not None:
+        selector["before"] = incremental["before"]
+        selector["after"] = incremental["after"]
+
+    if incremental is not None:
+        # The incremental path already knows every batch's verdict, so the
+        # whole-prefix read is not performed at all. `protocol_scan` stays unset
+        # deliberately: the merged violation rows are advanced by the selector
+        # delta the caller writes, and running `_write_protocol_violations` on
+        # top of that would replace them with a set derived from a scan that did
+        # not happen.
+        #
+        # This runs even when the DELTA carries no correction record, because a
+        # re-folded gap can: the merged rows are about to be written into
+        # `journal_effective_events`, and installing a corrected winner without
+        # the rebuild the correction demands is exactly what the loop refuses.
+        # Both loops are bounded by the delta's own scope, so the added work on
+        # an ordinary tick is zero rows.
+        for transition in incremental["transitions"]:
+            _raise_taint_transition(transition, incremental["coordinates"])
+        batches = {row.batch_id: row for row in incremental["after"].batches}
+        for row in incremental["after"].effective:
+            if row.batch_id is None:
                 continue
-            prior = _metadata_row(conn, selected.event_id)
-            if prior is not None:
-                prior_tuple = (int(prior[0]), prior[1], prior[2], prior[3])
-                selected_tuple = (
-                    selected.rev,
-                    selected.status,
-                    selected.content_hash,
-                    selected.batch_id,
+            prior = _metadata_row(conn, row.event_id)
+            if prior is not None and (
+                int(prior[0]), prior[1], prior[2], prior[3]
+            ) == (row.rev, row.status, row.content_hash, row.batch_id):
+                continue
+            batch = batches.get(row.batch_id)
+            commit = None
+            if batch is not None and batch.earliest_commit_segment is not None:
+                # The durable coordinate, which is what removes
+                # `_correction_commit_high_water`'s traversal from this path.
+                commit = (
+                    batch.earliest_commit_segment,
+                    int(batch.earliest_commit_offset),
                 )
-                if prior_tuple == selected_tuple:
-                    continue
+            if commit is None:
+                # A whole-prefix stream, and a correctness fallback rather than
+                # a fast path: acceptance criteria 6 and 17 ("no whole-journal
+                # read on the interactive ingest path") do NOT hold here.
+                #
+                # It is reached only when no durable batch row carries an
+                # `earliest_commit_*` for this winner, which `marker_coordinates`
+                # and `_carry_coordinates` normally prevent. It is NOT reached
+                # for a winner the delta merely passed through: `_metadata_row`
+                # and `_read_selector_effective_rows` read the same table, so a
+                # passed-through winner compares equal to its stored metadata
+                # above and is skipped before ever arriving here. A winner the
+                # delta RE-DECIDED names a batch the delta itself carried, whose
+                # row this pass is about to write.
+                commit = _correction_commit_high_water(row.batch_id, hw)
             raise CorrectionRebuildRequired(
-                f"completed correction batch {selected.batch_id} requires "
+                f"completed correction batch {row.batch_id} requires "
                 "stats index rebuild",
-                batch_id=selected.batch_id,
-                event_id=selected.event_id,
-                high_water=_correction_commit_high_water(selected.batch_id, hw),
+                batch_id=row.batch_id,
+                event_id=row.event_id,
+                high_water=commit,
                 expected_metadata=(
-                    selected.rev,
-                    selected.status,
-                    selected.content_hash,
-                    selected.batch_id,
-                ),
+                    row.rev, row.status, row.content_hash, row.batch_id),
                 recovery_eligible=True,
+                kind=CORRECTION_KIND_NEWLY_COMPLETED,
             )
+        return to_apply
+
+    if not has_corrections:
+        return to_apply
+
+    accumulators: dict = {}
+    full = _full_effective_selection(hw, accumulators)
+    if protocol_scan is not None:
+        protocol_scan["scanned"] = True
+        # The KERNEL's rows, not a second derivation: the rebuild writes these
+        # exact rows, and a fallback that wrote a different shape left the index
+        # unable to match its own journal prefix afterwards.
+        protocol_scan["rows"] = _lib_selector_state.violation_rows(
+            full, accumulators["fold"])
+    for selected in full.by_id.values():
+        if selected.batch_id is None:
+            continue
+        prior = _metadata_row(conn, selected.event_id)
+        if prior is not None:
+            prior_tuple = (int(prior[0]), prior[1], prior[2], prior[3])
+            selected_tuple = (
+                selected.rev,
+                selected.status,
+                selected.content_hash,
+                selected.batch_id,
+            )
+            if prior_tuple == selected_tuple:
+                continue
+        raise CorrectionRebuildRequired(
+            f"completed correction batch {selected.batch_id} requires "
+            "stats index rebuild",
+            batch_id=selected.batch_id,
+            event_id=selected.event_id,
+            high_water=_correction_commit_high_water(selected.batch_id, hw),
+            expected_metadata=(
+                selected.rev,
+                selected.status,
+                selected.content_hash,
+                selected.batch_id,
+            ),
+            recovery_eligible=True,
+            kind=CORRECTION_KIND_NEWLY_COMPLETED,
+        )
     return to_apply
 
 
@@ -3645,7 +5311,14 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     # advance — any harvested budget evt lands in the freshly-created first
     # segment past the (absent) HW and replays idempotently on the next cycle.
     decoded: list = []  # (record, segment, offset)
+    # End offset per decoded entry, positionally parallel to `decoded`. Kept
+    # separate rather than widened into those tuples because `QUOTA_APPLIER`
+    # consumes them by shape (#496 S5b): the selector needs each record's end
+    # coordinate, and re-encoding a record to recover its length would only be
+    # right for lines this binary wrote.
+    end_offsets: list = []
     malformed = 0
+    cursor = None
     cursor_target = None
     if hw is None:
         if reconcile_config is None and codex_apply is None:
@@ -3664,6 +5337,7 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
                 malformed += 1
                 continue
             decoded.append((rec, seg, off))
+            end_offsets.append(off + len(raw) + 1)
 
         # Step 3: cache leg (Codex quota) BEFORE the stats txn (lock-order law).
         # QUOTA_APPLIER attempts the global-then-Codex cache flock NB upsert; on
@@ -3673,11 +5347,23 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # scalar cursor sound).
         cursor_target = (hw_seg, hw_size)
         if QUOTA_APPLIER is not None:
-            stop = QUOTA_APPLIER(decoded)
+            # The cycle's own range, so the leg can advance the #496 S5b
+            # coverage certificate over a batch it can prove contiguous. A
+            # prefix-stop advances nothing, because the leg then committed
+            # neither family and `cursor_target` moves to the stop coordinate.
+            # `decoded_end` is the last DECODED record's end coordinate, which
+            # bounds the covered claim below the raw cursor target whenever the
+            # traversal stopped short of it — a torn or malformed trailing line.
+            stop = QUOTA_APPLIER(
+                decoded, cursor=cursor, covered_to=cursor_target,
+                decoded_end=(
+                    None if not decoded
+                    else (decoded[-1][1], end_offsets[-1])))
             if stop is not None:
                 _rec, stop_seg, stop_off = decoded[stop]
                 cursor_target = (stop_seg, stop_off)
                 decoded = decoded[:stop]
+                end_offsets = end_offsets[:stop]
 
     records = [r for (r, _s, _o) in decoded]
     batch = [r for r in records if r.get("t") in ("obs", "op")]
@@ -3685,12 +5371,27 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     # raising; the groups it drops are counted on the cycle summary.
     preflight_conflicts: list = []
     protocol_scan: dict = {}
+    # #496 S5b §3.3: the delta's own sequence numbering starts where the durable
+    # prefix stopped, and every decoded entry consumes one number — the same
+    # numbering the rebuild produces by appending a placeholder for each valid
+    # non-retained record. `_incremental_selection` owns that arithmetic: it
+    # rejects a durable prefix AHEAD of `cursor`, and re-folds the gap when the
+    # prefix is behind it, so an absent or stale state cannot make these numbers
+    # mean something else.
+    selector_state: dict = {}
+    selector_entries = [
+        (segment, end_offsets[index])
+        for index, (_rec, segment, _off) in enumerate(decoded)
+    ]
     journal_evts = _preflight_live_events(
         conn,
         records,
         cursor_target,
         conflicts=preflight_conflicts,
         protocol_scan=protocol_scan,
+        selector=selector_state,
+        cursor=cursor,
+        entries=selector_entries,
     )
 
     # Step 4: ONE BEGIN IMMEDIATE — replay + pipeline + derived-fact journaling +
@@ -3757,11 +5458,18 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # the cursor so shallow Doctor paths observe either the old complete
         # result or the new complete result, never an in-between state.
         if protocol_scan.get("scanned"):
-            _write_protocol_violations(
-                conn,
-                protocol_scan.get("violations", ()),
-                protocol_scan.get("acknowledged", ()),
-            )
+            _replace_protocol_violations(conn, protocol_scan.get("rows", ()))
+        # 4c''. Advance durable selector state (#496 S5b §3.3), in the SAME
+        # transaction as the cursor it describes, so the durable prefix equals
+        # the applied journal cursor at every commit and a crash rolls both back
+        # together. It runs AFTER step 4a: that step inserts the plain
+        # six-column effective row for a newly applied evt, and the delta
+        # replaces it with the eight-column row carrying the winning sequence.
+        # Absent when the generation did not validate, which leaves durable
+        # state where the last rebuild put it.
+        if selector_state.get("after") is not None:
+            _write_selector_delta(
+                conn, selector_state["before"], selector_state["after"])
         # 4d. Advance the cursor (to HW, or to the cache-leg prefix boundary).
         # `cursor_target is None` ONLY on a reconcile-only cycle over a still-
         # empty journal (§5.2 above): there are no consumed lines to advance
@@ -3999,8 +5707,48 @@ def _correction_error_result(error) -> IngestResult:
     )
 
 
+def _tainted_batch_converged(signal: CorrectionRebuildRequired) -> bool:
+    """Convergence for a completed-to-tainted signal (#496 S5b §3.7).
+
+    `_recover_completed_correction`'s existing predicate needs an exact
+    `(rev, status, content_hash, batch_id)`, and after a taint withdraws a
+    completed batch the post-rebuild winner may be an OLDER candidate that
+    durable selector state deliberately does not store — §3.2 keeps no losing
+    candidates. So this kind converges on state that is available: the selector
+    batch is tainted, selector coverage includes the causal offset, and no
+    effective winner names that batch.
+    """
+    if signal.batch_id is None or signal.high_water is None:
+        return False
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    if not path.exists():
+        return False
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    try:
+        rows = _read_selector_rows(conn)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    if rows is None:
+        return False
+    batch = {row.batch_id: row for row in rows.batches}.get(signal.batch_id)
+    if batch is None or batch.status != "tainted":
+        return False
+    if not _coordinate_covers(
+        (rows.state.covered_segment, rows.state.covered_offset),
+        signal.high_water,
+    ):
+        return False
+    return not any(
+        row.batch_id == signal.batch_id for row in rows.effective
+    )
+
+
 def _correction_index_converged(signal: CorrectionRebuildRequired) -> bool:
     """Revalidate the triggering effective row without open-time mutation."""
+    if signal.kind == CORRECTION_KIND_COMPLETED_TO_TAINTED:
+        return _tainted_batch_converged(signal)
     if signal.event_id is None or signal.expected_metadata is None:
         return False
     path = pathlib.Path(_cctally_core.DB_PATH)
@@ -4050,7 +5798,20 @@ def _recover_completed_correction(
     timeout_s: float,
 ) -> None:
     """Revalidate and, when still needed, replace through the trigger prefix."""
-    if (
+    if signal.kind == CORRECTION_KIND_COMPLETED_TO_TAINTED:
+        # A different contract, deliberately: this kind carries no `event_id`
+        # and no expected metadata tuple, because the post-taint winner may be a
+        # candidate the durable state does not store. The causal offset is
+        # mandatory and there is nothing to substitute for it, so an absent one
+        # is refused rather than widened to the pinned high-water.
+        if signal.batch_id is None or signal.high_water is None:
+            raise CorrectionRecoveryError(
+                _correction_recovery_guidance(
+                    "completed-to-tainted correction lacks the causal record "
+                    "offset its rebuild must include"
+                )
+            )
+    elif (
         signal.batch_id is None
         or signal.event_id is None
         or signal.high_water is None
@@ -4167,6 +5928,7 @@ def run_stats_ingest(
                 high_water=signal.high_water,
                 expected_metadata=signal.expected_metadata,
                 recovery_eligible=True,
+                kind=signal.kind,
             ) from signal
 
         try:
@@ -4315,7 +6077,12 @@ class RebuildResult:
     rows_by_table: dict       # journal-covered table -> row count in the rebuild
     malformed: int            # journal lines that failed to decode (spec §4.4)
     duration_s: float         # wall time of the whole rebuild
-    segments_read: int        # journal segments folded
+    # Segments in the pinned prefix, which is NOT the same as segments this
+    # pass opened: #496 S5b's elision skips some of them and contributes their
+    # stored summary instead. `traversal["elision"]["scannedSegments"]` is the
+    # opened count. The value here is unchanged from before elision existed, so
+    # the public `segmentsRead` key keeps meaning what it always meant.
+    segments_read: int        # journal segments in the pinned prefix
     lines_folded: int         # op + evt lines applied (obs are rederive input)
     # #374: divergent same-revision groups quarantined behind a lowest-sequence
     # provisional winner. The rebuild COMPLETES and exits 0 — reporting them is
@@ -4348,6 +6115,32 @@ class RebuildResult:
     peak_heap_bytes: int = 0
     #: cache writer flock acquisition to release, in seconds.
     quota_lock_hold_seconds: float = 0.0
+    #: #496 S5b — the durable selector prefix of the index this rebuild is about
+    #: to REPLACE, when that prefix was behind the index's own applied journal
+    #: cursor. `None` when the two agreed, when the destination did not exist, or
+    #: when either could not be read. A tick that cannot validate the durable
+    #: generation advances the cursor without advancing the selector, and the
+    #: next tick re-folds the gap silently (§6.3); this is the only surface on
+    #: which a persistent desynchronization is reported.
+    selector_desynchronized: "dict | None" = None
+    #: #496 S5b F11 — what the quota cache leg did: `status` in
+    #: `{skipped, covered, recovered, failed}`, `reason` naming the coverage
+    #: verdict, `coveredHighWater` and `replayedObservations`. `covered` is the
+    #: intact path, where the leg takes no cache writer flock and replays
+    #: nothing. Additive to the `schemaVersion: 1` rebuild record.
+    quota_cache_coverage: dict = field(default_factory=dict)
+    #: #496 S5b §4.7 — TRUE when this generation's stats quota projection was
+    #: materialized from a cache whose recovery left an uncovered remainder.
+    #:
+    #: It is a separate field from `quota_cache_coverage` because the two answer
+    #: different questions and a consumer must not read one as the other:
+    #: coverage describes the CACHE, this describes the PUBLISHED INDEX. The
+    #: quota projection is materialized FROM `cache.db`, so a partial cache
+    #: produces a semantically partial projection inside the generation being
+    #: published, and completing cache recovery later does not by itself
+    #: reconcile that projection. `RebuildResult` still has no success or
+    #: failure boolean, and this is not one — publication proceeds either way.
+    stats_quota_projection_incomplete: bool = False
 
 
 def _remove_db_sidecars_strict(path) -> None:
@@ -4392,6 +6185,9 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "journal_cursor",
         "journal_effective_events",
         "journal_protocol_violations",
+        "journal_selector_batch_records",
+        "journal_selector_batches",
+        "journal_selector_state",
         "percent_milestones",
         "project_budget_milestones",
         "projected_milestones",
@@ -4405,6 +6201,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "schema_migrations_skipped",
         "stats_open_fixups",
         "stats_publication_stamp",
+        "stats_quota_projection_state",
         "week_reset_events",
         "weekly_cost_snapshots",
         "weekly_credit_floors",
@@ -4429,6 +6226,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_five_hour_milestones_journal_id_null",
         "idx_five_hour_reset_events_journal_id",
         "idx_five_hour_reset_events_journal_id_null",
+        "idx_journal_protocol_violations_batch",
         "idx_percent_milestones_journal_id",
         "idx_percent_milestones_journal_id_null",
         "idx_project_budget_milestones_journal_id",
@@ -4453,7 +6251,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "7dde5a7995f441558d08b0204136824d6ff7208b221e576c79a76854b76aa178"
+    "2b378fc3be1c7bb249bb0c3ddd2111a802f689cf30b3fd42806a116611c799e6"
 )
 
 
@@ -4554,6 +6352,31 @@ def _validate_rebuilt_stats_index(
         )
 
 
+def _validate_selector_state(conn, expected) -> None:
+    """Refuse an index whose durable selector state is not what the journal says.
+
+    ``expected`` is the kernel rows a full selection over the same pinned
+    traversal produced. Raises `JournalError`; `stats_index_matches_journal_
+    prefix` catches that and answers False, while the rebuild lets it abort the
+    publication.
+
+    Single-row cardinality is part of the contract, so a zero-row state fails
+    here rather than reading as an empty-but-valid generation.
+    """
+    stored = _read_selector_rows(conn)
+    if stored is None:
+        raise JournalError(
+            "durable selector state is absent or not a single row"
+        )
+    if _lib_selector_state.comparable(stored) != _lib_selector_state.comparable(
+        expected
+    ):
+        raise JournalError(
+            "durable selector state does not match the journal selection "
+            "derived from the same pinned prefix"
+        )
+
+
 def stats_index_matches_journal_prefix(
     path: pathlib.Path, high_water: "tuple[str, int] | None"
 ) -> bool:
@@ -4568,6 +6391,26 @@ def stats_index_matches_journal_prefix(
     if not pathlib.Path(path).exists():
         return False
     try:
+        all_segments = list_segments()
+        segments = all_segments
+        elision = None
+        if high_water is not None:
+            if high_water[0] in segments:
+                segments = segments[:segments.index(high_water[0]) + 1]
+            # THE SAME planner the rebuild uses, constructed the same way from
+            # the same inputs (#496 S5b §5.6). An eliding rebuild and a prefix
+            # validation that disagreed about the same journal would make the
+            # validation meaningless.
+            #
+            # Constructed BEFORE the `stats.db` connection, deliberately: the
+            # planner reads `cache.db`, and the lock-order law runs cache before
+            # stats. Building it inside the stats connection's lifetime would
+            # open the cache underneath an already-open stats reader. Neither
+            # read takes a flock and Python's sqlite3 holds no implicit read
+            # transaction across `fetchall()`, so nothing deadlocks today — but
+            # the law is a TOTAL order, and the cost of keeping it is one short
+            # cache read on a path that was about to fail structurally.
+            elision = plan_segment_elision(segments, high_water)
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             _validate_rebuilt_stats_index(conn, high_water)
@@ -4582,17 +6425,28 @@ def stats_index_matches_journal_prefix(
             protocol_evidence = []
             prior_high_water = None
             cutover_captured = _CUTOVER_UNSEEN
-            all_segments = list_segments()
-            segments = all_segments
+            marker_coordinates: dict = {}
             hasher = _lib_journal_router.PrefixHashAccumulator()
             if high_water is not None:
-                if high_water[0] in segments:
-                    segments = segments[:segments.index(high_water[0]) + 1]
+                def _elide_segment(name, lo, hi, stat_result) -> bool:
+                    nonlocal prior_high_water
+                    summary = elision.decide(name, hi, stat_result)
+                    if summary is None:
+                        return False
+                    # Only the placeholders and the boundary: this pass builds
+                    # no counters, retains no observation bytes and folds no
+                    # last-seen map, so the `decoded`-entry count is the whole
+                    # contribution.
+                    decoded.extend([None] * int(summary.decoded_entry_count))
+                    prior_high_water = (name, int(summary.summarized_size))
+                    return True
+
                 for segment, offset, raw in _iter_range_with_segments(
                     None, high_water, segments,
                     on_segment=lambda name: hasher.begin_segment(
                         name, prior_high_water),
                     on_bytes=hasher.extend,
+                    elide=_elide_segment,
                 ):
                     record = _lib_journal.decode_line(raw)
                     if record is not None:
@@ -4600,11 +6454,23 @@ def stats_index_matches_journal_prefix(
                             record,
                             prior_high_water,
                             protocol_evidence,
-                            hasher=hasher,
+                            # See the rebuild's twin: a digest cannot be composed
+                            # over an elided prefix, so it is recomputed from
+                            # disk instead (§5.1).
+                            hasher=None if elision.elided else hasher,
                         )
+                        if (isinstance(record.get("payload"), dict)
+                                and record["payload"].get("kind")
+                                == _lib_journal._PROTOCOL_RESOLUTION_KIND):
+                            elision.resolution_seen = True
                         if (cutover_captured is _CUTOVER_UNSEEN
                                 and record.get("id") == CUTOVER_OP_ID):
                             cutover_captured = _cutover_value_of(record)
+                        if record.get("t") == "correction_batch":
+                            marker_coordinates[len(decoded)] = (
+                                segment,
+                                offset + len(raw) + 1,
+                            )
                         decoded.append(
                             record
                             if record.get("t")
@@ -4621,9 +6487,30 @@ def stats_index_matches_journal_prefix(
             for record in decoded:
                 if record is not None:
                     _normalize_legacy_account_stamp(record, cutover_claude)
+            selector_accumulators: dict = {}
             selection = _lib_journal.resolve_effective_events(
                 decoded,
                 protocol_prefix_evidence=protocol_evidence,
+                accumulators=selector_accumulators,
+            )
+            # The same semantic half the rebuild's oracle runs (#496 S5b §6.2).
+            # Both planners derive it from THEIR OWN pinned traversal, so an
+            # eliding rebuild and a prefix validation cannot reach different
+            # answers about the same journal.
+            _validate_selector_state(
+                conn,
+                _lib_selector_state.rows_from_selection(
+                    selection,
+                    accumulators=selector_accumulators,
+                    next_sequence=len(decoded),
+                    coordinates=marker_coordinates,
+                    covered=high_water,
+                    cutover_seen=cutover_captured is not _CUTOVER_UNSEEN,
+                    cutover_account_key=(
+                        None if cutover_captured is _CUTOVER_UNSEEN
+                        else cutover_captured
+                    ),
+                ),
             )
             expected = []
             for event_id, selected in selection.by_id.items():
@@ -4726,6 +6613,27 @@ def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> str:
     replacement main file.
     """
     import _cctally_db
+    import _lib_stats_wal
+
+    wal_index = _lib_stats_wal.inspect_wal_index_family(path)
+    wal_verdict = wal_index.get("verdict")
+    if _lib_stats_wal.is_incoherent_wal_index(wal_index):
+        # The caller has already proved whole-family drain and, for a heal,
+        # preserved the complete pre-checkpoint family. Opening SQLite here
+        # would let a stale aPgno[] map direct valid WAL frames to wrong main
+        # pages before quarantine records the original bytes.
+        return "skipped_incoherent_wal_index"
+    if wal_verdict in {"capture_raced", "analysis_truncated"}:
+        raise JournalError(
+            "old stats index WAL/SHM coherence could not be established "
+            f"before cutover ({wal_verdict})"
+        )
+    if wal_verdict not in {"coherent", "wal_absent", "wal_empty"}:
+        # A malformed/non-empty WAL, missing SHM, or another unrecognized raw
+        # shape is not permission to let SQLite reconstruct or checkpoint it.
+        # The caller has already preserved the complete family and can publish
+        # the independently rebuilt index without mutating these old bytes.
+        return "skipped_unproven_wal_index"
 
     try:
         conn = sqlite3.connect(str(path), timeout=15.0)
@@ -5214,6 +7122,7 @@ def _preserve_stats_family_for_cutover(
         "rebuildRecordPath": context.record_path,
         "binaryVersion": _binary_version(),
         "binaryEpoch": _cctally_core.STATS_INDEX_EPOCH,
+        "sqliteRuntimeVersion": sqlite3.sqlite_version,
         "preservedUserVersion": preserved_user_version,
         "familySizes": family_sizes,
         # The retained COPY is described, not the live file, because the copy
@@ -5402,12 +7311,40 @@ def _publish_generation_in_place(
             conn.execute(f"PRAGMA main.user_version={epoch:d}")
             # The publication's own identity, committed atomically with the
             # content and the epoch it describes (#496 S3 §5).
+            stamped_at = _utc_iso_now()
             conn.execute("DELETE FROM main.stats_publication_stamp")
             conn.execute(
                 "INSERT INTO main.stats_publication_stamp "
                 "(record_path, started_at_utc, stamped_at_utc) VALUES (?, ?, ?)",
-                (str(record_path), started_at, _utc_iso_now()),
+                (str(record_path), started_at, stamped_at),
             )
+            # Spec §7 case 5 asks for a failure BETWEEN the publication-stamp
+            # write and the selector-identity write, so the seam sits here
+            # rather than after both. An injection after both still established
+            # the property, but it exercised a different interleaving than the
+            # one the spec names.
+            _stats_rebuild_test_pause("publication_before_commit")
+            # The SAME identity onto the durable selector row, in the SAME
+            # transaction (#496 S5b §3.4). The scratch was built before this
+            # stamp existed, so a row populated there cannot carry the identity
+            # it will publish under; writing it here is what lets a live tick
+            # prove its durable state belongs to the generation it is reading.
+            #
+            # The existence probe is not tolerance for a missing table on a real
+            # generation — `_REBUILD_REQUIRED_TABLES` makes validation refuse a
+            # scratch that lacks it. This function publishes whatever schema its
+            # scratch carries, and the publication-protocol tests build minimal
+            # synthetic generations that legitimately have no selector state.
+            if conn.execute(
+                "SELECT 1 FROM main.sqlite_schema WHERE type='table' "
+                "AND name='journal_selector_state'"
+            ).fetchone() is not None:
+                conn.execute(
+                    "UPDATE main.journal_selector_state "
+                    "SET generation_record_path = ?, "
+                    "generation_stamped_at_utc = ?",
+                    (str(record_path), stamped_at),
+                )
             phase = sp.COMMIT_UNKNOWN
             conn.commit()
             phase = sp.COMMITTED
@@ -5451,30 +7388,33 @@ def _checkpoint_after_publication(conn: sqlite3.Connection) -> str:
     return "checkpointed" if int(row[0]) == 0 else "busy"
 
 
-def _remove_empty_db_sidecars(path) -> None:
-    """Remove the sidecars a read-only validation open leaves behind.
-
-    Unlike the physical path, an in-place publish leaves a LEGITIMATE WAL: it
-    belongs to the live database, and deleting a non-empty one would discard
-    committed frames. Only a zero-length WAL is removed — the state a
-    successful TRUNCATE checkpoint and a clean last close leave — so the
-    documented sidecar-free end state still holds without ever risking data.
-    """
-    path = pathlib.Path(path)
-    wal = pathlib.Path(str(path) + "-wal")
-    try:
-        if wal.stat().st_size:
-            return
-    except OSError:
-        pass
-    for suffix in ("-wal", "-shm"):
-        try:
-            pathlib.Path(str(path) + suffix).unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return
-    _fsync_dir(path.parent)
+# An in-place publication used to unlink the live `-wal` and `-shm` here once
+# the TRUNCATE checkpoint had emptied the WAL, to reach a sidecar-free end
+# state. That is issue #516 and the call is gone: unlinking the sidecars of a
+# database other connections still hold open is outside SQLite's contract, and
+# what it cost is a data-correctness fault and a crash, NOT a cosmetic end
+# state. Two conditions have to combine, and an earlier thirteen-arrangement
+# run never combined them: something must WRITE after the unlink, and the
+# reader must already have READ before it. Re-measured on both LAN runners
+# (macOS, Python 3.13.14, SQLite 3.53.4, byte-identical on each):
+#
+#   - later writer in the SAME process — a reader that had read before the
+#     unlink, read-write or `mode=ro`, raises `OperationalError: disk I/O
+#     error`; and a connection that keeps writing through the unlinked inodes
+#     breaks the NEXT connection opened in that process the same way;
+#   - later writer in a CHILD process — that reader silently reads a STALE
+#     generation, and so does a freshly opened connection in the parent;
+#   - a reader that had NOT read before the unlink reads the current value,
+#     which is why the earlier run observed nothing;
+#   - a reader holding a pinned read transaction makes the checkpoint busy, so
+#     the unlink is refused before it can happen.
+#
+# One mechanism seen from three ends: whichever connection holds an fd on the
+# stale `-wal` inode while the shared wal-index describes frames in the other
+# `-wal` inode takes the short read. A clean last close removes both sidecars
+# by itself, so nothing is leaked; only the case where a handle is open, which
+# is exactly the case that must not be unlinked, now leaves a zero-length WAL
+# behind.
 
 
 #: Probe 2 measured the live WAL peaking at 1.01x the main file across five
@@ -5676,7 +7616,6 @@ def _publish_stats_index_in_place(
     post_error = validate_published_stats_index(
         destination, high_water, expected_record_path=str(record_path),
     )
-    _remove_empty_db_sidecars(destination)
 
     live["publicationCheckpoint"] = checkpoint_outcome
     live["postPublicationValidation"] = {
@@ -5903,8 +7842,552 @@ def _decoded_quota_stream(quota_raw, cutover_claude, counters=None):
         yield record
 
 
+#: Every field the rebuild's F11 fast path needs, captured from ONE read-only
+#: snapshot so the certificate and the sequence it is validated against cannot
+#: come from two different cache states.
+#:
+#: ``conn`` is that snapshot's connection, and it is returned still inside its
+#: read transaction. Under WAL a read transaction's snapshot is fixed at its
+#: first read, so a caller that keeps it open sees the SAME cache state for
+#: every later read — which is what lets §4.4's projection bundle be captured
+#: from the snapshot the coverage verdict was decided against, rather than from
+#: a second connection opened later.
+_CoverageSnapshot = collections.namedtuple(
+    "_CoverageSnapshot", ("certificate", "physical_seq", "conn"))
+
+
+def _close_coverage_snapshot(snapshot) -> None:
+    """End the snapshot's read transaction and close it. Never raises."""
+    if snapshot is None or snapshot.conn is None:
+        return
+    try:
+        snapshot.conn.rollback()
+    except sqlite3.Error:
+        pass
+    try:
+        snapshot.conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _read_coverage_snapshot(cache_path) -> "_CoverageSnapshot | None":
+    """The stored coverage certificate and physical sequence, in one `BEGIN`.
+
+    Read-only and WAL, so it takes NO writer flock and blocks no writer — which
+    is the whole point of the fast path it feeds. Two separate reads could see
+    a certificate from before a writer's transaction and a sequence from after
+    it, which would validate a certificate the writer had just superseded.
+
+    **The transaction is left OPEN and the caller owns closing it.** Committing
+    here would release the snapshot, and §4.4 requires the source roots, the
+    observations and the ledger state to come from the same one. Every caller
+    goes through `_close_coverage_snapshot`.
+
+    Any failure answers None, and None means replay. Every degraded state here
+    falls back silently (spec §6.3).
+    """
+    import _cctally_cache
+    try:
+        conn = sqlite3.connect(
+            f"file:{cache_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN")
+        certificate = _cctally_cache.load_codex_journal_coverage_certificate(conn)
+        row = conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone()
+    except sqlite3.Error:
+        _close_coverage_snapshot(_CoverageSnapshot(None, 0, conn))
+        return None
+    try:
+        physical_seq = 0 if row is None or row[0] is None else int(row[0])
+    except (TypeError, ValueError):
+        _close_coverage_snapshot(_CoverageSnapshot(None, 0, conn))
+        return None
+    return _CoverageSnapshot(certificate, physical_seq, conn)
+
+
+def recover_quota_cache_from_journal(high_water=None, *, quiet=False) -> dict:
+    """Replay the journal's Codex quota records into `cache.db`, no stats work.
+
+    This is the cache half of a rebuild, reachable on its own, which is what
+    lets §4.7's open-time reconciliation resume a recovery a previous rebuild
+    could not finish without re-publishing a whole generation. It reads the
+    journal once, retains the observations as RAW BYTES for the same reason the
+    rebuild does, and hands both populations to the same bounded, revalidating
+    leg — so the caps, the per-chunk lock release, the restart rules and the
+    mint are literally the same code, not a second implementation of them.
+
+    ``quiet`` suppresses the leg's `[rebuild]`-prefixed stderr. This function is
+    reachable from an ordinary command, where acceptance criterion 10 requires
+    no new stderr line and where a `[rebuild]` prefix would be a lie about which
+    operation produced it. The rebuild itself passes the default.
+
+    Returns the leg's coverage record. `complete` is what the caller gates on.
+    """
+    hw = high_water if high_water is not None else journal_high_water()
+    coverage: dict = {
+        "status": "skipped", "reason": None, "replayedObservations": 0,
+        "complete": True, "remainder": None,
+    }
+    if hw is None:
+        return coverage
+    segments = list_segments()
+    if hw[0] not in segments:
+        coverage.update({"status": "incomplete", "complete": False,
+                         "remainder": {"reason": "missingSegment"}})
+        return coverage
+    segments = segments[:segments.index(hw[0]) + 1]
+
+    quota_raw: list = []
+    file_ops: list = []
+    cutover_captured = _CUTOVER_UNSEEN
+    # Advances for a malformed line too — consumed but not decoded — exactly as
+    # the rebuild's `prior_high_water` does, because `_bounded_covered_offset`
+    # is documented against the last line the pass CONSUMED.
+    consumed_end = None
+    for segment, offset, raw in _iter_range_with_segments(None, hw, segments):
+        consumed_end = (segment, offset + len(raw) + 1)
+        rec = _lib_journal.decode_line(raw)
+        if rec is None:
+            continue
+        if (cutover_captured is _CUTOVER_UNSEEN
+                and rec.get("id") == CUTOVER_OP_ID):
+            cutover_captured = _cutover_value_of(rec)
+        if _is_codex_file_account_op(rec):
+            file_ops.append(rec)
+        elif _is_codex_quota_obs(rec):
+            quota_raw.append(raw)
+    cutover_claude = _resolve_cutover_for_rebuild(
+        cutover_captured, hw, segments)
+    _rebuild_quota_cache_leg_raw(
+        quota_raw, file_ops, cutover_claude, None,
+        high_water=hw, coverage=coverage, decoded_end=consumed_end, quiet=quiet)
+    # An absent cache.db is a clean skip for the REBUILD — the records stay
+    # durable in the journal and a later `cache-sync` re-materializes them — but
+    # it is not a completed recovery. The leg's `complete: True` describes "no
+    # duty", and this caller's gate reads it as "the cache reached its target",
+    # which for an absent cache with records to replay it certainly has not. The
+    # distinction is made here rather than in the leg so the rebuild's
+    # documented missing-cache behaviour is unchanged.
+    if (coverage.get("complete") is True
+            and (quota_raw or file_ops)
+            and not _cctally_core.CACHE_DB_PATH.exists()):
+        coverage.update({
+            "status": "incomplete", "complete": False,
+            "remainder": {
+                "observations": len(quota_raw),
+                "chunksRemaining": None,
+                "reason": "cacheAbsent",
+            },
+        })
+    return coverage
+
+
+#: How long one process waits before re-attempting a reconciliation that did not
+#: clear the flag.
+#:
+#: Nothing bounded the repetition before this. The states that leave the flag
+#: set are ordinary — `locksBusy` under a multi-agent hook storm, `restartLimit`
+#: under a competing `cache-sync --rebuild`, `noCoverageEstablished` and
+#: `mintRefused` — and in every one of them the next attempt re-read the whole
+#: journal and failed the same way. The marker is stamped on ATTEMPT rather than
+#: on outcome, because the cost this bounds is the read, which a failing attempt
+#: pays in full.
+_PROJECTION_RECONCILE_RETRY_SECONDS = 300.0
+
+
+def _projection_reconcile_marker_path():
+    """Where the last reconciliation attempt is recorded.
+
+    Resolved at call time from `APP_DIR`, not captured at import, because the
+    path constants are re-pointed by `_init_paths_from_env` and by every test
+    fixture. It is a marker file rather than a column so the throttle costs no
+    schema change: `stats_quota_projection_state` is part of the epoch-1009
+    fingerprint, and widening it would move the hardcoded literal and every
+    doctor golden with it.
+    """
+    return _cctally_core.APP_DIR / "stats.quota-reconcile.attempt"
+
+
+def _projection_reconcile_throttled() -> bool:
+    """True when the previous attempt is too recent to repeat."""
+    if _PROJECTION_RECONCILE_RETRY_SECONDS <= 0:
+        return False
+    try:
+        age = time.time() - _projection_reconcile_marker_path().stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < _PROJECTION_RECONCILE_RETRY_SECONDS
+
+
+def _stamp_projection_reconcile_attempt() -> None:
+    """Record an attempt. Never raises — a marker that cannot be written costs
+    only a repeat, and failing an unrelated command over it would be worse."""
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        _projection_reconcile_marker_path().touch()
+        os.utime(_projection_reconcile_marker_path(), None)
+    except OSError:
+        pass
+
+
+def _clear_projection_reconcile_attempt() -> None:
+    """Drop the marker after a reconciliation that actually cleared the flag.
+
+    Same never-raises posture as the stamp: a marker that cannot be removed
+    costs only a delayed retry, and failing the caller over it would be worse.
+    """
+    try:
+        _projection_reconcile_marker_path().unlink()
+    except OSError:
+        pass
+
+
+def _cache_writer_flocks_available() -> bool:
+    """One non-blocking probe of the two cache writer flocks.
+
+    The journal read is the expensive half of a recovery and was paid FIRST: a
+    pass that cannot take these flocks applies no row, so reading 1.64 GB to
+    discover that is pure waste. Taken here, after the maintenance and ingest
+    locks, so the probe respects §4.7's lock order rather than inverting it.
+    """
+    from _lib_cache_writer_lock import (
+        acquire_cache_writer_flocks, release_cache_writer_flocks,
+    )
+    try:
+        held = acquire_cache_writer_flocks(
+            _cctally_core.CACHE_LOCK_PATH,
+            _cctally_core.CACHE_LOCK_CODEX_PATH,
+            timeout=None,
+        )
+    except OSError:
+        return False
+    if held is None:
+        return False
+    release_cache_writer_flocks(held)
+    return True
+
+
+def reconcile_incomplete_quota_projection(conn) -> bool:
+    """Resume cache recovery and re-materialize a gated quota projection.
+
+    Returns whether the flag was cleared. Called from `open_db` ahead of the
+    current-epoch fast return, because §4.7's "the next open reconciles it" is
+    only enforceable if some open actually does it — `RebuildResult` is
+    process-local and a current-epoch open otherwise returns without any
+    reconciliation at all.
+
+    `open_db` only reaches this for an ARMED process
+    (`_cctally_core.enable_quota_projection_reconciliation`), because the work
+    below reads the journal from zero to the current high water and `open_db`
+    is on the status-line path. Three things bound what an armed process pays:
+    the maintenance acquire is non-blocking rather than a thirty-second wait,
+    the cache flocks are probed BEFORE the journal read, and a durable marker
+    throttles the repeat.
+
+    Lock order is the repository's, stated in §4.7 and taken in this order:
+    maintenance-exclusive, then the ingest lock, then (inside the leg) the
+    global and Codex cache flocks, then the cache snapshot, then the stats
+    transaction. The ingest acquire is OPPORTUNISTIC: an open that loses it
+    leaves the flag set and the projection gated, which is the fail-closed
+    direction, rather than blocking an interactive command behind an ingest
+    cycle.
+
+    A caller that already holds the ingest lock is skipped outright. That
+    context is the serialized writer — a rebuild or an ingest cycle — and it
+    sets or clears this flag itself; reconciling underneath it would run a
+    second recovery inside its transaction.
+    """
+    import _cctally_db
+    import _cctally_store
+    if conn is None or _cctally_store.holds_ingest_lock():
+        return False
+    # #146's rule is literally about advancing `user_version`, and this path
+    # runs after the `_uv == STATS_INDEX_EPOCH` fast return, so it changes no
+    # schema and no version. But it WRITES data rows to the real prod stats.db
+    # and cache.db, and the cutover branch beside it in `open_db` already
+    # refuses that from a dev checkout. `db rebuild` is the only setter of the
+    # flag and already carries the guard, so the exposure is small — small is
+    # not a reason for the two neighbouring write paths to disagree.
+    if _cctally_db._would_block_prod_stats(_cctally_core.DB_PATH):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT incomplete FROM stats_quota_projection_state WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        # NOT "the flag must be clear" — that justification is false and
+        # `assert_projection_readable` no longer uses it. This is the opposite
+        # decision on the opposite question: a connection whose probe fails
+        # cannot safely START a reconciliation, because the reconciliation
+        # writes through this very connection and would take the maintenance,
+        # ingest and cache locks to do it. Declining leaves the flag set, and
+        # the gate — which fails CLOSED on the same error — still refuses every
+        # projection read. The two directions agree on the outcome the user
+        # sees: no incomplete projection is served.
+        return False
+    if row is None or not int(row[0] or 0):
+        return False
+    if _projection_reconcile_throttled():
+        return False
+    try:
+        with _cctally_store.stats_open_time_guard(
+                live=True, wait_seconds=0.0):
+            # Re-read under the exclusive: another process may have reconciled
+            # it while this one waited, and re-running the whole recovery to
+            # discover that would cost a journal read for nothing.
+            try:
+                row = conn.execute(
+                    "SELECT incomplete FROM stats_quota_projection_state "
+                    "WHERE id = 1").fetchone()
+            except sqlite3.Error:
+                return False
+            if row is None or not int(row[0] or 0):
+                return False
+            fd = _acquire_ingest_lock("opportunistic", 0.0)
+            if fd is None:
+                return False
+            try:
+                if not _cache_writer_flocks_available():
+                    return False
+                _stamp_projection_reconcile_attempt()
+                coverage = recover_quota_cache_from_journal(quiet=True)
+                if coverage.get("complete") is not True:
+                    return False
+                cleared = _rematerialize_and_clear_projection_gate(
+                    conn, quiet=True)
+                if cleared:
+                    # The marker bounds the cost of a FAILING attempt. A success
+                    # leaves nothing to bound, and keeping it makes the throttle
+                    # punish the next genuine incompleteness: a flag set again
+                    # within the interval — a second interrupted rebuild, which
+                    # is exactly the sequence an upgrade under lock contention
+                    # produces — would wait the interval out for no reason.
+                    _clear_projection_reconcile_attempt()
+                return cleared
+            finally:
+                _release_ingest_lock(fd)
+    except _cctally_db.StatsDbMaintenanceError:
+        # Another process owns stats maintenance. Leaving the flag set is the
+        # fail-closed direction and costs nothing but a later attempt.
+        return False
+
+
+def _rematerialize_and_clear_projection_gate(conn, *, quiet=False) -> bool:
+    """Re-materialize the projection from a complete cache and clear the flag.
+
+    Both happen in ONE stats transaction, so a crash between them cannot leave a
+    cleared flag over a projection that was never rewritten.
+
+    The bundle is read from a read-only cache snapshot taken AFTER recovery
+    completed, which is the same ordering the rebuild's recovery path uses and
+    for the same reason: a snapshot from before those writes would miss exactly
+    the rows recovery restored.
+
+    **No bundle, no clear.** `rematerialize_quota_projection_for_rebuild`
+    treats an absent or unreadable cache as a clean no-op, so calling it with
+    `bundle=None` returns without touching a single projection row — and
+    clearing the flag afterwards would serve the partial projection the flag
+    exists to refuse over a projection this function never rewrote. Every other
+    degraded path here fails closed and this one must too.
+
+    This is the SECOND of the two guards that close that path, and the two are
+    NESTED rather than disjoint: the `cacheAbsent` remainder in
+    `recover_quota_cache_from_journal` fires on a subset of the states this one
+    covers, because an absent cache also yields no bundle. Both still earn their
+    place. The first names the state in the coverage record, which is what the
+    `db rebuild --json` `cacheRecovery.remainder.reason` reports and what an
+    operator reads; this one additionally covers a cache that EXISTS but cannot
+    be read, which the first sees as present and would let through.
+    """
+    import _cctally_quota as _q
+    cache_path = _cctally_core.CACHE_DB_PATH
+    bundle = None
+    if cache_path.exists():
+        try:
+            cache = sqlite3.connect(
+                f"file:{cache_path}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return False
+        try:
+            cache.execute("PRAGMA busy_timeout=5000")
+            cache.execute("BEGIN")
+            bundle = _q.load_quota_projection_bundle(cache)
+        except sqlite3.Error:
+            return False
+        finally:
+            try:
+                cache.rollback()
+            except sqlite3.Error:
+                pass
+            cache.close()
+    if bundle is None:
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _q.rematerialize_quota_projection_for_rebuild(conn, bundle=bundle)
+        conn.execute(
+            "UPDATE stats_quota_projection_state SET incomplete = 0, "
+            "target_version = 0, recovery_target_json = NULL WHERE id = 1")
+        conn.commit()
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        if not quiet:
+            print(f"[stats] quota projection reconciliation failed: {exc}",
+                  file=sys.stderr)
+        return False
+    return True
+
+
+#: The version stamped into `stats_quota_projection_state.target_version`.
+#:
+#: The target is VERSIONED rather than a bare coordinate so a target written by
+#: one binary is never misread by another: a later binary that changes what the
+#: target names reads a version it does not recognize and treats the projection
+#: as reconcilable-by-full-recovery instead of interpreting fields it would
+#: misunderstand.
+PROJECTION_RECOVERY_TARGET_VERSION = 1
+
+
+def _write_quota_projection_state(conn, *, coverage, high_water):
+    """Record whether this generation's quota projection is complete.
+
+    Returns the flag it wrote, or **None** when it could not write one. The
+    third state is the point: returning `False` for both "wrote clear" and
+    "could not write" is what made a shipped test vacuous, because the caller
+    then reported a complete projection for a generation whose flag says
+    nothing. `None` is fail-closed at the caller — an unwritten flag is
+    reported as incomplete, which costs a reconciliation and never serves a
+    partial projection.
+
+    Runs inside the caller's transaction, which is the one that materialized
+    the projection — the flag and the rows it describes must commit or roll
+    back together.
+
+    A coverage record with no `complete` key is a leg that never ran (a
+    `update_quota_cache=False` rebuild, or one with nothing to do), and that is
+    complete by absence rather than incomplete by ignorance.
+    """
+    incomplete = bool(coverage) and coverage.get("complete") is False
+    target = None
+    if incomplete:
+        target = json.dumps(
+            {
+                "highWater": (
+                    None if high_water is None
+                    else [str(high_water[0]), int(high_water[1])]
+                ),
+                "coveredHighWater": coverage.get("coveredHighWater"),
+                "remainder": coverage.get("remainder"),
+            },
+            separators=(",", ":"), sort_keys=True,
+        )
+    try:
+        conn.execute(
+            "INSERT INTO stats_quota_projection_state"
+            "(id, incomplete, target_version, recovery_target_json) "
+            "VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET incomplete = excluded.incomplete, "
+            "target_version = excluded.target_version, "
+            "recovery_target_json = excluded.recovery_target_json",
+            (1 if incomplete else 0,
+             PROJECTION_RECOVERY_TARGET_VERSION if incomplete else 0,
+             target),
+        )
+    except sqlite3.Error as exc:  # pragma: no cover — pre-1009 index
+        print(f"[rebuild] quota projection state not recorded: {exc}",
+              file=sys.stderr)
+        return None
+    return incomplete
+
+
+def _read_quota_projection_bundle(snapshot_out):
+    """§4.4's projection bundle from a retained coverage snapshot, or None.
+
+    ``snapshot_out`` is the single-element list the leg appends its still-open
+    read transaction to on the intact path. The bundle is read from that same
+    transaction — under WAL its snapshot is fixed at the certificate read, so
+    the certificate, the sequence, the source roots, the observations and the
+    ledger state all describe ONE cache state.
+
+    None means "no snapshot to consume", and the projection then opens its own
+    connection. That is the recovery path, where a snapshot from before the
+    leg's writes would miss the rows recovery restored, and every degraded case,
+    where falling back is the same silent full behaviour §6.3 asks for.
+    """
+    if not snapshot_out:
+        return None
+    snapshot = snapshot_out[0]
+    if snapshot is None or snapshot.conn is None:
+        return None
+    try:
+        import _cctally_quota as _q
+        return _q.load_quota_projection_bundle(snapshot.conn)
+    except (sqlite3.Error, ValueError):
+        return None
+    finally:
+        _close_coverage_snapshot(snapshot)
+
+
+def _resolve_quota_cache_coverage(cache_path, high_water, decoded_end=None):
+    """``(vector, covered, verdict, snapshot)`` for this coverage decision.
+
+    ``snapshot`` is returned with its read transaction still open, or None when
+    none could be taken. The caller closes it — on the intact path after it has
+    read §4.4's projection bundle from it, and immediately otherwise.
+
+    ``verdict`` is one of `_lib_cache_coverage`'s reason strings, and `REASON_OK`
+    means the intact path: every cache-relevant journal record in the pinned
+    prefix is already materialized, so the leg takes no writer flock at all.
+
+    Two independent checks, and BOTH are required. `certificate_is_valid` is an
+    identity check — it asks whether the certificate describes the journal and
+    cache physically in front of it — and a certificate covering only the first
+    of three segments passes it. Whether coverage REACHES this rebuild's pinned
+    high-water is a separate comparison, made here.
+
+    ``decoded_end`` is the traversal's own last complete-line boundary, and it
+    bounds the covered claim for the reason `_bounded_covered_offset` gives.
+    """
+    vector = coverage_pinned_vector()
+    covered = None
+    for name, _raw_extent, covered_offset in vector:
+        if high_water is not None and name == str(high_water[0]):
+            covered = (name, _bounded_covered_offset(
+                name, int(high_water[1]), covered_offset, decoded_end))
+    if covered is None:
+        # No boundary could be resolved at all. Reporting `identityRoot` here
+        # would tell an operator the journal identity moved when in fact the
+        # certificate was never consulted.
+        return vector, None, _lib_cache_coverage.REASON_NO_BOUNDARY, None
+    snapshot = _read_coverage_snapshot(cache_path)
+    if snapshot is None:
+        return vector, covered, _lib_cache_coverage.REASON_ABSENT, None
+    ok, reason = _lib_cache_coverage.certificate_is_valid(
+        snapshot.certificate,
+        pinned_vector=vector,
+        physical_seq=snapshot.physical_seq,
+    )
+    if not ok:
+        return vector, covered, reason, snapshot
+    if not _coordinate_covers(snapshot.certificate["coveredHighWater"], covered):
+        return (vector, covered,
+                _lib_cache_coverage.REASON_COVERED_HIGH_WATER, snapshot)
+    return vector, covered, _lib_cache_coverage.REASON_OK, snapshot
+
+
 def _rebuild_quota_cache_leg_raw(
-    quota_raw, decoded, cutover_claude, counters=None
+    quota_raw, decoded, cutover_claude, counters=None, *,
+    high_water=None, coverage=None, decoded_end=None, snapshot_out=None,
+    quiet=False, elision_gaps=None,
 ) -> float:
     """Re-materialize cache.db `quota_window_snapshots` AND the #416 Codex
     attribution map from the journal (spec §5.4 + #416 spec §3.4), fed RAW
@@ -5942,58 +8425,407 @@ def _rebuild_quota_cache_leg_raw(
     file_accounts = [
         r for r in decoded if r is not None and _is_codex_file_account_op(r)
     ]
-    if not quota_raw and not file_accounts:
+    if coverage is not None:
+        # `complete` is TRUE for a skip, and that is not a slip. Spec §4.7
+        # distinguishes stats publication success from cache-recovery
+        # completeness, and a leg with nothing to recover has no shortfall to
+        # report — the incompleteness this flag exists for is an uncovered
+        # REMAINDER, not an absent duty.
+        coverage.update({
+            "status": "skipped", "reason": None, "replayedObservations": 0,
+            "chunks": 0, "plannedChunks": 0, "restarts": 0,
+            "concurrentWriter": False, "complete": True, "remainder": None,
+        })
+    # `elision_gaps` keeps this from returning early on an empty stream: a pass
+    # that elided every quota-bearing segment has an empty `quota_raw` and a
+    # cache that may still need those observations if the certificate stopped
+    # being valid while the pass ran.
+    if not quota_raw and not file_accounts and not elision_gaps:
         return 0.0
     cache_path = _cctally_core.CACHE_DB_PATH
     if not cache_path.exists():
         return 0.0
+
+    # F11's intact path (spec §4.4). Decided from a read-only WAL snapshot
+    # BEFORE any flock is requested, so a covered cache costs this rebuild zero
+    # writer-lock hold rather than the measured 23.0 s it costs today. The
+    # vector is pinned here for the same reason `_coverage_advance_plan` pins
+    # its own before the flocks: one captured after a concurrent append would
+    # match the current journal while a record nobody applied sat inside it.
+    vector, covered, verdict, snapshot = _resolve_quota_cache_coverage(
+        cache_path, high_water, decoded_end)
+    if coverage is not None:
+        coverage["reason"] = verdict
+    if verdict == _lib_cache_coverage.REASON_OK:
+        if coverage is not None:
+            coverage.update({
+                "status": "covered",
+                "coveredHighWater": [covered[0], covered[1]],
+                "replayedObservations": 0,
+                "complete": True, "remainder": None,
+            })
+        # The intact path wrote nothing, so this snapshot still describes the
+        # cache the verdict was decided against and §4.4's projection bundle may
+        # be read from it. Hand it to the caller with its read transaction open.
+        if snapshot_out is not None:
+            snapshot_out.append(snapshot)
+        else:
+            _close_coverage_snapshot(snapshot)
+        return 0.0
+
+    # The recovery path is about to WRITE to this cache, and a snapshot taken
+    # before those writes would miss exactly the rows recovery restores. It is
+    # closed here and the projection reads its own afterwards, which is what the
+    # pre-change leg did at the same point.
+    _close_coverage_snapshot(snapshot)
+    if elision_gaps:
+        # The read pass elided on a certificate that was valid when it planned,
+        # and this leg's own verdict disagrees — an ordinary Codex batch landing
+        # mid-pass is enough, because it advances the certificate over a journal
+        # this pass did not pin. Recovery is about to replay, so the elided
+        # segments' observations are re-read now, OUTSIDE both flocks, and the
+        # replay proceeds over the same stream a non-eliding pass would have
+        # built. Elision then costs one read in the racy case rather than an
+        # unmaterialized observation under a certificate claiming coverage.
+        before = len(quota_raw)
+        quota_raw, refilled = _refill_elided_quota_raw(quota_raw, elision_gaps)
+        if not refilled:
+            # A segment this pass elided could not be re-read, so its
+            # observations are absent from the stream about to be replayed.
+            # `_run_bounded_recovery` mints whenever `covered` is not None, and
+            # `covered` is the whole pinned prefix — so leaving it set would
+            # certify coverage over rows nobody applied. Dropping it routes the
+            # pass through `noCoverageEstablished`: it applies what it holds and
+            # certifies nothing.
+            covered = None
+        if coverage is not None:
+            coverage["elisionRefill"] = {
+                "segments": len(elision_gaps),
+                "observations": len(quota_raw) - before,
+                "complete": refilled,
+            }
+    return _run_bounded_recovery(
+        quota_raw, file_accounts, cutover_claude, counters,
+        cache_path=cache_path, vector=vector, covered=covered,
+        high_water=high_water, coverage=coverage, quiet=quiet,
+    )
+
+
+#: Per-chunk caps for the recovery pass. BOTH are enforced (spec §4.5): capping
+#: by records alone lets one chunk of large observations blow the memory bound,
+#: and capping by bytes alone lets a chunk of tiny ones carry far more rows than
+#: one transaction should.
+#:
+#: 8 MiB against the maintainer's 905-byte mean observation is roughly 9,000
+#: records, so the byte cap binds first on real data and the record cap is the
+#: backstop for a journal of unusually small lines. The pair keeps peak decoded
+#: memory at one chunk, which is what makes per-chunk decode satisfy F11 and S4's
+#: measured 2.09 GB together.
+_RECOVERY_CHUNK_BYTES = 8 * 1024 * 1024
+_RECOVERY_CHUNK_RECORDS = 20_000
+
+#: How many times one pass may restart from zero before giving up and reporting
+#: an uncovered remainder. A restart is triggered by a destructive writer, and a
+#: writer that keeps clearing the cache would otherwise make this pass loop for
+#: as long as it kept doing so. Three is enough to ride out a single competing
+#: `cache-sync --rebuild`; past that the honest answer is an incomplete pass,
+#: which §4.7 already has a contract for.
+_RECOVERY_MAX_RESTARTS = 3
+
+#: Test-only seam, called with the number of chunks committed so far AFTER both
+#: flocks are released and BEFORE the next chunk requests them. That is exactly
+#: the window a competing writer can use, so a test proving a hold was RELEASED
+#: rather than merely shortened writes here rather than racing a thread.
+_RECOVERY_BETWEEN_CHUNKS = None
+
+
+def _recovery_pass_identity():
+    """``(pass_id, started_at)`` for one recovery pass.
+
+    ``started_at`` is a coarse wall clock in microseconds, and it exists only to
+    ORDER two passes for the monotonic compare-and-swap. It is never compared for
+    equality and never used as a deadline.
+    """
+    return (
+        hashlib.sha256(
+            f"{os.getpid()}:{time.time_ns()}:{id(object())}".encode("utf-8")
+        ).hexdigest()[:16],
+        int(time.time() * 1_000_000),
+    )
+
+
+def _recovery_state(cache):
+    """``(physical_seq, source_roots_digest)`` read inside the caller's txn."""
+    import _cctally_quota
+    seq = _cctally_quota.codex_physical_mutation_seq(cache)
+    digest = _lib_cache_coverage.source_roots_digest(
+        _cctally_quota._cache_root_keys(cache))
+    return seq, digest
+
+
+def _run_bounded_recovery(
+    quota_raw, file_accounts, cutover_claude, counters, *,
+    cache_path, vector, covered, high_water, coverage, quiet=False,
+) -> float:
+    """Recovery as resumable chunks, each capped by bytes AND record count.
+
+    Per chunk: decode that chunk's raw lines, acquire the global then the Codex
+    flock, `BEGIN IMMEDIATE`, revalidate, apply, persist progress, commit,
+    release both locks, discard the decoded chunk. The decode is DELIBERATELY
+    per chunk and not once up front: decoding everything first would
+    re-materialize the roughly six gigabytes of observation dictionaries S4
+    removed to bring peak heap from 6.50 GB to 2.09 GB.
+
+    **Every chunk revalidates after reacquiring the locks, because releasing
+    them admits a destructive writer.** A concurrent `cache-sync --rebuild` can
+    take the locks between two chunks, run `_clear_codex_derived_rows`, and
+    delete both the materialized quota state and the certificate. A pass that
+    resumed from an in-memory cursor would continue over cleared state and mint
+    a certificate claiming coverage the cache does not have. Progress is
+    therefore persisted separately from the certificate, every destructive clear
+    deletes it in the same transaction (`_invalidate_codex_journal_coverage_
+    certificate` does both), and a pass that finds it gone restarts from zero.
+    Restarting is always sound, because every apply is idempotent on its natural
+    key.
+
+    Two pieces of per-record state survive the chunking (spec §4.6). The anchor
+    resolver is RECONSTRUCTED per chunk — `_apply_quota_records` builds one per
+    call, and it seeds lazily from the rows already stored, so each chunk's
+    anchor decisions are made against the state committed at that moment rather
+    than against a cache another writer may have mutated underneath a
+    long-lived resolver. The conflict-report set is THREADED across the chunks
+    of one pass, so a single recovery reports at most what a single unchunked
+    call reports today.
+
+    Returns the total measured flock hold across every chunk.
+    """
+    import _cctally_cache
     from _lib_cache_writer_lock import (
         acquire_cache_writer_flocks,
         release_cache_writer_flocks,
     )
 
+    pass_id, started_at = _recovery_pass_identity()
+    identity_root = _lib_cache_coverage.identity_root(vector)
+    spans = _lib_cache_coverage.chunk_spans(
+        [len(raw) + 1 for raw in quota_raw],
+        byte_cap=_RECOVERY_CHUNK_BYTES, record_cap=_RECOVERY_CHUNK_RECORDS,
+    )
+    # NOT cleared on a restart, deliberately. §4.6 requires that one recovery
+    # report at most what a single unchunked call reports today, and a restart
+    # replays records this pass has already reported a conflict for.
+    reported_conflicts: set = set()
+    # The replay counters are cumulative across every decode this pass makes, so
+    # a restart would count the re-decoded prefix twice and inflate
+    # `traversal["quota_replay"]` against what one unchunked call reports. They
+    # are snapshotted here and restored on each restart.
+    counter_baseline = dict(counters) if counters is not None else None
+    hold_seconds = 0.0
+    restarts = 0
+    chunk_index = 0
+    applied = 0
+    committed_chunks = 0
+    outcome = "recovered"
+    stop_reason = None
+    concurrent_writer = False
+
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        held = acquire_cache_writer_flocks(
-            _cctally_core.CACHE_LOCK_PATH,
-            _cctally_core.CACHE_LOCK_CODEX_PATH,
-            timeout=15.0,
-        )
-    except OSError as exc:
-        print(f"[rebuild] quota cache leg lock failed: {exc}", file=sys.stderr)
-        return 0.0
-    if held is None:
-        print("[rebuild] quota cache leg locks busy; skipping", file=sys.stderr)
-        return 0.0
-    held_from = time.monotonic()
-    try:
+
+    def _record(status):
+        if coverage is None:
+            return
+        coverage.update({
+            "status": status,
+            "coveredHighWater": (
+                None if covered is None else [covered[0], covered[1]]),
+            "replayedObservations": applied,
+            "chunks": committed_chunks,
+            "plannedChunks": len(plan),
+            "restarts": restarts,
+            "concurrentWriter": concurrent_writer,
+            "complete": status == "recovered",
+            "remainder": (
+                None if status == "recovered"
+                else {
+                    "observations": max(0, len(quota_raw) - applied),
+                    "chunksRemaining": max(
+                        0, len(plan) - committed_chunks),
+                    "reason": stop_reason,
+                }
+            ),
+        })
+
+    # Chunk 0 carries EVERY file-account decision, because §3.5 makes the
+    # file/range decision authoritative over the observation stamp and a
+    # decision must already govern the observations it covers. That population
+    # is the retained decision records — 5.08% of a production journal — and it
+    # is bounded by the decisions rather than by the observations, so it does
+    # not reintroduce the unbounded hold the chunking exists to remove.
+    #
+    # It shares chunk 0's transaction with the first observation span rather
+    # than taking a lock cycle of its own, so a recovery small enough to fit one
+    # chunk takes exactly ONE hold — byte-identical in shape to the unchunked
+    # form this replaces.
+    if spans:
+        plan = [(True, spans[0])] + [(False, span) for span in spans[1:]]
+    else:
+        plan = [(True, None)]
+
+    while chunk_index < len(plan):
+        with_decisions, span = plan[chunk_index]
+        decoded_chunk = None
+        if span is not None:
+            start, stop, _bytes = span
+            decoded_chunk = list(_decoded_quota_stream(
+                quota_raw[start:stop], cutover_claude, counters))
         try:
-            cache = sqlite3.connect(str(cache_path), timeout=15.0)
-        except sqlite3.Error as exc:  # pragma: no cover — cache.db unopenable
-            print(f"[rebuild] quota cache leg connect failed: {exc}", file=sys.stderr)
-            return time.monotonic() - held_from
-        try:
-            cache.execute("PRAGMA busy_timeout=15000")
-            cache.execute("BEGIN IMMEDIATE")
-            # Decisions FIRST — same §3.5 precedence ordering as `_cache_applier`.
-            _, _file_conflicts = _apply_file_account_records(cache, file_accounts)
-            _apply_quota_records(
-                cache,
-                _decoded_quota_stream(quota_raw, cutover_claude, counters),
+            held = acquire_cache_writer_flocks(
+                _cctally_core.CACHE_LOCK_PATH,
+                _cctally_core.CACHE_LOCK_CODEX_PATH,
+                timeout=15.0,
             )
-            cache.commit()
-            _report_file_account_conflicts(_file_conflicts)
-        except sqlite3.Error as exc:
+        except OSError as exc:
+            if not quiet:
+                print(f"[rebuild] quota cache leg lock failed: {exc}",
+                      file=sys.stderr)
+            outcome, stop_reason = "incomplete", "lockFailed"
+            break
+        if held is None:
+            if not quiet:
+                print("[rebuild] quota cache leg locks busy; skipping",
+                      file=sys.stderr)
+            outcome, stop_reason = "incomplete", "locksBusy"
+            break
+        held_from = time.monotonic()
+        cache = None
+        try:
             try:
-                cache.rollback()
-            except sqlite3.Error:
-                pass
-            print(f"[rebuild] quota cache leg write failed: {exc}", file=sys.stderr)
+                cache = sqlite3.connect(str(cache_path), timeout=15.0)
+                cache.execute("PRAGMA busy_timeout=15000")
+                cache.execute("BEGIN IMMEDIATE")
+                if chunk_index > 0:
+                    seq, digest = _recovery_state(cache)
+                    verdict, why, saw_writer = (
+                        _lib_cache_coverage.resume_verdict(
+                            _cctally_cache.load_codex_recovery_progress(cache),
+                            pass_id=pass_id, started_at=started_at,
+                            identity_root=identity_root, physical_seq=seq,
+                            source_roots_digest=digest,
+                        )
+                    )
+                    concurrent_writer = concurrent_writer or saw_writer
+                    if verdict == _lib_cache_coverage.YIELD:
+                        cache.rollback()
+                        outcome, stop_reason = "incomplete", why
+                        break
+                    if verdict == _lib_cache_coverage.RESTART:
+                        cache.rollback()
+                        restarts += 1
+                        if restarts > _RECOVERY_MAX_RESTARTS:
+                            outcome, stop_reason = "incomplete", "restartLimit"
+                            break
+                        chunk_index = 0
+                        applied = 0
+                        committed_chunks = 0
+                        if counter_baseline is not None:
+                            counters.clear()
+                            counters.update(counter_baseline)
+                        continue
+                file_conflicts = 0
+                if with_decisions:
+                    # Decisions FIRST inside this transaction — the same §3.5
+                    # precedence ordering `_cache_applier` keeps.
+                    _restored, file_conflicts = _apply_file_account_records(
+                        cache, file_accounts)
+                if decoded_chunk is not None:
+                    _apply_quota_records(
+                        cache, decoded_chunk,
+                        reported_conflicts=reported_conflicts, quiet=quiet)
+                    applied += len(decoded_chunk)
+                last = chunk_index == len(plan) - 1
+                if last and covered is None:
+                    # No boundary was resolvable at all, so this pass covered
+                    # bytes it cannot name and established nothing. Reporting
+                    # `complete` here would say "cache recovery complete" for a
+                    # pass that certified no prefix. The progress record goes
+                    # too: it describes a run that will never be finished.
+                    cache.execute(
+                        "DELETE FROM cache_meta WHERE key = ?",
+                        (_lib_cache_coverage.PROGRESS_KEY,))
+                    cache.commit()
+                    committed_chunks += 1
+                    chunk_index += 1
+                    _report_file_account_conflicts(file_conflicts, quiet=quiet)
+                    outcome, stop_reason = "incomplete", "noCoverageEstablished"
+                    break
+                if last and covered is not None:
+                    # The pass has now replayed the whole pinned prefix, so it
+                    # is the one caller allowed to ESTABLISH coverage rather
+                    # than only extend it — it is the only writer that reads the
+                    # journal. Inside the same transaction as the last rows it
+                    # certifies, so a rollback leaves no certificate over rows
+                    # that never landed. The progress record goes away with it:
+                    # a certificate supersedes progress, and leaving both would
+                    # let a later pass resume a run that already finished.
+                    minted = _cctally_cache._advance_codex_journal_coverage(
+                        cache, prior=None, covered=covered,
+                        applied_through=(
+                            str(high_water[0]), int(high_water[1])),
+                        pinned_vector=vector, allow_mint=True)
+                    cache.execute(
+                        "DELETE FROM cache_meta WHERE key = ?",
+                        (_lib_cache_coverage.PROGRESS_KEY,))
+                    if not minted:
+                        # The mint refused — a stored certificate already reaches
+                        # further than this pass consumed to. Nothing false was
+                        # certified, but no coverage was established either, so
+                        # the honest report is an incomplete pass rather than
+                        # `complete: True` over an absent certificate.
+                        cache.commit()
+                        committed_chunks += 1
+                        chunk_index += 1
+                        _report_file_account_conflicts(file_conflicts, quiet=quiet)
+                        outcome, stop_reason = "incomplete", "mintRefused"
+                        break
+                else:
+                    seq, digest = _recovery_state(cache)
+                    _cctally_cache._store_codex_recovery_progress(
+                        cache,
+                        _lib_cache_coverage.make_progress(
+                            pass_id=pass_id, started_at=started_at,
+                            chunks=chunk_index + 1,
+                            identity_root=identity_root, physical_seq=seq,
+                            source_roots_digest=digest,
+                            covered=(covered if covered is not None
+                                     else ("", 0))),
+                    )
+                cache.commit()
+                committed_chunks += 1
+                chunk_index += 1
+                _report_file_account_conflicts(file_conflicts, quiet=quiet)
+            except sqlite3.Error as exc:
+                if cache is not None:
+                    try:
+                        cache.rollback()
+                    except sqlite3.Error:
+                        pass
+                if not quiet:
+                    print(f"[rebuild] quota cache leg write failed: {exc}",
+                          file=sys.stderr)
+                outcome, stop_reason = "failed", "writeFailed"
+                break
+            finally:
+                if cache is not None:
+                    cache.close()
         finally:
-            cache.close()
-    finally:
-        release_cache_writer_flocks(held)
-    return time.monotonic() - held_from
+            hold_seconds += time.monotonic() - held_from
+            release_cache_writer_flocks(held)
+        decoded_chunk = None
+        if _RECOVERY_BETWEEN_CHUNKS is not None:
+            _RECOVERY_BETWEEN_CHUNKS(committed_chunks)
+
+    _record(outcome)
+    return hold_seconds
 
 
 #: `_resolve_cutover_for_rebuild` distinguishes "the streaming pass never saw the
@@ -6053,6 +8885,61 @@ def _resolve_cutover_for_rebuild(captured, hw, segments, counters=None) -> str:
             value = _cutover_value_of(record)
             return value if value is not None else _lib_accounts.UNATTRIBUTED
     return _lib_accounts.UNATTRIBUTED
+
+
+def _observe_selector_desynchronization(path) -> "dict | None":
+    """The selector prefix of the index at ``path``, when it is behind its cursor.
+
+    Returns `None` for the healthy case and for every unreadable one — an absent
+    destination, a pre-1009 index without the selector tables, a missing cursor
+    row. This is diagnostic reporting over a re-derivable artifact, so it must
+    never be the reason a rebuild fails.
+    """
+    import _lib_stats_wal
+
+    path = pathlib.Path(path)
+    if not path.exists():
+        return None
+    wal_index = _lib_stats_wal.inspect_wal_index_family(path)
+    if wal_index.get("verdict") not in {"coherent", "wal_absent", "wal_empty"}:
+        # This observation is optional. Opening an unproven WAL/SHM family can
+        # rewrite its headers before the cutover path preserves the incident
+        # bytes, so only let SQLite see a raw-classified safe family (#514).
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        state = _read_selector_state(conn)
+        if state is None:
+            return None
+        cursor = _read_cursor(conn)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    covered = (state.covered_segment, state.covered_offset)
+    covered_at = _prefix_position(covered)
+    cursor_at = _prefix_position(cursor)
+    if cursor_at is None or (covered_at is not None and covered_at >= cursor_at):
+        return None
+    # A gap the live path REFUSES to re-fold is a different state from one it
+    # will close on the next tick, and only the rebuild record makes either
+    # visible. `gapBytes` is `None` when the distance could not be determined,
+    # which the live path also treats as over the cap.
+    gap_bytes = _selector_gap_bytes(covered, cursor)
+    return {
+        "coveredSegment": covered[0],
+        "coveredOffset": covered[1],
+        "cursorSegment": cursor[0],
+        "cursorOffset": int(cursor[1]),
+        "gapBytes": gap_bytes,
+        "gapByteCap": _GAP_REFOLD_BYTE_CAP,
+        "gapExceedsCap": (
+            gap_bytes is None or gap_bytes > _GAP_REFOLD_BYTE_CAP
+        ),
+    }
 
 
 def rebuild_stats_index(
@@ -6128,6 +9015,13 @@ def rebuild_stats_index(
             )
         segments = segments[:segments.index(hw[0]) + 1]
 
+    # Observed BEFORE the scratch is built, because it describes the index this
+    # rebuild is about to replace (#496 S5b). It is the only report a persistent
+    # selector desynchronization gets: the live path's own recovery is silent by
+    # §6.3's uniform policy, so without this a repeatedly degrading generation
+    # check would leave no trace anywhere.
+    selector_desync = _observe_selector_desynchronization(dest)
+
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
     scratch = dest.with_name(dest.name + f".rebuilding-{stamp}")
     _remove_db_family(scratch)
@@ -6145,6 +9039,25 @@ def rebuild_stats_index(
                      "quota_replay")
     }
     quota_lock_hold = 0.0
+    #: Whether this generation's quota projection was materialized from a cache
+    #: whose recovery left an uncovered remainder. Declared out here because the
+    #: record and the result are assembled outside the try that sets it.
+    stats_projection_incomplete = False
+    #: §4.4's single read-only WAL snapshot, carried from the quota cache leg to
+    #: the projection pass. The leg appends it ONLY on the intact path, where it
+    #: wrote nothing and its snapshot therefore still describes the cache the
+    #: coverage verdict was decided against. A destructive clear landing between
+    #: the verdict and the projection would otherwise publish a generation whose
+    #: quota projection was materialized from a cleared cache while the verdict
+    #: already read `covered`. Declared out here so the `finally` that closes it
+    #: cannot meet an unbound name.
+    quota_snapshot: list = []
+    #: #496 S5b §4.7 "recorded, not silent": the coverage verdict, the boundary
+    #: it reached and how many observations it had to replay. Additive to a
+    #: `schemaVersion: 1` record under S4's rule, and the ONLY surface reporting
+    #: it — §6.3 makes every degraded coverage state a silent full replay.
+    quota_coverage: dict = {
+        "status": "skipped", "reason": None, "replayedObservations": 0}
     tracing = tracemalloc.is_tracing()
     if tracing:
         tracemalloc.reset_peak()
@@ -6160,23 +9073,70 @@ def rebuild_stats_index(
         protocol_evidence = []
         prior_high_water = None
         cutover_captured = _CUTOVER_UNSEEN
+        # Sequence -> journal coordinate, for correction-batch MARKERS only
+        # (#496 S5b §3.5). That is what removes `_correction_commit_high_water`'s
+        # separate traversal from the live fast path, and it is bounded to the
+        # markers because nothing else is ever looked up: a production journal's
+        # 64,248 correction records carry far fewer markers than lines.
+        marker_coordinates: dict = {}
         last_seen = _lib_journal_router.LastSeenAccumulator()
+        summaries = _SegmentSummaryCollector()
+        # F12 (#496 S5b §5). Planned before the first segment is reached, from
+        # the sidecar this pass's predecessor wrote and the coverage certificate
+        # Stage 3 mints. A plan that elides nothing is exactly today's pass.
+        elision = plan_segment_elision(segments, hw)
         hasher = _lib_journal_router.PrefixHashAccumulator()
         evidence_seconds = 0.0
         prefix = traversal["stats_prefix"]
         read_started = time.monotonic()
+
+        def _elide_segment(name, lo, hi, stat_result) -> bool:
+            """Contribute an elided segment's share instead of reading it."""
+            nonlocal prior_high_water
+            nonlocal malformed
+            summary = elision.decide(name, hi, stat_result)
+            if summary is None:
+                return False
+            prefix["lines"] += summary.lines
+            prefix["bytes"] += summary.bytes
+            prefix["decodes"] += summary.decodes
+            malformed += summary.malformed
+            # EXACTLY the segment's `decoded`-entry count. A quota-only segment
+            # contributes only placeholders, and `resolve_effective_events`
+            # numbers candidates with `enumerate(records)` — three of the seven
+            # structural violation kinds hash that number into a DURABLE
+            # fingerprint that `journal_protocol_resolution` ops reference by
+            # name, so contributing the wrong count makes an acknowledged
+            # violation unresolvable (#496 S5b §5.4).
+            decoded.extend([None] * int(summary.decoded_entry_count))
+            last_seen.merge(
+                summary.last_seen_stamped,
+                summary.last_seen_legacy_claude_at,
+                summary.last_seen_legacy_codex_at,
+            )
+            summaries.adopt(summary)
+            elision.quota_gaps.append(
+                (name, len(quota_raw), summary.summarized_size, summary.lines))
+            prior_high_water = (name, int(summary.summarized_size))
+            return True
+
         if hw is not None:
             for segment, offset, raw in _iter_range_with_segments(
                 None, hw, segments,
                 on_segment=lambda name: hasher.begin_segment(
                     name, prior_high_water),
                 on_bytes=hasher.extend,
+                on_extent=lambda name, lo, hi, st: summaries.begin(
+                    name, lo, hi, st, last_seen),
+                elide=_elide_segment,
             ):
                 prefix["lines"] += 1
                 prefix["bytes"] += len(raw) + 1
+                summaries.line(raw, offset + len(raw) + 1)
                 rec = _lib_journal.decode_line(raw)
                 if rec is None:
                     malformed += 1
+                    summaries.malformed_line()
                     prior_high_water = (
                         segment,
                         offset + len(raw) + 1,
@@ -6195,16 +9155,49 @@ def rebuild_stats_index(
                         rec,
                         prior_high_water,
                         protocol_evidence,
-                        hasher=hasher,
+                        # OPTIMISTIC ELISION, RE-READ FALLBACK (#496 S5b §5.1).
+                        # `PrefixHashAccumulator` absorbs completed segments
+                        # into ONE sequential sha256 and `hashlib` can neither
+                        # export nor restore midstate, so a digest over a prefix
+                        # containing an elided segment is not computable from
+                        # the bytes this pass read. Handing `None` routes the
+                        # digest to `journal_prefix_hash`, which re-reads the
+                        # prefix from disk — including the elided segments — and
+                        # produces the byte-identical durable digest. The op's
+                        # own claimed hash is never accepted without this
+                        # recomputation.
+                        hasher=None if elision.elided else hasher,
                     )
                     evidence_seconds += time.monotonic() - evidence_started
+                    if (isinstance(rec.get("payload"), dict)
+                            and rec["payload"].get("kind")
+                            == _lib_journal._PROTOCOL_RESOLUTION_KIND):
+                        # Nothing further is elided in this pass. The
+                        # accumulator stays non-composable for the rest of it —
+                        # a gap already read is still a gap — so every later
+                        # evidence point also recomputes from disk; what this
+                        # stops is a NEW gap opening after an op that will
+                        # certainly be followed by more evidence points.
+                        elision.resolution_seen = True
                 # First cutover op wins, exactly as `find_accounts_cutover_op`
                 # scans — captured here so the rebuild reads the journal once.
                 if (cutover_captured is _CUTOVER_UNSEEN
                         and rec.get("id") == CUTOVER_OP_ID):
                     cutover_captured = _cutover_value_of(rec)
-                last_seen.observe(rec, classify_legacy_provider)
-                if rec.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES:
+                # Folded into the OPEN SEGMENT's accumulator, which
+                # `_SegmentSummaryCollector.close` merges into `last_seen` at the
+                # boundary. The merge is a per-key maximum, so the resolved map
+                # is identical to a single whole-pass fold (#496 S5b §5.4).
+                summaries.last_seen.observe(rec, classify_legacy_provider)
+                if rec.get("t") == "correction_batch":
+                    marker_coordinates[len(decoded)] = (
+                        segment,
+                        offset + len(raw) + 1,
+                    )
+                retained = (
+                    rec.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES)
+                summaries.decoded(retained)
+                if retained:
                     decoded.append(rec)
                 else:
                     if update_quota_cache and _is_codex_quota_obs(rec):
@@ -6226,12 +9219,26 @@ def rebuild_stats_index(
                     segment,
                     offset + len(raw) + 1,
                 )
+        summaries.close(last_seen)
+        # §6.3 "recorded, not silent": every elision refusal is a SILENT
+        # fallback, and this block is the only surface that says which one.
+        traversal["elision"] = elision.counters()
         phase_seconds["journal_read_decode"] = round(
             max(0.0, time.monotonic() - read_started - evidence_seconds), 6)
         phase_seconds["protocol_evidence"] = round(evidence_seconds, 6)
         traversal["protocol_evidence"]["bytes"] = hasher.bytes_hashed
         traversal["protocol_evidence"]["lines"] = hasher.digests_computed
         hasher = None
+        # The sidecar is a pure re-derivable cache, so it is refreshed on the
+        # way past rather than guarded by anything: this pass just pinned every
+        # extent it describes, and `write_sidecar` swallows its own I/O failures
+        # because a pass that could not write it is still a correct pass.
+        if summaries.summaries:
+            _lib_segment_summary.write_sidecar(
+                segment_summary_sidecar_path(),
+                [summaries.summaries[name] for name in segments
+                 if name in summaries.summaries],
+            )
 
         # Legacy account normalisation (#341, spec §2 / handoff item 2): a
         # pre-#341 real-account line lacks an account stamp — inject the cutover
@@ -6254,9 +9261,29 @@ def rebuild_stats_index(
         # malformed revision, divergent same-revision candidate, or invalid
         # committed manifest leaves the existing destination untouched.
         selection_started = time.monotonic()
+        selector_accumulators: dict = {}
         effective = _lib_journal.resolve_effective_events(
             decoded,
             protocol_prefix_evidence=protocol_evidence,
+            accumulators=selector_accumulators,
+        )
+        # Durable selector state comes from THIS pinned traversal (#496 S5b
+        # §3.3), so publication carries the fold and the index content together
+        # and nothing has to read the journal a second time to derive it. The
+        # generation identity is deliberately absent here: `stats_publication_
+        # stamp` is written after the scratch is built, so a row populated now
+        # cannot carry the identity it will publish under.
+        selector_rows = _lib_selector_state.rows_from_selection(
+            effective,
+            accumulators=selector_accumulators,
+            next_sequence=len(decoded),
+            coordinates=marker_coordinates,
+            covered=hw,
+            cutover_seen=cutover_captured is not _CUTOVER_UNSEEN,
+            cutover_account_key=(
+                None if cutover_captured is _CUTOVER_UNSEEN
+                else cutover_captured
+            ),
         )
         phase_seconds["effective_selection"] = round(
             time.monotonic() - selection_started, 6)
@@ -6268,7 +9295,10 @@ def rebuild_stats_index(
         leg_started = time.monotonic()
         if update_quota_cache:
             quota_lock_hold = _rebuild_quota_cache_leg_raw(
-                quota_raw, decoded, cutover_claude, traversal["quota_replay"])
+                quota_raw, decoded, cutover_claude, traversal["quota_replay"],
+                high_water=hw, coverage=quota_coverage,
+                decoded_end=prior_high_water, snapshot_out=quota_snapshot,
+                elision_gaps=elision.quota_gaps)
         quota_raw = []
         phase_seconds["quota_cache_leg"] = round(
             time.monotonic() - leg_started, 6)
@@ -6297,7 +9327,7 @@ def rebuild_stats_index(
         # snapshots, resets+suppression, block_close, arming, credit effects.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            _write_effective_metadata(conn, effective)
+            _write_selector_state(conn, selector_rows)
             for _order, _seq, kind, rec in structural:
                 if kind == "op":
                     FOLD_APPLIERS[(rec.get("payload") or {}).get("kind")](conn, rec)
@@ -6311,11 +9341,44 @@ def rebuild_stats_index(
             except Exception:
                 pass
             raise
+        # Reported separately from `stats_fold` because this span is PART of how
+        # long the retained cache read snapshot stays open past the point it
+        # could have been consumed — see the WAL-pinning note in
+        # docs/journal-gotchas.md. Measured at 0.56 s over a 1.6 GB journal, and
+        # that figure is a LOWER BOUND on the pin, not the pin itself: this
+        # timer starts at `fold_started`, which is set after the fold stream is
+        # built and sorted above, and the snapshot opened earlier still inside
+        # `_rebuild_quota_cache_leg_raw`. The full pin is the leg's post-snapshot
+        # span plus the stream build and sort plus this fold. `quota_cache_leg`
+        # is reported separately, so an operator can bound the first term.
+        phase_seconds["structural_fold"] = round(
+            time.monotonic() - fold_started, 6)
+
+        # §4.4's bundle is read from the retained snapshot here, BEFORE phase 2a
+        # and before the stats transaction, so the cache read transaction closes
+        # as early as it can rather than being held across a stats write. An
+        # absent or unreadable snapshot leaves the bundle None, and the
+        # projection reads its own connection exactly as it did before.
+        #
+        # An open WAL read transaction holds a read mark, so
+        # `wal_checkpoint(TRUNCATE)` from any other process returns busy for as
+        # long as this snapshot lives — which disables both of issue #297's
+        # persistent defences. Reading it here rather than after phase 2a is
+        # what bounds that window: measured on a 1.6 GB journal, the structural
+        # fold above is 0.56 s and the open-block projection below is 27.7 s, so
+        # this placement removes about 98% of the pin. The RELATIVE claim is
+        # what those two figures support; neither is the absolute pin, because
+        # the snapshot opens inside the quota cache leg and both timers start
+        # later (see the note on `structural_fold` above). It cannot move any
+        # earlier without holding the bundle's 254 MiB of observations (measured
+        # on the same store, 232,466 rows) across the structural fold as well.
+        quota_bundle = _read_quota_projection_bundle(quota_snapshot)
 
         # Phase 2a — OPEN 5h block projection (own txn; block-only). Closed blocks
         # came from block_close evts; this materializes the never-closed window(s)
         # so the five_hour_milestone block_id derived_fk resolves. Best-effort
         # (the open block is a projection, §5.3).
+        projection_started = time.monotonic()
         try:
             cctally = sys.modules.get("cctally")
             bf = getattr(cctally, "_backfill_five_hour_blocks", None)
@@ -6324,6 +9387,8 @@ def rebuild_stats_index(
         except Exception as exc:  # pragma: no cover — projection is best-effort
             print(f"[rebuild] open 5h block re-materialization failed: {exc}",
                   file=sys.stderr)
+        phase_seconds["open_block_projection"] = round(
+            time.monotonic() - projection_started, 6)
 
         # Phase 2b + 3 (txn B) — quota projection re-materialization (after the
         # order-45 arming folds) + milestone/budget folds + cursor advance.
@@ -6331,10 +9396,26 @@ def rebuild_stats_index(
         try:
             try:
                 import _cctally_quota as _q
-                _q.rematerialize_quota_projection_for_rebuild(conn)
+                _q.rematerialize_quota_projection_for_rebuild(
+                    conn, bundle=quota_bundle)
             except Exception as exc:  # pragma: no cover — projection best-effort
                 print(f"[rebuild] quota projection re-materialization failed: {exc}",
                       file=sys.stderr)
+            # §4.7's durable, per-transaction gate. It is set in the SAME
+            # transaction that materializes the projection it describes, so a
+            # rollback leaves neither, and it rides into the live index with the
+            # generation's own content — a process-local `RebuildResult` field
+            # could not survive publication, and in-place publication
+            # deliberately keeps already-open readers alive, so a connection can
+            # observe the incomplete generation without ever calling `open_db`
+            # again.
+            _written = _write_quota_projection_state(
+                conn, coverage=quota_coverage, high_water=hw)
+            # `None` is "could not write the flag at all". Fail CLOSED: report
+            # incomplete, so the generation is reconciled rather than served on
+            # the strength of a flag nobody could store.
+            stats_projection_incomplete = (
+                True if _written is None else _written)
             for _order, _seq, _kind, rec in tail:
                 _apply_evt(conn, rec)
                 lines_folded += 1
@@ -6371,11 +9452,29 @@ def rebuild_stats_index(
         if checkpoint is not None and int(checkpoint[0]) != 0:
             raise JournalError("rebuilt stats index WAL could not be drained")
         _validate_rebuilt_stats_index(conn, hw)
+        # The SEMANTIC half (#496 S5b §6.2). The structural checks above cover
+        # the new tables' existence and definition; without this, a scratch
+        # carrying correct legacy rows and WRONG selector state would validate,
+        # receive a matching generation stamp, and then be trusted by the fast
+        # path — which is the precise failure shape epic #496 exists to
+        # eliminate, reintroduced one layer up. `selector_rows` is the full
+        # selection this pass already derived from the pinned traversal, so the
+        # comparison costs no second journal read.
+        _validate_selector_state(conn, selector_rows)
         _stats_rebuild_test_pause("rebuild_scratch_complete")
         phase_seconds["scratch_validate"] = round(
             time.monotonic() - validate_started, 6)
     finally:
         conn.close()
+        # A retained coverage snapshot holds an open read transaction on
+        # `cache.db`, which pins the WAL against checkpointing for as long as it
+        # lives. `_read_quota_projection_bundle` closes it on every ordinary
+        # path; this covers the paths that raise before reaching it, which
+        # matters most in a long-lived process such as the dashboard's auto-heal
+        # thread. Closing twice is harmless.
+        for _retained in quota_snapshot:
+            _close_coverage_snapshot(_retained)
+        quota_snapshot = []
 
     # Closed, drained, validated, and durable before the old family is touched.
     _remove_db_sidecars_strict(scratch)
@@ -6427,6 +9526,7 @@ def rebuild_stats_index(
             "forensicsPath": context.forensics_path,
             "binaryVersion": _binary_version(),
             "binaryEpoch": _cctally_core.STATS_INDEX_EPOCH,
+            "sqliteRuntimeVersion": sqlite3.sqlite_version,
             "highWater": [hw[0], hw[1]] if hw is not None else None,
             "destination": str(dest),
             "targetPath": str(target_path) if target_path is not None else None,
@@ -6447,6 +9547,14 @@ def rebuild_stats_index(
             },
             "peakHeapBytes": peak_heap_bytes,
             "quotaLockHoldSeconds": round(quota_lock_hold, 6),
+            "selectorDesynchronized": selector_desync,
+            "quotaCacheCoverage": quota_coverage,
+            # §4.7: distinct from `quotaCacheCoverage`, which describes the
+            # CACHE. This describes the PUBLISHED INDEX, and a consumer must not
+            # read one as the other. The record is written before publication
+            # returns, so a crash afterwards still leaves the remainder
+            # discoverable.
+            "statsQuotaProjectionIncomplete": stats_projection_incomplete,
         },
     )
     phase_seconds["publication"] = round(
@@ -6463,6 +9571,9 @@ def rebuild_stats_index(
         traversal=traversal,
         peak_heap_bytes=peak_heap_bytes,
         quota_lock_hold_seconds=round(quota_lock_hold, 6),
+        selector_desynchronized=selector_desync,
+        quota_cache_coverage=quota_coverage,
+        stats_quota_projection_incomplete=stats_projection_incomplete,
     )
 
 

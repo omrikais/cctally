@@ -3,7 +3,7 @@ title: Budget — calendar month 2026-06
 generated_at: 2026-06-10T12:00:00Z
 period: 2026-06-01T00:00:00Z..2026-07-01T00:00:00Z
 panel: budget
-anonymized: false
+anonymized: true
 cctally_version: VERSION
 ---
 # Budget — calendar month 2026-06

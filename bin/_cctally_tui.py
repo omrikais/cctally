@@ -270,6 +270,11 @@ from _cctally_dashboard_sources import (
     refresh_codex_source_clock,
     resolve_dashboard_source_semantics,
 )
+# #496 S5b §4.7. Module level rather than lazy, unlike this module's other
+# `_cctally_quota` uses: an `except` clause needs the name bound before the
+# `try`, and `_cctally_dashboard_sources` above already imports that module at
+# ITS module level, so this adds no edge to the import graph.
+from _cctally_quota import QuotaProjectionIncomplete
 from _lib_dashboard_sources import (
     SOURCE_SCHEMA_VERSION,
     CapabilityRecord,
@@ -2607,6 +2612,23 @@ def _tui_build_source_bundle(
             raw_config if raw_config is not None else c.load_config(),
             display_tz_name=display_tz_name,
         )
+        # `codex_stats_digest`'s relation table reads `quota_projection_state`
+        # and `quota_window_blocks` from a pure kernel that may not import
+        # `_cctally_quota`, so its callers gate it (#496 S5b section 4.7).
+        #
+        # This ONE call covers the second `codex_stats_digest` below as well,
+        # and the reason is not that the gate is a property of the connection:
+        # this connection's statement-scoped autocommit reads may see mixed
+        # generations, which is exactly what `stats_generation_moved` exists to
+        # catch, so the post-build read CAN see a generation this gate never
+        # checked. It is safe because that digest is never rendered — it is only
+        # compared against this one. A generation carrying an incomplete
+        # projection produces a different digest, `stats_generation_moved` is
+        # then true, and the build returns the prior bundle or raises. An EQUAL
+        # digest means the relations did not move, so the post-build read saw
+        # the generation this gate did check.
+        from _cctally_quota import assert_projection_readable
+        assert_projection_readable(stats_conn)
         stats_digest = codex_stats_digest(stats_conn)
         # #341 finding 9: the account registry/active-identity digest. Empty for
         # every <=1-account install (byte-neutral — appended only when non-empty),
@@ -3254,6 +3276,13 @@ def _tui_build_snapshot_once(
             with _perf.phase("signature"):
                 try:
                     dispatch_sig = _tui_compute_dispatch_signature(conn)
+                except QuotaProjectionIncomplete as exc:
+                    # #496 S5b §4.7: ahead of the generic handler on purpose.
+                    # Below it the refusal is sanitized into a generic
+                    # stats-or-cache failure, which names no cause and no
+                    # remedy; the message this leg records carries both.
+                    capture_failure("quota-projection", "other", exc)
+                    dispatch_sig = None
                 except Exception as exc:
                     capture_failure("dispatch-signature", "stats_or_cache", exc)
                     dispatch_sig = None
@@ -3886,6 +3915,15 @@ def _tui_build_snapshot_once(
                 )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
+            except QuotaProjectionIncomplete as exc:
+                # #496 S5b §4.7: ahead of the generic handler on purpose. Below
+                # it the refusal was sanitized into a generic stats-or-cache
+                # failure and the bundle fell back to `prior_source_bundle`,
+                # which is `None` on a cold start — a permanently blank Codex
+                # source panel with no cause and no remedy stated. The message
+                # this leg records carries both.
+                capture_failure("quota-projection", "other", exc)
+                source_bundle = prior_source_bundle
             except Exception as exc:
                 # Public source warnings are stable/sanitized; the detailed
                 # exception remains only on the internal rebuild-error string.
@@ -4012,6 +4050,11 @@ def _tui_compute_dispatch_signature(stats_conn):
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
+    # Same gate as `_tui_build_source_bundle`, for the same reason: this is the
+    # second caller of `codex_stats_digest`, whose relation table reads the two
+    # projection tables from a pure kernel (#496 S5b section 4.7).
+    from _cctally_quota import assert_projection_readable
+    assert_projection_readable(stats_conn)
     cache_conn = c.open_cache_db()
     try:
         return sc.compute_signature(
@@ -4202,6 +4245,16 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 )
         except _StatsSnapshotCorruption:
             raise
+        except QuotaProjectionIncomplete as exc:
+            # #496 S5b §4.7, same reason as the two handlers in
+            # `_tui_build_snapshot_once`: the branch below classifies against
+            # the connection that faulted and would report a stats-or-cache
+            # fault, which is the wrong cause and the wrong remedy.
+            errors.append(f"quota-projection: {exc}")
+            idle_failures.append(SyncFailureAttribution(
+                leg="quota-projection", database="other", corruption=False,
+            ))
+            source_bundle = prior.source_bundle
         except Exception as exc:  # noqa: BLE001 — retain prior complete bundle
             # #496 S3 §8 (F16). This branch read stats through
             # `source_stats_conn` and swallowed the failure into a plain

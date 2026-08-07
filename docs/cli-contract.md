@@ -30,7 +30,19 @@ cctally exit codes fall into three groups.
 | `db checkpoint` | `3` the target DB stayed busy / the WAL was not fully truncated through the timeout (`0` = drained, already-small, or DB absent) |
 | `tui` | `1` fatal (missing `rich`, narrow terminal, renderer crash) · `2` argument error |
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |
-| share surface | `2` flag-combo error · `3` output-filename collision exhaustion |
+| share surface | `2` flag-combo error · `3` output-filename collision exhaustion, or a privacy refusal (the render detected a forbidden identifier class and, per the #503 S1 decision, fails rather than redacting — nothing is written) |
+
+**The privacy refusal's stderr line.** The CLI prints `cctally: refused to write a share artifact — ` followed verbatim by the exception message, so the text after the em dash is whichever message the detector raised. There are two, and both begin with their own prefix. A document-wide class detection prints `share artifact would disclose: ` and then one comma-separated `<class> (<offending value>)` pair per detected class, each matched value truncated, at most five pairs and then `and N more`:
+
+```
+cctally: refused to write a share artifact — share artifact would disclose: absolute path (/Users/omri/repos/alpha), canonical UUID (0f9c…d21b)
+```
+
+A project display field that reached the renderer without going through preparation prints `project display fields escaped preparation: ` and then the escaped labels, comma-separated, at most five. It carries no `(value)` pairs, because the escaped values are themselves the project labels:
+
+```
+cctally: refused to write a share artifact — project display fields escaped preparation: acme-secret, other-repo
+```
 
 **Stats-index open failures are exit `3` for every stats-reading command.** Since the DB journal redesign (§7.1) `stats.db` is a disposable journal index; a `StatsEpochMismatchError` (a version-mismatched stats.db with no journal to rebuild from) or a `StatsDbCorruptError` (corruption the auto-heal could not resolve) is caught before the generic `DatabaseError` handler and returns `3` with one-line guidance, on whichever command opened the DB. The normal mismatch/corruption case never reaches here — it self-heals by rebuild on open.
 

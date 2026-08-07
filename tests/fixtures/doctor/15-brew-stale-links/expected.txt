@@ -39,6 +39,7 @@ Journal
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
   ✓ Journal conflicts        not scanned
   ✓ Journal protocol         not scanned
+  ✓ Quota projection         not applicable
 Data
   ✓ Latest snapshot          2s ago
   ✓ Statusline pipeline      no recent regular-pool timer observed
@@ -74,4 +75,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 52 OK · 6 WARN · 0 FAIL
+Summary: 53 OK · 6 WARN · 0 FAIL

@@ -15,6 +15,7 @@ import os
 import pathlib
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -75,6 +76,42 @@ def _await_marker(
     raise AssertionError(f"process never reached pause marker {marker}")
 
 
+def _test_wal_index_snapshot(db: pathlib.Path) -> dict:
+    """Test-only structural view, derived independently from production code."""
+    wal_path = pathlib.Path(f"{db}-wal")
+    shm_path = pathlib.Path(f"{db}-shm")
+    wal = wal_path.read_bytes()
+    shm = shm_path.read_bytes()
+    native = "<" if sys.byteorder == "little" else ">"
+    page_size = struct.unpack_from(">I", wal, 8)[0]
+    mx_frame = struct.unpack_from(f"{native}I", shm, 16)[0]
+    n_page = struct.unpack_from(f"{native}I", shm, 20)[0]
+    n_backfill = struct.unpack_from(f"{native}I", shm, 96)[0]
+    n_backfill_attempted = struct.unpack_from(f"{native}I", shm, 128)[0]
+    compared = min(mx_frame, (len(wal) - 32) // (24 + page_size), 4062)
+    mismatches = []
+    for index in range(compared):
+        frame_offset = 32 + index * (24 + page_size)
+        wal_page = struct.unpack_from(">I", wal, frame_offset)[0]
+        shm_page = struct.unpack_from(f"{native}I", shm, 136 + index * 4)[0]
+        if wal_page != shm_page:
+            mismatches.append(
+                {"frame": index + 1, "walPage": wal_page, "shmPage": shm_page}
+            )
+    return {
+        "walSalt": wal[16:24].hex(),
+        "shmSalt": shm[32:40].hex(),
+        "pageSize": page_size,
+        "mxFrame": mx_frame,
+        "nPage": n_page,
+        "nBackfill": n_backfill,
+        "nBackfillAttempted": n_backfill_attempted,
+        "comparedFrames": compared,
+        "mappingMismatchCount": len(mismatches),
+        "mappingMismatchSample": mismatches[:8],
+    }
+
+
 def _strand_committed_wal_family(
     db: pathlib.Path, tmp_path: pathlib.Path
 ) -> tuple:
@@ -125,6 +162,72 @@ os.kill(os.getpid(), signal.SIGSTOP)
     shm_bytes = shm.read_bytes()
     assert wal_bytes and shm_bytes
     return wal_bytes, shm_bytes
+
+
+def _strand_incoherent_wal_index_family(
+    db: pathlib.Path, tmp_path: pathlib.Path
+) -> dict:
+    """Build a valid WAL generation beside a stale SHM generation.
+
+    The child creates and strands a real WAL/SHM pair. The parent then changes
+    only bounded SHM structural metadata to reproduce the production
+    split-generation shape without retaining any incident payload.
+    """
+    ready = tmp_path / "wal-index.ready"
+    script = """
+import os, pathlib, signal, sqlite3, sys
+db, ready = sys.argv[1:]
+conn = sqlite3.connect(db, timeout=15)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("CREATE TABLE issue514_generation (value TEXT NOT NULL)")
+conn.commit()
+assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+conn.execute("INSERT INTO issue514_generation VALUES ('current')")
+conn.commit()
+pathlib.Path(ready).write_text("ready\\n")
+os.kill(os.getpid(), signal.SIGSTOP)
+"""
+    writer = subprocess.Popen(
+        [sys.executable, "-c", script, str(db), str(ready)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _await_marker(ready, writer)
+        os.kill(writer.pid, signal.SIGKILL)
+        _stdout, stderr = writer.communicate(timeout=30)
+    finally:
+        if writer.poll() is None:
+            os.kill(writer.pid, signal.SIGKILL)
+            writer.wait(timeout=30)
+    assert writer.returncode == -signal.SIGKILL, stderr
+
+    wal = pathlib.Path(f"{db}-wal")
+    shm = pathlib.Path(f"{db}-shm")
+    current = _test_wal_index_snapshot(db)
+    stale_bytes = bytearray(shm.read_bytes())
+    # Make the stale generation identity different in both header copies; this
+    # is a bounded structural fixture, not a recoverable SHM.
+    stale_bytes[32] ^= 0x01
+    stale_bytes[80] ^= 0x01
+    shm.write_bytes(stale_bytes)
+    stale = _test_wal_index_snapshot(db)
+    assert current["walSalt"] == current["shmSalt"]
+    assert stale["walSalt"] != stale["shmSalt"]
+
+    # The production incident also carried stale aPgno[] entries. Make that
+    # mismatch explicit without invalidating the older SHM header checksum:
+    # aPgno[] is outside the checksummed 48-byte header copies.
+    native = "<" if sys.byteorder == "little" else ">"
+    wal_page = struct.unpack_from(">I", wal.read_bytes(), 32)[0]
+    with shm.open("r+b") as handle:
+        handle.seek(136)
+        handle.write(struct.pack(f"{native}I", wal_page + 1))
+    stale = _test_wal_index_snapshot(db)
+    assert stale["mappingMismatchCount"] >= 1
+    return stale
 
 
 def _destroy_header_magic(db: pathlib.Path) -> None:
@@ -366,6 +469,367 @@ def test_forensics_bundle_carries_a_structured_damage_description(ns):
     assert isinstance(damage["shapeToken"], str) and damage["shapeToken"]
 
 
+def test_forensics_classifies_a_split_wal_index_generation(ns, tmp_path):
+    """The bundle must make the production mechanism queryable without a
+    one-off parser, while retaining only bounded structural metadata."""
+    import _cctally_core
+    import _cctally_db
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    raw = _strand_incoherent_wal_index_family(db, tmp_path)
+
+    bundle_path = _cctally_db.write_corruption_forensics(
+        db,
+        trigger_origin="test.issue514",
+        trigger_exception=sqlite3.DatabaseError(
+            "database disk image is malformed"
+        ),
+    )
+    bundle = json.loads(pathlib.Path(bundle_path).read_text())
+    evidence = bundle["walIndexEvidence"]
+
+    assert bundle["sqliteRuntimeVersion"] == sqlite3.sqlite_version
+    assert evidence["schemaVersion"] == 1
+    assert evidence["verdict"] == "wal_index_generation_mismatch"
+    assert evidence["captureStable"] is True
+    assert evidence["wal"]["saltHex"] == raw["walSalt"]
+    assert evidence["shm"]["saltHex"] == raw["shmSalt"]
+    assert evidence["wal"]["pageSize"] == raw["pageSize"]
+    assert evidence["shm"]["mxFrame"] == raw["mxFrame"]
+    assert evidence["shm"]["nPage"] == raw["nPage"]
+    assert evidence["shm"]["nBackfill"] == raw["nBackfill"]
+    assert evidence["shm"]["nBackfillAttempted"] == raw[
+        "nBackfillAttempted"
+    ]
+    mapping = evidence["frameMapping"]
+    assert mapping["mismatchCount"] >= 1
+    assert mapping["comparedCount"] >= mapping["mismatchCount"]
+    assert 1 <= len(mapping["mismatchSample"]) <= 8
+    assert mapping["mismatchSample"][0] == raw["mappingMismatchSample"][0]
+    for member in (evidence["wal"], evidence["shm"]):
+        assert isinstance(member["inode"], int)
+        assert member["sizeBytes"] > 0
+        assert member["mtimeNs"] > 0
+
+
+def test_wal_index_parser_excludes_stale_tail_frames_from_mapping_count(tmp_path):
+    """Only the current WAL generation through its last commit is comparable.
+
+    The production change this catches is treating stale physical tail bytes as
+    committed frames merely because a stale SHM advertises a larger mxFrame.
+    """
+    import _lib_stats_wal
+
+    db = tmp_path / "stats.db"
+    db.write_bytes(b"fixture")
+    page_size = 512
+    current_salt = bytes.fromhex("0102030405060708")
+    stale_salt = bytes.fromhex("1112131415161718")
+    header = bytearray(32)
+    struct.pack_into(">I", header, 0, 0x377F0682)
+    struct.pack_into(">I", header, 8, page_size)
+    header[16:24] = current_salt
+
+    def frame(page, committed_pages, salt):
+        raw = bytearray(24 + page_size)
+        struct.pack_into(">II", raw, 0, page, committed_pages)
+        raw[8:16] = salt
+        return raw
+
+    pathlib.Path(f"{db}-wal").write_bytes(
+        header
+        + frame(7, 10, current_salt)
+        + frame(99, 20, stale_salt)
+    )
+    shm = bytearray(32768)
+    native = "<" if sys.byteorder == "little" else ">"
+    struct.pack_into(f"{native}H", shm, 14, page_size)
+    struct.pack_into(f"{native}I", shm, 16, 1)
+    struct.pack_into(f"{native}I", shm, 20, 10)
+    shm[32:40] = current_salt
+    shm[48:96] = shm[:48]
+    struct.pack_into(f"{native}I", shm, 136, 7)
+    struct.pack_into(f"{native}I", shm, 140, 42)
+    pathlib.Path(f"{db}-shm").write_bytes(shm)
+
+    evidence = _lib_stats_wal.inspect_wal_index_family(db)
+
+    assert evidence["wal"]["physicalFrameCount"] == 2
+    assert evidence["wal"]["currentGenerationCommitFrameCount"] == 1
+    assert evidence["frameMapping"]["comparedCount"] == 1
+    assert evidence["frameMapping"]["mismatchCount"] == 0
+    assert evidence["verdict"] == "coherent"
+
+
+def test_real_restart_stale_tail_is_coherent(tmp_path):
+    """A RESTART reuses frame 1 and leaves ordinary old-salt tail bytes."""
+    import _lib_stats_wal
+
+    db = tmp_path / "stats.db"
+    conn = sqlite3.connect(str(db), timeout=15)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE payloads (value BLOB NOT NULL)")
+        conn.executemany(
+            "INSERT INTO payloads VALUES (zeroblob(4000))",
+            [()] * 128,
+        )
+        conn.commit()
+        assert conn.execute("PRAGMA wal_checkpoint(RESTART)").fetchone()[0] == 0
+        conn.execute("INSERT INTO payloads VALUES (zeroblob(4000))")
+        conn.commit()
+
+        evidence = _lib_stats_wal.inspect_wal_index_family(db)
+    finally:
+        conn.close()
+
+    assert evidence["wal"]["physicalFrameCount"] > evidence["shm"]["mxFrame"]
+    assert evidence["wal"]["stalePhysicalTailFrameCount"] > 0
+    assert evidence["frameMapping"]["mismatchCount"] == 0
+    assert evidence["verdict"] == "coherent"
+
+
+def test_lower_shm_mxframe_and_disagreeing_header_copy_are_incoherent(
+    tmp_path,
+):
+    import _lib_stats_wal
+
+    db = tmp_path / "stats.db"
+    db.write_bytes(b"fixture")
+    page_size = 512
+    salt = bytes.fromhex("0102030405060708")
+    wal = bytearray(32 + 2 * (24 + page_size))
+    struct.pack_into(">II", wal, 0, 0x377F0682, 3007000)
+    struct.pack_into(">I", wal, 8, page_size)
+    wal[16:24] = salt
+    for index, page in enumerate((7, 8)):
+        offset = 32 + index * (24 + page_size)
+        struct.pack_into(">II", wal, offset, page, 10)
+        wal[offset + 8:offset + 16] = salt
+    pathlib.Path(f"{db}-wal").write_bytes(wal)
+
+    native = "<" if sys.byteorder == "little" else ">"
+    shm = bytearray(32768)
+    struct.pack_into(f"{native}H", shm, 14, page_size)
+    struct.pack_into(f"{native}I", shm, 16, 1)
+    struct.pack_into(f"{native}I", shm, 20, 10)
+    shm[32:40] = salt
+    shm[48:96] = shm[:48]
+    struct.pack_into(f"{native}I", shm, 136, 7)
+    pathlib.Path(f"{db}-shm").write_bytes(shm)
+
+    lower_mx = _lib_stats_wal.inspect_wal_index_family(db)
+    assert lower_mx["verdict"] == "wal_index_mapping_mismatch"
+
+    shm[48] ^= 0x01
+    pathlib.Path(f"{db}-shm").write_bytes(shm)
+    split_copies = _lib_stats_wal.inspect_wal_index_family(db)
+    assert split_copies["shm"]["headerCopiesMatch"] is False
+    assert split_copies["verdict"] == "wal_index_mapping_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("wal_bytes", "shm_bytes"),
+    [
+        (b"short", bytes(32768)),
+        (bytes(32), bytes(32768)),
+    ],
+    ids=("truncated-header", "invalid-header"),
+)
+def test_unproven_wal_shape_is_preserved_without_sqlite_open(
+    tmp_path, monkeypatch, wal_bytes, shm_bytes
+):
+    import _cctally_journal as jr
+
+    db = tmp_path / "stats.db"
+    db.write_bytes(b"main-family-byte-proof")
+    pathlib.Path(f"{db}-wal").write_bytes(wal_bytes)
+    pathlib.Path(f"{db}-shm").write_bytes(shm_bytes)
+    paths = [db, pathlib.Path(f"{db}-wal"), pathlib.Path(f"{db}-shm")]
+    before = {path.name: path.read_bytes() for path in paths}
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("unproven WAL-index shape reached sqlite3.connect")
+
+    monkeypatch.setattr(jr.sqlite3, "connect", forbidden_connect)
+    outcome = jr._prepare_existing_stats_for_cutover(db)
+
+    assert outcome == "skipped_unproven_wal_index"
+    assert {path.name: path.read_bytes() for path in paths} == before
+
+
+def test_oversized_wal_analysis_is_positionally_bounded(tmp_path, monkeypatch):
+    import _lib_stats_wal
+
+    db = tmp_path / "stats.db"
+    db.write_bytes(b"fixture")
+    page_size = 512
+    salt = bytes.fromhex("0102030405060708")
+    cap = _lib_stats_wal._FRAME_ANALYSIS_MAX
+    wal_path = pathlib.Path(f"{db}-wal")
+    with wal_path.open("wb") as handle:
+        header = bytearray(32)
+        struct.pack_into(">I", header, 0, 0x377F0682)
+        struct.pack_into(">I", header, 8, page_size)
+        header[16:24] = salt
+        handle.write(header)
+        for index in range(cap):
+            frame = bytearray(24)
+            struct.pack_into(">II", frame, 0, index + 1, cap + 1)
+            frame[8:16] = salt
+            handle.seek(32 + index * (24 + page_size))
+            handle.write(frame)
+        handle.truncate(32 + (cap * 8) * (24 + page_size))
+
+    native = "<" if sys.byteorder == "little" else ">"
+    shm = bytearray(5 * 32768)
+    struct.pack_into(f"{native}H", shm, 14, page_size)
+    struct.pack_into(f"{native}I", shm, 16, cap + 1)
+    struct.pack_into(f"{native}I", shm, 20, cap + 1)
+    shm[32:40] = salt
+    shm[48:96] = shm[:48]
+    for frame_number in range(1, cap + 1):
+        index = frame_number - 1
+        if index < 4062:
+            offset = 136 + index * 4
+        else:
+            index -= 4062
+            region = 1 + index // 4096
+            offset = region * 32768 + (index % 4096) * 4
+        struct.pack_into(f"{native}I", shm, offset, frame_number)
+    pathlib.Path(f"{db}-shm").write_bytes(shm)
+
+    read_bytes = 0
+    original = _lib_stats_wal._read_at
+
+    def counted(handle, offset, size):
+        nonlocal read_bytes
+        raw = original(handle, offset, size)
+        read_bytes += len(raw)
+        return raw
+
+    monkeypatch.setattr(_lib_stats_wal, "_read_at", counted)
+    evidence = _lib_stats_wal.inspect_wal_index_family(db)
+
+    assert evidence["verdict"] == "analysis_truncated"
+    assert evidence["frameMapping"]["truncated"] is True
+    assert read_bytes < 1024 * 1024
+
+
+def test_zero_wal_fast_path_rejects_a_refill_before_open(tmp_path, monkeypatch):
+    """The opened descriptor, not an earlier pathname stat, owns the verdict."""
+    import _lib_stats_wal
+
+    db = tmp_path / "stats.db"
+    db.write_bytes(b"fixture")
+    wal = pathlib.Path(f"{db}-wal")
+    shm = pathlib.Path(f"{db}-shm")
+    wal.write_bytes(bytes(32))
+    shm.write_bytes(bytes(32768))
+    original_stat = pathlib.Path.stat
+    first_wal_stat = True
+
+    class StaleZeroStat:
+        st_size = 0
+
+    def stale_once(path, *args, **kwargs):
+        nonlocal first_wal_stat
+        if path == wal and first_wal_stat:
+            first_wal_stat = False
+            return StaleZeroStat()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", stale_once)
+    evidence = _lib_stats_wal.inspect_wal_index_family(db)
+
+    assert evidence["verdict"] == "capture_raced"
+    assert evidence["captureStable"] is False
+    assert evidence["wal"]["sizeBytes"] == 32
+
+
+def test_incoherent_wal_index_is_preserved_without_checkpoint(ns, tmp_path):
+    """A fallback checkpoint must not consume a stale SHM page map.
+
+    The production change this catches is opening/checkpointing the old family
+    before classifying its raw WAL/SHM generation under the cutover locks.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    _strand_incoherent_wal_index_family(db, tmp_path)
+    paths = [db, pathlib.Path(f"{db}-wal"), pathlib.Path(f"{db}-shm")]
+    before = {path.name: path.read_bytes() for path in paths}
+    incident = jr._preserve_stats_family_for_cutover(
+        db,
+        context=jr.RebuildContext(
+            trigger="test-fixture",
+            record_path=str(tmp_path / "rebuild-record.json"),
+        ),
+    )
+    for path in paths:
+        assert (incident / path.name).read_bytes() == before[path.name]
+
+    outcome = jr._prepare_existing_stats_for_cutover(db)
+    damage = jr._record_post_checkpoint_damage(incident, db, outcome)
+
+    after = {
+        path.name: path.read_bytes() if path.exists() else None for path in paths
+    }
+    assert outcome == "skipped_incoherent_wal_index"
+    assert after == before, (
+        "classifying an incoherent family must not open, checkpoint, rewrite, "
+        "or remove any family member"
+    )
+    assert damage["checkpointOutcome"] == "skipped_incoherent_wal_index"
+    manifest = json.loads((incident / "manifest.json").read_text())
+    assert manifest["sqliteRuntimeVersion"] == sqlite3.sqlite_version
+    assert manifest["damage"]["checkpointOutcome"] == (
+        "skipped_incoherent_wal_index"
+    )
+
+
+def test_real_rebuild_records_incoherent_fallback_without_checkpoint(
+    ns, tmp_path, monkeypatch
+):
+    """Exercise the complete fallback, record, replace, and validation path."""
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    _strand_incoherent_wal_index_family(db, tmp_path)
+    family = [db, pathlib.Path(f"{db}-wal"), pathlib.Path(f"{db}-shm")]
+    before = {path.name: path.read_bytes() for path in family}
+    monkeypatch.setattr(
+        jr, "_publish_stats_index_in_place", lambda **_kwargs: jr._FALL_BACK
+    )
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture")
+    )
+
+    assert result.quarantine_dir is not None
+    for path in family:
+        assert (result.quarantine_dir / path.name).read_bytes() == before[path.name]
+    record = _latest_record(_cctally_core.LOG_DIR)
+    assert record["status"] == "ok"
+    assert record["publicationMechanism"] == "replace"
+    assert record["damageShapeTokens"]["checkpointOutcome"] == (
+        "skipped_incoherent_wal_index"
+    )
+    conn = sqlite3.connect(str(db), timeout=15)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots"
+        ).fetchall() == [(7.0,)]
+    finally:
+        conn.close()
+
+
 def test_a_failing_damage_scan_never_breaks_the_heal(ns, monkeypatch):
     import _cctally_core
     import _lib_stats_damage
@@ -548,7 +1012,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1008
+    assert _cctally_core.STATS_INDEX_EPOCH == 1009
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -568,7 +1032,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1008
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1009
     finally:
         conn.close()
 
@@ -641,6 +1105,7 @@ def test_a_successful_rebuild_records_both_verdicts_and_leaves_no_marker(ns):
     assert record["status"] == "ok"
     assert record["trigger"] == "db-rebuild"
     assert record["binaryEpoch"] == _cctally_core.STATS_INDEX_EPOCH
+    assert record["sqliteRuntimeVersion"] == sqlite3.sqlite_version
     assert record["prePublicationValidation"] == {"ok": True, "error": None}
     assert record["postPublicationValidation"] == {"ok": True, "error": None}
     # #496 S3: an in-place publish never preserves, because preservation is a
@@ -652,7 +1117,25 @@ def test_a_successful_rebuild_records_both_verdicts_and_leaves_no_marker(ns):
     assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
-def test_a_published_family_ends_with_no_sidecars(ns):
+def test_a_published_family_ends_with_a_drained_wal(ns):
+    """This asserted a sidecar-free end state until issue #516.
+
+    Reaching that end state meant unlinking the live `-wal` and `-shm` after
+    the TRUNCATE checkpoint, which is outside SQLite's contract whenever any
+    connection still holds the database open. Re-measured on both LAN runners
+    (macOS, Python 3.13.14, SQLite 3.53.4), that unlink breaks a same-process
+    reader with `OperationalError: disk I/O error` and leaves a cross-process
+    one silently reading a STALE generation, once something writes after the
+    unlink and the reader had read before it — two conditions an earlier
+    thirteen-arrangement run never combined, which is why it reported the
+    sequence as harmless. The publication no longer unlinks anything, so the
+    read-only validation open leaves a drained WAL behind and SQLite removes it
+    on the next clean last close.
+
+    What the publication still owes is the property the old assertion was
+    standing in for: the WAL is DRAINED, so the published bytes are in the main
+    file and a fresh opener needs no recovery to read them.
+    """
     import _cctally_core
     import _cctally_journal as jr
 
@@ -661,8 +1144,175 @@ def test_a_published_family_ends_with_no_sidecars(ns):
 
     db = pathlib.Path(_cctally_core.DB_PATH)
     assert db.exists()
-    assert not pathlib.Path(f"{db}-wal").exists()
-    assert not pathlib.Path(f"{db}-shm").exists()
+    wal = pathlib.Path(f"{db}-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+
+def test_idle_connection_keeps_sidecar_generation_across_in_place_publish(
+    ns, tmp_path
+):
+    """A zero WAL is not permission to unlink an idle connection's SHM.
+
+    The production change this catches is any manual in-place-publication
+    cleanup that removes or replaces the visible WAL/SHM inode while a real
+    SQLite connection still owns the mapped generation.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    ready = tmp_path / "idle-holder.ready"
+    holder_script = """
+import pathlib, sqlite3, sys, time
+bin_dir, db, ready = sys.argv[1:]
+sys.path.insert(0, bin_dir)
+from _lib_dashboard_sources import codex_stats_digest
+conn = sqlite3.connect(db, timeout=15)
+conn.execute("PRAGMA journal_mode=WAL")
+digest = codex_stats_digest(conn)
+pathlib.Path(ready).write_text(digest + "\\n")
+try:
+    while True:
+        time.sleep(0.1)
+finally:
+    conn.close()
+    """
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_script, str(BIN), str(db), str(ready)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _await_marker(ready, holder)
+        checkpoint = sqlite3.connect(str(db), timeout=15)
+        try:
+            assert checkpoint.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()[0] == 0
+        finally:
+            checkpoint.close()
+
+        wal = pathlib.Path(f"{db}-wal")
+        shm = pathlib.Path(f"{db}-shm")
+        assert wal.exists() and wal.stat().st_size == 0
+        assert shm.exists() and shm.stat().st_size >= 32768
+        before = {"wal": wal.stat().st_ino, "shm": shm.stat().st_ino}
+
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture")
+        )
+        after_publish = {
+            "wal": wal.stat().st_ino if wal.exists() else None,
+            "shm": shm.stat().st_ino if shm.exists() else None,
+        }
+
+        writer_script = """
+import json, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=15)
+try:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS issue514_probe (value INTEGER)")
+    conn.execute("INSERT INTO issue514_probe VALUES (1)")
+    conn.commit()
+    checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    print(json.dumps({"checkpoint": list(checkpoint)}))
+finally:
+    conn.close()
+"""
+        writer = subprocess.run(
+            [sys.executable, "-c", writer_script, str(db)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        now = int(time.time())
+        hook_style = subprocess.run(
+            [
+                sys.executable,
+                str(CCTALLY),
+                "record-usage",
+                "--percent",
+                "8.0",
+                "--resets-at",
+                str(now + 3 * 86400),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        cli_consumer = subprocess.run(
+            [sys.executable, str(CCTALLY), "doctor", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        final_inodes = {
+            "wal": wal.stat().st_ino if wal.exists() else None,
+            "shm": shm.stat().st_ino if shm.exists() else None,
+        }
+        structural = (
+            _test_wal_index_snapshot(db)
+            if wal.exists() and wal.stat().st_size >= 32 and shm.exists()
+            else None
+        )
+        print(
+            "issue514_red_evidence="
+            + json.dumps(
+                {
+                    "beforeInodes": before,
+                    "afterPublishInodes": after_publish,
+                    "finalInodes": final_inodes,
+                    "writerReturncode": writer.returncode,
+                    "writerStdout": writer.stdout.strip(),
+                    "writerStderr": writer.stderr.strip(),
+                    "hookStyleReturncode": hook_style.returncode,
+                    "hookStyleStderr": hook_style.stderr.strip(),
+                    "cliConsumerReturncode": cli_consumer.returncode,
+                    "walIndex": structural,
+                },
+                sort_keys=True,
+            )
+        )
+
+        assert after_publish == before, (
+            "in-place publication replaced or unlinked sidecars still owned "
+            f"by the idle connection: before={before}, after={after_publish}"
+        )
+        assert writer.returncode == 0, writer.stderr
+        assert json.loads(writer.stdout)["checkpoint"] == [0, 0, 0]
+        assert hook_style.returncode == 0, hook_style.stderr
+        assert cli_consumer.returncode in (0, 2), cli_consumer.stderr
+        assert json.loads(cli_consumer.stdout)["schema_version"] == 1
+        assert final_inodes == before
+        assert structural is not None, "hook traffic must leave a current WAL"
+        assert structural["comparedFrames"] > 0
+        assert structural["walSalt"] == structural["shmSalt"]
+        assert structural["mappingMismatchCount"] == 0
+        probe = sqlite3.connect(str(db), timeout=15)
+        try:
+            assert probe.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            assert probe.execute(
+                "SELECT COUNT(*) FROM issue514_probe"
+            ).fetchone()[0] == 1
+            assert probe.execute(
+                "SELECT COUNT(*) FROM weekly_usage_snapshots"
+            ).fetchone()[0] >= 2
+        finally:
+            probe.close()
+    finally:
+        holder.terminate()
+        try:
+            holder.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            holder.kill()
+            holder.communicate(timeout=10)
 
 
 def test_a_failed_post_publication_verdict_is_durable_and_refuses_the_next_open(

@@ -165,7 +165,7 @@ def test_palettes_have_required_keys():
 
 def test_render_dispatches_md():
     snap = _make_minimal_snapshot()
-    out = _lib_share.render(snap, format="md", theme="light", branding=True)
+    out = _lib_share.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
     assert isinstance(out, str)
     assert snap.title in out
 
@@ -173,7 +173,7 @@ def test_render_dispatches_md():
 def test_render_unknown_format_raises():
     snap = _make_minimal_snapshot()
     try:
-        _lib_share.render(snap, format="pdf", theme="light", branding=True)
+        _lib_share.render(snap, format="pdf", theme="light", branding=True, reveal_projects=True)
     except ValueError as e:
         assert "format" in str(e).lower()
         return
@@ -182,7 +182,7 @@ def test_render_unknown_format_raises():
 
 def test_render_dispatches_svg():
     snap = _make_minimal_snapshot()
-    out = _lib_share.render(snap, format="svg", theme="light", branding=True)
+    out = _lib_share.render(snap, format="svg", theme="light", branding=True, reveal_projects=True)
     assert isinstance(out, str)
     assert "<svg" in out
     # Title escaped into the SVG comment by the stub.
@@ -191,7 +191,7 @@ def test_render_dispatches_svg():
 
 def test_render_dispatches_html():
     snap = _make_minimal_snapshot()
-    out = _lib_share.render(snap, format="html", theme="dark", branding=True)
+    out = _lib_share.render(snap, format="html", theme="dark", branding=True, reveal_projects=True)
     assert isinstance(out, str)
     assert "<!DOCTYPE html" in out
     assert _lib_share._xml_escape(snap.title) in out
@@ -200,7 +200,7 @@ def test_render_dispatches_html():
 def test_render_unknown_theme_raises():
     snap = _make_minimal_snapshot()
     try:
-        _lib_share.render(snap, format="svg", theme="solarized", branding=True)
+        _lib_share.render(snap, format="svg", theme="solarized", branding=True, reveal_projects=True)
     except ValueError as e:
         assert "theme" in str(e).lower()
         return
@@ -222,7 +222,7 @@ import dataclasses as _dc  # noqa: E402 — used by the toggle-gating tests belo
 
 def test_render_html_omits_chart_wrapper_when_chart_none():
     snap = _dc.replace(_make_minimal_snapshot(), chart=None)
-    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    out = _lib_share.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     # The chart wrapper div has `margin-top:12px` and contains an `<svg`
     # element — emitting the wrapper means the renderer leaked the
     # empty chart area into the document.
@@ -231,7 +231,7 @@ def test_render_html_omits_chart_wrapper_when_chart_none():
 
 def test_render_html_omits_table_when_columns_empty():
     snap = _dc.replace(_make_minimal_snapshot(), columns=(), rows=())
-    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    out = _lib_share.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     # The HTML table chrome always starts with `<table style=…><thead>…`;
     # gating on `snap.columns` drops the whole element rather than
     # emitting empty `<thead><tr></tr></thead><tbody></tbody>`.
@@ -248,7 +248,7 @@ def test_render_html_emits_chart_when_chart_present():
             reference_lines=(),
         ),
     )
-    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    out = _lib_share.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     assert "<svg" in out
     assert "<table" in out
 
@@ -861,6 +861,7 @@ def test_notes_render_visibly_in_every_artifact_format():
     for format in ("md", "html", "svg"):
         out = _lib_share.render(
             snap, format=format, theme="light", branding=False,
+            reveal_projects=True,
         )
         assert (
             "Codex current-week spend is based on stale provider-cycle evidence."
@@ -1047,7 +1048,8 @@ def test_anonymized_output_contains_zero_original_tokens():
     )
     scrubbed = _lib_share._scrub(snap, reveal_projects=False)
     for fmt in ("md", "svg", "html"):
-        out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
+        out = _lib_share.render(snap, format=fmt, theme="light",
+                                branding=True, reveal_projects=False)
         assert "client-foo-internal" not in out, f"original token leaked into {fmt}"
 
 
@@ -1088,7 +1090,8 @@ def test_scrub_anonymizes_chart_only_project_label():
     assert scrubbed.chart.points[0].x_label == "project-1"
     # And the original token must not survive into ANY render output.
     for fmt in ("md", "svg", "html"):
-        out = _lib_share.render(scrubbed, format=fmt, theme="light", branding=True)
+        out = _lib_share.render(snap, format=fmt, theme="light",
+                                branding=True, reveal_projects=False)
         assert "acme-secret-project" not in out, f"chart-only token leaked into {fmt}"
 
 
@@ -1200,13 +1203,16 @@ def test_share_render_and_emit_html_writes_file(tmp_path, monkeypatch, capsys):
 
 
 def test_share_render_and_emit_scrubs_project_labels(tmp_path, monkeypatch, capsys):
-    """Privacy regression: wrapper-level scrub must fire when reveal_projects=False.
+    """Privacy regression: the wrapper must reach the anonymizing chokepoint
+    when reveal_projects=False.
 
-    Bypass-scrub regressions (e.g., refactoring _share_render_and_emit and
-    accidentally dropping the _scrub call) would not surface in the existing
-    md/html-routing tests because the minimal snapshot has no project cells.
-    Any future refactor that drops or short-circuits the scrub step must fail
-    here — original project name leaks into stdout.
+    Since #503 S1 that chokepoint is `render()`'s preparation pass, not
+    `_scrub`. A regression that stops reaching it (refactoring
+    _share_render_and_emit so it renders without passing reveal_projects
+    through, say) would not surface in the existing md/html-routing tests
+    because the minimal snapshot has no project cells. Any future refactor
+    that drops or short-circuits anonymization must fail here — the original
+    project name leaks into stdout.
     """
     snap = ShareSnapshot(
         cmd="project",
@@ -1242,7 +1248,7 @@ def test_share_render_and_emit_scrubs_project_labels(tmp_path, monkeypatch, caps
     _cctally._share_render_and_emit(snap, args)
     captured = capsys.readouterr()
     assert "acme-secret-project" not in captured.out, (
-        "wrapper bypassed _scrub: original project name leaked to output"
+        "wrapper bypassed anonymization: original project name leaked to output"
     )
     assert "project-1" in captured.out, (
         "wrapper rendered without scrub-replacement label"
@@ -1262,8 +1268,8 @@ def test_share_render_and_emit_scrubs_project_labels(tmp_path, monkeypatch, caps
 
 def test_dark_theme_uses_dark_palette_in_svg():
     snap = _make_minimal_snapshot()
-    out_dark = _lib_share.render(snap, format="svg", theme="dark", branding=True)
-    out_light = _lib_share.render(snap, format="svg", theme="light", branding=True)
+    out_dark = _lib_share.render(snap, format="svg", theme="dark", branding=True, reveal_projects=True)
+    out_light = _lib_share.render(snap, format="svg", theme="light", branding=True, reveal_projects=True)
     assert _lib_share.PALETTE_DARK["bg"] in out_dark
     assert _lib_share.PALETTE_LIGHT["bg"] in out_light
     assert out_dark != out_light
@@ -1271,8 +1277,8 @@ def test_dark_theme_uses_dark_palette_in_svg():
 
 def test_dark_theme_uses_dark_palette_in_html():
     snap = _make_minimal_snapshot()
-    out_dark = _lib_share.render(snap, format="html", theme="dark", branding=True)
-    out_light = _lib_share.render(snap, format="html", theme="light", branding=True)
+    out_dark = _lib_share.render(snap, format="html", theme="dark", branding=True, reveal_projects=True)
+    out_light = _lib_share.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     assert _lib_share.PALETTE_DARK["bg"] in out_dark
     assert _lib_share.PALETTE_LIGHT["bg"] in out_light
 
@@ -1280,16 +1286,16 @@ def test_dark_theme_uses_dark_palette_in_html():
 def test_md_theme_is_noop():
     """Markdown is theme-agnostic — rendered output is identical for light/dark."""
     snap = _make_minimal_snapshot()
-    light = _lib_share.render(snap, format="md", theme="light", branding=True)
-    dark = _lib_share.render(snap, format="md", theme="dark", branding=True)
+    light = _lib_share.render(snap, format="md", theme="light", branding=True, reveal_projects=True)
+    dark = _lib_share.render(snap, format="md", theme="dark", branding=True, reveal_projects=True)
     assert light == dark
 
 
 def test_no_branding_strips_footer_in_all_formats():
     snap = _make_minimal_snapshot()
     for fmt in ("md", "svg", "html"):
-        with_branding = _lib_share.render(snap, format=fmt, theme="light", branding=True)
-        without_branding = _lib_share.render(snap, format=fmt, theme="light", branding=False)
+        with_branding = _lib_share.render(snap, format=fmt, theme="light", branding=True, reveal_projects=True)
+        without_branding = _lib_share.render(snap, format=fmt, theme="light", branding=False, reveal_projects=True)
         assert "Generated by" in with_branding or "cctally" in with_branding, fmt
         assert "Generated by" not in without_branding, fmt
 
@@ -1297,7 +1303,7 @@ def test_no_branding_strips_footer_in_all_formats():
 def test_html_chrome_appears_exactly_once_with_branding():
     """Chrome ownership invariant (Codex finding M5)."""
     snap = _make_minimal_snapshot()
-    out = _lib_share.render(snap, format="html", theme="light", branding=True)
+    out = _lib_share.render(snap, format="html", theme="light", branding=True, reveal_projects=True)
     assert out.count("Generated by") == 1
     # Title appears once in <h1> and once in <title>; no extra duplication.
     assert out.count("<h1") == 1
@@ -1857,3 +1863,675 @@ def test_copy_falls_back_when_no_clipboard_tool(monkeypatch):
         assert e.code == 2
         return
     raise AssertionError("expected SystemExit when no clipboard tool present")
+
+
+# ---------------------------------------------------------------------
+# #503 S1 Task A1 — explicit chart-axis discriminator.
+#
+# Before this, `_apply_anon_mapping` decided whether an `x_label` was a
+# project axis by testing `x_label == project_label`. That is a guess, and
+# the two `sessions` builders deliberately violate it (they put a session
+# id in `x_label` and the project path in `project_label`), which is the
+# proximate cause of F1: the scrubber rewrote the invisible field and left
+# the visible one alone.
+# ---------------------------------------------------------------------
+
+def test_chart_point_defaults_to_plain_axis():
+    p = _lib_share.ChartPoint(x_label="2026-05-07", x_value=0.0, y_value=1.0)
+    assert p.x_label_kind == "plain"
+    assert p.x_label_prefix is None
+
+
+def _chart_point_arg_blocks(src: str):
+    """Yield the full argument text of every `ChartPoint(...)` call.
+
+    Paren-balanced rather than a non-greedy regex: `x_label=str(s.get("id"))`
+    closes a paren before the call does, so a `.*?\\)` capture would truncate
+    the block and hide the `x_label_kind=` keyword that follows.
+    """
+    import re as _re
+    for m in _re.finditer(r"ChartPoint\(", src):
+        i = m.end()
+        depth = 1
+        while i < len(src) and depth:
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+            i += 1
+        yield src[m.end():i - 1]
+
+
+def _chart_point_kwarg(block: str, name: str) -> "str | None":
+    """Extract one keyword argument's VALUE from a `ChartPoint(...)` block.
+
+    Splitting on the first comma only reads the FIRST argument, so a site
+    that put `x_value=` ahead of `x_label=` slipped the scan silently. This
+    finds the named keyword wherever it appears and returns its value up to
+    the next TOP-LEVEL comma, so `x_label=str(s.get("a", "b"))` is not cut in
+    half at the nested comma.
+    """
+    import re as _re
+    m = _re.search(rf"\b{name}\s*=", block)
+    if not m:
+        return None
+    i = start = m.end()
+    depth = 0
+    while i < len(block):
+        c = block[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            break
+        i += 1
+    return block[start:i].strip()
+
+
+def _share_source_files():
+    """Every source file in `bin/`, including the extensionless entry point.
+
+    A `bin/*.py` glob misses `bin/cctally`, which is a real Python module and
+    a real re-export surface — structural scans have silently skipped it
+    before.
+    """
+    import pathlib as _pl
+    repo = _pl.Path(__file__).resolve().parent.parent
+    return sorted(
+        p for p in (repo / "bin").iterdir()
+        if p.is_file() and (p.suffix == ".py" or p.name == "cctally")
+    )
+
+
+# A project- or session-derived `x_label`. Applied to the EXTRACTED value of
+# the `x_label` keyword, never to the whole argument block: a legitimate
+# date axis may carry `project_label=` alongside a plain `x_label`, so a
+# whole-block match would flag correct code and train the next reader to
+# ignore this test.
+_PROJECT_DERIVED_X_LABEL = r"project|proj_|session|sess_|^label$|^name$|^key$"
+
+# A date-derived `x_label`. Used only to EXEMPT a site from the structural arm
+# below, never to flag one. A chart whose gutter is a calendar axis may carry
+# `project_label=` alongside it for the tooltip, and that combination is
+# correct code.
+_DATE_DERIVED_X_LABEL = r"date|month|week|day|hour|start_at|time|period"
+
+
+def _project_axis_offenders():
+    """Every ChartPoint construction that must carry `x_label_kind` and does
+    not. Shared by the guard and its own non-vacuity check.
+
+    TWO ARMS, because the name-based arm alone is not sufficient. It reads the
+    EXPRESSION assigned to `x_label`, so it only fires when that expression is
+    spelled with a project-ish word. `bin/_lib_share_templates.py`'s two
+    sessions builders assign `str(i + 1)` — the cost rank — which names
+    nothing, so the name arm does not reach them even though both are
+    project-keyed axes and both carry `project_label=`. Deleting the marker
+    from either left the guard green, which is the defect this second arm
+    closes.
+
+    Arm 1, by name: an `x_label` expression naming a project or session
+    identity must be marked `"project"` specifically.
+
+    Arm 2, structural: a construction that sets `project_label` at all, and
+    whose `x_label` is not a calendar expression, must set `x_label_kind`.
+    Presence rather than the literal `"project"`, because the preparation pass
+    in `bin/_lib_share.py` rebuilds points with `x_label_kind=p.x_label_kind`
+    — forwarding the discriminator is what that site owes, and pinning the
+    literal there would demand it hardcode a value it must propagate.
+    """
+    import re as _re
+    offenders = []
+    for path in _share_source_files():
+        src = path.read_text(encoding="utf-8", errors="replace")
+        for block in _chart_point_arg_blocks(src):
+            value = _chart_point_kwarg(block, "x_label")
+            if not value:
+                continue
+            kind = _chart_point_kwarg(block, "x_label_kind")
+            if _re.search(_PROJECT_DERIVED_X_LABEL, value):
+                if kind != '"project"':
+                    offenders.append((path.name, "named", block.strip()[:80]))
+                continue
+            project_label = _chart_point_kwarg(block, "project_label")
+            if not project_label or project_label == "None":
+                continue
+            if _re.search(_DATE_DERIVED_X_LABEL, value):
+                continue
+            if kind is None:
+                offenders.append((path.name, "structural", block.strip()[:80]))
+    return offenders
+
+
+def test_no_project_derived_axis_is_left_plain():
+    """Every ChartPoint construction whose x_label comes from a project or
+    session identity must be marked project-keyed. Guards the F1 class:
+    a new project axis added later without the marker cannot be scrubbed.
+
+    Scans ALL of `bin/`, not the two modules that happen to hold the sites
+    today — a project-keyed axis built in a third module would otherwise
+    pass silently.
+    """
+    offenders = _project_axis_offenders()
+    assert offenders == [], f"project-derived x_label left plain: {offenders}"
+
+
+def test_the_structural_arm_covers_the_two_sessions_builders():
+    """Non-vacuity of arm 2 against the real tree, not a synthetic source.
+
+    Both sessions builders assign the cost rank to `x_label`, so arm 1 cannot
+    see them. If this count ever falls to zero, arm 2 has stopped reaching the
+    sites it was written for and `test_no_project_derived_axis_is_left_plain`
+    is back to guarding three sites out of five.
+    """
+    import re as _re
+    reached = 0
+    for path in _share_source_files():
+        src = path.read_text(encoding="utf-8", errors="replace")
+        for block in _chart_point_arg_blocks(src):
+            value = _chart_point_kwarg(block, "x_label")
+            if not value or _re.search(_PROJECT_DERIVED_X_LABEL, value):
+                continue
+            project_label = _chart_point_kwarg(block, "project_label")
+            if not project_label or project_label == "None":
+                continue
+            if _re.search(_DATE_DERIVED_X_LABEL, value):
+                continue
+            reached += 1
+    assert reached >= 3, (
+        "arm 2 reaches only %d sites; it was written to cover the two "
+        "sessions builders plus the preparation rewrite" % reached)
+
+
+def test_the_project_axis_scan_actually_matches_something():
+    """A scan that matched nothing would pass vacuously forever.
+
+    Pins that the scan finds ChartPoint sites at all, and that it classifies
+    both a known project-keyed axis and a known date axis correctly.
+    """
+    import re as _re
+    total = 0
+    project_axes = 0
+    plain_axes = 0
+    for path in _share_source_files():
+        src = path.read_text(encoding="utf-8", errors="replace")
+        for block in _chart_point_arg_blocks(src):
+            value = _chart_point_kwarg(block, "x_label")
+            if not value:
+                continue
+            total += 1
+            if _re.search(_PROJECT_DERIVED_X_LABEL, value):
+                project_axes += 1
+            elif _chart_point_kwarg(block, "x_label_kind") is None:
+                plain_axes += 1
+    assert total >= 30, f"the ChartPoint scan found only {total} sites"
+    assert project_axes >= 3, "the project-derived predicate matched nothing"
+    assert plain_axes >= 15, "the plain-axis population disappeared"
+
+
+def test_the_project_axis_scan_catches_a_planted_offender(tmp_path):
+    """Non-vacuity of the predicate itself, over synthetic sources.
+
+    Includes the two shapes the previous narrower scan missed: a site whose
+    `x_label` is not the first keyword argument, and one in a module outside
+    the two the scan used to name.
+    """
+    import re as _re
+    planted = [
+        'ChartPoint(x_label=proj_label, x_value=1.0, y_value=1.0)',
+        'ChartPoint(x_value=1.0, x_label=proj_label, y_value=1.0)',
+        'ChartPoint(x_label=str(s.get("session_id", "")), x_value=1.0)',
+    ]
+    caught = 0
+    for src in planted:
+        for block in _chart_point_arg_blocks(src):
+            value = _chart_point_kwarg(block, "x_label")
+            if value and _re.search(_PROJECT_DERIVED_X_LABEL, value) \
+                    and _chart_point_kwarg(block, "x_label_kind") != '"project"':
+                caught += 1
+    assert caught == len(planted), f"predicate caught {caught}/{len(planted)}"
+
+
+def test_the_structural_arm_catches_a_rank_labelled_offender():
+    """Arm 2 over synthetic sources, including the exact shape the two
+    sessions builders use and the two shapes arm 2 must NOT flag."""
+    import re as _re
+
+    def _is_offender(src):
+        for block in _chart_point_arg_blocks(src):
+            value = _chart_point_kwarg(block, "x_label")
+            if not value or _re.search(_PROJECT_DERIVED_X_LABEL, value):
+                return False
+            project_label = _chart_point_kwarg(block, "project_label")
+            if not project_label or project_label == "None":
+                return False
+            if _re.search(_DATE_DERIVED_X_LABEL, value):
+                return False
+            return _chart_point_kwarg(block, "x_label_kind") is None
+        return False
+
+    offenders = [
+        # The sessions-builder shape: a rank, so arm 1's name predicate is
+        # blind to it.
+        'ChartPoint(x_label=str(i + 1), x_value=1.0, project_label=raw)',
+        # A project-keyed axis whose variable name carries no project word.
+        'ChartPoint(x_label=bucket, x_value=1.0, project_label=bucket)',
+    ]
+    exempt = [
+        # A calendar axis carrying a project label for the tooltip.
+        'ChartPoint(x_label=d["date"], x_value=1.0, project_label=raw)',
+        # Already marked.
+        'ChartPoint(x_label=str(i + 1), project_label=raw, '
+        'x_label_kind="project")',
+        # No project label at all.
+        'ChartPoint(x_label=str(i + 1), x_value=1.0)',
+    ]
+    assert all(_is_offender(s) for s in offenders), offenders
+    assert not any(_is_offender(s) for s in exempt), exempt
+
+
+# ---------------------------------------------------------------------
+# #503 S1 Task A2 — kernel preparation.
+#
+# Privacy ownership moves out of `_scrub` (a hand-enumerated field walker
+# that visits 3 of 17 snapshot fields) into a preparation pass the render
+# and compose boundaries own. Preparation resolves every typed project
+# display field, stamps a provenance marker, and refuses to run twice.
+# ---------------------------------------------------------------------
+
+def _make_snapshot_with_projects(paths, *, title="Projects", identities=None):
+    """A snapshot carrying one ProjectCell row + one project-keyed chart
+    point per supplied path, cost-descending so alias rank is deterministic."""
+    costs = [100.0 - i for i in range(len(paths))]
+    ids = identities or [None] * len(paths)
+    return ShareSnapshot(
+        cmd="project",
+        title=title,
+        subtitle=None,
+        period=PeriodSpec(
+            start=datetime(2026, 4, 11, tzinfo=timezone.utc),
+            end=datetime(2026, 5, 9, tzinfo=timezone.utc),
+            display_tz="UTC", label="Apr 11 -> May 9 (UTC)",
+        ),
+        columns=(
+            ColumnSpec(key="project", label="Project", align="left"),
+            ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ),
+        rows=tuple(
+            Row(cells={
+                "project": ProjectCell(label=p, identity=ids[i]),
+                "cost": MoneyCell(costs[i]),
+            })
+            for i, p in enumerate(paths)
+        ),
+        chart=HorizontalBarChart(
+            points=tuple(
+                ChartPoint(x_label=p, x_value=costs[i], y_value=costs[i],
+                           project_label=p, project_identity=ids[i],
+                           x_label_kind="project")
+                for i, p in enumerate(paths)
+            ),
+            x_label="$", cap=None,
+        ),
+        totals=(),
+        notes=(),
+        generated_at=datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        version="9.9.9",
+    )
+
+
+def test_disambiguate_appends_parent_on_basename_collision():
+    out = _lib_share.disambiguate_basenames(
+        ["/work/app", "/personal/app", "/x/solo"])
+    assert out[0] == "app (work)"
+    assert out[1] == "app (personal)"
+    assert out[2] == "solo"
+
+
+def test_disambiguate_qualifies_further_when_parents_also_repeat():
+    """A bare parent suffix is not always enough; the fallback must stay
+    deterministic rather than collapsing the two back together."""
+    out = _lib_share.disambiguate_basenames(["/a/w/app", "/b/w/app"])
+    assert out[0] != out[1]
+    assert out[0].startswith("app (") and out[1].startswith("app (")
+
+
+def test_disambiguate_leaves_a_label_without_a_separator_alone():
+    out = _lib_share.disambiguate_basenames(["alpha", "(unknown)", "app (work)"])
+    assert out == {0: "alpha", 1: "(unknown)", 2: "app (work)"}
+
+
+def test_reveal_mode_renders_two_colliding_projects_distinctly():
+    """Bare os.path.basename would collapse these into one indistinguishable
+    label, and post-scrub into ONE alias — losing privacy uniqueness."""
+    snap = _make_snapshot_with_projects(["/work/app", "/personal/app"])
+    out = _lib_share.render(snap, format="md", theme="light", branding=True,
+                            reveal_projects=True)
+    assert "app (work)" in out and "app (personal)" in out
+
+
+def test_prepare_stamps_provenance_and_render_rejects_double_preparation():
+    snap = _make_snapshot_with_projects(["/work/app"])
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    assert _lib_share._is_prepared(prepared)
+    assert not _lib_share._is_prepared(snap), "preparation must not mark its input"
+    try:
+        _lib_share.render(prepared, format="md", theme="light", branding=True,
+                          reveal_projects=False)
+    except _lib_share.SharePreparationError:
+        return
+    raise AssertionError("render must reject an already-prepared snapshot")
+
+
+def test_inventory_reaches_fields_the_scrubber_never_visited():
+    snap = _make_snapshot_with_projects(["/work/app"], title="/Volumes/x/secret")
+    inv = _lib_share._collect_sensitive_inventory(snap)
+    assert "/Volumes/x/secret" in inv.all_strings
+
+
+def test_prepare_composes_a_project_axis_label_from_the_prefix():
+    """P7: session gutter labels become rank + project, never the id."""
+    snap = _make_snapshot_with_projects(["/work/app"])
+    ranked = _dc.replace(snap, chart=HorizontalBarChart(
+        points=(ChartPoint(x_label="9f2b-session-id", x_value=1.0, y_value=1.0,
+                           project_label="/work/app", x_label_kind="project",
+                           x_label_prefix="1"),),
+        x_label="$", cap=None,
+    ))
+    prepared = _lib_share._prepare(ranked, reveal_projects=False)
+    assert prepared.chart.points[0].x_label == "1 · project-1"
+
+
+def test_prepare_leaves_a_plain_axis_untouched():
+    snap = _dc.replace(
+        _make_minimal_snapshot(),
+        chart=BarChart(
+            points=(ChartPoint(x_label="2026-04-11", x_value=0.0, y_value=1.0),),
+            y_label="$",
+        ),
+    )
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    assert prepared.chart.points[0].x_label == "2026-04-11"
+
+
+def test_prepare_keeps_distinct_identities_distinct_under_a_shared_basename():
+    """Alias keys derive from the FULL labels before any basename reduction,
+    so two `app` projects stay two aliases rather than merging into one."""
+    snap = _make_snapshot_with_projects(["/work/app", "/personal/app"])
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    labels = [r.cells["project"].label for r in prepared.rows]
+    assert labels == ["project-1", "project-2"]
+
+
+# ---------------------------------------------------------------------
+# #503 S1 R1 — the CLI session wrapper must feed the kernel DISTINCT
+# identities.
+#
+# `disambiguate_basenames` is total: given identical paths it cannot tell
+# them apart, so it appends a stable ordinal. `_build_session_snapshot`
+# calls the wrapper with one entry per SESSION, not per distinct project,
+# so several sessions inside one repository were handed to the kernel as
+# several colliding inputs and came back as `repo (parent) (1)`,
+# `repo (parent) (2)`, `repo (parent) (3)`. `ProjectCell.identity` is
+# None on that path, so the alias key is the LABEL — one project then
+# consumed three alias slots and split its cost across three ranks.
+# ---------------------------------------------------------------------
+
+def _session_stub(session_id: str, project_path: str, cost: float):
+    """A `ClaudeSessionUsage`-shaped stub carrying only what the builder reads."""
+    ts = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    return _cctally.ClaudeSessionUsage(
+        session_id=session_id,
+        project_path=project_path,
+        source_paths=[f"/fake/{session_id}.jsonl"],
+        first_activity=ts,
+        last_activity=ts,
+        input_tokens=0,
+        cache_creation_tokens=0,
+        cache_read_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        cost_usd=cost,
+        models=["claude-sonnet-4-5"],
+        model_breakdowns=[],
+    )
+
+
+def _session_snapshot_for(paths_and_costs):
+    sessions = tuple(
+        _session_stub(f"sess-{i:04d}", path, cost)
+        for i, (path, cost) in enumerate(paths_and_costs, 1)
+    )
+    view = _cctally.SessionsView(
+        rows=(),
+        aggregated=sessions,
+        total_sessions=len(sessions),
+        total_cost_usd=sum(c for _p, c in paths_and_costs),
+    )
+    return _cctally._build_session_snapshot(
+        view,
+        period_start=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        period_end=datetime(2026, 5, 9, tzinfo=timezone.utc),
+        display_tz="Etc/UTC",
+        version="9.9.9",
+        theme="light",
+        reveal_projects=False,
+        top_n=None,
+        tz=timezone.utc,
+    )
+
+
+def test_sessions_in_one_project_share_one_label_and_one_alias():
+    """Two sessions in one repository are ONE project, not two.
+
+    Before the wrapper deduplicated, the kernel's ordinal fallback gave the
+    pair two different labels, and because the session path carries no
+    identity the alias key is the label — so one project anonymized to
+    `project-1` AND `project-2`, splitting its cost across two ranks.
+    """
+    snap = _session_snapshot_for([
+        ("/Volumes/FIXTURE/repos/cctally", 3.0),
+        ("/Volumes/FIXTURE/repos/cctally", 2.0),
+        ("/Volumes/FIXTURE/repos/other", 1.0),
+    ])
+    raw_labels = [r.cells["project"].label for r in snap.rows]
+    assert raw_labels[0] == raw_labels[1], (
+        f"two sessions in one project must carry one label, got {raw_labels}")
+    assert raw_labels[2] != raw_labels[0]
+
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    aliases = {r.cells["project"].label for r in prepared.rows}
+    assert aliases == {"project-1", "project-2"}, (
+        f"one project must consume one alias slot, got {sorted(aliases)}")
+    # The two-session project outspends the single-session one, so it must
+    # rank first.
+    assert [r.cells["project"].label for r in prepared.rows] == [
+        "project-1", "project-1", "project-2"]
+
+
+def test_sessions_in_colliding_basenames_still_disambiguate():
+    """Deduplication must not weaken the collision case it exists to serve."""
+    snap = _session_snapshot_for([
+        ("/work/app", 3.0),
+        ("/personal/app", 2.0),
+    ])
+    labels = [r.cells["project"].label for r in snap.rows]
+    assert labels == ["app (work)", "app (personal)"]
+
+
+def test_session_disambiguation_dedupes_before_reaching_the_kernel():
+    """The wrapper's contract with `disambiguate_basenames`: distinct inputs.
+
+    `disambiguate_basenames` documents that its input is a set of DISTINCT
+    identities; handing it duplicates makes it invent ordinals to keep the
+    mapping total.
+    """
+    sessions = [
+        _session_stub("a", "/repos/cctally", 3.0),
+        _session_stub("b", "/repos/cctally", 2.0),
+        _session_stub("c", "/repos/cctally", 1.0),
+    ]
+    out = _cctally._session_disambiguate_labels(sessions)
+    # Sessions absent from the dict fall back to the bare basename.
+    displayed = {out.get(i, "cctally") for i in range(len(sessions))}
+    assert displayed == {"cctally"}, (
+        f"identical paths must resolve to one label, got {out}")
+
+
+# ---------------------------------------------------------------------
+# #503 S1 R4 — ONE enumeration of project display sites.
+#
+# `_scrub` leaked because it hand-enumerated three field sites out of a
+# seventeen-field graph. Replacing it with a second hand-enumeration would
+# only move that shape: preparation would rewrite one set of fields and
+# provenance collection would read a different one, and the two would drift
+# the first time someone added a project display field to only one. So
+# `_apply_project_mapping`, `_project_display_labels` and
+# `_project_label_by_key` all derive from `_map_project_display`.
+# ---------------------------------------------------------------------
+
+def test_the_single_enumeration_reaches_all_four_display_site_kinds():
+    """The enumeration must reach cells, project columns, chart project
+    labels (including a stacked series) and project-keyed axes.
+
+    The equality against `_project_display_labels` holds by construction —
+    that function IS this visitor — and is asserted here as a record of the
+    derivation. The load-bearing assertion is the membership check below: a
+    site kind the enumeration stopped reaching would drop out of it silently.
+    """
+    snap = _dc.replace(
+        _make_snapshot_with_projects(["/work/app", "/personal/app"]),
+        columns=(
+            ColumnSpec(key="project", label="Project", align="left"),
+            ColumnSpec(key="colproj", label="/work/columnar", align="right",
+                       kind="project"),
+        ),
+        chart=BarChart(
+            points=(ChartPoint(x_label="rank-1", x_value=0.0, y_value=1.0,
+                               project_label="/work/app",
+                               x_label_kind="project", x_label_prefix="1"),),
+            y_label="$",
+            stacks={"s": (ChartPoint(x_label="/work/stacked", x_value=0.0,
+                                     y_value=1.0,
+                                     project_label="/work/stacked",
+                                     x_label_kind="project"),)},
+        ),
+    )
+    seen: set[str] = set()
+
+    def _record(site):
+        if site.value:
+            seen.add(site.value)
+        return site.value
+
+    _lib_share._map_project_display(snap, _record)
+    assert seen == _lib_share._project_display_labels(snap)
+    # Non-vacuity: all four site kinds must actually have contributed.
+    assert {"/work/app", "/personal/app", "/work/columnar", "/work/stacked",
+            "rank-1"} <= seen
+
+
+def test_every_site_the_enumeration_reaches_is_rewritten_by_preparation():
+    """A site reachable by the enumeration but skipped by preparation would
+    be a silent leak; assert preparation resolves all of them."""
+    snap = _dc.replace(
+        _make_snapshot_with_projects(["/work/app"]),
+        columns=(
+            ColumnSpec(key="project", label="Project", align="left"),
+            ColumnSpec(key="colproj", label="/work/columnar", align="right",
+                       kind="project"),
+        ),
+    )
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    emitted = _lib_share._project_display_labels(prepared)
+    assert not any(v.startswith("/") for v in emitted), emitted
+
+
+def test_project_label_by_key_ignores_the_derived_axis_site():
+    """A project-keyed `x_label` is composed from another site's resolution,
+    so keying on it would mint a bogus ("legacy", "1 · project-1") entry."""
+    snap = _dc.replace(
+        _make_snapshot_with_projects(["/work/app"]),
+        chart=HorizontalBarChart(
+            points=(ChartPoint(x_label="1 · something", x_value=1.0,
+                               y_value=1.0, project_label="/work/app",
+                               x_label_kind="project", x_label_prefix="1"),),
+            x_label="$", cap=None,
+        ),
+    )
+    by_key = _lib_share._project_label_by_key(snap)
+    assert set(by_key.values()) == {"/work/app"}
+
+
+def test_render_does_not_pay_for_the_generic_string_walk():
+    """R5: `_verify_output` never read `all_strings`, so building it on every
+    render was dead computation. It stays available as a diagnostic."""
+    snap = _make_snapshot_with_projects(["/work/app"])
+    prepared = _lib_share._prepare(snap, reveal_projects=False)
+    inv = _lib_share._inventory_for(snap, prepared)
+    assert inv.all_strings == frozenset()
+    assert inv.project_labels == frozenset({"/work/app"})
+    # The diagnostic helper still walks the whole graph.
+    diag = _lib_share._collect_sensitive_inventory(snap)
+    assert "/work/app" in diag.all_strings
+
+
+# ---------------------------------------------------------------------
+# #503 S1 R6 — a privacy refusal must be a message, not a traceback.
+#
+# `render()` raises `SharePrivacyViolation` when the artifact would disclose
+# a forbidden identifier. Nothing between the kernel and `main()` converted
+# it, so the user-facing result of a privacy detection was a Python stack
+# trace. The dashboard side was already correct — `_share_public_failure`
+# routes it into the generic envelope.
+# ---------------------------------------------------------------------
+
+def _leaking_snapshot():
+    """A snapshot whose UNTYPED `title` carries an absolute path.
+
+    Preparation rewrites only TYPED project fields, so a builder that puts a
+    path into `title` raises rather than being silently corrected — that is
+    the intended behavior, and it is what reaches the CLI user.
+    """
+    return _dc.replace(_make_minimal_snapshot(),
+                       title="/Volumes/FIXTURE/repos/sample-project")
+
+
+class _ShareArgs:
+    format = "md"
+    theme = "light"
+    no_branding = False
+    reveal_projects = False
+    open_after_write = False
+    output = None
+    copy = False
+
+
+def test_cli_refuses_with_a_message_and_exit_3(capsys):
+    import pytest as _pytest
+    with _pytest.raises(SystemExit) as exc:
+        _cctally._share_render_and_emit(_leaking_snapshot(), _ShareArgs())
+    assert exc.value.code == 3
+    err = capsys.readouterr().err
+    assert err.startswith("cctally: refused to write a share artifact"), err
+    # The finding class must be named so the user can act on it.
+    assert "absolute path" in err
+    # And the OFFENDING VALUE, because the class alone is not actionable
+    # (#503 S1 A8). The user whose repository basename is itself a UUID, or
+    # who put a path in a title, cannot find the offending string in a
+    # multi-hundred-row artifact from the word "absolute path" alone.
+    assert "/Volumes/FIXTURE/repos/sample-project" in err, err
+
+
+def test_cli_privacy_refusal_writes_nothing(tmp_path):
+    """The refusal must precede the write, not truncate a file after it."""
+    import pytest as _pytest
+    target = tmp_path / "report.md"
+
+    class _Args(_ShareArgs):
+        output = str(target)
+
+    with _pytest.raises(SystemExit):
+        _cctally._share_render_and_emit(_leaking_snapshot(), _Args())
+    assert not target.exists()

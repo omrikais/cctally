@@ -101,6 +101,11 @@ def test_doctor_state_has_required_fields():
         "journal_conflicts", "journal_protocol_violations",
         "journal_protocol_acknowledged",
         "journal_protocol_error",
+        # #496 S5b §4.7: the durable incomplete-quota-projection flag the
+        # published generation carries, read by journal.quota_projection. The
+        # flag can stay set indefinitely — only a reconciliation or a later
+        # complete rebuild clears it — so a read-only leg has to name the cause.
+        "stats_quota_projection_incomplete",
         # #341 Task 3: multi-account health legs (accounts.identity/registry/
         # freshness/attribution) all read off this single gathered snapshot.
         "accounts_state",

@@ -105,3 +105,43 @@ _golden_diff_two_str () {
     rm -f "$gtmp" "$atmp"
     return "$rc"
 }
+
+# _golden_require <label> <golden_file> <actual_file> [max_lines]
+#   The missing-golden decision, in ONE place (#503 S1 B1).
+#
+#   A missing golden used to be COPIED INTO PLACE and counted as a pass, in
+#   three separate branches across two harnesses. That makes absent coverage
+#   silently bless whatever the code emits: the very first run of a new case
+#   records the current output as correct, and nobody ever reviews it. It is
+#   also how a golden deleted by mistake heals itself into whatever the tree
+#   happens to produce.
+#
+#   So a missing golden is a FAILURE. Creating one is an explicit act, gated
+#   on CCTALLY_REGEN_GOLDENS=1, and it prints [REGEN] so it shows up in a log
+#   as something a human asked for. Under regeneration the file also lands in
+#   `git status`, which is where it gets reviewed.
+#
+#   Returns 0 = match (or regenerated), 1 = mismatch or missing.
+_golden_require () {
+    local label="$1" golden="$2" actual="$3" max="${4:-200}"
+    if [ ! -f "$golden" ]; then
+        if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
+            mkdir -p "$(dirname "$golden")"
+            cp "$actual" "$golden"
+            echo "[REGEN] ${name:-?}: created $golden"
+            return 0
+        fi
+        echo "FAIL ${name:-?}: $label has no golden at $golden"
+        echo "    (a missing golden is a failure, not an adoption — re-run with"
+        echo "     CCTALLY_REGEN_GOLDENS=1 to create it deliberately)"
+        return 1
+    fi
+    if [ "${CCTALLY_REGEN_GOLDENS:-}" = "1" ]; then
+        if ! cmp -s "$golden" "$actual"; then
+            cp "$actual" "$golden"
+            echo "[REGEN] ${name:-?}: updated $golden"
+        fi
+        return 0
+    fi
+    _golden_diff_files "$label" "$golden" "$actual" "$max"
+}

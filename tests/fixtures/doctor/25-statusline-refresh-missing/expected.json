@@ -197,7 +197,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1008,
+                            "epoch": 1009,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -634,6 +634,15 @@
                     "severity": "ok",
                     "summary": "not scanned",
                     "title": "Journal protocol"
+                },
+                {
+                    "details": {
+                        "incomplete": null
+                    },
+                    "id": "journal.quota_projection",
+                    "severity": "ok",
+                    "summary": "not applicable",
+                    "title": "Quota projection"
                 }
             ],
             "id": "journal",
@@ -977,7 +986,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 52,
+            "ok": 53,
             "warn": 6
         },
         "severity": "warn"

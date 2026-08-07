@@ -553,8 +553,9 @@ def test_budget_empty_projects_json_baseline_unchanged(pjns, capsys):
 
 
 def test_budget_share_anonymizes_project_names(pjns, capsys):
-    """Default share output anonymizes project basenames (project-1, …) via
-    the _lib_share._scrub chokepoint; the real names never appear."""
+    """Default share output anonymizes project basenames (project-1, …) in
+    `_lib_share.render()`'s preparation pass, the privacy chokepoint since
+    #503 S1; the real names never appear."""
     _pj_seed_window(pjns)
     root_a = os.path.realpath("/fake/repos/alpha")
     _pj_seed_entries(pjns, {root_a: 10})  # $18.00

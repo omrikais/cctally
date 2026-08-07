@@ -3,7 +3,7 @@ title: Diff Report — Claude + Codex
 generated_at: 2026-07-02T00:00:00Z
 period: 2026-07-01T00:00:00Z..2026-07-02T00:00:00Z
 panel: composed
-anonymized: false
+anonymized: true
 cctally_version: 9.9.9
 ---
 

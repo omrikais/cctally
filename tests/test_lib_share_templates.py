@@ -214,3 +214,50 @@ def test_template_archetype_shape(template):
         )
     else:
         assert snap.rows == (), f"{template.id}: rows expected empty, got {len(snap.rows)}"
+
+
+# --- #503 S1 P7 — session chart gutter labels carry no identifier ----------
+
+def _sessions_panel_data():
+    return {
+        "sessions": [
+            {"session_id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+             "project_path": "/Volumes/FIXTURE/repos/alpha",
+             "cost_usd": 2.15, "started_at": "2026-05-07T00:00:00Z",
+             "model": "claude-opus-4"},
+            {"session_id": "7a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9",
+             "project_path": "/Volumes/FIXTURE/repos/beta",
+             "cost_usd": 1.82, "started_at": "2026-05-06T00:00:00Z",
+             "model": "claude-sonnet-4-5"},
+        ],
+    }
+
+
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.mark.parametrize("template_id", ["sessions-visual", "sessions-detail"])
+def test_session_chart_axis_carries_rank_and_project_not_a_session_id(template_id):
+    snap = _T.get_template(template_id).builder(
+        panel_data=_sessions_panel_data(),
+        options={"format": "md", "theme": "light", "reveal_projects": False,
+                 "top_n": 8, "display_tz": "Etc/UTC"},
+    )
+    points = snap.chart.points
+    assert [p.x_label_prefix for p in points] == ["1", "2"]
+    assert all(p.x_label_kind == "project" for p in points)
+    for p in points:
+        assert "3f2504e0" not in p.x_label
+        assert "7a1b2c3d" not in p.x_label
+
+
+@_pytest.mark.parametrize("template_id", ["sessions-visual", "sessions-detail"])
+def test_prepared_session_chart_axis_reads_rank_then_alias(template_id):
+    snap = _T.get_template(template_id).builder(
+        panel_data=_sessions_panel_data(),
+        options={"format": "md", "theme": "light", "reveal_projects": False,
+                 "top_n": 8, "display_tz": "Etc/UTC"},
+    )
+    prepared = _T._LS._prepare(snap, reveal_projects=False)
+    assert [p.x_label for p in prepared.chart.points] == \
+        ["1 · project-1", "2 · project-2"]

@@ -748,113 +748,167 @@ def _is_legacy_quota_arming_state(candidate: EffectiveEvent) -> bool:
     )
 
 
-def resolve_effective_events(
-    records,
-    *,
-    protocol_prefix_evidence=(),
-) -> EffectiveSelection:
-    """Validate correction batches and select one highest revision per evt id.
+class SelectorFold:
+    """The six accumulators `resolve_effective_events` builds over the stream.
 
-    Three failure classes, deliberately asymmetric (#374 §5, #402 Task A):
+    Named and made seedable for #496 S5b: durable selector state reproduces
+    exactly these six, and an incremental pass has to continue the same fold
+    from them rather than re-running it over the whole journal prefix. Keeping
+    ONE implementation is the point — a second copy of the taint rules in the
+    incremental path would be a second thing to keep correct.
 
-    - Divergent same-revision EVENTS are **quarantined**: the lowest-sequence
-      candidate becomes the provisional winner and the group is reported on
-      `EffectiveSelection.conflicts`. The journal is append-only, so a divergent
-      line can never be un-written; raising here wedged every rebuild forever.
-    - The seven enumerated **structural** correction-batch violations taint their
-      entire batch. No action from it is a candidate; the selector continues
-      with distinct valid batches and reports a bounded `ProtocolViolation`.
-    - Invalid marker/action field shapes and every other out-of-scope
-      `JournalProtocolError` remain fatal. Unknown record types remain ignored.
+    `completed` is filled by :func:`resolve_batches`, not by the record fold.
     """
-    candidates: list[EffectiveEvent] = []
-    markers: dict[str, dict[str, tuple[dict, str, str, int]]] = {}
-    actions: dict[str, dict[int, tuple[dict, str, int]]] = {}
-    resolutions: list[tuple[int, dict]] = []
-    tainted_batches: set[str] = set()
-    violations: dict[tuple[str, str, str], ProtocolViolation] = {}
-    violation_available_after: dict[str, int] = {}
 
-    def taint(violation: ProtocolViolation, *, available_after: int) -> None:
+    __slots__ = (
+        "candidates",
+        "markers",
+        "actions",
+        "resolutions",
+        "tainted_batches",
+        "violations",
+        "violation_available_after",
+        "completed",
+    )
+
+    def __init__(self) -> None:
+        #: one entry per evt record and per action of a completed batch
+        self.candidates: list[EffectiveEvent] = []
+        #: batch id -> phase -> (normalized core, record digest, identity
+        #: digest, sequence)
+        self.markers: dict[str, dict[str, tuple[dict, str, str, int]]] = {}
+        #: batch id -> action seq -> (normalized record, record digest, sequence)
+        self.actions: dict[str, dict[int, tuple[dict, str, int]]] = {}
+        self.resolutions: list[tuple[int, dict]] = []
+        self.tainted_batches: set[str] = set()
+        self.violations: dict[tuple[str, str, str], ProtocolViolation] = {}
+        self.violation_available_after: dict[str, int] = {}
+        self.completed: set[str] = set()
+
+    def taint(self, violation: ProtocolViolation, *, available_after: int) -> None:
         """Taint one batch and retain every distinct violation identity."""
-        tainted_batches.add(violation.batch_id)
-        violations[
+        self.tainted_batches.add(violation.batch_id)
+        self.violations[
             (violation.batch_id, violation.kind, violation.fingerprint)
         ] = violation
-        violation_available_after[violation.fingerprint] = min(
+        self.violation_available_after[violation.fingerprint] = min(
             available_after,
-            violation_available_after.get(
+            self.violation_available_after.get(
                 violation.fingerprint,
                 available_after,
             ),
         )
 
-    for sequence, record in enumerate(records):
-        if not isinstance(record, dict):
-            continue
-        record_type = record.get("t")
-        if record_type == "evt":
-            candidates.append(_candidate_from_evt(record, sequence))
-            continue
-        if (
-            record_type == "op"
-            and isinstance(record.get("payload"), dict)
-            and record["payload"].get("kind") == _PROTOCOL_RESOLUTION_KIND
-        ):
-            resolutions.append(
-                (sequence, _validate_protocol_resolution(record))
-            )
-            continue
-        if record_type == "correction_batch":
-            normalized = _validate_batch_marker(record)
-            batch_id = normalized["id"]
-            phase = record["phase"]
-            digest = _sha256_canonical(record)
-            marker_identity = dict(record)
-            marker_identity.pop("phase", None)
-            identity_digest = _sha256_canonical(marker_identity)
-            prior = markers.setdefault(batch_id, {}).get(phase)
-            if prior is not None and prior[1] != digest:
-                taint(
-                    _protocol_violation(
-                        batch_id,
-                        "marker_conflict",
-                        phase=phase,
-                        firstRecordHash=prior[1],
-                        conflictingRecordHash=digest,
-                    ),
-                    available_after=max(prior[3], sequence),
-                )
-            if prior is None:
-                markers[batch_id][phase] = (
-                    normalized,
-                    digest,
-                    identity_digest,
-                    sequence,
-                )
-            continue
-        if record_type == "correction":
-            normalized = _validate_correction_record(record)
-            batch_id = normalized["batch"]
-            seq = normalized["seq"]
-            digest = _sha256_canonical(record)
-            prior = actions.setdefault(batch_id, {}).get(seq)
-            if prior is not None and prior[1] != digest:
-                taint(
-                    _protocol_violation(
-                        batch_id,
-                        "action_sequence_conflict",
-                        actionSequence=seq,
-                        firstRecordHash=prior[1],
-                        conflictingRecordHash=digest,
-                    ),
-                    available_after=max(prior[2], sequence),
-                )
-            if prior is None:
-                actions[batch_id][seq] = (normalized, digest, sequence)
 
-    completed: set[str] = set()
-    for batch_id in sorted(set(markers) | set(actions)):
+def fold_records(fold: SelectorFold, records, *, start_sequence: int = 0) -> int:
+    """Phase 1 — accumulate one record stream into ``fold``.
+
+    ``start_sequence`` is the sequence number the FIRST element takes. It is
+    non-zero only on an incremental pass continuing a durable prefix, and the
+    numbering is load-bearing: three of the seven structural violation kinds put
+    that number inside `ProtocolViolation.evidence`, which the fingerprint
+    hashes, and that fingerprint is stored durably and referenced by name from a
+    `journal_protocol_resolution` op.
+
+    Returns the sequence the NEXT stream must start at. Every element consumes
+    one sequence number, including a non-dict element, because the rebuild
+    appends an explicit placeholder for every valid decoded non-retained record.
+    """
+    sequence = start_sequence
+    for record in records:
+        _fold_one(fold, record, sequence)
+        sequence += 1
+    return sequence
+
+
+def _fold_one(fold: SelectorFold, record, sequence: int) -> None:
+    candidates = fold.candidates
+    markers = fold.markers
+    actions = fold.actions
+    resolutions = fold.resolutions
+    taint = fold.taint
+    if not isinstance(record, dict):
+        return
+    record_type = record.get("t")
+    if record_type == "evt":
+        candidates.append(_candidate_from_evt(record, sequence))
+        return
+    if (
+        record_type == "op"
+        and isinstance(record.get("payload"), dict)
+        and record["payload"].get("kind") == _PROTOCOL_RESOLUTION_KIND
+    ):
+        resolutions.append(
+            (sequence, _validate_protocol_resolution(record))
+        )
+        return
+    if record_type == "correction_batch":
+        normalized = _validate_batch_marker(record)
+        batch_id = normalized["id"]
+        phase = record["phase"]
+        digest = _sha256_canonical(record)
+        marker_identity = dict(record)
+        marker_identity.pop("phase", None)
+        identity_digest = _sha256_canonical(marker_identity)
+        prior = markers.setdefault(batch_id, {}).get(phase)
+        if prior is not None and prior[1] != digest:
+            taint(
+                _protocol_violation(
+                    batch_id,
+                    "marker_conflict",
+                    phase=phase,
+                    firstRecordHash=prior[1],
+                    conflictingRecordHash=digest,
+                ),
+                available_after=max(prior[3], sequence),
+            )
+        if prior is None:
+            markers[batch_id][phase] = (
+                normalized,
+                digest,
+                identity_digest,
+                sequence,
+            )
+        return
+    if record_type == "correction":
+        normalized = _validate_correction_record(record)
+        batch_id = normalized["batch"]
+        seq = normalized["seq"]
+        digest = _sha256_canonical(record)
+        prior = actions.setdefault(batch_id, {}).get(seq)
+        if prior is not None and prior[1] != digest:
+            taint(
+                _protocol_violation(
+                    batch_id,
+                    "action_sequence_conflict",
+                    actionSequence=seq,
+                    firstRecordHash=prior[1],
+                    conflictingRecordHash=digest,
+                ),
+                available_after=max(prior[2], sequence),
+            )
+        if prior is None:
+            actions[batch_id][seq] = (normalized, digest, sequence)
+
+
+def resolve_batches(fold: SelectorFold, *, batch_ids=None) -> None:
+    """Phase 2 — decide completion or taint for each accumulated batch.
+
+    ``batch_ids`` restricts the pass. An incremental caller passes the batches
+    whose durable status is not already `completed`: a completed batch's action
+    cores are deliberately dropped once it completes, so its verdict is carried
+    forward rather than re-derived, and a later record that conflicts with it is
+    detected in phase 1 from the retained whole-record digest instead.
+    """
+    candidates = fold.candidates
+    markers = fold.markers
+    actions = fold.actions
+    tainted_batches = fold.tainted_batches
+    completed = fold.completed
+    taint = fold.taint
+    if batch_ids is None:
+        batch_ids = set(markers) | set(actions)
+    for batch_id in sorted(batch_ids):
         batch_markers = markers.get(batch_id, {})
         begin = batch_markers.get("begin")
         commit = batch_markers.get("commit")
@@ -873,8 +927,15 @@ def resolve_effective_events(
         if begin is None or commit is None:
             continue
         begin_core, _begin_hash, begin_identity, begin_sequence = begin
-        commit_core, _commit_hash, commit_identity, commit_sequence = commit
-        if begin_core != commit_core or begin_identity != commit_identity:
+        _commit_core, _commit_hash, commit_identity, commit_sequence = commit
+        # The identity digest covers the whole marker record MINUS its phase,
+        # and the normalized core is a pure function of fields inside that
+        # digest, so equal identities imply equal cores and unequal cores imply
+        # unequal identities. Comparing identities alone is therefore exactly
+        # the previous `core != core or identity != identity` condition, and it
+        # is what lets an incremental pass seed a marker from the durable row
+        # (#496 S5b §3.2), which stores the identity digest but not the core.
+        if begin_identity != commit_identity:
             taint(
                 _protocol_violation(
                     batch_id,
@@ -971,6 +1032,45 @@ def resolve_effective_events(
         for seq in range(count):
             normalized, _digest, sequence = batch_actions[seq]
             candidates.append(_candidate_from_correction(normalized, sequence))
+
+
+def resolve_effective_events(
+    records,
+    *,
+    protocol_prefix_evidence=(),
+    accumulators=None,
+) -> EffectiveSelection:
+    """Validate correction batches and select one highest revision per evt id.
+
+    Three failure classes, deliberately asymmetric (#374 §5, #402 Task A):
+
+    - Divergent same-revision EVENTS are **quarantined**: the lowest-sequence
+      candidate becomes the provisional winner and the group is reported on
+      `EffectiveSelection.conflicts`. The journal is append-only, so a divergent
+      line can never be un-written; raising here wedged every rebuild forever.
+    - The seven enumerated **structural** correction-batch violations taint their
+      entire batch. No action from it is a candidate; the selector continues
+      with distinct valid batches and reports a bounded `ProtocolViolation`.
+    - Invalid marker/action field shapes and every other out-of-scope
+      `JournalProtocolError` remain fatal. Unknown record types remain ignored.
+
+    ``accumulators`` (#496 S5b §3.1) is an optional out-dict. When supplied it
+    is populated with the :class:`SelectorFold` this pass built, under the key
+    ``"fold"``, so a caller can persist the six accumulators the summary
+    discards. It is an out-parameter rather than a new `EffectiveSelection`
+    field precisely so the frozen result shape and every existing caller stay
+    byte-unaffected.
+    """
+    fold = SelectorFold()
+    fold_records(fold, records)
+    resolve_batches(fold)
+    if accumulators is not None:
+        accumulators["fold"] = fold
+    candidates = fold.candidates
+    resolutions = fold.resolutions
+    violations = fold.violations
+    violation_available_after = fold.violation_available_after
+    completed = fold.completed
 
     violation_by_fingerprint = {
         violation.fingerprint: violation for violation in violations.values()

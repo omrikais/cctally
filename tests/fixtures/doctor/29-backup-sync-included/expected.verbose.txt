@@ -71,7 +71,7 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1008, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1009, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 41, 'ahead': False}
   ✓ Migrations               0/54 applied
       details:
@@ -124,6 +124,9 @@ Journal
         scanned: False
         error: None
         violations: None
+  ✓ Quota projection         not applicable
+      details:
+        incomplete: None
 Data
   ✓ Latest snapshot          2s ago
       details:
@@ -256,4 +259,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 52 OK · 6 WARN · 0 FAIL
+Summary: 53 OK · 6 WARN · 0 FAIL

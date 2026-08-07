@@ -1919,15 +1919,13 @@ def _emit_source_share(
         claude_snap = build_source_share_snapshot(
             command, claude, reveal_projects=reveal_projects,
         )
+        # RAW sections (#503 S1): `compose()` prepares them together under one
+        # merged alias namespace, so `project-1` denotes the same project in
+        # the Claude and the Codex section. A per-section pre-scrub gave each
+        # section its own numbering.
         sections = (
-            lib.ComposedSection(
-                snap=lib._scrub(claude_snap, reveal_projects=reveal_projects),
-                drift_detected=False,
-            ),
-            lib.ComposedSection(
-                snap=lib._scrub(codex_snap, reveal_projects=reveal_projects),
-                drift_detected=False,
-            ),
+            lib.ComposedSection(snap=claude_snap, drift_detected=False),
+            lib.ComposedSection(snap=codex_snap, drift_detected=False),
         )
         content = lib.compose(
             sections,

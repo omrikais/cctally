@@ -638,8 +638,16 @@ _STATS_OPEN_TIME_MAINTENANCE_WAIT_S = 30.0
 
 
 @contextlib.contextmanager
-def stats_open_time_guard(*, live: bool = True):
+def stats_open_time_guard(
+    *, live: bool = True, wait_seconds: "float | None" = None,
+):
     """Hold maintenance-exclusive + the sanctioned scope across open-time DDL.
+
+    ``wait_seconds`` overrides the generous default wait. #496 S5b's
+    quota-projection reconciliation passes ``0.0``: that path is optional work
+    on the open path, and waiting thirty seconds for a competitor to finish its
+    own maintenance is strictly worse than leaving the flag set for the next
+    armed open, which is the fail-closed direction anyway.
 
     ``live=False`` marks a ``_target_path`` (scratch) build: it enters the
     sanctioned scope but takes NO flock, mirroring the divergence
@@ -668,7 +676,10 @@ def stats_open_time_guard(*, live: bool = True):
     )
     acquired = False
     try:
-        deadline = time.monotonic() + _STATS_OPEN_TIME_MAINTENANCE_WAIT_S
+        deadline = time.monotonic() + (
+            _STATS_OPEN_TIME_MAINTENANCE_WAIT_S if wait_seconds is None
+            else float(wait_seconds)
+        )
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

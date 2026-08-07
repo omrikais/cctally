@@ -16,9 +16,12 @@
 #      IANA "/" and falls back to host zone otherwise).
 #   3. Runs `bin/cctally` against the per-scenario HOME, captures
 #      stdout to `output.<fmt>` in scratch.
-#   4. Diffs against the golden — emits [NEW] on first run (golden
-#      regenerated in-tree), [OK] on subsequent matching runs, [FAIL]
-#      on any divergence.
+#   4. Diffs against the golden through `bin/_lib-golden-diff.sh`
+#      (#106/#107 — never an inline `diff -u`). A MISSING golden is a
+#      FAILURE, not an adoption: it used to be copied into place and
+#      counted as a pass, which made absent coverage silently bless
+#      whatever the code emitted (#503 S1 B1). Set CCTALLY_REGEN_GOLDENS=1
+#      to create or update goldens deliberately.
 #
 # Plan-bash bug fixes baked in here vs the literal plan text:
 #   - `extra=""` reset at the TOP of each loop iteration (not per case
@@ -42,6 +45,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES_DIR="$REPO_ROOT/tests/fixtures/share"
 BIN="$REPO_ROOT/bin/cctally"
 
+# Golden comparison chokepoint (#106/#107) + the missing-golden decision
+# (#503 S1 B1). Never inline `diff -u` in this file.
+. "$REPO_ROOT/bin/_lib-golden-diff.sh"
+
 # Pinned `now` for `_share_now_utc()`. Late enough to cover all
 # fixture rows (latest entry: 2026-05-07T13:00:00Z).
 export CCTALLY_AS_OF="${CCTALLY_AS_OF:-2026-05-09T12:00:00Z}"
@@ -52,6 +59,7 @@ export TZ=Etc/UTC
 # Single scratch root for the entire run. One trap, one cleanup point.
 SCRATCH_ROOT="$(mktemp -d -t cctally-share-fixtures-XXXXXX)"
 trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+export GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 
 # Always rebuild fixtures on harness start so a manual edit to
 # `_fixture_builders.py` is reflected on the next test run without an
@@ -131,22 +139,12 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
     fi
 
     golden="$scenario_dir/output.$fmt.golden"
-    if [[ ! -f "$golden" ]]; then
-        echo "[NEW] $scenario: regenerating golden $golden"
-        cp "$out_file" "$golden"
-        # Treat regeneration as a pass — the next run validates the
-        # locked-in golden.
-        pass_count=$((pass_count + 1))
-        continue
-    fi
-
-    if ! diff -u "$golden" "$out_file" >/dev/null; then
-        echo "FAIL $scenario: output differs from golden"
-        diff -u "$golden" "$out_file" | head -200
-        fail_count=$((fail_count + 1))
-    else
+    name="$scenario"
+    if _golden_require "output.$fmt" "$golden" "$out_file"; then
         echo "PASS $scenario"
         pass_count=$((pass_count + 1))
+    else
+        fail_count=$((fail_count + 1))
     fi
 done
 
