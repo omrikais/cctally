@@ -421,16 +421,52 @@ def _dump(path):
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "ORDER BY name")
         ]
-        return {
-            table: conn.execute(
-                f"SELECT * FROM {table}").fetchall()
-            for table in tables
+        result = {}
+        for table in tables:
             # Written from the wall clock, so two passes never agree on it and
             # it says nothing about the journal either pass read.
-            if table not in {"stats_publication_stamp"}
-        }
+            if table == "stats_publication_stamp":
+                continue
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            if table == "schema_migrations":
+                # Rebuilds stamp the same migration set at their own wall-clock
+                # second.  Keep every migration name in the comparison while
+                # discarding only that non-content timestamp.
+                rows = [(name, "<applied-at>") for name, _applied_at in rows]
+            result[table] = rows
+        return result
     finally:
         conn.close()
+
+
+def test_the_oracle_dump_ignores_only_the_migration_wall_clock(tmp_path):
+    """Migration identity is content; its rebuild timestamp is not."""
+    import sqlite3
+
+    left = tmp_path / "left.sqlite"
+    right = tmp_path / "right.sqlite"
+    for path, applied_at in (
+        (left, "2026-08-08T07:47:02Z"),
+        (right, "2026-08-08T07:47:03Z"),
+    ):
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "CREATE TABLE schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?)",
+                ("001_fixture", applied_at),
+            )
+
+    assert _dump(left) == _dump(right)
+
+    with sqlite3.connect(right) as conn:
+        conn.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?)",
+            ("002_different_migration", "2026-08-08T07:47:03Z"),
+        )
+    assert _dump(left) != _dump(right)
 
 
 def test_a_certified_quota_only_segment_is_never_opened(

@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.94.2] - 2026-08-08
+
+### Fixed
+- Release validation's segment-elision oracle no longer flakes when two equivalent rebuilds cross a one-second boundary: it still compares the complete migration set, but ignores each rebuild's wall-clock migration timestamp.
+
 ## [1.94.1] - 2026-08-08
 
 ### Fixed
