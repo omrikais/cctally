@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.94.1] - 2026-08-08
+
+### Fixed
+- Release validation now runs reliably across Linux filesystems: corruption-recovery fixtures use the existing guarded test-copy path when reflinks are unavailable, identity-swap fixtures force a genuinely different inode even when the filesystem immediately reuses one, and doctor goldens normalize filesystem-specific allocated blocks without hiding a missing measurement.
+
 ## [1.94.0] - 2026-08-08
 
 ### Added

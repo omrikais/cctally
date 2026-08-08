@@ -11,12 +11,49 @@ in-process doctor kernel tests use.
 import datetime as dt
 import io
 import pathlib
+import subprocess
 import sys
 
 from conftest import load_script
 
 
 sys.path.insert(0, str(pathlib.Path(load_script()["__file__"]).resolve().parent))
+
+
+def test_doctor_fixture_canonicalizer_redacts_allocated_bytes_but_not_absence():
+    """Filesystem allocation varies by host; losing the measurement must not."""
+    canonicalizer = (
+        pathlib.Path(__file__).parent / "fixtures" / "doctor" / "_canonicalize.py"
+    )
+    raw = """{
+  \"retainedBytes\": 9461760,
+  \"reclaimableBytes\": 3153920,
+  \"protectedBytes\": 6307840,
+  \"floorRetainedBytes\": 3153920,
+  \"unmeasuredRetainedBytes\": null
+}
+retainedBytes: 9461760
+reclaimableBytes: 3153920
+protectedBytes: 6307840
+floorRetainedBytes: 3153920
+retainedBytes: None
+"""
+    result = subprocess.run(
+        [sys.executable, str(canonicalizer), "/unused/scratch"],
+        input=raw,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    for key in (
+        "retainedBytes", "reclaimableBytes", "protectedBytes",
+        "floorRetainedBytes",
+    ):
+        assert f'\"{key}\": \"<redacted>\"' in result.stdout
+        assert f"{key}: <redacted>" in result.stdout
+    assert '"unmeasuredRetainedBytes": null' in result.stdout
+    assert "retainedBytes: None" in result.stdout
 
 
 def _state(**overrides):

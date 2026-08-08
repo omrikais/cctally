@@ -104,8 +104,8 @@ Database
         policyStatus: valid
         policyReason: None
         scanned: True
-        retainedBytes: 9449472
-        reclaimableBytes: 9449472
+        retainedBytes: <redacted>
+        reclaimableBytes: <redacted>
         protectedBytes: 0
         protectedRoots: 0
         roots: 3

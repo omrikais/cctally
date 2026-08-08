@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from conftest import load_script, redirect_paths
 
 
 def _load(tmp_path, monkeypatch):
+    monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     return ns, sys.modules["_cctally_core"], sys.modules["_cctally_store"]
@@ -98,6 +100,20 @@ def test_the_retention_lock_is_taken_after_the_conversation_provider_flocks(
     """
     ns, core, _store = _load(tmp_path, monkeypatch)
     cache_mod = sys.modules["_cctally_cache"]
+    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/usr/bin/cp")
+
+    real_run = subprocess.run
+
+    def reject_clone(command, **kwargs):
+        if command[0] == "/usr/bin/cp":
+            return subprocess.CompletedProcess(
+                command, 1, "", "Operation not supported",
+            )
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        cache_mod.subprocess, "run", reject_clone,
+    )
     obs = _Observer()
     _trace_retention(monkeypatch, obs)
 
@@ -810,6 +826,21 @@ def _plant_dir(root, rel, *, body="{}"):
     return path
 
 
+def _recreate_dir_with_different_inode(path, *, device, inode):
+    """Create `path` while keeping any immediately-reused inode occupied."""
+    path = pathlib.Path(path)
+    reservations = []
+    for attempt in range(8):
+        path.mkdir()
+        info = path.stat()
+        if (int(info.st_dev), int(info.st_ino)) != (int(device), int(inode)):
+            return reservations
+        reservation = path.with_name(f".inode-reservation-{attempt}")
+        path.rename(reservation)
+        reservations.append(reservation)
+    raise AssertionError("filesystem reused the recorded directory inode 8 times")
+
+
 def _plant_file(root, rel, *, body="{}"):
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -989,7 +1020,10 @@ def test_an_inode_mismatch_before_marking_skips_the_member(
     # Replace the directory with a different inode at the same path.
     (planted / "manifest.json").unlink()
     planted.rmdir()
-    _plant_dir(root, "quarantine/cache.db-x")
+    _recreate_dir_with_different_inode(
+        planted, device=targets[0].device, inode=targets[0].inode,
+    )
+    (planted / "manifest.json").write_text("{}", encoding="utf-8")
 
     with ret.retention_exclusive():
         result = ret.mark_reclaim_plan(targets, plan_id="p1", root=root)
@@ -1218,9 +1252,15 @@ def test_a_replacement_inode_at_the_tombstone_path_fails_closed(
             _targets(ret, root, "quarantine/a"), plan_id="p1", root=root,
         )
     tomb = _tombstone(root, "quarantine/a", "p1")
+    record = ret._read_reclaim_record(
+        root / f"{ret.RECLAIM_RECORD_PREFIX}p1.json"
+    )
+    entry = record["entries"][0]
     (tomb / "manifest.json").unlink()
     tomb.rmdir()
-    tomb.mkdir()
+    _recreate_dir_with_different_inode(
+        tomb, device=entry["device"], inode=entry["inode"],
+    )
     (tomb / "someone-elses.json").write_text("{}", encoding="utf-8")
 
     outcome = ret.resume_reclaim(root=root)
@@ -1725,8 +1765,12 @@ def test_an_identity_mismatch_on_a_tombstone_also_becomes_stuck(
 
     # Replace the tombstone with a different inode of the same kind.
     tombstone = _tombstone(root, "quarantine/swapped", "p2")
+    record_path = root / f"{ret.RECLAIM_RECORD_PREFIX}p2.json"
+    before = ret._read_reclaim_record(record_path)["entries"][0]
     real_unlink(tombstone)
-    tombstone.mkdir()
+    _recreate_dir_with_different_inode(
+        tombstone, device=before["device"], inode=before["inode"],
+    )
 
     outcome = ret.resume_reclaim(root=root)
     assert "identity-mismatch" in outcome.errors["quarantine/swapped"]

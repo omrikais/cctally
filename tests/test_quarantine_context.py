@@ -17,6 +17,7 @@ import json
 import pathlib
 import sqlite3
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -42,6 +43,7 @@ STRICT_QUARANTINE_SITES = {
 
 
 def _load(tmp_path, monkeypatch):
+    monkeypatch.setenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", "1")
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     return ns, sys.modules["_cctally_core"], sys.modules["_cctally_cache"]
@@ -110,6 +112,20 @@ def test_direct_conversations_recovery_writes_an_additive_v2_manifest(
     tmp_path, monkeypatch,
 ):
     ns, core, cache_mod = _load(tmp_path, monkeypatch)
+    monkeypatch.setattr(cache_mod.shutil, "which", lambda _name: "/usr/bin/cp")
+
+    real_run = subprocess.run
+
+    def reject_clone(command, **kwargs):
+        if command[0] == "/usr/bin/cp":
+            return subprocess.CompletedProcess(
+                command, 1, "", "Operation not supported",
+            )
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(
+        cache_mod.subprocess, "run", reject_clone,
+    )
     ns["open_conversations_db"](attach_cache=False).close()
     path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
     raw = bytearray(path.read_bytes())

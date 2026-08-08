@@ -104,8 +104,8 @@ Database
         policyStatus: valid
         policyReason: None
         scanned: True
-        retainedBytes: 6299648
-        reclaimableBytes: 3149824
+        retainedBytes: <redacted>
+        reclaimableBytes: <redacted>
         protectedBytes: 0
         protectedRoots: 0
         roots: 2
@@ -113,7 +113,7 @@ Database
         partialScan: False
         unsatisfiedRules: []
         floorRetainedRoots: 1
-        floorRetainedBytes: 3149824
+        floorRetainedBytes: <redacted>
         stuckRecords: []
 Journal
   ✓ Journal                  no journal (pre-cutover install)

@@ -562,7 +562,7 @@
                 },
                 {
                     "details": {
-                        "floorRetainedBytes": 3149824,
+                        "floorRetainedBytes": "<redacted>",
                         "floorRetainedRoots": 1,
                         "freeDiskBytes": "<redacted>",
                         "partialScan": false,
@@ -570,8 +570,8 @@
                         "policyStatus": "valid",
                         "protectedBytes": 0,
                         "protectedRoots": 0,
-                        "reclaimableBytes": 3149824,
-                        "retainedBytes": 6299648,
+                        "reclaimableBytes": "<redacted>",
+                        "retainedBytes": "<redacted>",
                         "roots": 2,
                         "scanned": true,
                         "stuckRecords": [],

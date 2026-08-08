@@ -53,4 +53,21 @@ data = re.sub(
     r'\1<redacted>',
     data,
 )
+# Allocated bytes include directory blocks, whose size is filesystem-specific
+# (APFS reports zero for these fixture directories; hosted Linux reports one
+# 4 KiB block apiece).  Preserve `null`/`None` so losing the measurement still
+# moves every golden, while canonicalizing only successful numeric readings.
+allocation_keys = (
+    "retainedBytes|reclaimableBytes|protectedBytes|floorRetainedBytes"
+)
+data = re.sub(
+    rf'("(?:{allocation_keys})"\s*:\s*)[1-9]\d*',
+    r'\1"<redacted>"',
+    data,
+)
+data = re.sub(
+    rf'(?<!")(\b(?:{allocation_keys})\s*:\s*)[1-9]\d*',
+    r'\1<redacted>',
+    data,
+)
 sys.stdout.write(data)
