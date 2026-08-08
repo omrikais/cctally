@@ -67,6 +67,14 @@ SCENARIOS = {
     "29-backup-sync-included":        "backup_sync_included",
     # #421: post-migration Codex quota row missing its ingest-time anchor.
     "30-codex-null-reset-anchor":      "codex_null_reset_anchor",
+    # #496 S6 §7.6: four scenarios reaching the new WARN and FAIL branches.
+    # No existing fixture reaches any of them, and the FAIL fixture is split
+    # in three so each failure mode is covered separately rather than one of
+    # them standing in for the others.
+    "31-retained-artifacts-over-budget": "retained_artifacts_over_budget",
+    "32-retained-artifacts-protected":   "retained_artifacts_protected",
+    "33-heal-repeated-shape":            "heal_repeated_shape",
+    "34-retention-policy-malformed":     "retention_policy_malformed",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -289,6 +297,11 @@ def _scenario_body(slug: str) -> str:
             {"schemaVersion":1,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
             JSON
         """)
+    if slug in (
+        "retained_artifacts_over_budget", "retained_artifacts_protected",
+        "heal_repeated_shape", "retention_policy_malformed",
+    ):
+        return _scenario_body("all_ok") + _retention_scenario_body(slug)
     if slug == "cache_reclaimable":
         return _scenario_body("all_ok") + textwrap.dedent("""\
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-empty-codex-project-metadata \\
@@ -603,6 +616,10 @@ def main():
     p.add_argument("--emit-codex-null-anchor", action="store_true")
     p.add_argument("--emit-pricing-cache", action="store_true")
     p.add_argument("--emit-empty-codex-project-metadata", action="store_true")
+    p.add_argument("--emit-retention", choices=[
+        "retained_artifacts_over_budget", "retained_artifacts_protected",
+        "heal_repeated_shape", "retention_policy_malformed",
+    ])
     p.add_argument("--emit-codex-doctor-case", choices=[
         "quota-fresh-stale", "quota-fresh-future",
         "lifecycle-recent-never", "lifecycle-recent-stale",
@@ -625,6 +642,9 @@ def main():
         return
     if args.emit_empty_codex_project_metadata and args.path:
         _emit_empty_codex_project_metadata(pathlib.Path(args.path))
+        return
+    if args.emit_retention and args.path:
+        _emit_retention(args.emit_retention, pathlib.Path(args.path))
         return
     if args.emit_codex_doctor_case:
         if not args.path or len(args.roots) != 2:
@@ -660,6 +680,98 @@ def main():
             homes_path.unlink()
     print(f"Scaffolded {len(SCENARIOS)} scenarios under {ROOT}")
 
+
+
+#: #496 S6 §7.6. The four scenarios that reach `db.retained_artifacts`'s WARN
+#: and both FAIL branches, and `journal.auto_heal`'s repeated-shape FAIL.
+#:
+#: Every incident is CLASSIFIED unless the scenario is specifically about
+#: protection, because an unclassified incident is protected and would make
+#: the over-budget scenario reach the FAIL branch instead of the WARN one —
+#: which is exactly the "one fixture stands in for two branches" problem §7.6
+#: says four fixtures exist to avoid.
+_RETENTION_INCIDENT_BYTES = 3 * 1024 * 1024
+
+
+def _retention_scenario_body(slug: str) -> str:
+    import textwrap
+
+    return textwrap.dedent(f"""\
+        python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-retention \\
+            {slug} "$HARNESS_FAKE_HOME/.local/share/cctally"
+    """)
+
+
+def _emit_retention(slug: str, app_dir) -> None:
+    """Build one retained-artifact corpus for a doctor fixture (§7.6)."""
+    import json
+    import pathlib as _pl
+
+    app_dir = _pl.Path(app_dir)
+    quarantine = app_dir / "quarantine"
+    logs = app_dir / "logs"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+
+    if slug == "retention_policy_malformed":
+        # A VALID JSON document carrying an INVALID retention block, which is
+        # the second of §6.5's two malformed cases and the one a user is far
+        # more likely to produce than unparseable JSON.
+        config = app_dir / "config.json"
+        loaded = {}
+        if config.exists():
+            try:
+                loaded = json.loads(config.read_text(encoding="utf-8"))
+            except ValueError:
+                loaded = {}
+        loaded["storage.artifact_retention"] = {"max_age_days": 0}
+        config.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
+        return
+
+    classified = slug != "retained_artifacts_protected"
+    shape = "1702f06a27" if slug == "heal_repeated_shape" else None
+    count = 2 if slug == "heal_repeated_shape" else 3
+    # `journal.auto_heal` only escalates on a repeated shape seen WITHIN the
+    # seven-day window, so this scenario's incidents must sit inside it
+    # relative to the harness's pinned `CCTALLY_AS_OF` (2026-05-13). Dating
+    # them in January instead produced a fixture that could not reach the
+    # branch it exists to cover.
+    days = (11, 12) if slug == "heal_repeated_shape" else (1, 2, 3)
+    month = "05" if slug == "heal_repeated_shape" else "01"
+    for index in range(count):
+        stamp = f"2026{month}{days[index]:02d}T120000Z"
+        incident = quarantine / f"stats.db-{stamp}"
+        incident.mkdir(parents=True, exist_ok=True)
+        (incident / "stats.db").write_bytes(b"x" * _RETENTION_INCIDENT_BYTES)
+        manifest = {
+            "schemaVersion": 2 if classified else 1,
+            "quarantinedAtUtc": f"2026-{month}-{days[index]:02d}T12:00:00Z",
+            "originalPath": str(app_dir / "stats.db"),
+            "movedFiles": ["stats.db"],
+            "complete": True,
+        }
+        if classified:
+            manifest["trigger"] = "corruption-heal"
+        if shape is not None:
+            manifest["damage"] = {"preserved": {"shapeToken": shape}}
+        (incident / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8",
+        )
+
+    config = app_dir / "config.json"
+    loaded = {}
+    if config.exists():
+        try:
+            loaded = json.loads(config.read_text(encoding="utf-8"))
+        except ValueError:
+            loaded = {}
+    # A 1 MiB budget against a multi-megabyte corpus, so the bound fires on
+    # the fixture's own scale rather than on the production default — a
+    # threshold test whose fixture is below the threshold cannot fail.
+    loaded["storage.artifact_retention"] = {
+        "max_age_days": 1, "max_total_mib": 1, "min_free_mib": None,
+    }
+    config.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
 
 def _emit_snapshot(slug: str, db_path: pathlib.Path) -> None:
     """Seed weekly_usage_snapshots with a single row at the expected age."""

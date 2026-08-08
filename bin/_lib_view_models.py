@@ -1733,6 +1733,13 @@ class CodexDailyView:
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
     display_tz_label: str = ""
+    # `period_start` came from a CALENDAR BUCKET LABEL, not from an
+    # instant (#503 S2 D7). The share builder needs the distinction: a
+    # label must be re-grounded at midnight in the zone the artifact is
+    # labelled with, while `period_end` (always `now_utc`) converts. The
+    # value alone cannot say which — an empty view's `period_start` is a
+    # real instant that happens to sit at whatever time "now" is.
+    period_civil_bucket: bool = False
 
 
 @dataclass(frozen=True)
@@ -1749,6 +1756,7 @@ class CodexMonthlyView:
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
     display_tz_label: str = ""
+    period_civil_bucket: bool = False   # see `CodexDailyView`
 
 
 @dataclass(frozen=True)
@@ -1766,6 +1774,7 @@ class CodexWeeklyView:
     period_start: "dt.datetime | None" = None
     period_end: "dt.datetime | None" = None
     display_tz_label: str = ""
+    period_civil_bucket: bool = False   # see `CodexDailyView`
 
 
 @dataclass(frozen=True)
@@ -1849,6 +1858,7 @@ def build_codex_daily_view(entries, *, now_utc, tz_name=None, speed="standard"):
         period_start=_codex_period_start_from_date_bucket(buckets),
         period_end=now_utc,
         display_tz_label=_codex_tz_label(tz_name),
+        period_civil_bucket=bool(buckets),
     )
 
 
@@ -1869,6 +1879,7 @@ def build_codex_monthly_view(entries, *, now_utc, tz_name=None, speed="standard"
         period_start=_codex_period_start_from_month_bucket(buckets),
         period_end=now_utc,
         display_tz_label=_codex_tz_label(tz_name),
+        period_civil_bucket=bool(buckets),
     )
 
 
@@ -1891,6 +1902,7 @@ def build_codex_weekly_view(entries, *, now_utc, tz_name=None,
         period_start=_codex_period_start_from_date_bucket(buckets),
         period_end=now_utc,
         display_tz_label=_codex_tz_label(tz_name),
+        period_civil_bucket=bool(buckets),
     )
 
 

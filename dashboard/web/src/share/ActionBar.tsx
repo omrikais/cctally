@@ -32,6 +32,7 @@ import { SavePresetPopover } from './SavePresetPopover';
 import { useKeymap } from '../hooks/useKeymap';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
+import { reserveExportTab, POPUP_BLOCKED_MESSAGE } from './exporters/openTab';
 import { appendHistory } from './presetsApi';
 
 // M4.3 (spec §5.1, §11.4). After every successful export action we POST
@@ -84,7 +85,17 @@ interface Props {
   templateId: string | null;
   options: ShareOptions;
   onOptionsChange: (next: ShareOptions) => void;
+  // #503 S3 §5 — the last preview render failed. WARN, do not disable: the
+  // export re-fetches, so a failed preview does not imply a failed export,
+  // and disabling would remove a capability the user still has.
+  previewFailed?: boolean;
 }
+
+// 44 characters, inside the 47-character single-line budget documented on
+// `SharePrivacyStatus` for this column at 390px. Check any rewording against
+// that limit.
+export const PREVIEW_FAILED_NOTE = 'The preview failed — an export may fail too.';
+const PREVIEW_FAILED_NOTE_ID = 'share-preview-failed-note';
 
 // `cctally-<panel>-<utcdate>.<ext>` per spec §6.5. UTC date format
 // matches `_lib_share.py` filename rule (YYYYMMDD).
@@ -124,6 +135,7 @@ function triggerDownload(filename: string, blob: Blob): void {
 
 export function ActionBar({
   panel, source = 'claude', account = null, templateId, options, onOptionsChange,
+  previewFailed = false,
 }: Props) {
   const [busy, setBusy] = useState<null | 'copy' | 'download' | 'open' | 'basket' | 'png' | 'print'>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -140,6 +152,9 @@ export function ActionBar({
   // button via a wrapping <div> so click-outside can close it.
   const [savingOpen, setSavingOpen] = useState(false);
   const saveTriggerRef = useRef<HTMLDivElement | null>(null);
+  // #503 S3 §2 — where focus lands after a confirmed save. The popover that
+  // owned focus unmounts on success, so without this focus falls to <body>.
+  const saveButtonRef = useRef<HTMLButtonElement | null>(null);
 
   // Click-outside-the-anchor dismisses the popover. mousedown so the
   // press registers before the trigger's click re-opens it.
@@ -272,6 +287,10 @@ export function ActionBar({
         options,
         added_at: new Date().toISOString(),
         data_digest_at_add: resp.snapshot.data_digest,
+        // #503 S3 §4 — the digest and the definition it was minted under
+        // travel together; storing one without the other is what would make
+        // a later comparison meaningless.
+        data_digest_version_at_add: resp.snapshot.data_digest_version,
         kernel_version: resp.snapshot.kernel_version,
         label_hint: sharePanelLabel(panel),
         source,
@@ -303,20 +322,30 @@ export function ActionBar({
     }
   };
 
+  // #503 S3 §5 — the ORDER is the fix. The tab is reserved synchronously,
+  // inside the click's own task, because a popup opened after an `await` is
+  // what browsers block; the previous code awaited the fetch first and then
+  // discarded `window.open`'s return value, so a blocked popup produced a
+  // silent no-op AND a share-history row for an export that never happened.
   const handleOpen = async () => {
     if (disabledNoTemplate || !templateId) return;
+    const tab = reserveExportTab();
+    if (!tab) {
+      setActionError(`Open failed: ${POPUP_BLOCKED_MESSAGE}`);
+      return;
+    }
     setBusy('open');
     setActionError(null);
     try {
       const { body, format } = await fetchForExport();
-      const blob = new Blob([body], { type: mimeFor(format) });
-      const url = URL.createObjectURL(blob);
-      // The new window owns the blob URL for its lifetime; we don't
-      // revoke it (the user may want to keep the tab open). Browsers
-      // GC blob URLs when the window unloads.
-      window.open(url, '_blank', 'noopener,noreferrer');
+      tab.navigate(new Blob([body], { type: mimeFor(format) }));
+      showToast('Opened');
+      // Only now: the tab exists and holds the document.
       recordHistory({ panel, template_id: templateId, options, destination: 'open', source, account });
     } catch (err: unknown) {
+      // A render failure leaves a blank reserved tab; close it rather than
+      // stranding the user on about:blank.
+      tab.close();
       const msg =
         err instanceof ShareApiError
           ? err.message ?? `HTTP ${err.status}`
@@ -367,7 +396,11 @@ export function ActionBar({
     setActionError(null);
     try {
       const { body } = await fetchForExport();
+      // Throws when there is no print target and when the fallback window
+      // is blocked, so neither the toast nor the history row can claim a
+      // print that did not happen.
       printPdf(body);
+      showToast('Print dialog opened');
       recordHistory({ panel, template_id: templateId, options, destination: 'print', source, account });
     } catch (err: unknown) {
       const msg =
@@ -404,9 +437,21 @@ export function ActionBar({
         ))}
       </div>
 
+      {/* #503 S3 §5 — announced ONCE, not twice: the preview keeps its own
+          role="alert" banner for the event, and this note carries no live
+          region. The export buttons point at it with aria-describedby, so a
+          screen-reader user hears it on reaching a button — the moment it
+          matters. */}
+      {previewFailed ? (
+        <p className="share-preview-failed-note" id={PREVIEW_FAILED_NOTE_ID}>
+          {PREVIEW_FAILED_NOTE}
+        </p>
+      ) : null}
+
       <div className="share-action-row">
         <button
           type="button"
+          aria-describedby={previewFailed ? PREVIEW_FAILED_NOTE_ID : undefined}
           className="share-action share-action-copy"
           onClick={handleCopy}
           disabled={!canCopy}
@@ -422,6 +467,7 @@ export function ActionBar({
         </button>
         <button
           type="button"
+          aria-describedby={previewFailed ? PREVIEW_FAILED_NOTE_ID : undefined}
           className="share-action share-action-download"
           onClick={handleDownload}
           disabled={disabledNoTemplate}
@@ -431,6 +477,7 @@ export function ActionBar({
         </button>
         <button
           type="button"
+          aria-describedby={previewFailed ? PREVIEW_FAILED_NOTE_ID : undefined}
           className="share-action share-action-open"
           onClick={handleOpen}
           disabled={!canOpen}
@@ -446,6 +493,7 @@ export function ActionBar({
         </button>
         <button
           type="button"
+          aria-describedby={previewFailed ? PREVIEW_FAILED_NOTE_ID : undefined}
           className="share-action share-action-png"
           onClick={handlePng}
           disabled={!canPng}
@@ -461,6 +509,7 @@ export function ActionBar({
         </button>
         <button
           type="button"
+          aria-describedby={previewFailed ? PREVIEW_FAILED_NOTE_ID : undefined}
           className="share-action share-action-print"
           onClick={handlePrint}
           disabled={!canPrint}
@@ -498,6 +547,7 @@ export function ActionBar({
           <SavePresetPopover> inline, anchored to the button. */}
       <div className="share-save-preset-row" ref={saveTriggerRef}>
         <button
+          ref={saveButtonRef}
           type="button"
           className="share-save-preset"
           disabled={templateId == null || busy != null}
@@ -518,8 +568,15 @@ export function ActionBar({
             source={source}
             templateId={templateId}
             options={options}
-            onSaved={() => setSavingOpen(false)}
-            onCancel={() => setSavingOpen(false)}
+            focusAfterConfirm={() => saveButtonRef.current}
+            onSaved={() => {
+              setSavingOpen(false);
+              saveButtonRef.current?.focus();
+            }}
+            onCancel={() => {
+              setSavingOpen(false);
+              saveButtonRef.current?.focus();
+            }}
           />
         ) : null}
       </div>

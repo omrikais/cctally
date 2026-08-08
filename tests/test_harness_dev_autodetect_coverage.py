@@ -33,9 +33,16 @@ def test_preamble_exports_the_suppressor():
 
 
 def test_preamble_suppresses_detached_post_command_workers():
-    preamble = BIN / "_lib-harness-env.sh"
-    assert preamble.is_file()
-    assert "export CCTALLY_DISABLE_UPDATE_CHECK=1" in preamble.read_text()
+    """All THREE of them. The artifact-retention sweep (#496 S6) joined the
+    update check and the telemetry beat, and it is the one that broke a
+    harness: `cctally-rederive-test` fingerprints the whole data directory
+    before and after a no-op apply, which no asynchronous writer can satisfy.
+    The literals are hardcoded rather than imported so this fails if the
+    preamble drops one.
+    """
+    preamble = (BIN / "_lib-harness-env.sh").read_text()
+    assert "export CCTALLY_DISABLE_UPDATE_CHECK=1" in preamble
+    assert "export CCTALLY_DISABLE_RETENTION_SWEEP=1" in preamble
 
 
 def test_fixture_lib_sources_the_preamble():

@@ -202,6 +202,11 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
   // this flow; `null` until the first render resolves, and again whenever the
   // panel or template changes.
   const [hasProjectNames, setHasProjectNames] = useState<boolean | null>(null);
+  // #503 S3 §5 — did the last preview render fail? Reported by <PreviewPane>
+  // and consumed by <ActionBar>, which WARNS without disabling: the export
+  // re-fetches, so a failed preview does not imply a failed export, and
+  // disabling would remove a capability the user still has.
+  const [previewFailed, setPreviewFailed] = useState(false);
   const panelLabel = sharePanelLabel(panel);
   const [templates, setTemplates] = useState<ShareTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -371,10 +376,18 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
       <div className="share-modal-body">
         {isMobile && (
           <div className="share-preview-col share-preview-col--lead" aria-label="Live preview">
-            <SharePrivacyStatus
-              revealProjects={!!options.reveal_projects}
-              hasProjectNames={hasProjectNames}
-            />
+            {/* #503 S3 §5 — the privacy line is GATED OFF, not changed.
+                With `hasProjectNames === null` on a failed preview it still
+                renders a definite claim, including "Preview shows real
+                names" — which is false when the preview shows an error. The
+                export's privacy state is genuinely unknown here and the line
+                has no state for unknown; S1's derivation is untouched. */}
+            {previewFailed ? null : (
+              <SharePrivacyStatus
+                revealProjects={!!options.reveal_projects}
+                hasProjectNames={hasProjectNames}
+              />
+            )}
             <PreviewPane
               panel={panel}
               source={source}
@@ -382,6 +395,7 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
               templateId={selectedTemplateId}
               options={options}
               onProjectNamesResolved={setHasProjectNames}
+              onPreviewFailed={setPreviewFailed}
             />
           </div>
         )}
@@ -414,10 +428,12 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
           </div>
           {!isMobile && (
             <div className="share-preview-col" aria-label="Live preview">
-              <SharePrivacyStatus
-                revealProjects={!!options.reveal_projects}
-                hasProjectNames={hasProjectNames}
-              />
+              {previewFailed ? null : (
+                <SharePrivacyStatus
+                  revealProjects={!!options.reveal_projects}
+                  hasProjectNames={hasProjectNames}
+                />
+              )}
               <PreviewPane
                 panel={panel}
                 source={source}
@@ -425,6 +441,7 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
                 templateId={selectedTemplateId}
                 options={options}
                 onProjectNamesResolved={setHasProjectNames}
+                onPreviewFailed={setPreviewFailed}
               />
             </div>
           )}
@@ -436,6 +453,7 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
           panel={panel}
           source={source}
           account={account}
+          previewFailed={previewFailed}
           templateId={selectedTemplateId}
           options={options}
           onOptionsChange={handleOptionsChange}

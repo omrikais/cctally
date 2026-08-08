@@ -67,6 +67,7 @@ def _init_paths_from_env() -> None:
     global CONVERSATIONS_LOCK_MAINTENANCE_PATH
     global STATS_LOCK_MAINTENANCE_PATH
     global JOURNAL_DIR, JOURNAL_LOCK_PATH, JOURNAL_INGEST_LOCK_PATH
+    global ARTIFACT_RETENTION_LOCK_PATH
     global CONFIG_LOCK_PATH
     global CONFIG_PATH, MIGRATION_ERROR_LOG_PATH, CHANGELOG_PATH
     global HOOK_TICK_LOG_DIR, HOOK_TICK_LOG_PATH, HOOK_TICK_LOG_ROTATED_PATH
@@ -142,6 +143,14 @@ def _init_paths_from_env() -> None:
     JOURNAL_DIR = APP_DIR / "journal"
     JOURNAL_LOCK_PATH = APP_DIR / "journal.lock"
     JOURNAL_INGEST_LOCK_PATH = APP_DIR / "journal.ingest.lock"
+    # Retained-evidence reclamation flock (#496 S6, spec §5.3). It enters the
+    # lock-order law AFTER the conversation provider flocks and BEFORE SQLite
+    # transactions, which keeps `journal.lock` the leaf. Every producer of
+    # retained evidence — corruption forensics, quarantine manifests, rebuild
+    # records, the backups `db repair` writes — holds it SHARED across the span
+    # in which its evidence is being published; the reclamation worker takes it
+    # EXCLUSIVE holding nothing earlier, marks, releases, and only then deletes.
+    ARTIFACT_RETENTION_LOCK_PATH = APP_DIR / "artifact-retention.lock"
     CONFIG_LOCK_PATH = APP_DIR / "config.json.lock"
 
     CONFIG_PATH = APP_DIR / "config.json"
@@ -390,7 +399,7 @@ LEGACY_STATS_HEAD = 13
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
 #: publication transaction exists: a replacement index was published and then
 #: failed validation on a fresh connection. The existing corrupt-stats text
-#: says the database was "Not auto-recreated", which would be false here, so
+#: says the database "is never auto-recreated", which would be false here, so
 #: this path gets its own wording. It does not alter the heal message or any
 #: other corruption path.
 STATS_PUBLICATION_FAILED_MSG = (
@@ -729,6 +738,14 @@ def ensure_dirs() -> None:
         os.chmod(APP_DIR, 0o700)
     except OSError as exc:
         eprint(f"[core] could not chmod data dir 0700 ({exc}); continuing")
+    # #496 S6 §9.4: LOG_DIR was created at the umask and was drwxr-xr-x, the
+    # same class of defect as the 0644 stats family. It holds corruption
+    # forensics bundles and rebuild records, which name paths and carry damage
+    # detail, so it gets the data directory's mode rather than the umask's.
+    try:
+        os.chmod(LOG_DIR, 0o700)
+    except OSError as exc:
+        eprint(f"[core] could not chmod log dir 0700 ({exc}); continuing")
 
 
 # === stats.db maintenance-hold tracking (#386) ======================
@@ -1652,9 +1669,13 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # marker-only behaviour; see `_cctally_store.stats_open_guarded`.
     conn = _cctally_store.stats_open_guarded(db_path)
     conn.row_factory = sqlite3.Row
-    # #279 S1 F4: probe connect + initial PRAGMAs so a corrupt stats.db (the
-    # non-re-derivable DB) surfaces as a one-line diagnosis + staged exit 3 instead of
-    # a raw traceback. The catch boundary is DELIBERATELY narrow — ONLY the
+    # #279 S1 F4: probe connect + initial PRAGMAs so a corrupt stats.db
+    # surfaces as a one-line diagnosis + staged exit 3 instead of a raw
+    # traceback. With retained journal data stats.db is a disposable index and
+    # the heal hook below rebuilds it; the guided error is for the pre-cutover
+    # install with no retained journal data, whose stats.db may be the only
+    # copy of its recorded history and is therefore never auto-recreated.
+    # The catch boundary is DELIBERATELY narrow — ONLY the
     # connect/PRAGMA/probe below. The DDL + `_run_pending_migrations` region
     # further down is NOT wrapped: migration-handler failures have their own
     # logging/suppression contract and must not be mislabeled as corruption
@@ -1671,6 +1692,9 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # StatsDbCorruptError boundary.
         _cctally_store.apply_policy(conn, "stats")
         conn.execute("SELECT 1").fetchone()
+        # §9.2 (#496 S6 F23). AFTER `apply_policy`, because that is what sets
+        # journal_mode=WAL and so what can materialize the sidecars.
+        _cctally_store._harden_stats_family(db_path)
     except sqlite3.DatabaseError as exc:
         try:
             conn.close()
@@ -1699,6 +1723,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             try:
                 _cctally_store.apply_policy(conn, "stats")
                 conn.execute("SELECT 1").fetchone()
+                _cctally_store._harden_stats_family(db_path)
             except sqlite3.DatabaseError as exc2:
                 try:
                     conn.close()
@@ -1713,10 +1738,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         else:
             raise c.StatsDbCorruptError(
                 f"stats.db appears corrupt or unreadable ({exc}). path: {db_path}. "
-                f"Not auto-recreated — it holds your recorded usage history. "
-                "Recovery: run `cctally db repair --db stats --yes`; it preserves "
-                "the corrupt original before replacing anything. Do not copy, "
-                "restore, or move the live DB by hand."
+                "When journal data is retained for this install, stats.db is a "
+                "disposable index and `cctally db rebuild --db stats` rebuilds "
+                "it from the journal, losing nothing. On a pre-cutover install "
+                "with no retained journal data it may be the only copy of your "
+                "recorded history, so it is never auto-recreated: run `cctally "
+                "db repair --db stats --yes`, which preserves the corrupt "
+                "original before replacing anything. Do not copy, restore, or "
+                "move the live DB by hand."
             ) from exc
 
     # ── stats.db epoch gate / in-place cutover (DB journal redesign §7.1/§8) ──

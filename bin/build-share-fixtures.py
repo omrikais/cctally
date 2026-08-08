@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build deterministic SQLite fixtures + CHANGELOG fixture for cctally-share-test.
 
-Output layout (16 scenarios):
+Output layout (one directory per entry in SCENARIOS):
   tests/fixtures/share/<scenario>/
     cache.db
     stats.db
@@ -103,6 +103,11 @@ SCENARIOS: tuple[str, ...] = (
     "five-hour-blocks-credit-html",
     "five-hour-blocks-credit-svg",
     "session-md",
+    # #503 S2 F18/D2 coverage: `--no-branding` had no v1 golden at all,
+    # so the decision that it strips the advertisement and keeps the
+    # provenance had nothing to hold it. Same data shape as `report-md`;
+    # only the harness flag differs.
+    "report-md-no-branding",
 )
 
 # Scenarios that need an in-place 5h credit event seeded against the

@@ -93,6 +93,7 @@ cp "$REPO_ROOT/.githooks/_match.py" .githooks/
 # import time. Copy it INTO the scratch private's bin/ and run from
 # there so it walks the scratch private repo (not cctally-dev itself).
 cp "$REPO_ROOT/bin/cctally-mirror-public" bin/
+cp "$REPO_ROOT/bin/_lib_mirror_contributors.py" bin/
 chmod +x bin/cctally-mirror-public
 # Optional: .public-tag-patterns drives tag propagation. Copy it in so
 # the tag-propagated/tag-held-back scenarios match the live config.

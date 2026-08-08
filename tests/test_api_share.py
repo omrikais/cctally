@@ -505,7 +505,12 @@ def test_presets_post_overwrites_same_name(dashboard_server):
     base = {"panel": "weekly", "name": "team-monday",
             "template_id": "weekly-recap",
             "options": {"theme": "light", "format": "md"}}
-    updated = {**base, "options": {"theme": "dark", "format": "html"}}
+    # `overwrite` is now required to replace an existing name (#503 S3 §1);
+    # without it the second POST is a 409, which the conflict test below
+    # pins. This test keeps pinning that an overwrite REPLACES rather than
+    # appending a second record.
+    updated = {**base, "overwrite": True,
+               "options": {"theme": "dark", "format": "html"}}
     for payload in (base, updated):
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/share/presets",
@@ -549,6 +554,200 @@ def test_presets_delete_removes_entry(dashboard_server):
     ) as r:
         body = json.loads(r.read())
     assert body["presets"] == {}
+
+
+# ---------- #503 S3 §1 — rename is one atomic, server-authoritative op ----
+#
+# Rename used to be a client-side create-then-delete (`ManagePresetsModal`
+# issued savePreset then deletePreset), which rebuilt the record from four
+# fields. It therefore dropped `source`, reset `saved_at`, and silently
+# overwrote whatever preset already held the target name.
+
+
+def _presets_post(port, payload, path="/api/share/presets"):
+    """POST to a preset endpoint, returning `(status, body)` for 4xx too."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        return exc.code, (json.loads(raw) if raw else None)
+
+
+def _presets_get(port):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/presets", timeout=5,
+    ) as r:
+        return json.loads(r.read())["presets"]
+
+
+def _seed_preset(port, name, *, panel="weekly", template_id="weekly-recap",
+                 source="codex", theme="dark", overwrite=False):
+    status, body = _presets_post(port, {
+        "panel": panel, "name": name, "template_id": template_id,
+        "source": source, "overwrite": overwrite,
+        "options": {"theme": theme, "format": "md"},
+    })
+    assert status == 200, (status, body)
+    return body
+
+
+def test_presets_rename_preserves_source_and_saved_at(dashboard_server):
+    """A1. The record MOVES; nothing reconstructs it, so the fields the
+    client never sends survive."""
+    port, _ = dashboard_server
+    saved = _seed_preset(port, "team-monday", source="codex")
+    status, body = _presets_post(port, {
+        "panel": "weekly", "from_name": "team-monday",
+        "to_name": "team-tuesday",
+    }, path="/api/share/presets/rename")
+    assert status == 200, (status, body)
+
+    presets = _presets_get(port)["weekly"]
+    assert "team-monday" not in presets
+    moved = presets["team-tuesday"]
+    assert moved["source"] == "codex"
+    assert moved["saved_at"] == saved["saved_at"]
+    assert moved["template_id"] == "weekly-recap"
+    assert moved["options"]["theme"] == "dark"
+
+
+def test_presets_rename_onto_an_existing_name_conflicts(dashboard_server):
+    """A2. Decided under the writer lock, so a stale client preflight cannot
+    destroy the target."""
+    port, _ = dashboard_server
+    _seed_preset(port, "team-monday", source="codex", theme="dark")
+    _seed_preset(port, "deep-dive", source="claude", theme="light")
+
+    status, body = _presets_post(port, {
+        "panel": "weekly", "from_name": "team-monday", "to_name": "deep-dive",
+    }, path="/api/share/presets/rename")
+    assert status == 409
+    assert body["code"] == "preset_name_conflict"
+    assert body["field"] == "to_name"
+
+    presets = _presets_get(port)["weekly"]
+    assert set(presets) == {"team-monday", "deep-dive"}
+    assert presets["deep-dive"]["source"] == "claude"
+    assert presets["team-monday"]["source"] == "codex"
+
+
+def test_presets_rename_with_overwrite_replaces_and_removes_the_source(
+    dashboard_server,
+):
+    port, _ = dashboard_server
+    moving = _seed_preset(port, "team-monday", source="codex", theme="dark")
+    _seed_preset(port, "deep-dive", source="claude", theme="light")
+
+    status, body = _presets_post(port, {
+        "panel": "weekly", "from_name": "team-monday", "to_name": "deep-dive",
+        "overwrite": True,
+    }, path="/api/share/presets/rename")
+    assert status == 200, (status, body)
+
+    presets = _presets_get(port)["weekly"]
+    assert set(presets) == {"deep-dive"}
+    assert presets["deep-dive"]["source"] == "codex"
+    assert presets["deep-dive"]["saved_at"] == moving["saved_at"]
+
+
+def test_presets_self_rename_is_rejected_and_keeps_the_record(dashboard_server):
+    """A2's second half: a move-then-delete on one key deletes the record."""
+    port, _ = dashboard_server
+    _seed_preset(port, "team-monday", source="codex")
+    status, body = _presets_post(port, {
+        "panel": "weekly", "from_name": "team-monday",
+        "to_name": "team-monday",
+    }, path="/api/share/presets/rename")
+    assert status == 400
+    assert body["field"] == "to_name"
+
+    presets = _presets_get(port)["weekly"]
+    assert presets["team-monday"]["source"] == "codex"
+
+
+def test_presets_rename_of_a_missing_preset_is_404(dashboard_server):
+    port, _ = dashboard_server
+    status, body = _presets_post(port, {
+        "panel": "weekly", "from_name": "nope", "to_name": "still-nope",
+    }, path="/api/share/presets/rename")
+    assert status == 404
+    assert body["error"]
+
+
+def test_presets_rename_validates_its_names(dashboard_server):
+    port, _ = dashboard_server
+    _seed_preset(port, "team-monday")
+    for payload, field in (
+        ({"panel": "not-a-panel", "from_name": "team-monday",
+          "to_name": "x"}, "panel"),
+        ({"panel": "weekly", "from_name": "team-monday",
+          "to_name": "a/b"}, "to_name"),
+        ({"panel": "weekly", "from_name": "team-monday",
+          "to_name": ""}, "to_name"),
+        ({"panel": "weekly", "from_name": "", "to_name": "x"}, "from_name"),
+    ):
+        status, body = _presets_post(
+            port, payload, path="/api/share/presets/rename")
+        assert status == 400, (payload, status, body)
+        assert body["field"] == field, (payload, body)
+
+
+def test_presets_rename_csrf_gate(dashboard_server):
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/share/presets/rename",
+        data=json.dumps({"panel": "weekly", "from_name": "a",
+                         "to_name": "b"}).encode(),
+        method="POST",
+        headers={"Origin": "http://evil.example",
+                 "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
+def test_presets_save_onto_an_existing_name_conflicts(dashboard_server):
+    """The save POST used to overwrite unconditionally and ignore an
+    `overwrite` field entirely. Absent means false — the fail-safe
+    direction, and what makes this compatible with any older caller."""
+    port, _ = dashboard_server
+    first = _seed_preset(port, "team-monday", source="codex", theme="dark")
+
+    status, body = _presets_post(port, {
+        "panel": "weekly", "name": "team-monday",
+        "template_id": "weekly-recap", "source": "claude",
+        "options": {"theme": "light", "format": "html"},
+    })
+    assert status == 409
+    assert body["code"] == "preset_name_conflict"
+    assert body["field"] == "name"
+
+    presets = _presets_get(port)["weekly"]
+    assert presets["team-monday"]["source"] == "codex"
+    assert presets["team-monday"]["options"]["theme"] == "dark"
+    assert presets["team-monday"]["saved_at"] == first["saved_at"]
+
+
+def test_presets_save_with_explicit_false_overwrite_also_conflicts(
+    dashboard_server,
+):
+    port, _ = dashboard_server
+    _seed_preset(port, "team-monday")
+    status, body = _presets_post(port, {
+        "panel": "weekly", "name": "team-monday", "overwrite": False,
+        "template_id": "weekly-recap",
+        "options": {"theme": "light", "format": "html"},
+    })
+    assert status == 409
+    assert body["code"] == "preset_name_conflict"
 
 
 def test_presets_post_csrf_gate(dashboard_server):
@@ -655,20 +854,29 @@ def _compose_request(port: int, sections: list[dict], **overrides):
         return json.loads(r.read())
 
 
-def _section_recipe(panel: str, template_id: str, digest: str = "sha256:fake"):
-    return {
-        "snapshot": {
-            "panel": panel, "template_id": template_id,
-            "options": {
-                "format": "html", "theme": "light",
-                "reveal_projects": True, "no_branding": False,
-                "top_n": 5, "show_chart": True, "show_table": True,
-                "period": None, "project_allowlist": None,
-            },
-            "data_digest_at_add": digest,
-            "kernel_version": 1,
-        }
+def _section_recipe(panel: str, template_id: str, digest: str = "sha256:fake",
+                    digest_version: "int | None" = 2):
+    """One compose section recipe.
+
+    `digest_version` defaults to the CURRENT `_SHARE_DATA_DIGEST_VERSION`
+    (#503 S3 §4): two digests are compared only when the stored version
+    matches, so a recipe that omits it is deliberately not comparable and
+    can never report drift. Pass `None` to exercise that legacy case.
+    """
+    snapshot = {
+        "panel": panel, "template_id": template_id,
+        "options": {
+            "format": "html", "theme": "light",
+            "reveal_projects": True, "no_branding": False,
+            "top_n": 5, "show_chart": True, "show_table": True,
+            "period": None, "project_allowlist": None,
+        },
+        "data_digest_at_add": digest,
+        "kernel_version": 1,
     }
+    if digest_version is not None:
+        snapshot["data_digest_version_at_add"] = digest_version
+    return {"snapshot": snapshot}
 
 
 def test_compose_single_section_round_trip(dashboard_server):
@@ -869,75 +1077,268 @@ def test_history_post_preserves_valid_account_and_omits_agnostic(dashboard_serve
     assert "account" not in records[1]
 
 
-def test_history_post_rejects_unknown_panel(dashboard_server):
+@pytest.mark.parametrize("row_kind", ("panel", "composed"))
+def test_history_post_rejects_unknown_panel(dashboard_server, row_kind):
     """Panel validation mirrors presets POST — refuses non-share-capable
-    panels with HTTP 400."""
+    panels with HTTP 400.
+
+    Parameterized over both history branches (#503 S3 §3): a composed row's
+    sections are held to exactly the invariants a panel row is, because a
+    section that would 400 on replay poisons the dropdown the same way.
+    """
     port, _ = dashboard_server
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/share/history",
-        data=json.dumps({
-            "panel": "alerts",
-            "template_id": "weekly-recap",
-            "options": {"format": "md"},
-            "format": "md",
-            "destination": "download",
-        }).encode(),
-        method="POST",
-        headers=_csrf_headers(port),
+    recipe = {
+        "panel": "alerts",
+        "template_id": "weekly-recap",
+        "options": {"format": "md"},
+    }
+    payload = (
+        {**recipe, "format": "md", "destination": "download"}
+        if row_kind == "panel" else _composed_row(sections=[recipe])
     )
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 400
+    status, body = _history_post(port, payload)
+    assert status == 400, body
+    assert body["field"] == (
+        "panel" if row_kind == "panel" else "sections[0].panel")
 
 
-def test_history_post_rejects_unknown_template_id(dashboard_server):
+@pytest.mark.parametrize("row_kind", ("panel", "composed"))
+def test_history_post_rejects_unknown_template_id(dashboard_server, row_kind):
     """History records are persisted recipes, so an unknown `template_id`
     poisons the recent-shares dropdown with a row that 400s on replay.
-    Mirror the render/compose `get_template` lookup."""
+    Mirror the render/compose `get_template` lookup — in both branches."""
     port, _ = dashboard_server
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/share/history",
-        data=json.dumps({
-            "panel": "weekly",
-            "template_id": "weekly-bogus",
-            "options": {"format": "md"},
-            "format": "md",
-            "destination": "download",
-        }).encode(),
-        method="POST",
-        headers=_csrf_headers(port),
+    recipe = {
+        "panel": "weekly",
+        "template_id": "weekly-bogus",
+        "options": {"format": "md"},
+    }
+    payload = (
+        {**recipe, "format": "md", "destination": "download"}
+        if row_kind == "panel" else _composed_row(sections=[recipe])
     )
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 400
-    err = json.loads(exc.value.read())
-    assert err["field"] == "template_id"
+    status, err = _history_post(port, payload)
+    assert status == 400, err
+    assert err["field"] == (
+        "template_id" if row_kind == "panel" else "sections[0].template_id")
     assert "weekly-bogus" in err["error"]
 
 
-def test_history_post_rejects_wrong_panel_template(dashboard_server):
+@pytest.mark.parametrize("row_kind", ("panel", "composed"))
+def test_history_post_rejects_wrong_panel_template(dashboard_server, row_kind):
     """`weekly-recap` recorded against `panel='daily'` would land in the
     ring buffer and surface a recent-shares row that 400s on every replay.
-    Reject at write time with the same envelope as /api/share/render."""
+    Reject at write time with the same envelope as /api/share/render — in
+    both branches."""
     port, _ = dashboard_server
+    recipe = {
+        "panel": "daily",
+        "template_id": "weekly-recap",
+        "options": {"format": "md"},
+    }
+    payload = (
+        {**recipe, "format": "md", "destination": "download"}
+        if row_kind == "panel" else _composed_row(sections=[recipe])
+    )
+    status, err = _history_post(port, payload)
+    assert status == 400, err
+    assert err["field"] == (
+        "template_id" if row_kind == "panel" else "sections[0].template_id")
+    assert "belongs to panel" in err["error"]
+
+
+# ---------- #503 S3 §3 — history is a discriminated union on `kind` -------
+#
+# A composed export used to record nothing at all: the history record was
+# structurally single-panel (the server rejects a payload whose template_id
+# does not belong to its panel), so the five composer export handlers had
+# nowhere to write. A composed row carries `panel: null`, which an older
+# client's `h.panel === panel` filter evaluates false, so it hides rather
+# than mis-renders it. No migration: a missing `kind` reads as "panel".
+
+
+def _history_post(port, payload):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/share/history",
-        data=json.dumps({
-            "panel": "daily",
-            "template_id": "weekly-recap",
-            "options": {"format": "md"},
-            "format": "md",
-            "destination": "download",
-        }).encode(),
+        data=json.dumps(payload).encode(),
         method="POST",
-        headers=_csrf_headers(port),
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
     )
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 400
-    err = json.loads(exc.value.read())
-    assert err["field"] == "template_id"
-    assert "belongs to panel" in err["error"]
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        return exc.code, (json.loads(raw) if raw else None)
+
+
+def _history_get(port):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/api/share/history", timeout=5,
+    ) as r:
+        return json.loads(r.read())["history"]
+
+
+def _composed_row(sections=None, **overrides):
+    payload = {
+        "kind": "composed",
+        "sections": sections if sections is not None else [
+            {"panel": "weekly", "template_id": "weekly-recap",
+             "options": {"top_n": 5}, "source": "claude"},
+            {"panel": "daily", "template_id": "daily-visual",
+             "options": {}, "source": "codex"},
+        ],
+        "composite": {
+            "title": "Monday roundup", "theme": "dark",
+            "reveal_projects": False, "no_branding": True,
+        },
+        "format": "md",
+        "destination": "download",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_history_composed_row_round_trips(dashboard_server):
+    """A3's server half."""
+    port, _ = dashboard_server
+    status, record = _history_post(port, _composed_row())
+    assert status == 200, record
+    assert record["kind"] == "composed"
+    assert record["panel"] is None
+    assert record["recipe_id"]
+    assert record["exported_at"]
+    assert [s["panel"] for s in record["sections"]] == ["weekly", "daily"]
+    assert record["sections"][1]["source"] == "codex"
+    assert record["composite"]["title"] == "Monday roundup"
+    assert "template_id" not in record
+    assert "source" not in record
+
+    rows = _history_get(port)
+    assert len(rows) == 1
+    assert rows[0] == record
+
+
+def test_history_legacy_row_reads_as_panel_without_being_written_back(
+    dashboard_server, tmp_path,
+):
+    """A4. A `config.json` written before `kind` existed must read and
+    recall correctly, and a GET must stay read-only."""
+    port, _ = dashboard_server
+    status, _ = _history_post(port, {
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {"format": "md"}, "format": "md",
+        "destination": "download",
+    })
+    assert status == 200
+
+    config_path = tmp_path / ".local" / "share" / "cctally" / "config.json"
+    stored = json.loads(config_path.read_text())
+    # Simulate the pre-#503-S3 bytes: strip the discriminator entirely.
+    stored["share"]["history"][0].pop("kind", None)
+    config_path.write_text(json.dumps(stored))
+    before = config_path.read_text()
+
+    rows = _history_get(port)
+    assert rows[0]["kind"] == "panel"
+    assert rows[0]["panel"] == "weekly"
+    assert rows[0]["source"] == "claude"
+    assert config_path.read_text() == before, "GET must not write config back"
+
+
+def test_history_rejects_an_unknown_kind(dashboard_server):
+    port, _ = dashboard_server
+    status, body = _history_post(port, {
+        "kind": "composite", "panel": "weekly",
+        "template_id": "weekly-recap", "options": {},
+    })
+    assert status == 400
+    assert body["field"] == "kind"
+
+
+@pytest.mark.parametrize("count", (0, 21))
+def test_history_composed_row_bounds_its_section_list(dashboard_server, count):
+    """Twenty is the basket cap, so the row is bounded by construction."""
+    port, _ = dashboard_server
+    section = {"panel": "weekly", "template_id": "weekly-recap",
+               "options": {}, "source": "claude"}
+    status, body = _history_post(
+        port, _composed_row(sections=[dict(section)] * count))
+    assert status == 400, body
+    assert body["field"] == "sections"
+
+
+@pytest.mark.parametrize(("section", "field"), (
+    ({"panel": "weekly", "template_id": "weekly-recap", "options": []},
+     "sections[0].options"),
+    ({"panel": "weekly", "template_id": "weekly-recap", "options": {},
+      "account": "not-a-key"}, "sections[0].account"),
+    ({"panel": "weekly", "template_id": "weekly-recap", "options": {},
+      "source": "gemini"}, "sections[0].source"),
+    ("not-an-object", "sections[0]"),
+))
+def test_history_composed_row_validates_every_section(
+    dashboard_server, section, field,
+):
+    """The panel-membership and template-ownership halves live on the three
+    parameterized pinning tests above; these are the remaining per-section
+    invariants."""
+    port, _ = dashboard_server
+    status, body = _history_post(port, _composed_row(sections=[section]))
+    assert status == 400, body
+    assert body["field"] == field, body
+
+
+@pytest.mark.parametrize(("composite", "field"), (
+    ({"theme": "dark"}, "composite.title"),
+    ({"title": "T", "theme": "neon"}, "composite.theme"),
+    ({"title": "T", "theme": "dark", "reveal_projects": "yes"},
+     "composite.reveal_projects"),
+    ({"title": "T", "theme": "dark", "no_branding": 1},
+     "composite.no_branding"),
+))
+def test_history_composed_row_validates_its_composite_knobs(
+    dashboard_server, composite, field,
+):
+    port, _ = dashboard_server
+    status, body = _history_post(port, _composed_row(composite=composite))
+    assert status == 400, body
+    assert body["field"] == field, body
+
+
+@pytest.mark.parametrize(("payload", "field"), (
+    ({"kind": "composed", "panel": "weekly"}, "panel"),
+    ({"kind": "composed", "template_id": "weekly-recap"}, "template_id"),
+    ({"kind": "composed", "source": "codex"}, "source"),
+    ({"kind": "composed", "options": {"top_n": 3}}, "options"),
+    ({"kind": "panel", "panel": "weekly", "template_id": "weekly-recap",
+      "options": {}, "sections": []}, "sections"),
+    ({"kind": "panel", "panel": "weekly", "template_id": "weekly-recap",
+      "options": {}, "composite": {"title": "T"}}, "composite"),
+))
+def test_history_rejects_a_row_that_mixes_the_two_branches(
+    dashboard_server, payload, field,
+):
+    port, _ = dashboard_server
+    body_payload = dict(payload)
+    if body_payload.get("kind") == "composed":
+        base = _composed_row()
+        base.update(body_payload)
+        body_payload = base
+    status, body = _history_post(port, body_payload)
+    assert status == 400, body
+    assert body["field"] == field, body
+
+
+def test_history_composed_and_panel_rows_share_one_ring(dashboard_server):
+    port, _ = dashboard_server
+    assert _history_post(port, _composed_row())[0] == 200
+    assert _history_post(port, {
+        "panel": "weekly", "template_id": "weekly-recap",
+        "options": {}, "format": "md", "destination": "clipboard",
+    })[0] == 200
+    rows = _history_get(port)
+    assert [row["kind"] for row in rows] == ["composed", "panel"]
 
 
 def test_history_post_csrf_gate(dashboard_server):
@@ -1071,14 +1472,18 @@ def test_render_anonymizes_when_reveal_projects_is_absent(dashboard_server):
 
 def test_render_projects_panel_claims_anonymized_when_the_field_is_absent(
         dashboard_server):
-    port, _ = dashboard_server
+    """#503 S2 D5: the claim moved from the Projects subtitle to the facts
+    strip, which states it for EVERY panel rather than for this one, and
+    reads the provenance marker rather than a request field. An absent
+    `reveal_projects` must still produce the anonymized claim."""
     body = _render_request(
-        port, panel="projects", template_id="projects-recap",
+        dashboard_server[0], panel="projects", template_id="projects-recap",
         options={"format": "md", "theme": "light", "no_branding": False,
                  "top_n": 5, "period": {"kind": "current"},
                  "project_allowlist": None},
     )["body"]
-    assert "projects anonymized" in body
+    assert "anonymized: true" in body
+    assert "real project names" not in body
     assert "real projects" not in body
 
 
@@ -1214,7 +1619,7 @@ def test_compose_anonymizes_when_reveal_projects_is_absent(dashboard_server):
     assert "anonymized: true" in body
 
 
-def test_projects_subtitle_anonymizes_when_the_field_is_absent():
+def test_projects_subtitle_states_only_its_count():
     import importlib.util as _ilu
     import sys as _sys
     if "_lib_share_templates" in _sys.modules:
@@ -1225,6 +1630,8 @@ def test_projects_subtitle_anonymizes_when_the_field_is_absent():
         _T = _ilu.module_from_spec(_spec)
         _sys.modules["_lib_share_templates"] = _T
         _spec.loader.exec_module(_T)
-    assert _T._projects_subtitle({}, 3) == "3 projects · projects anonymized"
-    assert _T._projects_subtitle({"reveal_projects": True}, 3) == \
-        "3 projects · real projects"
+    # #503 S2 D5 — the subtitle keeps ONLY its count. The privacy claim
+    # is now the facts strip's, which reads the provenance marker rather
+    # than this options dict, so an omitted field cannot make it wrong.
+    assert _T._projects_subtitle(3) == "3 projects"
+    assert _T._projects_subtitle(3) == "3 projects"  # no privacy clause

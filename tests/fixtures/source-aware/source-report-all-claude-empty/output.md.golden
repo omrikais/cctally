@@ -9,27 +9,16 @@ cctally_version: 9.9.9
 
 # Dollars-per-Percent Report — Claude + Codex
 
-## Dollars-per-Percent Report
-
-# Dollars-per-Percent Report
-
-**Claude**
+## Dollars-per-Percent Report — Claude
 
 No data
-_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
-
-| Week | % Used | $ Cost | $/1% |
-|:---|---:|---:|---:|
 
 - **Trend total:** $0.00
 
-## Dollars-per-Percent Report
-
-# Dollars-per-Percent Report
-
-**Codex**
-_2026-07-02 → 2026-07-02 (UTC)_
+## Dollars-per-Percent Report — Codex
+_2026-07-02 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
 
 | Quota Series | % Used | $ Cost |

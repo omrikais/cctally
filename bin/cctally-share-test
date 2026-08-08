@@ -78,6 +78,9 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
 
     case "$scenario" in
         report-md)             cmd="report";           fmt="md";   theme="light" ;;
+        # #503 S2 F18/D2: `--no-branding` must strip the advertisement and
+        # keep the provenance. No v1 golden covered the flag at all.
+        report-md-no-branding) cmd="report";           fmt="md";   theme="light"; extra="--no-branding" ;;
         report-svg-light)      cmd="report";           fmt="svg";  theme="light" ;;
         report-svg-dark)       cmd="report";           fmt="svg";  theme="dark" ;;
         report-empty-html)     cmd="report";           fmt="html"; theme="light" ;;
@@ -147,6 +150,25 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         fail_count=$((fail_count + 1))
     fi
 done
+
+# The floor (#503 S2). Without it, a `$FIXTURES_DIR/*/` glob that matched
+# nothing — an un-run fixture builder, a mistyped path — would leave both
+# counters at 0 and the closing `[ "$fail_count" -eq 0 ]` would exit 0, the
+# same "absent coverage reads as success" shape the share-v2 legs guard
+# against. Sized by reading `SCENARIOS` from the BUILDER, which is a source
+# independent of the directory glob this loop walks; a floor counted from
+# the glob would move with the failure and could never fire.
+min_cases="$(python3 -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(len(m.SCENARIOS))' "$REPO_ROOT/bin/build-share-fixtures.py" 2>/dev/null)"
+if [[ ! "$min_cases" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FAIL share: cannot read SCENARIOS to size the case floor"
+    fail_count=$((fail_count + 1))
+elif [ "$((pass_count + fail_count))" -lt "$min_cases" ]; then
+    echo "FAIL share: ran $((pass_count + fail_count)) cases for $min_cases registered scenarios"
+    fail_count=$((fail_count + 1))
+fi
 
 echo "----"
 echo "passed: $pass_count   failed: $fail_count"

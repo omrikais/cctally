@@ -16,10 +16,31 @@ EPSILON = 1e-9
 
 
 def _load(name: str, path: Path):
+    """Get-or-load, matching every other test module in this tree.
+
+    This used to re-register `sys.modules[name]` unconditionally, which
+    left a SECOND `_lib_share` module object under the same key whenever
+    a peer test file had already loaded one. `_lib_share_templates` then
+    bound its `_LS` to the new object while a peer's module-level
+    `_lib_share` still referenced the old one, so `isinstance(cell,
+    ProjectCell)` failed across the seam and preparation found no project
+    display fields at all — an anonymized and a revealed render came out
+    byte-identical. `tests/test_share_privacy_detector.py` fails exactly
+    that way when it runs after this file in one process. The hazard is
+    the same one the loader comment at the top of
+    `tests/test_lib_share.py` describes; this file was the one loader
+    that did not guard against it.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
     return mod
 
 

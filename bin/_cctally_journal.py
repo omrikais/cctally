@@ -5668,6 +5668,27 @@ def _run_stats_ingest_once(
             if own_conn and conn is not None:
                 conn.close()
     finally:
+        # §9.2 (#496 S6 F23): the routine stats write. The `-wal`/`-shm`
+        # sidecars are materialized by the FIRST write, not by the connect, so
+        # hardening at open time alone would leave a 0644 WAL behind every
+        # ingest cycle — the exact shape of the cache.db defect #150 fixed.
+        # This runs while the ingest lock is still held, so the sidecars it
+        # inspects are the ones this cycle produced.
+        #
+        # Guarded because it is the FIRST statement of this block and the two
+        # lock releases are the last two: anything raised here — including the
+        # import — skips both, and the flocks are fd-scoped, so a long-lived
+        # dashboard process would hold them until it exited. Hardening is
+        # best-effort; releasing the locks is not.
+        try:
+            import _cctally_store
+            _cctally_store._harden_stats_family(_cctally_core.DB_PATH)
+        except Exception as exc:  # noqa: BLE001 — never above a lock release
+            print(
+                f"[ingest] could not harden the stats family ({exc}); "
+                "continuing",
+                file=sys.stderr,
+            )
         if lock_fd is not None:
             _release_ingest_lock(lock_fd)
         if maintenance_fd is not None:
@@ -7055,14 +7076,14 @@ def _record_post_checkpoint_damage(
 
 
 def _binary_version() -> "str | None":
-    """The running binary's released version, or None when it cannot be read."""
-    try:
-        import _lib_changelog
+    """The running binary's released version, or None when it cannot be read.
 
-        value = _lib_changelog._read_latest_changelog_version()
-    except Exception:  # pragma: no cover — a missing CHANGELOG is not fatal
-        return None
-    return value[0] if value else None
+    One implementation, in `_cctally_db`, shared with the incident manifests
+    the quarantine path writes (#496 S6 §4.2).
+    """
+    import _cctally_db
+
+    return _cctally_db._binary_version()
 
 
 def _preserve_stats_family_for_cutover(
@@ -7494,6 +7515,7 @@ def _publish_stats_index_in_place(
     no incident directory), or `_FALL_BACK` when physical replacement is the
     sanctioned response.
     """
+    import _cctally_store
     import _lib_stats_publish as sp
 
     try:
@@ -7607,6 +7629,11 @@ def _publish_stats_index_in_place(
         conn.close()
     except Exception:
         pass
+    # §9.2 (#496 S6 F23): the in-place publisher never touches the destination
+    # file's mode — it mutates objects inside it — so a family that was 0644
+    # before the publication is still 0644 after it. The checkpoint above is
+    # also the last thing that can re-materialize a sidecar.
+    _cctally_store._harden_stats_family(destination)
     _stats_rebuild_test_pause("rebuild_after_publication_replace")
 
     # Phase 2: validate the bytes that are now live, on a connection that never
@@ -7780,6 +7807,12 @@ def _publish_rebuilt_stats_index(
     )
 
     _stats_rebuild_test_pause("rebuild_before_cutover")
+    # §9.2 (#496 S6 F23): the scratch is closed and about to BECOME the
+    # destination, so hardening it here is what makes the replacement private
+    # from the instant it is visible under the live name. `os.replace` carries
+    # the source inode's mode across; a chmod after the rename would leave a
+    # window in which the live index was world-readable.
+    _cctally_store._harden_stats_family(scratch)
     os.replace(str(scratch), str(destination))
     _fsync_dir(destination.parent)
     _stats_rebuild_test_pause("rebuild_after_publication_replace")
@@ -7787,6 +7820,10 @@ def _publish_rebuilt_stats_index(
     # Phase 2: validate the bytes that are now live, on a connection that never
     # saw them being written.
     post_error = validate_published_stats_index(destination, high_water)
+    # The validation opened the family read-only, which materializes sidecars
+    # the removal below deletes; harden the destination itself while they are
+    # still present so neither the main nor a surviving sidecar stays 0644.
+    _cctally_store._harden_stats_family(destination)
     # The read-only open above creates a zero-byte WAL and a 32 KiB SHM.
     # Remove them so the documented no-post-publication-stale-sidecar end state
     # still holds; an empty WAL is consistent with the freshly published main,
@@ -8943,6 +8980,41 @@ def _observe_selector_desynchronization(path) -> "dict | None":
 
 
 def rebuild_stats_index(
+    *,
+    context: RebuildContext,
+    target_path=None,
+    high_water: "tuple[str, int] | None" = None,
+    update_quota_cache: bool = True,
+    before_swap=None,
+) -> RebuildResult:
+    """Rebuild the stats index under a SHARED `artifact-retention.lock` hold.
+
+    #496 S6 §5.3. A rebuild publishes three artifacts that reclamation must not
+    mark while they are being written: the preserved-family incident manifest,
+    the second manifest write `_record_post_checkpoint_damage` performs after
+    the explicit checkpoint, and the rebuild record that names both. The hold
+    spans all three, so no observer ever sees the incident half-described.
+
+    The hold is taken here rather than only at the producer call sites because
+    `db rebuild` and the auto-heal worker are not the only callers — the epoch
+    rebuild and the deferred rebuild reach the same cutover. It is refcounted,
+    so a caller that already holds it pays nothing.
+
+    See `_rebuild_stats_index_locked` for the rebuild itself.
+    """
+    import _cctally_retention
+
+    with _cctally_retention.retention_shared(label="stats rebuild"):
+        return _rebuild_stats_index_locked(
+            context=context,
+            target_path=target_path,
+            high_water=high_water,
+            update_quota_cache=update_quota_cache,
+            before_swap=before_swap,
+        )
+
+
+def _rebuild_stats_index_locked(
     *,
     context: RebuildContext,
     target_path=None,

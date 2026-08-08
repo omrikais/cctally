@@ -104,6 +104,22 @@ Database
         conversations_db_freelist_count: None
         conversations_db_free_ratio: None
         warn_ratio: 0.25
+  ✓ Retained evidence        0 B retained, within policy
+      details:
+        policyStatus: missing
+        policyReason: None
+        scanned: True
+        retainedBytes: 0
+        reclaimableBytes: 0
+        protectedBytes: 0
+        protectedRoots: 0
+        roots: 0
+        freeDiskBytes: <redacted>
+        partialScan: False
+        unsatisfiedRules: []
+        floorRetainedRoots: 0
+        floorRetainedBytes: 0
+        stuckRecords: []
 Journal
   ✓ Journal                  no journal (pre-cutover install)
       details:
@@ -117,6 +133,11 @@ Journal
   ✓ Auto-heal                no auto-heal incidents
       details:
         incidents: 0
+        detections: 0
+        recentDetections: 0
+        windowDays: 7
+        repeatedShapes: []
+        latest: None
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
       details:
         entries: 0
@@ -264,4 +285,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 51 OK · 8 WARN · 0 FAIL
+Summary: 52 OK · 8 WARN · 0 FAIL

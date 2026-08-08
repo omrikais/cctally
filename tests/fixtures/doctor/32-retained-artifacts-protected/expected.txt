@@ -1,0 +1,80 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+  ✓ Mode                     installed
+  ✓ Update channel           stable
+  ✓ Symlinks                 15/15 available
+  ✓ PATH                     cctally reachable on $PATH
+  ✓ Legacy status-line snippet not detected
+  ✓ Legacy bespoke hooks     not detected
+Hooks
+  ✓ Hook entries installed   PostToolBatch, Stop, SubagentStop
+  ✓ statusLine refreshInterval no statusLine configured
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+  ✓ Codex hooks installed    not applicable
+  ✓ Codex recent activity    not applicable
+Auth
+  ✓ OAuth token              present
+Database
+  ✓ stats.db                 version 0 / 13 known
+  ⚠ cache.db                 absent (fresh install)
+  ✓ Integrity                quick_check ok
+  ✓ Version ahead            none ahead
+  ✓ Migrations               0/54 applied
+  ⚠ Pending migrations       54 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+  ✓ Locks                    free
+  ✓ cache.db WAL size        within limit
+  ✓ Reclaimable cache space  below threshold
+  ✓ Reclaimable transcript space below threshold
+  ✗ Retained evidence        9.0 MiB retained; 9.0 MiB protected leaves the 1-day age bound and the 1 MiB budget unsatisfied
+      → Run `cctally db prune` to see which groups are protected and why; evidence cctally cannot classify is never deleted
+Journal
+  ✓ Journal                  no journal (pre-cutover install)
+  ✓ Journal integrity        no journal
+  ✓ Journal index            no cursor yet
+  ⚠ Auto-heal                3 incidents, 130d ago; no recurrence in 7d
+      → A DB corrupted and self-healed — inspect the forensics bundle in ~/.local/share/cctally/logs/
+  ✓ Stats writer guard       no unsanctioned stats.db writes recorded
+  ✓ Journal conflicts        not scanned
+  ✓ Journal protocol         not scanned
+  ✓ Quota projection         not applicable
+Data
+  ✓ Latest snapshot          2s ago
+  ✓ Statusline pipeline      no recent regular-pool timer observed
+  ✓ Claude cache             0 entries (no JSONL corpus)
+  ✓ Codex cache              none (no Codex session JSONL found)
+  ✓ Codex project metadata   qualified
+  ✓ Codex orphan pruning     no refused prune
+  ✓ Codex transcript replay  none pending
+  ✓ Codex ingest backlog     no Codex ingest backlog
+  ✓ Codex quota              not applicable
+  ✓ Codex quota verification no hand-off in the last 24h
+  ✓ Ingest parse health      no parse-health data yet (pre-first-sync)
+  ✓ Forked week buckets      none
+  ✓ Post-credit milestones   no credited weeks
+  ✓ Conversation rollup      no data
+Accounts
+  ✓ Account identity source  no active Claude identity on disk (single-account / api-key mode)
+  ✓ Codex account identity   no deferred Codex ingest
+  ✓ Account registry         no accounts observed yet
+  ✓ Account attribution freshness no attribution activity recorded
+  ✓ Account attribution      usage attribution healthy
+  ✓ Codex reset anchors      Codex reset anchors complete
+Pricing
+  ✓ Coverage                 all observed models priced
+Safety
+  ✓ Dashboard bind           config: loopback
+  ✓ Backup/sync              cctally data excluded from Time Machine
+  ✓ config.json              absent or parses cleanly
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+  ✓ update-suppress.json     parses cleanly
+  ✓ Update available         no
+Telemetry
+  ✓ State                    enabled (enabled)
+
+Summary: 53 OK · 6 WARN · 1 FAIL

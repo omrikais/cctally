@@ -470,3 +470,154 @@ describe('#503 S1 B2 — status-line strings fit one mobile line', () => {
     expect(new Set(seen).size, JSON.stringify(seen)).toBe(3);
   });
 });
+
+
+// #503 S3 §5 — the user learns that something failed BEFORE they export.
+//
+// Failures were never silent — every action writes an inline role="alert"
+// banner AFTER the click. What was missing is a signal before it. Preview
+// failure lived in <PreviewPane>'s local state and never reached <ActionBar>.
+describe('#503 S3 §5 — the failed-preview note', () => {
+  function stubFetchWithFailedRender() {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.includes('/api/share/presets')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ presets: {} }), { status: 200 }));
+      }
+      if (typeof url === 'string' && url.includes('/api/share/render')) {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          json: async () => ({ error: 'source render failed' }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          panel: 'weekly',
+          templates: [{
+            id: 'weekly-recap', label: 'Recap', description: 'Text',
+            default_options: { format: 'md', theme: 'light' },
+          }],
+        }),
+      });
+    }));
+  }
+
+  const NOTE = 'The preview failed — an export may fail too.';
+
+  function note() {
+    return document.querySelector('.share-preview-failed-note');
+  }
+
+  function exportButtons() {
+    return Array.from(document.querySelectorAll<HTMLButtonElement>(
+      '.share-action-copy, .share-action-download, .share-action-open,'
+      + ' .share-action-png, .share-action-print'));
+  }
+
+  it('surfaces the note and leaves EVERY action clickable', async () => {
+    stubMatchMedia(false);
+    stubFetchWithFailedRender();
+    await openShare();
+    await waitFor(() => expect(note()).not.toBeNull());
+    expect(note()!.textContent).toBe(NOTE);
+    // Warn, do not disable: the export re-fetches, so a failed preview does
+    // not imply a failed export. `disabled` here would remove a capability
+    // the user still has.
+    const enabled = exportButtons().filter((b) => !b.disabled);
+    expect(enabled.length).toBeGreaterThan(0);
+    for (const b of exportButtons()) {
+      // Any disabled button is disabled by its FORMAT gate, not by us.
+      if (b.disabled) expect(b.title).toMatch(/available for|only/i);
+    }
+  });
+
+  it('replaces the privacy line rather than doubling it', async () => {
+    stubMatchMedia(false);
+    stubFetchWithFailedRender();
+    await openShare();
+    await waitFor(() => expect(note()).not.toBeNull());
+    // With `hasProjectNames === null` the line still renders a definite
+    // claim — including "Preview shows real names", which is false when the
+    // preview shows an error.
+    expect(document.querySelector('.share-privacy-status')).toBeNull();
+  });
+
+  it('is referenced by the export buttons through aria-describedby',
+    async () => {
+      stubMatchMedia(false);
+      stubFetchWithFailedRender();
+      await openShare();
+      await waitFor(() => expect(note()).not.toBeNull());
+      const id = note()!.getAttribute('id');
+      expect(id).toBeTruthy();
+      for (const b of exportButtons()) {
+        expect(b.getAttribute('aria-describedby')).toBe(id);
+      }
+      // Announced ONCE: the preview keeps its own role="alert" banner for
+      // the event; this note carries no live region of its own.
+      expect(note()!.getAttribute('role')).toBeNull();
+      expect(note()!.getAttribute('aria-live')).toBeNull();
+    });
+
+  it('clears when a later render succeeds, restoring the privacy line',
+    async () => {
+      stubMatchMedia(false);
+      let fail = true;
+      vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+        if (typeof url === 'string' && url.includes('/api/share/presets')) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ presets: {} }), { status: 200 }));
+        }
+        if (typeof url === 'string' && url.includes('/api/share/render')) {
+          if (fail) {
+            return Promise.resolve({
+              ok: false, status: 500,
+              json: async () => ({ error: 'source render failed' }),
+            });
+          }
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              body: '# Weekly\n', content_type: 'text/markdown',
+              has_project_names: true,
+              snapshot: {
+                kernel_version: 1, panel: 'weekly',
+                template_id: 'weekly-recap', options: {},
+                generated_at: '2026-05-09T12:00:00Z', data_digest: 'd',
+              },
+            }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            panel: 'weekly',
+            templates: [{
+              id: 'weekly-recap', label: 'Recap', description: 'Text',
+              default_options: { format: 'md', theme: 'light' },
+            }],
+          }),
+        });
+      }));
+      await openShare();
+      await waitFor(() => expect(note()).not.toBeNull());
+
+      fail = false;
+      const box = document.querySelector<HTMLInputElement>(
+        'input[aria-label="Anonymize project names on export"]')!;
+      await act(async () => { box.click(); });
+      await waitFor(() => expect(note()).toBeNull());
+      expect(document.querySelector('.share-privacy-status')).not.toBeNull();
+    });
+
+  it('shows no note while the preview is healthy', async () => {
+    stubMatchMedia(false);
+    stubFetchWithRender(true);
+    await openShare();
+    await waitFor(() =>
+      expect(document.querySelector('.share-privacy-status')).not.toBeNull());
+    expect(note()).toBeNull();
+  });
+});

@@ -1,13 +1,13 @@
 ---
-title: Budget — week of May 26
+title: Budget — week of 2026-05-26
 generated_at: 2026-05-30T14:00:00Z
 period: 2026-05-26T14:00:00Z..2026-06-02T14:00:00Z
 panel: budget
 anonymized: true
 cctally_version: VERSION
 ---
-# Budget — week of May 26
-_May 26 → Jun 02 (Etc/UTC) · light · projects anonymized_
+# Budget — week of 2026-05-26
+_2026-05-26 → 2026-06-02 (Etc/UTC) · projects anonymized_
 _2026-05-30T14:00:00Z_
 
 | Metric | Value |

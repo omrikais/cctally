@@ -9,7 +9,7 @@ cctally_version: 9.9.9
 # Range Cost Report
 
 **Codex**
-_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-01 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
 
 | Model | Tokens | $ Cost |

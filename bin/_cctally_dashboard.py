@@ -1238,6 +1238,7 @@ from _cctally_dashboard_share import (
     _handle_share_compose_post_impl,
     _handle_share_presets_get_impl,
     _handle_share_presets_post_impl,
+    _handle_share_presets_rename_post_impl,
     _handle_share_presets_delete_impl,
     _handle_share_history_get_impl,
     _handle_share_history_post_impl,
@@ -4637,6 +4638,8 @@ _POST_ROUTES = (
     ("exact", "/api/share/render", "_handle_share_render_post", None, False),
     ("exact", "/api/share/compose", "_handle_share_compose_post", None, False),
     ("exact", "/api/share/presets", "_handle_share_presets_post", None, False),
+    ("exact", "/api/share/presets/rename", "_handle_share_presets_rename_post",
+     None, False),
     ("exact", "/api/share/history", "_handle_share_history_post", None, False),
 )
 
@@ -6086,6 +6089,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
     def _handle_share_presets_post(self) -> None:
         return _handle_share_presets_post_impl(self)
+
+    def _handle_share_presets_rename_post(self) -> None:
+        return _handle_share_presets_rename_post_impl(self)
 
     def _handle_share_presets_delete(self) -> None:
         return _handle_share_presets_delete_impl(self)

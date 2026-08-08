@@ -1,0 +1,27 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ cache.db                 absent (fresh install)
+  ⚠ Pending migrations       54 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+  ⚠ Retained evidence        9.0 MiB retained, 9.0 MiB reclaimable — over the 1-day age bound
+      → Run `cctally db prune` to preview, `--yes` to apply.
+Journal
+  ⚠ Auto-heal                3 incidents, 130d ago; no recurrence in 7d
+      → A DB corrupted and self-healed — inspect the forensics bundle in ~/.local/share/cctally/logs/
+Data
+Accounts
+Pricing
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+Telemetry
+
+Summary: 53 OK · 7 WARN · 0 FAIL

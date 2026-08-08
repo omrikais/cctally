@@ -1308,7 +1308,15 @@ def _share_int(value: object, default: int = 0) -> int:
 def _claude_project_share_rows(data: dict[str, object], lib) -> tuple[tuple, tuple, tuple]:
     """Adapt the established ``project`` JSON payload without Codex field guesses."""
     columns = (
-        lib.ColumnSpec(key="project", label="Project", kind="project"),
+        # NO `kind="project"` (#503 S2 F4). That flag declares the
+        # column LABEL to be a project display name — true for the
+        # cross-tab Detail templates, whose headers are project names,
+        # and false here, where the label is the literal header word.
+        # With it, the anonymizer rewrote the header itself, so the
+        # column ended up titled `project-1` and the artifact
+        # misstated what it was. The CELLS are `ProjectCell`s and are
+        # anonymized through the cell site, which is the correct one.
+        lib.ColumnSpec(key="project", label="Project"),
         lib.ColumnSpec(key="cost", label="$ Cost", align="right"),
         lib.ColumnSpec(key="tokens", label="Tokens", align="right"),
     )
@@ -1516,7 +1524,9 @@ def _claude_report_share_rows(data: dict[str, object], lib) -> tuple[tuple, tupl
             continue
         date_value = str(payload_row.get("weekStartDate", "—"))
         try:
-            display_week = dt.date.fromisoformat(date_value).strftime("%b %d")
+            # Full ISO (#503 S2 D4/F15): a `%b %d` week cell names no year,
+            # so a multi-year artifact is ambiguous.
+            display_week = dt.date.fromisoformat(date_value).isoformat()
         except ValueError:
             display_week = date_value
         used = payload_row.get("weeklyPercent")
@@ -1562,7 +1572,8 @@ def _source_share_rows(command: str, result: SourceResult, lib) -> tuple[tuple, 
 
     if command == "project":
         columns = (
-            lib.ColumnSpec(key="project", label="Project", kind="project"),
+            # No `kind="project"` — see `_claude_project_share_rows`.
+            lib.ColumnSpec(key="project", label="Project"),
             lib.ColumnSpec(key="cost", label="$ Cost", align="right"),
             lib.ColumnSpec(key="tokens", label="Tokens", align="right"),
         )
@@ -1687,13 +1698,18 @@ def build_source_share_snapshot(
         "empty" if source_result.status == "empty" else "ok"
     )
     source_label = "Claude" if source_result.source == "claude" else "Codex"
-    period_label = f"{start.date().isoformat()} → {end.date().isoformat()} (UTC)"
+    # The all-source CLI path has no display-tz plumbing; its bounds are
+    # UTC instants, so `Etc/UTC` is both the honest and the concrete IANA
+    # name for them (#503 S2 D7).
+    period_label = f"{start.date().isoformat()} → {end.date().isoformat()} (Etc/UTC)"
     notes = tuple(warning.message for warning in source_result.warnings if source_result.status != "unavailable")
     return lib.ShareSnapshot(
         cmd=command,
         title=_TERMINAL_TITLES[command],
-        subtitle=period_label,
-        period=lib.PeriodSpec(start=start, end=end, display_tz="UTC", label=period_label),
+        # #503 S2 D5 — the facts strip states this period, so a
+        # subtitle repeating it is duplicate chrome.
+        subtitle=None,
+        period=lib.PeriodSpec(start=start, end=end, display_tz="Etc/UTC", label=period_label),
         columns=columns,
         rows=rows,
         chart=None,
@@ -1927,16 +1943,28 @@ def _emit_source_share(
             lib.ComposedSection(snap=claude_snap, drift_detected=False),
             lib.ComposedSection(snap=codex_snap, drift_detected=False),
         )
-        content = lib.compose(
-            sections,
-            opts=lib.ComposeOptions(
-                title=f"{_TERMINAL_TITLES[command]} — Claude + Codex",
-                theme=getattr(args, "theme", "light"),
-                format=args.format,
-                no_branding=bool(getattr(args, "no_branding", False)),
-                reveal_projects=reveal_projects,
-            ),
-        )
+        # A privacy refusal is a MESSAGE and exit 3, exactly as on the
+        # single-source path (`_cctally_share._share_render_and_emit`).
+        # Without this catch the same `SharePrivacyViolation` reached the
+        # generic handler in `bin/cctally` and became exit 1, so `share.md`
+        # would have documented an exit code one of the two paths did not
+        # produce (#503 S2 F19). The refusal precedes destination
+        # resolution, so nothing is written.
+        try:
+            content = lib.compose(
+                sections,
+                opts=lib.ComposeOptions(
+                    title=f"{_TERMINAL_TITLES[command]} — Claude + Codex",
+                    theme=getattr(args, "theme", "light"),
+                    format=args.format,
+                    no_branding=bool(getattr(args, "no_branding", False)),
+                    reveal_projects=reveal_projects,
+                ),
+            )
+        except lib.SharePrivacyViolation as exc:
+            print(f"cctally: refused to write a share artifact — {exc}",
+                  file=sys.stderr)
+            sys.exit(3)
         utc_date = codex_snap.generated_at.astimezone(UTC).strftime("%Y-%m-%d")
         kind, value = c._resolve_destination(args, cmd=command, generated_at_utc_date=utc_date)
         c._emit(content, kind=kind, value=value)

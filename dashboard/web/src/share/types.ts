@@ -3,7 +3,7 @@
 // `SharePanelId` is the explicit subset of `PanelId` (from
 // lib/panelIds.ts) for which the kernel can render a shareable
 // snapshot. Source of truth on the Python side is
-// `bin/_lib_share_templates.SHARE_CAPABLE_PANELS` (8 panels). We
+// `bin/_lib_share_templates.SHARE_CAPABLE_PANELS` (9 panels). We
 // deliberately spell it as a literal union here (not
 // `Exclude<PanelId, 'alerts'>`) so a future PanelId addition that
 // happens to be non-share-capable doesn't silently widen this type.
@@ -83,6 +83,10 @@ export interface ShareSnapshot {
   options: ShareOptions;
   generated_at: string;
   data_digest: string;
+  // #503 S3 §4 — which digest DEFINITION `data_digest` was minted under.
+  // Stored beside the digest on a basket item and replayed at compose time;
+  // optional because an older server does not send it.
+  data_digest_version?: number;
   // Additive account metadata. The server omits both for agnostic shares and
   // anonymizes the label unless reveal_projects was explicitly enabled.
   account?: string;

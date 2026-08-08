@@ -2938,7 +2938,12 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
     db_recover.add_argument(
         "--yes",
         action="store_true",
-        help="Required for --db stats (non-re-derivable; may need a re-record)",
+        help=(
+            "No longer required: --db stats is retired because stats.db is a "
+            "disposable index rebuilt from the journal (use `db rebuild --db "
+            "stats`); a pre-cutover install whose stats.db may be the only "
+            "copy of its history is repaired with `db repair --db stats --yes`"
+        ),
     )
     db_recover.set_defaults(func=c.cmd_db_recover)
     db_rebuild = db_sub.add_parser(
@@ -3046,6 +3051,50 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help=argparse.SUPPRESS,
     )
     db_backup.set_defaults(func=c.cmd_db_backup)
+    db_prune = db_sub.add_parser(
+        "prune",
+        help="Reclaim retained corruption evidence the policy no longer keeps",
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Reclaim the quarantine incidents, forensics bundles,
+                    rebuild records and machine-written backups that the
+                    configured retention policy no longer keeps.
+
+                    Preview by default: nothing is deleted until you pass
+                    --yes. Evidence cctally cannot classify is NEVER deleted,
+                    in either mode, and the last surviving example of each
+                    distinct damage shape is always kept, for as many shapes
+                    as max_shape_examples allows.
+
+                    The policy lives at storage.artifact_retention in
+                    config.json. If it is present but malformed, this command
+                    exits 2 without deleting anything.
+
+                    Examples:
+                      cctally db prune
+                      cctally db prune --yes
+                      cctally db prune --json
+                      cctally db prune --yes --include-backups
+                    """
+                ),
+    )
+    db_prune.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply the plan (default: preview only)",
+    )
+    db_prune.add_argument(
+        "--include-backups",
+        action="store_true",
+        help="Also reclaim user-requested `cctally db backup` families",
+    )
+    db_prune.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON to stdout",
+    )
+    db_prune.set_defaults(func=c.cmd_db_prune)
     db_checkpoint = db_sub.add_parser(
         "checkpoint",
         help="Drain the WAL (TRUNCATE checkpoint) — fast, non-destructive",
@@ -3401,6 +3450,26 @@ def _build_stats_corruption_heal_parser(subparsers, name, *, help_text, xref=Non
     )
     worker.set_defaults(func=c.cmd_stats_corruption_heal_internal)
 
+def _build_artifact_retention_parser(subparsers, name, *, help_text, xref=None):
+    """Build the #496 S6 detached retained-artifact reclamation worker parser."""
+    c = _cctally()
+    worker = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: reclaim retained corruption evidence
+                    that the configured retention policy no longer keeps.
+                    Scheduled at most once a day by an ordinary successful
+                    command, and immediately whenever an interrupted sweep left
+                    a plan to finish. Always returns 0; failures are logged and
+                    remain retryable.
+                    """
+                ),
+    )
+    worker.set_defaults(func=c.cmd_artifact_retention_internal)
+
 def _build_codex_replay_drain_parser(subparsers, name, *, help_text, xref=None):
     """Build the `_codex-replay-drain` parser (public #5 §4)."""
     c = _cctally()
@@ -3504,6 +3573,7 @@ _REGISTRATION = (
     _Reg('_codex-quota-verify', _build_codex_quota_verify_parser, argparse.SUPPRESS, None, None),
     _Reg('_stats-epoch-rebuild', _build_stats_epoch_rebuild_parser, argparse.SUPPRESS, None, None),
     _Reg('_stats-corruption-heal', _build_stats_corruption_heal_parser, argparse.SUPPRESS, None, None),
+    _Reg('_artifact-retention', _build_artifact_retention_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-replay-drain', _build_codex_replay_drain_parser, argparse.SUPPRESS, None, None),
     _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
 )

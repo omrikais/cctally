@@ -1,6 +1,8 @@
 """#279 S1 F4 / #314 — corruption yields staged guidance, not a traceback.
 
-stats.db is the non-re-derivable DB (recorded usage history). Before this fix,
+stats.db is a disposable index rebuilt from the journal; only on a pre-cutover
+install with no retained journal data may it be the only copy of the recorded
+history, and that is the case this staged guidance exists for. Before this fix,
 `open_db()` connected + ran PRAGMAs/DDL with no `sqlite3.DatabaseError`
 handling, so a corrupt file surfaced as `Error: file is not a database` (rc 1)
 or a raw traceback. Now an open-time probe raises a typed

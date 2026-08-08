@@ -12,7 +12,7 @@
 // Re-exports `ShareApiError` from `./api` so callers can do
 //   `catch (err) { if (err instanceof ShareApiError) ... }`
 // without importing two files.
-import type { SharePanelId, ShareOptions } from './types';
+import type { SharePanelId, ShareOptions, ShareTheme } from './types';
 import type { DashboardSelection } from '../types/envelope';
 import { ShareApiError } from './api';
 
@@ -41,6 +41,9 @@ export interface SavePresetArgs {
   // #294 S5 §7 — stamp the share flow's source; the server records it against
   // the (panel, name) key (overwrite semantics preserved).
   source?: DashboardSelection;
+  // #503 S3 §1 — sent ONLY after the user confirms a collision. Absent means
+  // false server-side, so a save onto an existing name 409s by default.
+  overwrite?: boolean;
 }
 
 export interface SavedPreset extends PresetRecord {
@@ -48,16 +51,38 @@ export interface SavedPreset extends PresetRecord {
   name: string;
 }
 
+// #503 S3 §1 — rename is ONE server-side operation, not a save plus a
+// delete. The old client-side pair rebuilt the record from the four fields
+// it held, so it dropped `source` and reset `saved_at`; the endpoint moves
+// the stored record whole. `overwrite` is only ever sent after the user
+// confirms a collision — absent means false server-side.
+export interface RenamePresetArgs {
+  panel: SharePanelId;
+  from_name: string;
+  to_name: string;
+  overwrite?: boolean;
+}
+
+// The `code` a collision answers with, on both mutations. The UI enters its
+// confirmation on THIS discriminator rather than on its own name-list
+// preflight, which can go stale between the GET and the write.
+export const PRESET_NAME_CONFLICT = 'preset_name_conflict';
+
 async function jsonOrThrow<T>(resp: Response): Promise<T> {
   if (!resp.ok) {
-    let payload: { error?: string; field?: string } = {};
+    let payload: { error?: string; field?: string; code?: string } = {};
     try {
-      payload = await resp.json() as { error?: string; field?: string };
+      payload = await resp.json() as {
+        error?: string; field?: string; code?: string;
+      };
     } catch { /* ignore — non-JSON body */ }
     throw new ShareApiError(
       resp.status,
       payload.field,
       payload.error ?? `HTTP ${resp.status}`,
+      // #503 S3 §1 — carry the machine-readable code so a caller can
+      // branch on `preset_name_conflict` instead of matching prose.
+      payload.code,
     );
   }
   return resp.json() as Promise<T>;
@@ -76,6 +101,18 @@ export async function savePreset(
   init?: { signal?: AbortSignal },
 ): Promise<SavedPreset> {
   return jsonOrThrow<SavedPreset>(await fetch('/api/share/presets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(args),
+    signal: init?.signal,
+  }));
+}
+
+export async function renamePreset(
+  args: RenamePresetArgs,
+  init?: { signal?: AbortSignal },
+): Promise<SavedPreset> {
+  return jsonOrThrow<SavedPreset>(await fetch('/api/share/presets/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
@@ -120,11 +157,12 @@ export async function deletePreset(
 //   - `recipe_id`: random hex; opaque (we order by insertion, not by id).
 //   - `exported_at`: ISO-8601 UTC.
 
-export interface HistoryRecord {
+// #503 S3 §3 — a history row is a discriminated union on `kind`. `kind` is
+// OPTIONAL on read: a row written before the discriminator existed carries
+// none and means "panel". Read it through `historyRowKind` rather than
+// comparing the raw field, so the legacy default lives in one place.
+export interface HistoryFields {
   recipe_id: string;
-  panel: SharePanelId;
-  template_id: string;
-  options: ShareOptions;
   // `format` and `destination` are advisory display hints. The server
   // accepts string-or-null so a misconfigured client can't 400 itself
   // out of recording history; the dropdown row treats null/missing as
@@ -132,11 +170,52 @@ export interface HistoryRecord {
   format: string | null;
   destination: string | null;
   exported_at: string;
+}
+
+export interface PanelHistoryRecord extends HistoryFields {
+  kind?: 'panel';
+  panel: SharePanelId;
+  template_id: string;
+  options: ShareOptions;
   // #294 S5 §7 — the source the export was made under. Source participates in
   // history/digest identity server-side, so "same panel, different source" rows
   // are DISTINCT (no dedup/collapse). Optional on read (legacy → claude).
   source?: DashboardSelection;
   account?: string;
+}
+
+export interface ComposedHistorySection {
+  panel: SharePanelId;
+  template_id: string;
+  options: ShareOptions;
+  source?: DashboardSelection;
+  account?: string;
+}
+
+export interface ComposedHistoryRecord extends HistoryFields {
+  kind: 'composed';
+  // Explicitly null, which is what makes an older client's
+  // `h.panel === panel` filter hide the row rather than mis-render it.
+  panel: null;
+  sections: ComposedHistorySection[];
+  composite: {
+    title: string;
+    theme: ShareTheme;
+    reveal_projects: boolean;
+    no_branding: boolean;
+  };
+}
+
+export type HistoryRecord = PanelHistoryRecord | ComposedHistoryRecord;
+
+export function historyRowKind(row: HistoryRecord): 'panel' | 'composed' {
+  return row.kind ?? 'panel';
+}
+
+export function isComposedHistoryRow(
+  row: HistoryRecord,
+): row is ComposedHistoryRecord {
+  return historyRowKind(row) === 'composed';
 }
 
 export interface HistoryResponse {
@@ -153,6 +232,15 @@ export interface AppendHistoryArgs {
   // #294 S5 §7 — the share flow's captured source (stamped explicitly).
   source?: DashboardSelection;
   account?: string | null;
+}
+
+// POST body for a composed export (#503 S3 §3). One row per composed
+// document, shown in every panel's Recent shares and display-only.
+export interface AppendComposedHistoryArgs {
+  sections: ComposedHistorySection[];
+  composite: ComposedHistoryRecord['composite'];
+  format: string;
+  destination: string;
 }
 
 export async function listHistory(
@@ -174,6 +262,20 @@ export async function appendHistory(
     body: JSON.stringify(account == null ? legacyArgs : { ...legacyArgs, account }),
     signal: init?.signal,
   }));
+}
+
+export async function appendComposedHistory(
+  args: AppendComposedHistoryArgs,
+  init?: { signal?: AbortSignal },
+): Promise<ComposedHistoryRecord> {
+  return jsonOrThrow<ComposedHistoryRecord>(
+    await fetch('/api/share/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'composed', ...args }),
+      signal: init?.signal,
+    }),
+  );
 }
 
 export async function clearHistory(

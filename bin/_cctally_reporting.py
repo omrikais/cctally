@@ -139,7 +139,6 @@ def cmd_daily(args: argparse.Namespace) -> int:
             snap = c._build_daily_snapshot(
                 view, period_start=range_start, period_end=range_end,
                 display_tz=display_tz_str, version=c._share_resolve_version(),
-                theme=args.theme, reveal_projects=args.reveal_projects,
             )
             if args.order == "desc":
                 snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -249,8 +248,6 @@ def cmd_daily(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
         )
         if args.order == "desc":
             snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -325,8 +322,6 @@ def cmd_monthly(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
         )
         if args.order == "desc":
             snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -460,8 +455,6 @@ def cmd_weekly(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
             breakdown_model=bool(getattr(args, "breakdown", False)),
         )
         if args.order == "desc":
@@ -618,8 +611,6 @@ def cmd_session(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
             top_n=top_n,
             tz=tz,
         )

@@ -85,7 +85,10 @@ describe('printPdf', () => {
   });
 
   it('falls back to window.open when iframe.print throws', () => {
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const fallbackWin = {
+      document: { open: vi.fn(), write: vi.fn(), close: vi.fn() },
+    } as unknown as Window;
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fallbackWin);
     const origAppend = HTMLBodyElement.prototype.appendChild;
     vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(function (this: HTMLBodyElement, node: Node) {
       const ret = origAppend.call(this, node) as Node;
@@ -104,6 +107,94 @@ describe('printPdf', () => {
 
     printPdf('<html><body>fallback</body></html>');
 
-    expect(openSpy).toHaveBeenCalledWith('', '_blank', 'noopener,noreferrer');
+    expect(openSpy).toHaveBeenCalledWith('', '_blank');
+  });
+
+  it('opens the fallback with no feature string, so a block is detectable', () => {
+    // Per the HTML specification `window.open` returns null whenever
+    // `noopener` is present. This mock reproduces that rule, which a mock
+    // returning the same window for every argument list cannot: with a
+    // feature string the handle is null, so a fallback that passes one
+    // reports every SUCCESSFUL fallback as a blocked popup.
+    const fallbackWin = {
+      opener: {} as unknown,
+      document: { open: vi.fn(), write: vi.fn(), close: vi.fn() },
+    } as unknown as Window & { opener: unknown };
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(
+      ((_url?: unknown, _target?: unknown, features?: unknown) =>
+        (features ? null : fallbackWin)) as typeof window.open,
+    );
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(function (this: HTMLBodyElement, node: Node) {
+      const ret = origAppend.call(this, node) as Node;
+      if (node instanceof HTMLIFrameElement && node.contentWindow) {
+        Object.defineProperty(node.contentWindow, 'print', {
+          value: () => { throw new Error('print blocked'); },
+          configurable: true,
+        });
+        Object.defineProperty(node.contentWindow, 'focus', {
+          value: () => {}, configurable: true,
+        });
+      }
+      return ret;
+    });
+
+    printPdf('<html><body>fallback</body></html>');
+
+    expect(openSpy).toHaveBeenCalledWith('', '_blank');
+    // The isolation `noopener` would have provided, applied by hand.
+    expect(fallbackWin.opener).toBeNull();
+    expect(fallbackWin.document.write).toHaveBeenCalledWith(
+      '<html><body>fallback</body></html>',
+    );
+    // The iframe printed nothing, so it is not left behind for a second.
+    expect(document.querySelectorAll('iframe')).toHaveLength(0);
+  });
+
+  // ---- #503 S3 §5 — printPdf reports failure instead of returning ------
+
+  it('throws when the fallback window is blocked', () => {
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(function (this: HTMLBodyElement, node: Node) {
+      const ret = origAppend.call(this, node) as Node;
+      if (node instanceof HTMLIFrameElement && node.contentWindow) {
+        Object.defineProperty(node.contentWindow, 'print', {
+          value: () => { throw new Error('print blocked'); },
+          configurable: true,
+        });
+        Object.defineProperty(node.contentWindow, 'focus', {
+          value: () => {}, configurable: true,
+        });
+      }
+      return ret;
+    });
+
+    // A print that never happened must not return as though it did: the
+    // caller records share history and shows a success toast on return.
+    expect(() => printPdf('<html><body>x</body></html>')).toThrow(
+      /blocked the new tab/i,
+    );
+    expect(document.querySelectorAll('iframe')).toHaveLength(0);
+  });
+
+  it('does not silently succeed when there is no print target', () => {
+    // The defect this replaces: `iframe.contentWindow?.print()` on a null
+    // contentWindow evaluated to undefined and returned successfully.
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(function (this: HTMLBodyElement, node: Node) {
+      const ret = origAppend.call(this, node) as Node;
+      if (node instanceof HTMLIFrameElement && node.contentWindow) {
+        Object.defineProperty(node.contentWindow, 'print', {
+          value: undefined, configurable: true,
+        });
+      }
+      return ret;
+    });
+
+    expect(() => printPdf('<html><body>x</body></html>')).toThrow();
+    // It reached for the fallback rather than declaring success.
+    expect(openSpy).toHaveBeenCalled();
   });
 });

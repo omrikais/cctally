@@ -42,6 +42,15 @@ interface Props {
   // A second fetch would be a second source of truth and could disagree with
   // the preview the user is looking at.
   onProjectNamesResolved?: (hasProjectNames: boolean | null) => void;
+  // #503 S3 §5 — reports whether the preview render FAILED, so the action
+  // side can warn before the user clicks an export. Preview failure lived
+  // only in this component's local state and never reached `ActionBar`,
+  // which meant the first signal a user got was an error banner AFTER the
+  // click. Reported from here for the same reason `onProjectNamesResolved`
+  // is: this component owns the only `/api/share/render` call in the flow.
+  // Lifted through props rather than `shareSlice`, which deliberately holds
+  // only modal identity plus the captured source and account.
+  onPreviewFailed?: (failed: boolean) => void;
 }
 
 interface PreviewState {
@@ -63,7 +72,7 @@ const initialPreviewState: PreviewState = {
 };
 
 export function PreviewPane({ panel, source = 'claude', account = null, templateId, options,
-                              onProjectNamesResolved }: Props) {
+                              onProjectNamesResolved, onPreviewFailed }: Props) {
   const [preview, setPreview] = useState<PreviewState>(initialPreviewState);
   // Per-fetch AbortController, set when a fetch starts and aborted when
   // the next fetch starts (or the component unmounts).
@@ -80,6 +89,8 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
   // would make the preview refetch on every keystroke elsewhere in the modal.
   const reportRef = useRef(onProjectNamesResolved);
   reportRef.current = onProjectNamesResolved;
+  const failedRef = useRef(onPreviewFailed);
+  failedRef.current = onPreviewFailed;
 
   // Invalidate the reported answer when — and ONLY when — the thing it
   // describes changes. `has_project_names` is a property of (panel, template,
@@ -95,9 +106,13 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
   useEffect(() => {
     if (!templateId) {
       setPreview(initialPreviewState);
+      failedRef.current?.(false);
       return;
     }
     setPreview((prev) => ({ ...prev, status: 'loading' }));
+    // A new render is in flight, so any earlier failure no longer describes
+    // what an export would do.
+    failedRef.current?.(false);
     const myGen = ++genRef.current;
 
     const timeout = setTimeout(() => {
@@ -123,6 +138,7 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
             errorMessage: null,
             errorField: null,
           });
+          failedRef.current?.(false);
           // `undefined` from an older server stays `null` — unknown, not
           // "no project names".
           reportRef.current?.(
@@ -148,6 +164,7 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
               errorMessage: err.message ?? `HTTP ${err.status}`,
               errorField: err.field ?? null,
             });
+            failedRef.current?.(true);
             return;
           }
           setPreview({
@@ -157,6 +174,7 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
             errorMessage: (err as Error).message ?? 'Unknown error',
             errorField: null,
           });
+          failedRef.current?.(true);
         });
     }, PREVIEW_DEBOUNCE_MS);
 

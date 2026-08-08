@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import timezone
 
 from _cctally_core import WEEKDAY_MAP, _command_as_of, eprint, get_week_start_name
+from _lib_display_tz import _resolve_tz, resolve_display_tz_name
 
 
 UTC = timezone.utc
@@ -288,10 +289,39 @@ def _build_codex_share_snapshot(command: str, view, rows):
     c = _cctally()
     lib = c._share_load_lib()
     end = getattr(view, "period_end", None) or _command_as_of()
-    start = getattr(view, "period_start", None) or end
+    view_start = getattr(view, "period_start", None)
+    start = view_start or end
     if end < start:
         start = end
-    display_tz = getattr(view, "display_tz_label", "UTC") or "UTC"
+    # RESOLVED, not passed through (#503 S2 D7). The view's label comes
+    # from `_lib_view_models._codex_tz_label`, which returns whatever
+    # `--timezone` was given verbatim and otherwise falls back to
+    # `_local_tz_name()` — so it can carry a bare `UTC`, which is not a
+    # loadable ZoneInfo key on a case-sensitive filesystem, or a non-IANA
+    # abbreviation such as `IST`. Either would leave one artifact reading
+    # `(UTC)` beside a sibling reading `(Etc/UTC)`. Resolving here makes
+    # the label a concrete IANA zone whatever the view carried.
+    display_tz = resolve_display_tz_name(
+        getattr(view, "display_tz_label", None) or None)
+    # `period_start` on a bucketed Codex view is a CALENDAR LABEL — the
+    # oldest visible `YYYY-MM-DD` / `YYYY-MM` bucket, which
+    # `_lib_view_models` lifts with `datetime.combine(..., tzinfo=UTC)`.
+    # `period_end` is a real instant (`now_utc`), so the two boundaries
+    # are of different kinds and the per-period `civil_bucket` flag
+    # cannot express them. Ground the label at midnight in the zone the
+    # artifact names instead, which makes `period_civil_dates` recover
+    # the same bucket in every zone while the end still converts
+    # (#503 S2 D7). The VIEW declares which it carries through
+    # `period_civil_bucket`, because the value alone cannot say: an empty
+    # view's `period_start` is a real instant that happens to sit at
+    # whatever time "now" is, and `codex-session`'s is the earliest
+    # `last_activity`. A view without the field (the dashboard's adapter
+    # namespace, whose bounds are already grounded) is left alone.
+    if getattr(view, "period_civil_bucket", False) and view_start is not None:
+        start = c._share_ground_civil_date(
+            view_start.date(), _resolve_tz(display_tz, fallback=None))
+        if end < start:
+            start = end
     period_label = f"{start.date().isoformat()} → {end.date().isoformat()} ({display_tz})"
     titles = {
         "codex-daily": "Codex Token Usage — Daily",
@@ -339,7 +369,9 @@ def _build_codex_share_snapshot(command: str, view, rows):
     return lib.ShareSnapshot(
         cmd=command,
         title=titles[command],
-        subtitle=period_label,
+        # #503 S2 D5 — the facts strip states this period, so a
+        # subtitle repeating it is duplicate chrome.
+        subtitle=None,
         period=lib.PeriodSpec(start=start, end=end, display_tz=display_tz, label=period_label),
         columns=columns,
         rows=table_rows,

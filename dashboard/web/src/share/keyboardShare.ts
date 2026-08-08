@@ -101,14 +101,16 @@ export function buildShareKeyBinding(): Binding {
         dispatch({ type: 'SHOW_STATUS_TOAST', text: UNFOCUSED_TOAST_TEXT });
         return;
       }
-      // Not a share-capable kind (e.g. 'alerts'): silent ignore. The
-      // user clicked a panel, just not a shareable one — no toast.
+      // Not a share-capable kind ('alerts' or 'cache-report'): silent
+      // ignore. The user clicked a panel, just not a shareable one — no
+      // toast.
       if (!SHARE_CAPABLE_PANELS.has(kind)) return;
-      // #294 S5 §7 — the active source's share matrix gates this too:
-      // forecast/trend are share-capable but absent from the Codex/All matrix,
-      // so `S` on such a panel is a silent no-op under those sources. (Under
-      // Codex/All those panels are also hidden by §5.5, so this is belt-and-
-      // suspenders — but it keeps the invariant even if a panel leaks in.)
+      // #294 S5 §7 — the active source's share matrix gates this too. The
+      // matrix in `types.ts` currently holds the SAME nine panels for every
+      // source, so this rejects nothing today; it is the enforcement point
+      // for any future per-source divergence. (An earlier version of this
+      // comment claimed Forecast and Trend were absent under Codex and All.
+      // They are not, and were not — see `SHARE_PANEL_MATRIX`.)
       if (!isSharePanelAllowed(getState().activeSource, kind as SharePanelId)) return;
       // The membership check above proves `kind` is a SharePanelId (S2 #264 —
       // daily/weekly/monthly are grid ids AND SharePanelIds, no shim needed).

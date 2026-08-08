@@ -144,7 +144,179 @@ def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
             break
         except ValueError:
             continue
-    return {"kind": kind, "name": name, "age_s": age_s}
+    return {"kind": kind, "name": name, "age_s": age_s, "shape": None}
+
+
+def _incident_shape_token(incident) -> "str | None":
+    """One incident's `damage.preserved.shapeToken` (#496 S6 §7.2 / §3.4).
+
+    Read here rather than in the kernel, which takes no filesystem. A manifest
+    that cannot be read contributes no shape, which is the safe direction: a
+    missing shape cannot manufacture a recurrence.
+    """
+    try:
+        manifest = json.loads(
+            (incident / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    damage = manifest.get("damage")
+    preserved = damage.get("preserved") if isinstance(damage, dict) else None
+    token = preserved.get("shapeToken") if isinstance(preserved, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def _gather_heal_detections(now_utc: dt.datetime) -> "list | None":
+    """The durable heal ring, as `{heal_id, age_s}` per entry (§7.2).
+
+    A DETECTION is a ring entry keyed by `healId`, which is a different thing
+    from an incident: a declined or coalesced detection produces a ring entry
+    and no quarantine directory at all, and only the ring can report the RATE.
+    """
+    try:
+        import _cctally_store
+
+        events = _cctally_store.read_stats_heal_events()
+    except Exception:
+        return None
+    found = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        age_s = None
+        stamp = event.get("detectedAtUtc")
+        if isinstance(stamp, str) and stamp:
+            try:
+                parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                age_s = int((now_utc - parsed).total_seconds())
+            except ValueError:
+                age_s = None
+        found.append({
+            "heal_id": str(event.get("healId") or ""),
+            "age_s": age_s,
+            "outcome": event.get("outcome"),
+        })
+    return found
+
+
+def _gather_retained_artifacts(
+    now_utc: dt.datetime, *, deep: bool = False,
+) -> "dict | None":
+    """The read-only retention scan and plan behind `db.retained_artifacts`.
+
+    Takes NO lock and writes nothing — it is the same walk and the same kernel
+    plan `cctally db prune`'s preview runs. A malformed policy is reported
+    rather than repaired, because §6.5 makes an unreadable policy a FAIL and
+    not a fallback to the defaults.
+
+    **The walk and the planner are `deep`-gated, like the `quick_check` legs.**
+    This gather is reached from the TUI and the dashboard snapshot precompute
+    on every rebuild, not only from `GET /api/doctor`, and the pair costs tens
+    of milliseconds at the maintainer's corpus size and grows with it. What
+    stays in the shallow path is what an operator must act on and what costs
+    one file read and one glob: the policy resolution and the stuck reclaim
+    records.
+
+    `now_utc` is the gather's clock, which honours `CCTALLY_AS_OF`. Letting the
+    planner read the wall clock instead would make the age bound — and every
+    golden that depends on it — drift with the calendar.
+
+    The failure path names the exception CLASS rather than returning a bare
+    None. Doctor must not crash, but a degrade that says only "unavailable" is
+    indistinguishable from a healthy install with nothing retained, and a
+    programming error here reached four golden fixtures and made all four of
+    them vacuous before anything reported it.
+    """
+    now_epoch = now_utc.timestamp()
+    try:
+        import _cctally_retention
+
+        resolution = _cctally_retention.read_retention_policy()
+        stuck = [
+            {
+                "planId": record["planId"],
+                "memberIds": sorted(record["entries"]),
+                "stuck": bool(record.get("stuck")),
+                "ageSeconds": record.get("ageSeconds"),
+            }
+            for record in _cctally_retention.list_stuck_reclaim_records(
+                now_epoch=now_epoch,
+            )
+        ]
+        if resolution.status == "malformed":
+            # No byte figures are reported, rather than zeros: the scan never
+            # ran, and a zero here is a false measurement a consumer would
+            # render as "nothing retained".
+            return {
+                "policy_status": "malformed",
+                "policy_reason": resolution.reason,
+                "stuck_records": stuck,
+            }
+        bounds = {
+            "max_age_seconds": resolution.policy.max_age_seconds,
+            "max_count_per_family": resolution.policy.max_count_per_family,
+            "max_total_bytes": resolution.policy.max_total_bytes,
+            "min_free_bytes": resolution.policy.min_free_bytes,
+        }
+        if not deep:
+            return {
+                "policy_status": "not-scanned",
+                "policy_reason": None,
+                "stuck_records": stuck,
+                **bounds,
+            }
+        scan, plan, graph = _cctally_retention.plan_retention(
+            policy=resolution.policy, now_epoch=now_epoch, with_graph=True,
+        )
+        return {
+            "policy_status": resolution.status,
+            "policy_reason": None,
+            "retained_bytes": plan.before_bytes,
+            "reclaimable_bytes": plan.reclaimable_bytes,
+            "protected_bytes": _retention_protected_bytes(scan, plan, graph),
+            "protected_roots": len(plan.protected_ids),
+            "roots": len(plan.delete_ids) + len(plan.keep_ids)
+            + len(plan.protected_ids),
+            "free_disk_bytes": scan.free_disk_bytes,
+            "partial_scan": bool(scan.partial),
+            "unsatisfied_rules": list(plan.unsatisfied_rules),
+            # Which bounds actually SELECTED something. The WARN summary used
+            # to name the byte budget whatever drove the reclamation, the same
+            # false sentence the FAIL summary printed.
+            "driving_rules": [
+                rule for rule in _cctally_retention._kernel.BOUND_ORDER
+                if rule in set(plan.reasons.values())
+            ],
+            "floor_retained_roots": len(plan.floor_retained_ids),
+            "floor_retained_bytes": plan.floor_retained_bytes,
+            "stuck_records": stuck,
+            **bounds,
+        }
+    except Exception as exc:  # noqa: BLE001 — doctor never crashes
+        # Read-only diagnostics never fail the gather; the leg degrades. The
+        # class is carried so the degrade is STATED rather than silent.
+        return {"policy_status": "unavailable", "scan_error": type(exc).__name__}
+
+
+def _retention_protected_bytes(scan, plan, graph=None) -> int:
+    """Bytes held by protected roots, counted once across shared members.
+
+    The graph is handed in. Letting `summarize_prune` build its own made the
+    doctor leg construct the reference graph TWICE per gather, once inside
+    `plan_retention` and once here, for a structure neither call mutates.
+    """
+    try:
+        import _cctally_retention
+
+        return int(
+            _cctally_retention.summarize_prune(
+                scan, plan, graph=graph,
+            )["protectedBytes"]
+        )
+    except Exception:
+        return 0
 
 
 def _read_guard_log_tail(path) -> list[str]:
@@ -1770,8 +1942,13 @@ def _doctor_gather_state_impl(
             _incident_read_ok = True
             for entry in qroot.iterdir():
                 if entry.is_dir():
-                    _incidents.append(
-                        _journal_heal_incident("quarantine", entry.name, now_utc))
+                    record = _journal_heal_incident(
+                        "quarantine", entry.name, now_utc)
+                    # §7.2 escalates on a REPEATED damage shape, so the shape
+                    # has to travel with the incident it belongs to — counted
+                    # once per incident, never once per manifest read.
+                    record["shape"] = _incident_shape_token(entry)
+                    _incidents.append(record)
     except OSError:
         pass
     try:
@@ -1790,6 +1967,12 @@ def _doctor_gather_state_impl(
         _incidents.sort(key=lambda d: (d["age_s"] is None,
                                        d["age_s"] if d["age_s"] is not None else 0))
         journal_heal_incidents = _incidents
+
+    # #496 S6 §7.2 / §7.3. Both are read-only and take no lock; both degrade to
+    # None rather than failing the gather, because `doctor` is reached from the
+    # TUI and the dashboard snapshot precompute as well as from the CLI.
+    journal_heal_detections = _gather_heal_detections(now_utc)
+    retained_artifacts = _gather_retained_artifacts(now_utc, deep=deep)
 
     # #386/#389 stats sole-writer guard log (spec §6.4). Read-only, fail-soft: an
     # absent log is the NORMAL state and must read as INFO, never as a gather
@@ -1910,6 +2093,8 @@ def _doctor_gather_state_impl(
         journal_hw_segment=journal_hw_segment,
         journal_cursor_segment=journal_cursor_segment,
         journal_heal_incidents=journal_heal_incidents,
+        journal_heal_detections=journal_heal_detections,
+        retained_artifacts=retained_artifacts,
         journal_writer_guard=journal_writer_guard,
         # Multi-account attribution legs (#341).
         accounts_state=accounts_state,

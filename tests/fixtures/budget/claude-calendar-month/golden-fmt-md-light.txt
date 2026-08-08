@@ -7,7 +7,7 @@ anonymized: true
 cctally_version: VERSION
 ---
 # Budget — calendar month 2026-06
-_calendar month 2026-06 · light · projects anonymized_
+_2026-06-01 → 2026-07-01 (Etc/UTC)_
 _2026-06-10T12:00:00Z_
 
 | Metric | Value |

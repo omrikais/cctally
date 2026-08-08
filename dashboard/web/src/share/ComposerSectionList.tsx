@@ -39,11 +39,10 @@ interface Props {
   kernelVersion: number;
   onRefresh: (id: string) => void;
   onRemove: (id: string) => void;
-  onPreviewOnly: (id: string) => void;
 }
 
 export function ComposerSectionList({
-  items, results, kernelVersion, onRefresh, onRemove, onPreviewOnly,
+  items, results, kernelVersion, onRefresh, onRemove,
 }: Props) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -71,7 +70,6 @@ export function ComposerSectionList({
               kernelVersion={kernelVersion}
               onRefresh={onRefresh}
               onRemove={onRemove}
-              onPreviewOnly={onPreviewOnly}
             />
           ))}
         </ul>
@@ -81,14 +79,13 @@ export function ComposerSectionList({
 }
 
 function Row({
-  item, result, kernelVersion, onRefresh, onRemove, onPreviewOnly,
+  item, result, kernelVersion, onRefresh, onRemove,
 }: {
   item: BasketItem;
   result: ComposeSectionResult | undefined;
   kernelVersion: number;
   onRefresh: (id: string) => void;
   onRemove: (id: string) => void;
-  onPreviewOnly: (id: string) => void;
 }) {
   const {
     attributes, listeners, setNodeRef, transform, transition, isDragging,
@@ -161,14 +158,13 @@ function Row({
         </button>
         {kebabOpen ? (
           <ul role="menu" className="composer-section-menu">
-            <li>
-              <button
-                type="button"
-                onClick={() => { onPreviewOnly(item.id); setKebabOpen(false); }}
-              >
-                Preview only this
-              </button>
-            </li>
+            {/* #503 S3 §6 — "Preview only this" is gone. It was a menu item
+                wired to an empty function: clicking it did nothing, with no
+                feedback. That is a broken control, and removing it is the
+                correction — the user loses nothing. (The Projects-allowlist
+                placeholder stays: it is disabled and already states
+                "Exports include all projects", so it makes no false
+                promise.) */}
             <li>
               <button
                 type="button"

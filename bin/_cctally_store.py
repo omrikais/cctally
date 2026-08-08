@@ -66,6 +66,7 @@ import pathlib
 import re
 import signal
 import sqlite3
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -184,6 +185,63 @@ def apply_connection_policy(conn: sqlite3.Connection, store: str) -> None:
     conn.execute(f"PRAGMA synchronous={policy.synchronous}")
     conn.execute(f"PRAGMA busy_timeout={policy.busy_timeout}")
     conn.execute(f"PRAGMA journal_size_limit={policy.journal_size_limit}")
+
+
+# --------------------------------------------------------------------------
+# §9.2 — the stats family is published privately (#496 S6 F23)
+# --------------------------------------------------------------------------
+
+#: The at-rest mode of `stats.db` and its sidecars. `cache.db`,
+#: `conversations.db` and their sidecars are already published this way; the
+#: stats family was created at the process umask, which is `022` on the
+#: maintainer's machine, so a bare create landed at `0644`.
+STATS_FAMILY_MODE = 0o600
+
+
+def _harden_stats_family(path) -> None:
+    """Best-effort `0600` on a stats database and its `-wal`/`-shm` sidecars.
+
+    **This closes a defense-in-depth inconsistency, not a live exposure**
+    (§9.1). `ensure_dirs()` chmods the data directory to `0700`, so no other
+    local user can traverse to the file. It is corrected because a copied file
+    carries its own mode, a data directory created outside `ensure_dirs()` need
+    not be `0700`, and an inconsistent layer becomes a real hole when the layer
+    above changes.
+
+    **Every invocation checks the mode; there is no path memo.** A memo that
+    skipped the check after one success would leave a long-lived dashboard
+    process unable to repair an external `chmod`, and a same-path `os.replace`
+    installs a new inode behind a memoized path. The comparison is what avoids
+    the repeated `chmod`: an `lstat` is cheap, and a `chmod` on an
+    already-correct file is the cost being avoided. The statusline opens the
+    index at three sites, so the steady state is three `lstat` triples per
+    render and zero `chmod` calls.
+
+    The `lstat` does not follow symlinks, and a member that IS a symlink is
+    left alone rather than chmod'd through. This function never unlinks and
+    never renames (§9.3): `chmod` changes metadata on an existing inode and
+    does not invalidate an open descriptor, which is categorically different
+    from removing a live sidecar — the defect that closed as #516. A sidecar
+    SQLite removes between the `lstat` and the `chmod` surfaces as a swallowed
+    `ENOENT`.
+    """
+    base = str(path)
+    for member in (base, base + "-wal", base + "-shm"):
+        try:
+            info = os.lstat(member)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        if stat.S_IMODE(info.st_mode) == STATS_FAMILY_MODE:
+            continue
+        try:
+            os.chmod(member, STATS_FAMILY_MODE)
+        except OSError as exc:
+            print(
+                f"[store] could not chmod {member} 0600 ({exc}); continuing",
+                file=sys.stderr,
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1068,8 +1126,14 @@ def _resume_pending_quarantine(db_path: pathlib.Path) -> None:
                 + ", ".join(str(pid) for pid in sorted(open_pids))
             )
         # Resumes the SAME incident from the pending record -- never a second
-        # incident dir, never a recreation.
-        _cctally_db.quarantine_db_family(db_path, strict=True)
+        # incident dir, never a recreation. #496 S6 §5.3: held SHARED across
+        # the resume, because the final manifest is published here.
+        import _cctally_retention
+
+        with _cctally_retention.retention_shared(
+            label="stats quarantine resume"
+        ):
+            _cctally_db.quarantine_db_family(db_path, strict=True)
     except OSError as exc:
         raise sqlite3.OperationalError(
             f"stats.db pending quarantine could not resume: {exc}"
@@ -1754,8 +1818,8 @@ def _stats_heal_hook(
     catches it and degrades, while ``_cctally_core.open_db`` deliberately lets
     it propagate. The heal that replaced the index and then failed to validate
     it must report that itself, because ``open_db``'s decline branch would tell
-    the user the database was "Not auto-recreated" — false once replacement has
-    occurred."""
+    the user the database "is never auto-recreated" — false once replacement
+    has occurred."""
     global _HEAL_ACTIVE
     if store != "stats":
         return False
@@ -1799,10 +1863,20 @@ def _stats_heal_hook(
                 file=sys.stderr,
             )
             return False
+        import _cctally_retention
+
+        # #496 S6 §5.3, the parent's phase. SHARED from before the forensics
+        # bundle until either the request marker naming it is fsynced or the
+        # decision is terminal. A decline writes no marker and needs no bridge,
+        # because nothing will act on the bundle later.
+        retention = contextlib.ExitStack()
         try:
             probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
             if probe(path):
                 return True  # a sibling process already healed it — retry the open
+            retention.enter_context(
+                _cctally_retention.retention_shared(label="stats auto-heal")
+            )
             # Forensics FIRST — before anything disturbs the evidence. The
             # trigger pair is what arms the #496 S1 forensics-time WAL capture
             # and what lets the quarantine incident name the bundle that
@@ -1852,13 +1926,43 @@ def _stats_heal_hook(
                 )
                 return False
             append_stats_heal_event(build_stats_heal_event(request, "confirmed"))
+            # Phase 1: reserve and persist, UNDER maintenance and the shared
+            # retention hold. The marker is durable when this returns
+            # `reserved`, which is what closes the bundle-to-request gap.
+            reservation = reserve_stats_corruption_heal(request)
+            if reservation != "reserved":
+                # #496 S6 §5.3, the SECOND terminal decision. The shared hold
+                # is about to be released over a forensics bundle the durable
+                # request marker does not name — it names the earlier
+                # detection's bundle. That is legitimate for the same reason a
+                # decline is: nothing will act on THIS bundle later. Rewriting
+                # the marker to name it instead would be worse, because a
+                # worker that has already read the marker would attribute its
+                # incident to a bundle it never captured, and the record would
+                # mix two detections. §3.3 then governs the stranded bundle as
+                # an unreferenced one, which self-classifies from its own
+                # `trigger.origin` and is reclaimable under the ordinary
+                # bounds. Terminalizing it here, inside the hold, is what makes
+                # the decision durable before the hold drops, and stops the
+                # ring entry sitting at `detected` forever.
+                update_stats_heal_event(
+                    request["healId"],
+                    outcome=(
+                        "coalesced" if reservation == "pending"
+                        else "admission-failed"
+                    ),
+                )
         finally:
-            # Released BEFORE deferring: the worker takes maintenance
+            # Retention is released first: it sits BELOW maintenance in the
+            # lock order, so it must not outlive the hold it was taken under.
+            retention.close()
+            # Maintenance released BEFORE spawning: the worker takes it
             # EXCLUSIVE as a fresh process holding nothing, and a caller still
             # holding it here would make that acquire wait for a request it is
             # itself in the middle of filing.
             _release_stats_maintenance_for_heal(maint_fd)
-        outcome = defer_stats_corruption_heal(request)
+        # Phase 3: spawn, under no lock at all.
+        outcome = complete_stats_corruption_heal(reservation)
         # F15 (#496 S3 §7). Detachment supplies the timing for free: report at
         # DETECTION, naming the absolute forensics path and the heal id. It
         # cannot name an incident path, because the quarantine directory is
@@ -1898,7 +2002,7 @@ def _stats_heal_hook(
         print(f"[heal] stats.db auto-heal failed: {heal_exc}", file=sys.stderr)
         # A post-publication validation failure has ALREADY replaced the index.
         # Declining here sends `open_db` to its pre-existing branch, which tells
-        # the user the database was "Not auto-recreated" and to run
+        # the user the database "is never auto-recreated" and to run
         # `db repair --db stats --yes` — both false once replacement occurred.
         # The durable marker makes the NEXT process say the right thing; the
         # process that caused the failure must say it too (#496 S1 F1).
@@ -2085,8 +2189,27 @@ def _log_stats_heal(
         pass
 
 
-def defer_stats_corruption_heal(request: dict) -> str:
-    """Schedule one retryable detached corruption heal without blocking."""
+def reserve_stats_corruption_heal(request: dict) -> str:
+    """Phase 1 of the deferral: decide admission and make the marker durable.
+
+    #496 S6 §5.3 splits `defer_stats_corruption_heal` in two so the documented
+    lock order is satisfiable at all. Reservation — the admission flock, the
+    marker-age check, the worker-active probe and the fsynced marker write —
+    must happen while the caller still holds stats maintenance and the SHARED
+    retention lock, because the marker is what bridges the parent-to-worker
+    process boundary and tells reclamation that the forensics bundle it names
+    is still live. The spawn must happen AFTER maintenance is released,
+    because the worker takes maintenance exclusive as a fresh process.
+
+    The heal ring cannot serve as that bridge: `_mutate_stats_heal_ring`
+    returns False on a mkdir failure, a bounded-lock timeout and an `OSError`
+    during the write, and both hook call sites discard that result — so on a
+    legitimate failure path the ring entry does not exist and the bundle would
+    be unprotected.
+
+    Returns `reserved` (the marker is durable and the caller MUST spawn),
+    `pending` (coalesced onto an existing request) or `failed`.
+    """
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
         admission_fd = os.open(
@@ -2121,17 +2244,68 @@ def defer_stats_corruption_heal(request: dict) -> str:
             _cctally_db._atomic_write_private_json(marker, request)
         except OSError:
             return "failed"
-        from _cctally_update import _spawn_detached
-        if _spawn_detached(STATS_CORRUPTION_HEAL_COMMAND):
-            return "spawned"
-        _unlink_stats_heal_marker()
-        return "failed"
+        return "reserved"
     finally:
         try:
             fcntl.flock(admission_fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(admission_fd)
+
+
+def complete_stats_corruption_heal(reservation: str) -> str:
+    """Phase 3 of the deferral: spawn the worker a reservation admitted.
+
+    Takes no lock: the spawn need not occur under any, and the maintenance hold
+    must already have been released so the worker can take it exclusive. A
+    non-`reserved` reservation is returned unchanged, so a coalesced or failed
+    admission reports exactly what it reported before the split.
+    """
+    if reservation != "reserved":
+        return reservation
+    from _cctally_update import _spawn_detached
+    if _spawn_detached(STATS_CORRUPTION_HEAL_COMMAND):
+        return "spawned"
+    # Drop our own marker so the next detection is admitted immediately rather
+    # than waiting out the retry window. Done under the admission flock, as it
+    # was before the split, so no concurrent caller can coalesce onto a marker
+    # that is about to disappear. If the flock is unavailable the marker stays
+    # and the retry window clears it — the retryable direction.
+    _unlink_stats_heal_marker_under_admission()
+    return "failed"
+
+
+def _unlink_stats_heal_marker_under_admission() -> None:
+    try:
+        admission_fd = os.open(
+            _stats_heal_admission_path(), os.O_WRONLY | os.O_CREAT, 0o600
+        )
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        _unlink_stats_heal_marker()
+    finally:
+        try:
+            fcntl.flock(admission_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(admission_fd)
+
+
+def defer_stats_corruption_heal(request: dict) -> str:
+    """Schedule one retryable detached corruption heal without blocking.
+
+    The composed form of the two phases above, kept for callers that hold no
+    maintenance lock and therefore have no handoff to bridge. The auto-heal
+    hook calls the two phases separately (§5.3).
+    """
+    return complete_stats_corruption_heal(
+        reserve_stats_corruption_heal(request)
+    )
 
 
 def _run_stats_corruption_heal(request: dict) -> str:
@@ -2184,8 +2358,14 @@ def _run_stats_corruption_heal(request: dict) -> str:
             )
             if ingest_fd is None:
                 return "ingest-busy"
+        # #496 S6 §5.3, the worker's phase: SHARED after maintenance and
+        # ingest, before publication, released after the final rebuild record.
+        # The request marker is cleared last, by the caller, once this returns.
+        import _cctally_retention
+
         try:
-            with stats_write_scope("maintenance-heal"):
+            with _cctally_retention.retention_shared(label="stats heal worker"), \
+                    stats_write_scope("maintenance-heal"):
                 result = _cctally_journal.rebuild_stats_index(
                     context=_cctally_journal.RebuildContext(
                         trigger="corruption-heal",

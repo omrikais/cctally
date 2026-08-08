@@ -8075,7 +8075,15 @@ def _cache_open_guarded() -> sqlite3.Connection:
                                     str(pid) for pid in sorted(open_pids)
                                 )
                             )
-                        _cctally_db_sib.quarantine_db_family(path, strict=True)
+                        # #496 S6 §5.3: a resume publishes the incident's final
+                        # manifest, so it is a producer too.
+                        import _cctally_retention as _retention_sib
+                        with _retention_sib.retention_shared(
+                            label="cache quarantine resume"
+                        ):
+                            _cctally_db_sib.quarantine_db_family(
+                                path, strict=True,
+                            )
                     except OSError as exc:
                         fcntl.flock(lock_fh, fcntl.LOCK_UN)
                         raise sqlite3.DatabaseError(
@@ -8330,6 +8338,12 @@ def _recover_corrupt_cache(
             _close_cache_trigger_connection_best_effort(active_conn)
         _cctally_db_sib._release_repair_marker(path, claim)
         raise
+    # #496 S6 §5.3: this producer holds `artifact-retention.lock` SHARED from
+    # before its forensics bundle through the final manifest, so reclamation
+    # cannot mark evidence that is still being published. Released FIRST in the
+    # finally, below the maintenance flock it sits under in the lock order.
+    import _cctally_retention as _retention_sib
+    retention = contextlib.ExitStack()
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         if active_conn is not None:
@@ -8353,6 +8367,9 @@ def _recover_corrupt_cache(
         # this snapshot earlier and restoring it after the probe would overwrite
         # that writer's newer WAL index.
         shm_snapshot = _capture_cache_shm_snapshot(path)
+        retention.enter_context(
+            _retention_sib.retention_shared(label="cache recovery")
+        )
         try:
             forensics = _cctally_db_sib.write_corruption_forensics(
                 path,
@@ -8397,7 +8414,17 @@ def _recover_corrupt_cache(
             )
             return False
         try:
-            incident = _cctally_db_sib.quarantine_db_family(path, strict=True)
+            incident = _cctally_db_sib.quarantine_db_family(
+                path,
+                strict=True,
+                # #496 S6 §4.2: this is the process that observed the
+                # corruption, so it is the only one that can describe it.
+                context=_cctally_db_sib.quarantine_context(
+                    trigger=origin,
+                    trigger_error=exc,
+                    forensics_path=forensics.path,
+                ),
+            )
         except OSError as quarantine_exc:
             raise sqlite3.DatabaseError(
                 "cache.db recovery could not complete whole-family quarantine: "
@@ -8410,6 +8437,7 @@ def _recover_corrupt_cache(
         )
         return True
     finally:
+        retention.close()
         if active_conn is not None:
             _close_cache_trigger_connection_best_effort(active_conn)
         try:
@@ -8791,9 +8819,15 @@ def _conversations_open_guarded(
                                     str(pid) for pid in sorted(open_pids)
                                 )
                             )
-                        _cctally_db_sib.quarantine_db_family(
-                            path, strict=True,
-                        )
+                        # #496 S6 §5.3: a resume publishes the incident's final
+                        # manifest, so it is a producer too.
+                        import _cctally_retention as _retention_sib
+                        with _retention_sib.retention_shared(
+                            label="conversations quarantine resume"
+                        ):
+                            _cctally_db_sib.quarantine_db_family(
+                                path, strict=True,
+                            )
                     removed, reclaim_reason = (
                         _cctally_db_sib._remove_stale_repair_marker(path)
                     )
@@ -9291,6 +9325,9 @@ def _recover_corrupt_conversations(
 
     lock_fh = None
     provider_locks: list[Any] | None = None
+    # #496 S6 §5.3, same span as the cache producer above.
+    import _cctally_retention as _retention_sib
+    retention = contextlib.ExitStack()
     try:
         lock_path = pathlib.Path(
             _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
@@ -9323,6 +9360,9 @@ def _recover_corrupt_conversations(
                 + "; leaving the live family untouched"
             ) from exc
 
+        retention.enter_context(
+            _retention_sib.retention_shared(label="conversations recovery")
+        )
         try:
             with _conversation_probe_snapshot(path) as snapshot:
                 forensics = _cctally_db_sib.write_corruption_forensics(
@@ -9370,7 +9410,15 @@ def _recover_corrupt_conversations(
         _conversation_recovery_test_pause("confirmed")
         try:
             incident = _cctally_db_sib.quarantine_db_family(
-                path, strict=True,
+                path,
+                strict=True,
+                # #496 S6 §4.2: this is the process that observed the
+                # corruption, so it is the only one that can describe it.
+                context=_cctally_db_sib.quarantine_context(
+                    trigger=origin,
+                    trigger_error=exc,
+                    forensics_path=forensics.path,
+                ),
             )
         except OSError as quarantine_exc:
             raise sqlite3.DatabaseError(
@@ -9391,6 +9439,7 @@ def _recover_corrupt_conversations(
         )
         return True
     finally:
+        retention.close()
         if provider_locks is not None:
             _release_conversation_provider_locks(provider_locks)
         if lock_fh is not None:

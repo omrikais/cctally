@@ -251,6 +251,24 @@ def _resolve_display_tz_obj(config: dict) -> ZoneInfo:
         return ZoneInfo("Etc/UTC")
 
 
+def resolve_display_tz_name(raw: "str | None") -> str:
+    """Resolve a display-tz TOKEN to a concrete IANA zone name.
+
+    ``local`` and ``utc`` are configuration tokens, not zone names. A share
+    artifact states the zone its dates are in, and neither token names one:
+    ``(local)`` tells the reader nothing, and ``utc`` is not loadable as a
+    ``ZoneInfo`` key on a case-sensitive filesystem. #503 S2 D7 requires the
+    resolved concrete zone, so every share entry point routes its token
+    through here before it reaches a ``PeriodSpec``.
+
+    Delegates to ``_resolve_display_tz_obj`` rather than re-deriving the
+    host zone, so the ``local``-fallback warning and the malformed-value
+    behavior stay in one place. Returns ``ZoneInfo.key``, which is always a
+    loadable IANA name.
+    """
+    return _resolve_display_tz_obj({"display": {"tz": raw}}).key
+
+
 def _apply_display_tz_override(
     config: dict,
     override: "str | None",

@@ -30,6 +30,12 @@ export interface BasketItem {
   options: ShareOptions;
   added_at: string;
   data_digest_at_add: string;
+  // #503 S3 §4 — WHICH digest definition `data_digest_at_add` was minted
+  // under. Two digests are comparable only when the versions match, and a
+  // stored item from before this field existed reads as `undefined`, which
+  // the server treats as not-comparable — so redefining the digest does not
+  // badge every stored section Outdated exactly once.
+  data_digest_version_at_add?: number;
   kernel_version: number;
   label_hint: string;
   // #294 S5 §7 — the source the item was captured under (always-visible chip;
@@ -122,6 +128,11 @@ export function makeBasketItem(
     options: args.options,
     added_at: args.added_at,
     data_digest_at_add: args.data_digest_at_add,
+    // Omitted rather than nulled when the render response carried no
+    // version, so a legacy stored item stays byte-identical.
+    ...(args.data_digest_version_at_add == null
+      ? {}
+      : { data_digest_version_at_add: args.data_digest_version_at_add }),
     kernel_version: args.kernel_version,
     label_hint: args.label_hint,
     // Additive: default to 'claude' when a caller omits it (legacy call sites).

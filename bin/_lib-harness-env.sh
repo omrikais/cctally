@@ -21,6 +21,18 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # command handlers and doctor state resolution remain testable directly.
 export CCTALLY_DISABLE_UPDATE_CHECK=1
 
+# #496 S6: the artifact-retention sweep is the THIRD detached post-command
+# worker, and the paragraph above applies to it verbatim — it writes an
+# admission marker, a daily stamp and a log into the data directory after the
+# command it followed has already exited. `bin/cctally-rederive-test`
+# fingerprints the WHOLE data directory before and after a no-op apply and
+# requires byte equality, so an asynchronous writer makes that assertion
+# unmeetable; it failed on every run once ordinary mutating commands began
+# scheduling sweeps. The flag gates the post-command admission hook only, so
+# `cctally db prune`, the worker entry point and the admission predicate all
+# stay directly testable — and they are, in tests/test_retention_worker.py.
+export CCTALLY_DISABLE_RETENTION_SWEEP=1
+
 # Issue #108: cctally now honors $CODEX_HOME. Neutralize a dev's exported
 # value so it can't leak into codex-* goldens (the codex harnesses pin HOME
 # to a fake tree whose .codex/sessions the fixtures populate).

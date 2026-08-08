@@ -33,6 +33,7 @@ cycle-free.
 """
 from __future__ import annotations
 
+import dataclasses as _dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -50,6 +51,7 @@ from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 from _lib_five_hour import _canonical_5h_window_key
 from _lib_dashboard_sources import source_domain_freshness
+from _lib_display_tz import _resolve_tz, resolve_display_tz_name
 
 
 # Share-CLI helpers consumed by the dashboard's share-data builders.
@@ -76,7 +78,8 @@ def _share_iso(*args, **kwargs):
 # #279 S1 F3: cap on /api/share/* POST bodies. The share composer sends bigger
 # payloads than the 4 KB settings POSTs (a multi-panel compose recipe), but
 # must still be bounded — 64 KiB comfortably exceeds any real payload (render is
-# one panel; compose is ~8 panels each with a small options recipe).
+# one panel; compose is up to the basket cap of 20 sections, each with a
+# small options recipe).
 _SHARE_POST_MAX_BYTES = 64 * 1024
 
 
@@ -1428,16 +1431,58 @@ def _share_codex_state_for_period(data_snap, *, panel: str, options: dict):
         stats_conn.close()
 
 
-def _share_parse_bucket_start(panel: str, label: object) -> "dt.datetime | None":
+def _share_resolved_display_tz(raw: object = None) -> str:
+    """The concrete IANA zone a share artifact states its dates in.
+
+    One resolution for the whole dashboard share surface (#503 S2 D7):
+    the render handler injects it into `options`, the composite handler
+    injects it into every composite section's options, and the Codex
+    snapshot builders read it back instead of hardcoding `"UTC"` — so a
+    composed document cannot carry one section labelled `(UTC)` beside
+    another labelled `(Etc/UTC)`.
+
+    `raw` is a configuration token (`local` / `utc` / IANA) or None; None
+    means "read the server's config".
+    """
+    c = sys.modules["cctally"]
+    token = raw if isinstance(raw, str) and raw else c.get_display_tz_pref(c.load_config())
+    return resolve_display_tz_name(token)
+
+
+def _share_parse_bucket_start(panel: str, label: object,
+                              zone=None) -> "dt.datetime | None":
+    """Lift a bucket label or a row timestamp into a period boundary.
+
+    A NAIVE parse is a calendar label (`2026-05-04`, `2026-05`), so it is
+    grounded at midnight in the zone the artifact is labelled with —
+    grounding it in UTC and then converting it into that zone reports the
+    previous day everywhere west of UTC (#503 S2 D7). An AWARE parse
+    (`first_seen` / `last_activity`, which the envelope serializes with an
+    explicit offset) is a real instant and keeps its own offset.
+    """
     try:
         if panel == "monthly":
-            return dt.datetime.strptime(str(label), "%Y-%m").replace(tzinfo=dt.timezone.utc)
-        return dt.datetime.fromisoformat(str(label)).replace(tzinfo=dt.timezone.utc)
+            parsed = dt.datetime.strptime(str(label), "%Y-%m")
+        else:
+            parsed = dt.datetime.fromisoformat(str(label))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=zone or dt.timezone.utc)
+    return parsed
 
 
-def _share_codex_period_bounds(*, state, panel: str, options: dict, rows) -> tuple:
+def _share_codex_period_bounds(*, state, panel: str, options: dict, rows,
+                               display_tz: "str | None" = None) -> tuple:
+    """The period bounds for a Codex source snapshot.
+
+    `display_tz` is the zone the SNAPSHOT will be labelled with, and a
+    bucket label is grounded at ITS midnight (#503 S2 D7). The period
+    families resolve that from the panel's own value before calling
+    here, and that can differ from the options-derived default —
+    grounding in one zone while labelling with another states a date
+    the artifact's own rows do not use.
+    """
     now_override, start_override, err = _share_resolve_period(panel, options)
     if err is not None:
         raise ValueError("source capability unavailable")
@@ -1447,21 +1492,80 @@ def _share_codex_period_bounds(*, state, panel: str, options: dict, rows) -> tup
     end = end.astimezone(dt.timezone.utc)
     if start_override is not None:
         return start_override.astimezone(dt.timezone.utc), end
+    zone = _resolve_tz(
+        display_tz or _share_resolved_display_tz(options.get("display_tz")),
+        fallback=dt.timezone.utc)
     starts = []
     for row in rows:
         if not isinstance(row, Mapping):
             continue
         raw = row.get("first_seen") or row.get("last_activity") or row.get("label")
-        parsed = _share_parse_bucket_start("monthly" if panel == "monthly" else "daily", raw)
+        parsed = _share_parse_bucket_start(
+            "monthly" if panel == "monthly" else "daily", raw, zone)
         if parsed is not None:
             starts.append(parsed)
     if panel == "current-week":
         starts = [
             parsed for row in rows if isinstance(row, Mapping)
-            if (parsed := _share_parse_bucket_start("weekly", row.get("label"))) is not None
+            if (parsed := _share_parse_bucket_start(
+                "weekly", row.get("label"), zone)) is not None
         ]
         return (max(starts) if starts else end - dt.timedelta(days=7)), end
     return (min(starts) if starts else end), end
+
+
+# What the block column states when the row carries no parseable start.
+_CODEX_BLOCK_LABEL_UNKNOWN = "(unknown)"
+
+
+def _codex_block_label(ls, row) -> str:
+    """The block-start text a Codex quota artifact states.
+
+    `bin/_cctally_dashboard_sources.py` renders each block's `label` as
+    `%H:%M %b %d` for the dashboard chip, where the compact form is the
+    point and the year is context the surrounding page supplies. An
+    artifact leaves cctally, so it names its year: every Claude blocks
+    artifact states a full ISO instant, and this column stated the chip
+    string instead (#503 S2 M5, the sixth site of the D4 class).
+
+    The absent-`start_at` fallback does NOT reach for `label`. That field
+    is only ever the yearless chip, so falling back to it re-introduced
+    the exact string the fix removed — and neither D4 tripwire could see
+    it, because one scans the six share-builder modules (which do not
+    include `_cctally_dashboard_sources.py`, where the chip is formatted)
+    and the other scans committed goldens (no golden covers this panel).
+    A row with no parseable start falls back to its own `resets_at`,
+    stated as a full ISO instant and labelled as a reset so the column is
+    not read as a start. `(unknown)` discarded information the row still
+    carried and left the block unidentifiable in the artifact; it remains
+    only for a row that carries neither field (#503 S2 second review N4,
+    third review).
+    """
+    for field, prefix in (("start_at", ""), ("resets_at", "resets ")):
+        rendered = _codex_block_instant(ls, row, field)
+        if rendered is not None:
+            return prefix + rendered
+    return _CODEX_BLOCK_LABEL_UNKNOWN
+
+
+def _codex_block_instant(ls, row, field: str) -> "str | None":
+    """One of the row's instants as `…Z`, or None when it has none."""
+    raw = row.get(field)
+    if raw:
+        try:
+            parsed = parse_iso_datetime(str(raw), f"codex.block.{field}")
+        except ValueError:
+            pass
+        else:
+            # NORMALIZED to UTC before formatting. `parse_iso_datetime`
+            # ends with a bare `astimezone()`, so it hands back a
+            # host-local datetime, and `_format_generated_at_iso` keeps
+            # whatever offset it is given — the cell would otherwise read
+            # `+03:00` on one machine and `Z` on another, where every
+            # other blocks artifact states `…Z`.
+            return ls._format_generated_at_iso(
+                parsed.astimezone(dt.timezone.utc))
+    return None
 
 
 def _build_codex_source_share_snapshot(ls, *, state, panel: str,
@@ -1494,7 +1598,13 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         all_rows = tuple(weekly.get("rows", ()))
         source_rows = all_rows[-1:] if all_rows else ()
         command = "codex-weekly"
-        display_tz = str(weekly.get("display_tz") or "UTC")
+        # RESOLVED, never passed through (#503 S2 review F9). The panel
+        # value is a display label, and `_lib_view_models._display_tz_label`
+        # returns the literal `local` for a `None` zone — so a caller that
+        # omits `options["display_tz"]` would put `(local)` back into an
+        # artifact, which D7 exists to prevent.
+        display_tz = _share_resolved_display_tz(
+            weekly.get("display_tz") or options.get("display_tz"))
     elif panel in ("daily", "monthly", "weekly", "trend"):
         periods = data.get("periods")
         period_key = "weekly" if panel == "trend" else panel
@@ -1503,7 +1613,9 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
             raise ValueError("source capability unavailable")
         source_rows = tuple(panel_data.get("rows", ()))
         command = f"codex-{period_key}"
-        display_tz = str(panel_data.get("display_tz") or "UTC")
+        # Resolved, never passed through — see the `current-week` branch.
+        display_tz = _share_resolved_display_tz(
+            panel_data.get("display_tz") or options.get("display_tz"))
     elif panel == "forecast":
         quota = data.get("quota")
         panel_data = quota if isinstance(quota, Mapping) else {}
@@ -1534,7 +1646,10 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
             }))
         return ls.ShareSnapshot(
             cmd="codex-quota", title="Codex Quota Forecast", subtitle=None,
-            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            period=ls.PeriodSpec(
+                start=start, end=end, label=None,
+                display_tz=_share_resolved_display_tz(options.get("display_tz")),
+            ),
             columns=(
                 ls.ColumnSpec(key="limit", label="Limit"),
                 ls.ColumnSpec(key="current", label="Current", align="right"),
@@ -1549,7 +1664,7 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         panel_data = data.get(panel) if isinstance(data.get(panel), Mapping) else {}
         source_rows = tuple(panel_data.get("rows", ())) if isinstance(panel_data, Mapping) else ()
         command = "codex-session"
-        display_tz = "UTC"
+        display_tz = _share_resolved_display_tz(options.get("display_tz"))
     elif panel == "projects":
         panel_data = data.get("projects") if isinstance(data.get("projects"), Mapping) else {}
         source_rows = tuple(panel_data.get("rows", ())) if isinstance(panel_data, Mapping) else ()
@@ -1567,7 +1682,10 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         }) for row in source_rows if isinstance(row, Mapping))
         return ls.ShareSnapshot(
             cmd="project", title="Codex Project Usage", subtitle=None,
-            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            period=ls.PeriodSpec(
+                start=start, end=end, label=None,
+                display_tz=_share_resolved_display_tz(options.get("display_tz")),
+            ),
             columns=(
                 ls.ColumnSpec(key="project", label="Project"),
                 ls.ColumnSpec(key="tokens", label="Tokens", align="right"),
@@ -1579,7 +1697,15 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
             template_id=template_id, source="codex", source_label="Codex",
             availability=availability, availability_reason=reason,
         )
-    else:  # blocks
+    elif panel == "blocks":
+        # NAMED rather than left as the chain's `else`. The three
+        # `PeriodSpec` sites in this function are addressed BY ORDINAL
+        # from the test suite, and an unnamed branch cannot be attributed
+        # to a panel from the source, so the driver's ordinal-to-panel
+        # mapping was unassertable (#503 S2 third review). Naming it also
+        # turns an unrecognised panel into an error rather than silently
+        # rendering it as a blocks artifact; `required_domain` above
+        # already rejects every panel this chain does not list.
         quota = data.get("quota")
         panel_data = quota if isinstance(quota, Mapping) else {}
         source_rows = tuple(panel_data.get("blocks", ())) if isinstance(panel_data, Mapping) else ()
@@ -1594,23 +1720,29 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         def cells(row):
             percent = row.get("current_percent", 0.0)
             return {
-                "label": ls.TextCell(str(row.get("label", "Codex quota"))),
+                "label": ls.TextCell(_codex_block_label(ls, row)),
                 "usage": ls.TextCell(f"{float(percent or 0.0):.1f}%"),
                 "resets": ls.TextCell(str(row.get("resets_at", "—"))),
             }
         rows = tuple(ls.Row(cells=cells(row)) for row in source_rows if isinstance(row, Mapping))
         return ls.ShareSnapshot(
             cmd="codex-quota", title="Codex Quota Windows", subtitle=None,
-            period=ls.PeriodSpec(start=start, end=end, display_tz="UTC", label=None),
+            period=ls.PeriodSpec(
+                start=start, end=end, label=None,
+                display_tz=_share_resolved_display_tz(options.get("display_tz")),
+            ),
             columns=columns, rows=rows, chart=None,
             totals=(), notes=(), generated_at=end,
             version=sys.modules["cctally"]._share_resolve_version(),
             template_id=template_id, source="codex", source_label="Codex",
             availability=availability, availability_reason=reason,
         )
+    else:
+        raise ValueError(f"unsupported codex source panel: {panel}")
 
     start, end = _share_codex_period_bounds(
         state=state, panel=panel, options=options, rows=source_rows,
+        display_tz=display_tz,
     )
     normalized_rows = tuple(
         SimpleNamespace(
@@ -1637,27 +1769,6 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
     )
 
 
-def _share_plain_value(value):
-    if isinstance(value, Mapping):
-        return {str(key): _share_plain_value(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_share_plain_value(item) for item in value]
-    if isinstance(value, dt.datetime):
-        return value.astimezone(dt.timezone.utc).isoformat()
-    return value
-
-
-def _share_state_domain(state, panel: str):
-    data = state.data if isinstance(state.data, Mapping) else {}
-    if panel in ("daily", "monthly", "weekly", "current-week"):
-        periods = data.get("periods") if isinstance(data.get("periods"), Mapping) else {}
-        key = "weekly" if panel == "current-week" else panel
-        return periods.get(key)
-    if panel == "blocks":
-        return data.get("quota")
-    return data.get(panel)
-
-
 def _share_apply_current_week_freshness(snapshot, state, panel: str):
     """Qualify retained current-week actuals with provider-local evidence age."""
     if (
@@ -1672,46 +1783,124 @@ def _share_apply_current_week_freshness(snapshot, state, panel: str):
     return replace(snapshot, notes=tuple(snapshot.notes) + (note,))
 
 
+# The meaning of `data_digest`, as a stored value (#503 S3 §4).
+#
+# `data_digest_at_add` lives in localStorage basket items and is replayed at
+# compose time, so redefining what the digest hashes would mark every stored
+# section outdated exactly once. Version 2 is that redefinition: two digests
+# are compared ONLY when the stored version equals this one. A missing or
+# older version is NOT COMPARABLE, which is not drifted — no badge, no third
+# badge state. `KERNEL_VERSION` is untouched: it versions the RENDERER
+# contract (`_lib_share.py`), which has not changed.
+_SHARE_DATA_DIGEST_VERSION = 2
+
+
+def _share_digest_value(ls, value):
+    """Structurally project one value for `_data_digest` (#503 S3 §4).
+
+    `_data_digest` serializes with `default=str`, and its own contract warns
+    that arbitrary objects then hash as a per-process-unstable `repr`. The
+    projected snapshot fields are nested frozen dataclasses — cells, `Row`,
+    `ColumnSpec`, the chart union, chart points — so handing them over
+    directly is exactly that hazard. This converts them instead:
+
+    - a `PeriodSpec` becomes its CIVIL dates plus zone and label, never its
+      raw `start`/`end` instants (`period_civil_dates` already honours S2's
+      `civil_bucket` discriminator, so a `daily` bucket is not shifted a day
+      west of UTC);
+    - any other dataclass becomes a mapping of its declared fields, carrying
+      `__type__` so the cell and chart unions stay discriminated (a
+      `TextCell("5")` must not hash as a `DateCell("5")`);
+    - mappings recurse structurally and tuples/lists preserve order;
+    - a `datetime` outside a `PeriodSpec` becomes a normalized UTC ISO string;
+    - anything else RAISES, so the callers' empty-digest fallback stays
+      defensive rather than silently hashing a `repr`.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, ls.PeriodSpec):
+        start_civil, end_civil = ls.period_civil_dates(value)
+        return {
+            "__type__": "PeriodSpec",
+            "civil": [start_civil, end_civil],
+            "display_tz": value.display_tz,
+            "label": value.label,
+        }
+    if _dataclasses.is_dataclass(value) and not isinstance(value, type):
+        projected = {"__type__": type(value).__name__}
+        for field in _dataclasses.fields(value):
+            projected[field.name] = _share_digest_value(
+                ls, getattr(value, field.name))
+        return projected
+    if isinstance(value, Mapping):
+        return {str(key): _share_digest_value(ls, item)
+                for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_share_digest_value(ls, item) for item in value]
+    if isinstance(value, dt.datetime):
+        return value.astimezone(dt.timezone.utc).isoformat()
+    raise TypeError(
+        f"share digest cannot serialize {type(value).__name__}")
+
+
+def _share_snapshot_digest_projection(ls, snapshot):
+    """The canonical projection of ONE built, pre-toggle `ShareSnapshot`.
+
+    Two snapshot fields are excluded BY NAME. `generated_at` is a wall clock,
+    and hashing a wall clock is what made every section drift with elapsed
+    time. `version` is a renderer concern `KERNEL_VERSION` already covers.
+    Nothing from the ambient process state enters — no `data_version`, no raw
+    provider domain, no clock.
+    """
+    return {
+        "title": snapshot.title,
+        "subtitle": snapshot.subtitle,
+        "period": _share_digest_value(ls, snapshot.period),
+        "columns": _share_digest_value(ls, snapshot.columns),
+        "rows": _share_digest_value(ls, snapshot.rows),
+        "chart": _share_digest_value(ls, snapshot.chart),
+        "totals": _share_digest_value(ls, snapshot.totals),
+        "notes": _share_digest_value(ls, snapshot.notes),
+        "template_id": snapshot.template_id,
+        "source": snapshot.source,
+        "source_label": snapshot.source_label,
+        "availability": snapshot.availability,
+        "availability_reason": snapshot.availability_reason,
+    }
+
+
 def _share_digest_input(*, panel: str, template_id: str, source: str,
-                        source_explicit: bool, states, snapshots,
-                        panel_data, account: "str | None" = None):
+                        snapshots, account: "str | None" = None, ls=None):
+    """The digest payload: a projection of the built snapshots, and nothing else.
+
+    `snapshots` MUST be the PRE-toggle tuple. `_share_apply_content_toggles`
+    strips `chart` and `columns`/`rows` per `show_chart`/`show_table`, and a
+    Codex `blocks` section carries its window identity ONLY in its rows — its
+    title and period label are constants — so hashing the toggled tuple
+    collapses two different five-hour windows on one civil day into one
+    digest. Hashing pre-toggle also makes both toggles genuinely render-only,
+    which is what the render handler's comment has always promised.
+
+    One definition for every request: version 1 forked on `source_explicit`
+    and kept a separate legacy payload, which left that branch carrying the
+    defect this rewrite removes. `_SHARE_DATA_DIGEST_VERSION` is how a stored
+    digest's meaning moves; see `docs/share-gotchas.md`.
+    """
+    ls = ls if ls is not None else _share_load_lib()
     # #341 Task 4: the captured account participates in the digest so switching
     # the focused account registers as data drift in the composer (spec §4).
-    # Absent (legacy / account-agnostic) → omitted, so the digest is byte-stable.
+    # It stays TOP-LEVEL rather than being read off the snapshots: an
+    # account-focus change must change identity even when two scoped snapshots
+    # happen to hold equal values. Absent → omitted.
     account_key = {"account": account} if account is not None else {}
-    if not source_explicit:
-        return {
-            "panel": panel,
-            "template_id": template_id,
-            "panel_data": panel_data,
-            **account_key,
-        }
-    providers = []
-    for state, snapshot in zip(states, snapshots):
-        providers.append({
-            "source": state.source,
-            "data_version": state.data_version,
-            "availability": state.availability,
-            **(
-                {"hero_freshness": source_domain_freshness(state, "hero")}
-                if panel == "current-week" else {}
-            ),
-            "period": {
-                "start": snapshot.period.start,
-                "end": snapshot.period.end,
-                "display_tz": snapshot.period.display_tz,
-            },
-            "data": _share_plain_value(_share_state_domain(state, panel)),
-        })
     return {
         "panel": panel,
         "template_id": template_id,
         "source": source,
-        "providers": providers,
-        **(
-            {"claude_panel_data": panel_data}
-            if source in ("claude", "all") else {}
-        ),
+        "snapshots": [
+            _share_snapshot_digest_projection(ls, snapshot)
+            for snapshot in snapshots
+        ],
         **account_key,
     }
 
@@ -1953,8 +2142,14 @@ def _handle_share_render_post_impl(handler) -> None:
     # truth. Inject before `_share_apply_period_override` so the
     # daily panel rebuild and per-day cross-tab bucketing both see
     # the user's display tz instead of falling back to UTC.
-    if "display_tz" not in options:
-        options["display_tz"] = sys.modules["cctally"].get_display_tz_pref(sys.modules["cctally"].load_config())
+    #
+    # RESOLVED here, once (#503 S2 D7). `get_display_tz_pref` returns a
+    # configuration TOKEN whose default is the literal `local`, and that
+    # token used to travel all the way into `PeriodSpec.display_tz`, so
+    # the artifact stated a zone that names no zone. The resolution is
+    # unconditional rather than gated on the key being absent, because a
+    # caller-supplied token is a token too.
+    options["display_tz"] = _share_resolved_display_tz(options.get("display_tz"))
     if not isinstance(panel, str) or not panel:
         handler._respond_json(400, {
             "error": "missing or non-string panel",
@@ -2023,7 +2218,7 @@ def _handle_share_render_post_impl(handler) -> None:
     data_snap = snap_ref.get() if snap_ref is not None else None
     ls = _share_load_lib()
     try:
-        source_snaps, source_states, panel_data = _share_build_source_snapshots(
+        source_snaps, _source_states, _panel_data = _share_build_source_snapshots(
             ls=ls,
             template=template,
             template_id=template_id,
@@ -2045,6 +2240,11 @@ def _handle_share_render_post_impl(handler) -> None:
     except Exception as exc:
         _share_public_failure(handler, exc, phase="render provider")
         return
+    # TWO tuples, and the order is the whole point (#503 S3 §4). The digest
+    # hashes what the BUILDERS produced; `render()` receives the toggled
+    # versions. Reassigning `source_snaps` first — which is what this site
+    # did — hands the digest a snapshot whose rows a render knob erased.
+    digest_snaps = source_snaps
     source_snaps = tuple(
         _share_apply_content_toggles(item, options) for item in source_snaps
     )
@@ -2089,24 +2289,27 @@ def _handle_share_render_post_impl(handler) -> None:
         "svg":  "image/svg+xml",
     }[fmt]
 
-    # data_digest hashes the inputs that identify the underlying DATA
-    # (panel + template + panel_data), NOT rendering toggles like theme
-    # / branding / reveal_projects / format. Used by the composer to
-    # detect "section data has drifted since add-time" (spec §5.2 /
-    # §7.1) — flipping anon-on-export must not register as drift, since
-    # the underlying data is identical.
-    digest_input = _share_digest_input(
-        panel=panel,
-        template_id=template_id,
-        source=source,
-        source_explicit=source_explicit,
-        states=source_states,
-        snapshots=source_snaps,
-        panel_data=panel_data,
-        account=account,
-    )
+    # data_digest hashes a canonical projection of the BUILT, PRE-TOGGLE
+    # snapshots — what the artifact is made of — and nothing else. NOT the
+    # rendering toggles (theme / branding / reveal_projects / format /
+    # show_chart / show_table), and NOT the wall clock or the raw provider
+    # state. Used by the composer to detect "section data has drifted since
+    # add-time" (spec §5.2 / §7.1); flipping anon-on-export must not register
+    # as drift, since the underlying data is identical.
     try:
-        data_digest = ls._data_digest(digest_input)
+        # The projection is INSIDE the guard, matching the compose site.
+        # `_share_digest_value` raises on a value it cannot serialize, and
+        # `do_POST` has no exception guard of its own, so building the input
+        # outside this `try` turned a projection failure into a dropped
+        # connection instead of the empty digest the fallback promises.
+        data_digest = ls._data_digest(_share_digest_input(
+            panel=panel,
+            template_id=template_id,
+            source=source,
+            snapshots=digest_snaps,
+            account=account,
+            ls=ls,
+        ))
     except Exception:
         # Defensive: digest is non-blocking for the response — fall
         # back to an empty string and let the composer treat it as
@@ -2155,6 +2358,7 @@ def _handle_share_render_post_impl(handler) -> None:
             "options": options,
             "generated_at": _share_now_utc_iso(),
             "data_digest": data_digest,
+            "data_digest_version": _SHARE_DATA_DIGEST_VERSION,
             **({"source": source} if source_explicit else {}),
             **account_meta,
         },
@@ -2226,8 +2430,9 @@ def _handle_share_compose_post_impl(handler) -> None:
     # Resolve display_tz from config once (client `ShareOptions`
     # does not carry it); applied to every section's options below
     # so daily panel rebuilds and per-day cross-tab cells bucket in
-    # the user's display tz, not UTC.
-    composite_display_tz = sys.modules["cctally"].get_display_tz_pref(sys.modules["cctally"].load_config())
+    # the user's display tz, not UTC. Resolved to a CONCRETE IANA zone
+    # (#503 S2 D7) so no section states the token `local` as its zone.
+    composite_display_tz = _share_resolved_display_tz()
 
     composed_sections: list = []
     section_results: list[dict] = []
@@ -2297,9 +2502,15 @@ def _handle_share_compose_post_impl(handler) -> None:
         composite_opts = {**sec_opts, "reveal_projects": reveal_projects,
                           "theme": theme, "format": fmt,
                           "no_branding": no_branding}
-        composite_opts.setdefault("display_tz", composite_display_tz)
+        # Not `setdefault`: a section that arrived carrying its own
+        # `display_tz` is carrying a TOKEN, which must be resolved too.
+        composite_opts["display_tz"] = (
+            _share_resolved_display_tz(sec_opts["display_tz"])
+            if isinstance(sec_opts.get("display_tz"), str) and sec_opts["display_tz"]
+            else composite_display_tz
+        )
         try:
-            source_snaps, source_states, panel_data = _share_build_source_snapshots(
+            source_snaps, _source_states, _panel_data = _share_build_source_snapshots(
                 ls=ls,
                 template=template,
                 template_id=template_id,
@@ -2326,10 +2537,13 @@ def _handle_share_compose_post_impl(handler) -> None:
                 handler, exc, phase=f"compose section {idx} provider",
             )
             return
-        # Same content toggles as the single-section render path.
+        # Same content toggles as the single-section render path, and the
+        # same two-tuple ordering (#503 S3 §4): `digest_snaps` is what the
+        # builders produced, `source_snaps` is what `compose()` renders.
         # Per-section `show_chart`/`show_table` from the basket
         # recipe are applied here; the composite anon flag is
         # already merged into composite_opts upstream.
+        digest_snaps = source_snaps
         source_snaps = tuple(
             _share_apply_content_toggles(item, composite_opts)
             for item in source_snaps
@@ -2338,10 +2552,14 @@ def _handle_share_compose_post_impl(handler) -> None:
         # under one merged alias namespace. Scrubbing per section here is what
         # made `project-1` denote a different project in each section.
         #
-        # The digest below is unaffected by the removal: `_share_digest_input`
-        # reads only `snapshot.period` off each snapshot, never a label, so it
-        # stays byte-identical and no basket section spuriously reads
-        # "Outdated".
+        # The digest below is unaffected by the removal, and the reason has
+        # changed with version 2. `_share_digest_input` now reads `title`,
+        # `subtitle`, `columns`, `rows`, `chart`, `totals` and `notes` off each
+        # snapshot, labels included — so the claim can no longer rest on "it
+        # never reads a label". It rests on ORDER instead: the digest hashes
+        # `digest_snaps`, the snapshots the builders produced, and every
+        # anonymization happens later inside `compose()`. Nothing scrubbed can
+        # reach the digest, so no basket section spuriously reads "Outdated".
 
         # Defensive: digest is non-blocking metadata — fall back to
         # "" on failure rather than 500-ing the whole compose
@@ -2351,29 +2569,42 @@ def _handle_share_compose_post_impl(handler) -> None:
                 panel=panel,
                 template_id=template_id,
                 source=source,
-                source_explicit=source_explicit,
-                states=source_states,
-                snapshots=source_snaps,
-                panel_data=panel_data,
+                snapshots=digest_snaps,
+                ls=ls,
                 # #341 Task 4: carry the section's captured account so a
                 # focus-changed section re-digests as drift (matching render).
-                account=_share_account_selection(snap_recipe),
+                account=section_account,
             ))
         except Exception:
             digest_now = ""
+        # Two digests are comparable only when they mean the same thing
+        # (#503 S3 §4). A section stored before `_SHARE_DATA_DIGEST_VERSION`
+        # existed, or under an older one, is NOT COMPARABLE — and not
+        # comparable is not drifted, so it carries no badge rather than a
+        # spurious "Outdated" the user cannot clear. An absent field is the
+        # legacy case and reads as not comparable, which is the fail-safe
+        # direction: it under-reports drift once instead of over-reporting it
+        # for every stored section.
+        digest_comparable = (
+            snap_recipe.get("data_digest_version_at_add")
+            == _SHARE_DATA_DIGEST_VERSION
+        )
+        drift_detected = digest_comparable and digest_now != digest_at_add
         composed_sections.extend(
-            ls.ComposedSection(
-                snap=item,
-                drift_detected=(digest_now != digest_at_add),
-            )
+            ls.ComposedSection(snap=item, drift_detected=drift_detected)
             for item in source_snaps
         )
         section_results.append({
             "snapshot_id": f"{idx:02d}",
             "source": source,
-            "drift_detected": digest_now != digest_at_add,
+            "drift_detected": drift_detected,
             "data_digest_at_add": digest_at_add,
             "data_digest_now": digest_now,
+            # ADDITIVE (docs/cli-contract.md): a consumer that does not know
+            # this key keeps reading `drift_detected`, which is already
+            # false whenever this is false.
+            "digest_comparable": digest_comparable,
+            "data_digest_version": _SHARE_DATA_DIGEST_VERSION,
         })
 
     compose_opts = ls.ComposeOptions(
@@ -2529,20 +2760,163 @@ def _handle_share_presets_post_impl(handler) -> None:
         })
         return
 
+    # #503 S3 §1. Absent means false, which is the fail-safe direction and is
+    # what makes this compatible with a caller written before the field
+    # existed: an unwitting save can no longer destroy a stored recipe.
+    overwrite = bool(req.get("overwrite", False))
+
     saved_at = _share_now_utc_iso()
     record = {
         "template_id": template_id, "options": options,
         "source": source, "saved_at": saved_at,
     }
 
+    # The OUTCOME is decided under the lock; the RESPONSE is written after it.
+    # `config_writer_lock` is a cross-process `fcntl.flock`, and a client that
+    # reads its socket slowly would otherwise hold it for the length of that
+    # write, blocking every other config writer in every other process.
+    conflict = False
     with sys.modules["cctally"].config_writer_lock():
         cfg = _load_config_unlocked()
         share = cfg.setdefault("share", {})
         presets = share.setdefault("presets", {})
         panel_bucket = presets.setdefault(panel, {})
-        panel_bucket[name] = record
-        save_config(cfg)
+        # Decided INSIDE the writer lock (spec §1): a client-side name-list
+        # preflight can go stale between its GET and this write, so the
+        # preflight is an optimisation and this is the authority. Nothing is
+        # persisted on this branch — `save_config` is the only writer.
+        if name in panel_bucket and not overwrite:
+            conflict = True
+        else:
+            panel_bucket[name] = record
+            save_config(cfg)
+    if conflict:
+        handler._respond_json(409, _SHARE_PRESET_CONFLICT("name", name))
+        return
     handler._respond_json(200, {"panel": panel, "name": name, **record})
+
+
+# The one conflict body both preset mutations answer with (spec §1). Stable
+# machine-readable `code`, the offending field, and a message that names only
+# the preset the caller already sent.
+def _SHARE_PRESET_CONFLICT(field: str, name: str) -> dict:
+    return {
+        "code": "preset_name_conflict",
+        "error": f"a preset named {name!r} already exists",
+        "field": field,
+    }
+
+
+def _share_preset_name_error(field: str) -> dict:
+    return {
+        "error": "name must be 1-64 chars and contain no '/'",
+        "field": field,
+    }
+
+
+def _handle_share_presets_rename_post_impl(handler) -> None:
+    """Rename a preset atomically, keeping its identity (#503 S3 §1).
+
+    Body: ``{panel, from_name, to_name, overwrite}``. CSRF-gated.
+
+    Rename was not an operation: the client issued ``savePreset`` then
+    ``deletePreset``, rebuilding the record from the four fields it happened
+    to hold. That dropped ``source`` (the server defaults it to ``claude``,
+    so a renamed Codex preset started showing a Claude chip), reset
+    ``saved_at`` even though the recipe had not changed, and silently
+    overwrote any preset already holding the target name.
+
+    So this MOVES THE STORED RECORD WHOLE — ``bucket[to] = bucket.pop(from)``
+    — under ONE ``config_writer_lock`` with one ``save_config``. Nothing
+    reconstructs the record, so every field it carries survives, including
+    fields added later.
+
+    A self-rename is rejected explicitly: a move-then-delete on one key
+    deletes the record, and the client-side guard is not sufficient because
+    this endpoint is independently reachable.
+
+    Write discipline is the presets POST's: ``config_writer_lock`` +
+    ``_load_config_unlocked`` + ``save_config``. Never ``load_config`` inside
+    the lock — ``fcntl.flock`` is per-fd and self-deadlocks.
+    """
+    if not handler._check_origin_csrf():
+        return
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except ValueError:
+        length = 0
+    if length > _SHARE_POST_MAX_BYTES:
+        handler._respond_json(400, {"error": "body too large (max 64 KiB)"})
+        return
+    try:
+        raw = handler.rfile.read(length) if length > 0 else b""
+        req = json.loads(raw) if raw else {}
+    except (ValueError, json.JSONDecodeError):
+        handler._respond_json(400, {"error": "malformed json"})
+        return
+    if not isinstance(req, dict):
+        handler._respond_json(400, {"error": "expected JSON object"})
+        return
+
+    panel = req.get("panel")
+    from_name = req.get("from_name")
+    to_name = req.get("to_name")
+    overwrite = bool(req.get("overwrite", False))
+
+    if not isinstance(panel, str) or not panel:
+        handler._respond_json(400, {
+            "error": "missing or non-string panel",
+            "field": "panel",
+        })
+        return
+    tpl_mod = handler._share_load_templates_module()
+    if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+        handler._respond_json(400, {
+            "error": f"unknown share panel: {panel!r}",
+            "field": "panel",
+        })
+        return
+    for value, field in ((from_name, "from_name"), (to_name, "to_name")):
+        if (not isinstance(value, str) or not value
+                or "/" in value or len(value) > 64):
+            handler._respond_json(400, _share_preset_name_error(field))
+            return
+    if from_name == to_name:
+        handler._respond_json(400, {
+            "error": "from_name and to_name are the same preset",
+            "field": "to_name",
+        })
+        return
+
+    # Outcome decided under the lock, response written after it — the same
+    # rule the save handler above states, for the same reason.
+    outcome = "ok"
+    record = None
+    with sys.modules["cctally"].config_writer_lock():
+        cfg = _load_config_unlocked()
+        share = cfg.get("share") or {}
+        presets = share.get("presets") or {}
+        panel_bucket = presets.get(panel) or {}
+        if from_name not in panel_bucket:
+            outcome = "missing"
+        # The target is checked under the SAME lock that performs the move,
+        # so two renames racing onto one name cannot both win.
+        elif to_name in panel_bucket and not overwrite:
+            outcome = "conflict"
+        else:
+            record = panel_bucket.pop(from_name)
+            panel_bucket[to_name] = record
+            save_config(cfg)
+    if outcome == "missing":
+        handler._respond_json(404, {"error": "no such preset"})
+        return
+    if outcome == "conflict":
+        handler._respond_json(409, _SHARE_PRESET_CONFLICT("to_name", to_name))
+        return
+    handler._respond_json(200, {
+        "panel": panel, "name": to_name,
+        **(record if isinstance(record, dict) else {"record": record}),
+    })
 
 def _handle_share_presets_delete_impl(handler) -> None:
     """Remove a preset by `(panel, name)`.
@@ -2570,19 +2944,25 @@ def _handle_share_presets_delete_impl(handler) -> None:
         return
     panel = _urlparse.unquote(parts[4])
     name = _urlparse.unquote(parts[5])
+    # Outcome decided under the lock, response written after it — the same
+    # rule the save and rename handlers state, for the same reason.
+    missing = False
     with sys.modules["cctally"].config_writer_lock():
         cfg = _load_config_unlocked()
         share = cfg.get("share") or {}
         presets = share.get("presets") or {}
         panel_bucket = presets.get(panel) or {}
         if name not in panel_bucket:
-            handler._respond_json(404, {"error": "no such preset"})
-            return
-        del panel_bucket[name]
-        # Tidy empty buckets so GET stays clean.
-        if not panel_bucket:
-            presets.pop(panel, None)
-        save_config(cfg)
+            missing = True
+        else:
+            del panel_bucket[name]
+            # Tidy empty buckets so GET stays clean.
+            if not panel_bucket:
+                presets.pop(panel, None)
+            save_config(cfg)
+    if missing:
+        handler._respond_json(404, {"error": "no such preset"})
+        return
     handler.send_response(204)
     handler.send_header("Content-Length", "0")
     handler.end_headers()
@@ -2600,14 +2980,148 @@ def _handle_share_presets_delete_impl(handler) -> None:
 # `_check_origin_csrf`. The frontend posts fire-and-forget after
 # every successful export — history failures are non-fatal.
 
+# #503 S3 §3 — a history row is a discriminated union on `kind`.
+#
+# `"panel"` is every field the row has always carried. `"composed"` is one
+# multi-section export: `panel: null`, a bounded `sections[]`, and the
+# composite knobs. There is NO migration and none is needed: a missing `kind`
+# READS as `"panel"` (normalized in the GET response only, never written
+# back), and a composed row's `panel: null` makes an older client's
+# `h.panel === panel` filter false, so it hides the row rather than
+# mis-rendering it. `docs/share-gotchas.md` records that `share.*` keys need
+# no formal migration; this shape keeps that true.
+_SHARE_HISTORY_KINDS = ("panel", "composed")
+
+# Twenty is the composer basket cap, so a composed row is bounded by
+# construction — this is the server saying so rather than trusting it.
+_SHARE_HISTORY_COMPOSED_MAX_SECTIONS = 20
+
+# The fields that belong to exactly one branch. A row carrying the other
+# branch's fields is rejected rather than silently half-read.
+_SHARE_HISTORY_PANEL_ONLY_FIELDS = ("template_id", "options", "source",
+                                    "account")
+_SHARE_HISTORY_COMPOSED_ONLY_FIELDS = ("sections", "composite")
+
+
+class _ShareHistoryError(ValueError):
+    """Carry a 400 envelope out of the history validators."""
+
+    def __init__(self, payload: Mapping):
+        super().__init__(str(payload.get("error", "invalid history row")))
+        self.payload = dict(payload)
+
+
+def _share_history_read_kind(record) -> str:
+    """The branch a STORED row belongs to. Absent is the legacy panel row."""
+    if not isinstance(record, Mapping):
+        return "panel"
+    kind = record.get("kind")
+    return kind if kind in _SHARE_HISTORY_KINDS else "panel"
+
+
+def _share_history_normalize_record(record):
+    """The read-side shape of one stored row (response only, never written).
+
+    A panel row keeps its S4 `source` default; a composed row has no
+    top-level source to default, and inventing one would put a provider
+    label on a document that has one per section.
+    """
+    if not isinstance(record, Mapping):
+        return record
+    kind = _share_history_read_kind(record)
+    if kind == "composed":
+        return {**record, "kind": "composed", "panel": record.get("panel")}
+    return {**record, "kind": "panel",
+            "source": record.get("source", "claude")}
+
+
+def _share_history_validate_section(tpl_mod, sec, idx: int) -> dict:
+    """One composed section, held to the same invariants a panel row is."""
+    field = f"sections[{idx}]"
+    if not isinstance(sec, Mapping):
+        raise _ShareHistoryError({
+            "error": f"{field} must be an object", "field": field})
+    panel = sec.get("panel")
+    template_id = sec.get("template_id")
+    options = sec.get("options")
+    if options is None:
+        options = {}
+    if not isinstance(panel, str) or panel not in tpl_mod.SHARE_CAPABLE_PANELS:
+        raise _ShareHistoryError({
+            "error": f"unknown share panel: {panel!r}",
+            "field": f"{field}.panel"})
+    if not isinstance(template_id, str) or not template_id:
+        raise _ShareHistoryError({
+            "error": "missing or non-string template_id",
+            "field": f"{field}.template_id"})
+    try:
+        template = tpl_mod.get_template(template_id)
+    except KeyError:
+        raise _ShareHistoryError({
+            "error": f"unknown template_id: {template_id!r}",
+            "field": f"{field}.template_id"}) from None
+    if template.panel != panel:
+        raise _ShareHistoryError({
+            "error": (f"template_id {template_id!r} belongs to panel "
+                      f"{template.panel!r}, not {panel!r}"),
+            "field": f"{field}.template_id"})
+    if not isinstance(options, Mapping):
+        raise _ShareHistoryError({
+            "error": "options must be an object",
+            "field": f"{field}.options"})
+    try:
+        source, _ = _share_source_selection(dict(sec))
+    except ValueError:
+        raise _ShareHistoryError({
+            "code": "source_capability_unavailable",
+            "error": "source capability unavailable",
+            "field": f"{field}.source"}) from None
+    try:
+        account = _share_account_selection(dict(sec))
+    except ValueError:
+        raise _ShareHistoryError({
+            "error": "malformed account key",
+            "field": f"{field}.account"}) from None
+    return {
+        "panel": panel, "template_id": template_id,
+        "options": dict(options), "source": source,
+        **({"account": account} if account is not None else {}),
+    }
+
+
+def _share_history_validate_composite(composite) -> dict:
+    """The composite knobs a composed row states about the document."""
+    if composite is None:
+        composite = {}
+    if not isinstance(composite, Mapping):
+        raise _ShareHistoryError({
+            "error": "composite must be an object", "field": "composite"})
+    title = composite.get("title")
+    if not isinstance(title, str) or not title or len(title) > 200:
+        raise _ShareHistoryError({
+            "error": "composite.title must be 1-200 chars",
+            "field": "composite.title"})
+    theme = composite.get("theme", "light")
+    if theme not in ("light", "dark"):
+        raise _ShareHistoryError({
+            "error": f"unknown theme: {theme!r}", "field": "composite.theme"})
+    knobs = {}
+    for key in ("reveal_projects", "no_branding"):
+        value = composite.get(key, False)
+        if not isinstance(value, bool):
+            raise _ShareHistoryError({
+                "error": f"composite.{key} must be a boolean",
+                "field": f"composite.{key}"})
+        knobs[key] = value
+    return {"title": title, "theme": theme, **knobs}
+
+
 def _handle_share_history_get_impl(handler) -> None:
     """Return the recent-shares ring buffer (newest last, spec §11.4)."""
     cfg = sys.modules["cctally"].load_config()
     history = (cfg.get("share") or {}).get("history") or []
     handler._respond_json(200, {"history": [
-        ({**record, "source": record.get("source", "claude")}
-         if isinstance(record, dict) else record)
-        for record in history
+        _share_history_normalize_record(record) for record in history
     ]})
 
 def _handle_share_history_post_impl(handler) -> None:
@@ -2639,11 +3153,37 @@ def _handle_share_history_post_impl(handler) -> None:
     if not isinstance(req, dict):
         handler._respond_json(400, {"error": "expected JSON object"})
         return
+    # #503 S3 §3. An absent `kind` is the legacy panel row and validates
+    # exactly as it always has; an unknown value is refused rather than
+    # silently filed as one of the two branches.
+    kind = req.get("kind", "panel")
+    if kind not in _SHARE_HISTORY_KINDS:
+        handler._respond_json(400, {
+            "error": f"unknown history kind: {kind!r}",
+            "field": "kind",
+        })
+        return
+    tpl_mod = handler._share_load_templates_module()
+    if kind == "composed":
+        try:
+            record = _share_history_composed_record(tpl_mod, req)
+        except _ShareHistoryError as exc:
+            handler._respond_json(400, exc.payload)
+            return
+        _share_history_append(handler, record)
+        return
+    for field in _SHARE_HISTORY_COMPOSED_ONLY_FIELDS:
+        if field in req:
+            handler._respond_json(400, {
+                "error": f"{field} belongs to a composed row",
+                "field": field,
+            })
+            return
     panel = req.get("panel")
     template_id = req.get("template_id")
     options = req.get("options") or {}
-    fmt = req.get("format")
-    destination = req.get("destination")
+    # `fmt` and `destination` are read below from
+    # `_share_history_advisory_strings(req)`, which validates them.
     try:
         source, _ = _share_source_selection(req)
         account = _share_account_selection(req)
@@ -2659,7 +3199,6 @@ def _handle_share_history_post_impl(handler) -> None:
             "field": "panel",
         })
         return
-    tpl_mod = handler._share_load_templates_module()
     if panel not in tpl_mod.SHARE_CAPABLE_PANELS:
         handler._respond_json(400, {
             "error": f"unknown share panel: {panel!r}",
@@ -2695,25 +3234,15 @@ def _handle_share_history_post_impl(handler) -> None:
             "field": "options",
         })
         return
-    # `format` and `destination` are advisory strings — accept any
-    # non-empty string; the frontend uses them only as display hints
-    # in the dropdown row. None/missing is allowed (mirrors how the
-    # CLI doesn't always know which destination produced the export).
-    if fmt is not None and not isinstance(fmt, str):
-        handler._respond_json(400, {
-            "error": "format must be a string if provided",
-            "field": "format",
-        })
-        return
-    if destination is not None and not isinstance(destination, str):
-        handler._respond_json(400, {
-            "error": "destination must be a string if provided",
-            "field": "destination",
-        })
+    try:
+        fmt, destination = _share_history_advisory_strings(req)
+    except _ShareHistoryError as exc:
+        handler._respond_json(400, exc.payload)
         return
 
     record = {
         "recipe_id": _share_history_recipe_id(),
+        "kind": "panel",
         "panel": panel,
         "template_id": template_id,
         "options": options,
@@ -2723,6 +3252,84 @@ def _handle_share_history_post_impl(handler) -> None:
         "destination": destination,
         "exported_at": _share_now_utc_iso(),
     }
+    _share_history_append(handler, record)
+
+
+def _share_history_advisory_strings(req: Mapping) -> tuple:
+    """`format` and `destination` — display hints, not contracts.
+
+    Any non-empty string is accepted; the frontend uses them only as row
+    labels in the dropdown. None/missing is allowed (mirrors how the CLI
+    doesn't always know which destination produced the export).
+    """
+    values = []
+    for field in ("format", "destination"):
+        value = req.get(field)
+        if value is not None and not isinstance(value, str):
+            raise _ShareHistoryError({
+                "error": f"{field} must be a string if provided",
+                "field": field,
+            })
+        values.append(value)
+    return tuple(values)
+
+
+def _share_history_composed_record(tpl_mod, req: Mapping) -> dict:
+    """Validate and build ONE composed history row (#503 S3 §3).
+
+    Every section is held to exactly the invariants a panel row is — panel
+    membership, template ownership, options shape, source and account —
+    applied per section, because a section that would 400 on replay is the
+    same poisoned dropdown row a bad panel row would be.
+    """
+    for field in _SHARE_HISTORY_PANEL_ONLY_FIELDS:
+        if field in req:
+            raise _ShareHistoryError({
+                "error": f"{field} belongs to a panel row",
+                "field": field,
+            })
+    panel = req.get("panel")
+    if panel is not None:
+        raise _ShareHistoryError({
+            "error": "a composed row carries no panel",
+            "field": "panel",
+        })
+    sections_in = req.get("sections")
+    if (not isinstance(sections_in, list) or not sections_in
+            or len(sections_in) > _SHARE_HISTORY_COMPOSED_MAX_SECTIONS):
+        raise _ShareHistoryError({
+            "error": (
+                "sections must hold 1-"
+                f"{_SHARE_HISTORY_COMPOSED_MAX_SECTIONS} entries"
+            ),
+            "field": "sections",
+        })
+    sections = [
+        _share_history_validate_section(tpl_mod, sec, idx)
+        for idx, sec in enumerate(sections_in)
+    ]
+    composite = _share_history_validate_composite(req.get("composite"))
+    fmt, destination = _share_history_advisory_strings(req)
+    return {
+        "recipe_id": _share_history_recipe_id(),
+        "kind": "composed",
+        # EXPLICIT null, not an absent key: it is what makes an older
+        # client's `h.panel === panel` filter hide this row.
+        "panel": None,
+        "sections": sections,
+        "composite": composite,
+        "format": fmt,
+        "destination": destination,
+        "exported_at": _share_now_utc_iso(),
+    }
+
+
+def _share_history_append(handler, record: dict) -> None:
+    """Append one row to the ring buffer and answer with it.
+
+    Write discipline matches the presets handlers: `config_writer_lock` +
+    `_load_config_unlocked` + `save_config`.
+    """
     with sys.modules["cctally"].config_writer_lock():
         cfg = _load_config_unlocked()
         share = cfg.setdefault("share", {})

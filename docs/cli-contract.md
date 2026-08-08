@@ -27,6 +27,7 @@ cctally exit codes fall into three groups.
 | `db recover` | `2` `--db stats` (retired — use `db rebuild`), or the cache prod-guard refusal (`--db cache` heals otherwise) |
 | `db repair` | `2` missing `--yes`, healthy target, or prod-guard refusal · `3` active DB, missing recovery tool, recovery/import failure, or verification failure |
 | `db backup` | `2` invalid/existing destination · `3` backup or integrity failure |
+| `db prune` | `0` successful preview, no-op, or complete apply · `2` argument/configuration validation, including a malformed `storage.artifact_retention` block in **both** modes and the #146 prod-guard refusal · `3` partial apply, deletion or lock failure, or protected evidence leaving a bound unsatisfied (a blocked *preview* exits `0` with `status: "blocked"`) |
 | `db checkpoint` | `3` the target DB stayed busy / the WAL was not fully truncated through the timeout (`0` = drained, already-small, or DB absent) |
 | `tui` | `1` fatal (missing `rich`, narrow terminal, renderer crash) · `2` argument error |
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |

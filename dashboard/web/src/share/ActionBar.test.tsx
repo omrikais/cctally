@@ -148,18 +148,37 @@ describe('<ActionBar>', () => {
     expect(clickSpy).toHaveBeenCalled();
   });
 
-  it('Open spawns window.open for HTML format', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+  // #503 S3 §5 — the reserved-tab contract. A popup opened after an `await`
+  // is what browsers block, and `noopener` makes `window.open` return null
+  // by specification, so the old shape could not detect a block at all.
+  function fakeTab() {
+    return {
+      location: { href: '' },
+      opener: {} as unknown,
+      close: vi.fn(),
+    } as unknown as Window & { location: { href: string }; close: () => void };
+  }
+
+  function stubExportFetch(body = '<html>x</html>') {
+    const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({
-        body: '<html>x</html>',
-        content_type: 'text/html',
-        snapshot: {},
-      }),
-    }));
+      json: async () => ({ body, content_type: 'text/html', snapshot: {} }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  function historyPosts(fetchMock: ReturnType<typeof vi.fn>) {
+    return fetchMock.mock.calls.filter(
+      (c) => String(c[0]).startsWith('/api/share/history'));
+  }
+
+  it('Open reserves a tab synchronously and navigates it', async () => {
+    const fetchMock = stubExportFetch();
     const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
     stubProperty(URL, 'createObjectURL', createObjectURL);
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const tab = fakeTab();
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(tab);
 
     const opts: ShareOptions = { ...defaults(), format: 'html' };
     render(
@@ -173,11 +192,92 @@ describe('<ActionBar>', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
     });
-    expect(openSpy).toHaveBeenCalledWith(
-      'blob:fake-url',
-      '_blank',
-      'noopener,noreferrer',
+    // No feature string: `noopener` would suppress the handle.
+    expect(openSpy).toHaveBeenCalledWith('', '_blank');
+    expect(tab.location.href).toBe('blob:fake-url');
+    expect(tab.close).not.toHaveBeenCalled();
+    expect(historyPosts(fetchMock)).toHaveLength(1);
+  });
+
+  it('a blocked Open reports failure and records NO history', async () => {
+    const fetchMock = stubExportFetch();
+    stubProperty(URL, 'createObjectURL', vi.fn().mockReturnValue('blob:x'));
+    vi.spyOn(window, 'open').mockReturnValue(null);
+
+    const opts: ShareOptions = { ...defaults(), format: 'html' };
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId="weekly-recap"
+        options={opts}
+        onOptionsChange={() => {}}
+      />,
     );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(/blocked the new tab/i);
+    expect(historyPosts(fetchMock)).toHaveLength(0);
+  });
+
+  it('a render failure on Open closes the reserved tab and records nothing',
+    async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        json: async () => ({ error: 'render exploded' }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const tab = fakeTab();
+      vi.spyOn(window, 'open').mockReturnValue(tab);
+
+      const opts: ShareOptions = { ...defaults(), format: 'html' };
+      render(
+        <ActionBar
+          panel="weekly"
+          templateId="weekly-recap"
+          options={opts}
+          onOptionsChange={() => {}}
+        />,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
+      });
+      expect(tab.close).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('alert')).toHaveTextContent(/open failed/i);
+      expect(historyPosts(fetchMock)).toHaveLength(0);
+    });
+
+  it('a failed Print records no history and says so', async () => {
+    const fetchMock = stubExportFetch();
+    // No print target and a blocked fallback window: `printPdf` throws.
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(
+      function (this: HTMLBodyElement, node: Node) {
+        const ret = origAppend.call(this, node) as Node;
+        if (node instanceof HTMLIFrameElement && node.contentWindow) {
+          Object.defineProperty(node.contentWindow, 'print', {
+            value: () => { throw new Error('print blocked'); },
+            configurable: true,
+          });
+        }
+        return ret;
+      });
+
+    const opts: ShareOptions = { ...defaults(), format: 'html' };
+    render(
+      <ActionBar
+        panel="weekly"
+        templateId="weekly-recap"
+        options={opts}
+        onOptionsChange={() => {}}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /print/i }));
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(/print failed/i);
+    expect(historyPosts(fetchMock)).toHaveLength(0);
   });
 
   it('Format-gated action buttons carry explanatory tooltips', () => {

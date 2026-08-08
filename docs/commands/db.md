@@ -1,8 +1,8 @@
 # `cctally db`
 
-Migration / DB-management subcommand. Eleven actions: `status`, `skip`,
+Migration / DB-management subcommand. Twelve actions: `status`, `skip`,
 `unskip`, `rebuild`, `rederive`, `journal-repair`, `recover`, `repair`,
-`backup`, `checkpoint`, and `vacuum`.
+`backup`, `checkpoint`, `prune`, and `vacuum`.
 
 ## Synopsis
 
@@ -17,6 +17,7 @@ cctally db recover --db cache [--yes]   # --db stats is retired (see below)
 cctally db repair --db stats --yes
 cctally db backup --db {cache,stats} [--output <path>]
 cctally db checkpoint [--db {cache,stats}] [--json]
+cctally db prune [--yes] [--include-backups] [--json]
 cctally db vacuum [--db {cache,conversations,stats,all}]
 ```
 
@@ -413,7 +414,12 @@ dev-checkout-to-production guard, and requires a recovery-capable `sqlite3`
 command-line shell. cctally probes `.recover` before copying or changing any
 database bytes; a distro build without `SQLITE_ENABLE_DBPAGE_VTAB` is rejected
 with an installation hint for the official sqlite.org CLI. There is deliberately
-no `--force` race bypass for the non-re-derivable stats database.
+no `--force` race bypass, because this command exists for the pre-cutover case
+in which `stats.db` may be the only copy of your recorded history. When cctally
+has retained journal data for this installation, `stats.db` is instead a
+disposable index derived from it, damage heals automatically, and
+`cctally db rebuild --db stats` is the command to reach for — prefer it on any
+current binary.
 
 The repair sequence is fail-safe:
 
@@ -527,6 +533,57 @@ the dev data dir; the installed binary drains prod).
 `0` drained, already-small, or DB absent; `3` (staged) the target stayed
 `busy` / the WAL was not fully truncated through the timeout — an
 actionable "something is still holding it" signal.
+
+## `cctally db prune [--yes] [--include-backups] [--json]`
+
+Reclaim the corruption evidence cctally has retained — quarantine incident directories, forensics bundles, WAL-evidence directories, rebuild records and machine-written backup families — down to what the configured retention policy keeps. Issue #496.
+
+**Preview by default.** A bare `cctally db prune` reads the store, plans the reclamation and prints what it would do. Nothing is deleted until you pass `--yes`.
+
+Deletion is two-phase and crash-safe: every member is renamed to a `.reclaiming-*` tombstone inside its own parent under an exclusive lock, the mapping is fsynced to a `.reclaim-pending-<plan>.json` record, the lock is released, and only then is anything unlinked. An interrupted run is finished by the next one.
+
+### What is never deleted
+
+- **Evidence cctally cannot classify.** An incident whose cause it could not determine is protected, in both modes, forever, until something classifies it.
+- **Evidence something is still using.** A live heal request, a pending publication, a rebuild record that has not reported an outcome, or a quarantine that did not finish.
+- **The last surviving example of each distinct damage shape**, up to `max_shape_examples`. This is retention you asked for, so the report states it as an ordinary line and `cctally doctor` treats it as information rather than a problem.
+- **Backups you made yourself.** `cctally db backup` families are excluded unless you pass `--include-backups`. A `.bak-*` file with a name cctally does not recognize is never deleted automatically, whatever flags you pass — this is the fail-safe for hand-made copies.
+
+### Policy
+
+`storage.artifact_retention` in `config.json`. See `docs/commands/config.md`. If the block is present but malformed, this command deletes nothing and exits `2` in **both** modes, and automatic reclamation is switched off until you fix or remove it. cctally does not fall back to the defaults, because a policy you never wrote must not arm a deletion.
+
+### Text output
+
+```
+Policy: keep 30 days, 20 per family, 4096 MiB total; reclaim below 10240 MiB free;
+        keep 8 damage-shape examples.
+
+                          groups      on disk       delete         keep    protected
+stats.db incidents           118     7.86 GiB     6.09 GiB     1.37 GiB     0.40 GiB
+cache.db incidents            21    10.13 GiB     9.14 GiB     0.99 GiB           --
+machine backups                3     1.20 GiB     0.80 GiB     0.40 GiB           --
+
+Protected and never deleted (7 groups, 0.40 GiB):
+  5  classification is unknown
+  2  no classification recorded
+
+Keeping 3 damage-shape examples that age and count would otherwise have removed.
+
+Would free 16.03 GiB, leaving 3.16 GiB retained. Nothing was deleted — re-run with --yes.
+```
+
+Each row is one artifact family and kind. `groups` counts the units the policy ages and counts — an incident directory travels with the bundle and rebuild record it names, and a backup stem travels with its `-wal`, `-shm` and classification sidecar. Every byte is attributed to exactly one row. Figures render in whichever unit carries a real number, so a corpus of a few megabytes reads `3.24 MiB` rather than `0.00 GiB`.
+
+### `--json` fields
+
+`schemaVersion` is stamped first, then `status`, `policy`, `before`, `plan`, `protected`, `result`, `unsatisfiedRules`, `errors` and `stuckRecords`. Artifacts are named by a stable id relative to the data directory, never by absolute path. `status` is one of `preview`, `applied`, `no-op`, `partial`, `blocked`, `malformedPolicy` or `prodRefused`.
+
+### Exit codes
+
+`0` a successful preview, a no-op, or a complete apply; `2` argument or configuration validation — including a malformed retention policy, in **both** preview and apply, and the #146 prod-guard refusal (a development checkout will not prune the real data directory); `3` an apply that was partial, a deletion or lock that failed, or protected evidence that left a bound unsatisfied.
+
+A **preview** that reports a blocked bound still exits `0` with `status: "blocked"`: it deleted nothing and nothing failed. The same condition on an apply exits `3`, because the apply is the operation that was meant to resolve it.
 
 ## `cctally db vacuum [--db {cache,conversations,stats,all}]`
 

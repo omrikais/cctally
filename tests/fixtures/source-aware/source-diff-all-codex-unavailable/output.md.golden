@@ -9,12 +9,8 @@ cctally_version: 9.9.9
 
 # Diff Report — Claude + Codex
 
-## Diff Report
-
-# Diff Report
-
-**Claude**
-_2026-07-01 → 2026-07-02 (UTC)_
+## Diff Report — Claude
+_2026-07-01 → 2026-07-02 (Etc/UTC) · projects anonymized_
 _2026-07-02T00:00:00Z_
 
 | Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |
@@ -32,12 +28,8 @@ _2026-07-02T00:00:00Z_
 - **B tokens:** 380
 - **Δ tokens:** +190
 
-## Diff Report
-
-# Diff Report
-
-**Codex**
+## Diff Report — Codex
 
 Unavailable: Codex qualified project metadata is unavailable.
-_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_

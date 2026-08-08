@@ -2159,8 +2159,9 @@ def test_a_marker_holding_valid_json_that_is_not_an_object_is_not_a_traceback(
 def test_a_failed_publication_in_the_worker_reports_publication_guidance(ns):
     """#496 S1 F1, re-homed by S3's detachment.
 
-    Replacement has already occurred, so the pre-existing "Not auto-recreated …
-    run `cctally db repair --db stats --yes`" text is false. The process that
+    Replacement has already occurred, so the ordinary corrupt-stats text —
+    "never auto-recreated … run `cctally db repair --db stats --yes`" — is
+    false. The process that
     CAUSES the failure is now the detached worker, whose streams are
     `/dev/null`, so it can only record the verdict durably and log it; the
     guidance therefore reaches the user on the next open, from the marker. What

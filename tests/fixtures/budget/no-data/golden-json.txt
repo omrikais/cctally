@@ -1,0 +1,1 @@
+{"schemaVersion": 1, "status": "no_data", "weekly_usd": 300.0, "period": "subscription-week"}

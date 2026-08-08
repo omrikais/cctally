@@ -1,5 +1,5 @@
 // Display labels + filename extensions for the share modal. Mirrors the
-// `panelLabel` props sprinkled across the 8 share-capable panel/modal
+// `panelLabel` props sprinkled across the 9 share-capable panel/modal
 // components so the share modal can title itself without depending on
 // the caller (the share modal only knows the panel id from
 // `state.shareModal.panel`).

@@ -585,6 +585,28 @@
                     "severity": "ok",
                     "summary": "below threshold",
                     "title": "Reclaimable transcript space"
+                },
+                {
+                    "details": {
+                        "floorRetainedBytes": 0,
+                        "floorRetainedRoots": 0,
+                        "freeDiskBytes": "<redacted>",
+                        "partialScan": false,
+                        "policyReason": null,
+                        "policyStatus": "missing",
+                        "protectedBytes": 0,
+                        "protectedRoots": 0,
+                        "reclaimableBytes": 0,
+                        "retainedBytes": 0,
+                        "roots": 0,
+                        "scanned": true,
+                        "stuckRecords": [],
+                        "unsatisfiedRules": []
+                    },
+                    "id": "db.retained_artifacts",
+                    "severity": "ok",
+                    "summary": "0 B retained, within policy",
+                    "title": "Retained evidence"
                 }
             ],
             "id": "db",
@@ -622,7 +644,12 @@
                 },
                 {
                     "details": {
-                        "incidents": 0
+                        "detections": 0,
+                        "incidents": 0,
+                        "latest": null,
+                        "recentDetections": 0,
+                        "repeatedShapes": [],
+                        "windowDays": 7
                     },
                     "id": "journal.auto_heal",
                     "severity": "ok",
@@ -1012,7 +1039,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 51,
+            "ok": 52,
             "warn": 8
         },
         "severity": "warn"

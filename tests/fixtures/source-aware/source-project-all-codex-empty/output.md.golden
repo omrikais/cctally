@@ -9,30 +9,19 @@ cctally_version: 9.9.9
 
 # Project Report — Claude + Codex
 
-## Project Report
-
-# Project Report
-
-**Claude**
-_2026-07-02 → 2026-07-02 (UTC)_
+## Project Report — Claude
+_2026-07-02 → 2026-07-02 (Etc/UTC) · projects anonymized_
 _2026-07-02T12:00:00Z_
 
-| project-2 | $ Cost | Tokens |
+| Project | $ Cost | Tokens |
 |:---|---:|---:|
 | project-1 | $3.75 | 570 |
 
 - **Total:** $3.75
 - **Tokens:** 570
 
-## Project Report
-
-# Project Report
-
-**Codex**
+## Project Report — Codex
 
 No data
-_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-01 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
-
-| project-2 | $ Cost | Tokens |
-|:---|---:|---:|

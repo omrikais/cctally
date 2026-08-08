@@ -113,6 +113,11 @@ def test_legacy_none_identity_snapshot_is_byte_stable():
         "cctally_version: 1.0.0\n"
         "---\n"
         "# Legacy share\n"
+        # #503 S2 D1: the facts strip and the timestamp are unconditional.
+        # This snapshot carries no project names, so D5 omits the privacy
+        # clause rather than claiming a state it has no basis for.
+        "_2026-07-01 → 2026-07-02 (UTC)_\n"
+        "_2026-07-02T12:00:00Z_\n"
         "\n"
         "| Label |\n"
         "|:---|\n"
@@ -416,7 +421,8 @@ def test_default_claude_share_uses_structured_legacy_adapter(
                     "dollarsPerPercent": 3.0 / 37.0,
                 }],
             },
-            ("Jul 01", "37.0%", "$3.00"),
+            # #503 S2 D4/F15 — the week cell is full ISO, not `%b %d`.
+            ("2026-07-01", "37.0%", "$3.00"),
         ),
     ],
 )
@@ -710,3 +716,169 @@ def test_source_aware_branded_goldens_are_version_pinned_not_release_coupled():
     builder_source = (root / "bin" / "build-source-aware-fixtures.py").read_text(encoding="utf-8")
     assert "CCTALLY_TEST_CHANGELOG_PATH" in builder_source
     assert "os.get_terminal_size" in builder_source
+
+
+# =====================================================================
+# #503 S2 Task 11 — exit-3 parity for all-source composition (F19).
+#
+# Single-source rendering maps `SharePrivacyViolation` to exit 3 and a
+# one-line refusal. The all-source path called `compose()` with no such
+# catch, so the same refusal fell through to the generic handler in
+# `bin/cctally` and exited 1. Documenting exit 3 while one path exits 1
+# would leave F19 half-closed.
+# =====================================================================
+
+def _clean_codex_report_result():
+    at = datetime(2026, 7, 2, 12, tzinfo=UTC)
+    return SourceResult("codex", "ok", CodexReportData(
+        as_of=at,
+        series=(CodexReportSeries(
+            quota_key="quota:opaque", slot="five-hour", window_minutes=300,
+            rows=(CodexReportRow(
+                block_start=datetime(2026, 7, 2, 7, tzinfo=UTC),
+                reset_at=at, used_percent=37.0, cost_usd=4.25,
+                cost_per_percent=4.25 / 37, status="ok",
+            ),),
+        ),),
+        quota_status="ok",
+    ))
+
+
+def _poisoned_report_result(source: str):
+    """A legacy Claude report payload whose week label is an absolute path.
+
+    `_claude_legacy_share_rows` parses `weekStartDate` as a date and, when
+    that fails, uses the raw value as the cell text — so this reaches the
+    artifact verbatim and trips the detector's absolute-path class. A real
+    reproduction through the real compose path, not a monkeypatched raise.
+    """
+    return SourceResult(source, "ok", {
+        "trend": [{
+            "weekStartDate": "/Volumes/FIXTURE/repos/sample-project",
+            "weeklyPercent": 37.0,
+            "weeklyCostUSD": 3.0,
+            "dollarsPerPercent": 3.0 / 37.0,
+        }],
+    })
+
+
+class _AllSourceArgs:
+    source = "all"
+    format = "md"
+    theme = "light"
+    no_branding = False
+    reveal_projects = False
+    open_after_write = False
+    output = "-"
+    copy = False
+    command = "report"
+
+
+def test_a_single_source_share_refusal_exits_three():
+    ns, _ls, _source = _kernel()
+
+    class _Args(_AllSourceArgs):
+        source = "claude"
+
+    with pytest.raises(SystemExit) as exc:
+        ns["_cctally_source_analytics"]._emit_source_share(
+            _Args(), _poisoned_report_result("claude"),
+            command="report", claude=None)
+    assert exc.value.code == 3
+
+
+def test_all_source_share_refusal_exits_three_like_the_single_source_path():
+    ns, _ls, _source = _kernel()
+    with pytest.raises(SystemExit) as exc:
+        ns["_cctally_source_analytics"]._emit_source_share(
+            _AllSourceArgs(), _clean_codex_report_result(),
+            command="report", claude=_poisoned_report_result("claude"))
+    assert exc.value.code == 3
+
+
+def test_the_all_source_refusal_message_matches_the_single_source_one(capsys):
+    ns, _ls, _source = _kernel()
+    with pytest.raises(SystemExit):
+        ns["_cctally_source_analytics"]._emit_source_share(
+            _AllSourceArgs(), _clean_codex_report_result(),
+            command="report", claude=_poisoned_report_result("claude"))
+    err = capsys.readouterr().err
+    assert err.startswith("cctally: refused to write a share artifact"), err
+    assert "absolute path" in err
+
+
+def test_the_all_source_refusal_writes_nothing(tmp_path):
+    ns, _ls, _source = _kernel()
+    target = tmp_path / "report.md"
+
+    class _Args(_AllSourceArgs):
+        output = str(target)
+
+    with pytest.raises(SystemExit):
+        ns["_cctally_source_analytics"]._emit_source_share(
+            _Args(), _clean_codex_report_result(),
+            command="report", claude=_poisoned_report_result("claude"))
+    assert not target.exists()
+
+
+# =====================================================================
+# #503 S2 review — F4: the project column's HEADER was being anonymized.
+#
+# `ColumnSpec(kind="project")` declares that the column's LABEL is a
+# project display name, which is true for the cross-tab Detail templates
+# whose headers ARE project names. The two `project`-command adapters
+# below set it on a column whose label is the literal word `Project`, so
+# the anonymizer rewrote the header itself: `source-project-codex-empty`
+# rendered `<th>project-1</th>`, and `source-project-all-claude-empty`
+# rendered a `<th>project-2</th>` header above a `project-1` data row, so
+# the header and the row alias disagreed and the column was unlabelled.
+# =====================================================================
+
+def _f4_project_payload() -> dict:
+    return {
+        "projects": [
+            {"displayLabel": "repos/alpha", "project": "repos/alpha",
+             "costUsd": 3.0, "inputTokens": 10, "outputTokens": 5},
+            {"displayLabel": "repos/beta", "project": "repos/beta",
+             "costUsd": 1.0, "inputTokens": 4, "outputTokens": 2},
+        ],
+    }
+
+
+def test_the_project_column_header_is_not_a_project_name():
+    """The header is chrome, not data; only the CELLS are project names."""
+    _ns, ls, analytics = _kernel()
+    columns, _rows, _totals = analytics._claude_project_share_rows(
+        _f4_project_payload(), ls)
+    assert columns[0].label == "Project"
+    assert columns[0].kind is None, (
+        "the literal header word must not be declared a project display name")
+
+
+@pytest.mark.parametrize("fmt", ["md", "html", "svg"])
+@pytest.mark.parametrize("reveal", [False, True])
+def test_a_rendered_project_artifact_keeps_its_column_header(fmt, reveal):
+    _ns, ls, analytics = _kernel()
+    columns, rows, totals = analytics._claude_project_share_rows(
+        _f4_project_payload(), ls)
+    snap = ls.ShareSnapshot(
+        cmd="project", title="Project Report", subtitle=None,
+        period=_period(ls), columns=columns, rows=rows, chart=None,
+        totals=totals, notes=(),
+        generated_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC), version="9.9.9",
+    )
+    out = ls.render(snap, format=fmt, theme="light", branding=True,
+                    reveal_projects=reveal)
+    import re as _re
+    if fmt == "md":
+        header = next(line for line in out.splitlines()
+                      if line.startswith("| ")).split("|")[1].strip()
+    elif fmt == "html":
+        header = _re.search(r"<th[^>]*>([^<]*)</th>", out).group(1)
+    else:
+        # The SVG table's header cells are the bold sans-serif texts.
+        header = _re.search(
+            r'<text[^>]*font-family="sans-serif"[^>]*font-weight="bold"[^>]*>'
+            r'([^<]*)</text>', out).group(1)
+    assert header == "Project", (fmt, reveal, header)
+    assert not _re.fullmatch(r"project-\d+", header), (fmt, reveal, header)

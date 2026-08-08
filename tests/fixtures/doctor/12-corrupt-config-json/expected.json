@@ -577,10 +577,33 @@
                     "severity": "ok",
                     "summary": "below threshold",
                     "title": "Reclaimable transcript space"
+                },
+                {
+                    "details": {
+                        "floorRetainedBytes": null,
+                        "floorRetainedRoots": null,
+                        "freeDiskBytes": null,
+                        "partialScan": false,
+                        "policyReason": "config.json could not be read: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+                        "policyStatus": "malformed",
+                        "protectedBytes": null,
+                        "protectedRoots": null,
+                        "reclaimableBytes": null,
+                        "retainedBytes": null,
+                        "roots": null,
+                        "scanned": false,
+                        "stuckRecords": [],
+                        "unsatisfiedRules": []
+                    },
+                    "id": "db.retained_artifacts",
+                    "remediation": "Fix or remove the storage.artifact_retention block: config.json could not be read: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+                    "severity": "fail",
+                    "summary": "retention policy in config.json is malformed \u2014 automatic reclaim is off",
+                    "title": "Retained evidence"
                 }
             ],
             "id": "db",
-            "severity": "warn",
+            "severity": "fail",
             "title": "Database"
         },
         {
@@ -614,7 +637,12 @@
                 },
                 {
                     "details": {
-                        "incidents": 0
+                        "detections": 0,
+                        "incidents": 0,
+                        "latest": null,
+                        "recentDetections": 0,
+                        "repeatedShapes": [],
+                        "windowDays": 7
                     },
                     "id": "journal.auto_heal",
                     "severity": "ok",
@@ -1005,7 +1033,7 @@
     "generated_at": "2026-05-13T14:22:31Z",
     "overall": {
         "counts": {
-            "fail": 1,
+            "fail": 2,
             "ok": 51,
             "warn": 7
         },

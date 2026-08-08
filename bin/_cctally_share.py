@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 import _lib_changelog  # module-qualified: _lib_changelog._read_latest_changelog_version()
-from _lib_display_tz import format_display_dt
+from _lib_display_tz import _resolve_tz, format_display_dt, resolve_display_tz_name
 from _lib_fmt import stable_sum
 from _lib_render import _project_disambiguate_labels
 
@@ -270,28 +270,68 @@ def _share_period_label(
 ) -> str:
     """Render the canonical "<start> → <end> (<tz>)" period label.
 
-    Used by both the report and daily snapshot builders so the period label
-    format stays consistent across share-enabled subcommands.
+    Used by every CLI share snapshot builder so the period label format
+    stays consistent across share-enabled subcommands.
+
+    FULL ISO (#503 S2 D4). It used to render `%b %d`, so a report spanning
+    2020 to 2026 read `Jan 01 → May 09` and named neither year. This
+    matches the shape `bin/_cctally_codex.py` and
+    `bin/_cctally_source_analytics.py` already use.
     """
     return (
-        f"{period_start.strftime('%b %d')} → "
-        f"{period_end.strftime('%b %d')} ({display_tz_label})"
+        f"{period_start.date().isoformat()} → "
+        f"{period_end.date().isoformat()} ({display_tz_label})"
     )
+
+
+def _share_display_zone(tz: "ZoneInfo | None"):
+    """The concrete zone `_share_display_tz_label` names, as a tzinfo.
+
+    `resolve_display_tz` returns `None` for the `local` configuration
+    token, which is the DEFAULT. Every site that lifts a calendar label
+    into a `PeriodSpec` boundary must anchor it in this zone, because that
+    is the zone the artifact's period is labelled with (#503 S2 D7).
+    Falls back to UTC only when the resolved name is not loadable, which
+    keeps a stale host zone from turning a render into an exception.
+    """
+    if tz is not None:
+        return tz
+    resolved = _resolve_tz(_share_display_tz_label(None), strict_iana=False,
+                           fallback=None)
+    return resolved if resolved is not None else dt.timezone.utc
+
+
+def _share_ground_civil_date(d: "dt.date", tz: "ZoneInfo | None") -> dt.datetime:
+    """Lift a calendar label to midnight IN THE ZONE the artifact names.
+
+    `2026-04-13` is a calendar label, not an instant. Lifting it to UTC
+    midnight and then converting it into `America/New_York` — which is
+    what `period_civil_dates` does for a non-`civil_bucket` period —
+    reports `2026-04-12`, a day the artifact's own table does not contain
+    (#503 S2 D7). Grounding it here keeps the boundary a real instant, so
+    the conversion is the identity and the two boundary kinds stay
+    distinguishable without a second flag on the command-line path.
+    """
+    return dt.datetime(d.year, d.month, d.day, tzinfo=_share_display_zone(tz))
 
 
 def _share_parse_date_to_dt(value, tz: "ZoneInfo | None") -> dt.datetime:
     """Coerce a `YYYY-MM-DD` string or `dt.date` into a tz-aware datetime.
 
     Used by the share gate sites to lift week-boundary date strings
-    (`weekStartDate`, `weekEndDate`) into the tz-aware datetimes that
-    `PeriodSpec` expects. None / empty / unparseable -> current UTC; the
-    caller already gated on a non-empty trend before reaching this path,
-    so the fallback is purely defensive against missing-data corner cases.
+    (`weekStartDate`, `weekEndDate`) and 5-hour block date parts into the
+    tz-aware datetimes that `PeriodSpec` expects. None / empty /
+    unparseable -> current UTC; the caller already gated on a non-empty
+    trend before reaching this path, so the fallback is purely defensive
+    against missing-data corner cases.
+
+    A parsed calendar label is grounded through `_share_ground_civil_date`.
     """
     if value is None:
         return _share_now_utc()
     if isinstance(value, dt.datetime):
-        return value if value.tzinfo else value.replace(tzinfo=tz or dt.timezone.utc)
+        return (value if value.tzinfo
+                else value.replace(tzinfo=_share_display_zone(tz)))
     if isinstance(value, dt.date):
         d = value
     else:
@@ -299,18 +339,23 @@ def _share_parse_date_to_dt(value, tz: "ZoneInfo | None") -> dt.datetime:
             d = dt.date.fromisoformat(str(value))
         except ValueError:
             return _share_now_utc()
-    midnight = dt.datetime(d.year, d.month, d.day)
-    return midnight.replace(tzinfo=tz or dt.timezone.utc)
+    return _share_ground_civil_date(d, tz)
 
 
 def _share_display_tz_label(tz: "ZoneInfo | None") -> str:
-    """Render a stable display-tz string for `PeriodSpec.display_tz`.
+    """Render the concrete IANA zone name for `PeriodSpec.display_tz`.
 
-    `resolve_display_tz` returns `None` for "local" (caller does bare
-    astimezone); the share snapshot needs a non-None string. Map None ->
-    "local" and use ZoneInfo.key otherwise.
+    `resolve_display_tz` returns `None` for the "local" configuration
+    token (its callers then do a bare `astimezone()`). This used to map
+    that `None` to the literal string `"local"`, and every v1 share golden
+    printed `(local)` as a result — a label that names no zone, so a
+    reader could not tell which day boundary the artifact's dates use.
+
+    #503 S2 D7: resolve the token to the host's IANA zone instead. That is
+    the same zone the bare `astimezone()` produced, so the dates do not
+    move; only the label becomes truthful.
     """
-    return tz.key if tz is not None else "local"
+    return tz.key if tz is not None else resolve_display_tz_name("local")
 
 
 def _build_report_snapshot(
@@ -320,8 +365,6 @@ def _build_report_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally report`.
 
@@ -358,7 +401,7 @@ def _build_report_snapshot(
         wsd = r.week_start_date.isoformat() if r.week_start_date else None
         if isinstance(wsd, str) and wsd:
             try:
-                week_label = dt.date.fromisoformat(wsd).strftime("%b %d")
+                week_label = dt.date.fromisoformat(wsd).isoformat()
             except ValueError:
                 week_label = wsd
         else:
@@ -418,15 +461,12 @@ def _build_report_snapshot(
     else:
         title = "Weekly $ / % trend — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="report",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -444,8 +484,6 @@ def _build_daily_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally daily`.
 
@@ -496,7 +534,7 @@ def _build_daily_snapshot(
         bucket = getattr(r, "bucket", None)
         if isinstance(bucket, str) and bucket:
             try:
-                date_str = dt.date.fromisoformat(bucket).strftime("%b %d")
+                date_str = dt.date.fromisoformat(bucket).isoformat()
             except ValueError:
                 date_str = bucket
         else:
@@ -528,21 +566,18 @@ def _build_daily_snapshot(
     )
     if rows:
         title = (
-            f"Daily usage — {period_start.strftime('%b %d')} → "
-            f"{period_end.strftime('%b %d')}"
+            f"Daily usage — {period_start.date().isoformat()} → "
+            f"{period_end.date().isoformat()}"
         )
     else:
         title = "Daily usage — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="daily",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -560,8 +595,6 @@ def _build_monthly_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally monthly`.
 
@@ -646,15 +679,12 @@ def _build_monthly_snapshot(
         f"{period_start.strftime('%Y-%m')} → "
         f"{period_end.strftime('%Y-%m')} ({display_tz})"
     )
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="monthly",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -672,8 +702,6 @@ def _build_weekly_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
     breakdown_model: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally weekly`.
@@ -759,7 +787,7 @@ def _build_weekly_snapshot(
         bucket = getattr(r, "bucket", None)
         if isinstance(bucket, str) and bucket:
             try:
-                week_label = dt.date.fromisoformat(bucket).strftime("%b %d")
+                week_label = dt.date.fromisoformat(bucket).isoformat()
             except ValueError:
                 week_label = bucket
         else:
@@ -830,15 +858,12 @@ def _build_weekly_snapshot(
         else "Weekly usage — no data"
     )
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="weekly",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -855,8 +880,6 @@ def _build_forecast_snapshot(
     week_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
     actual_series: list[tuple[str, float, float]],
     projected_series: list[tuple[str, float, float]],
     current_pct: float,
@@ -978,21 +1001,18 @@ def _build_forecast_snapshot(
         ("LOW CONF — data thin",) if low_conf else ()
     )
     if actual_pts:
-        title = f"Forecast — week of {week_start.strftime('%b %d')}"
+        title = f"Forecast — week of {week_start.date().isoformat()}"
     else:
         title = "Forecast — no data"
     # Reuse the shared period-label helper so forecast's subtitle period
     # format matches sibling builders (cmd_daily / cmd_project / etc.).
     period_label = _share_period_label(week_start, week_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="forecast",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=week_start, end=week_end,
             display_tz=display_tz, label=period_label,
@@ -1010,8 +1030,6 @@ def _build_project_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally project`.
 
@@ -1155,21 +1173,18 @@ def _build_project_snapshot(
     )
     if rows:
         title = (
-            f"Per-project usage — {period_start.strftime('%b %d')} → "
-            f"{period_end.strftime('%b %d')}"
+            f"Per-project usage — {period_start.date().isoformat()} → "
+            f"{period_end.date().isoformat()}"
         )
     else:
         title = "Per-project usage — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="project",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -1187,8 +1202,6 @@ def _build_five_hour_blocks_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
     tz: "ZoneInfo | None",
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally five-hour-blocks`.
@@ -1277,7 +1290,7 @@ def _build_five_hour_blocks_snapshot(
                 block_iso.replace("Z", "+00:00")
             )
             block_lbl = format_display_dt(
-                parsed, tz, fmt="%b %d %H:%M", suffix=False,
+                parsed, tz, fmt="%Y-%m-%d %H:%M", suffix=False,
             )
         except (ValueError, AttributeError):
             block_lbl = str(block_iso)
@@ -1343,15 +1356,12 @@ def _build_five_hour_blocks_snapshot(
     else:
         title = "5-hour blocks — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="five-hour-blocks",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,
@@ -1426,8 +1436,6 @@ def _build_session_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
-    theme: str,
-    reveal_projects: bool,
     top_n: int | None,
     tz: "ZoneInfo | None",
 ) -> "ShareSnapshot":
@@ -1573,21 +1581,18 @@ def _build_session_snapshot(
             title = f"Top {len(snap_rows)} sessions"
         else:
             title = (
-                f"Sessions — {period_start.strftime('%b %d')} → "
-                f"{period_end.strftime('%b %d')}"
+                f"Sessions — {period_start.date().isoformat()} → "
+                f"{period_end.date().isoformat()}"
             )
     else:
         title = "Sessions — no data"
     period_label = _share_period_label(period_start, period_end, display_tz)
-    subtitle = " · ".join([
-        period_label,
-        theme,
-        "real projects" if reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="session",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=period_start, end=period_end,
             display_tz=display_tz, label=period_label,

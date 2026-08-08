@@ -5185,6 +5185,24 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
     _hook_tick_log_line(line)
     _hook_tick_log_rotate_if_needed()
 
+    # #496 S6 §5.2, the hook-tick branch. It is admitted HERE rather than from
+    # `main`'s post-command hook because the parent returns at the fork and
+    # never reaches that hook, and because the INLINE FALLBACK — `os.fork()`
+    # failed, so this body is running on Claude Code's blocking path — must not
+    # gain a spawn. `forked` is exactly that discriminator.
+    try:
+        _cctally()._load_sibling(
+            "_cctally_retention"
+        ).maybe_defer_artifact_retention(
+            command="hook-tick",
+            exit_code=0,
+            hook_forked=forked,
+            hook_explain=explain,
+            hook_foreground=foreground,
+        )
+    except Exception:
+        pass
+
     # --- Step 9: exit code ---
     if not explain:
         # Forked child: skip Python's atexit / argparse / cleanup paths

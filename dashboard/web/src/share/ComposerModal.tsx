@@ -2,7 +2,7 @@
 //
 // Two-pane layout:
 //   - left: section list (ComposerSectionList) with dnd-kit reorder +
-//     per-section kebab (preview-only / refresh / remove).
+//     per-section kebab (refresh-from-current-data / remove).
 //   - right: composite knob bar above + sandboxed live-preview iframe.
 //
 // Recompose pipeline (single 200ms-debounced useEffect): re-POSTs
@@ -30,8 +30,12 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { ModalHeader } from '../modals/ModalHeader';
+import { ConfirmAction, useConfirmHost } from './ConfirmAction';
 import { svgToPng } from './exporters/png';
 import { printPdf } from './exporters/printPdf';
+import { reserveExportTab, POPUP_BLOCKED_MESSAGE } from './exporters/openTab';
+import { PREVIEW_FAILED_NOTE } from './ActionBar';
+import { appendComposedHistory } from './presetsApi';
 import type { ShareFormat, ShareTheme } from './types';
 
 // Composite filename — `cctally-report-<utcdate>.<ext>` (spec §8.8 mirrors
@@ -56,6 +60,19 @@ function mimeFor(format: ShareFormat): string {
 // fill so dark-theme exports don't render on transparent (which some
 // viewers paint solid black). Keep the values byte-identical with
 // ActionBar so single + composite PNGs look the same.
+const CLEAR_ALL_ID = 'composer-clear-all';
+// #503 S3 §5 — the composer has the same defect as the share modal: the
+// export buttons never gated on, or mentioned, a failed preview. Same note,
+// same warn-do-not-disable rule, sourced from the modal-level `composeErr`
+// this component already owns.
+const COMPOSER_PREVIEW_FAILED_NOTE_ID = 'composer-preview-failed-note';
+
+// "1 section" / "3 sections" — the confirmation names what it destroys, and
+// naming it wrongly in the singular case would undercut the point.
+function sectionCountLabel(n: number): string {
+  return `${n} ${n === 1 ? 'section' : 'sections'}`;
+}
+
 function paletteBg(theme: 'light' | 'dark'): string {
   return theme === 'light' ? '#ffffff' : '#0f172a';
 }
@@ -96,6 +113,8 @@ export function ComposerModal() {
   // applied to both the empty-state and the populated path so the
   // stylesheet rules can target either.
   const isMobile = useIsMobile();
+  // #503 S3 §2 — one confirmation slot for the composer.
+  const confirm = useConfirmHost();
   // M1-1: lock background page scroll while the composer is open. Declared
   // before the early `return null` below (Rules of Hooks); keyed on the
   // open value so the effect's cleanup decrements the refcount on close.
@@ -317,6 +336,34 @@ export function ComposerModal() {
   const showToast = (text: string) =>
     dispatch({ type: 'SHOW_STATUS_TOAST', text });
 
+  // #503 S3 §3 — a composed export records ONE history row, in every
+  // panel's Recent shares. Fire-and-forget, copying ActionBar's shape, so a
+  // history failure can never block or fail an export that already
+  // succeeded. `Open` and `Print` call this only after §5's success checks,
+  // so an export that never happened is never recorded as one.
+  const recordComposedHistory = (
+    destination: 'copy' | 'download' | 'open' | 'png' | 'print',
+    exportFormat: ShareFormat,
+  ): void => {
+    void appendComposedHistory({
+      sections: basket.items.map((it) => ({
+        panel: it.panel,
+        template_id: it.template_id,
+        options: it.options,
+        source: it.source,
+        ...(it.account == null ? {} : { account: it.account }),
+      })),
+      composite: {
+        title,
+        theme,
+        reveal_projects: !anonOnExport,
+        no_branding: noBranding,
+      },
+      format: exportFormat,
+      destination,
+    }).catch(() => { /* non-fatal — history is a recall convenience */ });
+  };
+
   const runExport = async (
     kind: ExportKind,
     fn: () => Promise<void>,
@@ -344,6 +391,7 @@ export function ComposerModal() {
     }
     await navigator.clipboard.writeText(body);
     showToast('Copied');
+    recordComposedHistory('copy', 'md');
   }, 'Copy');
 
   const handleExportDownload = () => runExport('download', async () => {
@@ -351,27 +399,45 @@ export function ComposerModal() {
     const blob = new Blob([body], { type: mimeFor(format) });
     triggerDownload(composeFilename(format), blob);
     showToast('Downloaded');
+    recordComposedHistory('download', format);
   }, 'Download');
 
-  const handleExportOpen = () => runExport('open', async () => {
-    const { body } = await composeForExport(format);
-    const blob = new Blob([body], { type: mimeFor(format) });
-    const url = URL.createObjectURL(blob);
-    // The new window owns the blob URL for its lifetime; mirrors
-    // ActionBar's lifecycle.
-    window.open(url, '_blank', 'noopener,noreferrer');
-  }, 'Open');
+  // #503 S3 §5 — reserve the tab synchronously, before `runExport`'s first
+  // await, for the reason spelled out in `exporters/openTab.ts`.
+  const handleExportOpen = () => {
+    if (actionBusy != null) return;
+    const tab = reserveExportTab();
+    if (!tab) {
+      setActionError(`Open failed: ${POPUP_BLOCKED_MESSAGE}`);
+      return;
+    }
+    void runExport('open', async () => {
+      try {
+        const { body } = await composeForExport(format);
+        tab.navigate(new Blob([body], { type: mimeFor(format) }));
+      } catch (err) {
+        tab.close();
+        throw err;
+      }
+      showToast('Opened');
+      recordComposedHistory('open', format);
+    }, 'Open');
+  };
 
   const handleExportPng = () => runExport('png', async () => {
     const { body } = await composeForExport('svg');
     const png = await svgToPng(body, 2, paletteBg(theme));
     triggerDownload(composeFilename('svg').replace(/\.svg$/, '.png'), png);
     showToast('PNG downloaded');
+    recordComposedHistory('png', 'svg');
   }, 'PNG export');
 
   const handleExportPrint = () => runExport('print', async () => {
     const { body } = await composeForExport('html');
+    // Throws on a missing print target or a blocked fallback window.
     printPdf(body);
+    showToast('Print dialog opened');
+    recordComposedHistory('print', 'html');
   }, 'Print');
 
   const canCopy = actionBusy == null && format === 'md' && basket.items.length > 0;
@@ -488,7 +554,6 @@ export function ComposerModal() {
           kernelVersion={composeResp?.snapshot.kernel_version ?? 1}
           onRefresh={(id) => { void handleRefreshSection(id); }}
           onRemove={(id) => dispatch({ type: 'BASKET_REMOVE', id })}
-          onPreviewOnly={(_id) => { /* M4 niceties; not part of M3.6 */ }}
         />
         <figure className="composer-preview-frame">
           <figcaption className="composer-preview-label">Preview · {theme}</figcaption>
@@ -507,9 +572,20 @@ export function ComposerModal() {
         <div className="composer-error" role="alert">{actionError}</div>
       ) : null}
       <footer className="composer-actions">
+        {composeErr ? (
+          <p
+            className="share-preview-failed-note"
+            id={COMPOSER_PREVIEW_FAILED_NOTE_ID}
+          >
+            {PREVIEW_FAILED_NOTE}
+          </p>
+        ) : null}
         <div className="composer-export-row">
           <button
             type="button"
+            aria-describedby={
+              composeErr ? COMPOSER_PREVIEW_FAILED_NOTE_ID : undefined
+            }
             className="share-action share-action-copy"
             onClick={handleExportCopy}
             disabled={!canCopy}
@@ -525,6 +601,9 @@ export function ComposerModal() {
           </button>
           <button
             type="button"
+            aria-describedby={
+              composeErr ? COMPOSER_PREVIEW_FAILED_NOTE_ID : undefined
+            }
             className="share-action share-action-download"
             onClick={handleExportDownload}
             disabled={!canDownload}
@@ -534,6 +613,9 @@ export function ComposerModal() {
           </button>
           <button
             type="button"
+            aria-describedby={
+              composeErr ? COMPOSER_PREVIEW_FAILED_NOTE_ID : undefined
+            }
             className="share-action share-action-open"
             onClick={handleExportOpen}
             disabled={!canOpen}
@@ -549,6 +631,9 @@ export function ComposerModal() {
           </button>
           <button
             type="button"
+            aria-describedby={
+              composeErr ? COMPOSER_PREVIEW_FAILED_NOTE_ID : undefined
+            }
             className="share-action share-action-png"
             onClick={handleExportPng}
             disabled={!canPng}
@@ -564,6 +649,9 @@ export function ComposerModal() {
           </button>
           <button
             type="button"
+            aria-describedby={
+              composeErr ? COMPOSER_PREVIEW_FAILED_NOTE_ID : undefined
+            }
             className="share-action share-action-print"
             onClick={handleExportPrint}
             disabled={!canPrint}
@@ -578,13 +666,31 @@ export function ComposerModal() {
             {actionBusy === 'print' ? 'Printing…' : 'Print → PDF'}
           </button>
         </div>
+        {/* #503 S3 §2 — `Clear all` wrote straight through to localStorage
+            with no undo. It asks first now, naming what it is about to
+            destroy. */}
         <button
           type="button"
           className="composer-clear-all"
-          onClick={() => dispatch({ type: 'BASKET_CLEAR' })}
+          onClick={() => confirm.arm(CLEAR_ALL_ID)}
         >
           Clear all
         </button>
+        <ConfirmAction
+          id={CLEAR_ALL_ID}
+          host={confirm}
+          prompt={`Clear ${sectionCountLabel(basket.items.length)}?`}
+          confirmLabel={`Clear ${sectionCountLabel(basket.items.length)}`}
+          onConfirm={() => {
+            dispatch({ type: 'BASKET_CLEAR' });
+            // The button that initiated this disappears with the sections —
+            // the composer switches to its empty-basket view — so focus goes
+            // to the modal's close control.
+            confirm.close(() => document.querySelector<HTMLElement>(
+              '.composer-modal-close',
+            ));
+          }}
+        />
       </footer>
     </div>
   );

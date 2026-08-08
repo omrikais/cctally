@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   listPresets,
   listHistory,
+  isComposedHistoryRow,
   type PresetRecord,
   type HistoryRecord,
   ShareApiError,
@@ -71,9 +72,13 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
         // Filter to the current panel and reverse so newest is first
         // (server stores newest last for ring-buffer semantics; users
         // expect "most recent at top" in a recall dropdown).
+        // #503 S3 §3 — a composed row belongs to no single panel, so it
+        // appears in EVERY panel's Recent shares; a panel row still appears
+        // only in its own. `kind` is absent on a row written before the
+        // discriminator existed, and reads as "panel".
         setHistory(
           histResp.history
-            .filter((h) => h.panel === panel)
+            .filter((h) => isComposedHistoryRow(h) || h.panel === panel)
             .slice()
             .reverse(),
         );
@@ -173,32 +178,58 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
               </div>
               <ul className="share-presets-history-list">
                 {history.map((h) => (
-                  <li key={h.recipe_id} className="share-presets-history-row">
-                    <button
-                      type="button"
-                      role="menuitem"
-                      className="share-presets-history-item"
-                      onClick={() => {
-                        onPick(h.template_id, h.options);
-                        setOpen(false);
-                      }}
-                      title={`${h.template_id} · ${SELECTION_LABEL[h.source ?? 'claude']} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
+                  isComposedHistoryRow(h) ? (
+                    /* #503 S3 §3 — DISPLAY-ONLY. Restoring a basket from
+                       history is out of scope, so this is a <div>, not a
+                       menuitem: a button that recalls nothing is the same
+                       broken control this session removed elsewhere. */
+                    <li
+                      key={h.recipe_id}
+                      className="share-presets-history-row share-presets-history-row--composed"
                     >
-                      <span className="share-presets-history-template">
-                        {h.template_id}
+                      <span
+                        className="share-presets-history-composed"
+                        title={`${h.composite.title} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
+                      >
+                        <span className="share-presets-history-template">
+                          Composed
+                        </span>
+                        <span className="share-presets-history-meta">
+                          {' · '}{h.sections.length}
+                          {h.sections.length === 1 ? ' section' : ' sections'}
+                          {' · '}{h.format ?? 'unknown'}
+                          {' · '}{formatHistoryTimestamp(h.exported_at)}
+                        </span>
                       </span>
-                      <span className="share-presets-history-meta">
-                        {' · '}{h.format ?? 'unknown'}{' · '}{formatHistoryTimestamp(h.exported_at)}
+                    </li>
+                  ) : (
+                    <li key={h.recipe_id} className="share-presets-history-row">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="share-presets-history-item"
+                        onClick={() => {
+                          onPick(h.template_id, h.options);
+                          setOpen(false);
+                        }}
+                        title={`${h.template_id} · ${SELECTION_LABEL[h.source ?? 'claude']} · ${h.format ?? 'unknown'} · ${h.exported_at}`}
+                      >
+                        <span className="share-presets-history-template">
+                          {h.template_id}
+                        </span>
+                        <span className="share-presets-history-meta">
+                          {' · '}{h.format ?? 'unknown'}{' · '}{formatHistoryTimestamp(h.exported_at)}
+                        </span>
+                      </button>
+                      {/* #294 S5 §7 — history rows are per-source DISTINCT (source
+                          participates in server-side identity — no cross-source
+                          collapse); show the stored source as a sibling so the
+                          menuitem name stays clean. */}
+                      <span className={`source-chip source-chip--${h.source ?? 'claude'}`}>
+                        {SELECTION_LABEL[h.source ?? 'claude']}
                       </span>
-                    </button>
-                    {/* #294 S5 §7 — history rows are per-source DISTINCT (source
-                        participates in server-side identity — no cross-source
-                        collapse); show the stored source as a sibling so the
-                        menuitem name stays clean. */}
-                    <span className={`source-chip source-chip--${h.source ?? 'claude'}`}>
-                      {SELECTION_LABEL[h.source ?? 'claude']}
-                    </span>
-                  </li>
+                    </li>
+                  )
                 ))}
               </ul>
             </div>

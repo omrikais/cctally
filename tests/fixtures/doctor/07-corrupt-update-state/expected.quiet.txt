@@ -24,4 +24,4 @@ Safety
       → `rm ~/.local/share/cctally/update-state.json` (will be regenerated)
 Telemetry
 
-Summary: 52 OK · 6 WARN · 1 FAIL
+Summary: 53 OK · 6 WARN · 1 FAIL

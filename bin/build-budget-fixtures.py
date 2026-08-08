@@ -301,6 +301,19 @@ SCENARIOS = {
                       "alert_thresholds": [90, 100]},
         n_total=10, n_recent=10, weekly_percent=5.0,
     ),
+    # #503 S2 F10: budget SET but no weekly usage snapshot yet, so
+    # `_build_vendor_budget_inputs` returns None and `cmd_budget` takes the
+    # `_build_budget_no_data_snapshot` path. That constructor had no share
+    # golden of any kind, so nothing checked what its artifact states about
+    # itself. `seed_snapshot=False` on the subscription-week path is what
+    # makes the window unresolvable.
+    "no-data": dict(
+        as_of=WEEK_START + dt.timedelta(hours=96),
+        budget_block={"weekly_usd": 300.0, "alerts_enabled": True,
+                      "alert_thresholds": [90, 100]},
+        n_total=0, n_recent=0, weekly_percent=0.0,
+        seed_snapshot=False,
+    ),
     # No weekly_usd → friendly "no budget set" status. Window/entries still
     # seeded so the no-budget path is exercised independent of data presence.
     "no-budget": dict(

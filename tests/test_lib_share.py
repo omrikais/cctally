@@ -470,7 +470,8 @@ def test_line_chart_right_edge_xtick_label_right_anchored():
 def test_svg_chrome_header_includes_title_subtitle_timestamp():
     snap = _make_minimal_snapshot()
     out = _lib_share._render_svg_header(snap, palette=_lib_share.PALETTE_LIGHT,
-                                        x=20, y=20, width=560)
+                                        x=20, y=20, width=560,
+                                        shows_table=True)
     assert _lib_share._xml_escape(snap.title) in out
     assert _lib_share._xml_escape(snap.subtitle) in out
     # Generated-at timestamp ISO Z form.
@@ -1671,8 +1672,6 @@ def test_report_builder_renders_none_metrics_as_em_dash():
         period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
         display_tz="UTC",
         version="9.9.9",
-        theme="light",
-        reveal_projects=False,
     )
     assert len(snap.rows) == 3
     # Row 0: all metrics present.
@@ -1726,9 +1725,7 @@ def test_report_builder_skips_none_dpp_from_chart_and_avg():
         view,
         period_start=datetime(2026, 4, 6, tzinfo=timezone.utc),
         period_end=datetime(2026, 5, 4, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9", theme="light",
-        reveal_projects=False,
-    )
+        display_tz="UTC", version="9.9.9",)
     # Chart has 3 points (skipped the None middle row).
     assert snap.chart is not None
     assert len(snap.chart.points) == 3
@@ -1781,8 +1778,7 @@ def test_weekly_builder_renders_none_used_pct_as_em_dash():
         view,
         period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
         period_end=datetime(2026, 4, 27, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9", theme="light",
-        reveal_projects=False, breakdown_model=False,
+        display_tz="UTC", version="9.9.9",breakdown_model=False,
     )
     assert isinstance(snap.rows[0].cells["used"], _lib_share.PercentCell)
     assert isinstance(snap.rows[1].cells["used"], _lib_share.TextCell)
@@ -1804,8 +1800,7 @@ def test_project_builder_renders_none_attributed_pct_as_em_dash():
         rows,
         period_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
         period_end=datetime(2026, 5, 11, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9", theme="light", reveal_projects=True,
-    )
+        display_tz="UTC", version="9.9.9",)
     # Cost-desc default: alpha first, beta second.
     assert isinstance(snap.rows[0].cells["used"], _lib_share.PercentCell)
     assert isinstance(snap.rows[1].cells["used"], _lib_share.TextCell)
@@ -1834,8 +1829,7 @@ def test_project_builder_preserves_caller_order_for_table():
         rows,
         period_start=datetime(2026, 5, 4, tzinfo=timezone.utc),
         period_end=datetime(2026, 5, 11, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9", theme="light", reveal_projects=True,
-    )
+        display_tz="UTC", version="9.9.9",)
     # Table rows preserve caller (alphabetical asc) order.
     table_labels = [r.cells["project"].label for r in snap.rows]
     assert table_labels == ["alpha", "beta", "gamma"]
@@ -2315,8 +2309,6 @@ def _session_snapshot_for(paths_and_costs):
         period_end=datetime(2026, 5, 9, tzinfo=timezone.utc),
         display_tz="Etc/UTC",
         version="9.9.9",
-        theme="light",
-        reveal_projects=False,
         top_n=None,
         tz=timezone.utc,
     )
@@ -2535,3 +2527,2939 @@ def test_cli_privacy_refusal_writes_nothing(tmp_path):
     with _pytest.raises(SystemExit):
         _cctally._share_render_and_emit(_leaking_snapshot(), _Args())
     assert not target.exists()
+
+
+# =====================================================================
+# #503 S2 — the artifact states its own period, timezone and privacy.
+#
+# D7: the period is computed in, and labelled with, the RESOLVED CONCRETE
+# IANA zone. The literal config token `local` never reaches an artifact.
+# =====================================================================
+
+import datetime as _dt2
+import re as _re
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_TPL_PATH_S2 = _REPO_ROOT / "bin" / "_lib_share_templates.py"
+if "_lib_share_templates" in sys.modules:
+    _T2 = sys.modules["_lib_share_templates"]
+else:
+    _spec_t2 = importlib.util.spec_from_file_location(
+        "_lib_share_templates", _TPL_PATH_S2)
+    _T2 = importlib.util.module_from_spec(_spec_t2)
+    sys.modules["_lib_share_templates"] = _T2
+    _spec_t2.loader.exec_module(_T2)
+
+_DISPLAY_TZ_PATH_S2 = _REPO_ROOT / "bin" / "_lib_display_tz.py"
+if "_lib_display_tz" in sys.modules:
+    _DTZ = sys.modules["_lib_display_tz"]
+else:
+    _spec_dtz = importlib.util.spec_from_file_location(
+        "_lib_display_tz", _DISPLAY_TZ_PATH_S2)
+    _DTZ = importlib.util.module_from_spec(_spec_dtz)
+    sys.modules["_lib_display_tz"] = _DTZ
+    _spec_dtz.loader.exec_module(_DTZ)
+
+import pytest as _s2_pytest  # noqa: E402 — module-level skip gate below
+
+# The share-v2 fixture tree is MIRROR-PRIVATE. This file is public, and the
+# public suite runs it, so every case that reads that tree is gated on the
+# directory being present rather than left to fail on a clone that does not
+# carry it (`tests/test_public_test_dep_closure.py` Scope A2). The gate can
+# only fire where the fixtures are genuinely absent, so it never silences a
+# case in this repository.
+_S2_FIXTURES = _REPO_ROOT / "tests" / "fixtures" / "share-v2"
+_s2_needs_fixtures = _s2_pytest.mark.skipif(
+    not _S2_FIXTURES.is_dir(),
+    reason="share-v2 fixture tree is mirror-private and absent on a public clone",
+)
+
+
+# `.mirror-allowlist` is itself unmatched by the allowlist, so it is
+# never published — which makes its presence the marker for "this is the
+# private repository". This FILE is public, so the guard below has to be
+# able to tell the two trees apart rather than asserting unconditionally.
+_S2R_PRIVATE_REPO = (_REPO_ROOT / ".mirror-allowlist").is_file()
+
+
+@_s2_pytest.mark.skipif(not _S2R_PRIVATE_REPO,
+                        reason="the guard is about the private tree only")
+def test_the_share_v2_fixture_gate_is_inactive_in_this_repository():
+    """VACUITY GUARD. `_s2_needs_fixtures` skips the F16 bounds sweep,
+    the M4 collision sweep, the F17 empty-table cases and the whole D7
+    template classification. If the private fixture tree were ever absent
+    HERE, every one of them would pass silently. The gate exists only for
+    the public clone, so a skip in this repository is a failure."""
+    assert _S2_FIXTURES.is_dir(), _S2_FIXTURES
+    assert (_S2_FIXTURES / "compose" / "scenarios.json").is_file()
+    assert any(_S2_FIXTURES.glob("*/panel_data.json")), _S2_FIXTURES
+
+# Which builders carry CIVIL BUCKET boundaries (a `YYYY-MM-DD` / `YYYY-MM`
+# label lifted to a UTC-midnight sentinel) and which carry REAL INSTANTS.
+# Converting a civil bucket with `astimezone()` shifts it by a day; not
+# converting an instant labels a UTC civil date with another zone's name.
+#
+# Written out literally rather than derived, so a new template or a flipped
+# flag fails this test instead of being absorbed by it.
+_S2_CIVIL_BUCKET_TEMPLATES = {
+    "weekly-recap", "weekly-visual", "weekly-detail",
+    "current-week-recap", "current-week-visual", "current-week-detail",
+    "trend-recap", "trend-visual", "trend-detail",
+    "daily-recap", "daily-visual", "daily-detail",
+    "monthly-recap", "monthly-visual", "monthly-detail",
+    "forecast-recap", "forecast-visual", "forecast-detail",
+}
+_S2_INSTANT_TEMPLATES = {
+    "blocks-recap", "blocks-visual", "blocks-detail",
+    "sessions-recap", "sessions-visual", "sessions-detail",
+    "projects-recap", "projects-visual", "projects-detail",
+}
+
+_S2_DEFAULT_TOP_N = {
+    "current-week": 3, "trend": 3, "weekly": 5, "daily": 5, "monthly": 5,
+    "blocks": 3, "forecast": 5, "sessions": 15, "projects": 5,
+}
+
+
+def _s2_panel_data(panel: str) -> dict:
+    import json as _json
+    payload = _json.loads(
+        (_S2_FIXTURES / panel / "panel_data.json").read_text(encoding="utf-8"))
+    out = dict(payload)
+    for key in ("period_start", "period_end"):
+        value = out.get(key)
+        if isinstance(value, str):
+            out[key] = _dt2.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return out
+
+
+def _s2_build_template(template_id: str, *, display_tz: str = "Etc/UTC",
+                       panel_data=None):
+    tpl = _T2.get_template(template_id)
+    options = {
+        "format": "md", "theme": "light", "reveal_projects": False,
+        "no_branding": False, "top_n": _S2_DEFAULT_TOP_N[tpl.panel],
+        "show_chart": True, "show_table": True, "period": None,
+        "project_allowlist": None, "display_tz": display_tz,
+    }
+    for key, value in tpl.default_options.items():
+        if key not in ("reveal_projects", "theme", "no_branding"):
+            options[key] = value
+    if panel_data is None:
+        panel_data = _s2_panel_data(tpl.panel)
+    return tpl.builder(panel_data=panel_data, options=options)
+
+
+def test_resolve_display_tz_name_resolves_every_token_to_a_concrete_zone():
+    """D7: `local` and `utc` are config TOKENS, not zone names."""
+    for token in (None, "", "local", "LOCAL", "utc", "America/New_York"):
+        name = _DTZ.resolve_display_tz_name(token)
+        assert name not in ("local", "utc", ""), token
+        assert _ZoneInfo(name).key == name, token
+
+
+def test_share_display_tz_label_never_emits_the_local_token():
+    """Every v1 CLI golden prints `(local)` today; no artifact may name it."""
+    label = _cctally._share_display_tz_label(None)
+    assert label != "local"
+    assert "/" in label, label
+    assert _ZoneInfo(label).key == label
+
+
+def test_instant_builder_period_dates_are_civil_in_the_labelled_zone():
+    """An instant 03:30 UTC on May 5 is May 4 in America/New_York (UTC-4)."""
+    civil_start, civil_end = _lib_share.period_civil_dates(
+        _lib_share.PeriodSpec(
+            start=_dt2.datetime(2026, 5, 5, 3, 30, tzinfo=_dt2.timezone.utc),
+            end=_dt2.datetime(2026, 5, 9, 3, 30, tzinfo=_dt2.timezone.utc),
+            display_tz="America/New_York", label="x"))
+    assert civil_start == "2026-05-04"
+    assert civil_end == "2026-05-08"
+
+
+def test_civil_bucket_boundaries_are_not_shifted_by_zone_conversion():
+    """A daily bucket labelled May 4 stays May 4 in every zone."""
+    start = _dt2.datetime(2026, 5, 4, 0, 0, tzinfo=_dt2.timezone.utc)
+    end = _dt2.datetime(2026, 5, 9, 0, 0, tzinfo=_dt2.timezone.utc)
+    for tz in ("America/New_York", "Asia/Tokyo", "Etc/UTC"):
+        civil_start, civil_end = _lib_share.period_civil_dates(
+            _lib_share.PeriodSpec(start=start, end=end, display_tz=tz,
+                                  label="x", civil_bucket=True))
+        assert (civil_start, civil_end) == ("2026-05-04", "2026-05-09"), tz
+
+
+def test_period_civil_dates_tolerates_an_unloadable_zone_name():
+    """Defensive: a stale label must not turn a render into a crash."""
+    start = _dt2.datetime(2026, 5, 4, 6, 0, tzinfo=_dt2.timezone.utc)
+    assert _lib_share.period_civil_dates(
+        _lib_share.PeriodSpec(start=start, end=start,
+                              display_tz="Not/AZone", label="x")
+    ) == ("2026-05-04", "2026-05-04")
+
+
+@_s2_needs_fixtures
+def test_every_template_declares_its_period_boundary_kind():
+    registered = {t.id for t in _T2.SHARE_TEMPLATES}
+    assert registered == (_S2_CIVIL_BUCKET_TEMPLATES | _S2_INSTANT_TEMPLATES), (
+        "template registry drifted from the boundary-kind classification"
+    )
+    for template_id in sorted(registered):
+        snap = _s2_build_template(template_id)
+        assert snap.period.civil_bucket is (
+            template_id in _S2_CIVIL_BUCKET_TEMPLATES), template_id
+
+
+@_s2_needs_fixtures
+def test_civil_bucket_template_dates_are_zone_invariant():
+    """`daily` starts at 2026-05-02; in America/New_York a blind
+    `astimezone()` would report 2026-05-01."""
+    for template_id in sorted(_S2_CIVIL_BUCKET_TEMPLATES):
+        baseline = _lib_share.period_civil_dates(
+            _s2_build_template(template_id, display_tz="Etc/UTC").period)
+        for tz in ("America/New_York", "Asia/Tokyo"):
+            snap = _s2_build_template(template_id, display_tz=tz)
+            assert _lib_share.period_civil_dates(snap.period) == baseline, (
+                template_id, tz)
+
+
+# =====================================================================
+# #503 S2 review — the command-line and Codex halves of D7.
+#
+# The two tests above enumerate `_T2.SHARE_TEMPLATES`, which is the set
+# that was already correct: `civil_bucket=True` is set only in
+# `bin/_lib_share_templates.py`. The 16 `PeriodSpec` construction sites in
+# the five command-line and Codex modules were never classified, and five
+# commands stated a period one day early under any zone west of UTC,
+# because a calendar label was lifted to a UTC-midnight sentinel and then
+# converted into the zone the artifact names.
+#
+# The fix grounds a calendar label at midnight IN THE LABELLED ZONE at the
+# site that lifts it, so `period_civil_dates` recovers the same label in
+# every zone while a real instant still converts. The two mechanisms are
+# therefore both live and must stay distinguishable: templates declare
+# `civil_bucket=True`; the command line grounds instead.
+# =====================================================================
+
+_S2R_PERIOD_MODULES = (
+    "bin/_lib_share_templates.py",
+    "bin/_cctally_share.py",
+    "bin/_cctally_forecast.py",
+    "bin/_cctally_dashboard_share.py",
+    "bin/_cctally_source_analytics.py",
+    "bin/_cctally_codex.py",
+)
+
+# Every `PeriodSpec` construction site outside the template registry,
+# keyed by `(module, enclosing function, ORDINAL within that function)`
+# and valued by `{case: (start_kind, end_kind)}`.
+#
+# Three things this keying and this value shape fix (#503 S2 second
+# review N2). The ordinal: `_build_codex_source_share_snapshot` builds
+# THREE `PeriodSpec`s, and a set of `(module, function)` pairs collapsed
+# them into one entry, so a fourth call inside a listed function could
+# not fail the test. The per-boundary pair: two sites carry boundaries of
+# DIFFERENT kinds, and a single value per function cannot say so. The
+# per-case map: two more sites take their kind from their INPUT, and both
+# branches are real.
+#
+# The kinds, and how each is told apart from the others by driving the
+# site in three zones:
+#
+#   GROUNDED      the site re-anchors the boundary at midnight in the
+#                 labelled zone, so the ABSOLUTE instant differs in all
+#                 three zones while the stated civil date does not.
+#   INSTANT       the boundary is one real moment, identical in all three
+#                 zones, whose civil date is read in the labelled zone.
+#   PARAMETERIZED the site takes `civil_bucket` from its caller and must
+#                 propagate it. Only `_lib_share_templates._period`.
+#
+# Being identical in every zone AND being different in every zone are
+# mutually exclusive, so every value below is load-bearing: flip one and
+# its site fails. The previous map asserted only its KEYS, and five of
+# its fifteen values were in fact wrong.
+_S2R_GROUNDED = "grounded"
+_S2R_INSTANT = "instant"
+_S2R_PARAMETERIZED = "parameterized"
+
+_S2R_PERIOD_SITE_KINDS = {
+    ("bin/_lib_share_templates.py", "_period", 0):
+        {"": (_S2R_PARAMETERIZED, _S2R_PARAMETERIZED)},
+    # `weekStartDate` / `weekEndDate` are the calendar labels the `Week`
+    # column prints.
+    ("bin/_cctally_share.py", "_build_report_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_GROUNDED)},
+    # `--since` is a calendar label; the open end is `now`. Four sites
+    # share that shape and all four were classified `instant`.
+    ("bin/_cctally_share.py", "_build_daily_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_INSTANT)},
+    ("bin/_cctally_share.py", "_build_monthly_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_INSTANT)},
+    ("bin/_cctally_share.py", "_build_weekly_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_INSTANT)},
+    ("bin/_cctally_share.py", "_build_session_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_INSTANT)},
+    # The forecast window is anchored on the week's reset INSTANT, not on
+    # a calendar label — it was classified `grounded`.
+    ("bin/_cctally_share.py", "_build_forecast_snapshot", 0):
+        {"": (_S2R_INSTANT, _S2R_INSTANT)},
+    ("bin/_cctally_share.py", "_build_project_snapshot", 0):
+        {"": (_S2R_INSTANT, _S2R_INSTANT)},
+    # MIXED BY INPUT: a `--since`/`--until` filter is grounded, while the
+    # block-derived fallback is a real instant.
+    ("bin/_cctally_share.py", "_build_five_hour_blocks_snapshot", 0):
+        {"block-derived": (_S2R_INSTANT, _S2R_INSTANT),
+         "since-until": (_S2R_GROUNDED, _S2R_GROUNDED)},
+    ("bin/_cctally_forecast.py", "_build_budget_snapshot", 0):
+        {"": (_S2R_INSTANT, _S2R_INSTANT)},
+    ("bin/_cctally_forecast.py", "_build_budget_no_data_snapshot", 0):
+        {"": (_S2R_GROUNDED, _S2R_GROUNDED)},
+    ("bin/_cctally_forecast.py", "_build_budget_no_budget_snapshot", 0):
+        {"": (_S2R_INSTANT, _S2R_INSTANT)},
+    # MIXED BY INPUT, three times over: `_share_codex_period_bounds`
+    # grounds the oldest bucket label the rows carry and leaves the end
+    # as `now`, but falls back to the end itself when no row names a
+    # bucket.
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 0):
+        {"bucketed-rows": (_S2R_GROUNDED, _S2R_INSTANT),
+         "unbucketed-rows": (_S2R_INSTANT, _S2R_INSTANT)},
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 1):
+        {"bucketed-rows": (_S2R_GROUNDED, _S2R_INSTANT),
+         "unbucketed-rows": (_S2R_INSTANT, _S2R_INSTANT)},
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 2):
+        {"bucketed-rows": (_S2R_GROUNDED, _S2R_INSTANT),
+         "unbucketed-rows": (_S2R_INSTANT, _S2R_INSTANT)},
+    # The all-source CLI path labels every artifact `Etc/UTC` and takes
+    # no zone input at all, so both boundaries are the same instant
+    # whatever the host zone is.
+    ("bin/_cctally_source_analytics.py", "build_source_share_snapshot", 0):
+        {"": (_S2R_INSTANT, _S2R_INSTANT)},
+    # MIXED BY INPUT: the VIEW declares whether its start is a bucket
+    # label through `period_civil_bucket`; the end is always `now`.
+    ("bin/_cctally_codex.py", "_build_codex_share_snapshot", 0):
+        {"civil-bucket-view": (_S2R_GROUNDED, _S2R_INSTANT),
+         "instant-view": (_S2R_INSTANT, _S2R_INSTANT)},
+}
+
+
+def _s2r_construction_sites(call_name: str) -> "list[tuple[str, str, int]]":
+    """`(module, enclosing function, ordinal)` for every call to `call_name`.
+
+    Enumerated from the source with `ast`, not from a registry the
+    production code also reads, so the inventory cannot agree with a
+    drifted implementation by construction. The ordinal counts calls
+    within one function in source order, so a SECOND call added inside an
+    already-listed function is a new site rather than a duplicate the set
+    absorbs.
+    """
+    import ast as _ast
+    found: list[tuple[str, str, int]] = []
+    for rel in _S2R_PERIOD_MODULES:
+        tree = _ast.parse((_REPO_ROOT / rel).read_text(encoding="utf-8"))
+        stack: list[str] = []
+        counts: dict[tuple[str, str], int] = {}
+
+        def walk(node, stack=stack, rel=rel, counts=counts):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                stack.append(node.name)
+            if isinstance(node, _ast.Call):
+                func = node.func
+                name = (func.attr if isinstance(func, _ast.Attribute)
+                        else getattr(func, "id", None))
+                if name == call_name:
+                    key = (rel, stack[-1] if stack else "<module>")
+                    found.append((*key, counts.get(key, 0)))
+                    counts[key] = counts.get(key, 0) + 1
+            for child in _ast.iter_child_nodes(node):
+                walk(child)
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                stack.pop()
+
+        walk(tree)
+    return found
+
+
+def test_share_snapshot_constructor_inventory_is_fully_enumerated():
+    """F10's acceptance: an independently checked constructor inventory.
+
+    The number 43 used to appear only in a prose comment. Counted here
+    from the source across all six construction modules, with the
+    per-module split spelled out so a site that MOVES between modules
+    still fails rather than netting out.
+
+    SCOPE: those six modules, listed in `_S2R_PERIOD_MODULES`. The class
+    this guards is therefore "these six files", not "the tree" — a
+    `ShareSnapshot` built in a seventh module is invisible to it. The
+    scope is deliberate (every shipped builder lives in one of the six),
+    but it is a scope, so a new builder module must be added here
+    (#503 S2 second review N8).
+    """
+    per_module: dict[str, int] = {}
+    for rel, _fn, _ordinal in _s2r_construction_sites("ShareSnapshot"):
+        per_module[rel] = per_module.get(rel, 0) + 1
+    assert per_module == {
+        "bin/_lib_share_templates.py": 27,
+        "bin/_cctally_share.py": 8,
+        "bin/_cctally_forecast.py": 3,
+        "bin/_cctally_dashboard_share.py": 3,
+        "bin/_cctally_source_analytics.py": 1,
+        "bin/_cctally_codex.py": 1,
+    }
+    assert sum(per_module.values()) == 43
+
+
+def test_every_period_construction_site_declares_its_boundary_kind():
+    """Every site is classified, and a second call in one function is a
+    new site rather than a duplicate the previous set absorbed."""
+    sites = set(_s2r_construction_sites("PeriodSpec"))
+    assert sites == set(_S2R_PERIOD_SITE_KINDS), (
+        "PeriodSpec construction sites drifted from the boundary-kind "
+        "classification: "
+        f"unclassified={sorted(sites - set(_S2R_PERIOD_SITE_KINDS))} "
+        f"missing={sorted(set(_S2R_PERIOD_SITE_KINDS) - sites)}"
+    )
+
+
+def test_civil_bucket_is_declared_only_where_the_templates_declare_it():
+    """`declared` is not a kind any driven site below can carry.
+
+    A CLI-driven site is observed through its rendered artifact, which
+    does not print `civil_bucket`, so the behavioural assertions can only
+    tell GROUNDED from INSTANT. This closes that hole from the source:
+    `civil_bucket` is written in exactly one module.
+
+    POSITIONAL ARGUMENTS COUNT TOO. `PeriodSpec` is an ordinary
+    dataclass, so `civil_bucket` is its fifth positional parameter and a
+    five-argument call sets it without naming it — which a scan for the
+    keyword alone would not see (#503 S2 third review).
+    """
+    import ast as _ast
+    writers = set()
+    for rel in _S2R_PERIOD_MODULES:
+        for node in _ast.walk(
+                _ast.parse((_REPO_ROOT / rel).read_text(encoding="utf-8"))):
+            if not isinstance(node, _ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "civil_bucket":
+                    writers.add(rel)
+            func = node.func
+            name = (func.attr if isinstance(func, _ast.Attribute)
+                    else getattr(func, "id", None))
+            if name in ("PeriodSpec", "_period") and len(node.args) >= 5:
+                writers.add(rel)
+    assert writers == {"bin/_lib_share_templates.py"}, sorted(writers)
+    # NON-VACUITY: the position the scan guards is the one the dataclass
+    # actually declares, read from the class rather than assumed.
+    assert [f.name for f in _dc.fields(_lib_share.PeriodSpec)][4] == (
+        "civil_bucket")
+
+
+from collections import namedtuple as _s2r_namedtuple  # noqa: E402
+
+_S2R_BOUNDARY_ZONES = ("Etc/UTC", "America/New_York", "Asia/Tokyo")
+
+
+class _S2RBoundaryFacts(_s2r_namedtuple(
+        "_S2RBoundaryFacts",
+        "start_utc end_utc civil_start civil_end civil_bucket")):
+    """What one drive of one site, in one zone, says about its period."""
+
+
+def _s2r_facts_from_period(spec) -> _S2RBoundaryFacts:
+    civil_start, civil_end = _lib_share.period_civil_dates(spec)
+    return _S2RBoundaryFacts(
+        start_utc=spec.start.astimezone(timezone.utc),
+        end_utc=spec.end.astimezone(timezone.utc),
+        civil_start=civil_start, civil_end=civil_end,
+        civil_bucket=spec.civil_bucket)
+
+
+def _s2r_facts_from_markdown(markdown: str) -> _S2RBoundaryFacts:
+    """The same facts read off a rendered artifact.
+
+    `period:` carries the ABSOLUTE boundaries with their offsets, so a
+    re-anchored boundary and a fixed instant are distinguishable from the
+    bytes. `civil_bucket` is not printed, which is why
+    `test_civil_bucket_is_declared_only_where_the_templates_declare_it`
+    exists.
+    """
+    raw = _re.search(r"^period: (\S+)\.\.(\S+)$", markdown, _re.M)
+    assert raw, markdown[:400]
+    civil = _s2r_facts_line(markdown)
+    start_civil, rest = civil.split(" → ", 1)
+    end_civil = rest.split(" (", 1)[0]
+    return _S2RBoundaryFacts(
+        start_utc=datetime.fromisoformat(
+            raw.group(1).replace("Z", "+00:00")).astimezone(timezone.utc),
+        end_utc=datetime.fromisoformat(
+            raw.group(2).replace("Z", "+00:00")).astimezone(timezone.utc),
+        civil_start=start_civil, civil_end=end_civil, civil_bucket=None)
+
+
+def _s2r_cli_driver(scenario: str, command: str, extra=()):
+    def drive(tmp_path):
+        return {"": {
+            zone: _s2r_facts_from_markdown(
+                _s2r_run_cli(scenario, command, tz=zone, tmp_path=tmp_path,
+                             extra=extra))
+            for zone in _S2R_BOUNDARY_ZONES}}
+    return drive
+
+
+def _s2r_drive_five_hour_blocks(tmp_path):
+    cases = {}
+    for case, extra in (("block-derived", ()),
+                        ("since-until",
+                         ("--since", "2026-05-07", "--until", "2026-05-07"))):
+        cases[case] = {
+            zone: _s2r_facts_from_markdown(
+                _s2r_run_cli("five-hour-blocks-md", "five-hour-blocks",
+                             tz=zone, tmp_path=tmp_path, extra=extra))
+            for zone in _S2R_BOUNDARY_ZONES}
+    return cases
+
+
+def _s2r_drive_template_period(_tmp_path):
+    """`_period` propagates the kind its caller declares, and nothing else."""
+    start = _dt2.datetime(2026, 5, 4, tzinfo=_dt2.timezone.utc)
+    end = _dt2.datetime(2026, 5, 10, tzinfo=_dt2.timezone.utc)
+    return {
+        flag: {
+            zone: _s2r_facts_from_period(
+                _T2._period(start, end, label="x", display_tz=zone,
+                            civil_bucket=flag))
+            for zone in _S2R_BOUNDARY_ZONES}
+        for flag in (True, False)
+    }
+
+
+def _s2r_drive_source_analytics(_tmp_path):
+    module = _cctally._load_sibling("_cctally_source_analytics")
+    result_cls = _s2r_load_sibling("_lib_source_analytics").SourceResult
+    facts = {}
+    for zone in _S2R_BOUNDARY_ZONES:
+        # The zone is not an input to this builder at all — it labels
+        # every artifact `Etc/UTC` — so driving it three times is what
+        # PROVES the boundary is one fixed instant.
+        snap = module.build_source_share_snapshot(
+            "range-cost",
+            result_cls(source="codex", status="unavailable",
+                       data={"rangeStart": "2026-05-04T00:00:00Z",
+                             "rangeEnd": "2026-05-09T12:00:00Z"}),
+            reveal_projects=False)
+        facts[zone] = _s2r_facts_from_period(snap.period)
+    return {"": facts}
+
+
+def _s2r_drive_codex_share(_tmp_path):
+    import types as _types
+    module = _cctally._load_sibling("_cctally_codex")
+    cases = {}
+    for case, bucket in (("civil-bucket-view", True), ("instant-view", False)):
+        cases[case] = {}
+        for zone in _S2R_BOUNDARY_ZONES:
+            view = _types.SimpleNamespace(
+                period_start=_dt2.datetime(2026, 5, 4, tzinfo=_dt2.timezone.utc),
+                period_end=_dt2.datetime(2026, 5, 9, 12, 0,
+                                         tzinfo=_dt2.timezone.utc),
+                period_civil_bucket=bucket, display_tz_label=zone,
+                total_cost_usd=1.0)
+            snap = module._build_codex_share_snapshot("codex-daily", view, ())
+            cases[case][zone] = _s2r_facts_from_period(snap.period)
+    return cases
+
+
+def _s2r_budget_args(zone: str):
+    import types as _types
+    return _types.SimpleNamespace(_resolved_tz=_ZoneInfo(zone),
+                                  week_start_name="monday")
+
+
+def _s2r_drive_budget_no_budget(_tmp_path):
+    module = _cctally._load_sibling("_cctally_forecast")
+    # This site's boundary IS the wall clock, so three unpinned drives
+    # differ by microseconds and every kind would fail. `CCTALLY_AS_OF`
+    # is the same pin the CLI drivers use.
+    previous = os.environ.get("CCTALLY_AS_OF")
+    os.environ["CCTALLY_AS_OF"] = "2026-05-09T12:00:00Z"
+    try:
+        return {"": {
+            zone: _s2r_facts_from_period(
+                module._build_budget_no_budget_snapshot(
+                    _s2r_budget_args(zone)).period)
+            for zone in _S2R_BOUNDARY_ZONES}}
+    finally:
+        if previous is None:
+            os.environ.pop("CCTALLY_AS_OF", None)
+        else:
+            os.environ["CCTALLY_AS_OF"] = previous
+
+
+def _s2r_drive_budget_no_data(_tmp_path):
+    module = _cctally._load_sibling("_cctally_forecast")
+    now = _dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc)
+    facts = {}
+    for zone in _S2R_BOUNDARY_ZONES:
+        facts[zone] = _s2r_facts_from_period(
+            module._build_budget_no_data_snapshot(
+                _s2r_budget_args(zone), {"weekly_usd": 50.0}, now).period)
+    return {"": facts}
+
+
+def _s2r_drive_budget(_tmp_path):
+    import types as _types
+    module = _cctally._load_sibling("_cctally_forecast")
+    inputs = _types.SimpleNamespace(
+        week_start_at=_dt2.datetime(2026, 5, 4, 15, 0,
+                                    tzinfo=_dt2.timezone.utc),
+        week_end_at=_dt2.datetime(2026, 5, 11, 15, 0,
+                                  tzinfo=_dt2.timezone.utc),
+        target_usd=50.0)
+    status = _types.SimpleNamespace(
+        spent_usd=10.0, consumption_pct=20.0, remaining_usd=40.0,
+        daily_pace_usd=2.0, verdict="ok", low_confidence=False,
+        projected_eow_low_usd=35.0, projected_eow_high_usd=40.0)
+    facts = {}
+    for zone in _S2R_BOUNDARY_ZONES:
+        snap = module._build_budget_snapshot(
+            _s2r_budget_args(zone), {"weekly_usd": 50.0}, inputs, status,
+            tz=_ZoneInfo(zone))
+        facts[zone] = _s2r_facts_from_period(snap.period)
+    return {"": facts}
+
+
+def _s2r_codex_source_state(bucketed: bool):
+    """A Codex source state whose rows do — or do not — name a bucket."""
+    import types as _types
+    row = {"key": "codex-row", "label": "Codex quota",
+           "cost_usd": 1.0, "total_tokens": 10, "current_percent": 5.0}
+    if bucketed:
+        row["first_seen"] = "2026-05-04"
+    return _types.SimpleNamespace(
+        availability="ok",
+        last_success_at=_dt2.datetime(2026, 5, 9, 12, 0,
+                                      tzinfo=_dt2.timezone.utc),
+        data={
+            # `histories` feeds the forecast panel, `blocks` the blocks
+            # panel and `projects.rows` the projects panel — the three
+            # branches that build a `PeriodSpec` of their own.
+            "quota": {"histories": (row,), "blocks": (row,)},
+            "projects": {"rows": (row,), "total_cost_usd": 1.0},
+        })
+
+
+_S2R_CODEX_SOURCE_PANELS = ("forecast", "projects", "blocks")
+
+
+def _s2r_codex_source_panel_order() -> "list[str]":
+    """The panel each `PeriodSpec` in the Codex source builder belongs to.
+
+    Read from the source in construction order, because
+    `_S2R_PERIOD_DRIVERS` keys those three sites by ORDINAL and the
+    mapping to a panel was positional and unasserted: reorder the
+    branches and every driver would silently test the wrong one, with
+    nothing failing, because all three declare the same boundary kinds
+    (#503 S2 third review).
+    """
+    import ast as _ast
+    tree = _ast.parse((_REPO_ROOT / "bin" / "_cctally_dashboard_share.py")
+                      .read_text(encoding="utf-8"))
+    target = next(
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.FunctionDef)
+        and node.name == "_build_codex_source_share_snapshot")
+    order: list[str] = []
+    for node in _ast.walk(target):
+        if not isinstance(node, _ast.If):
+            continue
+        panels = [c.value for c in _ast.walk(node.test)
+                  if isinstance(c, _ast.Constant) and isinstance(c.value, str)]
+        builds = sum(
+            1 for child in node.body
+            for call in _ast.walk(child)
+            if isinstance(call, _ast.Call)
+            and (call.func.attr if isinstance(call.func, _ast.Attribute)
+                 else getattr(call.func, "id", None)) == "PeriodSpec")
+        order += [panels[0] if panels else "?"] * builds
+    return order
+
+
+def test_the_codex_source_period_drivers_address_the_panel_they_name():
+    assert _s2r_codex_source_panel_order() == list(_S2R_CODEX_SOURCE_PANELS)
+
+
+def _s2r_drive_codex_source(ordinal: int):
+    panel = _S2R_CODEX_SOURCE_PANELS[ordinal]
+
+    def drive(_tmp_path):
+        module = _cctally._load_sibling("_cctally_dashboard_share")
+        lib = _cctally._share_load_lib()
+        cases = {}
+        for case, bucketed in (("bucketed-rows", True),
+                               ("unbucketed-rows", False)):
+            cases[case] = {}
+            for zone in _S2R_BOUNDARY_ZONES:
+                snap = module._build_codex_source_share_snapshot(
+                    lib, state=_s2r_codex_source_state(bucketed), panel=panel,
+                    template_id=f"{panel}-recap",
+                    options={"format": "md", "theme": "light",
+                             "reveal_projects": False, "display_tz": zone})
+                cases[case][zone] = _s2r_facts_from_period(snap.period)
+        return cases
+    return drive
+
+
+# One driver per site. The equality assertion below is what stops a site
+# from having none: before this, nine of the fifteen classified sites had
+# no behavioural coverage at all.
+_S2R_PERIOD_DRIVERS = {
+    ("bin/_lib_share_templates.py", "_period", 0): _s2r_drive_template_period,
+    ("bin/_cctally_share.py", "_build_report_snapshot", 0):
+        _s2r_cli_driver("report-md", "report"),
+    ("bin/_cctally_share.py", "_build_daily_snapshot", 0):
+        _s2r_cli_driver("daily-md", "daily"),
+    ("bin/_cctally_share.py", "_build_monthly_snapshot", 0):
+        _s2r_cli_driver("monthly-md", "monthly"),
+    ("bin/_cctally_share.py", "_build_weekly_snapshot", 0):
+        _s2r_cli_driver("weekly-md", "weekly"),
+    ("bin/_cctally_share.py", "_build_session_snapshot", 0):
+        _s2r_cli_driver("session-md", "session"),
+    ("bin/_cctally_share.py", "_build_forecast_snapshot", 0):
+        _s2r_cli_driver("forecast-md", "forecast"),
+    ("bin/_cctally_share.py", "_build_project_snapshot", 0):
+        _s2r_cli_driver("project-md-anon", "project"),
+    ("bin/_cctally_share.py", "_build_five_hour_blocks_snapshot", 0):
+        _s2r_drive_five_hour_blocks,
+    ("bin/_cctally_forecast.py", "_build_budget_snapshot", 0):
+        _s2r_drive_budget,
+    ("bin/_cctally_forecast.py", "_build_budget_no_data_snapshot", 0):
+        _s2r_drive_budget_no_data,
+    ("bin/_cctally_forecast.py", "_build_budget_no_budget_snapshot", 0):
+        _s2r_drive_budget_no_budget,
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 0): _s2r_drive_codex_source(0),
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 1): _s2r_drive_codex_source(1),
+    ("bin/_cctally_dashboard_share.py",
+     "_build_codex_source_share_snapshot", 2): _s2r_drive_codex_source(2),
+    ("bin/_cctally_source_analytics.py", "build_source_share_snapshot", 0):
+        _s2r_drive_source_analytics,
+    ("bin/_cctally_codex.py", "_build_codex_share_snapshot", 0):
+        _s2r_drive_codex_share,
+}
+
+
+def test_every_period_construction_site_has_a_behavioural_driver():
+    assert set(_S2R_PERIOD_DRIVERS) == set(_S2R_PERIOD_SITE_KINDS), (
+        "sites without a driver: "
+        f"{sorted(set(_S2R_PERIOD_SITE_KINDS) - set(_S2R_PERIOD_DRIVERS))}; "
+        "drivers without a site: "
+        f"{sorted(set(_S2R_PERIOD_DRIVERS) - set(_S2R_PERIOD_SITE_KINDS))}")
+
+
+def _s2r_assert_boundary_kind(kind, facts, which, where):
+    absolutes = {getattr(f, f"{which}_utc") for f in facts.values()}
+    civils = {getattr(f, f"civil_{which}") for f in facts.values()}
+    if kind == _S2R_GROUNDED:
+        assert len(absolutes) == len(facts), (
+            f"{where}: declared GROUNDED, but the {which} boundary is the "
+            f"same absolute instant in every zone: {sorted(absolutes)}")
+        assert len(civils) == 1, (
+            f"{where}: declared GROUNDED, but the stated {which} date "
+            f"moves between zones: {sorted(civils)}")
+    elif kind == _S2R_INSTANT:
+        assert len(absolutes) == 1, (
+            f"{where}: declared INSTANT, but the {which} boundary is "
+            f"re-anchored per zone: {sorted(absolutes)}")
+    else:
+        raise AssertionError(f"{where}: unknown kind {kind!r}")
+
+
+def test_every_period_site_kind_is_asserted_by_driving_it(tmp_path):
+    """Each site is driven in `Etc/UTC`, `America/New_York` and
+    `Asia/Tokyo`, and its declared kind is checked against what it did.
+
+    The two properties are mutually exclusive — a boundary cannot be the
+    same absolute instant in all three zones AND a different one in each
+    — so no value here can be flipped without failing.
+    """
+    if not (_S2R_SHARE_FIXTURES / "report-md" / "cache.db").is_file():
+        _s2_pytest.skip("v1 share fixtures are built by "
+                        "bin/build-share-fixtures.py")
+    for site, cases in sorted(_S2R_PERIOD_SITE_KINDS.items()):
+        driven = _S2R_PERIOD_DRIVERS[site](tmp_path)
+        if site[1] == "_period":
+            # PARAMETERIZED: the site must carry its caller's declaration
+            # through, and the two declarations must behave differently.
+            for flag in (True, False):
+                for facts in driven[flag].values():
+                    assert facts.civil_bucket is flag, site
+            assert len({f.civil_start for f in driven[True].values()}) == 1
+            continue
+        assert set(driven) == set(cases), (site, sorted(driven), sorted(cases))
+        for case, (start_kind, end_kind) in cases.items():
+            facts = driven[case]
+            assert set(facts) == set(_S2R_BOUNDARY_ZONES), (site, case)
+            where = f"{site[0]}::{site[1]}#{site[2]} [{case or 'only'}]"
+            _s2r_assert_boundary_kind(start_kind, facts, "start", where)
+            _s2r_assert_boundary_kind(end_kind, facts, "end", where)
+
+
+def _s2r_zone(name: str):
+    return _ZoneInfo(name)
+
+
+def test_share_parse_date_to_dt_grounds_a_calendar_label_in_its_zone():
+    """`weekStartDate` is a calendar label, not an instant.
+
+    Lifting `2026-04-13` to UTC midnight and then converting it into
+    `America/New_York` reports `2026-04-12` — a day the artifact's own
+    table does not contain.
+    """
+    for zone_name in ("Etc/UTC", "America/New_York", "Asia/Tokyo"):
+        zone = _s2r_zone(zone_name)
+        grounded = _cctally._share_parse_date_to_dt("2026-04-13", zone)
+        assert grounded.date().isoformat() == "2026-04-13", zone_name
+        civil_start, civil_end = _lib_share.period_civil_dates(
+            _lib_share.PeriodSpec(start=grounded, end=grounded,
+                                  display_tz=zone_name, label="x"))
+        assert (civil_start, civil_end) == ("2026-04-13", "2026-04-13"), zone_name
+
+
+def test_share_parse_date_to_dt_grounds_in_the_resolved_zone_when_tz_is_none():
+    """`display.tz = local` (the default) resolves to `None`, and the
+    period label still names the host's concrete IANA zone — so a UTC
+    midnight sentinel would disagree with its own label."""
+    label = _cctally._share_display_tz_label(None)
+    grounded = _cctally._share_parse_date_to_dt("2026-04-13", None)
+    assert _lib_share.period_civil_dates(
+        _lib_share.PeriodSpec(start=grounded, end=grounded,
+                              display_tz=label, label="x")
+    ) == ("2026-04-13", "2026-04-13")
+
+
+_S2R_SHARE_FIXTURES = _REPO_ROOT / "tests" / "fixtures" / "share"
+_s2r_needs_share_fixtures = _s2_pytest.mark.skipif(
+    not (_S2R_SHARE_FIXTURES / "report-md" / "cache.db").is_file(),
+    reason="v1 share fixtures are built by bin/build-share-fixtures.py",
+)
+
+
+def _s2r_run_cli(scenario: str, command: str, *, tz: str, tmp_path,
+                 extra=()) -> str:
+    """Render one committed v1 share fixture through the real CLI.
+
+    Markdown only, deliberately: `--format html` and `--format svg` write
+    to a file rather than to stdout, so a format parameter here would
+    return an empty string. Every caller wants the Markdown artifact.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    fixture = _S2R_SHARE_FIXTURES / scenario
+    home = tmp_path / f"{scenario}-{tz.replace('/', '-')}-md"
+    (home / ".local" / "share" / "cctally").mkdir(parents=True, exist_ok=True)
+    for name in ("cache.db", "stats.db"):
+        _shutil.copy(fixture / name, home / ".local" / "share" / "cctally" / name)
+    env = dict(os.environ)
+    env.update({
+        "HOME": str(home),
+        "TZ": tz,
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_DISABLE_UPDATE_CHECK": "1",
+        "CCTALLY_AS_OF": "2026-05-09T12:00:00Z",
+        "CCTALLY_TEST_CHANGELOG_PATH": str(fixture / "CHANGELOG.md"),
+    })
+    env.pop("CCTALLY_DATA_DIR", None)
+    result = _subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "bin" / "cctally"), command,
+         "--format", "md", "--theme", "light", *extra],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, (scenario, tz, result.stderr)
+    return result.stdout
+
+
+def _s2r_facts_line(markdown: str) -> str:
+    for line in markdown.splitlines():
+        if "→" in line and line.startswith("_") and line.endswith("_"):
+            return line.strip("_").replace("\\_", "_")
+    raise AssertionError(f"no facts strip in artifact:\n{markdown}")
+
+
+@_s2r_needs_share_fixtures
+@_s2_pytest.mark.parametrize(
+    "scenario,command,expected",
+    [
+        # `report`'s boundaries are `weekStartDate` / `weekEndDate` — the
+        # same calendar labels its own `Week` column prints.
+        ("report-md", "report", "2026-04-13 → 2026-05-11"),
+        # `five-hour-blocks` takes the DATE PART of the oldest and newest
+        # block. Under America/New_York this named 2026-05-06, a day with
+        # no row in the table below it.
+        ("five-hour-blocks-md", "five-hour-blocks", "2026-05-07 → 2026-05-07"),
+        # Controls: these carry `--since`/`--until` instants that
+        # `_parse_cli_date_range` already grounds in the display zone.
+        ("daily-md", "daily", "2020-01-01 → 2026-05-09"),
+        ("weekly-md", "weekly", "2020-01-01 → 2026-05-09"),
+        ("session-md", "session", "2020-01-01 → 2026-05-09"),
+        ("project-md-anon", "project", "2026-05-04 → 2026-05-09"),
+    ],
+)
+def test_cli_artifacts_state_the_dates_their_own_rows_name(
+        scenario, command, expected, tmp_path):
+    """Run each family from its committed fixture in two zones.
+
+    Every one of these boundaries is either a calendar label or an
+    instant anchored in the display zone, so the stated dates are the
+    same in both zones. A UTC-midnight sentinel converted into
+    `America/New_York` is what breaks that.
+    """
+    for tz in ("Etc/UTC", "America/New_York"):
+        facts = _s2r_facts_line(_s2r_run_cli(scenario, command, tz=tz,
+                                             tmp_path=tmp_path))
+        assert facts.startswith(expected), (scenario, tz, facts)
+        zone = facts.rsplit("(", 1)[1].split(")", 1)[0]
+        assert _ZoneInfo(zone).key == zone, (scenario, tz, facts)
+
+
+def _s2r_codex_entries():
+    """Two Codex entries whose UTC calendar day is the bucket label."""
+    agg = _s2r_load_sibling("_lib_aggregators")
+    return [
+        agg.CodexEntry(
+            timestamp=_dt2.datetime(2026, 5, 4, 12, 0, tzinfo=_dt2.timezone.utc),
+            session_id="s1", model="gpt-5", input_tokens=100,
+            cached_input_tokens=0, output_tokens=10,
+            reasoning_output_tokens=0, total_tokens=110,
+            source_path="/tmp/x.jsonl",
+        ),
+    ]
+
+
+def _s2r_load_sibling(name: str):
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, _REPO_ROOT / "bin" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@_s2_pytest.mark.parametrize("command", ["codex-daily", "codex-monthly",
+                                         "codex-weekly"])
+def test_codex_bucket_period_dates_are_zone_invariant(command):
+    """`build_codex_*_view` sets `period_start` to `datetime.combine(bucket,
+    time.min, tzinfo=UTC)` — a calendar label, not an instant."""
+    vm = _s2r_load_sibling("_lib_view_models")
+    codex = _s2r_load_sibling("_cctally_codex")
+    builder = {
+        "codex-daily": vm.build_codex_daily_view,
+        "codex-monthly": vm.build_codex_monthly_view,
+        "codex-weekly": vm.build_codex_weekly_view,
+    }[command]
+    now = _dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc)
+    baseline = None
+    for zone_name in ("Etc/UTC", "America/New_York", "Asia/Tokyo"):
+        view = builder(_s2r_codex_entries(), now_utc=now, tz_name=zone_name)
+        snap = codex._build_codex_share_snapshot(command, view, view.rows)
+        assert snap.period.display_tz == zone_name
+        start_civil, _end = _lib_share.period_civil_dates(snap.period)
+        if baseline is None:
+            baseline = start_civil
+        assert start_civil == baseline, (command, zone_name)
+    assert baseline is not None and baseline.startswith("2026-05"), baseline
+
+
+# =====================================================================
+# #503 S2 Task 2 — the facts strip.
+#
+# 27 of the 43 `ShareSnapshot` construction sites pass `subtitle=None`, and
+# `_render_md_fragment` gated BOTH the subtitle and the generated-at
+# timestamp on that one field — so those artifacts stated neither the
+# window they cover nor when they were made. Provenance is a property of
+# the render path, not something each construction site opts into (D1).
+# =====================================================================
+
+_S2_GENERATED_AT = _dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc)
+
+
+def _s2_period(display_tz: str = "Etc/UTC"):
+    return PeriodSpec(
+        start=_dt2.datetime(2026, 5, 4, tzinfo=_dt2.timezone.utc),
+        end=_dt2.datetime(2026, 5, 9, tzinfo=_dt2.timezone.utc),
+        display_tz=display_tz, label="This week", civil_bucket=True)
+
+
+def _s2_snapshot(*, projects=(), subtitle=None, display_tz="Etc/UTC",
+                 totals=(), columns=None, rows=None, chart=None):
+    if columns is None:
+        columns = (
+            ColumnSpec(key="project", label="Project", align="left"),
+            ColumnSpec(key="cost", label="$ Cost", align="right"),
+        ) if projects else (
+            ColumnSpec(key="week", label="Week", align="left"),
+            ColumnSpec(key="cost", label="$ Cost", align="right"),
+        )
+    if rows is None:
+        rows = tuple(
+            Row(cells={"project": ProjectCell(name, float(idx + 1)),
+                       "cost": MoneyCell(float(idx + 1))})
+            for idx, name in enumerate(projects)
+        ) if projects else (
+            Row(cells={"week": TextCell("2026-05-04"),
+                       "cost": MoneyCell(12.34)}),
+        )
+    return ShareSnapshot(
+        cmd="weekly", title="Weekly recap", subtitle=subtitle,
+        period=_s2_period(display_tz), columns=columns, rows=rows,
+        chart=chart, totals=totals, notes=(),
+        generated_at=_S2_GENERATED_AT, version="9.9.9",
+        template_id="weekly-recap")
+
+
+def _s2_snapshot_with_projects(display_tz="Etc/UTC"):
+    return _s2_snapshot(projects=("repos/alpha", "repos/beta"),
+                        display_tz=display_tz)
+
+
+def _s2_snapshot_without_projects():
+    return _s2_snapshot()
+
+
+def _s2_prepared(snap, *, reveal_projects: bool):
+    return _lib_share._prepare(snap, reveal_projects=reveal_projects)
+
+
+def test_facts_line_states_period_timezone_and_anonymization():
+    snap = _s2_prepared(_s2_snapshot_with_projects(), reveal_projects=False)
+    assert _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True) == (
+        "2026-05-04 → 2026-05-09 (Etc/UTC) · projects anonymized")
+
+
+def test_facts_line_reports_reveal_mode_when_revealed():
+    snap = _s2_prepared(_s2_snapshot_with_projects(), reveal_projects=True)
+    assert _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True).endswith("· real project names")
+
+
+def test_facts_line_omits_the_privacy_clause_when_there_are_no_project_names():
+    """Trend and Forecast carry no project names; claiming anonymization
+    would be a false statement about the document."""
+    snap = _s2_prepared(_s2_snapshot_without_projects(), reveal_projects=False)
+    line = _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True)
+    assert line == "2026-05-04 → 2026-05-09 (Etc/UTC)"
+    assert "anonymi" not in line and "real project" not in line
+
+
+def test_facts_line_reads_the_provenance_marker_not_the_rendered_shape():
+    """F5's defect class: a project genuinely named `project-1` is NOT
+    anonymized, and no inspection of the rendered labels can tell."""
+    snap = _s2_prepared(_s2_snapshot(projects=("project-1",)),
+                        reveal_projects=True)
+    assert "real project names" in _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True)
+
+
+def test_facts_line_omits_the_privacy_clause_on_an_unprepared_snapshot():
+    """Test-only path: with no marker, neither state can be claimed."""
+    line = _lib_share.share_facts_line(_s2_snapshot_with_projects(), shows_chart=True, shows_table=True)
+    assert "anonymi" not in line and "real project" not in line
+    assert line == "2026-05-04 → 2026-05-09 (Etc/UTC)"
+
+
+def test_facts_line_ignores_the_semantic_period_label():
+    """Every dashboard builder sets a semantic label; printing it would put
+    'This week' where the dates belong."""
+    snap = _s2_prepared(_s2_snapshot_without_projects(), reveal_projects=False)
+    assert snap.period.label == "This week"
+    assert "This week" not in _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True)
+
+
+def test_every_facts_line_passes_the_forbidden_class_detector():
+    for tz in ("Etc/UTC", "America/New_York",
+               "America/Argentina/Buenos_Aires"):
+        for reveal in (True, False):
+            snap = _s2_prepared(_s2_snapshot_with_projects(display_tz=tz),
+                                reveal_projects=reveal)
+            line = _lib_share.share_facts_line(snap, shows_chart=True, shows_table=True)
+            assert _lib_share._scan_forbidden_classes(line) == [], (tz, reveal)
+            for variant in _lib_share._scan_variants(_md_wrap(line)):
+                assert _lib_share._scan_forbidden_classes(variant) == [], variant
+
+
+def _md_wrap(text: str) -> str:
+    return f"_{_lib_share._md_escape(text)}_"
+
+
+def test_markdown_fragment_emits_the_facts_line_without_a_subtitle():
+    """The subtitle-less templates previously emitted neither facts nor
+    timestamp, because one `if snap.subtitle:` gated both."""
+    md = _lib_share._render_md_fragment(
+        _s2_prepared(_s2_snapshot_without_projects(), reveal_projects=False),
+        branding=True)
+    assert "2026-05-04 → 2026-05-09 (Etc/UTC)" in md
+    assert _lib_share._format_generated_at_iso(_S2_GENERATED_AT) in md
+
+
+def test_markdown_fragment_states_the_facts_exactly_once_with_a_subtitle():
+    md = _lib_share._render_md_fragment(
+        _s2_prepared(_s2_snapshot(projects=("repos/alpha",),
+                                  subtitle="5 projects"),
+                     reveal_projects=False),
+        branding=True)
+    assert md.count("2026-05-04 → 2026-05-09 (Etc/UTC)") == 1
+    assert "_5 projects_" in md
+
+
+# =====================================================================
+# #503 S2 Task 3 — facts and totals in HTML and SVG, gated correctly.
+#
+# `_render_html_fragment` embeds `_render_svg(include_chrome=False,
+# include_table=False)`, and that path must carry the chart ALONE. Emitting
+# facts or totals unconditionally from `_render_svg` would print each of
+# them twice in every HTML artifact.
+# =====================================================================
+
+_S2_BUDGET_TOTALS = (
+    Totalled(label="Verdict", value="OVER"),
+    Totalled(label="Budget", value="$120.00"),
+)
+
+
+def _s2_chart_snapshot(**kwargs):
+    return _s2_snapshot(
+        chart=LineChart(
+            points=tuple(
+                ChartPoint(x_label=f"2026-05-0{i}", x_value=float(i),
+                           y_value=float(i))
+                for i in (4, 5, 6)),
+            y_label="$ / %"),
+        **kwargs)
+
+
+def test_html_and_svg_each_state_the_facts_exactly_once():
+    expected = "2026-05-04 → 2026-05-09 (Etc/UTC) · projects anonymized"
+    for fmt in ("md", "html", "svg"):
+        out = _lib_share.render(
+            _s2_chart_snapshot(projects=("repos/alpha", "repos/beta")),
+            format=fmt, theme="light", branding=True, reveal_projects=False)
+        assert out.count(expected) == 1, (fmt, out.count(expected))
+
+
+def test_totals_render_in_all_three_formats_exactly_once():
+    for fmt in ("md", "html", "svg"):
+        out = _lib_share.render(
+            _s2_chart_snapshot(totals=_S2_BUDGET_TOTALS),
+            format=fmt, theme="light", branding=True, reveal_projects=False)
+        assert out.count("OVER") == 1, (fmt, out)
+        assert out.count("$120.00") == 1, (fmt, out)
+
+
+def test_the_chart_svg_embedded_in_html_carries_neither_facts_nor_totals():
+    """`include_chrome=False` means chart only — the contract that keeps
+    HTML from stating each fact twice (docs/share-gotchas.md)."""
+    prepared = _s2_prepared(_s2_chart_snapshot(totals=_S2_BUDGET_TOTALS),
+                            reveal_projects=False)
+    chart = _lib_share._render_svg(
+        prepared, palette=_lib_share.PALETTE_LIGHT, branding=False,
+        include_chrome=False, include_table=False)
+    assert "OVER" not in chart
+    assert "$120.00" not in chart
+    assert "(Etc/UTC)" not in chart
+
+
+def test_budget_shaped_html_and_svg_carry_the_verdict_and_target():
+    """These live only in `totals`, so today both formats omit them."""
+    for fmt in ("html", "svg"):
+        out = _lib_share.render(
+            _s2_snapshot(totals=_S2_BUDGET_TOTALS),
+            format=fmt, theme="light", branding=True, reveal_projects=False)
+        assert "OVER" in out, fmt
+        assert "$120.00" in out, fmt
+
+
+def test_svg_canvas_height_covers_the_facts_and_totals_bands():
+    """A band emitted below the declared height is invisible."""
+    import re as _re
+    bare = _lib_share.render(_s2_snapshot(), format="svg", theme="light",
+                             branding=True, reveal_projects=False)
+    with_totals = _lib_share.render(
+        _s2_snapshot(totals=_S2_BUDGET_TOTALS), format="svg", theme="light",
+        branding=True, reveal_projects=False)
+
+    def _height(svg):
+        return float(_re.search(r'viewBox="0 0 [\d.]+ ([\d.]+)"', svg).group(1))
+
+    def _max_baseline(svg):
+        return max(float(m) for m in _re.findall(r'<text [^>]*\by="([\d.]+)"', svg))
+
+    assert _height(with_totals) > _height(bare)
+    for svg in (bare, with_totals):
+        assert _max_baseline(svg) <= _height(svg), svg[:200]
+
+
+def test_html_and_svg_state_the_facts_without_a_subtitle():
+    for fmt in ("html", "svg"):
+        out = _lib_share.render(_s2_snapshot(), format=fmt, theme="light",
+                                branding=True, reveal_projects=False)
+        assert "2026-05-04 → 2026-05-09 (Etc/UTC)" in out, fmt
+
+
+# =====================================================================
+# #503 S2 Task 8 — chart label geometry (F16, widened).
+#
+# The horizontal bar chart assumed a FIXED 120px left gutter and started
+# its value label at a fixed `ix + bw + 4`, so a long revealed project
+# label ran off the left edge and even `$0.01` ran off the right. The line
+# chart's y-axis label is end-anchored at `ix - 10` with no reservation at
+# all, so `projected %` starts at -6px in every shipped forecast SVG.
+# =====================================================================
+
+_S2_TEXT_RE = _re.compile(r'<text ([^>]*)>([^<]*)</text>')
+_S2_ATTR_RE = _re.compile(r'([\w-]+)="([^"]*)"')
+
+
+def _s2_viewbox_width(svg: str) -> float:
+    return float(_re.search(r'viewBox="0 0 ([\d.]+) ', svg).group(1))
+
+
+def _s2_emitted_text_boxes(svg: str):
+    """`(left, right, text)` for every EMITTED `<text>`.
+
+    Read back out of the rendered SVG, not recomputed from the layout
+    inputs — so a renderer that forgot to reserve space for a label fails
+    here even though it uses the same width estimator.
+    """
+    for raw_attrs, text in _S2_TEXT_RE.findall(svg):
+        attrs = dict(_S2_ATTR_RE.findall(raw_attrs))
+        x = float(attrs["x"])
+        size = float(attrs["font-size"])
+        anchor = attrs.get("text-anchor", "start")
+        width = _lib_share._svg_text_width(text, size)
+        if anchor == "end":
+            yield (x - width, x, text)
+        elif anchor == "middle":
+            yield (x - width / 2, x + width / 2, text)
+        else:
+            yield (x, x + width, text)
+
+
+def _s2_render_template_svg(template_id: str, *, reveal_projects: bool):
+    tpl = _T2.get_template(template_id)
+    options = {
+        "format": "svg", "theme": "light", "reveal_projects": reveal_projects,
+        "no_branding": False, "top_n": _S2_DEFAULT_TOP_N[tpl.panel],
+        "show_chart": True, "show_table": True, "period": None,
+        "project_allowlist": None, "display_tz": "Etc/UTC",
+    }
+    for key, value in tpl.default_options.items():
+        if key not in ("reveal_projects", "theme", "no_branding"):
+            options[key] = value
+    return _lib_share.render(
+        tpl.builder(panel_data=_s2_panel_data(tpl.panel), options=options),
+        format="svg", theme="light", branding=True,
+        reveal_projects=reveal_projects)
+
+
+@_s2_needs_fixtures
+def test_no_emitted_svg_text_extends_beyond_the_viewbox():
+    """Covers both hbar edges and the line chart's y-axis label, in both
+    privacy modes — a long REVEALED project label is the left-edge case
+    and an anonymized alias is not."""
+    offenders = []
+    for reveal in (False, True):
+        for tpl in _T2.SHARE_TEMPLATES:
+            svg = _s2_render_template_svg(tpl.id, reveal_projects=reveal)
+            view_w = _s2_viewbox_width(svg)
+            for left, right, text in _s2_emitted_text_boxes(svg):
+                if left < -0.01 or right > view_w + 0.01:
+                    offenders.append((tpl.id, reveal, text, left, right,
+                                      view_w))
+    assert not offenders, offenders
+
+
+def test_the_longest_hbar_value_label_fits():
+    """Today every value label begins at x=614 on a 640 canvas, so even
+    `$0.01` overflows."""
+    chart = HorizontalBarChart(
+        points=(
+            ChartPoint(x_label="alpha", x_value=0.0, y_value=1045.13),
+            ChartPoint(x_label="beta", x_value=1.0, y_value=99.99),
+            ChartPoint(x_label="gamma", x_value=2.0, y_value=0.01),
+        ),
+        x_label="$", cap=None)
+    svg = _lib_share.render(
+        _s2_snapshot(chart=chart, columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    view_w = _s2_viewbox_width(svg)
+    values = [(l, r) for l, r, t in _s2_emitted_text_boxes(svg)
+              if t.startswith("$")]
+    assert values
+    assert max(r for _l, r in values) <= view_w
+
+
+def test_a_long_revealed_project_label_is_not_clipped_on_the_left():
+    chart = HorizontalBarChart(
+        points=(ChartPoint(x_label="risk-analysis-toolkit-2026",
+                           x_value=0.0, y_value=8.42),),
+        x_label="$", cap=None)
+    svg = _lib_share.render(
+        _s2_snapshot(chart=chart, columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    gutter = [(l, r) for l, r, t in _s2_emitted_text_boxes(svg)
+              if t == "risk-analysis-toolkit-2026"]
+    assert gutter
+    assert min(l for l, _r in gutter) >= 0.0
+
+
+@_s2_needs_fixtures
+def test_line_chart_y_axis_labels_are_not_clipped_on_the_left():
+    """Shipped forecast SVGs start `projected %` at -6px."""
+    for template_id in ("forecast-recap", "forecast-visual",
+                        "forecast-detail"):
+        svg = _s2_render_template_svg(template_id, reveal_projects=False)
+        labels = [(l, r) for l, r, t in _s2_emitted_text_boxes(svg)
+                  if t.endswith("%") and not t[0].isdigit()]
+        assert labels, template_id
+        assert min(l for l, _r in labels) >= 0.0, template_id
+
+
+def test_hbar_bars_are_not_shrunk_to_make_labels_fit():
+    """The canvas widens; the plot keeps its nominal width."""
+    short = HorizontalBarChart(
+        points=(ChartPoint(x_label="a", x_value=0.0, y_value=1.0),),
+        x_label="$", cap=None)
+    long_labels = HorizontalBarChart(
+        points=(ChartPoint(x_label="risk-analysis-toolkit-2026",
+                           x_value=0.0, y_value=1.0),),
+        x_label="$", cap=None)
+
+    def _bar_width(chart):
+        svg = _lib_share.render(
+            _s2_snapshot(chart=chart, columns=(), rows=()),
+            format="svg", theme="light", branding=True, reveal_projects=False)
+        rects = _re.findall(
+            r'<rect ([^>]*)/>', svg)
+        widths = []
+        for raw in rects:
+            attrs = dict(_S2_ATTR_RE.findall(raw))
+            if attrs.get("fill") == _lib_share.PALETTE_LIGHT["series_primary"]:
+                widths.append(float(attrs["width"]))
+        return max(widths)
+
+    assert _bar_width(long_labels) >= _bar_width(short) - 0.01
+
+
+def test_svg_canvas_widens_rather_than_clipping_a_long_label():
+    narrow = _lib_share.render(
+        _s2_snapshot(chart=HorizontalBarChart(
+            points=(ChartPoint(x_label="a", x_value=0.0, y_value=1.0),),
+            x_label="$", cap=None), columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    wide = _lib_share.render(
+        _s2_snapshot(chart=HorizontalBarChart(
+            points=(ChartPoint(x_label="risk-analysis-toolkit-2026",
+                               x_value=0.0, y_value=1.0),),
+            x_label="$", cap=None), columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    assert _s2_viewbox_width(wide) > _s2_viewbox_width(narrow)
+
+
+# =====================================================================
+# #503 S2 Task 9 — empty tables (F17).
+#
+# HTML gates its table on `snap.columns` and SVG does too; Markdown did
+# not, so the eight chart-only `*-visual` templates emitted a blank line
+# for a table that renders as the empty string, then another before the
+# totals — a four-newline run in the middle of the document.
+#
+# `projects-visual` is the contradictory site: its docstring says "no
+# table" while it passes a full column set with zero rows, so it emits a
+# header-only table in all three formats.
+# =====================================================================
+
+@_s2_needs_fixtures
+def test_a_visual_markdown_artifact_has_no_blank_run():
+    for template_id in ("weekly-visual", "current-week-visual",
+                        "trend-visual", "daily-visual", "monthly-visual",
+                        "blocks-visual", "forecast-visual",
+                        "sessions-visual"):
+        tpl = _T2.get_template(template_id)
+        options = {
+            "format": "md", "theme": "light", "reveal_projects": False,
+            "no_branding": False, "top_n": _S2_DEFAULT_TOP_N[tpl.panel],
+            "show_chart": True, "show_table": True, "period": None,
+            "project_allowlist": None, "display_tz": "Etc/UTC",
+        }
+        for key, value in tpl.default_options.items():
+            if key not in ("reveal_projects", "theme", "no_branding"):
+                options[key] = value
+        md = _lib_share.render(
+            tpl.builder(panel_data=_s2_panel_data(tpl.panel), options=options),
+            format="md", theme="light", branding=True, reveal_projects=False)
+        assert "\n\n\n" not in md, template_id
+
+
+def test_a_header_only_table_is_not_rendered_in_any_format():
+    """DELIBERATELY REPLACES the S2 assertion that a columns-and-no-rows
+    snapshot still renders its header row.
+
+    Which of the two `budget` artifacts produces the schema-only shape
+    was stated backwards here, and the correction that fixed it
+    everywhere else did not reach this docstring (#503 S2 second review
+    N8). `_build_budget_no_budget_snapshot` is the one with `rows=()`;
+    `_build_budget_no_data_snapshot` carries a `Weekly budget` row. So
+    the shape does have one shipped producer — and it is still
+    suppressed, because that artifact is titled `Budget — no budget set`
+    and carries a note telling the reader how to set one, which makes
+    the header row a frame around nothing there too. What the shape
+    actually produced was a dead frame: `share/report-empty-html` drew a
+    four-cell header with no body under a title reading `— no data`, and
+    seventeen `tests/fixtures/source-aware/*-empty` goldens did the same.
+    `source-report-all-codex-unavailable` printed `Codex quota state is
+    unavailable.` and then drew a `Quota Series | % Used | $ Cost` frame
+    anyway. The gate is therefore on columns AND rows in all three
+    formats (#503 S2 review F3).
+    """
+    snap = _s2_snapshot(
+        columns=(ColumnSpec(key="metric", label="Metric", align="left"),
+                 ColumnSpec(key="value", label="Value", align="right")),
+        rows=())
+    md = _lib_share.render(snap, format="md", theme="light", branding=True,
+                           reveal_projects=False)
+    assert "| Metric | Value |" not in md
+    assert "\n\n\n\n" not in md
+    html = _lib_share.render(snap, format="html", theme="light",
+                             branding=True, reveal_projects=False)
+    assert "<table" not in html and "<th" not in html
+    svg = _lib_share.render(snap, format="svg", theme="light", branding=True,
+                            reveal_projects=False)
+    assert ">Metric<" not in svg
+
+
+def test_a_table_with_rows_still_renders_in_every_format():
+    """The gate must not suppress a real table."""
+    snap = _s2_snapshot()
+    for fmt, marker in (("md", "| Week | $ Cost |"), ("html", "<table"),
+                        ("svg", ">Week<")):
+        out = _lib_share.render(snap, format=fmt, theme="light",
+                                branding=True, reveal_projects=False)
+        assert marker in out, fmt
+
+
+@_s2_needs_fixtures
+def test_projects_visual_renders_no_table_in_any_format():
+    tpl = _T2.get_template("projects-visual")
+    for fmt in ("md", "html", "svg"):
+        options = {
+            "format": fmt, "theme": "light", "reveal_projects": False,
+            "no_branding": False, "top_n": 5, "show_chart": True,
+            "show_table": True, "period": None, "project_allowlist": None,
+            "display_tz": "Etc/UTC",
+        }
+        for key, value in tpl.default_options.items():
+            if key not in ("reveal_projects", "theme", "no_branding"):
+                options[key] = value
+        out = _lib_share.render(
+            tpl.builder(panel_data=_s2_panel_data("projects"),
+                        options=options),
+            format=fmt, theme="light", branding=True, reveal_projects=False)
+        assert "| Project |" not in out, fmt
+        assert "<table" not in out, fmt
+        assert "$ Cost" not in out, fmt
+
+
+@_s2_needs_fixtures
+def test_projects_visual_declares_no_columns_at_the_builder():
+    """Fixed at the builder, not by teaching the renderers a row-count
+    rule that would suppress legitimate schema-only tables."""
+    tpl = _T2.get_template("projects-visual")
+    snap = _s2_build_template("projects-visual")
+    assert snap.columns == ()
+    assert snap.rows == ()
+    assert tpl.default_options.get("show_table") is False
+
+
+# =====================================================================
+# #503 S2 Task 10 — full dates, and no subtitle that repeats the facts.
+#
+# F15: the CLI period label and six titles rendered `%b %d`, so a report
+# spanning 2020 to 2026 read `Jan 01 → May 09` and named no year. D4 makes
+# them full ISO. D5 then removes the subtitles whose whole content the
+# facts strip now states — including the theme, which is dropped outright.
+# =====================================================================
+
+def _s2_trend_row(date_iso, cost, pct, dpp):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        week_start_date=_dt2.date.fromisoformat(date_iso),
+        used_pct=pct, weekly_cost_usd=cost, dollars_per_percent=dpp)
+
+
+def _s2_report_snapshot():
+    from types import SimpleNamespace
+    view = SimpleNamespace(
+        rows=(_s2_trend_row("2020-01-01", 10.0, 1.0, 10.0),
+              _s2_trend_row("2026-05-04", 20.0, 2.0, 10.0)),
+        avg_dollars_per_pct=10.0)
+    return _cctally._build_report_snapshot(
+        view,
+        period_start=_dt2.datetime(2020, 1, 1, tzinfo=_dt2.timezone.utc),
+        period_end=_dt2.datetime(2026, 5, 9, tzinfo=_dt2.timezone.utc),
+        display_tz="Etc/UTC", version="9.9.9")
+
+
+def test_period_label_carries_the_year():
+    label = _cctally._share_period_label(
+        _dt2.datetime(2020, 1, 1, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 5, 9, tzinfo=_dt2.timezone.utc), "Etc/UTC")
+    assert label == "2020-01-01 → 2026-05-09 (Etc/UTC)"
+
+
+def test_a_cross_year_artifact_is_unambiguous():
+    snap = _s2_report_snapshot()
+    assert snap.period.label == "2020-01-01 → 2026-05-09 (Etc/UTC)"
+    week_labels = [row.cells["week"].text for row in snap.rows]
+    assert week_labels == ["2020-01-01", "2026-05-04"]
+    assert not any("Jan 01" in label for label in week_labels)
+
+
+def test_the_cli_builders_no_longer_carry_a_subtitle():
+    """Period, theme and privacy: the facts strip states two of the three
+    and D5 drops the theme, so the subtitle has nothing left to say — and
+    the builders no longer take `theme` or `reveal_projects` at all, which
+    keeps a builder from acting on the privacy mode `render()` owns."""
+    import inspect
+    snap = _s2_report_snapshot()
+    assert snap.subtitle is None
+    for builder in ("_build_report_snapshot", "_build_daily_snapshot",
+                    "_build_monthly_snapshot", "_build_weekly_snapshot",
+                    "_build_forecast_snapshot", "_build_project_snapshot",
+                    "_build_five_hour_blocks_snapshot",
+                    "_build_session_snapshot"):
+        params = inspect.signature(getattr(_cctally, builder)).parameters
+        assert "theme" not in params, builder
+        assert "reveal_projects" not in params, builder
+
+
+def test_the_projects_subtitle_keeps_only_its_count():
+    subtitle = _T2._projects_subtitle(5)
+    assert subtitle == "5 projects"
+    assert "anonymi" not in subtitle and "real project" not in subtitle
+    assert _T2._projects_subtitle(1) == "1 project"
+
+
+def test_no_share_snapshot_builder_still_formats_a_yearless_date():
+    """Structural tripwire over the four builder modules. The literal is
+    hardcoded, not imported, so it keeps guarding after a rename."""
+    offenders = []
+    for name in ("_cctally_share.py", "_cctally_forecast.py",
+                 "_cctally_codex.py", "_cctally_source_analytics.py",
+                 "_lib_share_templates.py"):
+        text = (_REPO_ROOT / "bin" / name).read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0]
+            # `%b %-d` (the ANSI terminal forecast panel) is deliberately
+            # not matched: it is not a share artifact. Comments are
+            # stripped so a note ABOUT the retired format does not count
+            # as a use of it.
+            if "%b %d" not in code:
+                continue
+            offenders.append(f"{name}:{lineno}: {line.strip()}")
+    assert offenders == [], offenders
+
+
+# =====================================================================
+# #503 S2 review — F6: the text-width heuristic at the ends.
+#
+# `_svg_text_width` estimated every glyph at 0.6 em. It sizes the hbar
+# gutter and value reserve, the line chart's y-axis indent, and the SVG
+# TABLE's column widths — including the ellipsis decision — so being
+# wrong at the ends both clipped labels and overprinted table cells.
+#
+# The reference widths below were MEASURED in a real browser during the
+# QA round, at font-size 11, and are hardcoded here: an estimator checked
+# against itself proves nothing.
+# =====================================================================
+
+# Every figure below was measured with `getComputedTextLength()` in
+# Chromium at font-size 11, where `sans-serif` resolves to Helvetica.
+#
+# The three ASCII entries this table used to carry (W×20 = 214.20,
+# i×36 = 100.08, `risk-analysis-toolkit` = 103.34) came from a DIFFERENT
+# font: none of them matches any Helvetica or Arial advance, and W×20 in
+# particular implies 0.974 em where both fonts give 0.944. They are
+# retired rather than kept beside numbers they contradict, and the
+# realistic-project-name case is dropped because no measurement of it
+# exists in the current font (#503 S2 second review N6).
+_S2R_MEASURED_WIDTHS = (
+    # (text, font_size, measured px, max under-reservation, max over)
+    ("M" * 20, 11.0, 183.27, 0.02, 0.02),
+    ("i" * 36, 11.0, 87.98, 0.02, 0.02),
+    ("W" * 20, 11.0, 207.66, 0.02, 0.02),
+    # Wide scripts. Over-reservation is the SAFE direction — an
+    # under-reserved label overprints its neighbour — so hangul, which
+    # the system fallback draws at 0.865 em against the full em the
+    # estimator reserves, is allowed to run well over.
+    ("数据平台迁移项目二零二六", 11.0, 134.91, 0.0, 0.10),
+    ("データ基盤移行", 11.0, 77.97, 0.0, 0.10),
+    ("프로젝트관리", 11.0, 57.09, 0.0, 0.25),
+    # Emoji are wider than a full em.
+    ("\U0001F680" * 8, 11.0, 112.00, 0.0, 0.10),
+    # A combining mark advances the pen by zero: twelve acute accents
+    # over twelve `e` measure exactly the twelve `e`.
+    ("é" * 12, 11.0, 73.42, 0.02, 0.02),
+)
+
+
+def test_the_text_width_estimate_matches_measured_widths_in_every_script():
+    for text, size, measured, max_under, max_over in _S2R_MEASURED_WIDTHS:
+        estimate = _lib_share._svg_text_width(text, size)
+        error = (estimate - measured) / measured
+        assert -max_under <= error <= max_over, (
+            f"{text[:12]!r}: estimated {estimate:.2f} against a measured "
+            f"{measured:.2f} ({error:+.1%}), outside "
+            f"[-{max_under:.0%}, +{max_over:.0%}]")
+
+
+def test_the_text_width_estimate_still_scales_linearly_with_font_size():
+    for text, _size, _measured, _under, _over in _S2R_MEASURED_WIDTHS:
+        assert _lib_share._svg_text_width(text, 20.0) == _s2_pytest.approx(
+            2 * _lib_share._svg_text_width(text, 10.0))
+
+
+def test_a_non_latin_label_is_never_under_reserved_against_the_fallback():
+    """DELIBERATELY REPLACES `test_an_unknown_glyph_keeps_a_finite_estimate`.
+
+    That test asserted only `width > 0.0`, which the flat 0.6-em fallback
+    satisfied while under-reserving a Chinese project name by 41.3% and
+    an emoji run by 52.9% — so it could not observe the degradation it
+    was written for. The property that matters is the DIRECTION of the
+    error against the fallback, because an under-reserved label prints on
+    top of the value beside it (#503 S2 second review N6).
+    """
+    fallback = _lib_share._SVG_AVG_GLYPH_WIDTH_FRACTION * 11.0
+    for text in ("数据平台", "データ", "프로젝트", "\U0001F680\U0001F680"):
+        estimate = _lib_share._svg_text_width(text, 11.0)
+        assert estimate > len(text) * fallback, (text, estimate)
+    # A combining mark is the one case that must measure LESS.
+    assert _lib_share._svg_text_width("é", 11.0) == _s2_pytest.approx(
+        _lib_share._svg_text_width("e", 11.0))
+    # And the characters that are neither keep the fallback rather than
+    # measuring zero — the arrow the facts strip prints is one.
+    for text in ("→", "…", "café"):
+        assert _lib_share._svg_text_width(text, 11.0) > 0.0, text
+
+
+# =====================================================================
+# #503 S2 review — F5: a standalone SVG rendered in two fonts.
+#
+# Only the 24 table cells carried `font-family="sans-serif"`. The other
+# 17 text elements — title, subtitle, the facts strip, the timestamp, the
+# footer, every chart label and every composed section heading — carried
+# none and fell back to the viewer default, which is Times in Chromium.
+# So the same report was typographically different as `.svg` and as
+# `.html`, and F16's width guarantee was calibrated for a sans-serif the
+# standalone form did not actually get.
+# =====================================================================
+
+def _s2r_svg_roots(text: str) -> "list[str]":
+    import re as _re
+    return _re.findall(r"<svg\b[^>]*>", text)
+
+
+@_s2_pytest.mark.parametrize("fmt", ["svg", "html"])
+def test_every_emitted_svg_declares_one_font_family(fmt):
+    # A chart-bearing snapshot: HTML emits an `<svg>` only for the chart.
+    out = _lib_share.render(
+        _s2_snapshot(chart=BarChart(
+            points=(ChartPoint(x_label="2026-05-04", x_value=0.0,
+                               y_value=1.0),),
+            y_label="$ / week")),
+        format=fmt, theme="light", branding=True, reveal_projects=False)
+    roots = _s2r_svg_roots(out)
+    assert roots, fmt
+    for root in roots:
+        assert 'font-family="sans-serif"' in root, (fmt, root[:120])
+
+
+
+# =====================================================================
+# #503 S2 review — M3: the widened canvas overflowed the HTML body.
+#
+# `chart_required_width` widens `content_w`, and `_render_html_fragment`
+# embeds that SVG with hard `width=`/`height=` attributes inside a body
+# capped at `max-width:680px; padding:20px`, with no `max-width:100%`
+# and no scroll container.
+#
+# The content box is 680px, not 640px: the padding lies outside the cap
+# under the default `content-box`. Measured over the four fixture roots,
+# the committed goldens hold 83 embedded charts; 35 exceed 640px and NONE
+# exceeds 680px, the widest being 670.9px in
+# `share-v2/sessions/output.detail.reveal-light-branded.html.golden`.
+#
+# So the goldens alone cannot demonstrate this defect, and an earlier
+# record of it — "0 of 152 before, 141 after", and a 696.6px canvas in
+# the `projects` golden, which renders 669.0px — measured against the
+# wrong box. Real data does reach it: `project --reveal-projects`
+# produces a 755.3px canvas, and a real-PDF A/B showed the unfixed
+# document losing its top bar's `$2,814.88` value label.
+# =====================================================================
+
+# `_wrap_document` emits `padding:20px;max-width:680px` on `<body>`, and
+# nothing in an artifact sets `box-sizing`, so under the default
+# `content-box` the padding lies OUTSIDE the cap and the content box is
+# the full 680px. Subtracting the padding gave 640, which is the figure
+# an earlier pass recorded and measured against (#503 S2 fourth review).
+_S2R_HTML_BODY_CONTENT_W = 680.0
+
+
+def _s2r_wide_chart():
+    """A chart whose labels force `chart_required_width` past 680px."""
+    return HorizontalBarChart(
+        points=tuple(
+            ChartPoint(x_label=f"enterprise-data-platform-migration-{n}",
+                       x_value=float(i), y_value=1000.0 - i)
+            for i, n in enumerate((2026, 2025, 2024))
+        ),
+        x_label="$", cap=None)
+
+
+_S2R_CSS_WIDTH_CAP = _re.compile(r"max-width\s*:\s*(?!none)")
+
+
+def _s2r_scroll_box_around(document: str, needle: str) -> str:
+    """The innermost element wrapping `needle`, as its opening tag.
+
+    Read from the emitted bytes rather than asserted against a literal,
+    so the test observes the relationship between the element and its
+    container instead of the presence of a CSS token.
+    """
+    at = document.index(needle)
+    stack: list[str] = []
+    for match in _re.finditer(r"<div\b[^>]*>|</div>", document[:at]):
+        if match.group(0) == "</div>":
+            stack.pop()
+        else:
+            stack.append(match.group(0))
+    assert stack, f"{needle[:60]!r} has no element around it"
+    return stack[-1]
+
+
+def _s2r_box_overflow(box: str) -> str:
+    """The `overflow` an emitted container DECLARES.
+
+    Read as a parsed declaration rather than as a substring, so a value
+    that merely contains the expected token cannot pass. Whether the box
+    then actually scrolls is a browser property and is checked at the
+    real-browser gate; the declaration is what this layer can observe.
+    """
+    return _s2r_declarations(_s2r_tag_attrs(box)[1].get("style", "")).get(
+        "overflow", "")
+
+
+def test_a_widened_embedded_chart_keeps_its_size_and_its_box_scrolls():
+    """The mechanism has to be able to fire.
+
+    The earlier pairing declared a scroll container around an element it
+    had already capped to that container, so `scrollWidth - clientWidth`
+    was 0 in all 582 browser checks and the cap silently shrank the chart
+    instead — to 5.93 CSS px of axis text at a 420px viewport (#503 S2
+    second review N1). Here: the embedded chart's own width exceeds the
+    content box, nothing on it reduces that width, and the element around
+    it is a scroll container.
+    """
+    snap = _s2_snapshot(chart=_s2r_wide_chart(), columns=(), rows=())
+    html = _lib_share.render(snap, format="html", theme="light",
+                             branding=True, reveal_projects=False)
+    root = _s2r_svg_roots(html)[0]
+    declared = _s2_viewbox_width(html)
+    assert declared > _S2R_HTML_BODY_CONTENT_W, declared
+    assert float(_re.search(r'\bwidth="([\d.]+)"', root).group(1)) == declared
+    assert not _S2R_CSS_WIDTH_CAP.search(root), root[:200]
+    box = _s2r_scroll_box_around(html, root)
+    assert _s2r_box_overflow(box) in ("auto", "scroll"), box
+
+
+def test_the_data_table_scrolls_inside_its_own_box():
+    """The `<table>` is what actually overflowed the page.
+
+    Measured at a 420px viewport, `documentElement.scrollWidth -
+    clientWidth` was 129px in three `daily` detail artifacts and the
+    rightmost columns were off-screen. A table shrink-wraps to its
+    content, so the box around it is the only place the scroll can live.
+    """
+    snap = _s2_snapshot(
+        columns=tuple(
+            ColumnSpec(key=f"c{i}", label=f"enterprise-column-{i}",
+                       align="right")
+            for i in range(8)),
+        rows=(Row(cells={f"c{i}": TextCell(f"value-{i}") for i in range(8)}),),
+        chart=None)
+    html = _lib_share.render(snap, format="html", theme="light",
+                             branding=True, reveal_projects=False)
+    table = _re.search(r"<table\b[^>]*>", html).group(0)
+    assert not _S2R_CSS_WIDTH_CAP.search(table), table
+    box = _s2r_scroll_box_around(html, table)
+    assert _s2r_box_overflow(box) in ("auto", "scroll"), box
+
+
+def test_a_standalone_svg_scales_to_its_viewport():
+    """A `.svg` artifact IS the whole viewport's content, so scaling it
+    down scales everything together and the reader can zoom. That is the
+    opposite answer from the embedded chart, and deliberately so."""
+    snap = _s2_snapshot(chart=_s2r_wide_chart(), columns=(), rows=())
+    svg = _lib_share.render(snap, format="svg", theme="light",
+                            branding=True, reveal_projects=False)
+    root = _s2r_svg_roots(svg)[0]
+    assert "max-width:100%" in root
+    assert "height:auto" in root
+
+
+# =====================================================================
+# #503 S2 third review — the scroll boxes reached PAPER, where a scroll
+# container is a crop.
+#
+# The screen answer above (an intrinsically-sized chart and table, each
+# inside its own `overflow:auto` box) is wrong on paper. A print engine
+# clips a scroll container to its box, so the chart loses everything past
+# the content box, and that is where the bar value labels and the last
+# axis tick sit.
+#
+# The content box is 680px, not 640: `body` declares `padding:20px;
+# max-width:680px` under default `content-box` sizing, so the padding is
+# outside the cap. Measured against the true box, NONE of the 83 embedded
+# charts in the committed goldens overflows — the widest declares 670.9 —
+# and the fix is justified by data the fixtures do not carry: real
+# `project --reveal-projects` output produces a 755.3px chart, and a
+# real-PDF A/B showed the uncorrected version losing the top bar's
+# `$2,814.88` value label (#503 S2 fourth review).
+#
+# The table half of the rule is specification-conformance insurance
+# rather than an observed fix. CSS fragmentation makes any box whose
+# `overflow` is not `visible` monolithic, but Chromium 151 paginates an
+# `overflow:auto` table across pages regardless — 240 rows over 8 pages,
+# identically with and without the rule.
+#
+# Both are corrected inside `@media print`, which keeps the print delta
+# to one replaced `<style>` line per HTML golden and cannot touch the
+# screen behaviour at all.
+# =====================================================================
+
+_S2R_PRINT_BLOCK = _re.compile(r"<style>@media print \{(.*)\}</style>",
+                               _re.DOTALL)
+_S2R_CSS_RULE = _re.compile(r"([^{}]+?)\s*\{\s*([^{}]*?)\s*\}")
+_S2R_SIMPLE_SELECTOR = _re.compile(
+    r'^(?P<tag>[a-z]+)'
+    r'(?:\[(?P<attr>[a-z-]+)(?P<op>\*?=)"(?P<value>[^"]*)"\])?$')
+
+
+def _s2r_print_rules(document: str) -> "list[tuple[str, dict]]":
+    """Every `(selector, declarations)` pair inside the print stylesheet."""
+    block = _S2R_PRINT_BLOCK.search(document)
+    assert block, "the document carries no print stylesheet"
+    rules = []
+    for selector, body in _S2R_CSS_RULE.findall(block.group(1)):
+        rules.append((selector.strip(), _s2r_declarations(body)))
+    return rules
+
+
+def _s2r_declarations(style: str) -> dict:
+    """`{property: value}` from a declaration list, `!important` dropped."""
+    out = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        name, _, value = declaration.partition(":")
+        out[name.strip().lower()] = (
+            value.replace("!important", "").strip().lower())
+    return out
+
+
+def _s2r_tag_attrs(tag: str) -> "tuple[str, dict]":
+    """`(name, attributes)` read off an emitted opening tag."""
+    name = _re.match(r"<([a-zA-Z]+)", tag).group(1).lower()
+    return name, dict(_S2_ATTR_RE.findall(tag))
+
+
+def _s2r_rules_selecting(document: str, element: str) -> "list[dict]":
+    """The print declarations that actually SELECT this emitted element.
+
+    The selectors are evaluated against the element's own attributes as
+    the renderer wrote them, so the test observes whether the print rule
+    reaches the markup rather than whether some string is present in the
+    stylesheet. That distinction is the whole point here: the scroll
+    boxes were added to the markup and the print stylesheet was never
+    told about them, and no token check would have noticed.
+    """
+    name, attrs = _s2r_tag_attrs(element)
+    reaching = []
+    for selector, declarations in _s2r_print_rules(document):
+        for one in selector.split(","):
+            match = _S2R_SIMPLE_SELECTOR.match(one.strip())
+            if match is None or match.group("tag") != name:
+                continue
+            if match.group("attr") is None:
+                reaching.append(declarations)
+                break
+            have = attrs.get(match.group("attr"))
+            if have is None:
+                continue
+            wanted = match.group("value")
+            if (have == wanted if match.group("op") == "="
+                    else wanted in have):
+                reaching.append(declarations)
+                break
+    return reaching
+
+
+def _s2r_printable_document() -> str:
+    """A dark artifact carrying both scroll boxes and an over-wide chart."""
+    snap = _s2_snapshot(
+        chart=_s2r_wide_chart(),
+        columns=tuple(
+            ColumnSpec(key=f"c{i}", label=f"enterprise-column-{i}",
+                       align="right")
+            for i in range(8)),
+        rows=tuple(
+            Row(cells={f"c{i}": TextCell(f"value-{i}-{n}") for i in range(8)})
+            for n in range(4)),
+    )
+    return _lib_share.render(snap, format="html", theme="dark",
+                             branding=True, reveal_projects=False)
+
+
+def _s2r_emitted_scroll_boxes(document: str) -> "list[str]":
+    """Every emitted `<div>` that DECLARES itself a scroll container.
+
+    Swept from the document rather than looked up by needle. The two boxes
+    this rule was written for are the chart wrapper and the table wrapper,
+    and enumerating those two would leave a third wrapper added later
+    unreleased on paper with nothing failing — which is precisely the
+    shape that produced this session's P1.
+    """
+    boxes = []
+    for tag in _re.findall(r"<div\b[^>]*>", document):
+        declarations = _s2r_declarations(_s2r_tag_attrs(tag)[1].get("style", ""))
+        if declarations.get("overflow") in ("auto", "scroll", "hidden"):
+            boxes.append(tag)
+    return boxes
+
+
+def test_print_releases_every_scroll_box_the_document_emits():
+    """A scroll container crops on paper and cannot break across pages.
+
+    The class, not the two instances: any box whose `overflow` is not
+    `visible` is cropped by a print engine and made monolithic by CSS
+    fragmentation, so every one the document emits must be released.
+    `hidden` is swept alongside `auto` and `scroll` because it has the
+    same two consequences on paper and none of the screen benefit — and
+    because the shipped print selector is `div[style*="overflow:auto"]`,
+    which reaches neither of the other two values. A wrapper declaring
+    `overflow:scroll` would therefore be emitted, cropped on paper and
+    released by nothing, and only a sweep of the class can see that.
+    """
+    html = _s2r_printable_document()
+    boxes = _s2r_emitted_scroll_boxes(html)
+    # The two known wrappers are present, so the sweep is not passing on
+    # an empty set: the chart's box and the table's box.
+    assert _s2r_scroll_box_around(html, _s2r_svg_roots(html)[0]) in boxes
+    assert _s2r_scroll_box_around(
+        html, _re.search(r"<table\b[^>]*>", html).group(0)) in boxes
+    for box in boxes:
+        released = [d for d in _s2r_rules_selecting(html, box)
+                    if d.get("overflow") == "visible"]
+        assert released, (
+            "no print rule releases this scroll box: " + box[:160])
+
+
+def test_print_scales_the_embedded_chart_into_the_page():
+    """On paper the chart must fit the sheet, not keep its intrinsic width.
+
+    On screen the embedded chart deliberately carries no `max-width`, so
+    that the box around it can scroll (#503 S2 second review N1). Paper
+    has no scrolling, so the same absence crops the chart instead — the
+    right edge, which is where the bar value labels and the last axis
+    tick are.
+    """
+    html = _s2r_printable_document()
+    root = _s2r_svg_roots(html)[0]
+    assert _s2_viewbox_width(html) > _S2R_HTML_BODY_CONTENT_W
+    assert not _S2R_CSS_WIDTH_CAP.search(root), root[:200]
+    sizing = [d for d in _s2r_rules_selecting(html, root)
+              if d.get("max-width") == "100%"]
+    assert sizing, "no print rule caps the embedded chart's width"
+    assert any(d.get("height") == "auto" for d in sizing), (
+        "the print cap does not keep the chart's aspect ratio")
+
+
+# =====================================================================
+# #503 S2 review — M4: chart text that overprints its neighbour.
+#
+# F16 widened the canvas for the y-axis label and the hbar gutter, and
+# did nothing for x-tick spacing — so an uncorrected member of F16's own
+# class survived. In the `blocks` templates the ticks are full ISO
+# timestamps about 103 units wide at 56 units of spacing, and in the
+# forecast chart two ticks sit 1.73 units apart and visually touch.
+#
+# The rule is the class, not the two instances: chart text that does not
+# fit must not collide or clip, wherever it is emitted. This sweep sits
+# beside `test_no_emitted_svg_text_extends_beyond_the_viewbox` and covers
+# the other axis of the same rule.
+# =====================================================================
+
+_S2R_TRANSLATE_GROUP = _re.compile(r'<g transform="translate\(0,[\d.]+\)">')
+_S2R_SVG_BODY = _re.compile(r"<svg\b[^>]*>(.*?)</svg>", _re.DOTALL)
+
+
+def _s2r_text_collisions(document: str):
+    """Every pair of `<text>` boxes that overlap on one baseline.
+
+    Compared per `<svg>` element and, inside a composed stack, per
+    translated section group — two sections legitimately reuse the same
+    local `y`.
+    """
+    offenders = []
+    for body in _S2R_SVG_BODY.findall(document):
+        for segment in _S2R_TRANSLATE_GROUP.split(body):
+            rows: dict = {}
+            for left, right, text, baseline in _s2r_boxes(segment):
+                rows.setdefault(round(baseline, 1), []).append(
+                    (left, right, text))
+            for baseline, items in rows.items():
+                items.sort()
+                for i in range(len(items) - 1):
+                    if items[i][1] > items[i + 1][0] + 0.01:
+                        offenders.append(
+                            (baseline, items[i][2], items[i + 1][2],
+                             round(items[i][1] - items[i + 1][0], 2)))
+    return offenders
+
+
+def _s2r_boxes(segment: str):
+    for raw_attrs, text in _S2_TEXT_RE.findall(segment):
+        attrs = dict(_S2_ATTR_RE.findall(raw_attrs))
+        x = float(attrs["x"])
+        baseline = float(attrs["y"])
+        size = float(attrs["font-size"])
+        anchor = attrs.get("text-anchor", "start")
+        width = _lib_share._svg_text_width(text, size)
+        if anchor == "end":
+            yield (x - width, x, text, baseline)
+        elif anchor == "middle":
+            yield (x - width / 2, x + width / 2, text, baseline)
+        else:
+            yield (x, x + width, text, baseline)
+
+
+@_s2_needs_fixtures
+def test_no_emitted_svg_text_overprints_a_sibling():
+    offenders = []
+    for reveal in (False, True):
+        for tpl in _T2.SHARE_TEMPLATES:
+            svg = _s2_render_template_svg(tpl.id, reveal_projects=reveal)
+            for hit in _s2r_text_collisions(svg):
+                offenders.append((tpl.id, reveal, *hit))
+    assert not offenders, offenders[:10]
+
+
+def test_a_dense_axis_drops_labels_rather_than_overprinting_them():
+    """Twenty full-ISO ticks cannot all fit; the ones that remain must
+    still name the first and the last sample."""
+    points = tuple(
+        ChartPoint(x_label=f"2026-05-{day:02d}T05:00:00Z", x_value=float(i),
+                   y_value=float(i + 1))
+        for i, day in enumerate(range(1, 21))
+    )
+    svg = _lib_share.render(
+        _s2_snapshot(chart=BarChart(points=points, y_label="$ / block"),
+                     columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    assert not _s2r_text_collisions(svg), _s2r_text_collisions(svg)
+    assert "2026-05-01T05:00:00Z" in svg
+    assert "2026-05-20T05:00:00Z" in svg
+
+
+def test_a_two_tick_axis_drops_the_last_rather_than_overprinting_the_first():
+    """The dense case above only exercises twenty ticks.
+
+    With two or three tight ISO ticks the sweep returns a SINGLE label:
+    the last is reserved before the interior ticks are walked, but it is
+    dropped when it cannot coexist with the first. That is the documented
+    behaviour and it was previously untested, so the docstring could have
+    described both endpoints as reserved without anything failing
+    (#503 S2 second review N8).
+    """
+    for count in (2, 3):
+        ticks = [
+            (60.0 + 10.0 * i,
+             "end" if i == count - 1 else "middle",
+             f"2026-05-0{i + 1}T05:00:00Z", 11.0)
+            for i in range(count)
+        ]
+        assert _lib_share._visible_axis_ticks(ticks) == {0}, count
+
+
+def test_the_axis_sweep_reads_left_to_right_whatever_order_it_is_given():
+    """`_render_line_chart_svg` does not sort its points, so a sweep that
+    assumed ascending order dropped the actual leftmost label."""
+    ticks = [(300.0, "middle", "B", 11.0),
+             (60.0, "middle", "A", 11.0),
+             (500.0, "middle", "C", 11.0)]
+    kept = _lib_share._visible_axis_ticks(ticks)
+    assert {ticks[i][2] for i in kept} == {"A", "B", "C"}
+    # Tight enough that only the ends survive — and the ends are the
+    # LEFTMOST and RIGHTMOST samples, not the first and last supplied.
+    tight = [(165.0, "middle", "2026-05-02T05:00:00Z", 11.0),
+             (60.0, "middle", "2026-05-01T05:00:00Z", 11.0),
+             (270.0, "middle", "2026-05-03T05:00:00Z", 11.0)]
+    kept = _lib_share._visible_axis_ticks(tight)
+    assert {tight[i][2] for i in kept} == {"2026-05-01T05:00:00Z",
+                                           "2026-05-03T05:00:00Z"}
+
+
+def test_a_sparse_axis_keeps_every_label():
+    points = tuple(
+        ChartPoint(x_label=str(i), x_value=float(i), y_value=float(i + 1))
+        for i in range(4)
+    )
+    svg = _lib_share.render(
+        _s2_snapshot(chart=BarChart(points=points, y_label="$"),
+                     columns=(), rows=()),
+        format="svg", theme="light", branding=True, reveal_projects=False)
+    for i in range(4):
+        assert f">{i}<" in svg, i
+
+
+# =====================================================================
+# #503 S2 review — F9: defensive gaps on D7's own path.
+# =====================================================================
+
+_S2R_EMPTY_PANEL_KEY = {
+    "trend-recap": "weeks", "trend-visual": "weeks", "trend-detail": "weeks",
+    "daily-recap": "days", "daily-visual": "days", "daily-detail": "days",
+    "monthly-recap": "months", "monthly-visual": "months",
+    "monthly-detail": "months",
+}
+
+
+@_s2_needs_fixtures
+@_s2_pytest.mark.parametrize("template_id", sorted(_S2R_EMPTY_PANEL_KEY))
+def test_an_empty_civil_panel_states_today_in_the_labelled_zone(
+        template_id, monkeypatch):
+    """`_utc_now()` is a real INSTANT, and marking one `civil_bucket=True`
+    tells `period_civil_dates` to skip the conversion — so an empty
+    artifact stated the UTC calendar day under another zone's name."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-09T02:00:00Z")
+    tpl = _T2.get_template(template_id)
+    payload = dict(_s2_panel_data(tpl.panel))
+    payload[_S2R_EMPTY_PANEL_KEY[template_id]] = []
+    for zone, expected in (("Etc/UTC", "2026-05-09"),
+                           ("America/New_York", "2026-05-08"),
+                           ("Asia/Tokyo", "2026-05-09")):
+        options = {
+            "format": "md", "theme": "light", "reveal_projects": False,
+            "no_branding": False, "top_n": _S2_DEFAULT_TOP_N[tpl.panel],
+            "show_chart": True, "show_table": True, "period": None,
+            "project_allowlist": None, "display_tz": zone,
+        }
+        for key, value in tpl.default_options.items():
+            if key not in ("reveal_projects", "theme", "no_branding"):
+                options[key] = value
+        snap = tpl.builder(panel_data=payload, options=options)
+        start_civil, _end = _lib_share.period_civil_dates(snap.period)
+        assert start_civil == expected, (template_id, zone, start_civil)
+
+
+def test_the_dashboard_share_display_tz_is_resolved_not_passed_through():
+    """`_lib_view_models._display_tz_label` returns the literal `local`
+    for a `None` zone, so a panel value used verbatim puts `(local)`
+    back into an artifact."""
+    share = _cctally._load_sibling("_cctally_dashboard_share")
+    for token in ("local", "utc", "", None, "America/New_York"):
+        resolved = share._share_resolved_display_tz(token)
+        assert resolved not in ("local", "utc", ""), token
+        assert _ZoneInfo(resolved).key == resolved, token
+
+
+def test_a_block_derived_period_bound_is_an_instant_that_converts():
+    """A 5-hour block that began at 03:30 UTC on May 5 is May 4 in an
+    American zone — which is what the artifact's own row cell says, and
+    what the CHANGELOG entry for D7 promises. The site used to keep only
+    the UTC date part, naming a day the table does not contain."""
+    five_hour = _s2r_load_sibling("_cctally_five_hour")
+    instant = five_hour._blocks_period_instant("2026-05-05T03:30:00Z")
+    for zone, expected in (("Etc/UTC", "2026-05-05"),
+                           ("America/New_York", "2026-05-04"),
+                           ("Asia/Tokyo", "2026-05-05")):
+        civil_start, _end = _lib_share.period_civil_dates(
+            _lib_share.PeriodSpec(start=instant, end=instant,
+                                  display_tz=zone, label="x"))
+        assert civil_start == expected, (zone, civil_start)
+
+
+def test_a_user_supplied_since_date_is_a_calendar_label():
+    """`--since 2026-05-06` names a civil day in the user's own zone, so
+    it must NOT move when converted — the opposite of a block start."""
+    for zone in ("Etc/UTC", "America/New_York", "Asia/Tokyo"):
+        grounded = _cctally._share_parse_date_to_dt("2026-05-06",
+                                                    _ZoneInfo(zone))
+        civil_start, _end = _lib_share.period_civil_dates(
+            _lib_share.PeriodSpec(start=grounded, end=grounded,
+                                  display_tz=zone, label="x"))
+        assert civil_start == "2026-05-06", zone
+
+
+def test_a_codex_view_label_is_resolved_at_the_share_boundary():
+    """F9's second item, answered where it belongs.
+
+    `_lib_view_models._codex_tz_label` can return an abbreviation such as
+    `EDT`, which `period_civil_dates` cannot load. That value is the
+    dashboard ENVELOPE's display label, whose shape is pinned by oracle
+    tests, so it is resolved at the two share boundaries that turn it
+    into a `PeriodSpec.display_tz` rather than in the envelope wire.
+    """
+    codex = _s2r_load_sibling("_cctally_codex")
+    share = _cctally._load_sibling("_cctally_dashboard_share")
+    now = _dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc)
+
+    class _View:
+        rows = ()
+        total_cost_usd = 0.0
+        total_tokens = 0
+        period_start = None
+        period_end = now
+        display_tz_label = "EDT"
+
+    snap = codex._build_codex_share_snapshot("codex-daily", _View(), ())
+    assert _ZoneInfo(snap.period.display_tz).key == snap.period.display_tz
+    assert snap.period.display_tz not in ("EDT", "local", "utc", "")
+    for token in ("EDT", "IST", "UTC"):
+        resolved = share._share_resolved_display_tz(token)
+        assert _ZoneInfo(resolved).key == resolved, token
+
+
+# =====================================================================
+# #503 S2 third review — one rule, swept over the whole class.
+#
+# "The period an artifact states must describe what that artifact
+# actually displays" shipped as a template-only guard, so it saw 27 of
+# the 43 `ShareSnapshot` construction sites and none of the command-line
+# ones. Four `source-aware` artifacts therefore stated a period NARROWER
+# than their own table — one of them a zero-width instant above a row
+# dated three days earlier — and passed a test whose docstring stated the
+# rule in general terms.
+#
+# The shipped extractor was also blind to a whole cell type: it read
+# dates out of `str` attributes only, so `DateCell.when` — a `datetime` —
+# contributed nothing and `sessions-recap` and `sessions-detail` checked
+# zero cells each. Every sweep below reads the RENDERED BYTES instead of
+# the snapshot graph, which closes that blindness by construction:
+# whatever the artifact prints is what the sweep sees, whichever field it
+# came from.
+#
+# The two directions are separate tests, because they fail for opposite
+# reasons — one artifact understates and another overstates.
+# =====================================================================
+
+_S2T_DATE_TOKEN = _re.compile(
+    r"^(\d{4}-\d{2})(-\d{2})?"
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?$")
+_S2T_HTML_CELL = _re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", _re.DOTALL)
+_S2T_SVG_TEXT = _re.compile(r"<text\b[^>]*>(.*?)</text>", _re.DOTALL)
+_S2T_TAG = _re.compile(r"<[^>]+>")
+_S2T_FACTS_MD = _re.compile(r"^_(\d{4}-\d{2}-\d{2}) → (\d{4}-\d{2}-\d{2}) \(",
+                            _re.M)
+_S2T_FACTS_HTML = _re.compile(
+    r"<div[^>]*>(\d{4}-\d{2}-\d{2}) → (\d{4}-\d{2}-\d{2}) \(")
+_S2T_FRONTMATTER_PERIOD = _re.compile(r"^period: (\S+)\.\.(\S+)$", _re.M)
+
+
+def _s2t_token(text: str) -> "str | None":
+    """`YYYY-MM` or `YYYY-MM-DD` when the WHOLE string is a date.
+
+    Anchored on purpose. A substring match would read a date out of a
+    title (`Weekly recap — week of 2026-05-04`), which names what the
+    artifact is ABOUT rather than what it displays, and out of the facts
+    strip itself.
+    """
+    match = _S2T_DATE_TOKEN.match(text.strip())
+    if match is None:
+        return None
+    return match.group(1) + (match.group(2) or "")
+
+
+def _s2t_plain(fragment: str) -> str:
+    return (_S2T_TAG.sub("", fragment)
+            .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("\\", "").strip())
+
+
+def _s2t_md_dates(markdown: str) -> "list[tuple[str, str]]":
+    """Every date a Markdown fragment's TABLE displays.
+
+    Markdown draws no chart, so its table is the whole of what it
+    displays. Table lines are the only ones read, which is what keeps
+    the title, the strip itself and the frontmatter out.
+    """
+    found = []
+    for line in markdown.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        for cell in line.strip("|").split("|"):
+            token = _s2t_token(cell.replace("\\", "").strip())
+            if token:
+                found.append(("table", token))
+    return found
+
+
+def _s2t_html_dates(document: str) -> "list[tuple[str, str]]":
+    """Every date an HTML fragment displays — its table AND its chart.
+
+    The only `<svg>` in an HTML artifact is the embedded chart, rendered
+    with `include_chrome=False`, so every `<text>` in it is a chart label
+    rather than document chrome.
+    """
+    found = [("table", token)
+             for raw in _S2T_HTML_CELL.findall(document)
+             if (token := _s2t_token(_s2t_plain(raw)))]
+    found += [("chart", token)
+              for raw in _S2T_SVG_TEXT.findall(document)
+              if (token := _s2t_token(_s2t_plain(raw)))]
+    return found
+
+
+def _s2t_sections(document: str, fmt: str) -> "list[tuple[tuple, str]]":
+    """`((start, end), body)` per facts strip, in document order.
+
+    A composed document carries one strip per section, and each section's
+    content follows its own strip. Slicing on the strips is what lets one
+    sweep read a standalone artifact and a composite the same way.
+    """
+    pattern = _S2T_FACTS_MD if fmt == "md" else _S2T_FACTS_HTML
+    marks = list(pattern.finditer(document))
+    out = []
+    for i, mark in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(document)
+        out.append(((mark.group(1), mark.group(2)),
+                    document[mark.end():end]))
+    return out
+
+
+def _s2t_covers(stated: "tuple[str, str]", token: str) -> bool:
+    start, end = stated
+    return start[:len(token)] <= token <= end[:len(token)]
+
+
+def _s2t_offenders(document: str, fmt: str) -> list:
+    """Every displayed date its own section's stated period does not cover."""
+    extract = _s2t_md_dates if fmt == "md" else _s2t_html_dates
+    found = []
+    for stated, body in _s2t_sections(document, fmt):
+        for origin, token in extract(body):
+            if not _s2t_covers(stated, token):
+                found.append((fmt, origin, token, stated))
+    return found
+
+
+def _s2t_counted(document: str, fmt: str) -> int:
+    extract = _s2t_md_dates if fmt == "md" else _s2t_html_dates
+    return sum(len(extract(body))
+               for _stated, body in _s2t_sections(document, fmt))
+
+
+def _s2t_template_sites():
+    for template_id in sorted(t.id for t in _T2.SHARE_TEMPLATES):
+        yield f"template:{template_id}", _s2_build_template(template_id)
+
+
+def _s2t_builder_sites():
+    """The `ShareSnapshot` sites outside the template registry and the CLI.
+
+    Constructed here rather than reached through `_S2R_PERIOD_DRIVERS`,
+    which returns period facts rather than snapshots.
+    """
+    import types as _types
+    forecast = _cctally._load_sibling("_cctally_forecast")
+    dash = _cctally._load_sibling("_cctally_dashboard_share")
+    analytics = _cctally._load_sibling("_cctally_source_analytics")
+    codex = _cctally._load_sibling("_cctally_codex")
+    lib = _cctally._share_load_lib()
+    result_cls = _s2r_load_sibling("_lib_source_analytics").SourceResult
+
+    args = _s2r_budget_args("Etc/UTC")
+    inputs = _types.SimpleNamespace(
+        week_start_at=_dt2.datetime(2026, 5, 4, 15, 0,
+                                    tzinfo=_dt2.timezone.utc),
+        week_end_at=_dt2.datetime(2026, 5, 11, 15, 0,
+                                  tzinfo=_dt2.timezone.utc),
+        target_usd=50.0)
+    status = _types.SimpleNamespace(
+        spent_usd=10.0, consumption_pct=20.0, remaining_usd=40.0,
+        daily_pace_usd=2.0, verdict="ok", low_confidence=False,
+        projected_eow_low_usd=35.0, projected_eow_high_usd=40.0)
+    now = _dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc)
+
+    previous = os.environ.get("CCTALLY_AS_OF")
+    os.environ["CCTALLY_AS_OF"] = "2026-05-09T12:00:00Z"
+    try:
+        yield ("forecast:_build_budget_snapshot",
+               forecast._build_budget_snapshot(
+                   args, {"weekly_usd": 50.0}, inputs, status,
+                   tz=_ZoneInfo("Etc/UTC")))
+        yield ("forecast:_build_budget_no_data_snapshot",
+               forecast._build_budget_no_data_snapshot(
+                   args, {"weekly_usd": 50.0}, now))
+        yield ("forecast:_build_budget_no_budget_snapshot",
+               forecast._build_budget_no_budget_snapshot(args))
+    finally:
+        if previous is None:
+            os.environ.pop("CCTALLY_AS_OF", None)
+        else:
+            os.environ["CCTALLY_AS_OF"] = previous
+
+    for panel in _S2R_CODEX_SOURCE_PANELS:
+        for case, bucketed in (("bucketed", True), ("unbucketed", False)):
+            yield (f"dashboard:codex-source:{panel}:{case}",
+                   dash._build_codex_source_share_snapshot(
+                       lib, state=_s2r_codex_source_state(bucketed),
+                       panel=panel, template_id=f"{panel}-recap",
+                       options={"format": "md", "theme": "light",
+                                "reveal_projects": False,
+                                "display_tz": "Etc/UTC"}))
+
+    yield ("analytics:build_source_share_snapshot",
+           analytics.build_source_share_snapshot(
+               "range-cost",
+               result_cls(source="codex", status="unavailable",
+                          data={"rangeStart": "2026-05-04T00:00:00Z",
+                                "rangeEnd": "2026-05-09T12:00:00Z"}),
+               reveal_projects=False))
+
+    view = _types.SimpleNamespace(
+        period_start=_dt2.datetime(2026, 5, 4, tzinfo=_dt2.timezone.utc),
+        period_end=_dt2.datetime(2026, 5, 9, 12, 0, tzinfo=_dt2.timezone.utc),
+        period_civil_bucket=True, display_tz_label="Etc/UTC",
+        total_cost_usd=1.0)
+    yield ("codex:_build_codex_share_snapshot",
+           codex._build_codex_share_snapshot("codex-daily", view, ()))
+
+
+_S2T_CLI_SITES = (
+    ("report-md", "report"),
+    ("daily-md", "daily"),
+    ("monthly-md", "monthly"),
+    ("weekly-md", "weekly"),
+    ("session-md", "session"),
+    ("forecast-md", "forecast"),
+    ("project-md-anon", "project"),
+    ("five-hour-blocks-md", "five-hour-blocks"),
+)
+
+
+def _s2t_render(snap, fmt: str) -> str:
+    return _lib_share.render(snap, format=fmt, theme="light", branding=True,
+                             reveal_projects=False)
+
+
+def _s2t_all_sites():
+    return list(_s2t_template_sites()) + list(_s2t_builder_sites())
+
+
+@_s2_needs_fixtures
+def test_every_snapshot_site_states_a_period_covering_what_it_displays():
+    """NEVER NARROWER THAN THE CONTENT — every driveable builder site.
+
+    The shipped guard enumerated `_T2.SHARE_TEMPLATES` only, so the
+    command-line, budget, Codex and source-aware builders were outside
+    it entirely.
+    """
+    offenders = []
+    checked = 0
+    sites = _s2t_all_sites()
+    assert len(sites) >= 35, len(sites)
+    for where, snap in sites:
+        for fmt in ("md", "html"):
+            document = _s2t_render(snap, fmt)
+            checked += _s2t_counted(document, fmt)
+            offenders += [(where, *o) for o in _s2t_offenders(document, fmt)]
+    assert checked > 250, f"vacuous: only {checked} displayed dates were found"
+    assert not offenders, offenders[:12]
+
+
+@_s2r_needs_share_fixtures
+def test_every_cli_artifact_states_a_period_covering_what_it_displays(tmp_path):
+    """The same rule, driven through the real command line.
+
+    These eight builders live in `bin/_cctally_share.py`, and none of
+    them is constructible from a literal, so they are observed through
+    the artifact the CLI actually writes. Markdown only: the HTML and
+    SVG forms of these same commands are covered by the committed-corpus
+    sweep below, and `--format html` writes to a file rather than to
+    stdout.
+    """
+    offenders = []
+    checked = 0
+    for scenario, command in _S2T_CLI_SITES:
+        document = _s2r_run_cli(scenario, command, tz="Etc/UTC",
+                                tmp_path=tmp_path)
+        checked += _s2t_counted(document, "md")
+        offenders += [(scenario, *o) for o in _s2t_offenders(document, "md")]
+    assert checked > 12, f"vacuous: only {checked} displayed dates were found"
+    assert not offenders, offenders[:12]
+
+
+_S2T_CORPUS_ROOTS = ("share", "share-v2", "source-aware", "budget")
+# The census, MEASURED over the committed tree rather than predicted from
+# any manifest. Exact rather than a floor, because the failure it replaces
+# was a whole family leaving the sweep unnoticed, and a floor cannot
+# observe that. Changing a count here is a deliberate act: a new golden
+# family is added to the census in the same commit that adds the family.
+_S2T_CORPUS_CENSUS = {"md": 133, "html": 122, "svg": 120}
+# The files whose NAME carries no format token. They are what the previous
+# filename classifier could not see; counted so this sweep cannot quietly
+# stop reaching them.
+_S2T_CORPUS_UNHINTED = 20
+
+
+def _s2t_has_format_hint(name: str) -> bool:
+    """Whether a filename states the format of the artifact inside it."""
+    return (".md" in name or ".html" in name or ".svg" in name
+            or name.endswith("-md-light.txt"))
+
+
+def _s2t_artifact_format(text: str) -> "str | None":
+    """The format a committed file IS, read from its own bytes.
+
+    Classifying by FILENAME is what let a whole family out of the sweep.
+    The nine `share-v2/compose` goldens are named `all-anon.golden`,
+    `dark-composite-html.golden`, `no-branding-stripped.golden` and so on,
+    and eleven `budget/*.txt` goldens spell their format with dashes
+    (`golden-fmt-md-anon.txt`), so `".md" in name` / `".html" in name`
+    excluded fifteen committed Markdown and HTML artifacts. Among them:
+    every compose golden — the family the composite-period sweep below is
+    named for — and `no-branding-stripped.golden`, the one golden whose
+    stated period narrowed in this session's fourth round.
+    """
+    stripped = text.lstrip()
+    if stripped.startswith("<svg"):
+        return "svg"
+    if stripped[:20].lower().startswith("<!doctype html"):
+        return "html"
+    # Every committed Markdown artifact opens with frontmatter; the facts
+    # strip is the second reading, so a fragment golden would still be
+    # seen. Neither matches this repository's prose Markdown — a
+    # `CHANGELOG.md` or the delta ledger — which the filename rule read as
+    # an artifact and then discarded on an empty section list.
+    if text.startswith("---\n") or _S2T_FACTS_MD.search(text):
+        return "md"
+    return None
+
+
+def _s2t_corpus():
+    """Every committed share artifact in the tree, classified by CONTENT.
+
+    The live sweeps above prove the MECHANISM on the sites a test can
+    drive. This one proves the RESULT on what the repository actually
+    ships, including the four `source-aware` composites whose builders no
+    literal reconstructs — which is where the defect was.
+    """
+    root = _REPO_ROOT / "tests" / "fixtures"
+    for name in _S2T_CORPUS_ROOTS:
+        base = root / name
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                # The v1 share fixtures commit their SQLite databases
+                # beside their goldens.
+                continue
+            fmt = _s2t_artifact_format(text)
+            if fmt is not None:
+                yield path, fmt
+
+
+@_s2_needs_fixtures
+def test_the_committed_artifact_corpus_is_a_census_no_family_drops_out_of():
+    """Every shipped artifact reaches the sweeps, whatever it is named.
+
+    Two independent measurements of this corpus disagreed and are
+    reconciled here. A review counted fifteen excluded artifacts by hand;
+    a browser round re-extracted by content and reported 375 artifacts
+    with a larger unhinted set. Both are readings of the same tree: 375
+    artifacts exist, 20 of them carry no format token in their filename,
+    and 15 of those 20 are Markdown or HTML — which is the set the two
+    period sweeps below were missing.
+    """
+    seen = {"md": 0, "html": 0, "svg": 0}
+    unhinted = []
+    for path, fmt in _s2t_corpus():
+        seen[fmt] += 1
+        if not _s2t_has_format_hint(path.name):
+            unhinted.append((fmt, path.relative_to(_REPO_ROOT).as_posix()))
+    assert seen == _S2T_CORPUS_CENSUS, seen
+    assert len(unhinted) == _S2T_CORPUS_UNHINTED, unhinted
+    # Named rather than merely counted: these are the two families a
+    # filename rule cannot classify, so their presence is what proves the
+    # sniff is doing the work.
+    assert sum(1 for _f, p in unhinted if "/compose/" in p) == 9, unhinted
+    assert sum(1 for _f, p in unhinted if "/budget/" in p) == 11, unhinted
+
+
+@_s2_needs_fixtures
+def test_every_committed_artifact_states_a_period_covering_what_it_displays():
+    """NEVER NARROWER THAN THE CONTENT — over the shipped corpus."""
+    offenders = []
+    checked = 0
+    documents = 0
+    for path, fmt in _s2t_corpus():
+        if fmt == "svg":
+            # SVG chrome is `<text>` too, so its displayed dates are not
+            # structurally separable; `test_svg_and_html_state_the_same_
+            # period_for_the_same_snapshot` anchors that format instead.
+            continue
+        document = path.read_text(encoding="utf-8")
+        if not _s2t_sections(document, fmt):
+            continue
+        documents += 1
+        checked += _s2t_counted(document, fmt)
+        offenders += [(path.relative_to(_REPO_ROOT).as_posix(), *o)
+                      for o in _s2t_offenders(document, fmt)]
+    assert documents > 240, f"vacuous: only {documents} artifacts were read"
+    assert checked > 700, f"vacuous: only {checked} displayed dates were found"
+    assert not offenders, offenders[:12]
+
+
+@_s2_needs_fixtures
+def test_a_composed_markdown_period_covers_every_section_it_carries():
+    """The frontmatter's union is the document's own claim about itself.
+
+    The union is only a UNION in a document that carries more than one
+    section, so a floor over all checks is satisfied by single-section
+    artifacts that state the same period twice. `composite_checks` counts
+    the sections that belong to a multi-section document, and is what
+    makes this test non-vacuous about the composed case it is named for.
+    """
+    offenders = []
+    checked = 0
+    composite_checks = 0
+    for path, fmt in _s2t_corpus():
+        if fmt != "md":
+            continue
+        document = path.read_text(encoding="utf-8")
+        declared = _S2T_FRONTMATTER_PERIOD.search(document)
+        sections = _s2t_sections(document, "md")
+        if declared is None or not sections:
+            continue
+        span = (declared.group(1)[:10], declared.group(2)[:10])
+        for stated, _body in sections:
+            checked += 1
+            if len(sections) > 1:
+                composite_checks += 1
+            if not (_s2t_covers(span, stated[0])
+                    and _s2t_covers(span, stated[1])):
+                offenders.append(
+                    (path.relative_to(_REPO_ROOT).as_posix(), span, stated))
+    assert checked > 140, f"vacuous: only {checked} sections were checked"
+    assert composite_checks > 35, (
+        f"vacuous for COMPOSED documents: only {composite_checks} of "
+        f"{checked} checked sections came from a multi-section artifact")
+    assert not offenders, offenders[:12]
+
+
+@_s2_needs_fixtures
+def test_no_markdown_period_is_widened_by_a_chart_markdown_never_draws():
+    """NEVER WIDER THAN WHAT THAT FORMAT SHOWS.
+
+    Markdown renders no chart, so a chart may not move what a Markdown
+    artifact says about itself. Observed by rendering each snapshot twice
+    — once as built and once with its chart removed — and requiring the
+    two Markdown artifacts to state the same period. The second render is
+    what makes this non-tautological: the same code path, with one input
+    taken away.
+
+    The defect this closes: `weekly-recap`, `weekly-visual`,
+    `blocks-recap` and `blocks-visual` stated the span their CHART covers
+    above a Markdown document that draws no chart at all, so
+    `weekly-recap` claimed `2026-03-16 → 2026-05-10` above one week's
+    spend and `blocks-recap` claimed thirty-four hours above one block's.
+    """
+    offenders = []
+    charted = 0
+    for where, snap in _s2t_all_sites():
+        if snap.chart is None:
+            continue
+        charted += 1
+        with_chart = _s2t_sections(_s2t_render(snap, "md"), "md")[0][0]
+        without = _s2t_sections(
+            _s2t_render(_dc.replace(snap, chart=None), "md"), "md")[0][0]
+        if with_chart != without:
+            offenders.append((where, with_chart, without))
+    assert charted >= 20, f"vacuous: only {charted} snapshots carry a chart"
+    assert not offenders, offenders[:12]
+
+
+# A panel whose declared window IS the span of its records: `daily`'s
+# days, `monthly`'s months, `trend`'s weeks, `sessions`' sessions and
+# `forecast`'s projection curve. Their TABLES draw that span in every
+# format, so declaring it is a correct statement rather than an
+# overstatement, and there is no smaller record to reduce them to.
+_S2T_WINDOW_IS_THE_SPAN = frozenset(
+    {"daily", "monthly", "trend", "sessions", "forecast"})
+# A panel whose declared window is ABOUT one focal record, with the rest
+# of its data drawn by some formats and not others.
+_S2T_FOCAL_PANELS = frozenset({"weekly", "blocks", "current-week", "projects"})
+
+
+def _s2t_focal_panel_data(panel: str, data: dict) -> "dict | None":
+    """`panel_data` reduced to the records the panel's window is ABOUT.
+
+    `None` for a panel in `_S2T_WINDOW_IS_THE_SPAN`, which has no smaller
+    record to reduce to. `top_projects` is emptied wherever it appears: a
+    cost ranking is never what a window is about.
+    """
+    if panel in _S2T_WINDOW_IS_THE_SPAN:
+        return None
+    trimmed = dict(data)
+    if isinstance(trimmed.get("top_projects"), list):
+        trimmed["top_projects"] = []
+    if panel == "weekly":
+        trimmed["weeks"] = [data["weeks"][data.get("current_week_index", 0)]]
+        trimmed["current_week_index"] = 0
+    elif panel == "blocks":
+        trimmed["recent_blocks"] = []       # the focal record is current_block
+    elif panel == "current-week":
+        trimmed["daily_progression"] = []   # the focal record is the week
+    elif panel == "projects":
+        trimmed["rows"] = []                # explicit period_start/period_end
+    return trimmed
+
+
+@_s2_needs_fixtures
+def test_no_declared_period_depends_on_history_the_focal_record_excludes():
+    """NEVER WIDER — the rule, at the BUILDER, across every template.
+
+    The overstatement lived in the builder's declared period, and the
+    chart-removal sweep above cannot see it: restore the previous pass's
+    `_weekly_period_bounds` and `_blocks_period_bounds` and that test
+    still passes, because removing the chart does not change what the
+    builder declared. Its only detector was six hardcoded parametrized
+    expectations, which is the fixed-instance shape this epic keeps
+    recording as the wrong answer.
+
+    The checkable rule is the one those builders' docstrings state: the
+    declared window must not depend on history the narrowest format does
+    not draw. Observed by rebuilding each template from `panel_data`
+    trimmed to the focal record and requiring the declared period to be
+    unchanged — the same code path, with the surrounding history taken
+    away.
+
+    Every panel must be classified into one of the two sets, so a panel
+    added later cannot be silently skipped.
+    """
+    panels = {tpl.panel for tpl in _T2.SHARE_TEMPLATES}
+    assert panels == _S2T_WINDOW_IS_THE_SPAN | _S2T_FOCAL_PANELS, panels
+    covered = 0
+    offenders = []
+    for tpl in sorted(_T2.SHARE_TEMPLATES, key=lambda t: t.id):
+        trimmed = _s2t_focal_panel_data(tpl.panel, _s2_panel_data(tpl.panel))
+        if trimmed is None:
+            continue
+        covered += 1
+        full = _s2_build_template(tpl.id).period
+        focal = _s2_build_template(tpl.id, panel_data=trimmed).period
+        if ((full.start, full.end, full.civil_bucket)
+                != (focal.start, focal.end, focal.civil_bucket)):
+            offenders.append((tpl.id, (full.start, full.end),
+                              (focal.start, focal.end)))
+    assert covered >= 12, f"vacuous: only {covered} templates were rebuilt"
+    assert not offenders, offenders
+
+
+@_s2_needs_fixtures
+def test_svg_and_html_state_the_same_period_for_the_same_snapshot():
+    """The two formats display the same chart and the same table.
+
+    SVG's own chrome makes a text-level extraction of its DISPLAYED dates
+    unreliable — its title, facts strip, timestamp, totals and footer are
+    `<text>` elements too — so its leg of the sweep is anchored to HTML,
+    whose data regions are structurally identifiable.
+    """
+    for where, snap in _s2t_all_sites():
+        html = _s2t_sections(_s2t_render(snap, "html"), "html")[0][0]
+        svg_line = next(_s2t_plain(raw)
+                        for raw in _S2T_SVG_TEXT.findall(
+                            _s2t_render(snap, "svg"))
+                        if "→" in raw)
+        start, rest = svg_line.split(" → ", 1)
+        assert html == (start.strip(), rest.split(" (", 1)[0].strip()), where
+
+
+@_s2_needs_fixtures
+def test_a_markdown_period_is_never_wider_than_its_own_html_period():
+    """HTML displays everything Markdown does, plus the chart.
+
+    So Markdown's stated period is bounded by HTML's on both sides. The
+    reverse — Markdown claiming a span HTML does not — is the shape the
+    overstatement took.
+    """
+    for where, snap in _s2t_all_sites():
+        md = _s2t_sections(_s2t_render(snap, "md"), "md")[0][0]
+        html = _s2t_sections(_s2t_render(snap, "html"), "html")[0][0]
+        assert html[0] <= md[0] and md[1] <= html[1], (where, md, html)
+
+
+@_s2_needs_fixtures
+@_s2_pytest.mark.parametrize(
+    "template_id,markdown,rich",
+    [
+        # The focal week, above one week's spend, in a format that draws
+        # no chart — and the charted eight weeks where the chart exists.
+        ("weekly-recap", ("2026-05-04", "2026-05-10"),
+         ("2026-03-16", "2026-05-10")),
+        ("weekly-visual", ("2026-05-04", "2026-05-10"),
+         ("2026-03-16", "2026-05-10")),
+        # `weekly-detail`'s TABLE carries the eight weeks, and a table is
+        # drawn in every format, so this one does not differ.
+        ("weekly-detail", ("2026-03-16", "2026-05-10"),
+         ("2026-03-16", "2026-05-10")),
+        ("blocks-recap", ("2026-05-08", "2026-05-08"),
+         ("2026-05-07", "2026-05-08")),
+        ("blocks-visual", ("2026-05-08", "2026-05-08"),
+         ("2026-05-07", "2026-05-08")),
+        ("blocks-detail", ("2026-05-07", "2026-05-08"),
+         ("2026-05-07", "2026-05-08")),
+    ],
+)
+def test_the_weekly_and_blocks_panels_state_the_span_each_format_draws(
+        template_id, markdown, rich):
+    """The four artifacts the overstatement was measured on, plus their
+    two siblings whose tables make the wide span genuine."""
+    snap = _s2_build_template(template_id)
+    assert _s2t_sections(_s2t_render(snap, "md"), "md")[0][0] == markdown
+    assert _s2t_sections(_s2t_render(snap, "html"), "html")[0][0] == rich
+
+
+# =====================================================================
+# #503 S2 fourth review — the END side of the completion.
+#
+# `effective_period` widens both bounds to midnight of the widened civil
+# date. That is the minimal bound consistent with the strip on the START
+# side and WRONG on the end side, twice over:
+#
+#   * A displayed value may be a full ISO INSTANT — the Codex quota
+#     `blocks` panel's `Resets` column prints `2026-05-07T18:00:00+00:00`
+#     — and midnight of its own day precedes it, so the machine-readable
+#     frontmatter bound excluded content the civil date admits.
+#   * `2026-05` widened to `2026-05-01` is right as a start bound and
+#     backwards as an end bound: a displayed May bucket above an earlier
+#     period ended the stated window on the first of the month.
+#
+# Neither is reachable through a committed golden, so both are asserted
+# at the kernel.
+# =====================================================================
+
+def _s2t_period(start, end, *, civil_bucket=False, display_tz="Etc/UTC"):
+    return _lib_share.PeriodSpec(start=start, end=end, label="window",
+                                 display_tz=display_tz,
+                                 civil_bucket=civil_bucket)
+
+
+def _s2t_snapshot_with_period(period, *, columns, rows, chart=None):
+    return ShareSnapshot(
+        cmd="blocks", title="Quota blocks", subtitle=None, period=period,
+        columns=columns, rows=rows, chart=chart, totals=(), notes=(),
+        generated_at=_S2_GENERATED_AT, version="9.9.9")
+
+
+def test_a_widened_end_bound_covers_the_instant_the_artifact_prints():
+    """An end completed from an INSTANT must not precede that instant.
+
+    The `Resets` column renders a raw ISO timestamp, so the artifact
+    displays the instant itself rather than a date derived from it. The
+    stated civil date must not move — that is what a next-midnight bound
+    would break — while the machine bound must reach the value on the
+    page.
+    """
+    printed = _dt2.datetime(2026, 5, 8, 10, 0, tzinfo=_dt2.timezone.utc)
+    period = _s2t_period(
+        _dt2.datetime(2026, 5, 7, 5, 0, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 5, 7, 10, 0, tzinfo=_dt2.timezone.utc))
+    snap = _s2t_snapshot_with_period(
+        period,
+        columns=(ColumnSpec(key="resets", label="Resets", align="left"),),
+        rows=(Row(cells={"resets": TextCell(
+            printed.isoformat().replace("+00:00", "+00:00"))}),))
+    widened = _lib_share.effective_period(snap, shows_chart=False,
+                                          shows_table=True)
+    assert _lib_share.period_civil_dates(widened) == ("2026-05-07",
+                                                      "2026-05-08")
+    assert widened.end >= printed, widened.end
+
+
+def test_a_widened_end_bound_from_a_month_bucket_covers_the_whole_month():
+    """`2026-05` as an END bound is the last of May, not the first."""
+    period = _s2t_period(
+        _dt2.datetime(2026, 4, 1, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 4, 30, tzinfo=_dt2.timezone.utc),
+        civil_bucket=True)
+    snap = _s2t_snapshot_with_period(
+        period,
+        columns=(ColumnSpec(key="month", label="Month", align="left"),),
+        rows=(Row(cells={"month": TextCell("2026-05")}),))
+    widened = _lib_share.effective_period(snap, shows_chart=False,
+                                          shows_table=True)
+    assert _lib_share.period_civil_dates(widened) == ("2026-04-01",
+                                                      "2026-05-31")
+
+
+def test_a_widened_start_bound_still_names_the_first_of_its_month():
+    """The start side is unchanged: a month bucket opens on the first."""
+    period = _s2t_period(
+        _dt2.datetime(2026, 6, 1, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 6, 30, tzinfo=_dt2.timezone.utc),
+        civil_bucket=True)
+    snap = _s2t_snapshot_with_period(
+        period,
+        columns=(ColumnSpec(key="month", label="Month", align="left"),),
+        rows=(Row(cells={"month": TextCell("2026-05")}),))
+    widened = _lib_share.effective_period(snap, shows_chart=False,
+                                          shows_table=True)
+    assert _lib_share.period_civil_dates(widened) == ("2026-05-01",
+                                                      "2026-06-30")
+
+
+def test_displayed_dates_reads_every_series_a_bar_chart_draws():
+    """`_chart_points` claimed completeness it did not have.
+
+    It read `points` and `multi_series` while `BarChart` also carries
+    `stacks`, which `_render_bar_chart_svg` draws as cumulative segments.
+    No shipped builder exercises the gap — `_build_weekly_snapshot`
+    builds its stack points from the same `week_label` values as
+    `points` — but it is the same blindness the `DateCell` walk had, and
+    the docstring asserted the coverage either way.
+    """
+    chart = BarChart(
+        points=(ChartPoint(x_label="2026-05-04", x_value=0.0, y_value=1.0),),
+        y_label="$",
+        stacks={"opus": (ChartPoint(x_label="2026-05-11", x_value=0.0,
+                                    y_value=1.0),)})
+    snap = _s2t_snapshot_with_period(
+        _s2t_period(_dt2.datetime(2026, 5, 4, tzinfo=_dt2.timezone.utc),
+                    _dt2.datetime(2026, 5, 10, tzinfo=_dt2.timezone.utc),
+                    civil_bucket=True),
+        columns=(), rows=(), chart=chart)
+    tokens = _lib_share.displayed_dates(snap, shows_chart=True,
+                                        shows_table=False)
+    assert "2026-05-11" in tokens, tokens
+    widened = _lib_share.effective_period(snap, shows_chart=True,
+                                          shows_table=False)
+    assert _lib_share.period_civil_dates(widened)[1] == "2026-05-11"

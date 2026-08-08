@@ -100,6 +100,23 @@ Database
         conversations_db_freelist_count: None
         conversations_db_free_ratio: None
         warn_ratio: 0.25
+  ✗ Retained evidence        retention policy in config.json is malformed — automatic reclaim is off
+      → Fix or remove the storage.artifact_retention block: config.json could not be read: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+      details:
+        policyStatus: malformed
+        policyReason: config.json could not be read: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+        scanned: False
+        retainedBytes: None
+        reclaimableBytes: None
+        protectedBytes: None
+        protectedRoots: None
+        roots: None
+        freeDiskBytes: None
+        partialScan: False
+        unsatisfiedRules: []
+        floorRetainedRoots: None
+        floorRetainedBytes: None
+        stuckRecords: []
 Journal
   ✓ Journal                  no journal (pre-cutover install)
       details:
@@ -113,6 +130,11 @@ Journal
   ✓ Auto-heal                no auto-heal incidents
       details:
         incidents: 0
+        detections: 0
+        recentDetections: 0
+        windowDays: 7
+        repeatedShapes: []
+        latest: None
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
       details:
         entries: 0
@@ -263,4 +285,4 @@ Telemetry
         enabled: True
         reason: enabled
 
-Summary: 51 OK · 7 WARN · 1 FAIL
+Summary: 51 OK · 7 WARN · 2 FAIL

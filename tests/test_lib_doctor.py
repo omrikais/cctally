@@ -121,6 +121,13 @@ def test_doctor_state_has_required_fields():
         "codex_replay_pending", "codex_replay_blocked", "codex_replay_deferred",
         # #485: privacy-safe unsafe-orphan-prune refusal records.
         "codex_prune_refusals",
+        # #496 S6 §7.2: the durable heal ring, read as DETECTIONS. A detection
+        # is not an incident — a declined or coalesced one writes a ring entry
+        # and no quarantine directory at all, and only the ring reports a rate.
+        "journal_heal_detections",
+        # #496 S6 §7.3: the read-only retention scan and plan behind
+        # db.retained_artifacts.
+        "retained_artifacts",
     }
     assert fields == expected, fields ^ expected
 
@@ -1643,9 +1650,21 @@ def test_db_integrity_stats_corrupt_is_fail_no_delete():
         cache_db_quick_check="database disk image is malformed",
         conversations_db_quick_check="file is not a database"))
     assert r.severity == "fail"
-    assert "backup" in r.remediation.lower() or "back up" in r.remediation.lower()
+    remediation = r.remediation.lower()
+    # #496 S6 F21: BOTH cases, stated positively. This used to pin the word
+    # "backup", which is vocabulary rather than behaviour — it turned the suite
+    # red on a rewording that changed nothing, while never checking the leg
+    # F21 actually requires, the journal-backed branch.
+    assert "cctally db rebuild --db stats" in remediation, (
+        "the journal-backed branch is not stated: with retained journal data "
+        "stats.db is a disposable index and rebuild is the answer"
+    )
+    assert "journal" in remediation
+    assert "only copy" in remediation, (
+        "the pre-cutover branch is not stated"
+    )
     assert "cctally db repair --db stats --yes" in r.remediation
-    assert "delete" in r.remediation.lower()  # "Do not delete"
+    assert "do not" in remediation and "delete" in remediation
 
 
 def test_db_integrity_cache_corrupt_stats_ok_is_warn():

@@ -61,8 +61,7 @@ def test_share_account_selection_validates():
 def test_account_participates_in_data_digest():
     common = dict(
         panel="weekly", template_id="weekly-default", source="claude",
-        source_explicit=False, states=(), snapshots=(),
-        panel_data={"rows": [1, 2, 3]},
+        snapshots=(), ls=_lib_share,
     )
     none_input = share._share_digest_input(**common, account=None)
     a_input = share._share_digest_input(**common, account=A)

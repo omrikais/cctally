@@ -560,8 +560,12 @@ def test_stats_commands_return_retry_guidance_instead_of_partial_output(
 
 def test_cli_exits_3_while_a_corruption_heal_runs_in_the_background(runtime):
     """The widened CLI boundary must give retry guidance, not a raw traceback
-    and not the pre-#496 "Not auto-recreated — run db repair" wording, which is
-    false once a worker is running."""
+    and not the pre-cutover "never auto-recreated — run db repair" wording,
+    which is false once a worker is running.
+
+    #496 S6 F21 reworded that message, so the negative assertion below tracks
+    the CURRENT wording. Asserting the absence of a phrase the product no
+    longer emits anywhere would pass by construction."""
     ns, core, _db, _store = runtime
     import _cctally_journal as journal
     import _lib_journal as wire
@@ -601,7 +605,8 @@ def test_cli_exits_3_while_a_corruption_heal_runs_in_the_background(runtime):
     assert elapsed < 30.0
     assert result.stdout == ""
     assert "corruption rebuild is running in the background" in result.stderr
-    assert "Not auto-recreated" not in result.stderr
+    assert "never auto-recreated" not in result.stderr
+    assert "db repair --db stats --yes" not in result.stderr
 
 
 @pytest.mark.parametrize(

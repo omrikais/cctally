@@ -703,6 +703,8 @@ _share_history_recipe_id = _cctally_share._share_history_recipe_id
 _share_resolve_version = _cctally_share._share_resolve_version
 _share_period_label = _cctally_share._share_period_label
 _share_parse_date_to_dt = _cctally_share._share_parse_date_to_dt
+_share_display_zone = _cctally_share._share_display_zone
+_share_ground_civil_date = _cctally_share._share_ground_civil_date
 _share_display_tz_label = _cctally_share._share_display_tz_label
 _build_report_snapshot = _cctally_share._build_report_snapshot
 _build_daily_snapshot = _cctally_share._build_daily_snapshot
@@ -1002,6 +1004,13 @@ cmd_stats_epoch_rebuild_internal = (
 cmd_stats_corruption_heal_internal = (
     _cctally_store.cmd_stats_corruption_heal_internal
 )
+# #496 S6: the retained-artifact reclamation worker and `cctally db prune`
+# share one sweep implementation, so both resolve through the same sibling.
+_cctally_retention = _load_sibling("_cctally_retention")
+cmd_artifact_retention_internal = (
+    _cctally_retention.cmd_artifact_retention_internal
+)
+cmd_db_prune = _cctally_retention.cmd_db_prune
 _print_migration_error_banner_if_needed = _cctally_db._print_migration_error_banner_if_needed
 cmd_db_status = _cctally_db.cmd_db_status
 _db_status_for = _cctally_db._db_status_for
@@ -3346,9 +3355,13 @@ def main(argv: list[str] | None = None) -> int:
         eprint(f"{exc}")  # message already carries the 'cctally:' prefix
         return 2
     except StatsDbCorruptError as exc:
-        # #279 S1 F4: corrupt stats.db (non-re-derivable) — one-line diagnosis
-        # + recovery guidance, exit 2. Caught before the generic handler so it
-        # never renders as a raw traceback.
+        # #279 S1 F4: corrupt stats.db — one-line diagnosis + recovery
+        # guidance, exit 3. Caught before the generic handler so it never
+        # renders as a raw traceback. With retained journal data stats.db is a
+        # disposable index the heal hook rebuilds; this handler is reached when
+        # that did not resolve it, and the message it prints distinguishes the
+        # rebuild from the pre-cutover case where stats.db may be the only copy
+        # of the recorded history.
         eprint(f"cctally: {exc}")
         return 3
     except StatsDbMaintenanceError as exc:
@@ -3405,6 +3418,25 @@ def main(argv: list[str] | None = None) -> int:
     # current command failed.
     try:
         _post_command_update_hooks(getattr(args, "command", None), args)
+    except Exception:
+        pass
+    # #496 S6 §5.2. Its own try/except and its own admission predicate: an
+    # automatic reclamation must never perturb the command the user ran, and
+    # the predicate is what keeps it off `statusline`, `doctor`, every hidden
+    # worker, every failed command and `db prune` in every mode. `hook-tick`
+    # is admitted from inside its own FORKED CHILD, never here — the parent
+    # returns before the body runs, and the inline fallback is on Claude
+    # Code's blocking path.
+    try:
+        _cctally_retention.maybe_defer_artifact_retention(
+            command=getattr(args, "command", None),
+            action=getattr(args, "db_action", None),
+            exit_code=rc,
+            # `db journal-repair` and `db rederive` are preview-by-default, and
+            # the former's preview carries a literal no-mutation contract that
+            # the update hook above already honours by skipping it entirely.
+            applied=getattr(args, "yes", None),
+        )
     except Exception:
         pass
     return rc
@@ -3486,7 +3518,7 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         return
     if command in ("_update-check", "_telemetry-beat", "_codex-quota-verify",
                    "_stats-epoch-rebuild", "_stats-corruption-heal",
-                   "_codex-replay-drain"):
+                   "_codex-replay-drain", "_artifact-retention"):
         # All six hidden workers are detached and have already done their one job
         # in their own command handler; none must re-enter this hook.
         # Without the guard the ``_update-check`` worker would fall through to

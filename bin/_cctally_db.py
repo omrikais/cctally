@@ -270,9 +270,15 @@ class StatsDbCorruptError(sqlite3.DatabaseError):
     dashboard/TUI background threads, the 5h-anchor fallback) keep treating it
     as a DB failure exactly as before — but command-level handlers that map DB
     errors to OTHER exit codes must re-raise it so the global staged diagnosis
-    wins (``cmd_record_credit`` does; its documented DB-error exit is 3). NOT
-    auto-recreated: stats.db is the non-re-derivable DB (recorded usage
-    history), unlike cache.db.
+    wins (``cmd_record_credit`` does; its documented DB-error exit is 3).
+
+    stats.db is never auto-recreated the way cache.db is, and the reason is
+    NOT that it is undrivable. With retained journal data it is a disposable
+    index and the classifier-gated heal rebuilds it from the journal, losing
+    nothing. The refusal exists for the pre-cutover install with no retained
+    journal data, whose stats.db may be the only copy of its recorded history:
+    an empty recreate there would destroy it silently, so the guided repair
+    path runs instead.
     """
 
 
@@ -280,7 +286,7 @@ class StatsPublicationFailedError(StatsDbCorruptError):
     """A replacement stats index was published and then FAILED validation.
 
     Distinct from ``StatsDbCorruptError``'s ordinary case because replacement
-    already occurred, so the inherited "Not auto-recreated" wording would be
+    already occurred, so the inherited "never auto-recreated" wording would be
     false. Subclasses it deliberately: every graceful-degrade site and the CLI
     boundary's staged exit 3 keep applying unchanged (#496 S1 F1).
     """
@@ -1131,6 +1137,95 @@ def write_corruption_forensics(
     return result if return_result else out
 
 
+def _binary_version() -> "str | None":
+    """The running binary's released version, or None when it cannot be read."""
+    try:
+        import _lib_changelog
+
+        value = _lib_changelog._read_latest_changelog_version()
+    except Exception:  # pragma: no cover — a missing CHANGELOG is not fatal
+        return None
+    return value[0] if value else None
+
+
+@dataclass(frozen=True)
+class QuarantineContext:
+    """What a direct producer knows about the recovery it is quarantining for.
+
+    #496 S6 §4.2. Supplied when a NEW pending record is created and persisted
+    into it; the three resume call sites read it back from that record and pass
+    none of their own, so a resuming process never invents a trigger it did not
+    observe. An incident finalized without a context stays `schemaVersion: 1`,
+    which the retention planner treats as unclassified and therefore protected
+    — the safe direction.
+    """
+
+    trigger: str
+    trigger_error: "str | None" = None
+    forensics_path: "str | None" = None
+    binary_version: "str | None" = None
+
+    def to_record(self) -> "dict[str, object]":
+        return {
+            "trigger": self.trigger,
+            "triggerError": self.trigger_error,
+            "forensicsPath": self.forensics_path,
+            "binaryVersion": self.binary_version,
+        }
+
+
+def quarantine_context(
+    *,
+    trigger: str,
+    trigger_error: object = None,
+    forensics_path: object = None,
+) -> QuarantineContext:
+    """Build a `QuarantineContext`, bounding the error text and stamping the
+    binary version. `trigger_error` may be an exception; it is rendered and
+    truncated to `_FORENSICS_EXCEPTION_MESSAGE_MAX` so a pathological SQLite
+    message cannot bloat the incident manifest."""
+    return QuarantineContext(
+        trigger=_bounded_forensics_text(trigger, _FORENSICS_ORIGIN_MAX),
+        trigger_error=(
+            None
+            if trigger_error is None
+            else _bounded_forensics_text(
+                trigger_error, _FORENSICS_EXCEPTION_MESSAGE_MAX
+            )
+        ),
+        forensics_path=(
+            None if forensics_path is None else str(forensics_path)
+        ),
+        binary_version=_binary_version(),
+    )
+
+
+def _context_from_record(raw: object) -> "QuarantineContext | None":
+    """Read a persisted context back, or None when it cannot classify.
+
+    Deliberately lenient about the optional fields and strict about `trigger`:
+    a record whose trigger is missing or not a non-empty string cannot produce
+    a self-classifying manifest, so the incident finalizes as v1 and stays
+    protected rather than failing the resume outright. Refusing to resume over
+    a metadata defect would turn a recoverable quarantine into an outage.
+    """
+    if not isinstance(raw, dict):
+        return None
+    trigger = raw.get("trigger")
+    if not isinstance(trigger, str) or not trigger:
+        return None
+
+    def _text(value: object) -> "str | None":
+        return value if isinstance(value, str) and value else None
+
+    return QuarantineContext(
+        trigger=trigger,
+        trigger_error=_text(raw.get("triggerError")),
+        forensics_path=_text(raw.get("forensicsPath")),
+        binary_version=_text(raw.get("binaryVersion")),
+    )
+
+
 def _quarantine_pending_path(db_path: pathlib.Path) -> pathlib.Path:
     return db_path.with_name(f"{db_path.name}.quarantine-pending.json")
 
@@ -1200,8 +1295,37 @@ def _load_pending_quarantine(db_path: pathlib.Path) -> "dict[str, Any] | None":
     return state
 
 
+_QUARANTINE_MISSING_CONTEXT_WARNED = False  # one-shot warn flag
+
+
+def _warn_quarantine_created_without_context(incident: pathlib.Path) -> None:
+    """Report a creation that supplied no `QuarantineContext` (#496 S6 §4.2).
+
+    The incident is still finalized, as a v1 manifest. Raising instead would
+    turn a metadata defect into a FAILED corruption recovery, which trades a
+    permanently protected incident for lost evidence — the wrong direction. But
+    the two adjacent programming errors (a context on a resume, a context with
+    ``strict=False``) both raise, so this one must not be the single path that
+    degrades with nothing said: a v1 incident is unclassifiable and therefore
+    protected forever, and nothing else would ever explain why.
+    """
+    global _QUARANTINE_MISSING_CONTEXT_WARNED
+    if _QUARANTINE_MISSING_CONTEXT_WARNED:
+        return
+    _QUARANTINE_MISSING_CONTEXT_WARNED = True
+    eprint(
+        f"[quarantine] created {incident} without a QuarantineContext; its "
+        "manifest stays schemaVersion 1, which the retention planner treats "
+        "as unclassified and never reclaims. Every production producer "
+        "supplies one — report this."
+    )
+
+
 def _quarantine_db_family_strict(
-    db_path: pathlib.Path, *, ts: "str | None" = None,
+    db_path: pathlib.Path,
+    *,
+    ts: "str | None" = None,
+    context: "QuarantineContext | None" = None,
 ) -> pathlib.Path:
     """Resumably move every snapshotted family member or fail closed.
 
@@ -1209,10 +1333,20 @@ def _quarantine_db_family_strict(
     owner or individual rename failure therefore leaves enough information for
     the next maintenance-exclusive opener to complete the exact same incident;
     recreation is forbidden until every member is present at its destination.
+
+    ``context`` (#496 S6 §4.2) is supplied only when this call CREATES the
+    pending record.  It is persisted into that record and read back on every
+    resume, so the manifest describes what the process that observed the
+    corruption knew rather than what a later resumer guessed.
     """
     db_path = pathlib.Path(db_path)
     pending = _quarantine_pending_path(db_path)
     state = _load_pending_quarantine(db_path)
+    if state is not None and context is not None:
+        raise ValueError(
+            "a resume of a pending quarantine must not supply its own "
+            f"context: {pending}"
+        )
     if state is None:
         ts = ts or _db_backup_timestamp()
         root = _cctally_core.APP_DIR / "quarantine"
@@ -1244,6 +1378,13 @@ def _quarantine_db_family_strict(
             "members": members,
             "createdAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
         }
+        # Additive under the SAME record schemaVersion: an older binary reading
+        # this record ignores the key and finalizes a v1 manifest rather than
+        # refusing to resume, which a version bump would have caused.
+        if context is not None:
+            state["context"] = context.to_record()
+        else:
+            _warn_quarantine_created_without_context(incident)
         _atomic_write_private_json(pending, state)
     else:
         incident = pathlib.Path(state["incidentPath"])
@@ -1273,30 +1414,57 @@ def _quarantine_db_family_strict(
             pass
         moved.append(name)
 
-    manifest = {
+    manifest: "dict[str, Any]" = {
         "schemaVersion": 1,
         "quarantinedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
         "originalPath": str(db_path),
         "movedFiles": moved,
         "complete": True,
     }
+    # #496 S6 §4.2: the additive v2 manifest. Every key above keeps its v1 name
+    # and meaning; the bump only records that the four classification fields
+    # are present. A manifest without a truthy trigger stays v1 and is treated
+    # as unclassified — and therefore protected — by the retention planner.
+    persisted = _context_from_record(state.get("context"))
+    if persisted is not None:
+        manifest.update({
+            "schemaVersion": 2,
+            "trigger": persisted.trigger,
+            "triggerError": persisted.trigger_error,
+            "forensicsPath": persisted.forensics_path,
+            "binaryVersion": persisted.binary_version,
+        })
     _atomic_write_private_json(incident / "manifest.json", manifest)
+    _fsync_directory(incident)
     pending.unlink()
     _fsync_directory(pending.parent)
     return incident
 
 
 def quarantine_db_family(
-    db_path, *, ts: "str | None" = None, strict: bool = False,
+    db_path,
+    *,
+    ts: "str | None" = None,
+    strict: bool = False,
+    context: "QuarantineContext | None" = None,
 ) -> pathlib.Path:
     """Move a damaged DB + its ``-wal``/``-shm`` sidecars into a single
     timestamped incident directory under ``quarantine/`` with a manifest (spec
     §6.3). NEVER deletes evidence — three renames under the caller's exclusion
     locks, not pretending to be one atomic op. ``0o700`` dir / ``0o600`` files.
-    Returns the incident directory (which may be empty if nothing was present)."""
+    Returns the incident directory (which may be empty if nothing was present).
+
+    ``context`` (#496 S6 §4.2) is required when CREATING a new pending record
+    and must be omitted on a resume, where it is read back from that record.
+    Only the strict path persists it; ``strict=False`` has no production caller.
+    """
     db_path = pathlib.Path(db_path)
     if strict:
-        return _quarantine_db_family_strict(db_path, ts=ts)
+        return _quarantine_db_family_strict(db_path, ts=ts, context=context)
+    if context is not None:
+        raise ValueError(
+            "quarantine_db_family(strict=False) does not persist a context"
+        )
     ts = ts or _db_backup_timestamp()
     root = _cctally_core.APP_DIR / "quarantine"
     incident = root / f"{db_path.name}-{ts}"
@@ -1328,8 +1496,11 @@ def quarantine_db_family(
         "movedFiles": moved,
     }
     try:
-        (incident / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True))
+        # The same durable private writer the strict path uses: a bare
+        # write_text left the manifest at the process umask (0644 observed) and
+        # unfsynced, so the incident could survive a crash while the record
+        # describing it did not.
+        _atomic_write_private_json(incident / "manifest.json", manifest)
     except OSError:
         pass
     return incident
@@ -1419,26 +1590,34 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
                     "journal.ingest.lock. Retry shortly."
                 )
                 return 3
+        # #496 S6 §5.3: SHARED from before the forensics bundle through the
+        # final rebuild record. `rebuild_stats_index` takes it again for its own
+        # preservation span; the hold is refcounted, so that is a no-op here.
+        import _cctally_retention
+
         try:
-            if path.exists():
-                # Forensics FIRST. The common cutover performs the final drain
-                # check only after the scratch index is complete.
-                forensics = write_corruption_forensics(path, db_label="stats")
-            # #386: declare the sanctioned maintenance regime around the
-            # replacement — the rebuild writes its scratch index through an
-            # authorizer-armed `open_db(_target_path=...)` connection, and we
-            # hold maintenance exclusive, which is what spec §3.1 sanctions.
-            with _cctally_store.stats_write_scope("maintenance-rebuild"):
-                result = _cctally_journal.rebuild_stats_index(
-                    context=_cctally_journal.RebuildContext(
-                        trigger="db-rebuild",
-                        trigger_error=None,
-                        forensics_path=(
-                            str(forensics) if forensics is not None else None
-                        ),
+            with _cctally_retention.retention_shared(label="db rebuild"):
+                if path.exists():
+                    # Forensics FIRST. The common cutover performs the final
+                    # drain check only after the scratch index is complete.
+                    forensics = write_corruption_forensics(
+                        path, db_label="stats"
                     )
-                )
-                incident = result.quarantine_dir
+                # #386: declare the sanctioned maintenance regime around the
+                # replacement — the rebuild writes its scratch index through an
+                # authorizer-armed `open_db(_target_path=...)` connection, and
+                # we hold maintenance exclusive, which spec §3.1 sanctions.
+                with _cctally_store.stats_write_scope("maintenance-rebuild"):
+                    result = _cctally_journal.rebuild_stats_index(
+                        context=_cctally_journal.RebuildContext(
+                            trigger="db-rebuild",
+                            trigger_error=None,
+                            forensics_path=(
+                                str(forensics) if forensics is not None else None
+                            ),
+                        )
+                    )
+                    incident = result.quarantine_dir
         except Exception as exc:
             eprint(f"cctally: stats.db rebuild failed: {exc}")
             return 3
@@ -8951,15 +9130,24 @@ def cmd_db_unskip(args: argparse.Namespace) -> int:
 
 
 def cmd_db_recover(args: argparse.Namespace) -> int:
-    """Revert a version-ahead DB to this binary's known schema head (#145).
+    """Revert a version-ahead cache.db to this binary's known schema head (#145).
 
     cache.db is fully re-derivable, so `--db cache` heals without --yes.
-    stats.db holds non-re-derivable snapshots/milestones, so `--db stats`
-    requires explicit --yes and may need a re-record afterward, AND honors the
-    #146 prod guard (a dev/worktree binary refuses to trim+revert the real prod
-    stats.db unless CCTALLY_ALLOW_PROD_MIGRATION=1). Bypasses
-    open_db()/open_cache_db() (raw connect) so it never re-triggers the
-    dispatcher. Idempotent: a no-op when the DB is not ahead.
+
+    **`--db stats` is retired and this function never repairs it.** The body
+    below exits 2 and points at `db rebuild --db stats`, so the two sentences
+    this docstring used to carry — that stats.db holds rows nothing can
+    re-derive, and that `--db stats` requires an explicit --yes and honors the
+    #146 prod guard — described a code path that no longer exists. Both are
+    replaced here rather than corrected, because neither is true of the
+    shipped command: with retained journal data stats.db is a disposable
+    index that a version mismatch self-heals by rebuilding from the journal,
+    and on a pre-cutover install with no retained journal data — whose
+    stats.db may be the only copy of its recorded history — trim-and-revert
+    was never the safe answer either; `db repair --db stats --yes` is.
+
+    Bypasses open_db()/open_cache_db() (raw connect) so it never re-triggers
+    the dispatcher. Idempotent: a no-op when the DB is not ahead.
     """
     which = args.db  # "cache" | "stats"
     if which == "stats":
@@ -9335,6 +9523,66 @@ def _copy_db_family(
         _fsync_file(dst)
 
 
+#: The classification sidecar's own schema version, matching the incident
+#: `classification.json` the correlator writes.
+_BACKUP_CLASSIFICATION_SCHEMA_VERSION = 1
+
+
+def _backup_classification_path(stem: pathlib.Path) -> pathlib.Path:
+    return stem.with_name(f"{stem.name}.classification.json")
+
+
+def _write_backup_classification_sidecar(
+    stem: pathlib.Path,
+    *,
+    trigger: str = "db-repair",
+    method: str = "db-repair",
+    forensics_path: "str | None" = None,
+) -> pathlib.Path:
+    """Classify a machine-written backup family for retention (#496 S6 §3.7).
+
+    A `.bak-*` family has no incident manifest, so §3.3 classifies it by this
+    sidecar instead — and only while the member identities it records still
+    match the family on disk. Recording device and inode is what stops a
+    REPLACEMENT family written at the same machine-shaped stem from inheriting
+    this `exact` verdict and becoming deletable without ever having been
+    classified.
+
+    The caller writes this only AFTER the copied family and its directory are
+    durable, and before it releases the shared retention lock. A crash in that
+    window leaves the backup unclassified and therefore protected, which is the
+    safe direction.
+    """
+    members = []
+    for suffix in ("", "-wal", "-shm"):
+        member = pathlib.Path(str(stem) + suffix)
+        try:
+            info = member.stat()
+        except OSError:
+            continue
+        members.append({
+            "name": member.name,
+            "size": int(info.st_size),
+            "mtime": float(info.st_mtime),
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+        })
+    payload = {
+        "schemaVersion": _BACKUP_CLASSIFICATION_SCHEMA_VERSION,
+        "method": method,
+        "confidence": "exact",
+        "trigger": trigger,
+        "binaryVersion": _binary_version(),
+        "backupStem": stem.name,
+        "members": members,
+        "forensicsPath": forensics_path,
+        "classifiedAtUtc": _forensics_iso(dt.datetime.now(dt.timezone.utc)),
+    }
+    path = _backup_classification_path(stem)
+    _atomic_write_private_json(path, payload)
+    return path
+
+
 def _read_user_version_header(path: pathlib.Path) -> "int | None":
     """Read SQLite's big-endian user_version field without opening pages."""
     try:
@@ -9460,6 +9708,13 @@ def _repair_preflight_and_copy(
         # repair marker, and the caller has already proved no old handle exists.
         _copy_db_family(path, backup)
         _fsync_directory(path.parent)
+        # #496 S6 §3.7. Written here, immediately after the family and its
+        # directory are durable, so EVERY backup this function creates is
+        # classified — including one left behind by a repair that then fails
+        # its WAL checkpoint. `_atomic_write_private_json` fsyncs the file and
+        # the directory entry, and the caller still holds the shared retention
+        # lock (§5.3), so the sidecar is durable before reclamation can see it.
+        _write_backup_classification_sidecar(backup)
         conn.rollback()
 
         try:
@@ -9507,9 +9762,13 @@ def cmd_db_repair(args: argparse.Namespace) -> int:
         return 0
     if not getattr(args, "yes", False):
         eprint(
-            "cctally: repairing stats.db replaces the live non-re-derivable "
-            "database after preserving the corrupt original. Re-run with "
-            "--yes after stopping the dashboard and other cctally processes."
+            "cctally: repairing stats.db replaces the live database after "
+            "preserving the corrupt original. This command is for a "
+            "pre-cutover install with no retained journal data, whose stats.db "
+            "may be the only copy of its recorded history; with retained "
+            "journal data stats.db is a disposable index and `cctally db "
+            "rebuild --db stats` is the command to use. Re-run with --yes "
+            "after stopping the dashboard and other cctally processes."
         )
         return 2
 
@@ -9599,8 +9858,24 @@ def _cmd_db_repair_locked(args: argparse.Namespace, path: pathlib.Path) -> int:
 
 
 def _cmd_db_repair_claimed(args: argparse.Namespace, path: pathlib.Path) -> int:
-    """Repair body; caller owns the marker and has proved no old handles."""
+    """Repair body; caller owns the marker and has proved no old handles.
 
+    #496 S6 §5.3: the shared retention hold is taken HERE — after the
+    maintenance flock its caller holds, and above `_repair_preflight_and_copy`,
+    whose `_copy_db_family` runs inside a `BEGIN IMMEDIATE`. Acquiring around
+    the copy instead would put a lock acquisition inside a SQLite transaction
+    and invert the lock order. It is released after the classification sidecar
+    for the backup family is durable.
+    """
+    import _cctally_retention
+
+    with _cctally_retention.retention_shared(label="db repair"):
+        return _cmd_db_repair_under_retention(args, path)
+
+
+def _cmd_db_repair_under_retention(
+    args: argparse.Namespace, path: pathlib.Path,
+) -> int:
     timeout_ms = int(getattr(args, "busy_timeout_ms", 250) or 250)
     sqlite_binary = (
         getattr(args, "sqlite3_binary", None) or shutil.which("sqlite3")

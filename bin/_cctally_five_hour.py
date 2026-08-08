@@ -995,6 +995,27 @@ def _load_breakdown(
     return [dict(r) for r in rows]
 
 
+def _blocks_period_instant(raw: object) -> "dt.datetime":
+    """A block boundary as a real INSTANT for the artifact's period.
+
+    `block_start_at` and `five_hour_resets_at` are timestamps, not
+    calendar labels, so they convert into the display zone (#503 S2 D7).
+    Keeping only the UTC date part — which is what this site used to do —
+    named the wrong civil day west of UTC and disagreed with the block's
+    own row cell, which `format_display_dt` renders in the display zone.
+
+    It takes no zone argument. The conversion into the display zone
+    happens in `period_civil_dates`, from the zone the `PeriodSpec` is
+    labelled with, so a zone passed here would be a second authority that
+    could disagree with the first (#503 S2 second review N8).
+    """
+    _c = _cctally()
+    try:
+        return parse_iso_datetime(str(raw), "five_hour_blocks.block_start_at")
+    except (TypeError, ValueError):
+        return _c._share_now_utc()
+
+
 def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
     """List API-anchored 5h blocks with rollup totals + 7d-drift columns."""
     _c = _cctally()
@@ -1172,11 +1193,13 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                     since_iso, args._resolved_tz,
                 )
             elif block_dicts:
-                tail = block_dicts[-1].get("block_start_at")
-                period_start = _c._share_parse_date_to_dt(
-                    (tail or "").split("T")[0] or None,
-                    args._resolved_tz,
-                )
+                # A block start is a real INSTANT, so it converts into the
+                # display zone rather than being grounded (#503 S2 D7).
+                # This used to keep only the UTC date part, which named
+                # the wrong civil day west of UTC and disagreed with the
+                # block's own row cell, rendered in the display zone.
+                period_start = _blocks_period_instant(
+                    block_dicts[-1].get("block_start_at"))
             else:
                 period_start = _c._share_now_utc()
             if until_iso:
@@ -1184,11 +1207,17 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                     until_iso, args._resolved_tz,
                 )
             elif block_dicts:
-                head = block_dicts[0].get("block_start_at")
-                period_end = _c._share_parse_date_to_dt(
-                    (head or "").split("T")[0] or None,
-                    args._resolved_tz,
-                )
+                # The newest block's END, not its start. A block runs for
+                # five hours and the artifact's rows describe all of it,
+                # so ending the stated period at 13:00 for a block that
+                # runs to 18:00 understated what the artifact covers —
+                # invisible while the period was rendered as a date and
+                # visible the moment the frontmatter carried the full
+                # timestamp (#503 S2 second review N5).
+                newest = block_dicts[0]
+                period_end = _blocks_period_instant(
+                    newest.get("five_hour_resets_at")
+                    or newest.get("block_start_at"))
             else:
                 period_end = _c._share_now_utc()
             # Build a BlocksView from the API-anchored table rows
@@ -1208,8 +1237,6 @@ def cmd_five_hour_blocks(args: argparse.Namespace) -> int:
                 period_end=period_end,
                 display_tz=display_tz_str,
                 version=_c._share_resolve_version(),
-                theme=args.theme,
-                reveal_projects=args.reveal_projects,
                 tz=args._resolved_tz,
             )
             _c._share_render_and_emit(snap, args)

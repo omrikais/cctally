@@ -5,8 +5,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   basketReducer, initialBasketState, makeBasketItem,
+  saveBasketToStorage, loadBasketFromStorage,
   type BasketSlice,
 } from './basketSlice';
+import { buildComposeRequest } from '../share/composerApi';
 import type { ShareOptions } from '../share/types';
 
 function defaults(): ShareOptions {
@@ -148,5 +150,68 @@ describe('makeBasketItem', () => {
     expect(a.id).toBeTruthy();
     expect(b.id).toBeTruthy();
     expect(a.id).not.toBe(b.id);
+  });
+});
+
+// ---- #503 S3 §4 — the digest version travels with the digest -------------
+
+describe('basket digest versioning', () => {
+  it('stores the version a digest was minted under', () => {
+    const item = makeBasketItem({
+      panel: 'weekly',
+      template_id: 'weekly-recap',
+      options: defaults(),
+      added_at: '2026-05-11T09:00:00Z',
+      data_digest_at_add: 'sha256:abc',
+      data_digest_version_at_add: 2,
+      kernel_version: 1,
+      label_hint: 'Weekly',
+    });
+    expect(item.data_digest_version_at_add).toBe(2);
+  });
+
+  it('omits the field when the render response carried no version', () => {
+    const item = makeBasketItem({
+      panel: 'weekly',
+      template_id: 'weekly-recap',
+      options: defaults(),
+      added_at: '2026-05-11T09:00:00Z',
+      data_digest_at_add: 'sha256:abc',
+      kernel_version: 1,
+      label_hint: 'Weekly',
+    });
+    // Absent rather than null, so a legacy stored item stays byte-identical
+    // and the server reads it as not comparable.
+    expect(item).not.toHaveProperty('data_digest_version_at_add');
+  });
+
+  it('replays the stored version into the compose request', () => {
+    const versioned = makeBasketItem({
+      panel: 'weekly', template_id: 'weekly-recap', options: defaults(),
+      added_at: 't', data_digest_at_add: 'sha256:abc',
+      data_digest_version_at_add: 2, kernel_version: 1, label_hint: 'Weekly',
+    });
+    const legacy = makeBasketItem({
+      panel: 'daily', template_id: 'daily-recap', options: defaults(),
+      added_at: 't', data_digest_at_add: 'sha256:def',
+      kernel_version: 1, label_hint: 'Daily',
+    });
+    const req = buildComposeRequest([versioned, legacy], {
+      title: 'T', theme: 'light', format: 'md',
+      no_branding: false, reveal_projects: false,
+    });
+    expect(req.sections[0].snapshot.data_digest_version_at_add).toBe(2);
+    expect(req.sections[1].snapshot)
+      .not.toHaveProperty('data_digest_version_at_add');
+  });
+
+  it('keeps a stored version through a storage round trip', () => {
+    const item = makeBasketItem({
+      panel: 'weekly', template_id: 'weekly-recap', options: defaults(),
+      added_at: 't', data_digest_at_add: 'sha256:abc',
+      data_digest_version_at_add: 2, kernel_version: 1, label_hint: 'Weekly',
+    });
+    saveBasketToStorage([item]);
+    expect(loadBasketFromStorage()[0].data_digest_version_at_add).toBe(2);
   });
 });

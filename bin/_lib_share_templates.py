@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
+from zoneinfo import ZoneInfo as _ZoneInfo
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,9 +38,13 @@ from typing import Any
 # --- Panel set ---
 #
 # Share-capable panels are the 9 data-view panels in the dashboard.
-# RecentAlertsPanel ('alerts') is intentionally excluded: it's a
-# notification stream, not a data view — shipping share templates over
-# alerts would conflate the two concepts (spec §6.1, §9.5).
+# TWO panels are excluded. RecentAlertsPanel ('alerts') is a notification
+# stream, not a data view — shipping share templates over alerts would
+# conflate the two concepts (spec §6.1, §9.5). The Cache Report panel
+# ('cache-report') is a data view, but no share kernel was ever written
+# for it, so it has no template here and no share icon in the dashboard.
+# The client mirror of this set is `SHARE_PANEL_MATRIX` in
+# `dashboard/web/src/share/types.ts`.
 SHARE_CAPABLE_PANELS: frozenset[str] = frozenset({
     "current-week",
     "trend",
@@ -381,12 +386,105 @@ def _parse_iso_utc(s: str) -> _dt.datetime:
     return parsed.astimezone(_dt.timezone.utc)
 
 
-def _period(start, end, *, label: str, display_tz: str):
+def _period(start, end, *, label: str, display_tz: str,
+            civil_bucket: bool = False):
+    """Build a `PeriodSpec`, declaring which KIND of boundary it carries.
+
+    Two kinds reach this function and they must not be treated alike
+    (#503 S2 D7):
+
+    - CIVIL BUCKET (`civil_bucket=True`) — the boundary began life as a
+      calendar label (`weeks[i]["start_date"]`, `days[i]["date"]`,
+      `months[i]["month"]`, `projection_curve[i]["date"]`) that
+      `_parse_iso_utc` lifted to a UTC-midnight sentinel. `2026-05-02`
+      names the same day in every zone, so converting the sentinel into
+      `America/New_York` would report `2026-05-01`.
+    - INSTANT (the default) — the boundary is a real moment in time (a
+      5-hour block's `start_at`, a session's `started_at`, the Projects
+      panel's window bounds). Its civil date is only meaningful once
+      converted into the labelled zone.
+
+    Callers pass the kind explicitly; `period_civil_dates` reads it.
+    """
     return _LS.PeriodSpec(start=start, end=end,
-                          display_tz=display_tz, label=label)
+                          display_tz=display_tz, label=label,
+                          civil_bucket=civil_bucket)
+
+
+def _civil_period(start, end, *, label: str, display_tz: str):
+    """`_period` for a builder whose boundaries are calendar labels."""
+    return _period(start, end, label=label, display_tz=display_tz,
+                   civil_bucket=True)
+
+
+def _weekly_period_bounds(panel_data) -> tuple:
+    """The focal week — what the weekly panel's artifact is ABOUT.
+
+    The previous pass widened this to the eight weeks the CHART covers,
+    because `weekly-detail` and the two chart-bearing templates displayed
+    history the header did not admit to. That was the right correction
+    made in the wrong place: Markdown renders no chart, so all three
+    `weekly-*` Markdown artifacts then claimed eight weeks above one
+    week's spend, and `weekly-recap` stated `2026-03-16 → 2026-05-10`
+    above `**$ spent:** $14.27` (#503 S2 third review).
+
+    The builder declares the focal week again, and `effective_period`
+    completes it per FORMAT from what that format actually draws. The
+    title names the focal week either way.
+    """
+    weeks = panel_data["weeks"]
+    focal = weeks[panel_data.get("current_week_index", 0)]
+    start = _parse_iso_utc(focal["start_date"])
+    return start, start + _dt.timedelta(days=6)
+
+
+def _blocks_period_bounds(panel_data) -> tuple:
+    """The current 5-hour block — what the blocks panel is ABOUT.
+
+    Same story as `_weekly_period_bounds`, and reverted for the same
+    reason: widening this to the recent blocks the chart draws made
+    `blocks-recap` state a thirty-four-hour period above
+    `$ this block: $1.84` in a format that draws no chart at all.
+    `effective_period` completes the span per format instead.
+    """
+    current = panel_data.get("current_block") or {}
+    start = (_parse_iso_utc(current["start_at"])
+             if current.get("start_at") else _utc_now())
+    end = (_parse_iso_utc(current["end_at"])
+           if current.get("end_at") else start + _dt.timedelta(hours=5))
+    return start, end
+
+
+def _civil_now_bucket(options) -> _dt.datetime:
+    """Today's calendar date in the labelled zone, as a bucket sentinel.
+
+    The EMPTY-panel fallback for a civil-bucket builder. `_utc_now()`
+    returns a real instant, and marking one `civil_bucket=True` tells
+    `period_civil_dates` to skip the conversion — so an empty artifact
+    stated the UTC calendar day under another zone's name, which is the
+    same defect D7 exists to prevent (#503 S2 review F9). Cosmetic, since
+    the artifact has no rows, but wrong.
+
+    An unloadable zone name degrades to the UTC day rather than raising:
+    a renderer that raises is a refused artifact, not a wrong date.
+    """
+    try:
+        zone = _ZoneInfo(_display_tz(options))
+    except Exception:                       # noqa: BLE001 — see docstring
+        return _dt.datetime.combine(_utc_now().date(), _dt.time.min,
+                                    tzinfo=_dt.timezone.utc)
+    return _dt.datetime.combine(_utc_now().astimezone(zone).date(),
+                                _dt.time.min, tzinfo=_dt.timezone.utc)
 
 
 def _display_tz(options) -> str:
+    """The concrete IANA zone the artifact's dates are stated in.
+
+    The dashboard resolves the `local` / `utc` configuration tokens before
+    injecting `display_tz` into `options` (#503 S2 D7), so this reads a
+    zone name, never a token. The `Etc/UTC` default covers the fixture and
+    direct-builder paths that supply no option at all.
+    """
     return options.get("display_tz", "Etc/UTC")
 
 
@@ -412,13 +510,13 @@ def _build_weekly_recap(*, panel_data, options):
     weeks = panel_data["weeks"]
     idx = panel_data.get("current_week_index", 0)
     w = weeks[idx]
-    start = _parse_iso_utc(w["start_date"])
-    end = start + _dt.timedelta(days=6)
+    start, end = _weekly_period_bounds(panel_data)
     return _LS.ShareSnapshot(
         cmd="weekly",
         title=f"Weekly recap — week of {w['start_date']}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=_PROJECT_COLUMNS,
         rows=_top_projects_rows(w.get("top_projects") or [], options.get("top_n", 5)),
         chart=_LS.LineChart(
@@ -468,7 +566,8 @@ def _build_current_week_recap(*, panel_data, options):
         cmd="current-week",
         title=f"Current week — through {today_label}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=_PROJECT_COLUMNS,
         rows=_top_projects_rows(panel_data.get("top_projects") or [],
                                 options.get("top_n", 3)),
@@ -513,15 +612,16 @@ def _build_trend_recap(*, panel_data, options):
         }
     """
     weeks = panel_data["weeks"]
-    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _utc_now()
-    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _utc_now()
+    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _civil_now_bucket(options)
+    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _civil_now_bucket(options)
     end = end_anchor + _dt.timedelta(days=6)
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
         title="$/% trend — last 8 weeks",
         subtitle=None,
-        period=_period(start, end, label="Last 8 weeks", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 8 weeks",
+                              display_tz=_display_tz(options)),
         columns=(
             _LS.ColumnSpec(key="week",  label="Week",   align="left"),
             _LS.ColumnSpec(key="cost",  label="$",      align="right", emphasis=True),
@@ -571,7 +671,7 @@ def _build_daily_recap(*, panel_data, options):
         }
     """
     days = panel_data.get("days") or []
-    start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
+    start = _parse_iso_utc(days[0]["date"]) if days else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
     sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
@@ -579,7 +679,8 @@ def _build_daily_recap(*, panel_data, options):
         cmd="daily",
         title=f"Daily — last {len(days)} day{'s' if len(days) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Last 7 days", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 7 days",
+                              display_tz=_display_tz(options)),
         columns=_PROJECT_COLUMNS,
         rows=_top_projects_rows(panel_data.get("top_projects") or [],
                                 options.get("top_n", 5)),
@@ -620,7 +721,7 @@ def _build_monthly_recap(*, panel_data, options):
     def _month_start(s):
         return _parse_iso_utc(f"{s}-01")
 
-    start = _month_start(months[0]["month"]) if months else _utc_now()
+    start = _month_start(months[0]["month"]) if months else _civil_now_bucket(options)
     if months:
         last = _month_start(months[-1]["month"])
         # End of last month: simple 31-day forward, then truncate to month end.
@@ -633,8 +734,8 @@ def _build_monthly_recap(*, panel_data, options):
         cmd="monthly",
         title=f"Monthly — last {len(months)} month{'s' if len(months) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Recent months",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Recent months",
+                             display_tz=_display_tz(options)),
         columns=_PROJECT_COLUMNS,
         rows=_top_projects_rows(panel_data.get("top_projects") or [],
                                 options.get("top_n", 5)),
@@ -674,8 +775,7 @@ def _build_blocks_recap(*, panel_data, options):
     """
     cb = panel_data.get("current_block") or {}
     recent = panel_data.get("recent_blocks") or []
-    start = _parse_iso_utc(cb["start_at"]) if cb.get("start_at") else _utc_now()
-    end = _parse_iso_utc(cb["end_at"]) if cb.get("end_at") else start + _dt.timedelta(hours=5)
+    start, end = _blocks_period_bounds(panel_data)
     return _LS.ShareSnapshot(
         cmd="five-hour-blocks",
         title="Current 5-hour block",
@@ -729,7 +829,7 @@ def _build_forecast_recap(*, panel_data, options):
     """
     curve = panel_data.get("projection_curve") or []
     budgets = panel_data.get("daily_budgets") or {}
-    start = _parse_iso_utc(curve[0]["date"]) if curve else _utc_now()
+    start = _parse_iso_utc(curve[0]["date"]) if curve else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(curve[-1]["date"]) if curve else start
     end = end_anchor + _dt.timedelta(days=1)
     confidence = panel_data.get("confidence") or "ok"
@@ -738,8 +838,8 @@ def _build_forecast_recap(*, panel_data, options):
         cmd="forecast",
         title="Forecast — projection to ceiling",
         subtitle=None,
-        period=_period(start, end, label="Next 7 days",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Next 7 days",
+                             display_tz=_display_tz(options)),
         columns=(
             _LS.ColumnSpec(key="metric", label="Metric", align="left"),
             _LS.ColumnSpec(key="value",  label="$/day", align="right", emphasis=True),
@@ -858,13 +958,13 @@ def _build_weekly_visual(*, panel_data, options):
     weeks = panel_data["weeks"]
     idx = panel_data.get("current_week_index", 0)
     w = weeks[idx]
-    start = _parse_iso_utc(w["start_date"])
-    end = start + _dt.timedelta(days=6)
+    start, end = _weekly_period_bounds(panel_data)
     return _LS.ShareSnapshot(
         cmd="weekly",
         title=f"Weekly visual — week of {w['start_date']}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.LineChart(
@@ -896,8 +996,7 @@ def _build_weekly_detail(*, panel_data, options):
     weeks = panel_data["weeks"]
     idx = panel_data.get("current_week_index", 0)
     w = weeks[idx]
-    start = _parse_iso_utc(w["start_date"])
-    end = start + _dt.timedelta(days=6)
+    start, end = _weekly_period_bounds(panel_data)
     top_n = max(int(options.get("top_n", 5)), 1)
 
     breakdowns = [dict(week.get("models") or {}) for week in weeks]
@@ -929,7 +1028,8 @@ def _build_weekly_detail(*, panel_data, options):
         cmd="weekly",
         title=f"Weekly detail — week of {w['start_date']}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=columns,
         rows=rows,
         chart=_LS.LineChart(
@@ -962,7 +1062,8 @@ def _build_current_week_visual(*, panel_data, options):
         cmd="current-week",
         title=f"Current week visual — through {today_label}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.LineChart(
@@ -995,7 +1096,8 @@ def _build_current_week_detail(*, panel_data, options):
         cmd="current-week",
         title=f"Current week detail — through {today_label}",
         subtitle=None,
-        period=_period(start, end, label="This week", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="This week",
+                              display_tz=_display_tz(options)),
         columns=_PROJECT_COLUMNS,
         rows=_top_projects_rows(panel_data.get("top_projects") or [], top_n),
         chart=_LS.LineChart(
@@ -1022,15 +1124,16 @@ def _build_current_week_detail(*, panel_data, options):
 def _build_trend_visual(*, panel_data, options):
     """Trend visual — $/% trend line over 8 weeks; rows=() (spec §9.5)."""
     weeks = panel_data["weeks"]
-    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _utc_now()
-    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _utc_now()
+    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _civil_now_bucket(options)
+    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _civil_now_bucket(options)
     end = end_anchor + _dt.timedelta(days=6)
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
         title="$/% trend visual — last 8 weeks",
         subtitle=None,
-        period=_period(start, end, label="Last 8 weeks", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 8 weeks",
+                              display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.LineChart(
@@ -1055,15 +1158,16 @@ def _build_trend_visual(*, panel_data, options):
 def _build_trend_detail(*, panel_data, options):
     """Trend detail — full 8-week × $/%/rate table + sparkline (spec §9.5)."""
     weeks = panel_data["weeks"]
-    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _utc_now()
-    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _utc_now()
+    start = _parse_iso_utc(weeks[0]["start_date"]) if weeks else _civil_now_bucket(options)
+    end_anchor = _parse_iso_utc(weeks[-1]["start_date"]) if weeks else _civil_now_bucket(options)
     end = end_anchor + _dt.timedelta(days=6)
     delta = panel_data.get("delta_3_weeks") or {}
     return _LS.ShareSnapshot(
         cmd="report",
         title="$/% trend detail — last 8 weeks",
         subtitle=None,
-        period=_period(start, end, label="Last 8 weeks", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 8 weeks",
+                              display_tz=_display_tz(options)),
         columns=(
             _LS.ColumnSpec(key="week",  label="Week",   align="left"),
             _LS.ColumnSpec(key="cost",  label="$",      align="right", emphasis=True),
@@ -1101,7 +1205,7 @@ def _build_trend_detail(*, panel_data, options):
 def _build_daily_visual(*, panel_data, options):
     """Daily visual — 7-day cost bar, rows=() (spec §9.5)."""
     days = panel_data.get("days") or []
-    start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
+    start = _parse_iso_utc(days[0]["date"]) if days else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
     sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
@@ -1109,7 +1213,8 @@ def _build_daily_visual(*, panel_data, options):
         cmd="daily",
         title=f"Daily visual — last {len(days)} day{'s' if len(days) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Last 7 days", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 7 days",
+                              display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.BarChart(
@@ -1137,7 +1242,7 @@ def _build_daily_detail(*, panel_data, options):
     carries each day's per-project breakdown.
     """
     days = panel_data.get("days") or []
-    start = _parse_iso_utc(days[0]["date"]) if days else _utc_now()
+    start = _parse_iso_utc(days[0]["date"]) if days else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(days[-1]["date"]) if days else start
     end = end_anchor + _dt.timedelta(days=1)
     sum_cost = stable_sum(float(d["cost_usd"]) for d in days)
@@ -1172,7 +1277,8 @@ def _build_daily_detail(*, panel_data, options):
         cmd="daily",
         title=f"Daily detail — last {len(days)} day{'s' if len(days) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Last 7 days", display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Last 7 days",
+                              display_tz=_display_tz(options)),
         columns=columns,
         rows=rows,
         chart=_LS.BarChart(
@@ -1200,7 +1306,7 @@ def _build_monthly_visual(*, panel_data, options):
     def _month_start(s):
         return _parse_iso_utc(f"{s}-01")
 
-    start = _month_start(months[0]["month"]) if months else _utc_now()
+    start = _month_start(months[0]["month"]) if months else _civil_now_bucket(options)
     if months:
         last = _month_start(months[-1]["month"])
         end_anchor = last.replace(day=28) + _dt.timedelta(days=4)
@@ -1212,8 +1318,8 @@ def _build_monthly_visual(*, panel_data, options):
         cmd="monthly",
         title=f"Monthly visual — last {len(months)} month{'s' if len(months) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Recent months",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Recent months",
+                             display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.BarChart(
@@ -1241,7 +1347,7 @@ def _build_monthly_detail(*, panel_data, options):
     def _month_start(s):
         return _parse_iso_utc(f"{s}-01")
 
-    start = _month_start(months[0]["month"]) if months else _utc_now()
+    start = _month_start(months[0]["month"]) if months else _civil_now_bucket(options)
     if months:
         last = _month_start(months[-1]["month"])
         end_anchor = last.replace(day=28) + _dt.timedelta(days=4)
@@ -1280,8 +1386,8 @@ def _build_monthly_detail(*, panel_data, options):
         cmd="monthly",
         title=f"Monthly detail — last {len(months)} month{'s' if len(months) != 1 else ''}",
         subtitle=None,
-        period=_period(start, end, label="Recent months",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Recent months",
+                             display_tz=_display_tz(options)),
         columns=columns,
         rows=rows,
         chart=_LS.BarChart(
@@ -1306,8 +1412,7 @@ def _build_blocks_visual(*, panel_data, options):
     """Blocks visual — recent-blocks line, rows=() (spec §9.5)."""
     cb = panel_data.get("current_block") or {}
     recent = panel_data.get("recent_blocks") or []
-    start = _parse_iso_utc(cb["start_at"]) if cb.get("start_at") else _utc_now()
-    end = _parse_iso_utc(cb["end_at"]) if cb.get("end_at") else start + _dt.timedelta(hours=5)
+    start, end = _blocks_period_bounds(panel_data)
     return _LS.ShareSnapshot(
         cmd="five-hour-blocks",
         title="Current 5-hour block — visual",
@@ -1339,8 +1444,7 @@ def _build_blocks_detail(*, panel_data, options):
     """Blocks detail — per-block × per-project cross-tab (spec §9.5)."""
     cb = panel_data.get("current_block") or {}
     recent = panel_data.get("recent_blocks") or []
-    start = _parse_iso_utc(cb["start_at"]) if cb.get("start_at") else _utc_now()
-    end = _parse_iso_utc(cb["end_at"]) if cb.get("end_at") else start + _dt.timedelta(hours=5)
+    start, end = _blocks_period_bounds(panel_data)
     top_n = max(int(options.get("top_n", 5)), 1)
 
     breakdowns = [dict(b.get("projects") or {}) for b in recent]
@@ -1399,7 +1503,7 @@ def _build_blocks_detail(*, panel_data, options):
 def _build_forecast_visual(*, panel_data, options):
     """Forecast visual — projection chart with 90/100% ceilings, rows=() (spec §9.5)."""
     curve = panel_data.get("projection_curve") or []
-    start = _parse_iso_utc(curve[0]["date"]) if curve else _utc_now()
+    start = _parse_iso_utc(curve[0]["date"]) if curve else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(curve[-1]["date"]) if curve else start
     end = end_anchor + _dt.timedelta(days=1)
     confidence = panel_data.get("confidence") or "ok"
@@ -1408,8 +1512,8 @@ def _build_forecast_visual(*, panel_data, options):
         cmd="forecast",
         title="Forecast visual — projection to ceiling",
         subtitle=None,
-        period=_period(start, end, label="Next 7 days",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Next 7 days",
+                             display_tz=_display_tz(options)),
         columns=(),
         rows=(),
         chart=_LS.LineChart(
@@ -1444,7 +1548,7 @@ def _build_forecast_detail(*, panel_data, options):
     """
     curve = panel_data.get("projection_curve") or []
     budgets = panel_data.get("daily_budgets") or {}
-    start = _parse_iso_utc(curve[0]["date"]) if curve else _utc_now()
+    start = _parse_iso_utc(curve[0]["date"]) if curve else _civil_now_bucket(options)
     end_anchor = _parse_iso_utc(curve[-1]["date"]) if curve else start
     end = end_anchor + _dt.timedelta(days=1)
     confidence = panel_data.get("confidence") or "ok"
@@ -1473,8 +1577,8 @@ def _build_forecast_detail(*, panel_data, options):
         cmd="forecast",
         title="Forecast detail — projection to ceiling",
         subtitle=None,
-        period=_period(start, end, label="Next 7 days",
-                       display_tz=_display_tz(options)),
+        period=_civil_period(start, end, label="Next 7 days",
+                             display_tz=_display_tz(options)),
         columns=(
             _LS.ColumnSpec(key="metric", label="Metric", align="left"),
             _LS.ColumnSpec(key="value",  label="$/day", align="right", emphasis=True),
@@ -1704,14 +1808,16 @@ def _projects_period(panel_data: dict, options: dict):
                    display_tz=_display_tz(options))
 
 
-def _projects_subtitle(options: dict, total_rows: int) -> str:
-    # FAIL CLOSED (#503 S1 F3): an omitted field made the Projects panel
-    # print the claim "real projects" about its own contents.
-    reveal = options.get("reveal_projects", False)
-    return " · ".join([
-        f"{total_rows} project{'' if total_rows == 1 else 's'}",
-        "real projects" if reveal else "projects anonymized",
-    ])
+def _projects_subtitle(total_rows: int) -> str:
+    """The project COUNT, and nothing else.
+
+    The privacy mode it used to append is now stated by the facts strip,
+    which reads the provenance marker preparation stamped rather than an
+    option — so this cannot claim "real projects" about a scrubbed
+    snapshot (#503 S1 F3, #503 S2 D5). The count is a genuine semantic
+    fact and stays.
+    """
+    return f"{total_rows} project{'' if total_rows == 1 else 's'}"
 
 
 def _build_projects_recap(*, panel_data, options):
@@ -1726,7 +1832,7 @@ def _build_projects_recap(*, panel_data, options):
     return _LS.ShareSnapshot(
         cmd="projects",
         title=f"Projects recap — top {min(cap, len(rows))}",
-        subtitle=_projects_subtitle(options, len(rows)),
+        subtitle=_projects_subtitle(len(rows)),
         period=_projects_period(panel_data, options),
         columns=_PROJECTS_TABLE_COLUMNS,
         rows=_projects_rows_for_template(rows, cap),
@@ -1747,6 +1853,12 @@ def _build_projects_visual(*, panel_data, options):
     Mirrors `weekly-visual` / `current-week-visual` — chart-led, no
     table. Spec §7.6 routes the visual archetype to a HorizontalBarChart
     of the top-12 projects.
+
+    #503 S2 F17: this docstring said "no table" while the builder passed
+    a full column set with zero rows, so every format emitted a
+    header-only table with an empty body. Fixed HERE rather than by
+    teaching the renderers a row-count rule, because columns with zero
+    rows is a legitimate empty-result schema elsewhere.
     """
     rows = panel_data.get("rows") or []
     cap_chart = 12
@@ -1754,10 +1866,10 @@ def _build_projects_visual(*, panel_data, options):
     return _LS.ShareSnapshot(
         cmd="projects",
         title=f"Projects — top {min(cap_chart, len(rows))} by cost",
-        subtitle=_projects_subtitle(options, len(rows)),
+        subtitle=_projects_subtitle(len(rows)),
         period=_projects_period(panel_data, options),
-        columns=_PROJECTS_TABLE_COLUMNS,
-        rows=(),                                  # visual archetype: empty table
+        columns=(),                               # visual archetype: no table
+        rows=(),
         chart=_projects_chart_for_template(rows, cap=cap_chart),
         totals=_kpi_strip(
             ("$ spent", f"${total:,.2f}"),
@@ -1786,7 +1898,7 @@ def _build_projects_detail(*, panel_data, options):
     return _LS.ShareSnapshot(
         cmd="projects",
         title=f"Projects detail — {len(rows)} project{'' if len(rows) == 1 else 's'}",
-        subtitle=_projects_subtitle(options, len(rows)),
+        subtitle=_projects_subtitle(len(rows)),
         period=_projects_period(panel_data, options),
         columns=_PROJECTS_TABLE_COLUMNS,
         rows=_projects_rows_for_template(rows, cap),

@@ -9,14 +9,10 @@ cctally_version: 9.9.9
 
 # Diff Report — Claude + Codex
 
-## Diff Report
-
-# Diff Report
-
-**Claude**
+## Diff Report — Claude
 
 No data
-_2026-07-01 → 2026-07-02 (UTC)_
+_2026-07-01 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T00:00:00Z_
 
 | Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |
@@ -30,12 +26,8 @@ _2026-07-02T00:00:00Z_
 - **B tokens:** 0
 - **Δ tokens:** +0
 
-## Diff Report
-
-# Diff Report
-
-**Codex**
-_2026-07-01 → 2026-07-02 (UTC)_
+## Diff Report — Codex
+_2026-07-01 → 2026-07-02 (Etc/UTC) · projects anonymized_
 _2026-07-02T00:00:00Z_
 
 | Section | Item | Status | A $ Cost | B $ Cost | Δ $ Cost | A Tokens | B Tokens | Δ Tokens |

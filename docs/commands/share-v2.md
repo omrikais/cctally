@@ -18,7 +18,7 @@ Each share-capable dashboard panel (and its detail modal) renders a header **sha
 | Modal header `↗` | Opens the share modal layered above the panel modal. Closing share returns to the underlying modal — it does not unmount. |
 | Keyboard `S` | Opens the share modal for the currently-focused panel. (See [Keyboard](#keyboard).) |
 
-**Not share-capable:** the Alerts panel has no share icon — it is a notification stream, not a snapshotted data view.
+**Not share-capable:** the Alerts panel and the Cache Report panel have no share icon. Alerts is a notification stream rather than a snapshotted data view; Cache Report is the one remaining data panel with no share kernel behind it.
 
 ## Share modal anatomy
 
@@ -32,7 +32,7 @@ Each share-capable dashboard panel (and its detail modal) renders a header **sha
 │  │ Period: This week ▾ │  ┌────────────────────────────┐ │ │
 │  │ Theme:  ◉ light ○ dk│  │ sandboxed preview iframe   │ │ │
 │  │ Top-N:  [10  ]      │  │ (live re-render on knob    │ │ │
-│  │ Projects: 5 of 7 ▾  │  │  changes, 200 ms debounce) │ │ │
+│  │ Projects: all (n/a) │  │  changes, 200 ms debounce) │ │ │
 │  │ Show chart  ☑       │  └────────────────────────────┘ │ │
 │  │ Show table  ☑       │                                  │ │
 │  │ Anon on export ☑    │                                  │ │
@@ -80,7 +80,7 @@ Live in the left column of the modal. Knob changes debounce by 200 ms before re-
 | **Period** | `This week` (default for week-scoped panels), `Previous week`, or `Custom` (start/end pickers). For non-weekly panels the default tracks the panel's focus (Daily → today; Monthly → current month; etc.). |
 | **Theme** | `light` (default) or `dark` palette. No-op for Markdown. |
 | **Top-N** | Number of rows in the table. Default 5; 15 for Sessions. Validation: `N >= 1`. |
-| **Projects allowlist** | Multi-select popover with real project names. Filters before anonymization, so anon labels stay dense (`project-1, project-2, project-3` — no gaps). |
+| **Projects allowlist** | **Not shipped.** The control renders disabled and states `Exports include all projects`; every export carries every project the panel holds. The multi-select popover described in the v2 design is unbuilt. |
 | **Show chart** | Include / drop the chart fragment from the output. |
 | **Show table** | Include / drop the table fragment from the output. |
 | **Anon on export** | Anonymize project names in exports. **Preview always reveals**; only exports respect this checkbox. Default on. |
@@ -134,7 +134,7 @@ Buttons that don't apply to the selected format are disabled with an explanatory
 - A share, composer, panel, or update modal is already open (mode-stack guard).
 - A filter / search input has focus.
 - No panel is focused — `S` surfaces a help toast: *"Click a panel first, then press S to share it."*
-- The focused panel is the Alerts panel (not share-capable).
+- **`S` only:** the focused panel is not share-capable (Alerts or Cache Report). `B` opens the composer and resolves no focused panel at all, so this guard does not apply to it.
 - The viewport is at or below the mobile breakpoint (640 px) — hotkeys are mouse-only on mobile per spec §12.9.
 
 Both bindings fire the same dispatch as clicking the corresponding icon (panel `↗` for `S`, header chip for `B`); focus restores to the trigger when the modal closes.
@@ -162,17 +162,19 @@ Build multi-section reports by collecting templates from different panels into a
 
 The composer modal:
 
-- **Left pane:** reorderable section list (drag the `≡` handle). Per-section kebab `⋯` opens preview-only / refresh-from-current-data / remove.
+- **Left pane:** reorderable section list (drag the `≡` handle). Per-section kebab `⋯` offers refresh-from-current-data and remove. There is no preview-only action.
 - **Right pane:** live combined preview in a sandboxed iframe.
 - **Top knobs:** title, theme, format, anon-on-export, no-branding. These are composite — they override every section's add-time values per spec §8.5.
 - **Outdated badge:** appears when section data has shifted since add-time OR when the kernel version has changed. Click `Refresh from current data` to re-render.
 - **Real-name banner:** appears at the top of the composed output whenever the composite `anon-on-export` is unchecked and the basket is not empty. Each section's add-time anonymization choice does not enter into it. Anonymizing at compose time hides the banner. (An earlier version of this page said the banner also required at least one section to have been added with `reveal_projects=true`. That condition was retired because it hid a real-name export: compose re-renders every section with the composite value, so a section captured anonymously is revealed anyway, and under the old condition the banner stayed silent about it.)
 
-The basket persists across page reloads in browser localStorage (`cctally:share:basket`). Hard-capped at 20 sections. Cleared via the composer's `Clear all` button (no Undo affordance — refresh is the recovery).
+The basket persists across page reloads in browser localStorage (`cctally:share:basket`). Hard-capped at 20 sections. Cleared via the composer's `Clear all` button, which asks for confirmation first and names how many sections it is about to clear. There is no Undo, and a refresh does not recover a cleared basket — the confirmation is the protection.
 
 ## Share history
 
-Every successful export appends a recipe (no body) to a 20-deep ring buffer at `share.history` in `config.json`. Surfaced under the **Recent shares** segmented group inside the gallery's **presets ▾** dropdown — filtered to the panel you're sharing. Clicking a history entry overwrites the modal's options; it does NOT auto-export.
+Every successful export appends a recipe (no body) to a 20-deep ring buffer at `share.history` in `config.json`. Surfaced under the **Recent shares** segmented group inside the gallery's **presets ▾** dropdown. An export that never happened is never recorded: a blocked pop-up on `Open`, or a `Print` with no print target, reports the failure and writes no row.
+
+A row is one of two kinds. A **panel** row is a single panel's recipe and appears only in that panel's list; clicking it overwrites the modal's options, and it does NOT auto-export. A **composed** row records one multi-section export from the composer; it appears in **every** panel's list, is labelled `Composed · N sections · <format>`, and is **display-only** — restoring a basket from history is not a v2 affordance. A row written before this distinction existed reads as a panel row, and a composed row is invisible to an older browser tab.
 
 Clearing history has no GUI control in v2 yet — edit `~/.local/share/cctally/config.json` directly (drop the `share.history` key) or call `DELETE /api/share/history` (Origin/Host CSRF gate applies; pass `-H 'Origin: http://127.0.0.1:8789'`).
 

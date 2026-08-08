@@ -332,6 +332,7 @@ ALLOWED_CONFIG_KEYS = (
     "budget.codex.accounts",
     "telemetry.enabled",
     "conversation.retention_days",
+    "storage.artifact_retention",
     "codex.hook.ingest_budget_seconds",
 )
 
@@ -387,6 +388,61 @@ def _validate_retention_days_value(raw: object) -> int:
             "conversation.retention_days must be >= 0 (use 'off' or 0 to disable)"
         )
     return value
+
+
+def _validate_artifact_retention_value(raw: object) -> dict:
+    """Validate a ``config set`` value for ``storage.artifact_retention`` (#496 S6).
+
+    The argument is the raw CLI string (or an already-parsed object). JSON is
+    parsed here; every semantic rule is delegated to the kernel's
+    ``resolve_retention_policy`` so ``config set`` and the retention worker
+    share ONE predicate rather than drifting apart. Raises ``ValueError``,
+    which the caller maps to exit 2.
+    """
+    import _lib_artifact_retention as _ar
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.lower() in {"null", "none", ""}:
+            raise ValueError(
+                "storage.artifact_retention must be a JSON object "
+                "(use `config unset storage.artifact_retention` to restore "
+                "the defaults)"
+            )
+        try:
+            parsed: object = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError(
+                "storage.artifact_retention must be a JSON object, got "
+                f"{raw!r}"
+            )
+    else:
+        parsed = raw
+    if not isinstance(parsed, dict):
+        raise ValueError("storage.artifact_retention must be a JSON object")
+    resolution = _ar.resolve_retention_policy(parsed)
+    if resolution.status == "malformed":
+        raise ValueError(resolution.reason)
+    return parsed
+
+
+def resolve_artifact_retention_block(config: object) -> dict:
+    """The effective ``storage.artifact_retention`` block, in config units.
+
+    Read-only convenience for ``config get``: a malformed persisted block
+    surfaces the defaults here (mirroring every other ``_config_known_value``
+    branch) because a plain read must not error out. The DELETION path never
+    uses this — it calls ``resolve_retention_policy`` on a raw file read and
+    refuses to act on ``malformed`` (spec §6.5, C14).
+    """
+    import _lib_artifact_retention as _ar
+
+    storage = config.get("storage") if isinstance(config, dict) else None
+    raw = storage.get("artifact_retention") if isinstance(storage, dict) else None
+    resolution = _ar.resolve_retention_policy(raw)
+    if resolution.policy is None:
+        return _ar.default_policy_block()
+    return _ar.policy_to_block(resolution.policy)
 
 
 def _validate_codex_hook_ingest_budget_value(raw: object) -> float:
@@ -1068,6 +1124,11 @@ def _config_known_value(config: dict, key: str) -> "object":
         # Effective transcript-retention window in days (default 180; 0 = keep
         # forever). Malformed persisted data surfaces the safe default (F8).
         return resolve_retention_days(config)
+    if key == "storage.artifact_retention":
+        # Effective retained-evidence policy in config units (#496 S6 §6.5).
+        # Malformed persisted data surfaces the defaults on this READ path
+        # only; the deletion path refuses to act on it instead.
+        return resolve_artifact_retention_block(config)
     if key == "codex.hook.ingest_budget_seconds":
         # Wall-clock budget for the native Codex hook's ingest leg (public #5).
         # Malformed or out-of-range persisted data surfaces the default.
@@ -1172,7 +1233,7 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
     def _coerce(k: str, v: "object") -> "object":
         if k in (
             "alerts.command_template", "alerts.quota", "budget.projects",
-            "budget.accounts", "budget.codex",
+            "budget.accounts", "budget.codex", "storage.artifact_retention",
         ) or k.startswith(_CODEX_BUDGET_LEAF_PREFIX):
             return v
         return v if v is not None else ""
@@ -1216,7 +1277,7 @@ def _cmd_config_get(args: argparse.Namespace, config: dict) -> int:
             # round-trips via `config set alerts.enabled <plain-text>` work.
             if k in (
                 "alerts.command_template", "alerts.quota", "budget.projects",
-                "budget.accounts", "budget.codex",
+                "budget.accounts", "budget.codex", "storage.artifact_retention",
             ):
                 # JSON-encoded so `config get` output round-trips through the
                 # matching `config set` branch (both JSON-parse their value).
@@ -1803,6 +1864,37 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
         else:
             print(f"{key}={normalized}")
         return 0
+    if key == "storage.artifact_retention":
+        # Validate first; rejection short-circuits before lock acquisition.
+        # The whole block is stored verbatim (partial blocks inherit the
+        # per-field defaults at resolve time), so an operator can write one
+        # field without restating the rest.
+        try:
+            block_value = _validate_artifact_retention_value(raw)
+        except ValueError as exc:
+            print(f"cctally: {exc}", file=sys.stderr)
+            return 2
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            existing_storage = config.get("storage")
+            if existing_storage is not None and not isinstance(
+                existing_storage, dict
+            ):
+                print(
+                    "cctally: storage config error: storage must be an object",
+                    file=sys.stderr,
+                )
+                return 2
+            storage_block = dict(existing_storage or {})
+            storage_block["artifact_retention"] = block_value
+            config["storage"] = storage_block
+            save_config(config)
+        if getattr(args, "emit_json", False):
+            print(json.dumps(
+                {"storage": {"artifact_retention": block_value}}, indent=2))
+        else:
+            print(f"{key}={json.dumps(block_value, sort_keys=True)}")
+        return 0
     if key in ("update.check.enabled", "update.check.ttl_hours"):
         # Validate first; rejection short-circuits before lock acquisition.
         if key == "update.check.enabled":
@@ -2351,6 +2443,20 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 del block["retention_days"]
                 if not block:
                     config.pop("conversation", None)
+                save_config(config)
+            # idempotent: silent on missing key
+        return 0
+    if key == "storage.artifact_retention":
+        # Mirror the conversation.retention_days branch: drop the leaf; if the
+        # `storage` block ends up empty, drop it too. The next resolve returns
+        # the whole DEFAULT_POLICY, not a partially-defaulted one.
+        with config_writer_lock():
+            config = _load_config_unlocked()
+            block = config.get("storage")
+            if isinstance(block, dict) and "artifact_retention" in block:
+                del block["artifact_retention"]
+                if not block:
+                    config.pop("storage", None)
                 save_config(config)
             # idempotent: silent on missing key
         return 0

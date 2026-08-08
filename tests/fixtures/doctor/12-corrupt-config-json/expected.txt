@@ -32,6 +32,8 @@ Database
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
   ✓ Reclaimable transcript space below threshold
+  ✗ Retained evidence        retention policy in config.json is malformed — automatic reclaim is off
+      → Fix or remove the storage.artifact_retention block: config.json could not be read: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
 Journal
   ✓ Journal                  no journal (pre-cutover install)
   ✓ Journal integrity        no journal
@@ -77,4 +79,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 51 OK · 7 WARN · 1 FAIL
+Summary: 51 OK · 7 WARN · 2 FAIL

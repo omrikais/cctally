@@ -1,11 +1,13 @@
 // Spec §6.6 + §11.3 — list saved presets across all panels with
 // rename / delete affordances.
 //
-// Rename is implemented client-side as "save under new name, then
-// delete old" so a mid-flight failure can't lose the preset. The
-// server has no rename endpoint (per spec the contract is idempotent
-// on (panel, name) — save is the only mutation surface), and this
-// keeps the implementation honest about the failure mode.
+// Rename is ONE request to `POST /api/share/presets/rename` (#503 S3 §1).
+// It used to be a client-side "save under new name, then delete old" pair,
+// which rebuilt the record from the four fields this modal happened to hold
+// — so it dropped `source`, reset `saved_at`, and silently overwrote any
+// preset already holding the target name. The endpoint moves the stored
+// record whole under one config writer lock, and answers a collision with
+// HTTP 409 `preset_name_conflict`.
 //
 // Esc closes the modal — registered at `modal` scope. The share
 // modal's overlay-scope Esc binding is gated by `when: () => !manageOpen`
@@ -14,13 +16,15 @@
 // audit, not implemented here.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  listPresets, deletePreset, savePreset, type PresetRecord, ShareApiError,
+  listPresets, deletePreset, renamePreset, PRESET_NAME_CONFLICT,
+  type PresetRecord, type SavedPreset, ShareApiError,
 } from './presetsApi';
 import type { SharePanelId } from './types';
 import { dispatch } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
 import { sharePanelLabel } from './panelLabels';
 import { ModalHeader } from '../modals/ModalHeader';
+import { ConfirmAction, useConfirmHost, type ConfirmHost } from './ConfirmAction';
 
 interface Props {
   open: boolean;
@@ -32,6 +36,40 @@ interface Props {
 // readers read what's actually painted.
 const MANAGE_PRESETS_TITLE_ID = 'share-manage-presets-title';
 
+// #503 S3 §2 — the focus fallback after a destructive confirm. Confirming a
+// delete removes the initiating button and a rename changes the row key, so
+// literal restoration is impossible: focus goes to the next row's first
+// action, and to the table's Name heading when the confirmed row was the
+// last one. The heading takes `tabIndex={-1}` for exactly that reason.
+const MANAGE_PRESETS_HEADING_ID = 'share-manage-presets-name-heading';
+
+// `alsoRemoved` names a SECOND row the same operation destroys. An
+// overwrite-rename destroys the row holding the target name, and that row can
+// be the very next one — in which case the plain "next row's first action"
+// answer resolves to a button that is about to leave the DOM, `restore()`
+// declines to focus a detached node, and focus lands nowhere at all. So the
+// scan walks past every row this operation removes.
+function focusAfterRowRemoval(
+  panel: string, name: string, alsoRemoved?: string,
+): HTMLElement | null {
+  const rows = Array.from(
+    document.querySelectorAll<HTMLTableRowElement>('.share-manage-table tbody tr'),
+  );
+  const doomed = new Set([`${panel}/${name}`]);
+  if (alsoRemoved != null) doomed.add(`${panel}/${alsoRemoved}`);
+  const idx = rows.findIndex((r) => r.dataset.presetKey === `${panel}/${name}`);
+  if (idx >= 0) {
+    for (const next of rows.slice(idx + 1)) {
+      if (next.dataset.presetKey != null && doomed.has(next.dataset.presetKey)) {
+        continue;
+      }
+      const action = next.querySelector<HTMLElement>('.share-manage-actions button');
+      if (action) return action;
+    }
+  }
+  return document.getElementById(MANAGE_PRESETS_HEADING_ID);
+}
+
 interface Row {
   panel: SharePanelId;
   name: string;
@@ -42,6 +80,9 @@ export function ManagePresetsModal({ open, onClose }: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ONE confirmation slot for the whole table — see ConfirmAction.tsx for
+  // why this cannot be per-row state.
+  const confirm = useConfirmHost();
 
   const bindings = useMemo(
     () => open
@@ -118,51 +159,99 @@ export function ManagePresetsModal({ open, onClose }: Props) {
   async function handleDelete(row: Row) {
     setBusy(true);
     setError(null);
+    // Resolved BEFORE the row leaves the DOM, because afterwards there is no
+    // row to count from. The element itself is CAPTURED here and the closure
+    // handed to `confirm.close` returns that same node — it is not looked up
+    // again. Surviving rows keep their React key, so their DOM nodes survive
+    // the re-render; `restore()` declines a detached node either way.
+    const focusTarget = focusAfterRowRemoval(row.panel, row.name);
     try {
       await deletePreset(row.panel, row.name);
-      setRows((curr) =>
-        curr.filter((r) => !(r.panel === row.panel && r.name === row.name)),
-      );
-      dispatch({ type: 'SHOW_STATUS_TOAST', text: `Deleted preset "${row.name}"` });
     } catch (err: unknown) {
       const msg =
         err instanceof ShareApiError
           ? err.message ?? `HTTP ${err.status}`
           : (err as Error).message;
       setError(msg ?? 'Delete failed');
-    } finally {
       setBusy(false);
+      return;
     }
+    setRows((curr) =>
+      curr.filter((r) => !(r.panel === row.panel && r.name === row.name)),
+    );
+    // `setBusy(false)` MUST precede `confirm.close`. Every row action renders
+    // `disabled={busy}`, and React applies queued updates in call order, so
+    // clearing the flag first is what puts the re-enable in the same commit
+    // the deferred focus restore reads. This used to sit in a `finally` that
+    // ran after the close: the restore then ran against a still-disabled
+    // button, the call was absorbed, and focus stayed on <body>.
+    setBusy(false);
+    confirm.close(() => focusTarget);
+    dispatch({ type: 'SHOW_STATUS_TOAST', text: `Deleted preset "${row.name}"` });
   }
 
-  async function handleRename(row: Row, nextName: string) {
+  // Returns the outcome rather than swallowing it, because a collision is
+  // not an error the user should read as a failure — it is the moment the
+  // UI asks whether to replace. The 409 `code` is the discriminator, not
+  // the client's own name-list preflight, which can go stale.
+  async function handleRename(
+    row: Row, nextName: string, overwrite = false,
+  ): Promise<'ok' | 'conflict' | 'error'> {
     setBusy(true);
     setError(null);
+    let saved: SavedPreset;
     try {
-      // Save under new name first; only delete old if save succeeds so
-      // a mid-flight failure can't lose the preset.
-      await savePreset({
+      saved = await renamePreset({
         panel: row.panel,
-        name: nextName,
-        template_id: row.record.template_id,
-        options: row.record.options,
+        from_name: row.name,
+        to_name: nextName,
+        ...(overwrite ? { overwrite: true } : {}),
       });
-      await deletePreset(row.panel, row.name);
-      setRows((curr) => curr.map((r) =>
-        (r.panel === row.panel && r.name === row.name)
-          ? { ...r, name: nextName }
-          : r,
-      ));
-      dispatch({ type: 'SHOW_STATUS_TOAST', text: `Renamed to "${nextName}"` });
     } catch (err: unknown) {
+      // Cleared before returning, for the same reason handleDelete clears it
+      // before `confirm.close`: the overwrite confirmation closes the moment
+      // this promise settles, and its focus target renders `disabled={busy}`.
+      setBusy(false);
+      if (err instanceof ShareApiError
+          && err.code === PRESET_NAME_CONFLICT) {
+        return 'conflict';
+      }
       const msg =
         err instanceof ShareApiError
           ? err.message ?? `HTTP ${err.status}`
           : (err as Error).message;
       setError(msg ?? 'Rename failed');
-    } finally {
-      setBusy(false);
+      return 'error';
     }
+    setRows((curr) => {
+      // An overwrite consumed whatever held the target name.
+      const survivors = overwrite
+        ? curr.filter((r) => !(r.panel === row.panel && r.name === nextName))
+        : curr;
+      return survivors.map((r) =>
+        (r.panel === row.panel && r.name === row.name)
+          // The server answers with the MOVED record, so the row shows
+          // what is stored. Carrying the stale `record` forward is what
+          // made the "Saved at" cell disagree with the server.
+          ? {
+            ...r,
+            name: nextName,
+            record: {
+              template_id: saved.template_id,
+              options: saved.options,
+              saved_at: saved.saved_at,
+              ...(saved.source ? { source: saved.source } : {}),
+            },
+          }
+          : r,
+      );
+    });
+    // Before the caller's `.then` runs, so the commit that closes the
+    // overwrite confirmation is also the commit that re-enables the row
+    // actions the restore is about to focus.
+    setBusy(false);
+    dispatch({ type: 'SHOW_STATUS_TOAST', text: `Renamed to "${nextName}"` });
+    return 'ok';
   }
 
   if (!open) return null;
@@ -192,7 +281,7 @@ export function ManagePresetsModal({ open, onClose }: Props) {
           <thead>
             <tr>
               <th>Panel</th>
-              <th>Name</th>
+              <th id={MANAGE_PRESETS_HEADING_ID} tabIndex={-1}>Name</th>
               <th>Saved at</th>
               <th />
             </tr>
@@ -203,8 +292,9 @@ export function ManagePresetsModal({ open, onClose }: Props) {
                 key={`${row.panel}/${row.name}`}
                 row={row}
                 busy={busy}
+                confirm={confirm}
                 onDelete={() => void handleDelete(row)}
-                onRename={(next) => void handleRename(row, next)}
+                onRename={(next, overwrite) => handleRename(row, next, overwrite)}
               />
             ))}
           </tbody>
@@ -214,14 +304,22 @@ export function ManagePresetsModal({ open, onClose }: Props) {
   );
 }
 
-function ManagePresetRow({ row, busy, onDelete, onRename }: {
+function ManagePresetRow({ row, busy, confirm, onDelete, onRename }: {
   row: Row;
   busy: boolean;
+  confirm: ConfirmHost;
   onDelete: () => void;
-  onRename: (next: string) => void;
+  onRename: (next: string, overwrite?: boolean) =>
+    Promise<'ok' | 'conflict' | 'error'>;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(row.name);
+  // The name the server refused because something already holds it. Kept so
+  // the confirmation can re-issue the SAME rename with `overwrite`.
+  const [pendingName, setPendingName] = useState<string | null>(null);
+  const rowKey = `${row.panel}/${row.name}`;
+  const deleteKey = `delete:${rowKey}`;
+  const renameKey = `rename:${rowKey}`;
 
   const commitRename = () => {
     const trimmed = draft.trim();
@@ -230,12 +328,19 @@ function ManagePresetRow({ row, busy, onDelete, onRename }: {
       setEditing(false);
       return;
     }
-    onRename(trimmed);
     setEditing(false);
+    void onRename(trimmed).then((outcome) => {
+      // The 409 `code` is the discriminator, not a client-side name-list
+      // preflight, which can go stale between its GET and the write.
+      if (outcome === 'conflict') {
+        setPendingName(trimmed);
+        confirm.arm(renameKey);
+      }
+    });
   };
 
   return (
-    <tr>
+    <tr data-preset-key={rowKey}>
       <td>{sharePanelLabel(row.panel)}</td>
       <td>
         {editing ? (
@@ -278,9 +383,41 @@ function ManagePresetRow({ row, busy, onDelete, onRename }: {
         >
           {editing ? 'Cancel' : 'Rename'}
         </button>
-        <button type="button" disabled={busy} onClick={onDelete}>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => confirm.arm(deleteKey)}
+        >
           Delete
         </button>
+        <ConfirmAction
+          id={deleteKey}
+          host={confirm}
+          prompt={`Delete "${row.name}"?`}
+          confirmLabel="Delete"
+          onConfirm={onDelete}
+        />
+        <ConfirmAction
+          id={renameKey}
+          host={confirm}
+          prompt={`A preset named "${pendingName ?? ''}" already exists`}
+          confirmLabel="Replace it"
+          onConfirm={() => {
+            const target = pendingName;
+            if (target == null) return;
+            // The overwrite destroys the row holding `target` as well as
+            // moving this one, so that row is excluded from the scan.
+            const focusTarget = focusAfterRowRemoval(
+              row.panel, row.name, target,
+            );
+            void onRename(target, true).then((outcome) => {
+              if (outcome === 'ok') {
+                setPendingName(null);
+                confirm.close(() => focusTarget);
+              }
+            });
+          }}
+        />
       </td>
     </tr>
   );

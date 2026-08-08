@@ -476,6 +476,11 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "JOURNAL_DIR": share / "journal",
         "JOURNAL_LOCK_PATH": share / "journal.lock",
         "JOURNAL_INGEST_LOCK_PATH": share / "journal.ingest.lock",
+        # Retained-evidence reclamation flock (#496 S6). Pinned for the same
+        # reason as the journal locks: every producer takes it, so an unpinned
+        # constant would serialize the whole test suite on the developer's real
+        # prod lock file.
+        "ARTIFACT_RETENTION_LOCK_PATH": share / "artifact-retention.lock",
         # Claude identity file (#341). Pinned so account-attribution reads (the
         # epoch-transition coordinator, record-usage/statusline stamping) hit the
         # per-test fake HOME, never the developer's real ~/.claude.json.

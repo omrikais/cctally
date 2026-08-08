@@ -575,7 +575,8 @@ def test_codex_report_quota_failure_keeps_the_as_of_envelope_and_source_block(
         "report", "--source", "all", "--format", "md", "--output", "-",
     ]) == 0
     all_share = capsys.readouterr().out
-    assert "**Claude**" in all_share and "**Codex**" in all_share
+    # D6 heading qualifier, not the retired per-section provider line.
+    assert " — Claude\n" in all_share and " — Codex\n" in all_share
     assert "Codex quota state is unavailable." in all_share
 
 
@@ -761,7 +762,8 @@ def test_all_source_commands_compose_real_provider_blocks(
         ),
         (
             ["report", "--source", "all", "--weeks", "1"],
-            "Jul 13", "primary · 10080m",
+            # #503 S2 D4/F15 — the week cell is full ISO, not `%b %d`.
+            "2026-07-13", "primary · 10080m",
         ),
     ],
 )
@@ -777,8 +779,12 @@ def test_real_all_source_populated_share_keeps_provider_rows_separate_and_ordere
     assert ns["main"]([*argv, "--format", "md", "--output", "-"]) == 0
     rendered = capsys.readouterr().out
 
-    claude_at = rendered.index("**Claude**")
-    codex_at = rendered.index("**Codex**")
+    # #503 S2 D6: an all-source composition qualifies each section heading
+    # by provider and drops the separate `**Claude**` / `**Codex**` line,
+    # because both sections otherwise carry the SAME title and only that
+    # small line distinguished them. The heading is now the marker.
+    claude_at = rendered.index(" — Claude\n")
+    codex_at = rendered.index(" — Codex\n")
     assert claude_at < codex_at
     assert claude_marker in rendered[claude_at:codex_at]
     assert codex_marker in rendered[codex_at:]

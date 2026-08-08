@@ -137,7 +137,13 @@ def test_repair_stats_recovers_and_preserves_irreplaceable_invariants(
         conn.close()
     assert stat.S_IMODE(source.stat().st_mode) == 0o600
 
-    backups = list(source.parent.glob("stats.db.bak-corrupt-malformed-*") )
+    backups = [
+        item
+        for item in source.parent.glob("stats.db.bak-corrupt-malformed-*")
+        # #496 S6 §3.7 writes a `<stem>.classification.json` beside the family,
+        # and its spec-mandated name shares the family's prefix.
+        if not item.name.endswith(("-wal", "-shm", ".classification.json"))
+    ]
     assert len(backups) == 1
     assert backups[0].read_bytes() == corrupt_bytes
     assert _integrity(backups[0]) != "ok"
@@ -237,7 +243,13 @@ def test_repair_refuses_when_source_usage_count_cannot_be_proved(
     assert rc == 3
     assert "cannot prove preservation" in capsys.readouterr().err
     assert source.read_bytes() == before
-    assert len(list(source.parent.glob("stats.db.bak-corrupt-malformed-*"))) == 1
+    # One backup FAMILY. #496 S6 §3.7's classification sidecar shares the
+    # family's name prefix, so it is excluded here like the WAL/SHM members.
+    assert len([
+        item
+        for item in source.parent.glob("stats.db.bak-corrupt-malformed-*")
+        if not item.name.endswith(("-wal", "-shm", ".classification.json"))
+    ]) == 1
 
 
 def test_repair_stats_requires_yes_and_leaves_bytes_untouched(
@@ -546,3 +558,138 @@ def test_backup_publish_race_never_overwrites_new_owner_file(
     assert rc == 2
     assert "already exists" in capsys.readouterr().err
     assert output.read_bytes() == b"racing owner"
+
+
+# --------------------------------------------------------------------------
+# #496 S6 Task 5 — the backup classification sidecar (spec §3.7)
+# --------------------------------------------------------------------------
+
+
+def _only_backup_stem(source: pathlib.Path) -> pathlib.Path:
+    stems = [
+        item
+        for item in source.parent.glob("stats.db.bak-corrupt-malformed-*")
+        if not item.name.endswith(("-wal", "-shm", ".classification.json"))
+    ]
+    assert len(stems) == 1, stems
+    return stems[0]
+
+
+def test_db_repair_writes_a_classification_sidecar_for_its_backup(
+    monkeypatch, tmp_path, capsys
+):
+    import json
+
+    c = _ns(monkeypatch, tmp_path)
+    source = c._cctally_core.DB_PATH
+    _seed_corrupt_wal_family(source, tmp_path)
+
+    rc = c.cmd_db_repair(_repair_args())
+    assert rc == 0, capsys.readouterr().err
+
+    stem = _only_backup_stem(source)
+    sidecar = pathlib.Path(f"{stem}.classification.json")
+    payload = json.loads(sidecar.read_text())
+
+    assert payload["schemaVersion"] == 1
+    assert payload["method"] == "db-repair"
+    assert payload["confidence"] == "exact"
+    assert payload["trigger"] == "db-repair"
+    assert payload["backupStem"] == stem.name
+    assert payload["binaryVersion"]
+    assert payload["classifiedAtUtc"].endswith("Z")
+    # Nullable — `db repair` writes no forensics bundle, and the heal's
+    # no-journal path returns before one exists.
+    assert "forensicsPath" in payload
+
+    names = {member["name"] for member in payload["members"]}
+    assert names == {
+        item.name
+        for item in source.parent.glob(f"{stem.name}*")
+        if not item.name.endswith(".classification.json")
+    }
+    for member in payload["members"]:
+        for field in ("name", "size", "mtime", "device", "inode"):
+            assert field in member, field
+        on_disk = source.parent / member["name"]
+        info = on_disk.stat()
+        assert member["size"] == info.st_size
+        assert member["device"] == info.st_dev
+        assert member["inode"] == info.st_ino
+
+    assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+
+def test_a_crash_before_the_sidecar_leaves_the_backup_protected(
+    monkeypatch, tmp_path, capsys
+):
+    """The durable order is family, then directory, then sidecar (§3.7).
+
+    A crash in that window must leave the backup UNCLASSIFIED, which the
+    retention planner treats as protected — the safe direction.
+    """
+    c = _ns(monkeypatch, tmp_path)
+    import _cctally_db
+
+    source = c._cctally_core.DB_PATH
+    _seed_corrupt_wal_family(source, tmp_path)
+
+    real_write = _cctally_db._write_backup_classification_sidecar
+
+    def crash(*args, **kwargs):
+        raise OSError("injected crash after the family was copied")
+
+    monkeypatch.setattr(
+        _cctally_db, "_write_backup_classification_sidecar", crash
+    )
+
+    rc = c.cmd_db_repair(_repair_args())
+    assert rc == 3
+    capsys.readouterr()
+
+    stem = _only_backup_stem(source)
+    assert stem.exists(), "the copied family must survive"
+    assert not pathlib.Path(f"{stem}.classification.json").exists()
+    assert callable(real_write)
+
+
+def test_the_sidecar_is_written_only_after_the_family_is_durable(
+    monkeypatch, tmp_path, capsys
+):
+    c = _ns(monkeypatch, tmp_path)
+    import _cctally_db
+
+    source = c._cctally_core.DB_PATH
+    _seed_corrupt_wal_family(source, tmp_path)
+
+    order: list[str] = []
+    real_copy = _cctally_db._copy_db_family
+    real_fsync_dir = _cctally_db._fsync_directory
+    real_sidecar = _cctally_db._write_backup_classification_sidecar
+
+    def copy(src, dst, **kwargs):
+        result = real_copy(src, dst, **kwargs)
+        if "bak-corrupt-malformed" in str(dst):
+            order.append("family-copied")
+        return result
+
+    def fsync_dir(path):
+        result = real_fsync_dir(path)
+        if order and order[-1] == "family-copied":
+            order.append("directory-fsynced")
+        return result
+
+    def sidecar(*args, **kwargs):
+        order.append("sidecar-written")
+        return real_sidecar(*args, **kwargs)
+
+    monkeypatch.setattr(_cctally_db, "_copy_db_family", copy)
+    monkeypatch.setattr(_cctally_db, "_fsync_directory", fsync_dir)
+    monkeypatch.setattr(
+        _cctally_db, "_write_backup_classification_sidecar", sidecar
+    )
+
+    assert c.cmd_db_repair(_repair_args()) == 0, capsys.readouterr().err
+    assert order[:3] == [
+        "family-copied", "directory-fsynced", "sidecar-written",
+    ], order

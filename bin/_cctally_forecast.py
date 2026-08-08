@@ -1039,22 +1039,21 @@ def cmd_report(args: argparse.Namespace) -> int:
                 # fixture goldens don't drift when the harness host's
                 # wall-clock day rolls past CCTALLY_AS_OF.
                 now_local = _command_as_of().astimezone(tz)
-                local_tz = now_local.tzinfo
                 ws_d, we_d = compute_week_bounds(now_local, week_start_name)
-                ws_dt = dt.datetime.combine(
-                    ws_d, dt.time.min, tzinfo=local_tz
-                )
-                we_dt = dt.datetime.combine(
-                    we_d + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
-                )
+                # Grounded in the zone the period is LABELLED with, not in
+                # `now_local.tzinfo` (#503 S2 D7). That attribute is the
+                # fixed offset in force right now, so a week that began
+                # under a different DST offset was anchored an hour away
+                # from its own midnight and could state the previous day.
+                ws_dt = c._share_ground_civil_date(ws_d, tz)
+                we_dt = c._share_ground_civil_date(
+                    we_d + dt.timedelta(days=1), tz)
                 snap = c._build_report_snapshot(
                     c.TrendView(),
                     period_start=ws_dt,
                     period_end=we_dt,
                     display_tz=display_tz_str,
                     version=c._share_resolve_version(),
-                    theme=args.theme,
-                    reveal_projects=args.reveal_projects,
                 )
                 c._share_render_and_emit(snap, args)
                 return 0
@@ -1253,8 +1252,6 @@ def cmd_report(args: argparse.Namespace) -> int:
                 period_end=period_end,
                 display_tz=display_tz_str,
                 version=c._share_resolve_version(),
-                theme=args.theme,
-                reveal_projects=args.reveal_projects,
             )
             c._share_render_and_emit(snap, args)
             return 0
@@ -1442,14 +1439,13 @@ def cmd_forecast(args: argparse.Namespace) -> int:
                 config, getattr(args, "week_start_name", None)
             )
             ws_date, we_date = compute_week_bounds(now_utc, week_start_name)
-            # internal fallback: host-local intentional
-            local_tz = dt.datetime.now().astimezone().tzinfo
-            week_start_dt = dt.datetime.combine(
-                ws_date, dt.time.min, tzinfo=local_tz
-            )
-            week_end_dt = dt.datetime.combine(
-                we_date + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
-            )
+            # Grounded in the zone `display_tz_str` names (#503 S2 D7). It
+            # used to be host-local, which disagrees with the label
+            # whenever `display.tz` names another zone.
+            _res_tz = getattr(args, "_resolved_tz", None)
+            week_start_dt = c._share_ground_civil_date(ws_date, _res_tz)
+            week_end_dt = c._share_ground_civil_date(
+                we_date + dt.timedelta(days=1), _res_tz)
             # Pass `low_conf=False` + explicit notes: the issue is "no data
             # recorded yet," not "thin data." LOW CONF would mislead the
             # reader into thinking a projection ran with sparse samples.
@@ -1458,8 +1454,6 @@ def cmd_forecast(args: argparse.Namespace) -> int:
                 week_end=week_end_dt,
                 display_tz=display_tz_str,
                 version=c._share_resolve_version(),
-                theme=args.theme,
-                reveal_projects=args.reveal_projects,
                 actual_series=[],
                 projected_series=[],
                 current_pct=0.0,
@@ -1564,8 +1558,6 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             week_end=i.week_end_at,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
             actual_series=actual_series,
             projected_series=projected_series,
             current_pct=float(i.p_now),
@@ -3057,7 +3049,7 @@ def _build_budget_snapshot(
         period_label = c._share_period_label(
             inputs.week_start_at, inputs.week_end_at, tz_label
         )
-        title = f"Budget — week of {inputs.week_start_at.strftime('%b %d')}"
+        title = f"Budget — week of {inputs.week_start_at.date().isoformat()}"
     period_spec = _lib_share.PeriodSpec(
         start=inputs.week_start_at, end=inputs.week_end_at,
         display_tz=tz_label, label=period_label,
@@ -3082,15 +3074,12 @@ def _build_budget_snapshot(
                               "value": _lib_share.MoneyCell(status.projected_eow_high_usd)}),
     )
     notes = ("LOW CONF — early in week",) if status.low_confidence else ()
-    subtitle = " · ".join([
-        period_label,
-        args.theme,
-        "real projects" if args.reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="budget",
         title=title,
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=period_spec,
         columns=columns,
         rows=rows,
@@ -3118,22 +3107,17 @@ def _build_budget_no_data_snapshot(args, budget_cfg, now_utc):
         config, getattr(args, "week_start_name", None)
     )
     ws_date, we_date = compute_week_bounds(now_utc, week_start_name)
-    # internal fallback: host-local intentional
-    local_tz = dt.datetime.now().astimezone().tzinfo
-    week_start_dt = dt.datetime.combine(ws_date, dt.time.min, tzinfo=local_tz)
-    week_end_dt = dt.datetime.combine(
-        we_date + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz
-    )
+    # Grounded in the zone `tz_label` names (#503 S2 D7), not host-local.
+    week_start_dt = c._share_ground_civil_date(ws_date, tz)
+    week_end_dt = c._share_ground_civil_date(we_date + dt.timedelta(days=1), tz)
     period_label = c._share_period_label(week_start_dt, week_end_dt, tz_label)
     target = budget_cfg["weekly_usd"]
-    subtitle = " · ".join([
-        period_label, args.theme,
-        "real projects" if args.reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="budget",
-        title=f"Budget — week of {week_start_dt.strftime('%b %d')}",
-        subtitle=subtitle,
+        title=f"Budget — week of {week_start_dt.date().isoformat()}",
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=week_start_dt, end=week_end_dt,
             display_tz=tz_label, label=period_label,
@@ -3172,14 +3156,12 @@ def _build_budget_no_budget_snapshot(args):
         tz = c.resolve_display_tz(args, config)
     tz_label = c._share_display_tz_label(tz)
     period_label = c._share_period_label(now_utc, now_utc, tz_label)
-    subtitle = " · ".join([
-        period_label, args.theme,
-        "real projects" if args.reveal_projects else "projects anonymized",
-    ])
     return _lib_share.ShareSnapshot(
         cmd="budget",
         title="Budget — no budget set",
-        subtitle=subtitle,
+        # #503 S2 D5 — the facts strip states the period and the
+        # privacy mode; the theme is dropped deliberately.
+        subtitle=None,
         period=_lib_share.PeriodSpec(
             start=now_utc, end=now_utc, display_tz=tz_label, label=period_label,
         ),

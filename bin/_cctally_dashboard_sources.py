@@ -2770,6 +2770,15 @@ def _build_codex_native_weekly_view(
         total_tokens=sum(row.total_tokens for row in display_rows),
         period_start=(periods[0].start_at if periods else None),
         period_end=now_utc,
+        # A DISPLAY LABEL, deliberately not resolved here (#503 S2 review
+        # F9). It can be an abbreviation such as `EDT`, which
+        # `period_civil_dates` cannot load — but this value is the
+        # dashboard envelope's, and the envelope's shape is pinned by
+        # oracle tests. Resolution happens at the two SHARE boundaries
+        # that turn it into a `PeriodSpec.display_tz`:
+        # `_cctally_dashboard_share._share_resolved_display_tz` and
+        # `_cctally_codex._build_codex_share_snapshot`, both of which
+        # call `resolve_display_tz_name` unconditionally.
         display_tz_label=display_tz_name or str(dt.datetime.now().astimezone().tzinfo),
     )
 

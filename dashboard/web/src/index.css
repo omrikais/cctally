@@ -4260,6 +4260,42 @@ mark.current {
   cursor: not-allowed;
 }
 
+/* #503 S3 §5 — the failed-preview warning beside the export actions. It
+   REPLACES the privacy line rather than doubling it, so it inherits that
+   line's one-line-at-390px budget. */
+.share-preview-failed-note {
+  color: var(--accent-amber);
+  font-size: var(--fs-meta);
+  margin: 0 0 6px;
+}
+
+/* #503 S3 §2 — inline confirmation for a destructive share action.
+   Deliberately NOT a modal: `docs/share-gotchas.md` records that an inline
+   group stays inside the host's existing focus and Escape ownership, and a
+   third modal slot would need its own trap. The group wraps rather than
+   overflowing so the prompt stays readable at 390px. */
+.share-confirm {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.share-confirm-prompt {
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+}
+.share-confirm-yes {
+  border-color: var(--accent-red);
+  color: var(--accent-red);
+}
+.share-manage-actions .share-confirm,
+.composer-clear-all + .share-confirm {
+  margin-left: 6px;
+}
+.share-save-popover .share-confirm {
+  margin-top: 6px;
+}
+
 /* Preview pane ------------------------------------------------------------ */
 /* #294 S5 §7 — share source chrome: the flow's captured source shown in the
    modal header + above the live preview, and per-item/per-row chips in the
@@ -4273,6 +4309,17 @@ mark.current {
 .share-presets-history-row { display: flex; align-items: center; gap: 6px; }
 .share-presets-row .share-presets-item,
 .share-presets-history-row .share-presets-history-item { flex: 1; }
+/* #503 S3 §3 — a composed export is DISPLAY-ONLY in Recent shares. It names
+   the document and its section count and is deliberately not a control,
+   because restoring a basket from history does not exist. Sized like the
+   recall rows beside it so the group still reads as one list. */
+.share-presets-history-row--composed .share-presets-history-composed {
+  flex: 1;
+  display: block;
+  padding: 6px 8px;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+}
 
 .share-preview {
   flex: 1; min-height: 280px;

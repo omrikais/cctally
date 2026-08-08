@@ -296,7 +296,13 @@ beforeEach(() => {
   stubProperty(URL, 'createObjectURL', vi.fn().mockReturnValue('blob:share-smoke'));
   stubProperty(URL, 'revokeObjectURL', vi.fn());
   anchorClickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
-  windowOpenSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+  // #503 S3 §5 — `Open` reserves a tab synchronously and navigates it, so a
+  // blocked popup is detectable. A null handle now means "blocked".
+  windowOpenSpy = vi.spyOn(window, 'open').mockImplementation(() => ({
+    location: { href: '' },
+    opener: null,
+    close: () => {},
+  }) as unknown as Window);
   pngMocks.svgToPng.mockReset();
   pngMocks.svgToPng.mockResolvedValue(new Blob(['png-bytes'], { type: 'image/png' }));
   printMocks.printPdf.mockReset();
@@ -366,9 +372,7 @@ describe('share-v2 manual smoke harness', () => {
     fireEvent.click(screen.getByLabelText('html'));
     await clickExport(/^open$/i);
     await waitFor(() => expect(windowOpenSpy).toHaveBeenCalledWith(
-      'blob:share-smoke',
-      '_blank',
-      'noopener,noreferrer',
+      '', '_blank',
     ));
     await waitFor(() => expect(server.historyPosts).toHaveLength(2));
     expect(server.historyPosts[1].options.reveal_projects).toBe(true);
@@ -486,7 +490,13 @@ describe('share-v2 manual smoke harness', () => {
     await clickExport(/print/i);
     await waitFor(() => expect(printMocks.printPdf).toHaveBeenCalledWith(expect.stringContaining('<!DOCTYPE html>')));
 
-    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    // #503 S3 §2 — `Clear all` confirms before wiping localStorage.
+    const sectionCount = getState().basket.items.length;
+    fireEvent.click(screen.getByRole('button', { name: /^clear all$/i }));
+    expect(getState().basket.items).toHaveLength(sectionCount);
+    fireEvent.click(await screen.findByRole('button', {
+      name: `Clear ${sectionCount} sections`,
+    }));
     expect(getState().basket.items).toHaveLength(0);
     expect(JSON.parse(localStorage.getItem(BASKET_STORAGE_KEY) ?? '[]')).toEqual([]);
   });

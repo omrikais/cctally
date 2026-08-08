@@ -28,6 +28,10 @@ export interface ComposeRequest {
       template_id: string;
       options: BasketItem['options'];
       data_digest_at_add: string;
+      // #503 S3 §4 — replayed so the server can decide whether the stored
+      // digest is comparable to the one it just computed. Omitted for an
+      // item stored before the field existed, which reads as not comparable.
+      data_digest_version_at_add?: number;
       kernel_version: number;
       // #294 S5 §7 — each section carries the source its basket item was
       // captured under, so a mixed-source basket composes as provider-labeled
@@ -43,6 +47,11 @@ export interface ComposeSectionResult {
   drift_detected: boolean;
   data_digest_at_add: string;
   data_digest_now: string;
+  // #503 S3 §4 — additive. False when the stored digest was minted under a
+  // different definition; `drift_detected` is already false whenever this
+  // is, so a consumer that ignores it still reads "not outdated".
+  digest_comparable?: boolean;
+  data_digest_version?: number;
 }
 
 export interface ComposeResponse {
@@ -77,6 +86,9 @@ export function buildComposeRequest(
         template_id: it.template_id,
         options: it.options,
         data_digest_at_add: it.data_digest_at_add,
+        ...(it.data_digest_version_at_add == null
+          ? {}
+          : { data_digest_version_at_add: it.data_digest_version_at_add }),
         kernel_version: it.kernel_version,
         source: it.source,
         ...(it.account == null ? {} : { account: it.account }),

@@ -62,6 +62,24 @@ KNOWN_SAFE_DESELECT = {
     # #503 S1 B4: the registry/fixture/golden bijection enumerates both share
     # fixture roots, and both harnesses rebuild theirs in place.
     "tests/test_share_registry_completeness.py",
+    # #503 S2: the boundary-kind classification, the chart bounding-box
+    # sweep and the empty-table cases build every registered template from
+    # the share-v2 panel fixtures, which bin/cctally-share-v2-test rebuilds
+    # in place on every start. Unlike the four entries above, these two
+    # files are PUBLIC — their share-v2 reads carry a module-level
+    # `.is_dir()` skip gate so a public clone skips them rather than
+    # failing, which is a separate concern from the overlap race this list
+    # records.
+    "tests/test_lib_share.py",
+    "tests/test_lib_share_v2.py",
+    # #496 S6 §7.6: the tripwire that asserts each of the four new doctor
+    # scenarios still reaches the WARN or FAIL branch it exists to cover reads
+    # their committed `expected.txt` and `expected.exit`, under a root
+    # bin/cctally-doctor-test rebuilds in place. The tripwire exists because a
+    # gather defect once degraded all four to "retention scan unavailable" —
+    # which reads exactly like a healthy install — with the harness still green
+    # because the goldens had been regenerated from the broken output.
+    "tests/test_doctor_journal_legs.py",
 }
 # builder stem -> output roots when NOT tests/fixtures/<stem>.
 BUILDER_ROOT_EXCEPTIONS = {

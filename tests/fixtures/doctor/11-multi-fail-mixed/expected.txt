@@ -35,6 +35,7 @@ Database
   ✓ cache.db WAL size        within limit
   ✓ Reclaimable cache space  below threshold
   ✓ Reclaimable transcript space below threshold
+  ✓ Retained evidence        0 B retained, within policy
 Journal
   ✓ Journal                  no journal (pre-cutover install)
   ✓ Journal integrity        no journal
@@ -80,4 +81,4 @@ Safety
 Telemetry
   ✓ State                    enabled (enabled)
 
-Summary: 48 OK · 8 WARN · 3 FAIL
+Summary: 49 OK · 8 WARN · 3 FAIL

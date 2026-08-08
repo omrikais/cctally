@@ -1,18 +1,18 @@
 ---
 title: 5-hour blocks — last 1 blocks
 generated_at: 2026-05-09T12:00:00Z
-period: 2026-05-07T00:00:00Z..2026-05-07T00:00:00Z
+period: 2026-05-07T13:00:00Z..2026-05-07T18:00:00Z
 panel: five-hour-blocks
 anonymized: true
 cctally_version: 9.9.9
 ---
 # 5-hour blocks — last 1 blocks
-_May 07 → May 07 (local) · light · projects anonymized_
+_2026-05-07 → 2026-05-07 (Etc/UTC)_
 _2026-05-09T12:00:00Z_
 
 | Block Start | $ Cost | 5h % | Reset |
 |:---|---:|---:|:---|
-| May 07 13:00 | $1.85 | 32.5% | — |
+| 2026-05-07 13:00 | $1.85 | 32.5% | — |
 
 - **Sum:** $1.85
 - **Blocks:** 1

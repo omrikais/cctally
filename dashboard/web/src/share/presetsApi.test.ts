@@ -7,7 +7,12 @@ import {
   deletePreset,
   listHistory,
   appendHistory,
+  appendComposedHistory,
   clearHistory,
+  renamePreset,
+  historyRowKind,
+  isComposedHistoryRow,
+  PRESET_NAME_CONFLICT,
   ShareApiError,
 } from './presetsApi';
 import type { ShareOptions } from './types';
@@ -131,7 +136,14 @@ describe('presetsApi', () => {
     const out = await listHistory();
     expect(fetchSpy).toHaveBeenCalledWith('/api/share/history', expect.any(Object));
     expect(out.history).toHaveLength(1);
-    expect(out.history[0].template_id).toBe('weekly-recap');
+    // A row with no `kind` is the legacy panel row (#503 S3 §3); narrowing
+    // through the discriminator is how a caller reaches its recipe fields.
+    const row = out.history[0];
+    expect(isComposedHistoryRow(row)).toBe(false);
+    expect(historyRowKind(row)).toBe('panel');
+    if (!isComposedHistoryRow(row)) {
+      expect(row.template_id).toBe('weekly-recap');
+    }
   });
 
   it('appendHistory POSTs body as JSON', async () => {
@@ -180,6 +192,111 @@ describe('presetsApi', () => {
     const agnostic = JSON.parse((fetchSpy.mock.calls[1][1] as RequestInit).body as string);
     expect(focused.account).toBe(account);
     expect(agnostic).not.toHaveProperty('account');
+  });
+
+  // ---- #503 S3 §1/§3/§4 — rename, the conflict code, the history union ----
+
+  it('renamePreset POSTs one request to the rename endpoint', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        panel: 'weekly', name: 'new-name', template_id: 'weekly-recap',
+        options: defaults(), saved_at: '2026-05-11T09:00:00Z',
+        source: 'codex',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    const out = await renamePreset({
+      panel: 'weekly', from_name: 'old-name', to_name: 'new-name',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/share/presets/rename');
+    const body = JSON.parse(
+      (fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    expect(body).toEqual({
+      panel: 'weekly', from_name: 'old-name', to_name: 'new-name',
+    });
+    expect(body).not.toHaveProperty('overwrite');
+    expect(out.source).toBe('codex');
+  });
+
+  it('a 409 surfaces its machine-readable code', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        code: PRESET_NAME_CONFLICT,
+        error: "a preset named 'deep-dive' already exists",
+        field: 'to_name',
+      }), { status: 409, headers: { 'Content-Type': 'application/json' } }),
+    );
+    await expect(renamePreset({
+      panel: 'weekly', from_name: 'a', to_name: 'deep-dive',
+    })).rejects.toMatchObject({
+      status: 409, code: PRESET_NAME_CONFLICT, field: 'to_name',
+    });
+  });
+
+  it('savePreset also surfaces the conflict code', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        code: PRESET_NAME_CONFLICT, error: 'exists', field: 'name',
+      }), { status: 409, headers: { 'Content-Type': 'application/json' } }),
+    );
+    await expect(savePreset({
+      panel: 'weekly', name: 'team-monday',
+      template_id: 'weekly-recap', options: defaults(),
+    })).rejects.toMatchObject({ code: PRESET_NAME_CONFLICT });
+  });
+
+  it('narrows a composed history row through the discriminator', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        history: [{
+          recipe_id: 'c1', kind: 'composed', panel: null,
+          sections: [
+            { panel: 'weekly', template_id: 'weekly-recap',
+              options: defaults(), source: 'claude' },
+            { panel: 'daily', template_id: 'daily-recap',
+              options: defaults(), source: 'codex' },
+          ],
+          composite: {
+            title: 'Monday', theme: 'dark',
+            reveal_projects: false, no_branding: true,
+          },
+          format: 'md', destination: 'download',
+          exported_at: '2026-05-11T10:00:00Z',
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    const row = (await listHistory()).history[0];
+    expect(historyRowKind(row)).toBe('composed');
+    expect(isComposedHistoryRow(row)).toBe(true);
+    if (isComposedHistoryRow(row)) {
+      expect(row.panel).toBeNull();
+      expect(row.sections).toHaveLength(2);
+      expect(row.composite.title).toBe('Monday');
+    }
+  });
+
+  it('appendComposedHistory POSTs the composed branch', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        recipe_id: 'c1', kind: 'composed', panel: null, sections: [],
+        composite: { title: 'T', theme: 'light', reveal_projects: false,
+                     no_branding: false },
+        format: 'md', destination: 'copy',
+        exported_at: '2026-05-11T10:00:00Z',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    await appendComposedHistory({
+      sections: [{ panel: 'weekly', template_id: 'weekly-recap',
+                   options: defaults(), source: 'claude' }],
+      composite: { title: 'T', theme: 'light', reveal_projects: false,
+                   no_branding: false },
+      format: 'md', destination: 'copy',
+    });
+    const body = JSON.parse(
+      (fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.kind).toBe('composed');
+    expect(body.sections).toHaveLength(1);
+    expect(body).not.toHaveProperty('panel');
   });
 
   it('clearHistory DELETEs /api/share/history', async () => {

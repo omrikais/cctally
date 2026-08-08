@@ -32,4 +32,25 @@ data = re.sub(
     r'\1"<redacted>"',
     data,
 )
+# #496 S6: `db.retained_artifacts` reports the host's real free disk, which
+# changes between two runs on the same machine and differs across the two LAN
+# runners. Redact it for the same reason `cctally_version` is redacted — the
+# value is genuinely useful in the report and genuinely unstable in a golden.
+# DIGITS ONLY. Redacting `null`/`None` too would absorb the loss of the
+# measurement itself: a regression that stopped measuring free disk would
+# render `null`, get redacted to the same `<redacted>` token, and move no
+# golden at all.
+data = re.sub(
+    r'("freeDiskBytes"\s*:\s*)\d+',
+    r'\1"<redacted>"',
+    data,
+)
+# The verbose text dump prints the same key UNQUOTED, so a JSON-only pattern
+# left half the divergence in place — which is how the first regeneration
+# still produced 12 failing scenarios.
+data = re.sub(
+    r'(?<!")(\bfreeDiskBytes\s*:\s*)\d+',
+    r'\1<redacted>',
+    data,
+)
 sys.stdout.write(data)

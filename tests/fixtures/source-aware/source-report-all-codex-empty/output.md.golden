@@ -1,7 +1,7 @@
 ---
 title: Dollars-per-Percent Report — Claude + Codex
 generated_at: 2026-07-02T12:00:00Z
-period: 2026-07-02T12:00:00Z..2026-07-02T12:00:00Z
+period: 2026-06-29T00:00:00Z..2026-07-02T12:00:00Z
 panel: composed
 anonymized: true
 cctally_version: 9.9.9
@@ -9,29 +9,18 @@ cctally_version: 9.9.9
 
 # Dollars-per-Percent Report — Claude + Codex
 
-## Dollars-per-Percent Report
-
-# Dollars-per-Percent Report
-
-**Claude**
-_2026-07-02 → 2026-07-02 (UTC)_
+## Dollars-per-Percent Report — Claude
+_2026-06-29 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
 
 | Week | % Used | $ Cost | $/1% |
 |:---|---:|---:|---:|
-| Jun 29 | 37.0% | $1.25 | $0.03 |
+| 2026-06-29 | 37.0% | $1.25 | $0.03 |
 
 - **Trend total:** $1.25
 
-## Dollars-per-Percent Report
-
-# Dollars-per-Percent Report
-
-**Codex**
+## Dollars-per-Percent Report — Codex
 
 No data
-_2026-07-02 → 2026-07-02 (UTC)_
+_2026-07-02 → 2026-07-02 (Etc/UTC)_
 _2026-07-02T12:00:00Z_
-
-| Quota Series | % Used | $ Cost |
-|:---|---:|---:|

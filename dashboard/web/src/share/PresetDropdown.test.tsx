@@ -345,3 +345,123 @@ describe('<PresetDropdown>', () => {
     expect(screen.queryByText(/recent shares/i)).not.toBeInTheDocument();
   });
 });
+
+// ---- #503 S3 §3 — the composed history row -------------------------------
+
+function composedRow(overrides: Record<string, unknown> = {}) {
+  return {
+    recipe_id: 'c1',
+    kind: 'composed',
+    panel: null,
+    sections: [
+      { panel: 'weekly', template_id: 'weekly-recap', options: defaults(),
+        source: 'claude' },
+      { panel: 'daily', template_id: 'daily-recap', options: defaults(),
+        source: 'codex' },
+      { panel: 'trend', template_id: 'trend-recap', options: defaults(),
+        source: 'claude' },
+    ],
+    composite: { title: 'Monday roundup', theme: 'dark',
+                 reveal_projects: false, no_branding: true },
+    format: 'md',
+    destination: 'download',
+    exported_at: '2026-05-11T10:00:00Z',
+    ...overrides,
+  };
+}
+
+describe('<PresetDropdown> composed history rows', () => {
+  it.each(['weekly', 'daily', 'projects'] as const)(
+    'shows a composed row in the %s panel',
+    async (panel) => {
+      mockFetchBoth({ presets: {} }, { history: [composedRow()] });
+      render(
+        <PresetDropdown panel={panel} onPick={() => {}} onManage={() => {}} />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+      await screen.findByText('Composed');
+      expect(screen.getByText(/3 sections/)).toBeInTheDocument();
+      expect(screen.getByText(/· md ·/)).toBeInTheDocument();
+    },
+  );
+
+  it('renders the composed row non-interactively', async () => {
+    const onPick = vi.fn();
+    mockFetchBoth({ presets: {} }, { history: [composedRow()] });
+    render(
+      <PresetDropdown panel="weekly" onPick={onPick} onManage={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+    const label = await screen.findByText('Composed');
+    // Display-only: restoring a basket from history is out of scope, so the
+    // row must not present itself as something that can be recalled.
+    expect(label.closest('button')).toBeNull();
+    expect(
+      screen.queryByRole('menuitem', { name: /composed/i }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(label);
+    expect(onPick).not.toHaveBeenCalled();
+  });
+
+  it('says "1 section" for a single-section composed export', async () => {
+    mockFetchBoth({ presets: {} }, {
+      history: [composedRow({
+        sections: [{ panel: 'weekly', template_id: 'weekly-recap',
+                     options: defaults(), source: 'claude' }],
+      })],
+    });
+    render(
+      <PresetDropdown panel="weekly" onPick={() => {}} onManage={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+    expect(await screen.findByText(/1 section(?!s)/)).toBeInTheDocument();
+  });
+
+  it('a legacy row with no kind still recalls, and is panel-scoped',
+    async () => {
+      const onPick = vi.fn();
+      mockFetchBoth({ presets: {} }, {
+        history: [
+          {
+            recipe_id: 'legacy',
+            panel: 'weekly',
+            template_id: 'weekly-recap',
+            options: defaults(),
+            format: 'md',
+            destination: 'download',
+            exported_at: '2026-05-11T09:00:00Z',
+          },
+          composedRow(),
+        ],
+      });
+      render(
+        <PresetDropdown panel="weekly" onPick={onPick} onManage={() => {}} />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+      const item = await screen.findByRole('menuitem', {
+        name: /weekly-recap/,
+      });
+      fireEvent.click(item);
+      expect(onPick).toHaveBeenCalledWith('weekly-recap', defaults());
+    });
+
+  it('hides a legacy row belonging to another panel', async () => {
+    mockFetchBoth({ presets: {} }, {
+      history: [{
+        recipe_id: 'other',
+        panel: 'daily',
+        template_id: 'daily-recap',
+        options: defaults(),
+        format: 'md',
+        destination: 'download',
+        exported_at: '2026-05-11T09:00:00Z',
+      }],
+    });
+    render(
+      <PresetDropdown panel="weekly" onPick={() => {}} onManage={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+    await waitFor(() =>
+      expect(screen.queryByText('daily-recap')).not.toBeInTheDocument());
+  });
+});

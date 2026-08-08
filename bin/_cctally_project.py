@@ -788,8 +788,6 @@ def cmd_project(args: argparse.Namespace) -> int:
             period_end=until_dt,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
-            theme=args.theme,
-            reveal_projects=args.reveal_projects,
         )
         c._share_render_and_emit(snap, args)
         return 0

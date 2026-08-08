@@ -393,18 +393,43 @@ describe('<ComposerModal> export actions (spec §8.8)', () => {
     expect(clickSpy).toHaveBeenCalled();
 
     // Composite reveal flows from !anonOnExport → false (checkbox on).
-    const downloadCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
-    const bodyJson = JSON.parse((downloadCall[1] as RequestInit).body as string);
+    // #503 S3 §3 — a composed export also POSTs one history row, so the
+    // compose request is no longer simply the last call.
+    const bodyJson = lastComposeBody(fetchSpy);
     expect(bodyJson.reveal_projects).toBe(false);
   });
 
-  it('Open spawns window.open for HTML format with the composite recipe', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+  it('Open reserves a tab, navigates it, and records one composed row',
+    async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        exportComposeResp('<html>x</html>', 'text/html'),
+      );
+      const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
+      exportStubProperty(URL, 'createObjectURL', createObjectURL);
+      const tab = fakeExportTab();
+      const openSpy = vi.spyOn(window, 'open').mockReturnValue(tab);
+      seedOneItemBasket();
+      dispatch(openComposer());
+      render(<ComposerModal />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
+      });
+      expect(openSpy).toHaveBeenCalledWith('', '_blank');
+      expect(tab.location.href).toBe('blob:fake-url');
+      const rows = composedHistoryPosts(fetchSpy);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].kind).toBe('composed');
+      expect(rows[0].destination).toBe('open');
+      expect(rows[0].sections).toHaveLength(1);
+    });
+
+  it('a blocked Open reports failure and records no composed row', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       exportComposeResp('<html>x</html>', 'text/html'),
     );
-    const createObjectURL = vi.fn().mockReturnValue('blob:fake-url');
-    exportStubProperty(URL, 'createObjectURL', createObjectURL);
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    exportStubProperty(URL, 'createObjectURL', vi.fn().mockReturnValue('blob:x'));
+    vi.spyOn(window, 'open').mockReturnValue(null);
     seedOneItemBasket();
     dispatch(openComposer());
     render(<ComposerModal />);
@@ -412,8 +437,161 @@ describe('<ComposerModal> export actions (spec §8.8)', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /^open$/i }));
     });
-    expect(openSpy).toHaveBeenCalledWith('blob:fake-url', '_blank', 'noopener,noreferrer');
+    expect(screen.getByText(/blocked the new tab/i)).toBeInTheDocument();
+    expect(composedHistoryPosts(fetchSpy)).toHaveLength(0);
   });
+
+  it('Download records exactly one composed row', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    exportStubProperty(URL, 'createObjectURL', vi.fn().mockReturnValue('blob:x'));
+    exportStubProperty(URL, 'revokeObjectURL', vi.fn());
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^download$/i }));
+    });
+    await waitFor(() =>
+      expect(composedHistoryPosts(fetchSpy)).toHaveLength(1));
+    const row = composedHistoryPosts(fetchSpy)[0];
+    expect(row.kind).toBe('composed');
+    expect(row.destination).toBe('download');
+    expect(row.composite).toMatchObject({ reveal_projects: false });
+  });
+
+  it('Copy records exactly one composed row', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    exportStubProperty(navigator, 'clipboard', { writeText });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('# Composed report', 'text/markdown'),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    fireEvent.change(screen.getByLabelText(/^format$/i), {
+      target: { value: 'md' },
+    });
+    const copy = screen.getByRole('button', { name: /^copy$/i });
+    await waitFor(() => expect(copy).not.toBeDisabled());
+    await act(async () => { fireEvent.click(copy); });
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(composedHistoryPosts(fetchSpy)).toHaveLength(1));
+    expect(composedHistoryPosts(fetchSpy)[0].destination).toBe('copy');
+  });
+
+  it('PNG records exactly one composed row', async () => {
+    // The fifth handler §3 names. Copy, Download, Open and Print were
+    // pinned; PNG was not, so `recordComposedHistory('png', 'svg')` was the
+    // one append nothing executed.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>',
+        'image/svg+xml',
+      ),
+    );
+    // The URL + Image + canvas surfaces svgToPng touches (ActionBar's PNG
+    // test documents the same set).
+    exportStubProperty(URL, 'createObjectURL', vi.fn().mockReturnValue('blob:x'));
+    exportStubProperty(URL, 'revokeObjectURL', vi.fn());
+    exportStubProperty(
+      Image.prototype as object, 'decode', vi.fn().mockResolvedValue(undefined),
+    );
+    exportStubProperty(Image.prototype as object, 'naturalWidth', 50);
+    exportStubProperty(Image.prototype as object, 'naturalHeight', 50);
+    exportStubProperty(
+      HTMLCanvasElement.prototype as object, 'toBlob',
+      function (cb: BlobCallback) { cb(new Blob(['png'], { type: 'image/png' })); },
+    );
+    exportStubProperty(
+      HTMLCanvasElement.prototype as object, 'getContext',
+      () => ({
+        fillRect: () => {}, scale: () => {}, drawImage: () => {}, fillStyle: '#fff',
+      } as unknown as CanvasRenderingContext2D),
+    );
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {});
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    fireEvent.change(screen.getByLabelText(/^format$/i), {
+      target: { value: 'svg' },
+    });
+    const png = screen.getByRole('button', { name: /^png$/i });
+    await waitFor(() => expect(png).not.toBeDisabled());
+    await act(async () => { fireEvent.click(png); });
+
+    expect(clickSpy).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(composedHistoryPosts(fetchSpy)).toHaveLength(1));
+    const row = composedHistoryPosts(fetchSpy)[0];
+    expect(row.kind).toBe('composed');
+    expect(row.destination).toBe('png');
+    // The composed row records the format the SERVER produced, which for a
+    // PNG is the SVG the rasterizer consumed.
+    expect(row.format).toBe('svg');
+  });
+
+  it('a failed Print records no composed row', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const origAppend = HTMLBodyElement.prototype.appendChild;
+    vi.spyOn(HTMLBodyElement.prototype, 'appendChild').mockImplementation(
+      function (this: HTMLBodyElement, node: Node) {
+        const ret = origAppend.call(this, node) as Node;
+        if (node instanceof HTMLIFrameElement && node.contentWindow) {
+          Object.defineProperty(node.contentWindow, 'print', {
+            value: () => { throw new Error('print blocked'); },
+            configurable: true,
+          });
+        }
+        return ret;
+      });
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /print/i }));
+    });
+    expect(screen.getByText(/print failed/i)).toBeInTheDocument();
+    expect(composedHistoryPosts(fetchSpy)).toHaveLength(0);
+  });
+
+  // #503 S3 §5 — the reserved-tab handle the composer navigates.
+  function fakeExportTab() {
+    return {
+      location: { href: '' },
+      opener: {} as unknown,
+      close: vi.fn(),
+    } as unknown as Window & { location: { href: string }; close: () => void };
+  }
+
+  function composeCalls(spy: { mock: { calls: unknown[][] } }) {
+    return spy.mock.calls.filter(
+      (c) => String(c[0]).startsWith('/api/share/compose'));
+  }
+
+  function lastComposeBody(spy: { mock: { calls: unknown[][] } }) {
+    const calls = composeCalls(spy);
+    return JSON.parse(
+      (calls[calls.length - 1][1] as RequestInit).body as string,
+    ) as Record<string, unknown>;
+  }
+
+  function composedHistoryPosts(spy: { mock: { calls: unknown[][] } }) {
+    return spy.mock.calls
+      .filter((c) => String(c[0]).startsWith('/api/share/history'))
+      .map((c) => JSON.parse((c[1] as RequestInit).body as string));
+  }
 
   it('PNG is format-gated to SVG; Print is format-gated to HTML (spec §8.8)', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -456,12 +634,10 @@ describe('<ComposerModal> export actions (spec §8.8)', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /^download$/i }));
     });
-    const downloadCall = fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1];
-    const bodyJson = JSON.parse((downloadCall[1] as RequestInit).body as string);
-    expect(bodyJson.reveal_projects).toBe(true);
+    expect(lastComposeBody(fetchSpy).reveal_projects).toBe(true);
   });
 
-  it('Clear all still wipes the basket', () => {
+  it('Clear all asks first, then wipes the basket', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       exportComposeResp('<html />', 'text/html'),
     );
@@ -469,7 +645,84 @@ describe('<ComposerModal> export actions (spec §8.8)', () => {
     dispatch(openComposer());
     render(<ComposerModal />);
     expect(getState().basket.items).toHaveLength(1);
-    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    // #503 S3 §2 — the first click commits nothing. `Clear all` wrote
+    // through to localStorage with no undo, so it names what it destroys.
+    fireEvent.click(screen.getByRole('button', { name: /^clear all$/i }));
+    expect(getState().basket.items).toHaveLength(1);
+    expect(screen.getByText('Clear 1 section?')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear 1 section' }));
     expect(getState().basket.items).toHaveLength(0);
+  });
+
+  it('Clear all can be cancelled, and Escape cancels it too', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    fireEvent.click(screen.getByRole('button', { name: /^clear all$/i }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(getState().basket.items).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: /^clear all$/i }));
+    await screen.findByText('Clear 1 section?');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() =>
+      expect(screen.queryByText('Clear 1 section?')).not.toBeInTheDocument());
+    expect(getState().basket.items).toHaveLength(1);
+    // …and the composer itself is still open: the confirmation owned Escape,
+    // it did not leak through to the modal's own binding.
+    expect(getState().composerModal?.open).toBe(true);
+  });
+});
+
+
+// #503 S3 §5 — the composer carries the same defect the share modal did:
+// its export buttons never gated on, or mentioned, `composeErr`.
+describe('#503 S3 §5 — the composer failed-preview note', () => {
+  function note() {
+    return document.querySelector('.share-preview-failed-note');
+  }
+
+  function exportButtons() {
+    return Array.from(document.querySelectorAll<HTMLButtonElement>(
+      '.composer-export-row .share-action'));
+  }
+
+  it('warns beside the actions without disabling them', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ error: 'compose exploded' }),
+        { status: 500 }),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+
+    await waitFor(() => expect(note()).not.toBeNull());
+    expect(note()!.textContent).toBe('The preview failed — an export may fail too.');
+    const id = note()!.getAttribute('id');
+    for (const b of exportButtons()) {
+      expect(b.getAttribute('aria-describedby')).toBe(id);
+    }
+    // Warn, do not disable — same rule as the share modal.
+    expect(exportButtons().filter((b) => !b.disabled).length)
+      .toBeGreaterThan(0);
+    // Announced once: the composer keeps its own role="alert" banner.
+    expect(note()!.getAttribute('aria-live')).toBeNull();
+    expect(document.querySelector('.composer-error[role="alert"]'))
+      .not.toBeNull();
+  });
+
+  it('shows no note while the compose preview is healthy', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      exportComposeResp('<html />', 'text/html'),
+    );
+    seedOneItemBasket();
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    await waitFor(() =>
+      expect(document.querySelector('.composer-preview')).not.toBeNull());
+    expect(note()).toBeNull();
   });
 });

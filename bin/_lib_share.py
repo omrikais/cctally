@@ -8,15 +8,18 @@ Spec: docs/superpowers/specs/2026-05-08-shareable-reports-design.md
 from __future__ import annotations
 
 import base64
+import calendar
 import dataclasses
 import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # --- Version + digest ---
@@ -107,10 +110,51 @@ class Totalled:
 
 @dataclass(frozen=True)
 class PeriodSpec:
+    """The window an artifact covers, and the zone its dates are stated in.
+
+    `display_tz` is a concrete IANA zone name. The configuration TOKENS
+    `local` and `utc` are resolved by the entry point that builds the
+    snapshot and must never reach here (#503 S2 D7).
+
+    `civil_bucket` discriminates the two kinds of boundary this field
+    carries. False (the default) means `start`/`end` are real instants, so
+    the civil dates an artifact states are obtained by converting them into
+    `display_tz`. True means they are ALREADY civil calendar labels — a
+    `daily` bucket named `2026-05-04`, lifted to a UTC-midnight sentinel —
+    and converting one shifts it by a day in every zone west of UTC.
+    """
     start: datetime
     end: datetime
     display_tz: str
     label: str
+    civil_bucket: bool = False
+
+
+def period_civil_dates(period: PeriodSpec) -> tuple[str, str]:
+    """Return `(start_civil, end_civil)` as ISO dates in `period.display_tz`.
+
+    The one place a `PeriodSpec` becomes the pair of dates an artifact
+    states about itself. Never reads `period.label`: every dashboard
+    builder sets a SEMANTIC label (`This week`, `Last 8 weeks`, `Recent
+    sessions`), and none of them names a date.
+
+    A `civil_bucket` period is returned verbatim, because its boundaries
+    are already calendar labels; anything else is converted into the
+    labelled zone, because its boundaries are instants.
+
+    An unloadable zone name falls back to the datetimes as they are rather
+    than raising. `_verify_output` turns a raise inside a renderer into a
+    refused artifact, so a stale label must degrade to a slightly-wrong
+    date rather than an outage.
+    """
+    if period.civil_bucket:
+        return period.start.date().isoformat(), period.end.date().isoformat()
+    try:
+        zone = ZoneInfo(period.display_tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return period.start.date().isoformat(), period.end.date().isoformat()
+    return (period.start.astimezone(zone).date().isoformat(),
+            period.end.astimezone(zone).date().isoformat())
 
 
 # --- Chart primitives ---
@@ -457,19 +501,172 @@ _PADDING_BOTTOM = 30  # x-tick labels
 _PADDING_TOP = 10
 _PADDING_RIGHT = 10
 
-_HBAR_LABEL_GUTTER = 120.0   # left gutter for project labels (anonymized fits; long revealed labels may overflow)
+# The MINIMUM left gutter for hbar project labels. It used to be the
+# only gutter, so a revealed `risk-analysis-toolkit-2026` started 36px
+# left of the canvas and was clipped (#503 S2 F16).
+_HBAR_LABEL_GUTTER = 120.0
 _HBAR_RIGHT_PAD = 10.0       # right-side breathing room for value labels
+_HBAR_LABEL_PAD = 4.0        # gap between a gutter label and its bar
+_HBAR_VALUE_PAD = 4.0        # gap between a bar's end and its value label
+_HBAR_LABEL_FONT = 11.0
+_HBAR_VALUE_FONT = 10.0
+
+# Distance from the plot's left edge back to the end-anchored y-axis
+# label. With no reservation for the label's own width, `projected %`
+# starts at -6px in every shipped forecast SVG.
+_Y_AXIS_LABEL_GAP = 10.0
+_Y_AXIS_LABEL_FONT = 10.0
 
 
 def _chart_inner_box(
     x: float, y: float, width: float, height: float,
+    pad_left: float = _PADDING_LEFT,
 ) -> tuple[float, float, float, float]:
-    """Compute (ix, iy, iw, ih) — the inner plot area inside chart padding."""
-    ix = x + _PADDING_LEFT
+    """Compute (ix, iy, iw, ih) — the inner plot area inside chart padding.
+
+    `pad_left` defaults to `_PADDING_LEFT` so every existing caller is
+    unchanged; the line and bar renderers widen it when their y-axis
+    label needs more room than 50px.
+    """
+    ix = x + pad_left
     iy = y + _PADDING_TOP
-    iw = width - _PADDING_LEFT - _PADDING_RIGHT
+    iw = width - pad_left - _PADDING_RIGHT
     ih = height - _PADDING_TOP - _PADDING_BOTTOM
     return ix, iy, iw, ih
+
+
+def _y_axis_pad_left(chart: "ChartSpec") -> float:
+    """Left padding wide enough to hold the y-axis label inside the plot.
+
+    The label is end-anchored at `ix - _Y_AXIS_LABEL_GAP`, so it needs
+    `gap + its own width` of padding. Never narrower than `_PADDING_LEFT`,
+    which is what the axis tick labels already assume.
+    """
+    label = getattr(chart, "y_label", "") or ""
+    if not label:
+        return _PADDING_LEFT
+    return max(_PADDING_LEFT,
+               _Y_AXIS_LABEL_GAP + _svg_text_width(label, _Y_AXIS_LABEL_FONT))
+
+
+def _hbar_visible_points(chart: "HorizontalBarChart") -> tuple:
+    return chart.points[:chart.cap] if chart.cap is not None else chart.points
+
+
+def _hbar_label_gutter(points) -> float:
+    """Left gutter wide enough for the widest gutter label."""
+    if not points:
+        return _HBAR_LABEL_GUTTER
+    widest = max(_svg_text_width(p.x_label, _HBAR_LABEL_FONT) for p in points)
+    return max(_HBAR_LABEL_GUTTER, widest + _HBAR_LABEL_PAD)
+
+
+def _hbar_value_text(point: "ChartPoint") -> str:
+    """The value label a bar carries — one definition, so the width the
+    layout reserves and the string the renderer emits cannot diverge."""
+    return f"${point.y_value:,.2f}"
+
+
+def _hbar_right_reserve(points) -> float:
+    """Right reserve wide enough for the widest value label plus padding."""
+    if not points:
+        return _HBAR_RIGHT_PAD
+    widest = max(_svg_text_width(_hbar_value_text(p), _HBAR_VALUE_FONT)
+                 for p in points)
+    return _HBAR_VALUE_PAD + widest + _HBAR_RIGHT_PAD
+
+
+def chart_required_width(chart: "ChartSpec | None", *,
+                         nominal_width: float) -> float:
+    """The canvas width this chart needs so no label leaves the plot.
+
+    The canvas WIDENS; bars are not shrunk and labels are not truncated
+    (#503 S2 F16). The nominal plot width is preserved by adding exactly
+    the extra gutter and reserve the labels require on top of it.
+    """
+    if chart is None:
+        return nominal_width
+    if isinstance(chart, HorizontalBarChart):
+        points = _hbar_visible_points(chart)
+        if not points:
+            return nominal_width
+        nominal_plot_w = (
+            nominal_width - _HBAR_LABEL_GUTTER - _HBAR_RIGHT_PAD)
+        required = (_hbar_label_gutter(points) + nominal_plot_w
+                    + _hbar_right_reserve(points))
+        return max(nominal_width, required)
+    return nominal_width + max(0.0, _y_axis_pad_left(chart) - _PADDING_LEFT)
+
+
+_AXIS_TICK_MIN_GAP = 4.0
+
+
+def _axis_tick_box(x: float, anchor: str, text: str,
+                   font_size: float) -> tuple[float, float]:
+    """The horizontal extent one x-tick label occupies."""
+    width = _svg_text_width(text, font_size)
+    if anchor == "end":
+        return x - width, x
+    if anchor == "middle":
+        return x - width / 2.0, x + width / 2.0
+    return x, x + width
+
+
+def _visible_axis_ticks(ticks: "Sequence[tuple[float, str, str, float]]") -> set:
+    """Indices of the x-tick labels that fit without overprinting.
+
+    F16 widened the canvas so no chart label leaves the plot, and left
+    the other half of the same rule unaddressed: a label can sit inside
+    the viewBox and still print on top of its neighbour. In the `blocks`
+    templates the ticks are full ISO timestamps 102.3 units wide at 108.0
+    units of centre-to-centre spacing, which leaves 5.7 units between
+    consecutive interior labels — but the LAST tick is anchored inward at
+    the plot's right edge, so that one pair overlapped by 45.4 units and
+    rendered as one unreadable string (#503 S2 review M4). One pair, not
+    every pair: the earlier account of this conflated the last pair's
+    56-unit spacing with the general spacing, and the corrected figures
+    are re-measured against the current glyph table (#503 S2 second
+    review N8).
+
+    Widening the canvas cannot fix this: tick spacing is a fraction of
+    the plot width, so fitting sixteen ISO dates would need a canvas far
+    past the 680px page the HTML artifact is laid out in. Dropping the
+    labels that do not fit is the conventional axis answer, and the row
+    data the ticks index is in the table beside the chart.
+
+    THE LEFTMOST AND RIGHTMOST labels are the ones that name the window
+    the chart covers, so the rightmost is reserved before the interior
+    ticks are walked. It is DROPPED — leaving a single-label axis — when
+    it cannot coexist with the leftmost, which is what two or three tight
+    ISO ticks produce. Describing both ends as reserved would overstate
+    the guarantee.
+
+    Ticks are swept in left-to-right order rather than in the order the
+    caller supplies them. `_render_line_chart_svg` does not sort its
+    points, so an unsorted series made the sweep drop the actual leftmost
+    label while keeping a later one.
+    """
+    if len(ticks) <= 1:
+        return set(range(len(ticks)))
+    boxes = [_axis_tick_box(*tick) for tick in ticks]
+    # By the tick's own axis position, not by its box: an end-anchored
+    # edge tick starts further left than the sample before it, and
+    # ordering by box would call it the leftmost label.
+    order = sorted(range(len(ticks)), key=lambda i: (ticks[i][0], i))
+    first, last = order[0], order[-1]
+    keep = {first}
+    if boxes[first][1] + _AXIS_TICK_MIN_GAP <= boxes[last][0]:
+        keep.add(last)
+        limit = boxes[last][0] - _AXIS_TICK_MIN_GAP
+    else:
+        limit = float("inf")
+    prev_right = boxes[first][1]
+    for index in order[1:-1]:
+        left, right = boxes[index]
+        if left >= prev_right + _AXIS_TICK_MIN_GAP and right <= limit:
+            keep.add(index)
+            prev_right = right
+    return keep
 
 
 def _scale_y(
@@ -502,7 +699,8 @@ def _render_chart_no_data(palette: Mapping[str, str], *,
 # Line chart.
 def _render_line_chart_svg(chart: LineChart, *, palette: dict,
                            x: float, y: float, width: float, height: float) -> str:
-    ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
+    ix, iy, iw, ih = _chart_inner_box(x, y, width, height,
+                                      pad_left=_y_axis_pad_left(chart))
     pts = chart.points
     if not pts:
         return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
@@ -582,11 +780,17 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
     # projected ray extending past it via multi_series — keeps that tick
     # centered rather than mis-anchoring a non-edge label.
     right_edge_x = ix + iw
+    ticks = []
     for p in pts:
         tx = ix + scale_x(p.x_value)
         anchor = "end" if tx >= right_edge_x - 1e-6 else "middle"
-        elements.append(svg_text(tx, iy + ih + 14, p.x_label,
-                                 font_size=10, fill=palette["muted"], anchor=anchor))
+        ticks.append((tx, anchor, p.x_label, 10.0))
+    # Thinned, not truncated (#503 S2 review M4) — see `_visible_axis_ticks`.
+    for index in sorted(_visible_axis_ticks(ticks)):
+        tx, anchor, label, size = ticks[index]
+        elements.append(svg_text(tx, iy + ih + 14, label,
+                                 font_size=size, fill=palette["muted"],
+                                 anchor=anchor))
 
     # Y-axis label.
     elements.append(svg_text(ix - 10, iy + ih / 2, chart.y_label,
@@ -598,7 +802,8 @@ def _render_line_chart_svg(chart: LineChart, *, palette: dict,
 # Bar chart (vertical).
 def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
                           x: float, y: float, width: float, height: float) -> str:
-    ix, iy, iw, ih = _chart_inner_box(x, y, width, height)
+    ix, iy, iw, ih = _chart_inner_box(x, y, width, height,
+                                      pad_left=_y_axis_pad_left(chart))
     pts = chart.points
     if not pts:
         return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
@@ -636,6 +841,14 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
 
     series_palette = palette["series_palette"]
 
+    # Tick geometry is decided before the bars are drawn so the thinning
+    # decision sees every label at once (#503 S2 review M4).
+    ticks = [
+        (ix + i * (bar_w + bar_gap) + bar_w / 2, "middle", p.x_label, 10.0)
+        for i, p in enumerate(pts)
+    ]
+    visible_ticks = _visible_axis_ticks(ticks)
+
     for i, p in enumerate(pts):
         bx = ix + i * (bar_w + bar_gap)
         if has_stacks:
@@ -659,9 +872,10 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
             bh = (iy + ih) - by
             elements.append(svg_rect(bx, by, bar_w, bh, fill=palette["series_primary"]))
         # X-tick label centered under bar.
-        tx = bx + bar_w / 2
-        elements.append(svg_text(tx, iy + ih + 14, p.x_label,
-                                 font_size=10, fill=palette["muted"], anchor="middle"))
+        if i in visible_ticks:
+            elements.append(svg_text(ticks[i][0], iy + ih + 14, p.x_label,
+                                     font_size=10, fill=palette["muted"],
+                                     anchor="middle"))
 
     # Legend (top-right of inner box, only when stacks are present).
     # SVG is the only artifact where the table doesn't double as a key, so
@@ -694,16 +908,22 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
 # Horizontal bar chart (top-N with cap).
 def _render_hbar_chart_svg(chart: HorizontalBarChart, *, palette: dict,
                            x: float, y: float, width: float, height: float) -> str:
-    pts = chart.points
-    if chart.cap is not None:
-        pts = pts[:chart.cap]
+    pts = _hbar_visible_points(chart)
     if not pts:
         return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
-    label_w = _HBAR_LABEL_GUTTER
+    # Both edges are MEASURED (#503 S2 F16). The gutter was a fixed 120px,
+    # which clipped any revealed project label wider than that, and the
+    # right side reserved a fixed 10px, which was narrower than every
+    # value label the chart emits — so even `$0.01` ran off the canvas.
+    # `_render_svg` widens the canvas by the same amounts through
+    # `chart_required_width`, so the plot keeps its nominal width and the
+    # bars are not shrunk to pay for the labels.
+    label_w = _hbar_label_gutter(pts)
+    right_reserve = _hbar_right_reserve(pts)
     ix = x + label_w
     iy = y + 6
-    iw = width - label_w - _HBAR_RIGHT_PAD
+    iw = width - label_w - right_reserve
     ih = height - 12
 
     n = len(pts)
@@ -720,13 +940,15 @@ def _render_hbar_chart_svg(chart: HorizontalBarChart, *, palette: dict,
         ry = iy + i * row_h + bar_gap
         bw = (p.y_value / x_max) * iw
         elements.append(svg_rect(ix, ry, bw, bar_h, fill=palette["series_primary"]))
-        # Label gutter (right-aligned to ix - 4).
-        elements.append(svg_text(ix - 4, ry + bar_h / 2 + 3, p.x_label,
-                                 font_size=11, fill=palette["fg"], anchor="end"))
+        # Label gutter (right-aligned to the bar's left edge).
+        elements.append(svg_text(ix - _HBAR_LABEL_PAD, ry + bar_h / 2 + 3,
+                                 p.x_label, font_size=_HBAR_LABEL_FONT,
+                                 fill=palette["fg"], anchor="end"))
         # Value label at end of bar.
-        elements.append(svg_text(ix + bw + 4, ry + bar_h / 2 + 3,
-                                 f"${p.y_value:,.2f}",
-                                 font_size=10, fill=palette["muted"], anchor="start"))
+        elements.append(svg_text(ix + bw + _HBAR_VALUE_PAD, ry + bar_h / 2 + 3,
+                                 _hbar_value_text(p),
+                                 font_size=_HBAR_VALUE_FONT,
+                                 fill=palette["muted"], anchor="start"))
 
     return svg_group(elements)
 
@@ -744,44 +966,102 @@ def _version_label(version: str) -> str:
     return f"v{version}" if version else "dev"
 
 
+_SVG_HEADER_ROW_H = 18.0
+
+
+def _svg_header_rows(snap: ShareSnapshot, *,
+                     shows_table: bool) -> "list[tuple[str, float]]":
+    """The `(text, font_size)` rows stacked under the SVG title.
+
+    A FLOW, not fixed slots. The subtitle used to be pinned at `y + 36`
+    and the provider line at `y + 54`, so a snapshot with a provider and
+    no subtitle rendered a blank 18px band between them — and the #503 S2
+    subtitle cleanup makes exactly that shape the common one. Stacking the
+    rows in order keeps the header tight whichever of them are present,
+    and `_svg_header_height` counts the same list.
+
+    The facts strip is always the last row, because it is unconditional.
+    """
+    rows: list[tuple[str, float]] = []
+    if snap.subtitle:
+        rows.append((snap.subtitle, 12.0))
+    source_label, availability = _source_chrome(snap)
+    if source_label:
+        rows.append((
+            source_label if availability is None
+            else f"{source_label} · {availability}",
+            10.0,
+        ))
+    rows.append((share_facts_line(snap, shows_chart=snap.chart is not None,
+                                  shows_table=shows_table), 10.0))
+    return rows
+
+
 def _render_svg_header(snap: ShareSnapshot, *, palette: dict,
-                       x: float, y: float, width: float) -> str:
+                       x: float, y: float, width: float,
+                       shows_table: bool) -> str:
     elements = []
     elements.append(svg_text(x, y + 18, snap.title,
                              font_size=18, fill=palette["fg"], weight="bold"))
-    if snap.subtitle:
-        elements.append(svg_text(x, y + 36, snap.subtitle,
-                                 font_size=12, fill=palette["muted"]))
-    source_label, availability = _source_chrome(snap)
-    if source_label:
-        source_text = source_label if availability is None else f"{source_label} · {availability}"
-        elements.append(svg_text(x, y + 54, source_text,
-                                 font_size=10, fill=palette["muted"]))
+    baseline = y + 18
+    for text, font_size in _svg_header_rows(snap, shows_table=shows_table):
+        baseline += _SVG_HEADER_ROW_H
+        elements.append(svg_text(x, baseline, text,
+                                 font_size=font_size, fill=palette["muted"]))
     elements.append(svg_text(x + width, y + 18,
                              _format_generated_at_iso(snap.generated_at),
                              font_size=10, fill=palette["muted"], anchor="end"))
     return svg_group(elements)
 
 
-def _svg_header_height(snap: ShareSnapshot, *, include_chrome: bool) -> float:
-    """Reserve the added source/availability line without perturbing v1 SVGs."""
+def _svg_header_height(snap: ShareSnapshot, *, include_chrome: bool,
+                       shows_table: bool) -> float:
+    """Reserve one band per row `_render_svg_header` actually emits.
+
+    `_SVG_HEADER_H` covers the title plus ONE stacked row; every further
+    row adds another band. A height that under-counts puts the last row
+    below the declared canvas, where it is invisible.
+    """
     if not include_chrome:
         return 0.0
-    source_label, _availability = _source_chrome(snap)
-    return _SVG_HEADER_H + (18.0 if source_label else 0.0)
+    extra_rows = max(0, len(_svg_header_rows(
+        snap, shows_table=shows_table)) - 1)
+    return _SVG_HEADER_H + _SVG_HEADER_ROW_H * extra_rows
+
+
+def _attribution_text(version: str) -> str:
+    """The one provenance sentence a branded artifact carries.
+
+    Shared by the standalone SVG footer and the composed SVG footer
+    (#503 S2 review F7): the composed one read the bare `cctally ·
+    composed`, so a composed artifact dropped the project and the version
+    a standalone one states. `--no-branding` removes the whole footer in
+    both, which is D2's split for HTML and SVG — there the footer IS the
+    advertisement, and the provenance a reader needs (period, zone,
+    privacy mode, generated-at) is in each section's facts strip.
+    """
+    return ("Generated by cctally · github.com/omrikais/cctally · "
+            + _version_label(version))
 
 
 def _render_svg_footer(snap: ShareSnapshot, *, palette: dict,
                        x: float, y: float, width: float, branding: bool) -> str:
     if not branding:
         return ""
-    label = (
-        "Generated by cctally · github.com/omrikais/cctally · "
-        + _version_label(snap.version)
-    )
+    label = _attribution_text(snap.version)
     return svg_group([
         svg_text(x, y, label, font_size=10, fill=palette["footer_link"]),
     ])
+
+
+def _provider_label(snap: ShareSnapshot) -> str:
+    """The authoritative visible provider name for a snapshot.
+
+    Factored out of `_source_chrome` so `compose()` can put it in a
+    section heading (#503 S2 D6) without a second definition of which
+    string names the provider.
+    """
+    return snap.source_label or ("Claude" if snap.source == "claude" else "Codex")
 
 
 def _source_chrome(snap: ShareSnapshot) -> tuple[str | None, str | None]:
@@ -795,7 +1075,7 @@ def _source_chrome(snap: ShareSnapshot) -> tuple[str | None, str | None]:
         or snap.source_label is not None
         or snap.availability != "ok"
     )
-    label = snap.source_label or ("Claude" if snap.source == "claude" else "Codex")
+    label = _provider_label(snap)
     status = (
         "No data" if snap.availability == "empty" else
         f"Unavailable: {snap.availability_reason}"
@@ -1981,9 +2261,278 @@ def _encode_probe_identity_key() -> str:
     return "v1." + base64.urlsafe_b64encode(canonical).decode("ascii").rstrip("=")
 
 
+# --- The provenance facts strip (#503 S2 D1/D5) ---
+
+# A displayed value counts as a date only when the WHOLE of it is one.
+# Anchored deliberately: a substring match would read a date out of a
+# title such as `Weekly recap — week of 2026-05-04`, which names what
+# the artifact is ABOUT rather than what it displays.
+_DISPLAYED_DATE_RE = re.compile(
+    r"^(\d{4}-\d{2})(-\d{2})?"
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$")
+
+
+def _displayed_date_token(text: str) -> "str | None":
+    """`YYYY-MM` or `YYYY-MM-DD` when `text` is entirely a date."""
+    match = _DISPLAYED_DATE_RE.match(text.strip())
+    if match is None:
+        return None
+    return match.group(1) + (match.group(2) or "")
+
+
+def _chart_points(chart) -> list:
+    """Every point a chart draws — primary series, rays and stacks.
+
+    All three series channels this kernel defines are read, because the
+    docstring's claim of completeness has to be true of the code. Two of
+    them were not read at all before (#503 S2 fourth review):
+
+    `BarChart.stacks` was never visited, although `_render_bar_chart_svg`
+    draws it as cumulative segments. And `LineChart.multi_series` is a
+    `Mapping[str, tuple[ChartPoint, ...]]`, so iterating it bare yielded
+    its KEYS — plain strings, whose `getattr(series, "points", ())` is
+    empty — which made the projected forecast ray contribute nothing.
+    Every other reader of these two fields in this module uses
+    `.values()`; this one alone did not.
+
+    No shipped builder puts a label in a stack or a ray that is absent
+    from `points`, so correcting both changes no artifact today. Reading
+    one of three channels while claiming all of them is the same
+    blindness that made the predecessor of `displayed_dates` see nothing
+    at all in the two `sessions` templates.
+    """
+    if chart is None:
+        return []
+    points = list(getattr(chart, "points", ()) or ())
+    for series in (getattr(chart, "multi_series", None) or {}).values():
+        points += list(series or ())
+    for series in (getattr(chart, "stacks", None) or {}).values():
+        points += list(series or ())
+    return points
+
+
+def displayed_dates(snap: ShareSnapshot, *, shows_chart: bool,
+                    shows_table: bool) -> list:
+    """Every date this rendering DISPLAYS, as a `YYYY-MM[-DD]` token.
+
+    Read from the text the renderers themselves print — `_render_cell_text`
+    for a cell, `x_label` for a chart point — rather than from the fields
+    behind them. That is what keeps this in step with the artifact: a
+    `DateCell` carries a `datetime` and prints `%Y-%m-%d`, so a walker
+    over string attributes saw nothing at all in the two `sessions`
+    templates (#503 S2 third review).
+
+    Only cells reachable through `snap.columns` are visited, because only
+    those are rendered.
+    """
+    tokens: list[str] = []
+    if shows_table and _has_table(snap):
+        for column in snap.columns:
+            token = _displayed_date_token(column.label or "")
+            if token:
+                tokens.append(token)
+        for row in snap.rows:
+            for column in snap.columns:
+                cell = row.cells.get(column.key)
+                if cell is None:
+                    continue
+                token = _displayed_date_token(_render_cell_text(cell))
+                if token:
+                    tokens.append(token)
+    if shows_chart:
+        for point in _chart_points(snap.chart):
+            token = _displayed_date_token(point.x_label or "")
+            if token:
+                tokens.append(token)
+    return tokens
+
+
+def _period_boundary_at(period: PeriodSpec, iso_date: str, *,
+                        side: str) -> datetime:
+    """A boundary of the same KIND as `period`, naming `iso_date`.
+
+    A civil-bucket period's boundaries are calendar labels lifted to
+    UTC-midnight sentinels, so the widened one must be the same shape or
+    `period_civil_dates` would convert it and name another day. An
+    instant-based period's boundary must instead be midnight IN THE
+    LABELLED ZONE, which is what converts back to `iso_date`.
+
+    `side` is required because the two ends are not symmetric. A START is
+    the first instant of its civil day. An END of an INSTANT period is
+    the LAST instant of its civil day: an artifact may display a full ISO
+    timestamp — the Codex quota `blocks` panel's `Resets` column prints
+    `2026-05-07T18:00:00+00:00` — and midnight of that same day precedes
+    it, so the Markdown frontmatter's machine-readable bound excluded
+    content the strip's civil date admits (#503 S2 fourth review). The
+    next day's midnight is NOT the answer: `period_civil_dates` would
+    then name a day the artifact does not display.
+
+    A civil-bucket END stays a midnight sentinel, because there the
+    datetime is a calendar LABEL rather than an instant, and every
+    declared civil-bucket boundary in the tree carries that shape.
+    """
+    year, month, day = (int(part) for part in iso_date.split("-"))
+    zone = timezone.utc
+    if not period.civil_bucket:
+        try:
+            zone = ZoneInfo(period.display_tz)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            zone = timezone.utc
+    if side == "end" and not period.civil_bucket:
+        return datetime(year, month, day, 23, 59, 59, 999999, tzinfo=zone)
+    return datetime(year, month, day, tzinfo=zone)
+
+
+def _whole_date(token: str, *, side: str) -> str:
+    """A month token resolved to a day, in the direction of its bound.
+
+    `2026-05` opens on the first of May and closes on the last of it. The
+    single first-day answer was right as a start bound and backwards as
+    an end bound: a displayed May bucket above an earlier-ending period
+    ended the stated window on `2026-05-01`, before most of the month it
+    was widened to cover. A day token needs no resolution.
+    """
+    if len(token) == 10:
+        return token
+    year, month = (int(part) for part in token.split("-"))
+    if side == "start":
+        return f"{token}-01"
+    return f"{token}-{calendar.monthrange(year, month)[1]:02d}"
+
+
+def effective_period(snap: ShareSnapshot, *, shows_chart: bool,
+                     shows_table: bool) -> PeriodSpec:
+    """`snap.period`, widened to cover what THIS rendering displays.
+
+    A builder declares the window its artifact is about — the focal week,
+    the current block, the range the user asked for. What a given FORMAT
+    then puts on the page is not the same thing: Markdown draws no chart,
+    and a chart-only template therefore displays nothing dated at all
+    while its HTML and SVG forms display eight weeks of it.
+
+    So the period is completed here rather than at the builder, and the
+    two failures that motivated it are opposite. UNDERSTATEMENT: four
+    `source-aware` artifacts stated a period narrower than their own
+    table, one of them a zero-width instant above a row dated three days
+    earlier — a reader taking the header at face value would conclude the
+    row could not be there. OVERSTATEMENT: the previous pass widened the
+    `weekly` and `blocks` BUILDERS to the span their charts cover, which
+    made every Markdown artifact from those panels claim eight weeks
+    above one week's spend.
+
+    Doing it per rendering closes both at once and closes them for all 43
+    construction sites rather than for the ones anybody enumerated. It
+    never NARROWS: a report that covered nine days and found rows on five
+    still covered nine, and an empty artifact must still say what it
+    looked at.
+    """
+    period = snap.period
+    tokens = displayed_dates(snap, shows_chart=shows_chart,
+                             shows_table=shows_table)
+    if not tokens:
+        return period
+    start_civil, end_civil = period_civil_dates(period)
+    # Compared at the token's OWN precision, so a `2026-05` month bucket
+    # is covered by any period whose bounds fall in that month.
+    below = [t for t in tokens if t < start_civil[:len(t)]]
+    above = [t for t in tokens if t > end_civil[:len(t)]]
+    if not below and not above:
+        return period
+    start = (_period_boundary_at(period, _whole_date(min(below), side="start"),
+                                 side="start")
+             if below else period.start)
+    end = (_period_boundary_at(period, _whole_date(max(above), side="end"),
+                               side="end")
+           if above else period.end)
+    return dataclasses.replace(period, start=start, end=end)
+
+
+def _md_effective_period(snap: ShareSnapshot) -> PeriodSpec:
+    """The period a MARKDOWN rendering of `snap` states.
+
+    One spelling for the frontmatter, the composite frontmatter union
+    and the strip, because a document that stated two different
+    periods about itself would be the defect this closes.
+    """
+    return effective_period(snap, shows_chart=False,
+                            shows_table=_has_table(snap))
+
+
+def _md_facts_line(snap: ShareSnapshot) -> str:
+    return share_facts_line(snap, shows_chart=False,
+                            shows_table=_has_table(snap))
+
+
+def share_facts_line(snap: ShareSnapshot, *, shows_chart: bool,
+                     shows_table: bool) -> str:
+    """The one sentence every artifact states about itself.
+
+    Reads `{start} → {end} ({zone})`, plus `· projects anonymized` or
+    `· real project names` when the document actually contains project
+    names. Public because the three fragment renderers are the only
+    callers today, but the string is part of the artifact contract.
+
+    `shows_chart` and `shows_table` say what THIS rendering puts on the
+    page, and both are required keywords with no default — the period is
+    completed from them through `effective_period`, and a default would
+    let a new caller silently claim a span its format does not draw.
+
+    THE PRIVACY CLAUSE COMES FROM THE PROVENANCE MARKER, never from the
+    rendered output. `_prepare` records which project display labels it
+    consumed and which privacy mode it ran under; inferring either from
+    the emitted labels is exactly the defect #503 S1 F5 was, because a
+    project legitimately named `project-1` is indistinguishable from an
+    alias by shape alone.
+
+    `originals - {ANON_UNKNOWN}` is the has-project-names predicate. It
+    reads `originals` rather than `allowed`, because composed preparation
+    supplies a DOCUMENT-WIDE mapping while `originals` stays specific to
+    this section — a Forecast section composed beside a Projects section
+    must not claim the Projects section's anonymization. It inspects no
+    columns, rows, charts or aliases.
+
+    An UNPREPARED snapshot — reachable only from tests, never from
+    `render()` or `compose()` — carries no marker, so it can truthfully
+    claim neither state and the clause is omitted entirely.
+    """
+    period = effective_period(snap, shows_chart=shows_chart,
+                              shows_table=shows_table)
+    start_civil, end_civil = period_civil_dates(period)
+    line = f"{start_civil} → {end_civil} ({period.display_tz})"
+    prov = _provenance_of(snap)
+    if prov is None or not (prov.originals - {ANON_UNKNOWN}):
+        return line
+    clause = "real project names" if prov.reveal_projects else "projects anonymized"
+    return f"{line} · {clause}"
+
+
+def _has_table(snap: ShareSnapshot) -> bool:
+    """Whether this artifact carries a table at all.
+
+    ONE predicate for all three renderers. It requires both columns and
+    rows: a header row with no body is a frame around nothing, and every
+    artifact that drew one was an empty-result artifact whose title
+    already said so — `share/report-empty-html` drew a four-cell header
+    under a title reading `— no data`, and seventeen
+    `tests/fixtures/source-aware/*-empty` goldens did the same, including
+    one that printed `Codex quota state is unavailable.` and then drew a
+    `Quota Series | % Used | $ Cost` frame anyway (#503 S2 review F3).
+
+    ONE builder does produce the schema-only shape: `budget`'s no-budget
+    snapshot passes a `Metric | Value` column pair with no rows. Its
+    artifact is titled `Budget — no budget set` and carries a note
+    telling the reader how to set one, so the header row was a frame
+    around nothing there too, and it is suppressed with the rest.
+    """
+    return bool(snap.columns) and bool(snap.rows)
+
+
 # --- Format renderers ---
 
-def _render_md_fragment(snap: ShareSnapshot, *, branding: bool) -> str:
+def _render_md_fragment(snap: ShareSnapshot, *, branding: bool,
+                        heading_level: int = 1,
+                        heading_override: "str | None" = None,
+                        suppress_provider: bool = False) -> str:
     """Render the MD section body.
 
     M1.2 contract: returns the full current `_render_md` body. Frontmatter
@@ -1991,18 +2540,45 @@ def _render_md_fragment(snap: ShareSnapshot, *, branding: bool) -> str:
     + `_wrap_document`. Fragment shape is body-only by definition; even
     without frontmatter the wrap layer remains the single chrome chokepoint
     so future surfaces (compose, history) extend it once.
+
+    `heading_level` defaults to 1, which is what every standalone caller
+    passes, so their output is byte-identical. `compose()` passes 2 so a
+    composed document has one H1 and one H2 per section (#503 S2 F12).
+
+    `heading_override` and `suppress_provider` implement D6: in an
+    all-source document the heading reads `<title> — <provider>` and the
+    section's separate provider line is dropped, because otherwise both
+    sections carry the same title and only a small line below tells them
+    apart. `suppress_provider` removes ONLY the provider name; the
+    availability text (`No data`, `Unavailable: …`) is preserved.
     """
-    parts = [f"# {_md_escape(snap.title)}"]
+    heading = snap.title if heading_override is None else heading_override
+    parts = [f"{'#' * heading_level} {_md_escape(heading)}"]
     source_label, availability = _source_chrome(snap)
+    if suppress_provider:
+        source_label = None
     if source_label:
         parts.extend(["", f"**{_md_escape(source_label)}**"])
     if availability:
         parts.extend(["", _md_escape(availability)])
     if snap.subtitle:
         parts.append(f"_{_md_escape(snap.subtitle)}_")
-        parts.append(f"_{_format_generated_at_iso(snap.generated_at)}_")
-    parts.append("")  # blank line before table
-    parts.append(_render_md_table(snap))
+    # UNCONDITIONAL (#503 S2 D1): the subtitle is optional editorial
+    # content and may be absent, but the facts strip and the generation
+    # timestamp are what the artifact states about itself, so neither may
+    # be gated on it.
+    # Markdown draws NO chart, so its period is completed from its own
+    # table alone (#503 S2 third review).
+    parts.append(f"_{_md_escape(_md_facts_line(snap))}_")
+    parts.append(f"_{_format_generated_at_iso(snap.generated_at)}_")
+    # Gated on `_has_table` — columns AND rows — in all three formats
+    # (#503 S2 F17, closed for the empty case by the S2 review). Ungated,
+    # the eight chart-only `*-visual` templates appended a blank line and
+    # then a table that renders as the empty string, producing a
+    # four-newline run in the middle of the document.
+    if _has_table(snap):
+        parts.append("")  # blank line before table
+        parts.append(_render_md_table(snap))
 
     if snap.totals:
         parts.append("")
@@ -2028,6 +2604,59 @@ def _render_md_fragment(snap: ShareSnapshot, *, branding: bool) -> str:
 # --- SVG composition ---
 
 _SVG_WIDTH = 600
+# `font-family` (#503 S2 review F5) is carried by EVERY `<svg>` root this
+# kernel emits: only the 24 SVG table cells declared one, so the title,
+# subtitle, facts strip, timestamp, footer and every chart label fell back
+# to the viewer default — Times in Chromium. The same report was therefore
+# typographically different as `.svg` and as `.html`, and
+# `_svg_text_width`'s sans-serif calibration did not apply to the
+# standalone form at all. `font-family` is an inherited SVG presentation
+# attribute, so declaring it once on the root reaches every `<text>`; the
+# per-cell declarations stay and agree with it.
+_SVG_ROOT_COMMON_ATTRS = (
+    'xmlns="http://www.w3.org/2000/svg" font-family="sans-serif"'
+)
+# A DOCUMENT root — a standalone `.svg` artifact or a composed stack.
+# Scaling here is correct: the whole artifact is the viewport's content,
+# so shrinking it to fit shrinks everything together and the reader can
+# zoom. `height:auto` keeps the aspect ratio while `max-width:100%`
+# bounds the width.
+_SVG_ROOT_ATTRS = (
+    f'{_SVG_ROOT_COMMON_ATTRS} style="max-width:100%;height:auto"'
+)
+# The chart EMBEDDED in an HTML document, which is a different problem
+# with the opposite answer (#503 S2 second review N1).
+#
+# `_wrap_document` caps the HTML body at `max-width:680px` with 20px
+# padding. Under the default `content-box` sizing that padding lies
+# OUTSIDE the cap, so the content box is 680px wide, not 640 — the figure
+# an earlier pass recorded (#503 S2 fourth review). `chart_required_width`
+# widens the canvas past it for a long label; the widest embedded chart in
+# the committed goldens declares 670.9, and real `project
+# --reveal-projects` data produces 755.3. Carrying `max-width:100%` scaled
+# the chart down to fit, which is why the surrounding `overflow:auto`
+# container could never activate: measured in a browser,
+# `scrollWidth - clientWidth` was 0 in all 582 document-by-viewport
+# checks. The cost was legibility rather than layout — at a 420px
+# viewport the chart scaled to 0.593 and its smallest axis text rendered
+# at 5.93 CSS px, with 111 chart instances below 9px across the tested
+# viewports and a worst desktop case of 8.80px at 1280px.
+#
+# So the embedded chart keeps its intrinsic size and its container
+# scrolls. `display:block` removes the inline baseline strut under a
+# replaced element, which would otherwise make the container's content
+# taller than its box and raise a vertical scrollbar with no content to
+# reveal.
+_SVG_EMBED_ROOT_ATTRS = f'{_SVG_ROOT_COMMON_ATTRS} style="display:block"'
+# Both the chart and the table are laid out at their own intrinsic width
+# and scroll inside their own box, so the DOCUMENT never scrolls
+# horizontally. `overflow` is declared on both axes deliberately: CSS
+# computes `overflow-y: visible` to `auto` whenever `overflow-x` is not
+# `visible`, so `overflow-x:auto` alone already made these elements
+# scroll containers on both axes. Writing it out says so, and it avoids
+# `overflow-y:hidden`, which clips the bottom of the content by the
+# height of a classic (non-overlay) horizontal scrollbar.
+_HTML_SCROLL_BOX_STYLE = "overflow:auto"
 _SVG_HEADER_H = 60
 _SVG_CHART_H = 220
 _SVG_FOOTER_H = 30
@@ -2040,6 +2669,15 @@ _SVG_FOOTER_BASELINE = 18
 # Vertical padding between stacked sections in `_stitch_svg`.
 _SVG_SECTION_GAP = 20.0
 
+# --- Composed SVG chrome (#503 S2 F13b) ---
+# The composite title band and the branding-gated composite footer. Sized
+# to match the standalone SVG's own title (18pt at a +30 baseline inside a
+# 48px band) and footer (10pt at a +18 baseline inside a 30px band).
+_SVG_COMPOSITE_HEADER_H = 48.0
+_SVG_COMPOSITE_TITLE_BASELINE = 30.0
+_SVG_COMPOSITE_FOOTER_H = 30.0
+_SVG_COMPOSITE_FOOTER_BASELINE = 18.0
+
 # --- SVG table geometry (issue #38) ---
 _SVG_TABLE_FONT = 11
 _SVG_TABLE_CELL_PAD_X = 8
@@ -2048,23 +2686,157 @@ _SVG_TABLE_LINE_H_MULT = 1.4
 _SVG_TABLE_GAP = 16
 _SVG_TABLE_MAX_WRAP_LINES = 3
 _SVG_TABLE_MIN_COL_W = 24
-_SVG_AVG_GLYPH_WIDTH_FRACTION = 0.6
+_SVG_AVG_GLYPH_WIDTH_FRACTION = 0.6   # fallback for an unclassified glyph
+# Advance width as a fraction of the font size, per printable ASCII
+# character, from the Helvetica AFM (`sans-serif` resolves to Helvetica in
+# the browser these were measured in). Written as the AFM's per-mille
+# integers so each value can be checked against the font's own table
+# rather than against a class the implementor invented.
+#
+# This replaced a four-class approximation whose two re-tuned entries are
+# the reason it is now per-character: `M` was 0.95 against Helvetica's
+# 0.833 and `i` was 0.28 against 0.222, and both errors reached the SVG
+# table's column widths as well as the chart gutters.
+_SVG_GLYPH_ADVANCE_PER_MILLE: dict[str, int] = {
+    " ": 278, "!": 278, '"': 355, "#": 556, "$": 556, "%": 889, "&": 667,
+    "'": 191, "(": 333, ")": 333, "*": 389, "+": 584, ",": 278, "-": 333,
+    ".": 278, "/": 278,
+    "0": 556, "1": 556, "2": 556, "3": 556, "4": 556, "5": 556, "6": 556,
+    "7": 556, "8": 556, "9": 556,
+    ":": 278, ";": 278, "<": 584, "=": 584, ">": 584, "?": 556, "@": 1015,
+    "A": 667, "B": 667, "C": 722, "D": 722, "E": 667, "F": 611, "G": 778,
+    "H": 722, "I": 278, "J": 500, "K": 667, "L": 556, "M": 833, "N": 722,
+    "O": 778, "P": 667, "Q": 778, "R": 722, "S": 667, "T": 611, "U": 722,
+    "V": 667, "W": 944, "X": 667, "Y": 667, "Z": 611,
+    "[": 278, "\\": 278, "]": 278, "^": 469, "_": 556, "`": 333,
+    "a": 556, "b": 556, "c": 500, "d": 556, "e": 556, "f": 278, "g": 556,
+    "h": 556, "i": 222, "j": 222, "k": 500, "l": 222, "m": 833, "n": 556,
+    "o": 556, "p": 556, "q": 556, "r": 333, "s": 500, "t": 278, "u": 556,
+    "v": 500, "w": 722, "x": 500, "y": 500, "z": 500,
+    "{": 334, "|": 260, "}": 334, "~": 584,
+}
+_SVG_GLYPH_WIDTH_FRACTIONS: dict[str, float] = {
+    char: per_mille / 1000.0
+    for char, per_mille in _SVG_GLYPH_ADVANCE_PER_MILLE.items()
+}
+# A wide-script character (CJK ideograph, kana, hangul, fullwidth form) is
+# a full em by definition, and the fallback fonts that render it measured
+# 1.02 em for CJK and 1.01 for kana at font-size 11. Reserving 1.05
+# over-reserves those slightly and hangul more (it measured 0.865), which
+# is the safe direction: under-reservation OVERPRINTS. Against the old
+# 0.6-em estimate a twelve-character Chinese project name reserved 79.20
+# where the browser drew 134.91, so the `$ Cost` column began at x=129.4
+# while the name ran to x=162.8 — 27.5px of value printed on top of name.
+_SVG_WIDE_GLYPH_WIDTH_FRACTION = 1.05
+# Emoji are wider still: eight rockets measured 112.00 at font-size 11,
+# which is 1.27 em each, against the 52.80 the flat estimate reserved.
+_SVG_EMOJI_WIDTH_FRACTION = 1.3
+# Codepoint ranges treated as emoji. Deliberately coarse and deliberately
+# NOT the whole of East_Asian_Width=W, which these also carry: the arrow
+# in the facts strip and the ellipsis are neither emoji nor wide.
+_SVG_EMOJI_RANGES: tuple[tuple[int, int], ...] = (
+    (0x1F000, 0x1FAFF),   # mahjong/domino/cards through symbols & pictographs
+    (0x2600, 0x27BF),     # misc symbols and dingbats
+    (0x2B00, 0x2BFF),     # misc symbols and arrows (the emoji stars live here)
+)
+# A combining mark, an enclosing mark and a format character (ZWJ, the
+# variation selectors) all advance the pen by zero. Twelve acute accents
+# over twelve `e` measured 73.42 at font-size 11 — exactly the twelve `e`
+# — where treating each mark as a glyph reserved 153.12, over-reserving by
+# 108.6% and wasting canvas the chart could have used.
+_SVG_ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Cf"})
+# Two characters this kernel emits itself, and neither is emoji nor
+# East_Asian_Width=W, so both fell to the 0.6-em fallback while Chromium
+# advances them at exactly one em: measured 11.00 at font-size 11, 13.00
+# at 13 and 18.00 at 18 for both. The arrow appears once per artifact in
+# the facts strip, and the ellipsis GATES the SVG table's truncation
+# decision, so under-reserving it by 0.40 em under-reserves a truncated
+# cell (#503 S2 third review). Live impact was sub-pixel — worst
+# synthetic case −0.45px, zero viewBox escapes across 255 charts — but a
+# known-wrong entry in a table whose whole point is correctness is worth
+# more than the delta it moves.
+_SVG_FULL_EM_CHARS = frozenset({"\u2192", "\u2026"})
+# A ZWJ sequence renders as ONE glyph. The joiner itself is `Cf` and
+# already advances zero, but each joined codepoint was reserved a full
+# emoji width, so a family sequence reserved ~3.9 em for one rendered
+# character.
+_SVG_ZWJ = "\u200d"
 _SVG_WRAP_BREAK_CHARS = (" ", "/", "-", "_")
 _SVG_ELLIPSIS = "…"
 _SVG_NOTE_FONT = 11
 _SVG_NOTE_LINE_H = 16
 _SVG_NOTE_GAP = 14
 
+# --- SVG totals band (#503 S2 D3) ---
+_SVG_TOTALS_FONT = 11
+_SVG_TOTALS_LINE_H = 16
+_SVG_TOTALS_GAP = 14
+
+
+def _svg_glyph_width_fraction(char: str) -> float:
+    """The advance width of one character, as a fraction of the font size.
+
+    Five cases, in the order they are tested. Printable ASCII comes from
+    the Helvetica AFM. A combining or format character advances zero. The
+    arrow and the ellipsis this kernel emits itself are a measured full
+    em. An emoji is the widest class. A wide-script character is a full
+    em. Every other character — `é`, Cyrillic, Greek — keeps the
+    historical 0.6-em fallback, which is where the estimator is still an
+    estimate.
+    """
+    fraction = _SVG_GLYPH_WIDTH_FRACTIONS.get(char)
+    if fraction is not None:
+        return fraction
+    if unicodedata.category(char) in _SVG_ZERO_WIDTH_CATEGORIES:
+        return 0.0
+    if char in _SVG_FULL_EM_CHARS:
+        return 1.0
+    code = ord(char)
+    for low, high in _SVG_EMOJI_RANGES:
+        if low <= code <= high:
+            return _SVG_EMOJI_WIDTH_FRACTION
+    if unicodedata.east_asian_width(char) in ("W", "F"):
+        return _SVG_WIDE_GLYPH_WIDTH_FRACTION
+    return _SVG_AVG_GLYPH_WIDTH_FRACTION
+
 
 def _svg_text_width(text: str, font_size: float) -> float:
     """Estimate rendered width of `text` at `font_size` in a sans-serif font.
 
-    Heuristic-only: actual width depends on the UA-selected font. SVG
-    goldens are diffed as source text, so this function's job is
-    determinism, not pixel-perfect measurement. Wrap-then-ellipsize
-    layout tolerates moderate over/under-allocation.
+    Still a heuristic — the actual width depends on the UA-selected font,
+    and this stays a table rather than a font-metrics dependency. But the
+    flat 0.6-em estimate it replaced was wrong by a factor at both ends:
+    20 `W` at font-size 11 reserved 132.0 against a measured 207.66, so
+    the label began at `x = -75.66` and was cut off, while 36 `i` reserved
+    237.6 against a measured 87.98. The same estimate sizes the SVG
+    table's columns and gates its ellipsis decision, so an under-estimate
+    did not merely clip a chart label — it let two table values print on
+    top of each other (#503 S2 review F6).
+
+    A four-class approximation closed the ASCII ends and left the
+    non-Latin ones open, which is the same defect in the same function:
+    against real Chromium a twelve-character Chinese project name was
+    under-reserved by 41.3%, kana by 40.7%, hangul by 30.6% and emoji by
+    52.9%, while a combining mark was over-reserved by 108.6% (#503 S2
+    second review N6). `_svg_glyph_width_fraction` classifies those.
+
+    A ZWJ SEQUENCE IS ONE GLYPH, and the per-character sum cannot see
+    that on its own: the joiner advances zero, but each joined codepoint
+    was reserved a full emoji width, so a family sequence reserved about
+    3.9 em for a single rendered character (#503 S2 third review). A
+    codepoint that follows a joiner is therefore skipped.
     """
-    return len(text) * font_size * _SVG_AVG_GLYPH_WIDTH_FRACTION
+    total = 0.0
+    joined = False
+    for char in text:
+        if joined:
+            joined = char == _SVG_ZWJ
+            continue
+        if char == _SVG_ZWJ:
+            joined = True
+            continue
+        total += _svg_glyph_width_fraction(char)
+    return total * font_size
 
 
 def _wrap_for_width(text: str, content_w: float, font_size: float) -> list[str]:
@@ -2147,6 +2919,30 @@ def _render_svg_notes(
         for idx, line in enumerate(lines)
     ])
     return body, float(len(lines) * _SVG_NOTE_LINE_H)
+
+
+def _render_svg_totals(
+    snap: "ShareSnapshot", *, palette: dict, x: float, y: float,
+) -> tuple[str, float]:
+    """Render `snap.totals` as one `Label: value` row each (#503 S2 D3).
+
+    Returns `("", 0.0)` when there is nothing to render, so the caller's
+    height arithmetic and the emitted band stay derived from one decision.
+    SVG carried no totals at all before this, which is why `cctally budget
+    --format svg` showed neither its `ok`/`warn`/`over` verdict nor its
+    target: both live in `totals` and in no table row.
+    """
+    if not snap.totals:
+        return "", 0.0
+    body = svg_group([
+        svg_text(
+            x, y + ((idx + 1) * _SVG_TOTALS_LINE_H),
+            f"{total.label}: {total.value}",
+            font_size=_SVG_TOTALS_FONT, fill=palette["fg"], weight="bold",
+        )
+        for idx, total in enumerate(snap.totals)
+    ])
+    return body, float(len(snap.totals) * _SVG_TOTALS_LINE_H)
 
 
 def _svg_table_anchor_and_x(align: str, col_x: float, col_w: float,
@@ -2321,9 +3117,10 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
                            chart-slot embed stays table-free (HTML <table>
                            is rendered separately as a sibling element).
     """
-    has_table = include_table and bool(snap.columns)
+    has_table = include_table and _has_table(snap)
     chart_h = _SVG_CHART_H if snap.chart is not None else 0
-    header_h = _svg_header_height(snap, include_chrome=include_chrome)
+    header_h = _svg_header_height(snap, include_chrome=include_chrome,
+                                  shows_table=has_table)
 
     # Pre-layout the table (we need its height before declaring outer SVG height).
     if has_table:
@@ -2334,32 +3131,54 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
     else:
         table_svg, table_h, table_w = "", 0.0, 0.0
 
-    # Canvas grows when the table's used width exceeds _SVG_WIDTH — happens
-    # only when the min-col-w clamp fired (pathological top_n). Header /
-    # chart / footer keep their original positioning anchored at _SVG_WIDTH;
-    # the canvas just extends to the right so wide tables aren't clipped at
-    # the viewBox. Issue #38 follow-up (Codex PR #40 P2).
-    content_w = max(_SVG_WIDTH, table_w)
+    # Canvas grows when its content needs more than _SVG_WIDTH. Two
+    # sources: a table whose min-col-w clamp fired (issue #38 follow-up,
+    # Codex PR #40 P2), and a chart whose labels do not fit the nominal
+    # gutters (#503 S2 F16). The chart, header, notes and footer all lay
+    # out against `content_w` so a widened canvas keeps its chart's
+    # nominal plot width and right-aligns its timestamp at the real edge.
+    # The TABLE is deliberately excluded: its own width is an input to
+    # this maximum, so laying it out against the result would be circular.
+    content_w = max(_SVG_WIDTH, table_w,
+                    chart_required_width(snap.chart, nominal_width=_SVG_WIDTH))
 
     table_block_h = (_SVG_TABLE_GAP + table_h) if has_table else 0
+
+    # Totals sit between the table and the notes, matching the Markdown
+    # order. GATED ON `include_chrome` for the same reason the facts strip
+    # is: `_render_html_fragment` embeds this renderer with
+    # `include_chrome=False` to get the chart alone, and an ungated band
+    # would print every total twice in every HTML artifact.
+    totals_block_h = 0.0
+    totals_svg = ""
+    if include_chrome and snap.totals:
+        totals_y = (
+            _SVG_PADDING + header_h + chart_h + table_block_h + _SVG_TOTALS_GAP
+        )
+        totals_svg, totals_h = _render_svg_totals(
+            snap, palette=palette, x=_SVG_PADDING, y=totals_y,
+        )
+        totals_block_h = _SVG_TOTALS_GAP + totals_h
+
     note_block_h = 0.0
     note_svg = ""
     if include_chrome and snap.notes:
         note_y = (
-            _SVG_PADDING + header_h + chart_h + table_block_h + _SVG_NOTE_GAP
+            _SVG_PADDING + header_h + chart_h + table_block_h + totals_block_h
+            + _SVG_NOTE_GAP
         )
         note_svg, note_h = _render_svg_notes(
             snap,
             palette=palette,
             x=_SVG_PADDING,
             y=note_y,
-            width=_SVG_WIDTH,
+            width=content_w,
         )
         note_block_h = _SVG_NOTE_GAP + note_h
 
     if include_chrome:
         height = (
-            header_h + chart_h + table_block_h + note_block_h
+            header_h + chart_h + table_block_h + totals_block_h + note_block_h
             + _SVG_FOOTER_H + (_SVG_PADDING * 2)
         )
     else:
@@ -2370,7 +3189,8 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
     if include_chrome:
         pieces.append(_render_svg_header(
             snap, palette=palette,
-            x=_SVG_PADDING, y=_SVG_PADDING, width=_SVG_WIDTH,
+            x=_SVG_PADDING, y=_SVG_PADDING, width=content_w,
+            shows_table=has_table,
         ))
 
     chart_y = _SVG_PADDING + header_h
@@ -2378,41 +3198,50 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
         if isinstance(snap.chart, LineChart):
             pieces.append(_render_line_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
             ))
         elif isinstance(snap.chart, BarChart):
             pieces.append(_render_bar_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
             ))
         elif isinstance(snap.chart, HorizontalBarChart):
             pieces.append(_render_hbar_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=_SVG_WIDTH, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
             ))
 
     if has_table:
         pieces.append(table_svg)
+
+    if totals_svg:
+        pieces.append(totals_svg)
 
     if note_svg:
         pieces.append(note_svg)
 
     if include_chrome:
         footer_y = (
-            _SVG_PADDING + header_h + chart_h + table_block_h + note_block_h
-            + _SVG_FOOTER_BASELINE
+            _SVG_PADDING + header_h + chart_h + table_block_h + totals_block_h
+            + note_block_h + _SVG_FOOTER_BASELINE
         )
         pieces.append(_render_svg_footer(
             snap, palette=palette,
             x=_SVG_PADDING, y=footer_y,
-            width=_SVG_WIDTH, branding=branding,
+            width=content_w, branding=branding,
         ))
 
     total_w = content_w + (_SVG_PADDING * 2)
     bg_rect = svg_rect(0, 0, total_w, height, fill=palette["bg"])
     inner = bg_rect + "".join(pieces)
+    # `include_chrome=False` IS the HTML-embedded chart contract (see the
+    # docstring), and it is the only way this root tag reaches an
+    # artifact: the chrome-bearing form is always re-wrapped by
+    # `_wrap_document` or `_stitch_svg` after `_strip_outer_svg_tag`. An
+    # embedded chart must not be scaled down to fit — it scrolls instead.
+    root_attrs = _SVG_ROOT_ATTRS if include_chrome else _SVG_EMBED_ROOT_ATTRS
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'<svg {root_attrs} '
         f'viewBox="0 0 {_fmt_num(total_w)} {_fmt_num(height)}" '
         f'width="{_fmt_num(total_w)}" height="{_fmt_num(height)}">'
         f'{inner}'
@@ -2462,6 +3291,16 @@ def _render_cell_md(cell: Cell) -> str:
 # --- HTML chrome and table ---
 
 def _render_html_table(snap: ShareSnapshot, palette: dict) -> str:
+    """The data table, inside its own horizontal scroll box.
+
+    The table — not the chart — is what actually overflowed the 680px
+    content box (#503 S2 second review N1). Measured at a 420px viewport,
+    `documentElement.scrollWidth - clientWidth` was 129px in three of the
+    `daily` detail artifacts, 76px in a fourth and 53px in a `blocks` one,
+    and the rightmost columns were reachable only by scrolling the whole
+    document sideways. A table shrink-wraps to its content and has no cap
+    to give it, so the box around it is the mechanism.
+    """
     th_cells = "".join(
         f'<th style="text-align:{c.align};padding:6px 10px;background:{palette["table_header_bg"]};color:{palette["fg"]}">{_xml_escape(c.label)}</th>'
         for c in snap.columns
@@ -2475,31 +3314,53 @@ def _render_html_table(snap: ShareSnapshot, palette: dict) -> str:
         )
         body_rows.append(f"<tr>{td_cells}</tr>")
     return (
-        f'<table style="border-collapse:collapse;font-family:system-ui,-apple-system,sans-serif;font-size:13px;margin-top:12px">'
+        f'<div style="margin-top:12px;{_HTML_SCROLL_BOX_STYLE}">'
+        f'<table style="border-collapse:collapse;font-family:system-ui,-apple-system,sans-serif;font-size:13px">'
         f'<thead><tr>{th_cells}</tr></thead>'
         f'<tbody>{"".join(body_rows)}</tbody>'
         f'</table>'
+        f'</div>'
     )
 
 
-def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool) -> str:
+def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool,
+                          heading_level: int = 1,
+                          heading_override: "str | None" = None,
+                          suppress_provider: bool = False) -> str:
     """Render the HTML body fragment — header + chart + table + (branded footer).
 
     Document chrome (<!DOCTYPE>/<html>/<head>/<body>) is layered on at the wrap
     step via `_wrap_document`, keeping body-only content composable for v2's
     multi-section stitcher.
+
+    `heading_level`, `heading_override` and `suppress_provider` mean the
+    same as in `_render_md_fragment`. HTML had the INVERTED form of the
+    Markdown heading defect: `_stitch_html` wrapped one composite `<h1>`
+    around one `<h1>` per section, so a composed document declared several
+    top-level headings.
     """
     # `_share_apply_content_toggles` sets `snap.chart=None` for show_chart=False
     # and `snap.columns=()`/`snap.rows=()` for show_table=False. Gate the chart
     # wrapper div + the table chrome on those, so disabled sections drop entirely
     # rather than rendering empty chrome (an empty `<svg>` chart area or an
     # `<table>` with no `<th>`/`<td>`).
+    # The chart keeps its intrinsic size and this box scrolls (#503 S2
+    # second review N1). The earlier pairing — a `max-width:100%` cap on
+    # the `<svg>` inside an `overflow-x:auto` box — could not scroll at
+    # all, because the cap guaranteed the content already fitted.
     chart_html = (
-        f'<div style="margin-top:12px">{_render_svg(snap, palette=palette, branding=False, include_chrome=False, include_table=False)}</div>'
+        f'<div style="margin-top:12px;{_HTML_SCROLL_BOX_STYLE}">{_render_svg(snap, palette=palette, branding=False, include_chrome=False, include_table=False)}</div>'
         if snap.chart is not None else ""
     )
-    title_html = f'<h1 style="font-size:20px;color:{palette["fg"]};margin:0">{_xml_escape(snap.title)}</h1>'
+    heading = snap.title if heading_override is None else heading_override
+    heading_tag = f"h{heading_level}"
+    title_html = (
+        f'<{heading_tag} style="font-size:20px;color:{palette["fg"]};margin:0">'
+        f'{_xml_escape(heading)}</{heading_tag}>'
+    )
     source_label, availability = _source_chrome(snap)
+    if suppress_provider:
+        source_label = None
     source_html = (
         f'<div style="font-size:13px;color:{palette["muted"]};margin-top:4px">{_xml_escape(source_label)}</div>'
         if source_label else ""
@@ -2512,11 +3373,29 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
         f'<div style="font-size:13px;color:{palette["muted"]};margin-top:4px">{_xml_escape(snap.subtitle)}</div>'
         if snap.subtitle else ""
     )
+    # Unconditional (#503 S2 D1) — see `share_facts_line`.
+    facts_html = (
+        f'<div style="font-size:13px;color:{palette["muted"]};margin-top:4px">'
+        f'{_xml_escape(share_facts_line(snap, shows_chart=snap.chart is not None, shows_table=_has_table(snap)))}</div>'
+    )
     timestamp_html = (
         f'<div style="font-size:11px;color:{palette["muted"]};margin-top:4px">'
         f'{_format_generated_at_iso(snap.generated_at)}</div>'
     )
-    table_html = _render_html_table(snap, palette) if snap.columns else ""
+    table_html = _render_html_table(snap, palette) if _has_table(snap) else ""
+    # #503 S2 D3 — totals render in all three formats. `budget`'s verdict
+    # and target live only here, so HTML omitted both entirely.
+    totals_html = (
+        f'<ul aria-label="Totals" style="margin-top:12px;padding-left:18px;'
+        f'font-size:13px;color:{palette["fg"]}">'
+        + "".join(
+            f'<li><strong>{_xml_escape(total.label)}:</strong> '
+            f'{_xml_escape(total.value)}</li>'
+            for total in snap.totals
+        )
+        + "</ul>"
+        if snap.totals else ""
+    )
     notes_html = (
         f'<aside aria-label="Data notes" '
         f'style="margin-top:14px;padding:8px 10px;border-left:3px solid {palette["ref_warn"]};'
@@ -2541,9 +3420,11 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
     else:
         footer_html = ""
     return (
-        f'<header>{title_html}{source_html}{availability_html}{subtitle_html}{timestamp_html}</header>'
+        f'<header>{title_html}{source_html}{availability_html}{subtitle_html}'
+        f'{facts_html}{timestamp_html}</header>'
         f'{chart_html}'
         f'{table_html}'
+        f'{totals_html}'
         f'{notes_html}'
         f'{footer_html}'
     )
@@ -2553,7 +3434,7 @@ def _render_html_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool)
 
 def _render_md_table(snap: ShareSnapshot) -> str:
     """Markdown table per ColumnSpec + Row contract."""
-    if not snap.columns:
+    if not _has_table(snap):
         return ""
     head = "| " + " | ".join(_md_escape(c.label) for c in snap.columns) + " |"
     sep = "|" + "|".join(
@@ -2607,70 +3488,274 @@ def _render_svg_fragment(snap: ShareSnapshot, *, palette: dict, branding: bool) 
 # --- Print stylesheet + MD frontmatter (placeholders for M2.x layering) ---
 
 def _print_stylesheet() -> str:
-    """Print-only CSS injected into HTML <head> for PDF export polish (spec §11.2).
+    """Print-only CSS injected into HTML <head> so a dark export prints.
 
-    M1.2 stub returned this string but it was NOT wired into `_wrap_document`
-    yet to keep v1 HTML goldens byte-stable through M1-M3. M4.2 wires it in
-    so Print → PDF on a dark-theme export renders as black-on-white instead
-    of a solid-black page, and forces page-break-inside avoidance on
-    semantic blocks. v1 + v2 HTML goldens re-baseline once on first run
-    after this change and are byte-stable thereafter; MD + SVG goldens are
-    unaffected (the stylesheet only lives in the HTML document head).
+    `body * { color: #000 !important }` is the rule that reaches the
+    document (#503 S2 F14). `!important` resolves the cascade among
+    declarations for ONE element and does not propagate through
+    inheritance, and every descendant of `body` here carries an inline
+    `color`, so each has a specified value and never inherits — a rule on
+    `body` alone leaves the dark palette at 1.24:1.
+
+    The embedded chart SVG needs its own rules twice over: its text is
+    coloured by `fill`, which no rule about `color` touches, and it paints
+    a full-canvas rectangle plus `fill` / `stroke` presentation attributes
+    that are not `color` either.
+
+    THE DARK-TO-LIGHT MAP IS NOT VALUE-TO-VALUE, and cannot be. `#1f2937`
+    is both `grid` and `table_row_alt`, whose light counterparts are
+    `#e5e7eb` and `#f9fafb`; and the dark `fg` `#e5e7eb` is itself the
+    light `grid`. So the selectors discriminate by CONTEXT — `rect` fill
+    versus `line` stroke — rather than by value alone.
+
+    THE DATA COLOURS ARE MAPPED TOO (#503 S2 review F1/F2), because they
+    are not legible on white: dark `ref_warn` #fbbf24 measures 1.67:1
+    where its light counterpart #d97706 measures 3.19:1, dark `ref_alarm`
+    #f87171 measures 2.77:1 against 4.83:1, and dark `series_primary`
+    #60a5fa measures 2.54:1 against 5.17:1. A reference LABEL is mapped
+    alongside its LINE, so the colour that encodes severity stays paired;
+    the per-value `text[fill=…]` rules outrank the blanket `svg text` one
+    on specificity.
+
+    THAT PAIRING IS DECLARED FOR BOTH THEMES, not only the dark one. The
+    blanket `svg text` rule is theme-blind and a map keyed only on the
+    dark values is not, so a LIGHT forecast printed a black `90%` above
+    an amber reference line while the dark forecast of the same report
+    printed both amber. The light entries are identity rules whose only
+    job is to outrank the blanket rule (#503 S2 second review N7).
+
+    `print-color-adjust: exact` appears only to stop the browser dropping
+    the corrected colours and light backgrounds; it is never the
+    correction itself.
+
+    The zebra stripe is preserved through `nth-child`, which reproduces the
+    light palette's own alternation, rather than through a fragile
+    `[style*=…]` match on the inline background.
+
+    THE TWO SCREEN SCROLL BOXES ARE RELEASED HERE, and the embedded chart
+    is given back the proportional sizing the screen answer took away
+    (#503 S2 third review). On screen the chart and the table each keep
+    their intrinsic width inside an `overflow:auto` box, so the document
+    never scrolls sideways. Paper has no scrolling, and a print engine
+    CLIPS a scroll container to its box, so the chart lost everything
+    past the content box — the bar value labels and the last axis tick.
+    `overflow: visible` answers that, and `max-width: 100%; height: auto`
+    on the chart restores the scaling it had before the screen fix split
+    the two roots apart.
+
+    THE CONTENT BOX IS 680px, NOT 640 (#503 S2 fourth review). `body`
+    declares `padding:20px; max-width:680px` under the default
+    `content-box` sizing, so the padding lies OUTSIDE the 680px content
+    box rather than inside it, and no rule in an emitted artifact sets
+    `box-sizing`. Measured against the true box, NONE of the 83 embedded
+    charts in the committed goldens overflows: the widest declares 670.9.
+    An earlier record of this fix read "35 of 83 above 640", which is
+    true against 640 and false against the real box; the count is
+    corrected here rather than the claim, because THE FIX IS STILL
+    NECESSARY and was verified independently of the goldens. Real data
+    produces a 755.3px chart from `project --reveal-projects`, and a
+    real-PDF A/B showed the control losing the top bar's `$2,814.88`
+    value label while the corrected version keeps it.
+
+    THE TABLE HALF IS SPECIFICATION-CONFORMANCE INSURANCE, NOT AN
+    OBSERVED CHROMIUM FIX. CSS fragmentation makes a box whose `overflow`
+    is not `visible` monolithic, which is what the rule is written
+    against — but Chromium 151 fragments an `overflow:auto` box across
+    pages anyway: a 240-row table paginates to 8 pages carrying all 240
+    rows, identically with and without this rule, and identically inside
+    a `break-inside: avoid` section. The rule is kept because it matches
+    the specification and other engines may follow it; do not cite it as
+    a defect anybody has seen.
+
+    The scroll-box selector is BUILT FROM `_HTML_SCROLL_BOX_STYLE`, the
+    same constant the two wrappers are emitted with, so the rule cannot
+    drift away from the markup it exists to reach. That is what
+    distinguishes it from the `[style*=…]` match rejected for the zebra
+    stripe, which would have keyed on a palette VALUE that varies per row
+    and per theme.
+
+    Kept to ONE `<style>` element on one line, so the delta in each
+    affected HTML golden is a single replaced line that can be audited
+    mechanically. A per-element inline-colour change would produce a
+    per-element delta across all of them.
+
+    SCOPE: printed HTML, including its embedded chart SVG. A standalone
+    `.svg` artifact carries no document head and no stylesheet, so it is
+    out of scope.
     """
+    light = PALETTE_LIGHT
+    dark = PALETTE_DARK
+    # Data roles, mapped index-wise so a re-picked palette stays paired.
+    data_pairs = [(dark[role], light[role])
+                  for role in ("series_primary", "series_secondary",
+                               "ref_warn", "ref_alarm")]
+    data_pairs += list(zip(dark["series_palette"], light["series_palette"]))
+    seen: set = set()
+    fills = []
+    strokes = []
+    for dark_value, light_value in data_pairs:
+        if dark_value in seen:
+            continue
+        seen.add(dark_value)
+        # `rect` is the only element this kernel currently fills with a
+        # data colour, but `path` and `polyline` are filled elements too,
+        # so a future filled area chart would otherwise print dark. Named
+        # here rather than recorded as a known gap (#503 S2 second review
+        # N8).
+        fills.append(
+            f' svg rect[fill="{dark_value}"],'
+            f' svg path[fill="{dark_value}"],'
+            f' svg polyline[fill="{dark_value}"]'
+            f' {{ fill: {light_value} !important; }}')
+        strokes.append(
+            f' svg line[stroke="{dark_value}"] {{ stroke: {light_value} !important; }}'
+            f' svg polyline[stroke="{dark_value}"] {{ stroke: {light_value} !important; }}'
+            f' svg path[stroke="{dark_value}"] {{ stroke: {light_value} !important; }}')
+    # Text roles. The per-value rules outrank the blanket `svg text` one
+    # on specificity, so a reference label prints the colour its line does.
+    #
+    # BOTH palettes are listed, because the blanket rule is theme-blind
+    # while the map was not: a LIGHT artifact already carries the light
+    # `ref_warn`, which no dark-keyed rule matches, so `svg text` won and
+    # printed a black `90%` above an amber reference line while the dark
+    # artifact of the same report printed both in amber (#503 S2 second
+    # review N7). The light entry is an identity rule — it re-states the
+    # colour the element already has, at a specificity that beats the
+    # blanket one.
+    # Deduplicated by SOURCE VALUE, exactly as the fill map is. Keying
+    # on the (source, light) PAIR would let one source value carry two
+    # rules with the same selector and different values, where the later
+    # one silently wins — the shape the fill map avoids by construction
+    # (#503 S2 third review). No collision exists in the shipped
+    # palettes, so this changes no byte today.
+    text_roles = ("muted", "footer_link", "ref_warn", "ref_alarm")
+    text_values: list[tuple[str, str]] = []
+    text_seen: set = set()
+    for role in text_roles:
+        for source_value in (dark[role], light[role]):
+            if source_value in text_seen:
+                continue
+            text_seen.add(source_value)
+            text_values.append((source_value, light[role]))
+    text_rules = "".join(
+        f' svg text[fill="{source_value}"] {{ fill: {light_value} !important; }}'
+        for source_value, light_value in text_values
+    )
     return (
         '<style>@media print {'
         ' body { color-scheme: light; background: #fff !important; color: #000 !important; }'
-        ' header, footer, section { page-break-inside: avoid; }'
+        ' body * { color: #000 !important; }'
+        f' th {{ background: {light["table_header_bg"]} !important; }}'
+        f' td {{ background: {light["bg"]} !important; }}'
+        f' tbody tr:nth-child(even) td {{ background: {light["table_row_alt"]} !important; }}'
+        ' th, td { print-color-adjust: exact; -webkit-print-color-adjust: exact; }'
+        ' header, footer, section { break-inside: avoid; page-break-inside: avoid; }'
+        f' div[style*="{_HTML_SCROLL_BOX_STYLE}"] {{ overflow: visible !important; }}'
+        ' svg { max-width: 100% !important; height: auto !important; }'
+        f' svg text {{ fill: {light["fg"]} !important; }}'
+        f'{text_rules}'
+        f' svg rect[fill="{dark["bg"]}"] {{ fill: {light["bg"]} !important; }}'
+        f' svg rect[fill="{dark["table_header_bg"]}"] {{ fill: {light["table_header_bg"]} !important; }}'
+        f' svg rect[fill="{dark["table_row_alt"]}"] {{ fill: {light["table_row_alt"]} !important; }}'
+        f' svg line[stroke="{dark["grid"]}"] {{ stroke: {light["grid"]} !important; }}'
+        f' svg line[stroke="{dark["axis"]}"] {{ stroke: {light["axis"]} !important; }}'
+        + "".join(fills) + "".join(strokes) +
+        ' svg rect, svg path, svg polyline, svg line'
+        ' { print-color-adjust: exact; -webkit-print-color-adjust: exact; }'
         '}</style>'
     )
 
 
-def _build_md_frontmatter(snap: ShareSnapshot) -> str:
-    """YAML frontmatter prepended to MD exports (spec §11.5).
+@dataclass(frozen=True)
+class _FrontmatterMeta:
+    """What a Markdown document states about itself in its frontmatter.
 
-    Byte-stable: key order is fixed (title -> generated_at -> period ->
-    panel -> optional template_id -> anonymized -> cctally_version);
-    single-line values; no eolian formatting. `_wrap_document` strips this when
-    `branding=False` so `--no-branding` behaves consistently with the
-    HTML/SVG footer-link stripping.
+    An explicit argument rather than a `ShareSnapshot`, because a composed
+    document has no single snapshot to read: its title comes from
+    `ComposeOptions`, its period is the union across sections, its panel
+    is the literal `composed`, and it deliberately carries no template id.
+    `_stitch_md` used to build that block by hand, so the two frontmatter
+    writers could drift; now both go through one builder.
+    """
+    title: str
+    generated_at: datetime
+    period_start: datetime
+    period_end: datetime
+    panel: str
+    template_id: str | None
+    anonymized: bool
+    version: str
 
-    `template_id` is present for dashboard share-v2 snapshots and omitted
-    for legacy CLI snapshots that have no template recipe.
 
-    `anonymized` reports the MODE the document was rendered in, read off the
-    provenance marker preparation stamped: `not reveal_projects`. It used to
-    be INFERRED by regex-matching `project-\\d+` over the labels, which was
-    wrong three ways — it never inspected the chart, so `sessions-visual`
-    stamped `false` onto a demonstrably scrubbed snapshot; a real project
-    named `project-1` reported as anonymized; and a silently failed scrub
-    producing conforming labels was indistinguishable from a successful one.
+def _frontmatter_meta_for_snapshot(snap: ShareSnapshot) -> _FrontmatterMeta:
+    """Frontmatter metadata for a single prepared snapshot.
+
+    `anonymized` reports the MODE the document was rendered in, read off
+    the provenance marker preparation stamped: `not reveal_projects`. It
+    used to be INFERRED by regex-matching `project-\\d+` over the labels,
+    which was wrong three ways — it never inspected the chart, so
+    `sessions-visual` stamped `false` onto a demonstrably scrubbed
+    snapshot; a real project named `project-1` reported as anonymized; and
+    a silently failed scrub producing conforming labels was
+    indistinguishable from a successful one.
 
     An UNPREPARED snapshot never went through the privacy contract, so the
     document cannot claim anonymization and reports `false`. That reaches
     only the `_render_md` back-compat shim; `render()` always prepares.
     """
-    period = snap.period
-    period_iso = (
-        f"{_format_generated_at_iso(period.start)}.."
-        f"{_format_generated_at_iso(period.end)}"
-    )
     prov = _provenance_of(snap)
-    anonymized = "true" if (prov is not None and not prov.reveal_projects) else "false"
+    # Markdown's own period, so the frontmatter and the facts strip in
+    # the SAME document cannot disagree (#503 S2 third review).
+    period = _md_effective_period(snap)
+    return _FrontmatterMeta(
+        title=snap.title,
+        generated_at=snap.generated_at,
+        period_start=period.start,
+        period_end=period.end,
+        panel=snap.cmd,
+        template_id=snap.template_id,
+        anonymized=prov is not None and not prov.reveal_projects,
+        version=snap.version,
+    )
+
+
+def _build_md_frontmatter(meta: _FrontmatterMeta, *, branding: bool) -> str:
+    """YAML frontmatter prepended to MD exports (spec §11.5).
+
+    Byte-stable: key order is fixed (title -> generated_at -> period ->
+    panel -> optional template_id -> anonymized -> cctally_version);
+    single-line values; no eolian formatting.
+
+    `branding=False` removes `cctally_version` AND NOTHING ELSE (#503 S2
+    D2). It used to suppress the whole block, justified as consistency
+    with the HTML and SVG footer-link stripping — but those lose exactly
+    one `<footer>` element each and keep their timestamps, while Markdown
+    lost its title, its period, its panel and its privacy mode. A reader
+    of an unbranded export could no longer tell what the file covered.
+    `--no-branding` removes the advertisement; the provenance stays.
+
+    `panel` and `template_id` are artifact identity, not branding, so the
+    gate leaves both. `template_id` is present for dashboard share-v2
+    snapshots and absent for legacy CLI and composed documents, which have
+    no single template recipe.
+    """
+    period_iso = (
+        f"{_format_generated_at_iso(meta.period_start)}.."
+        f"{_format_generated_at_iso(meta.period_end)}"
+    )
     lines = [
         "---",
-        f"title: {_yaml_scalar(snap.title)}",
-        f"generated_at: {_format_generated_at_iso(snap.generated_at)}",
+        f"title: {_yaml_scalar(meta.title)}",
+        f"generated_at: {_format_generated_at_iso(meta.generated_at)}",
         f"period: {period_iso}",
-        f"panel: {snap.cmd}",
+        f"panel: {meta.panel}",
     ]
-    if snap.template_id:
-        lines.append(f"template_id: {_yaml_scalar(snap.template_id)}")
-    lines.extend([
-        f"anonymized: {anonymized}",
-        f"cctally_version: {snap.version}",
-        "---",
-        "",
-    ])
+    if meta.template_id:
+        lines.append(f"template_id: {_yaml_scalar(meta.template_id)}")
+    lines.append(f"anonymized: {'true' if meta.anonymized else 'false'}")
+    if branding:
+        lines.append(f"cctally_version: {meta.version}")
+    lines.extend(["---", ""])
     return "\n".join(lines)
 
 
@@ -2693,7 +3778,10 @@ def _yaml_scalar(s: str) -> str:
 # --- Fragment + wrap ---
 
 def _render_fragment(snap: ShareSnapshot, *, format: str,
-                     palette: Mapping[str, str], branding: bool) -> "str | tuple[str, float, float]":
+                     palette: Mapping[str, str], branding: bool,
+                     heading_level: int = 1,
+                     heading_override: "str | None" = None,
+                     suppress_provider: bool = False) -> "str | tuple[str, float, float]":
     """Body-only render — no document chrome.
 
     Returns:
@@ -2704,13 +3792,23 @@ def _render_fragment(snap: ShareSnapshot, *, format: str,
     Callers compose this into either:
       - render(): wraps in full document chrome via `_wrap_document`.
       - compose(): stitches multiple fragments under one wrapper (M3.x).
+
+    The three heading arguments reach Markdown and HTML only. SVG has no
+    heading rank, and D6 excludes it from provider qualification because
+    its provider and availability text are one text node.
     """
     if format == "html":
-        return _render_html_fragment(snap, palette=palette, branding=branding)
+        return _render_html_fragment(
+            snap, palette=palette, branding=branding,
+            heading_level=heading_level, heading_override=heading_override,
+            suppress_provider=suppress_provider)
     if format == "svg":
         return _render_svg_fragment(snap, palette=palette, branding=branding)
     if format == "md":
-        return _render_md_fragment(snap, branding=branding)
+        return _render_md_fragment(
+            snap, branding=branding, heading_level=heading_level,
+            heading_override=heading_override,
+            suppress_provider=suppress_provider)
     raise ValueError(f"unknown format: {format!r}")
 
 
@@ -2723,10 +3821,12 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
     character-for-character. The v1 share goldens (`bin/cctally-share-test`)
     are the gate.
 
-    MD: prepends `_build_md_frontmatter(snap)` when `branding=True` (spec
-    §11.5). Suppressed when `branding=False` -- same surface as the
-    HTML/SVG footer-link strip done inside the per-format renderers --
-    so `--no-branding` behaves consistently across all three formats.
+    MD: always prepends `_build_md_frontmatter` (spec §11.5). Under
+    `branding=False` the builder drops `cctally_version` and keeps every
+    other key (#503 S2 D2), which is what makes the Markdown strip the
+    same size as the HTML and SVG ones: those lose one `<footer>` element
+    and keep their timestamps. Suppressing the whole block cost an
+    unbranded export its title, period, panel and privacy mode.
     """
     if format == "html":
         return (
@@ -2745,19 +3845,19 @@ def _wrap_document(fragment, *, format: str, palette: Mapping[str, str] | None,
         # `_fmt_num`) so single-section wraps are byte-identical to the v1
         # producer. The 0 0 origin matches `_render_svg`'s `viewBox` literal.
         return (
-            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'<svg {_SVG_ROOT_ATTRS} '
             f'viewBox="0 0 {_fmt_num(w)} {_fmt_num(h)}" '
             f'width="{_fmt_num(w)}" height="{_fmt_num(h)}">'
             f'{inner}'
             f'</svg>'
         )
     if format == "md":
-        front = _build_md_frontmatter(snap) if branding else ""
+        front = _build_md_frontmatter(_frontmatter_meta_for_snapshot(snap),
+                                      branding=branding)
         # Frontmatter already ends with "---\n" (trailing "" in the join
         # adds the separator newline); concat directly so the byte shape
-        # is `---\n...---\n<fragment>`. When branding=False, front is
-        # "" and the fragment passes through untouched.
-        return (front + fragment) if front else fragment
+        # is `---\n...---\n<fragment>`.
+        return front + fragment
     raise ValueError(f"unknown format: {format!r}")
 
 
@@ -2794,11 +3894,26 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
         )
         for sec in sections
     )
+    # D6 — an all-source document qualifies its section headings by
+    # provider. Decided HERE, once, rather than by each caller: both the
+    # dashboard and the CLI all-source path pass source-bearing snapshots
+    # into `compose()`, so caller-side qualification would duplicate the
+    # policy and could disagree between them. The predicate is "more than
+    # one distinct `snap.source`", because a single-provider composition
+    # needs no disambiguation and must stay byte-identical.
+    qualify_providers = len({sec.snap.source for sec in prepared}) > 1
     if fmt == "html":
-        body = _stitch_html(prepared, opts=opts)
+        body = _stitch_html(prepared, opts=opts,
+                            qualify_providers=qualify_providers)
     elif fmt == "md":
-        body = _stitch_md(prepared, opts=opts)
+        body = _stitch_md(prepared, opts=opts,
+                          qualify_providers=qualify_providers)
     elif fmt == "svg":
+        # SVG is excluded from D6 deliberately: its provider and
+        # availability text share one text node, so suppressing the
+        # provider would also lose `No data` / `Unavailable: <reason>`.
+        # Composed SVG already renders per-section provider chrome, so its
+        # sections are distinguishable without the qualifier.
         body = _stitch_svg(prepared, opts=opts)
     else:
         raise ValueError(f"unknown format: {fmt!r}")
@@ -2809,7 +3924,7 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
 
 
 def _stitch_html(sections: tuple[ComposedSection, ...], *,
-                 opts: ComposeOptions) -> str:
+                 opts: ComposeOptions, qualify_providers: bool = False) -> str:
     """HTML compose: single ``<html><body>`` wrapper, sections as ``<section>`` blocks."""
     palette = PALETTE_LIGHT if opts.theme == "light" else PALETTE_DARK
     body_open = (
@@ -2817,18 +3932,38 @@ def _stitch_html(sections: tuple[ComposedSection, ...], *,
         f'font-family:system-ui,-apple-system,sans-serif;'
         f'padding:20px;max-width:680px;margin:auto">'
     )
-    header = f'<header><h1>{_xml_escape(opts.title)}</h1></header>'
+    # #503 S2 F13a — this `<h1>` was the ONLY text-bearing element in the
+    # whole composed HTML document with no specified colour, so it
+    # resolved to the user agent's default black and rendered invisible on
+    # the dark palette's #0b0f17 background. Every other element in both
+    # the stitcher and the fragment carries an explicit inline colour.
+    header = (
+        f'<header><h1 style="color:{palette["fg"]}">'
+        f'{_xml_escape(opts.title)}</h1></header>'
+    )
     blocks = []
     for sec in sections:
         # branding here is for the *fragment* — composite footer is one
         # level up, so per-section branding is unconditional False to
         # keep the chrome single.
-        frag = _render_fragment(sec.snap, format="html",
-                                palette=palette, branding=False)
+        frag = _render_fragment(
+            sec.snap, format="html", palette=palette, branding=False,
+            heading_level=2,
+            heading_override=(
+                f"{sec.snap.title} — {_provider_label(sec.snap)}"
+                if qualify_providers else None),
+            suppress_provider=qualify_providers)
         blocks.append(f'<section class="share-section">{frag}</section>')
+    # #503 S2 review F7 — the same attribution the standalone footer
+    # carries, in the same markup, so a composed artifact does not drop
+    # provenance a single-panel one keeps. The version comes from the
+    # first section, as the composite frontmatter's already does.
     footer = (
         f'<footer style="font-size:11px;color:{palette["muted"]};margin-top:24px">'
-        f'cctally · composed</footer>' if not opts.no_branding else ""
+        f'Generated by cctally · '
+        f'<a href="https://github.com/omrikais/cctally" style="color:{palette["footer_link"]}">github.com/omrikais/cctally</a>'
+        f' · {_version_label(sections[0].snap.version)}'
+        f'</footer>' if not opts.no_branding else ""
     )
     return (
         f'<!DOCTYPE html>'
@@ -2842,40 +3977,40 @@ def _stitch_html(sections: tuple[ComposedSection, ...], *,
 
 
 def _stitch_md(sections: tuple[ComposedSection, ...], *,
-               opts: ComposeOptions) -> str:
-    """MD compose: one composite frontmatter + ``## `` headers + bodies."""
+               opts: ComposeOptions, qualify_providers: bool = False) -> str:
+    """MD compose: one composite frontmatter + one H2-headed body per section."""
     parts: list[str] = []
-    if not opts.no_branding:
-        # Composite frontmatter: same key set as the single-section
-        # `_build_md_frontmatter` but `panel` becomes `composed` and
-        # `template_id` is omitted because one composed document can contain
-        # multiple section templates.
-        # `generated_at` and `cctally_version` are taken from the first
-        # section since the composite document has no independent
-        # provenance — every section was rendered in the same request.
-        first_snap = sections[0].snap
-        # `period` for the composite document = earliest start ..
-        # latest end across all sections (per spec §11.5 implied
-        # convention; reference test uses identical periods so the
-        # union collapses).
-        earliest = min(sec.snap.period.start for sec in sections)
-        latest = max(sec.snap.period.end for sec in sections)
-        # #503 S1: the composite frontmatter reports the composite MODE.
-        # `compose()` re-renders every section with `opts.reveal_projects`
-        # and discards each section's add-time value, so the composite flag
-        # is the whole truth about what the document contains.
-        anon_field = "false" if opts.reveal_projects else "true"
-        parts.append(
-            "---\n"
-            f"title: {_yaml_scalar(opts.title)}\n"
-            f"generated_at: {_format_generated_at_iso(first_snap.generated_at)}\n"
-            f"period: {_format_generated_at_iso(earliest)}.."
-            f"{_format_generated_at_iso(latest)}\n"
-            f"panel: composed\n"
-            f"anonymized: {anon_field}\n"
-            f"cctally_version: {first_snap.version}\n"
-            "---\n\n"
-        )
+    # Composite frontmatter through the SAME builder the single-section
+    # path uses, so the two writers cannot drift in key order or in what
+    # the branding gate removes (#503 S2 D2).
+    #
+    # `panel` is the literal `composed` and there is no `template_id`,
+    # because one composed document can contain several section templates.
+    # `generated_at` and `version` come from the first section: the
+    # composite has no independent provenance, since every section was
+    # rendered in the same request. The period is the union — earliest
+    # start to latest end.
+    #
+    # #503 S1: `anonymized` reports the COMPOSITE mode. `compose()`
+    # re-renders every section with `opts.reveal_projects` and discards
+    # each section's add-time value, so that flag is the whole truth about
+    # what the document contains.
+    first_snap = sections[0].snap
+    parts.append(_build_md_frontmatter(
+        _FrontmatterMeta(
+            title=opts.title,
+            generated_at=first_snap.generated_at,
+            period_start=min(_md_effective_period(sec.snap).start
+                             for sec in sections),
+            period_end=max(_md_effective_period(sec.snap).end
+                           for sec in sections),
+            panel="composed",
+            template_id=None,
+            anonymized=not opts.reveal_projects,
+            version=first_snap.version,
+        ),
+        branding=not opts.no_branding,
+    ) + "\n")
     # Title as H1 (when frontmatter is present, this duplicates the
     # title key visually — accept the duplication; markdown readers
     # vary in how they render frontmatter and the H1 is the universal
@@ -2886,9 +4021,18 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
     parts.append(f"# {_md_escape(opts.title)}\n\n")
     last_idx = len(sections) - 1
     for idx, sec in enumerate(sections):
-        frag = _render_fragment(sec.snap, format="md", palette=PALETTE_LIGHT,
-                                branding=False)
-        parts.append(f"## {_md_escape(sec.snap.title)}\n\n")
+        # The section heading is the FRAGMENT's own heading, rendered at
+        # level 2. This function used to emit a `## <title>` of its own
+        # ahead of a fragment that opened with `# <title>`, so every
+        # composed section printed its title twice at two different ranks
+        # (#503 S2 F12). Escaping still happens inside the fragment.
+        frag = _render_fragment(
+            sec.snap, format="md", palette=PALETTE_LIGHT, branding=False,
+            heading_level=2,
+            heading_override=(
+                f"{sec.snap.title} — {_provider_label(sec.snap)}"
+                if qualify_providers else None),
+            suppress_provider=qualify_providers)
         parts.append(frag.rstrip("\n"))
         parts.append("\n\n" if idx < last_idx else "\n")
     return "".join(parts)
@@ -2898,9 +4042,13 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
                 opts: ComposeOptions) -> str:
     """SVG compose: single outer ``<svg>``, sections positioned vertically.
 
-    `opts.no_branding` is intentionally unused: the SVG composite has no
-    chrome footer band, so there is nothing to strip. HTML stitcher uses
-    it to gate the `<footer>cctally · composed</footer>` line.
+    Carries the same three pieces of chrome the standalone SVG and the
+    composed HTML both carry (#503 S2 F13b).
+
+    Layout: one full-canvas background rect (the standalone SVG contract),
+    then a title band, then the section stack, then a branding-gated
+    footer whose text matches the composed HTML attribution. The title is
+    NOT branding — it names the document — so `no_branding` leaves it.
     """
     palette = PALETTE_LIGHT if opts.theme == "light" else PALETTE_DARK
     inners: list[tuple[str, float, float]] = []
@@ -2908,17 +4056,45 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
         inner, w, h = _render_fragment(sec.snap, format="svg",
                                        palette=palette, branding=False)
         inners.append((inner, w, h))
-    total_w = max(w for _, w, _ in inners)
-    total_h = sum(h for _, _, h in inners) + _SVG_SECTION_GAP * (len(inners) - 1)
-    body_blocks: list[str] = []
-    y = 0.0
+    footer_text = _attribution_text(sections[0].snap.version)
+    # The composite title and footer CONTRIBUTE to the width (#503 S2
+    # review F8). It used to be the section maximum alone, so an 18pt
+    # title longer than the widest section ran off the viewBox — the
+    # standalone bounds sweep covers templates only and could not see it.
+    total_w = max(
+        max(w for _, w, _ in inners),
+        _SVG_PADDING * 2 + _svg_text_width(opts.title, 18.0),
+        0.0 if opts.no_branding
+        else _SVG_PADDING * 2 + _svg_text_width(footer_text, 10.0),
+    )
+    stack_h = (sum(h for _, _, h in inners)
+               + _SVG_SECTION_GAP * (len(inners) - 1))
+    header_h = _SVG_COMPOSITE_HEADER_H
+    footer_h = 0.0 if opts.no_branding else _SVG_COMPOSITE_FOOTER_H
+    total_h = header_h + stack_h + footer_h
+
+    body_blocks: list[str] = [
+        svg_rect(0, 0, total_w, total_h, fill=palette["bg"]),
+        svg_group([
+            svg_text(_SVG_PADDING, _SVG_COMPOSITE_TITLE_BASELINE, opts.title,
+                     font_size=18, fill=palette["fg"], weight="bold"),
+        ]),
+    ]
+    y = header_h
     for inner, _w, h in inners:
         body_blocks.append(
             f'<g transform="translate(0,{_fmt_num(y)})">{inner}</g>'
         )
         y += h + _SVG_SECTION_GAP
+    if not opts.no_branding:
+        body_blocks.append(svg_group([
+            svg_text(_SVG_PADDING,
+                     header_h + stack_h + _SVG_COMPOSITE_FOOTER_BASELINE,
+                     footer_text,
+                     font_size=10, fill=palette["footer_link"]),
+        ]))
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'<svg {_SVG_ROOT_ATTRS} '
         f'viewBox="0 0 {_fmt_num(total_w)} {_fmt_num(total_h)}" '
         f'width="{_fmt_num(total_w)}" height="{_fmt_num(total_h)}">'
         f'{"".join(body_blocks)}'

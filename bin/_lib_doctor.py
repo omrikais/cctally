@@ -311,7 +311,13 @@ class DoctorState:
     #     and the cursor's segment, for the verbose detail.
     #   * journal_heal_incidents — most-recent-first list of the auto-heal
     #     artifacts (quarantine/ dirs + logs/<db>-corruption-forensics-*.json);
-    #     each dict carries {kind, name, age_s}. None = the dirs were unreadable.
+    #     each dict carries {kind, name, age_s, shape}. `shape` is the
+    #     incident manifest's `damage.preserved.shapeToken` and is None for a
+    #     bundle. None = the dirs were unreadable.
+    #   * journal_heal_detections (#496 S6 §7.2) — the durable heal-ring
+    #     entries, each {heal_id, age_s}. A DETECTION is a ring entry keyed by
+    #     `healId`; an INCIDENT is a quarantine directory and nothing else; a
+    #     forensics bundle is linked evidence and is neither.
     journal_present: bool = False
     journal_appendable: Optional[bool] = None
     journal_segment_count: int = 0
@@ -322,6 +328,13 @@ class DoctorState:
     journal_hw_segment: Optional[str] = None
     journal_cursor_segment: Optional[str] = None
     journal_heal_incidents: Optional[list] = None
+    journal_heal_detections: Optional[list] = None
+    #   * retained_artifacts (#496 S6 §7.3) — the read-only retention scan
+    #     and plan: policy status, retained/reclaimable/protected bytes,
+    #     free disk, the partial-scan flag, the unsatisfied bounds, what
+    #     the damage-shape floor kept, and any stuck reclaim record. None =
+    #     the scan could not run, which DEGRADES rather than failing.
+    retained_artifacts: Optional[dict] = None
     #   * journal_writer_guard (#386) — the stats sole-writer guard's log
     #     (logs/stats-writer-guard.log). `None` = the log is absent (the normal
     #     state, and NOT an error); otherwise
@@ -2181,11 +2194,15 @@ def _check_db_integrity(s: DoctorState) -> CheckResult:
             id="db.integrity", title="Integrity", severity="fail",
             summary=f"stats.db quick_check: {s.stats_db_quick_check}",
             remediation=(
-                "stats.db (the non-re-derivable DB) reports corruption. "
-                "Stop the dashboard and other cctally processes, then run "
-                "`cctally db repair --db stats --yes`. The command preserves "
-                "a backup of the corrupt original before replacing anything. "
-                "Do not copy, restore, move, or delete the live DB by hand."),
+                "stats.db reports corruption. With retained journal data it is "
+                "a disposable index: run `cctally db rebuild --db stats` to "
+                "rebuild it from the journal, which loses nothing. On a "
+                "pre-cutover install with no retained journal data it may be "
+                "the only copy of your recorded history — stop the dashboard "
+                "and other cctally processes, then run `cctally db repair --db "
+                "stats --yes`, which preserves a backup of the corrupt original "
+                "before replacing anything. Do not copy, restore, move, or "
+                "delete the live DB by hand."),
             details=details,
         )
     if s.cache_db_quick_check is not None and s.cache_db_quick_check != "ok":
@@ -2362,6 +2379,234 @@ def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
     )
 
 
+#: A stuck reclaim entry has persisted past this, so no pass will clear it.
+_RECLAIM_STUCK_AFTER_SECONDS = 24 * 3600
+
+
+def _gib_text(value) -> str:
+    """One decimal, through the retention kernel's single formatter."""
+    import _lib_artifact_retention
+
+    return _lib_artifact_retention.format_disk_bytes(value, digits=1)
+
+
+def _int_or_none(value) -> "Optional[int]":
+    """`int(value)` when the gather measured it, `None` when it did not.
+
+    Coercing an unmeasured figure to zero is worse than leaving it out: a
+    consumer reading `details.retainedBytes` would report nothing retained on
+    an install holding gigabytes.
+    """
+    return None if value is None else int(value)
+
+
+def _bound_phrase(rule: str, state: dict) -> str:
+    """Name one unsatisfied retention bound the way an operator sets it.
+
+    The FAIL summary used to render the byte budget for EVERY member of
+    `unsatisfied_rules`, so a corpus blocked on the 30-day age bound printed
+    "holds it over the 4096 MiB budget" while sitting well inside that budget.
+    Each bound therefore names its own configured value, and degrades to a
+    value-free phrase when the gather could not read it.
+    """
+    if rule == "max_age_seconds":
+        seconds = state.get("max_age_seconds")
+        days = None if seconds is None else max(int(seconds) // 86400, 0)
+        return f"the {days}-day age bound" if days else "its age bound"
+    if rule == "max_count_per_family":
+        count = state.get("max_count_per_family")
+        return (
+            f"the {int(count)} per family count bound" if count
+            else "its per-family count bound"
+        )
+    if rule == "max_total_bytes":
+        budget = state.get("max_total_bytes")
+        return (
+            f"the {int(budget) // (1024 ** 2)} MiB budget" if budget
+            else "its size budget"
+        )
+    if rule == "min_free_bytes":
+        floor = state.get("min_free_bytes")
+        return (
+            f"the {int(floor) // (1024 ** 2)} MiB free-disk floor" if floor
+            else "its free-disk floor"
+        )
+    return rule
+
+
+def _bound_phrases(rules, state: dict) -> str:
+    phrases = [_bound_phrase(rule, state) for rule in rules]
+    if not phrases:
+        return "its retention policy"
+    if len(phrases) == 1:
+        return phrases[0]
+    return ", ".join(phrases[:-1]) + f" and {phrases[-1]}"
+
+
+def _check_db_retained_artifacts(s: DoctorState) -> CheckResult:
+    """Retained corruption evidence against the retention policy (#496 S6 §7.3).
+
+    Owns retained bytes across quarantine, logs and the backup families;
+    reclaimable bytes; protected bytes; free disk; the stuck-reclaim condition;
+    and the malformed-policy condition.
+
+    **The damage-shape floor is information, not a failure.** §3.6 excuses it
+    from `unsatisfied_rules` precisely so this leg cannot FAIL over it: two of
+    the maintainer's four damage shapes have exactly one example, so once those
+    age past the bound a floor-driven FAIL would be permanent and no action
+    would clear it. A FAIL an operator cannot resolve trains them to ignore
+    doctor, which defeats F14 — the finding this leg exists to fix.
+
+    **An unavailable scan WARNs; a `deep`-gated skip does not.** §7.5 already
+    degrades a partial scan to `warn`, and a scan that produced nothing at all
+    is strictly worse than one that produced part of the corpus, so it cannot
+    be quieter. At `ok` the leg is skipped by `render_text` under `--quiet` and
+    `doctor` exits 0, which removes the only visibility into the retained
+    corpus and into a stuck reclaim record. A shallow gather is different: it
+    did not try, and it says so, exactly as `db.integrity` does when
+    `quick_check` did not run.
+    """
+    state = s.retained_artifacts or {"policy_status": "not-scanned"}
+    if state.get("policy_status") == "unavailable":
+        # ATTEMPTED and failed, which is what earns the WARN. An ABSENT field
+        # is a state nothing populated — a shallow gather, or a DoctorState
+        # assembled for one other leg — and it falls through to the
+        # "not scanned" branch below instead, the same way `db.integrity`
+        # reads an absent `quick_check`.
+        reason = state.get("scan_error")
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="warn",
+            summary=(
+                f"retention scan unavailable ({reason})" if reason
+                else "retention scan unavailable"
+            ),
+            remediation=(
+                "Nothing is reporting the retained corpus while this persists. "
+                "Run `cctally db prune` to scan it directly."
+            ),
+            details={"available": False, "scanned": False, "scanError": reason},
+        )
+
+    scanned = state.get("policy_status") not in ("not-scanned", "malformed")
+    retained = _int_or_none(state.get("retained_bytes"))
+    reclaimable = _int_or_none(state.get("reclaimable_bytes"))
+    protected = _int_or_none(state.get("protected_bytes"))
+    unsatisfied = list(state.get("unsatisfied_rules") or [])
+    stuck = [
+        record for record in (state.get("stuck_records") or [])
+        if record.get("stuck")
+    ]
+    details = {
+        "policyStatus": state.get("policy_status"),
+        "policyReason": state.get("policy_reason"),
+        "scanned": scanned,
+        "retainedBytes": retained,
+        "reclaimableBytes": reclaimable,
+        "protectedBytes": protected,
+        "protectedRoots": _int_or_none(state.get("protected_roots")),
+        "roots": _int_or_none(state.get("roots")),
+        "freeDiskBytes": state.get("free_disk_bytes"),
+        "partialScan": bool(state.get("partial_scan")),
+        "unsatisfiedRules": unsatisfied,
+        "floorRetainedRoots": _int_or_none(state.get("floor_retained_roots")),
+        "floorRetainedBytes": _int_or_none(state.get("floor_retained_bytes")),
+        "stuckRecords": stuck,
+    }
+
+    if state.get("policy_status") == "malformed":
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="fail",
+            summary=(
+                "retention policy in config.json is malformed — automatic "
+                "reclaim is off"
+            ),
+            remediation=(
+                "Fix or remove the storage.artifact_retention block: "
+                + str(state.get("policy_reason") or "see `cctally db prune`")
+            ),
+            details=details,
+        )
+    if unsatisfied:
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="fail",
+            summary=(
+                f"{_gib_text(retained)} retained; {_gib_text(protected)} "
+                f"protected leaves {_bound_phrases(unsatisfied, state)} "
+                "unsatisfied"
+            ),
+            remediation=(
+                "Run `cctally db prune` to see which groups are protected and "
+                "why; evidence cctally cannot classify is never deleted"
+            ),
+            details=details,
+        )
+    if stuck:
+        record = stuck[0]
+        members = ", ".join(record.get("memberIds") or []) or "an unnamed member"
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="warn",
+            summary=(
+                f"reclaim plan {record.get('planId')} has been stuck for "
+                f"{_relative_age(record.get('ageSeconds')).replace(' ago', '')}"
+                f" on {members}"
+            ),
+            remediation=(
+                "No reclamation pass can decide this entry. Inspect the named "
+                "member, then remove .reclaim-pending-"
+                f"{record.get('planId')}.json from "
+                "~/.local/share/cctally/ once nothing is pending on it"
+            ),
+            details=details,
+        )
+    if not scanned:
+        # The `deep` gate (§7.5). The dashboard and TUI reach this gather every
+        # rebuild, so the walk and the planner run only for the CLI. The two
+        # conditions an operator must act on — a malformed policy and a stuck
+        # reclaim record — are cheap and were decided above, so nothing
+        # actionable is hidden by the skip.
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="ok",
+            summary="not scanned (fast gather — run `cctally doctor`)",
+            remediation=None, details=details,
+        )
+    if state.get("partial_scan"):
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="warn",
+            summary=(
+                f"{_gib_text(retained)} retained, from a partial scan — the "
+                "walk stopped at its entry cap"
+            ),
+            remediation=(
+                "Run `cctally db prune` to see the corpus; the figures here "
+                "cover only part of it"
+            ),
+            details=details,
+        )
+    if reclaimable > 0:
+        return CheckResult(
+            id="db.retained_artifacts", title="Retained evidence",
+            severity="warn",
+            summary=(
+                f"{_gib_text(retained)} retained, {_gib_text(reclaimable)} "
+                f"reclaimable — over "
+                f"{_bound_phrases(state.get('driving_rules') or (), state)}"
+            ),
+            remediation="Run `cctally db prune` to preview, `--yes` to apply.",
+            details=details,
+        )
+    return CheckResult(
+        id="db.retained_artifacts", title="Retained evidence", severity="ok",
+        summary=f"{_gib_text(retained)} retained, within policy",
+        remediation=None, details=details,
+    )
+
+
 # ── DB journal redesign §9 — append-only journal legs ────────────────────
 # A monthly segment is MB-scale (§4.5), so a multi-MB unconsumed cursor gap
 # means no ingest cycle has run for a long stretch. An auto-heal incident within
@@ -2465,31 +2710,139 @@ def _check_journal_index_freshness(s: DoctorState) -> CheckResult:
     )
 
 
+#: A damage token of the literal `none` is not a shape (§3.4), so two of them
+#: are not a recurrence. Eleven of the 29 tokens on the maintainer's store
+#: carry this value, which is why the exclusion is load-bearing rather than
+#: defensive.
+_NON_SHAPE_TOKEN = "none"
+
+#: Three detections inside the window, the same threshold
+#: `stats_heal_recurrence` already escalates on
+#: (`bin/_cctally_store.py:2275-2276`).
+_JOURNAL_HEAL_RECURRENCE_THRESHOLD = 3
+
+
+def _relative_age(age_s) -> str:
+    """`45m ago` / `3h ago` / `2d ago`.
+
+    `age_s // 86400` rendered every sub-day incident as "0d ago", which is the
+    exact wording an operator reads as "nothing happened today".
+    """
+    if age_s is None:
+        return "age unknown"
+    age_s = int(age_s)
+    if age_s < 3600:
+        return f"{max(age_s // 60, 0)}m ago"
+    if age_s < 86400:
+        return f"{age_s // 3600}h ago"
+    return f"{age_s // 86400}d ago"
+
+
 def _check_journal_auto_heal(s: DoctorState) -> CheckResult:
-    """The most recent auto-heal incident (quarantine dir + forensics bundle).
-    INFO listing the latest; WARN when it fired within the last 7 days."""
-    incidents = s.journal_heal_incidents
-    if not incidents:
+    """Auto-heal incidents and their recurrence (#496 S6 §7.2).
+
+    Identity rules, because the gather enumerates two different artifacts: an
+    INCIDENT is a quarantine directory and nothing else, a DETECTION is a
+    heal-ring entry keyed by `healId`, and a forensics bundle is linked
+    evidence that is neither. Without the join rule a directory and the bundle
+    written moments before it would count as two incidents.
+
+    `ok` when there is no incident and no detection; `warn` for a single
+    historical incident or non-recurring detections; `fail` on at least three
+    detections in seven days, or the same non-`none` damage shape in two
+    distinct incidents within seven days.
+    """
+    raw_incidents = s.journal_heal_incidents or []
+    incidents = [
+        item for item in raw_incidents if item.get("kind") == "quarantine"
+    ]
+    detections = {
+        item.get("heal_id"): item for item in (s.journal_heal_detections or [])
+    }
+    recent_detections = [
+        item for item in detections.values()
+        if item.get("age_s") is not None
+        and item["age_s"] <= _JOURNAL_HEAL_RECENT_SECONDS
+    ]
+
+    shape_counts: "dict[str, int]" = {}
+    for incident in incidents:
+        shape = incident.get("shape")
+        if not isinstance(shape, str) or not shape or shape == _NON_SHAPE_TOKEN:
+            continue
+        age_s = incident.get("age_s")
+        if age_s is None or age_s > _JOURNAL_HEAL_RECENT_SECONDS:
+            continue
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+    repeated = sorted(
+        (shape for shape, count in shape_counts.items() if count >= 2),
+        key=lambda shape: (-shape_counts[shape], shape),
+    )
+
+    window_days = int(_JOURNAL_HEAL_RECENT_SECONDS // 86400)
+    latest = incidents[0] if incidents else None
+    details = {
+        "incidents": len(incidents),
+        "detections": len(detections),
+        "recentDetections": len(recent_detections),
+        "windowDays": window_days,
+        "repeatedShapes": repeated,
+        "latest": latest,
+    }
+
+    if not incidents and not detections:
         return CheckResult(
             id="journal.auto_heal", title="Auto-heal", severity="ok",
             summary="no auto-heal incidents", remediation=None,
-            details={"incidents": 0},
+            details=details,
         )
-    latest = incidents[0]
-    age_s = latest.get("age_s")
-    name = latest.get("name", "?")
-    details = {"incidents": len(incidents), "latest": latest}
-    if age_s is not None and age_s <= _JOURNAL_HEAL_RECENT_SECONDS:
+
+    count = (
+        f"{len(incidents)} incident{'' if len(incidents) == 1 else 's'}"
+        if incidents else
+        f"{len(detections)} detection{'' if len(detections) == 1 else 's'}"
+    )
+    when = _relative_age(latest.get("age_s")) if latest else None
+    head = f"{count}, {when}" if when else count
+
+    if len(recent_detections) >= _JOURNAL_HEAL_RECURRENCE_THRESHOLD:
         return CheckResult(
-            id="journal.auto_heal", title="Auto-heal", severity="warn",
-            summary=f"auto-heal fired recently ({name}, {age_s // 86400}d ago)",
-            remediation=("A DB corrupted and self-healed — inspect the forensics "
-                         "bundle in ~/.local/share/cctally/logs/"),
+            id="journal.auto_heal", title="Auto-heal", severity="fail",
+            summary=(
+                f"{len(recent_detections)} heals in {window_days}d — recurring"
+                + (
+                    f"; shape {repeated[0]} seen {shape_counts[repeated[0]]}x"
+                    if repeated else ""
+                )
+            ),
+            remediation=(
+                "A DB has corrupted repeatedly — report the bundles in "
+                "~/.local/share/cctally/logs/ and the events in "
+                "logs/stats-heal-events.json"
+            ),
+            details=details,
+        )
+    if repeated:
+        return CheckResult(
+            id="journal.auto_heal", title="Auto-heal", severity="fail",
+            summary=(
+                f"{head}; the same damage shape {repeated[0]} appears in "
+                f"{shape_counts[repeated[0]]} incidents within {window_days}d"
+            ),
+            remediation=(
+                "The same damage is recurring — report the manifests in "
+                "~/.local/share/cctally/quarantine/"
+            ),
             details=details,
         )
     return CheckResult(
-        id="journal.auto_heal", title="Auto-heal", severity="ok",
-        summary=f"last incident {name}", remediation=None, details=details,
+        id="journal.auto_heal", title="Auto-heal", severity="warn",
+        summary=f"{head}; no recurrence in {window_days}d",
+        remediation=(
+            "A DB corrupted and self-healed — inspect the forensics bundle in "
+            "~/.local/share/cctally/logs/"
+        ),
+        details=details,
     )
 
 
@@ -3029,6 +3382,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.wal_size", "_check_db_wal_size"),
         ("db.reclaimable", "_check_db_reclaimable"),
         ("db.conversations_reclaimable", "_check_db_conversations_reclaimable"),
+        ("db.retained_artifacts", "_check_db_retained_artifacts"),
     )),
     ("journal", "Journal", (
         ("journal.presence", "_check_journal_presence"),
