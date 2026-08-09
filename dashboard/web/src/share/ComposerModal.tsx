@@ -28,6 +28,7 @@ import { makeBasketItem } from '../store/basketSlice';
 import { bannerVisible } from './anonFormula';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
+import { useIframeKeymapBridge } from '../hooks/useIframeKeymapBridge';
 import { useScrollLock } from '../hooks/useScrollLock';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ConfirmAction, useConfirmHost } from './ConfirmAction';
@@ -144,6 +145,10 @@ export function ComposerModal() {
   const [composeResp, setComposeResp] = useState<ComposeResponse | null>(null);
   const [composeErr, setComposeErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // #503 S4 F28 — state-backed callback ref so the Esc bridge's effect re-runs
+  // on every mount/unmount of the combined-preview frame.
+  const [previewFrame, setPreviewFrame] = useState<HTMLIFrameElement | null>(null);
+  useIframeKeymapBridge(previewFrame);
   const acRef = useRef<AbortController | null>(null);
   // Export actions (spec §8.8). Separate from the recompose `busy` flag
   // so a running export doesn't suppress preview refresh, and a running
@@ -561,8 +566,12 @@ export function ComposerModal() {
             className="composer-preview"
             title="Combined preview"
             tabIndex={-1}
+            // `allow-same-origin` is ALSO the Esc bridge's precondition
+            // (useIframeKeymapBridge reads contentDocument). See
+            // docs/share-gotchas.md.
             sandbox="allow-same-origin"
             srcDoc={composeResp?.body ?? '<p>Composing&hellip;</p>'}
+            ref={setPreviewFrame}
           />
         </figure>
       </div>

@@ -9,6 +9,7 @@ import {
   installGlobalKeydown,
   uninstallGlobalKeydown,
   registerKeymap,
+  dispatchKeydown,
   _resetForTests as _resetKeymap,
 } from './keymap';
 
@@ -118,5 +119,20 @@ describe('layer breaks same-scope ties (#159)', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).not.toHaveBeenCalled();
+  });
+});
+
+describe('dispatchKeydown is callable without the document listener (#503 S4)', () => {
+  it('dispatchKeydown resolves a binding without the document listener installed', () => {
+    _resetKeymap();
+    const fired: string[] = [];
+    registerKeymap([
+      { key: 'Escape', scope: 'overlay', layer: 200, action: () => fired.push('low') },
+      { key: 'Escape', scope: 'overlay', layer: 210, action: () => fired.push('high') },
+    ]);
+    // Deliberately do NOT call installGlobalKeydown(): the iframe bridge calls
+    // dispatchKeydown directly, so it must work standalone.
+    dispatchKeydown(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(fired).toEqual(['high']);
   });
 });

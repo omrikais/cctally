@@ -24,16 +24,17 @@
 // the test to be robust to surface-area changes (Customize…
 // affordance, B keymap, BasketChip click are all valid openers).
 import {
-  render, screen, act, cleanup, waitFor,
+  render, screen, act, cleanup, waitFor, within, fireEvent,
 } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ComposerModal } from './ComposerModal';
 import { ManagePresetsModal } from './ManagePresetsModal';
 import { ShareModalRoot } from './ShareModalRoot';
+import { SHARE_PRESETS_TRIGGER_ID } from './PresetDropdown';
 import { _resetForTests, dispatch } from '../store/store';
 import { openShareModal, closeShareModal, openComposer, closeComposer } from '../store/shareSlice';
 import {
-  installGlobalKeydown, _resetForTests as _resetKeymap,
+  installGlobalKeydown, registeredBindings, _resetForTests as _resetKeymap,
 } from '../store/keymap';
 import type { BasketItem } from '../store/basketSlice';
 import type { ShareOptions } from './types';
@@ -278,5 +279,148 @@ describe('share-v2 focus restoration', () => {
     expect(document.activeElement).not.toBe(trigger);
     expect(document.activeElement).not.toBe(internalControl);
     internalControl.remove();
+  });
+});
+
+// #503 S4 §3.1 / #531 item 2 — Manage presets claimed `role="dialog"
+// aria-modal="true"` while computing to `position: static; z-index: auto`: an
+// in-flow block at the bottom of the share modal that trapped nothing, owned
+// Escape only because ShareModal gated itself out, and restored focus to an
+// element that had already left the DOM.
+//
+// The presets fixture below is NOT decoration. With no saved presets the
+// dialog holds exactly one focusable (its close button), and a one-element
+// focusable set makes the Tab-wrap assertion vacuous — first and last are the
+// same node, so a trap and no trap look identical.
+const MANAGE_FIXTURE_PRESETS = {
+  weekly: {
+    Alpha: { template_id: 'weekly-recap', options: {}, saved_at: '2026-05-01T00:00:00Z' },
+    Beta: { template_id: 'weekly-recap', options: {}, saved_at: '2026-05-02T00:00:00Z' },
+  },
+};
+
+function stubShareFetchWithPresets(): void {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+    if (typeof url === 'string' && url.includes('/api/share/history')) {
+      return Promise.resolve(new Response(
+        JSON.stringify({ history: [] }), { status: 200 },
+      ));
+    }
+    if (typeof url === 'string' && url.includes('/api/share/presets')) {
+      return Promise.resolve(new Response(
+        JSON.stringify({ presets: MANAGE_FIXTURE_PRESETS }), { status: 200 },
+      ));
+    }
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({
+        panel: 'weekly',
+        templates: [{
+          id: 'weekly-recap', label: 'Recap',
+          description: 'Text + tiny chart',
+          default_options: { format: 'md', theme: 'light' },
+        }],
+      }),
+    });
+  }));
+}
+
+async function renderShareModalWithManageOpen() {
+  stubShareFetchWithPresets();
+  render(<ShareModalRoot />);
+  await act(async () => {
+    dispatch(openShareModal('weekly', null));
+  });
+  // Open the preset dropdown, then its "Manage presets…" footer item — the
+  // real path, which is what makes the dropdown (and the menuitem the old
+  // restore effect captured) unmount as Manage opens.
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole('menuitem', { name: /manage presets/i }));
+  });
+  const dialog = await screen.findByRole('dialog', { name: /manage presets/i });
+  await waitFor(() => {
+    expect(within(dialog).getAllByRole('button', { name: /^rename$/i }).length)
+      .toBeGreaterThan(1);
+  });
+  const closeManage = async () => {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: /close/i }));
+    });
+  };
+  return { dialog, closeManage };
+}
+
+function escapeBindingCounts() {
+  const all = registeredBindings().filter((b) => b.key === 'Escape');
+  const overlay = all.filter((b) => b.scope === 'overlay');
+  return {
+    overlay: overlay.length,
+    modal: all.filter((b) => b.scope === 'modal').length,
+    layers: overlay.map((b) => b.layer ?? 0).sort((a, b) => a - b),
+  };
+}
+
+describe('share-v2 Manage presets is a real modal layer (#503 S4 §3.1)', () => {
+  it('<ManagePresetsModal> contains Tab while open', async () => {
+    const { dialog } = await renderShareModalWithManageOpen();
+    const focusables = within(dialog).getAllByRole('button');
+    expect(focusables.length).toBeGreaterThan(1);   // guards the wrap assertion
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    act(() => { last.focus(); });
+    fireEvent.keyDown(document, { key: 'Tab' });
+    // Containment, asserted as the WRAP rather than as mere presence: without
+    // the dialog's own trap the share modal's trap owns this keydown and sends
+    // focus to ITS first focusable, out in the template gallery. Asserting only
+    // `dialog.contains(activeElement)` would also pass in the case where
+    // nothing moved focus at all.
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(first);
+  });
+
+  it('restores focus to the presets trigger, which outlives the dropdown', async () => {
+    const { closeManage } = await renderShareModalWithManageOpen();
+    await closeManage();
+    // The hand-rolled effect this replaced captured `document.activeElement`
+    // at open — the "Manage presets…" menuitem, which unmounts as Manage
+    // opens. It therefore always fell into its blur-and-focus-body fallback.
+    await waitFor(() => {
+      expect(document.activeElement)
+        .toBe(document.getElementById(SHARE_PRESETS_TRIGGER_ID));
+    });
+    expect(document.getElementById(SHARE_PRESETS_TRIGGER_ID)).not.toBeNull();
+  });
+
+  it('<ManagePresetsModal> owns Escape at overlay scope, not modal scope', async () => {
+    stubShareFetchWithPresets();
+    render(<ShareModalRoot />);
+    await act(async () => {
+      dispatch(openShareModal('weekly', null));
+    });
+    const before = escapeBindingCounts();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /presets/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('menuitem', { name: /manage presets/i }));
+    });
+    await screen.findByRole('dialog', { name: /manage presets/i });
+    const after = escapeBindingCounts();
+    // A bare `overlay Escape count > 0` would pass before the fix, because
+    // ShareModal and PresetDropdown already register two. The discriminator is
+    // that opening Manage ADDS an overlay binding and adds NO modal-scope one:
+    // before the fix it was the other way round.
+    expect(after.overlay).toBe(before.overlay + 1);
+    expect(after.modal).toBe(0);
+    // The NUMBER, not just the scope. 208 is hardcoded rather than imported
+    // from ManagePresetsModal on purpose: a tripwire that reads the constant
+    // it guards moves with the code and can never fail. The scope assertions
+    // above leave 208 as prose — they pass just as well at 205, which loses
+    // Escape to the preset dropdown, or at 220, which takes it from an armed
+    // rename confirmation.
+    expect(after.layers).toEqual([...before.layers, 208].sort((a, b) => a - b));
   });
 });

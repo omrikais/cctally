@@ -53,13 +53,14 @@ def test_builder_writes_both_dbs(tmp_path):
     assert (out / "cache.db").exists()
 
 
-def test_both_dbs_have_wal(tmp_path):
+def test_fixture_dbs_match_production_journal_modes(tmp_path):
     mod = _load_builder()
     out = _isolated_build(mod, tmp_path)
-    for db_name in ("stats.db", "cache.db"):
+    expected = {"stats.db": "delete", "cache.db": "wal"}
+    for db_name, wanted in expected.items():
         with sqlite3.connect(out / db_name) as conn:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            assert mode.lower() == "wal", f"{db_name}: {mode!r}"
+            assert mode.lower() == wanted, f"{db_name}: {mode!r}"
 
 
 def test_eight_weeks_of_usage_snapshots(tmp_path):

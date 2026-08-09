@@ -726,3 +726,100 @@ describe('#503 S3 §5 — the composer failed-preview note', () => {
     expect(note()).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------
+// #503 S4 §3.2 / §3.3 — the per-section kebab (#531 items 1 and 3).
+//
+// Each row held its OWN `kebabOpen` with nothing coordinating them, so
+// several menus could be open at once and Escape had no owner: it fell
+// through to the composer's layer-210 binding and closed the whole composer,
+// taking unsaved title/theme/format edits with it.
+describe('composer section kebab (#531 items 1 and 3)', () => {
+  function composeResponse(labels: string[]) {
+    return jsonResponse({
+      body: '<html><body><section>x</section></body></html>',
+      content_type: 'text/html',
+      snapshot: {
+        kernel_version: 1,
+        composed_at: '2026-05-11T09:00:00Z',
+        section_results: labels.map((_, i) => ({
+          snapshot_id: String(i),
+          drift_detected: false,
+          data_digest_at_add: 'sha256:abc',
+          data_digest_now: 'sha256:abc',
+        })),
+      },
+    });
+  }
+
+  function renderComposerWithSections(labels: string[]) {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(composeResponse(labels));
+    seedBasket(labels.map((label) => ({
+      id: label, panel: 'weekly' as const, template_id: 'weekly-recap',
+      options: defaultOpts(), added_at: 't', data_digest_at_add: 'sha256:abc',
+      kernel_version: 1, label_hint: label, source: 'claude' as const,
+    })));
+    dispatch(openComposer());
+    return render(<ComposerModal />);
+  }
+
+  it('opening a second section menu closes the first', () => {
+    renderComposerWithSections(['a', 'b']);
+    fireEvent.click(screen.getByRole('button', { name: /actions for a/i }));
+    fireEvent.click(screen.getByRole('button', { name: /actions for b/i }));
+    // Nothing else proves the single-open invariant: the Escape test below
+    // passes with or without it.
+    expect(screen.getByRole('button', { name: /actions for a/i }))
+      .toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: /actions for b/i }))
+      .toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('Escape in a section menu closes the menu and KEEPS the composer and its edits', () => {
+    renderComposerWithSections(['a']);
+    // The discriminating input: "the composer stayed open" has to mean "the
+    // edits survived", not "a container is still in the DOM".
+    const title = screen.getByLabelText(/title/i);
+    fireEvent.change(title, { target: { value: 'My weekly review' } });
+    fireEvent.click(screen.getByRole('button', { name: /actions for a/i }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(screen.getByRole('button', { name: /actions for a/i }))
+      .toHaveAttribute('aria-expanded', 'false');
+    expect(getState().composerModal).not.toBeNull();
+    expect(screen.getByLabelText(/title/i)).toHaveValue('My weekly review');
+    expect(document.activeElement)
+      .toBe(screen.getByRole('button', { name: /actions for a/i }));
+  });
+
+  it('a second Escape then closes the composer', () => {
+    renderComposerWithSections(['a']);
+    fireEvent.click(screen.getByRole('button', { name: /actions for a/i }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().composerModal).not.toBeNull();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(getState().composerModal).toBeNull();
+  });
+
+  it('the section actions claim no menu semantics and stay Tab-reachable', () => {
+    renderComposerWithSections(['a']);
+    const trigger = screen.getByRole('button', { name: /actions for a/i });
+    expect(trigger).not.toHaveAttribute('aria-haspopup');
+    // `aria-controls` names the list only while the list exists. The <ul>
+    // renders conditionally, so carrying the attribute while closed points at
+    // a missing id — `aria-valid-attr-value`, which nothing here would catch
+    // because this repo runs no axe pass. Asserting that the IDREF RESOLVES,
+    // rather than merely that the attribute is present, is what makes this a
+    // real check: the previous form passed against the dangling reference.
+    expect(trigger).not.toHaveAttribute('aria-controls');
+    fireEvent.click(trigger);
+    const menuId = trigger.getAttribute('aria-controls');
+    expect(menuId).toBeTruthy();
+    expect(document.getElementById(menuId as string)).not.toBeNull();
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(screen.queryAllByRole('menuitem')).toHaveLength(0);
+    expect(screen.getByRole('button', { name: /refresh from current data/i }))
+      .toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /remove a/i })).toBeInTheDocument();
+  });
+});

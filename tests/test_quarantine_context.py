@@ -330,6 +330,33 @@ def test_the_stats_resume_reads_context_from_the_pending_record(
     assert sorted(m["movedFiles"]) == ["stats.db", "stats.db-wal"]
 
 
+def test_strict_stats_quarantine_preserves_a_hot_rollback_journal(
+    tmp_path, monkeypatch,
+):
+    """#538: destructive cold recovery preserves every rollback byte."""
+    _ns, core, _cache_mod = _load(tmp_path, monkeypatch)
+    db_mod = sys.modules["_cctally_db"]
+    path = pathlib.Path(core.DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"damaged main")
+    rollback = pathlib.Path(f"{path}-journal")
+    rollback.write_bytes(b"hot rollback journal")
+
+    incident = db_mod.quarantine_db_family(
+        path,
+        strict=True,
+        context=db_mod.quarantine_context(trigger="test.stats_rollback"),
+    )
+
+    assert not path.exists()
+    assert not rollback.exists()
+    assert (incident / path.name).read_bytes() == b"damaged main"
+    assert (incident / rollback.name).read_bytes() == b"hot rollback journal"
+    manifest = _manifest(incident)
+    assert manifest["complete"] is True
+    assert manifest["movedFiles"] == [rollback.name, path.name]
+
+
 def test_a_legacy_pending_record_without_context_finalizes_as_v1(
     tmp_path, monkeypatch,
 ):
@@ -474,6 +501,38 @@ def test_a_creation_with_a_context_stays_silent(tmp_path, monkeypatch, capsys):
 
     assert _manifest(_only_incident(path, "cache.db"))["schemaVersion"] == 2
     assert "without a QuarantineContext" not in capsys.readouterr().err
+
+
+def test_family_drain_detects_a_rollback_journal_only_holder(
+    tmp_path, monkeypatch,
+):
+    """The #538 cold-drain family includes `-journal`, even without main."""
+    _ns, _core, _cache_mod = _load(tmp_path, monkeypatch)
+    db_mod = sys.modules["_cctally_db"]
+    db = tmp_path / "stats.db"
+    journal = pathlib.Path(f"{db}-journal")
+    journal.write_bytes(b"rollback evidence")
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time\nf=open(sys.argv[1], 'rb')\n"
+            "print('ready', flush=True)\ntime.sleep(120)\n",
+            str(journal),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        pids = db_mod._db_family_open_pids(db)
+        assert pids is not None and holder.pid in pids
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+        if holder.stdout is not None:
+            holder.stdout.close()
 
 
 # --------------------------------------------------------------------------

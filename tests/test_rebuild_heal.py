@@ -492,8 +492,7 @@ def no_spawn(monkeypatch):
 def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
     ns, tmp_path, no_spawn,
 ):
-    """#496 S3 §6: the heal writes forensics and files a request; the caller
-    degrades immediately, and a detached worker does the rebuild."""
+    """#530: the hook admits promptly; its worker captures and rebuilds."""
     jr, J = _jr(), _jlib()
     import _cctally_core
     import _cctally_db
@@ -518,7 +517,7 @@ def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
 
     logs = _cctally_core.LOG_DIR
     forensics = [p for p in logs.iterdir() if "corruption-forensics" in p.name]
-    assert forensics, "the forensics bundle is written first, in the hook"
+    assert forensics == [], "forensics belongs to the elected fresh worker"
     qdir = _cctally_core.APP_DIR / "quarantine"
     assert not qdir.exists(), (
         "the caller's thread must not replace anything — the worker owns that"
@@ -527,8 +526,8 @@ def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
     request = st._read_stats_heal_request()
     assert request["healId"] == deferred.value.heal_id
     assert request["probeKind"] == st._STATS_HEAL_PROBE_READABILITY
-    assert request["forensicsPath"] == deferred.value.forensics_path
-    assert pathlib.Path(request["forensicsPath"]).is_absolute()
+    assert request["forensicsPath"] is None
+    assert deferred.value.forensics_path is None
     assert request["journalHighWater"] is not None
 
     import types as _types
@@ -545,6 +544,10 @@ def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
     incidents = list(qdir.iterdir()) if qdir.exists() else []
     assert len(incidents) == 1, "the damaged family is quarantined into an incident dir"
     assert (incidents[0] / "manifest.json").exists()
+    events = st.read_stats_heal_events()
+    assert len(events) == 1
+    assert pathlib.Path(events[0]["forensicsPath"]).is_absolute()
+    assert pathlib.Path(events[0]["forensicsPath"]).exists()
     assert st._read_stats_heal_request() is None, (
         "a completed worker clears its own request"
     )
@@ -673,6 +676,245 @@ def test_heal_admission_spawns_once_and_coalesces_later_detections(
     assert st._read_stats_heal_request()["healId"] == "a", (
         "a coalesced detection must not overwrite the request in flight"
     )
+    events = st.read_stats_heal_events()
+    assert len(events) == 1
+    assert events[0]["healId"] == "a"
+    assert events[0]["coalescedDetections"] == 1
+
+
+def test_admission_contender_receives_the_elected_identity_before_marker_reread(
+    ns, tmp_path, monkeypatch,
+):
+    """A loser arriving before marker creation must still name the winner."""
+    import threading
+    import _cctally_db
+    import _cctally_store as st
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_write = _cctally_db._atomic_write_private_json
+    first_marker_write = True
+
+    def paused_write(path, payload):
+        nonlocal first_marker_write
+        if path == st._stats_heal_marker_path() and first_marker_write:
+            first_marker_write = False
+            entered.set()
+            assert release.wait(5)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", paused_write)
+    results = {}
+
+    def reserve(name):
+        request = {"healId": name, "probeKind": "readability"}
+        event = {
+            **st.build_stats_heal_event(request, "pending-classification"),
+            "outcome": "admitted",
+            "coalescedDetections": 0,
+        }
+        results[name] = st._reserve_stats_corruption_heal(
+            request, admission_event=event,
+        )
+
+    winner = threading.Thread(target=reserve, args=("winner",))
+    loser = threading.Thread(target=reserve, args=("loser",))
+    winner.start()
+    assert entered.wait(5)
+    loser.start()
+    time.sleep(0.05)
+    release.set()
+    winner.join(5)
+    loser.join(5)
+
+    assert results["winner"][0] == "reserved"
+    assert results["loser"][0] == "pending"
+    assert results["loser"][1]["healId"] == "winner"
+    assert results["loser"][1]["coalescedDetections"] == 1
+    assert st._read_stats_heal_request()["healId"] == "winner"
+    events = st.read_stats_heal_events()
+    assert [(e["healId"], e["coalescedDetections"]) for e in events] == [
+        ("winner", 1)
+    ]
+
+
+def test_admission_rolls_back_promptly_when_occurrence_event_cannot_persist(
+    ns, tmp_path,
+):
+    """No event means no owner, no marker and no ten-second detector wait."""
+    import fcntl
+    import _cctally_store as st
+
+    st._cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    held = os.open(
+        st._stats_heal_ring_lock_path(), os.O_WRONLY | os.O_CREAT, 0o600,
+    )
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    started = time.monotonic()
+    try:
+        status, elected = st._reserve_stats_corruption_heal(
+            {"healId": "unrecorded", "probeKind": "readability"}
+        )
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    elapsed = time.monotonic() - started
+
+    assert (status, elected) == ("failed", None)
+    assert elapsed < 1.0
+    assert st._read_stats_heal_request() is None
+    assert st.read_stats_heal_events() == []
+
+
+def test_worker_finalization_reconciles_a_coalesced_count_after_ring_contention(
+    ns, tmp_path, monkeypatch,
+):
+    """The marker carries exact accounting until the worker settles it."""
+    import _cctally_store as st
+
+    request = {"healId": "owner", "probeKind": "readability"}
+    assert st.reserve_stats_corruption_heal(request) == "reserved"
+    real_update = st.update_stats_heal_event
+    monkeypatch.setattr(st, "update_stats_heal_event", lambda *_a, **_kw: False)
+    status, elected = st._reserve_stats_corruption_heal(
+        {"healId": "loser", "probeKind": "readability"}
+    )
+    assert status == "pending"
+    assert elected["healId"] == "owner"
+    assert elected["coalescedDetections"] == 1
+    assert st.read_stats_heal_events()[0]["coalescedDetections"] == 0
+
+    monkeypatch.setattr(st, "update_stats_heal_event", real_update)
+    assert st._finalize_stats_heal_request("owner") is True
+    assert st._read_stats_heal_request() is None
+    assert st.read_stats_heal_events()[0]["coalescedDetections"] == 1
+
+
+def test_hook_spawn_failure_clears_admission_for_immediate_retry(
+    ns, tmp_path, monkeypatch,
+):
+    """A failed detached spawn must not suppress the next eligible owner."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    import _cctally_update
+
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as handle:
+        handle.write(b"not a database " * 200)
+    def fail_after_coalescer(_command):
+        status, elected = st._reserve_stats_corruption_heal(
+            {"healId": "spawn-race-loser", "probeKind": "readability"}
+        )
+        assert status == "pending"
+        assert elected["coalescedDetections"] == 1
+        return False
+
+    monkeypatch.setattr(_cctally_update, "_spawn_detached", fail_after_coalescer)
+    with pytest.raises(_cctally_db.StatsHealDeferred) as failed:
+        _cctally_core.open_db()
+    assert failed.value.outcome == "failed"
+    assert st._read_stats_heal_request() is None
+    first = st.read_stats_heal_events()
+    assert len(first) == 1 and first[0]["outcome"] == "spawn-failed"
+    assert first[0]["coalescedDetections"] == 1
+
+    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _command: True)
+    with pytest.raises(_cctally_db.StatsHealDeferred) as retried:
+        _cctally_core.open_db()
+    assert retried.value.outcome == "spawned"
+    assert st._read_stats_heal_request()["healId"] == retried.value.heal_id
+
+
+def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
+    ns, tmp_path, monkeypatch,
+):
+    """A coalescer holding admission cannot leave a fresh ownerless marker."""
+    import threading
+    import _cctally_db
+    import _cctally_store as st
+    import _cctally_update
+
+    owner = {"healId": "spawn-owner", "probeKind": "readability"}
+    assert st.reserve_stats_corruption_heal(owner) == "reserved"
+    entered = threading.Event()
+    release = threading.Event()
+    real_write = _cctally_db._atomic_write_private_json
+
+    def pause_coalescer(path, payload):
+        if (
+            path == st._stats_heal_marker_path()
+            and int(payload.get("coalescedDetections") or 0) == 1
+        ):
+            entered.set()
+            assert release.wait(5)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", pause_coalescer)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: False)
+    results = {}
+
+    def coalesce():
+        results["coalescer"] = st._reserve_stats_corruption_heal(
+            {"healId": "spawn-loser", "probeKind": "readability"}
+        )
+
+    def fail_spawn():
+        results["spawn"] = st.complete_stats_corruption_heal("reserved")
+
+    loser = threading.Thread(target=coalesce)
+    finisher = threading.Thread(target=fail_spawn)
+    loser.start()
+    assert entered.wait(5)
+    started = time.monotonic()
+    finisher.start()
+    time.sleep(0.05)
+    release.set()
+    loser.join(5)
+    finisher.join(5)
+
+    assert results["coalescer"][0] == "pending"
+    assert results["coalescer"][1]["healId"] == "spawn-owner"
+    assert results["spawn"] == "failed"
+    assert time.monotonic() - started < 1.0
+    assert st._read_stats_heal_request() is None
+    events = st.read_stats_heal_events()
+    assert len(events) == 1
+    assert events[0]["outcome"] == "spawn-failed"
+    assert events[0]["coalescedDetections"] == 1
+
+
+def test_stale_crashed_owner_is_terminalized_and_replaced(
+    ns, tmp_path, no_spawn,
+):
+    """A dead worker's stale marker cannot suppress the next recovery owner."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+
+    _seed_one_snapshot(jr, J)
+    with open(_cctally_core.DB_PATH, "r+b") as handle:
+        handle.write(b"not a database " * 200)
+    with pytest.raises(_cctally_db.StatsHealDeferred) as first:
+        _cctally_core.open_db()
+    marker = st._stats_heal_marker_path()
+    stale = time.time() - st._STATS_HEAL_RETRY_SECONDS - 1
+    os.utime(marker, (stale, stale))
+
+    with pytest.raises(_cctally_db.StatsHealDeferred) as second:
+        _cctally_core.open_db()
+    assert second.value.outcome == "spawned"
+    assert second.value.heal_id != first.value.heal_id
+    assert st._read_stats_heal_request()["healId"] == second.value.heal_id
+    events = {event["healId"]: event for event in st.read_stats_heal_events()}
+    assert events[first.value.heal_id]["outcome"] == "stale-retried"
+    assert events[second.value.heal_id]["outcome"] == "admitted"
+    assert no_spawn == [
+        st.STATS_CORRUPTION_HEAL_COMMAND,
+        st.STATS_CORRUPTION_HEAL_COMMAND,
+    ]
 
 
 def test_heal_admission_refreshes_while_a_long_worker_holds_its_flock(
@@ -685,7 +927,7 @@ def test_heal_admission_refreshes_while_a_long_worker_holds_its_flock(
 
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     marker = st._stats_heal_marker_path()
-    marker.write_text("{}")
+    assert st.reserve_stats_corruption_heal({"healId": "held"}) == "reserved"
     stale = time.time() - st._STATS_HEAL_RETRY_SECONDS - 1
     os.utime(marker, (stale, stale))
     held = os.open(st._stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -697,6 +939,8 @@ def test_heal_admission_refreshes_while_a_long_worker_holds_its_flock(
         os.close(held)
     assert no_spawn == []
     assert time.time() - marker.stat().st_mtime < 5
+    assert st._read_stats_heal_request()["healId"] == "held"
+    assert st._read_stats_heal_request()["coalescedDetections"] == 1
 
 
 def test_heal_admission_and_epoch_admission_cannot_suppress_each_other(
@@ -804,11 +1048,10 @@ def test_locked_recheck_rejects_lazy_open_corruption(monkeypatch, tmp_path):
 
 # --- #496 S3 Task 11: the F4 gate, the F6 ring, the F15 message ---------
 
-def test_an_unconfirmed_probe_declines_and_never_defers(
+def test_an_unconfirmed_worker_probe_declines_without_replacement(
     ns, tmp_path, no_spawn, capsys,
 ):
-    """F4, first point. Classifier gating stays a precondition; this narrows
-    WITHIN classified triggers exactly as the cache path does."""
+    """Classifier gating remains a precondition inside the elected worker."""
     jr, J = _jr(), _jlib()
     import _cctally_core
     import _cctally_db
@@ -830,24 +1073,29 @@ def test_an_unconfirmed_probe_declines_and_never_defers(
 
     _cctally_db.write_corruption_forensics = unconfirmed
     try:
-        assert st.HEAL_HOOK(
-            "stats", sqlite3.DatabaseError("database disk image is malformed")
-        ) is False
+        with pytest.raises(_cctally_db.StatsHealDeferred):
+            st.HEAL_HOOK(
+                "stats", sqlite3.DatabaseError("database disk image is malformed")
+            )
+        import types as _types
+        assert st.cmd_stats_corruption_heal_internal(
+            _types.SimpleNamespace()
+        ) == 0
     finally:
         _cctally_db.write_corruption_forensics = real
 
-    assert no_spawn == [], "an unconfirmed probe must not admit a worker"
+    assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
     assert st._read_stats_heal_request() is None
     assert not (_cctally_core.APP_DIR / "quarantine").exists()
-    err = capsys.readouterr().err
-    assert "declined" in err and "integrity_check_ok" in err
     bundles = sorted(_cctally_core.LOG_DIR.glob(
         "stats.db-corruption-forensics-*.json"))
-    assert str(bundles[-1]) in err, "the decline must name the bundle path"
+    assert len(bundles) == 1
 
     events = st.read_stats_heal_events()
     assert [e["disposition"] for e in events] == ["unconfirmed"]
     assert [e["outcome"] for e in events] == ["declined-unconfirmed"]
+    assert events[0]["declineReason"] == "integrity_check_ok"
+    assert events[0]["forensicsPath"] == str(bundles[0])
 
 
 def test_the_worker_declines_a_readable_index_under_its_own_lock(
@@ -894,9 +1142,7 @@ def test_the_worker_declines_a_readable_index_under_its_own_lock(
 def test_the_ring_records_the_detection_and_the_worker_updates_its_entry(
     ns, tmp_path, no_spawn,
 ):
-    """The hook appends at detection; the worker updates the entry MATCHING its
-    heal id, so admission coalescing several detections into one run cannot
-    make the worker update the wrong record."""
+    """One occurrence event carries admission, coalescing and worker outcome."""
     import types as _types
     jr, J = _jr(), _jlib()
     import _cctally_core
@@ -913,19 +1159,24 @@ def test_the_ring_records_the_detection_and_the_worker_updates_its_entry(
     events = st.read_stats_heal_events()
     assert [e["healId"] for e in events] == [heal_id]
     detected = events[0]
-    assert detected["outcome"] == "detected"
-    assert detected["disposition"] == "confirmed"
-    assert detected["forensicsPath"] == deferred.value.forensics_path
+    assert detected["outcome"] == "admitted"
+    assert detected["disposition"] == "pending-classification"
+    assert detected["forensicsPath"] is None
+    assert deferred.value.forensics_path is None
     assert detected["incidentPath"] is None, (
         "preservation has not allocated an incident directory at detection"
     )
     assert detected["changed"] == "unknown"
+    assert detected["coalescedDetections"] == 0
 
-    # A second detection while the first is still in flight coalesces: it gets
-    # its own ring entry, and the worker must not settle THAT one.
-    st.append_stats_heal_event(
-        st.build_stats_heal_event({"healId": "coalesced"}, "confirmed")
-    )
+    # A second detection increments the elected event rather than creating a
+    # second incident-shaped ring entry.
+    with pytest.raises(_cctally_db.StatsHealDeferred) as coalesced:
+        _cctally_core.open_db()
+    assert coalesced.value.outcome == "pending"
+    events = st.read_stats_heal_events()
+    assert len(events) == 1
+    assert events[0]["coalescedDetections"] == 1
 
     assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
 
@@ -940,9 +1191,7 @@ def test_the_ring_records_the_detection_and_the_worker_updates_its_entry(
     )
     assert events[heal_id]["conflicts"] == 0
     assert events[heal_id]["protocolViolations"] == 0
-    assert events["coalesced"]["outcome"] == "detected", (
-        "a heal whose worker never ran must stay visible as incomplete"
-    )
+    assert events[heal_id]["coalescedDetections"] == 1
 
 
 def test_a_contended_ring_writer_does_not_drop_its_event(ns, tmp_path):
@@ -1000,11 +1249,12 @@ def test_the_ring_is_bounded_by_count_and_stays_private(ns, tmp_path):
 def test_a_verdict_that_reaches_no_ring_entry_is_reported_not_dropped(
     ns, tmp_path,
 ):
-    """A lost detection append must not make the worker's verdict silent.
+    """A legacy/malformed missing event must not make a verdict silent.
 
     `update_stats_heal_event` settles the entry MATCHING the heal id and
-    returns False when there is none — which is exactly what a detection that
-    lost the ring lock leaves behind. The worker's stdout and stderr are
+    returns False when there is none. Current admission rolls its marker back
+    if the event cannot persist, but this remains a fail-loud defense for an
+    old or externally damaged ring. The worker's stdout and stderr are
     `/dev/null`, so the durable heal log is the only channel that can report it.
     """
     import _cctally_core
@@ -1045,12 +1295,10 @@ def test_a_ring_file_that_cannot_be_read_is_reported_not_treated_as_empty(
     assert "result=ring-unreadable-NoEventList" in log_path.read_text()
 
 
-def test_the_detection_message_names_the_bundle_and_id_but_no_incident(
+def test_the_detection_message_names_the_id_and_worker_owned_forensics(
     ns, tmp_path, no_spawn, capsys,
 ):
-    """F15. The quarantine directory is allocated only during preservation,
-    after the worker has chosen physical fallback and begun it, so the
-    detection message CANNOT name an incident path."""
+    """Admission names the owner; forensics and incident follow in the worker."""
     jr, J = _jr(), _jlib()
     import _cctally_core
     import _cctally_db
@@ -1064,8 +1312,8 @@ def test_the_detection_message_names_the_bundle_and_id_but_no_incident(
     err = capsys.readouterr().err
 
     assert deferred.value.heal_id in err
-    assert deferred.value.forensics_path in err
-    assert pathlib.Path(deferred.value.forensics_path).is_absolute()
+    assert deferred.value.forensics_path is None
+    assert "Forensics will be captured by that owner" in err
     assert "quarantine/" not in err, (
         "no incident directory exists at detection time"
     )
@@ -1238,6 +1486,195 @@ def _corrupt_stats_with_journal(ns, tmp_path):
     return _cctally_core
 
 
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        ("prod", "prod-refused"),
+        ("maintenance", "maintenance-busy"),
+        ("ingest", "ingest-busy"),
+        ("persist", "request-persist-failed"),
+    ],
+)
+def test_worker_fail_closed_branches_never_replace_the_corrupt_family(
+    ns, tmp_path, monkeypatch, branch, expected,
+):
+    """Every new negative branch preserves the damaged family byte-for-byte."""
+    core = _corrupt_stats_with_journal(ns, tmp_path)
+    import _cctally_db
+    import _cctally_journal
+    import _cctally_store as st
+
+    before = core.DB_PATH.read_bytes()
+    request = st._build_stats_heal_request(
+        sqlite3.DatabaseError("database disk image is malformed"),
+        None,
+        post_query=False,
+        high_water=_cctally_journal.journal_high_water(),
+    )
+    if branch == "prod":
+        monkeypatch.setattr(_cctally_db, "_would_block_prod_stats", lambda _p: True)
+    elif branch in ("maintenance", "ingest"):
+        real_flock = st._heal_flock_bounded
+
+        def selected_busy(path, timeout_s):
+            target = (
+                core.STATS_LOCK_MAINTENANCE_PATH
+                if branch == "maintenance"
+                else core.JOURNAL_INGEST_LOCK_PATH
+            )
+            if path == target:
+                return None
+            return real_flock(path, timeout_s)
+
+        monkeypatch.setattr(st, "_heal_flock_bounded", selected_busy)
+    else:
+        monkeypatch.setattr(st, "_persist_stats_heal_request", lambda _r: False)
+
+    assert st._run_stats_corruption_heal(request) == expected
+    assert core.DB_PATH.read_bytes() == before
+    assert not (core.APP_DIR / "quarantine").exists()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "retryable"),
+    [
+        ("maintenance-busy", True),
+        ("ingest-busy", True),
+        ("prod-refused", False),
+        ("request-persist-failed", False),
+    ],
+)
+def test_worker_fail_closed_marker_lifecycle(
+    ns, tmp_path, monkeypatch, outcome, retryable,
+):
+    """Busy owners retain admission; terminal declines release it."""
+    import types as _types
+    import _cctally_store as st
+
+    request = {"healId": "negative-owner", "probeKind": "readability"}
+    assert st.reserve_stats_corruption_heal(request) == "reserved"
+    monkeypatch.setattr(st, "_run_stats_corruption_heal", lambda _r: outcome)
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+    assert (st._read_stats_heal_request() is not None) is retryable
+    event = st.read_stats_heal_events()[0]
+    if retryable:
+        assert event["outcome"] == "admitted"
+    else:
+        assert event["outcome"] == outcome
+
+
+def _corrupt_selector_with_foreign_model_page(ns, tmp_path):
+    """Reproduce the observed selector -> model-page signature, not its cause.
+
+    Production exposed 45 ``journal_selector_state`` rows whose first nine
+    values were the corresponding ``five_hour_block_models`` values.  Valid
+    SQL through the selector schema cannot create that shape.  This fixture
+    uses ``writable_schema`` solely to make the two table definitions resolve
+    to the same B-tree root, which deterministically reproduces the observable
+    signature and an integrity failure without pretending to know which
+    low-level mechanism substituted the production page.
+    """
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+
+    _seed_one_snapshot(jr, J)
+    conn = sqlite3.connect(str(_cctally_core.DB_PATH))
+    try:
+        conn.executemany(
+            "INSERT INTO five_hour_block_models ("
+            "block_id, five_hour_window_key, model, input_tokens, "
+            "output_tokens, cache_create_tokens, cache_read_tokens, cost_usd, "
+            "entry_count, account_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (445 + i, 10_000 + i, f"foreign-model-{i:02d}", i + 1,
+                 i + 2, i + 3, i + 4, float(i) / 10.0, i + 5,
+                 "unattributed")
+                for i in range(45)
+            ],
+        )
+        model_root = int(conn.execute(
+            "SELECT rootpage FROM sqlite_schema "
+            "WHERE type = 'table' AND name = 'five_hour_block_models'"
+        ).fetchone()[0])
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "UPDATE sqlite_schema SET rootpage = ? "
+            "WHERE type = 'table' AND name = 'journal_selector_state'",
+            (model_root,),
+        )
+        conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    probe = sqlite3.connect(str(_cctally_core.DB_PATH))
+    try:
+        selector_rows = probe.execute(
+            "SELECT id, generation_record_path, generation_stamped_at_utc, "
+            "covered_segment, covered_offset, next_sequence, selector_version, "
+            "cutover_seen, cutover_account_key FROM journal_selector_state "
+            "ORDER BY id"
+        ).fetchall()
+        model_rows = probe.execute(
+            "SELECT id, block_id, five_hour_window_key, model, input_tokens, "
+            "output_tokens, cache_create_tokens, cache_read_tokens, cost_usd "
+            "FROM five_hour_block_models ORDER BY id"
+        ).fetchall()
+        assert len(selector_rows) == 45
+        assert selector_rows == model_rows
+        assert probe.execute("PRAGMA quick_check").fetchall() != [("ok",)]
+    finally:
+        probe.close()
+    return _cctally_core
+
+
+def _shared_maintenance_holder(bin_dir, home_dir, data_dir, ready, release):
+    """Hold maintenance SHARED in a real process until the parent releases it."""
+    import fcntl as _fcntl
+    import os as _os
+
+    _load_cctally_in_child(bin_dir, home_dir, data_dir)
+    import _cctally_core
+
+    fd = _os.open(
+        str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),
+        _os.O_RDWR | _os.O_CREAT,
+        0o600,
+    )
+    _fcntl.flock(fd, _fcntl.LOCK_SH)
+    ready.set()
+    try:
+        release.wait(30)
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        _os.close(fd)
+
+
+def _heal_without_spawning_worker(bin_dir, home_dir, data_dir, q):
+    """Run the real detector but record, rather than launch, its worker."""
+    import sqlite3 as _sqlite3
+
+    try:
+        _load_cctally_in_child(bin_dir, home_dir, data_dir)
+        import _cctally_store
+        import _cctally_update
+
+        _cctally_update._spawn_detached = lambda _command: True
+        try:
+            outcome = _cctally_store.HEAL_HOOK(
+                "stats",
+                _sqlite3.DatabaseError("database disk image is malformed"),
+                post_query=True,
+            )
+            q.put(("returned", repr(outcome)))
+        except BaseException as exc:  # noqa: BLE001 - deferral is the result
+            q.put(("raised", type(exc).__name__, getattr(exc, "outcome", None)))
+    except BaseException as exc:  # pragma: no cover
+        q.put(("ERR", f"{type(exc).__name__}:{exc}"))
+
+
 def test_heal_under_an_exclusive_holder_does_not_self_deadlock(ns, tmp_path):
     """flock conflicts per open-file-description WITHIN a process: LOCK_EX on
     one fd then LOCK_SH on a second blocks forever, and run_stats_ingest can
@@ -1292,6 +1729,73 @@ def test_heal_does_not_block_a_caller_behind_a_foreign_maintenance_holder(
         "stats.db.maintenance.lock instead of giving up within a bound"
     )
     assert result[0] != "ERR", result
+
+
+def test_foreign_page_storm_admits_once_before_shared_maintenance_drains(
+    ns, tmp_path,
+):
+    """#530 RED: election must precede every maintenance-exclusive wait.
+
+    Three independent detectors meet the production-shaped foreign-page
+    corruption while another process holds maintenance SHARED.  The admitted
+    request must exist while that hold is still live, within a bound far below
+    the old five-second detector timeout, and all callers must return through
+    one spawned plus two coalesced deferrals.
+    """
+    core = _corrupt_selector_with_foreign_model_page(ns, tmp_path)
+    ctx = mp.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    holder = ctx.Process(
+        target=_shared_maintenance_holder,
+        args=(_BIN_DIR, os.environ["HOME"], str(core.APP_DIR), ready, release),
+    )
+    holder.start()
+    assert ready.wait(20), "the shared maintenance holder never became ready"
+
+    q = ctx.Queue()
+    detectors = [
+        ctx.Process(
+            target=_heal_without_spawning_worker,
+            args=(_BIN_DIR, os.environ["HOME"], str(core.APP_DIR), q),
+        )
+        for _ in range(3)
+    ]
+    started = time.monotonic()
+    for detector in detectors:
+        detector.start()
+    marker = core.APP_DIR / "stats-corruption-heal.pending"
+    deadline = started + 2.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    admitted_while_contended = marker.exists()
+
+    results = []
+    if admitted_while_contended:
+        results = [q.get(timeout=20) for _ in detectors]
+    release.set()
+    for detector in detectors:
+        detector.join(timeout=20)
+        if detector.is_alive():
+            detector.terminate()
+            detector.join(timeout=10)
+    holder.join(timeout=20)
+    if holder.is_alive():
+        holder.terminate()
+        holder.join(timeout=10)
+
+    assert admitted_while_contended, (
+        "no durable heal request was admitted while maintenance stayed shared; "
+        "detectors are still waiting on the old pre-admission five-second path"
+    )
+    assert time.monotonic() - started < 5.0
+    assert all(result[0] == "raised" for result in results), results
+    assert sorted(result[2] for result in results) == [
+        "pending", "pending", "spawned",
+    ]
+    import _cctally_store as st
+    events = st.read_stats_heal_events()
+    assert len(events) == 1, events
+    assert events[0]["coalescedDetections"] == 2
 
 
 def test_concurrent_detections_coalesce_into_one_deferred_heal(ns, tmp_path):

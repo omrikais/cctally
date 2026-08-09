@@ -127,18 +127,11 @@ def test_a_freshly_opened_stats_family_is_private(ns):
     assert _mode(core.DB_PATH) == 0o600
 
 
-def test_the_wal_is_private_once_a_write_materializes_it(ns):
-    """The sidecars exist only from the first WRITE until the last close.
-
-    A caller-owned connection is what keeps them present across the ingest
-    cycle. Under the plain `run_stats_ingest()` form the cycle closes its own
-    connection and SQLite deletes the `-wal`, so that form cannot observe the
-    mode at all — which is exactly why hardening at open time alone would leave
-    a `0644` WAL behind every write, the shape of the cache.db defect #150
-    fixed.
-    """
+def test_rollback_journal_family_is_private_and_has_no_wal_sidecars(ns):
+    """Stats hardening covers rollback journals and WAL/SHM stay retired."""
     import _cctally_core as core
     import _cctally_journal as jr
+    import _cctally_store as store
     import _lib_journal as J
 
     jr.append_record(
@@ -160,46 +153,16 @@ def test_the_wal_is_private_once_a_write_materializes_it(ns):
         result = jr.run_stats_ingest(mode="authoritative", conn=conn)
         assert result.consumed == 1, f"the cycle folded nothing: {result!r}"
         assert _mode(base) == 0o600
-        assert os.path.exists(wal), "the ingest cycle left no -wal sidecar"
-        assert _mode(wal) == 0o600
-        # Unconditional, deliberately. A live WAL-mode connection is open, so
-        # `-shm` exists; guarding the assertion on the file's presence would
-        # leave half of F23 untested and SILENT about it on any build where
-        # the file did not appear.
-        assert os.path.exists(shm), (
-            "the ingest cycle left no -shm sidecar under a live WAL-mode "
-            "connection; F23's -shm leg cannot be observed here"
-        )
-        assert _mode(shm) == 0o600
-
-        # The write path on its own. The open-time hardening already covered
-        # the sidecars above, because `apply_policy`'s `PRAGMA journal_mode=WAL`
-        # creates the `-wal` before the open-time call runs — measured, not
-        # assumed. Loosening the family on a connection that stays open and
-        # running a second cycle is therefore what discriminates the
-        # end-of-write hardening from the open-time hardening; without it this
-        # leg passes with the write-path call deleted.
-        for member in (base, wal):
-            os.chmod(member, 0o644)
-        jr.append_record(
-            J.make_obs(
-                at="2026-01-05T09:00:00Z",
-                src="record-usage",
-                provider="claude",
-                payload={
-                    "weekly_percent": 9.0,
-                    "resets_at": _W1,
-                    "source": "statusline",
-                    "captured_at": "2026-01-05T09:00:00Z",
-                },
-            )
-        )
-        second = jr.run_stats_ingest(mode="authoritative", conn=conn)
-        assert second.consumed >= 1, f"the second cycle folded nothing: {second!r}"
-        assert _mode(base) == 0o600, "the write path did not re-harden the main"
-        assert _mode(wal) == 0o600, "the write path did not re-harden the -wal"
+        assert not os.path.exists(wal)
+        assert not os.path.exists(shm)
     finally:
         conn.close()
+
+    rollback = pathlib.Path(str(base) + "-journal")
+    rollback.write_bytes(b"test rollback journal")
+    os.chmod(rollback, 0o644)
+    store._harden_stats_family(base)
+    assert _mode(rollback) == 0o600
 
 
 def test_an_in_place_rebuild_preserves_private_modes(ns):

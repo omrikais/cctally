@@ -6,10 +6,11 @@ cctally is a multi-process system by design — ``record-usage`` (from
 claude-statusline), ``hook-tick`` (CC PostToolUse/Stop hooks), and one or
 more ``dashboard`` servers all write to ``~/.local/share/cctally/stats.db``
 concurrently, and worktrees magnify the writer count without changing the
-data store. Before #87, ``open_db()`` set ``journal_mode=WAL`` +
-``synchronous=NORMAL`` but NOT ``busy_timeout`` (default 0), so the first
-time SQLite returned BUSY the call raised ``OperationalError: database is
-locked`` immediately. Both open paths now set ``busy_timeout=15000``
+data store. Before #87, ``open_db()`` did not set ``busy_timeout`` (default
+0), so the first time SQLite returned BUSY the call raised
+``OperationalError: database is locked`` immediately. The stats store now uses
+DELETE/FULL rollback journaling (#538), while both open paths retain
+``busy_timeout=15000``
 (``bin/_cctally_cache.py`` + ``open_db``; raised from 5000 by #297 so a
 writer waits out a slow-but-normal sync rather than erroring instantly).
 
@@ -300,20 +301,14 @@ def test_concurrent_milestone_crossing_keeps_exactly_one_row(ns):
     )
 
 
-def test_busy_timeout_does_not_absorb_busy_snapshot(ns):
-    """Characterizes WHY the live write paths take the write lock up front
-    (BEGIN IMMEDIATE) rather than relying on busy_timeout alone (#87).
+def test_rollback_writer_waits_then_reports_busy_behind_reader(ns):
+    """A rollback writer honors its timeout behind a pinned reader.
 
-    busy_timeout=15000 IS in effect (see test_open_db_sets_busy_timeout), but
-    it does NOT cover ``SQLITE_BUSY_SNAPSHOT``: a deferred transaction that
-    READS (taking a WAL read snapshot), then sees a competing connection
-    COMMIT, then tries to WRITE, fails the snapshot-to-write upgrade and
-    raises ``database is locked`` *instantly* — the busy handler is never
-    consulted, because waiting could never resolve a stale snapshot.
-
-    This is the exact shape ``_backfill_five_hour_blocks`` had with a plain
-    ``BEGIN`` (read min/max rows, then INSERT). The fix is to grab the write
-    lock at BEGIN time so there is no read-then-upgrade.
+    #538 deliberately trades WAL snapshot upgrades for rollback-journal lock
+    ordering. A reader may hold SHARED while the writer prepares under RESERVED,
+    but COMMIT waits for that reader and reports a controlled busy result when
+    the configured bound expires. Once the reader exits, the same transaction
+    commits cleanly.
     """
     ns["open_db"]().close()  # build schema
     seed = ns["open_db"]()
@@ -328,6 +323,7 @@ def test_busy_timeout_does_not_absorb_busy_snapshot(ns):
 
     reader = ns["open_db"]()
     writer = ns["open_db"]()
+    writer.execute("PRAGMA busy_timeout=100")
     reader.isolation_level = None
     writer.isolation_level = None
     try:
@@ -338,15 +334,12 @@ def test_busy_timeout_does_not_absorb_busy_snapshot(ns):
         writer.execute(
             "UPDATE weekly_usage_snapshots SET weekly_percent = weekly_percent + 1"
         )
-        writer.execute("COMMIT")  # advance the WAL past reader's snapshot
-
         start = time.monotonic()
         with pytest.raises(sqlite3.OperationalError, match="locked"):
-            reader.execute(
-                "UPDATE weekly_usage_snapshots SET weekly_percent = 99"
-            )
-        # Instant raise: busy_timeout (15s) did NOT delay it.
-        assert time.monotonic() - start < 1.0
+            writer.execute("COMMIT")
+        assert time.monotonic() - start >= 0.08
+        reader.execute("ROLLBACK")
+        writer.execute("COMMIT")
     finally:
         try:
             reader.execute("ROLLBACK")
@@ -372,10 +365,10 @@ def test_live_write_paths_use_begin_immediate():
     write lock up front via ``BEGIN IMMEDIATE``, never a bare deferred
     ``BEGIN``.
 
-    A deferred ``BEGIN`` followed by a read leaves the transaction exposed to
-    the unabsorbable ``SQLITE_BUSY_SNAPSHOT`` raise characterized in
-    test_busy_timeout_does_not_absorb_busy_snapshot. This source-level guard
-    fails loudly if either site regresses to a plain ``BEGIN``.
+    Taking RESERVED up front makes writer serialization explicit and avoids a
+    deferred read-to-write upgrade after application work has begun. This
+    source-level guard fails loudly if either site regresses to a plain
+    ``BEGIN``.
     """
     import pathlib
 

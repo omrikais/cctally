@@ -425,15 +425,8 @@ sys.stdin.readline()
 
 
 @pytest.mark.parametrize("mode", ["authoritative", "opportunistic"])
-def test_live_reader_keeps_its_snapshot_and_leaves_no_scratch(ns, mode):
-    """#496 S3 replaced the refusal with snapshot isolation.
-
-    The correction rebuild used to be declined outright while any other
-    process held stats.db open, because the physical protocol renamed a scratch
-    over the live file. It now publishes transactionally into that file, so the
-    recovery completes, a reader pinned to a read transaction keeps the
-    generation it opened on, and — as before — no correction scratch survives.
-    """
+def test_live_reader_blocks_rollback_publication_then_retry_converges(ns, mode):
+    """DELETE mode fails soft behind a pinned reader, then retries cleanly."""
     core, jr, journal = _siblings()
     cursor_before, correction_high_water = _strand_completed_correction(
         jr, journal
@@ -451,14 +444,21 @@ def test_live_reader_keeps_its_snapshot_and_leaves_no_scratch(ns, mode):
         assert holder.stdin is not None
         assert holder.stdout.readline().strip() == pinned
 
-        result = jr.run_stats_ingest(mode=mode)
+        if mode == "authoritative":
+            with pytest.raises(
+                jr.CorrectionRecoveryError, match="database is locked"
+            ):
+                jr.run_stats_ingest(mode=mode)
+        else:
+            blocked = jr.run_stats_ingest(mode=mode)
+            assert isinstance(blocked.error, jr.CorrectionRecoveryError)
+            assert "database is locked" in str(blocked.error)
 
-        assert result.error is None
-        assert _live_state(core, jr) == (20.0, correction_high_water, "ok")
+        assert _live_state(core, jr) == (10.0, cursor_before, "ok")
         holder.stdin.write("go\n")
         holder.stdin.flush()
         assert holder.stdout.readline().strip() == pinned, (
-            "the pinned reader must keep the generation it opened on"
+            "the pinned reader must keep the old complete generation"
         )
         assert jr._correction_scratch_mains() == set()
     finally:
@@ -469,6 +469,11 @@ def test_live_reader_keeps_its_snapshot_and_leaves_no_scratch(ns, mode):
             holder.stdout.close()
         if holder.stderr is not None:
             holder.stderr.close()
+
+    retried = jr.run_stats_ingest(mode="authoritative")
+    assert retried.error is None
+    assert _live_state(core, jr) == (20.0, correction_high_water, "ok")
+    assert jr._correction_scratch_mains() == set()
 
 
 @pytest.mark.parametrize("mode", ["authoritative", "opportunistic"])

@@ -177,9 +177,10 @@ def test_index_only_stats_corruption_heals_once_after_handle_drain(
     envelope = ns["snapshot_to_envelope"](snapshot, now_utc=_NOW)
     assert envelope["sync_failure"]["kind"] == "stats_corruption"
 
-    # Nothing was replaced on the caller's thread; the detached worker owns it.
-    forensics = sorted(core.LOG_DIR.glob("stats.db-corruption-forensics-*.json"))
-    assert len(forensics) == 1
+    # Nothing was captured or replaced on the caller's thread. The preliminary
+    # marker elects the detached worker, which owns both operations (#530).
+    assert sorted(core.LOG_DIR.glob("stats.db-corruption-forensics-*.json")) == []
+    assert store._read_stats_heal_request()["forensicsPath"] is None
     assert not (core.APP_DIR / "quarantine").exists()
     assert spawned == [store.STATS_CORRUPTION_HEAL_COMMAND]
 
@@ -200,6 +201,8 @@ def test_index_only_stats_corruption_heals_once_after_handle_drain(
     incidents = sorted((core.APP_DIR / "quarantine").glob("stats.db-*"))
     assert len(incidents) == 1
     assert (incidents[0] / "manifest.json").exists()
+    forensics = sorted(core.LOG_DIR.glob("stats.db-corruption-forensics-*.json"))
+    assert len(forensics) == 1
     assert forensics[0].stat().st_mtime_ns <= incidents[0].stat().st_mtime_ns
 
 

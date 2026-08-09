@@ -788,6 +788,21 @@ def main(argv=None) -> int:
         else:
             print(render_assembly_table(result))
         return 0
+    # #529 S1: --update-baseline ADOPTS the committed baseline instead of
+    # comparing against it, which is the same hazard as a golden-regeneration
+    # variable. It is a flag rather than an inheritable variable, so it is
+    # handled here rather than by the manifest's forbiddenRegeneration list:
+    # refused inside an authoritative run, ordinary direct operator use
+    # unaffected. Placed AFTER the --assembly-scan incompatibility check so a
+    # usage error stays a usage error.
+    if args.update_baseline and os.environ.get("CCTALLY_AUTHORITATIVE_RUN") == "1":
+        print(
+            "cctally-bench: --update-baseline overwrites the committed baseline "
+            "instead of comparing against it, so it is refused inside an "
+            "authoritative run (CCTALLY_AUTHORITATIVE_RUN=1). Run it directly.",
+            file=sys.stderr,
+        )
+        return 3
     root = _resolve_root(args)
     result = run_all(
         scale=args.scale, seed=args.seed, iterations=args.iterations,

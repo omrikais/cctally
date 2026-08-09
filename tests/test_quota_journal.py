@@ -2354,41 +2354,10 @@ def test_the_gate_refuses_a_connection_opened_before_the_publication(
         before.close()
 
 
-def test_a_publication_never_unlinks_the_sidecars_of_an_open_reader(
+def test_rollback_publication_uses_no_wal_sidecars_and_open_handle_updates(
     tmp_path, monkeypatch,
 ):
-    """Issue #516. An in-place publication used to unlink the live `-wal` and
-    `-shm` once its TRUNCATE checkpoint had emptied the WAL, for a sidecar-free
-    end state its own helper described as cosmetic. Unlinking the sidecars of a
-    database that other connections still hold open is outside SQLite's
-    contract, and what it costs is a silent stale read and a crash.
-
-    Reaching either needs TWO conditions an earlier thirteen-arrangement run
-    never combined: something must WRITE after the unlink, and the reader must
-    already have READ before it. Re-measured on both LAN runners (macOS, Python
-    3.13.14, SQLite 3.53.4, byte-identical on each) by replaying the deleted
-    helper's exact body after a real write-in-place, a
-    `wal_checkpoint(TRUNCATE)` and a read-only validation open: with the later
-    writer in the SAME process a reader that had read before the unlink —
-    read-write or `mode=ro` — raises `OperationalError: disk I/O error`, and a
-    connection that keeps writing through the unlinked inodes breaks the NEXT
-    connection opened in that process the same way; with the later writer in a
-    CHILD process that reader silently reads a STALE generation, and so does a
-    freshly opened connection in the parent.
-
-    The assertion is structural and about the publisher rather than about
-    SQLite's reaction to it, and there is deliberately no test asserting the
-    `disk I/O error`. The reason is NOT that the error is environment-dependent
-    or flaky — every failing arrangement reproduced deterministically, first
-    try, on both runners. The reason is that the production path that produced
-    it no longer exists, so there is nothing left to pin, and a test that
-    recreated the unlink by hand would be asserting SQLite's behaviour rather
-    than cctally's. This structural assertion is the guard: with a connection
-    open across the publication, both sidecars are still present afterwards. A
-    clean last close removes them by itself, so nothing is leaked — only the
-    case where a handle is open, which is exactly the case that must not be
-    unlinked, now leaves them behind.
-    """
+    """#538 removes the WAL/SHM generation from current stats operation."""
     ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
     quota_mod = importlib.import_module("_cctally_quota")
     core = importlib.import_module("_cctally_core")
@@ -2404,12 +2373,13 @@ def test_a_publication_never_unlinks_the_sidecars_of_an_open_reader(
         assert _rebuild(jr).stats_quota_projection_incomplete is True
 
         db = Path(str(core.DB_PATH))
-        assert Path(f"{db}-wal").exists(), "the live WAL was unlinked (#516)"
-        assert Path(f"{db}-shm").exists(), "the live SHM was unlinked (#516)"
+        assert before.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert not Path(f"{db}-wal").exists()
+        assert not Path(f"{db}-shm").exists()
+        assert not Path(f"{db}-journal").exists()
 
-        # And the connection still tracks the published generation, which is
-        # acceptance criterion 13e's "including for a connection opened before
-        # that publication".
+        # An open autocommit handle remains usable and observes the generation
+        # published after its prior statement completed.
         row = before.execute(
             "SELECT incomplete FROM stats_quota_projection_state "
             "WHERE id = 1").fetchone()

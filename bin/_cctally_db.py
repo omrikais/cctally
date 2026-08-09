@@ -373,10 +373,11 @@ class StatsHealDeferred(StatsRebuildDeferred):
     quarantine and rebuild while the caller waited (#496 S3 §6). The caller
     degrades where it already degrades; it never blocks on the rebuild.
 
-    ``heal_id`` correlates this signal with the durable heal event the hook
-    recorded at detection, and ``forensics_path`` is the absolute bundle the
-    user was told about. Both are attributes rather than message text so a
-    consumer can use them without parsing.
+    ``heal_id`` correlates this signal with the durable admitted occurrence.
+    ``forensics_path`` is optional: since #530 the fresh worker captures and
+    persists that bundle after maintenance drains, so the detector normally
+    raises before a path exists. Both remain attributes rather than parsed
+    message text.
     """
 
     def __init__(
@@ -1042,7 +1043,7 @@ def write_corruption_forensics(
                 "truncated": False,
             },
         }
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-journal", "-wal", "-shm"):
         p = pathlib.Path(str(db_path) + suffix)
         try:
             st = p.stat()
@@ -1276,6 +1277,7 @@ def _load_pending_quarantine(db_path: pathlib.Path) -> "dict[str, Any] | None":
             isinstance(name, str)
             and name in {
                 db_path.name,
+                f"{db_path.name}-journal",
                 f"{db_path.name}-wal",
                 f"{db_path.name}-shm",
             }
@@ -1363,6 +1365,7 @@ def _quarantine_db_family_strict(
         members = [
             candidate.name
             for candidate in (
+                pathlib.Path(f"{db_path}-journal"),
                 pathlib.Path(f"{db_path}-wal"),
                 pathlib.Path(f"{db_path}-shm"),
                 db_path,
@@ -1448,7 +1451,7 @@ def quarantine_db_family(
     strict: bool = False,
     context: "QuarantineContext | None" = None,
 ) -> pathlib.Path:
-    """Move a damaged DB + its ``-wal``/``-shm`` sidecars into a single
+    """Move a damaged DB and its SQLite journals into a single
     timestamped incident directory under ``quarantine/`` with a manifest (spec
     §6.3). NEVER deletes evidence — three renames under the caller's exclusion
     locks, not pretending to be one atomic op. ``0o700`` dir / ``0o600`` files.
@@ -1475,7 +1478,7 @@ def quarantine_db_family(
         except OSError:
             pass
     moved: list = []
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-journal", "-wal", "-shm"):
         src = pathlib.Path(str(db_path) + suffix)
         if not src.exists():
             continue
@@ -9415,10 +9418,10 @@ def _release_repair_marker(path: pathlib.Path, claim: RepairMarkerClaim) -> None
 
 
 def _db_family_open_pids(path: pathlib.Path) -> "set[int] | None":
-    """Return processes with main/WAL/SHM open; None means unverifiable."""
+    """Return processes with any SQLite family member open; None if unknown."""
     family = [
         pathlib.Path(str(path) + suffix)
-        for suffix in ("", "-wal", "-shm")
+        for suffix in ("", "-journal", "-wal", "-shm")
         if pathlib.Path(str(path) + suffix).exists()
     ]
     if not family:
@@ -9478,7 +9481,7 @@ def _unique_sibling_path(path: pathlib.Path) -> pathlib.Path:
     def family_exists(candidate: pathlib.Path) -> bool:
         return any(
             pathlib.Path(str(candidate) + suffix).exists()
-            for suffix in ("", "-wal", "-shm")
+            for suffix in ("", "-journal", "-wal", "-shm")
         )
 
     if not family_exists(path):
@@ -9510,9 +9513,9 @@ def _copy_db_family(
     source: pathlib.Path,
     destination: pathlib.Path,
     *,
-    suffixes: "tuple[str, ...]" = ("", "-wal", "-shm"),
+    suffixes: "tuple[str, ...]" = ("", "-journal", "-wal", "-shm"),
 ) -> None:
-    """Copy main/WAL/SHM bytes while the caller holds SQLite's writer lock."""
+    """Copy main and journal bytes while the caller owns the family."""
     for suffix in suffixes:
         src = pathlib.Path(str(source) + suffix)
         if not src.exists():
@@ -9521,6 +9524,53 @@ def _copy_db_family(
         shutil.copyfile(src, dst)
         os.chmod(dst, 0o600)
         _fsync_file(dst)
+
+
+def _reserve_post_drain_evidence_path(
+    backup: pathlib.Path, suffix: str
+) -> pathlib.Path:
+    """Reserve a unique sibling without ever overwriting retained evidence."""
+    for number in range(1, 10_000):
+        infix = ".post-drain" if number == 1 else f".post-drain-{number}"
+        candidate = pathlib.Path(f"{backup}{infix}{suffix}")
+        try:
+            fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError(f"could not allocate post-drain evidence beside {backup}")
+
+
+def _preserve_post_drain_sidecars(
+    source: pathlib.Path, backup: pathlib.Path
+) -> "tuple[pathlib.Path, ...]":
+    """Move late sidecars aside without changing the classified backup."""
+    moved = []
+    for suffix in ("-journal", "-wal", "-shm"):
+        member = pathlib.Path(str(source) + suffix)
+        if not member.exists():
+            continue
+        destination = _reserve_post_drain_evidence_path(backup, suffix)
+        try:
+            # The O_EXCL reservation owns this pathname, so replace cannot
+            # destroy pre-existing user or pre-checkpoint evidence.
+            os.replace(member, destination)
+        except OSError:
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
+            raise
+        os.chmod(destination, 0o600)
+        _fsync_file(destination)
+        _fsync_directory(destination.parent)
+        moved.append(destination)
+    return tuple(moved)
 
 
 #: The classification sidecar's own schema version, matching the incident
@@ -9554,7 +9604,7 @@ def _write_backup_classification_sidecar(
     safe direction.
     """
     members = []
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-journal", "-wal", "-shm"):
         member = pathlib.Path(str(stem) + suffix)
         try:
             info = member.stat()
@@ -9680,7 +9730,23 @@ def _repair_preflight_and_copy(
     *,
     timeout_ms: int,
 ) -> "tuple[int, dict[str, int | None], int | None, sqlite3.Connection | None, str]":
-    """Preserve forensic bytes, drain WAL, and return a held writer guard."""
+    """Preserve bytes, drain only proven-coherent legacy WAL, and hold writer."""
+    import _lib_stats_wal
+
+    wal_evidence = _lib_stats_wal.inspect_wal_index_family(path)
+    wal_verdict = wal_evidence.get("verdict")
+    if _lib_stats_wal.is_incoherent_wal_index(wal_evidence):
+        return (
+            3, {}, None, None,
+            "incoherent legacy WAL family; refusing to open or checkpoint it",
+        )
+    if wal_verdict not in {"coherent", "wal_absent", "wal_empty"}:
+        return (
+            3, {}, None, None,
+            "could not prove the legacy WAL family coherent "
+            f"({wal_verdict or 'unknown'}); refusing repair",
+        )
+    checkpoint_legacy_wal = wal_verdict == "coherent"
     conn = sqlite3.connect(
         f"file:{path}?mode=rw", uri=True, timeout=max(timeout_ms, 0) / 1000
     )
@@ -9717,20 +9783,23 @@ def _repair_preflight_and_copy(
         _write_backup_classification_sidecar(backup)
         conn.rollback()
 
-        try:
-            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        except sqlite3.DatabaseError as exc:
-            conn.close()
-            return 3, {}, None, None, f"WAL checkpoint failed: {exc}"
-        wal_path = pathlib.Path(str(path) + "-wal")
-        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
-        if checkpoint is None or int(checkpoint[0]) != 0 or wal_bytes != 0:
-            conn.close()
-            return 3, {}, None, None, "WAL could not be fully checkpointed"
+        if checkpoint_legacy_wal:
+            try:
+                checkpoint = conn.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                conn.close()
+                return 3, {}, None, None, f"WAL checkpoint failed: {exc}"
+            wal_path = pathlib.Path(str(path) + "-wal")
+            wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+            if checkpoint is None or int(checkpoint[0]) != 0 or wal_bytes != 0:
+                conn.close()
+                return 3, {}, None, None, "WAL could not be fully checkpointed"
 
-        # Hold this one write exclusion continuously through .recover and the
-        # main-file replace. Since the WAL is empty, replacement failure leaves
-        # the old main file coherent and no committed frames can be lost.
+        # Hold this write exclusion through source capture and `.recover`.
+        # Final replacement releases it only to perform the mandatory second
+        # whole-family drain under the repair marker + maintenance fence.
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.DatabaseError as exc:
@@ -10047,18 +10116,34 @@ def _cmd_db_repair_under_retention(
         try:
             os.chmod(recovered_path, 0o600)
             _fsync_file(recovered_path)
-            # WAL is already fully checkpointed and this same guard has blocked
-            # every writer since capture. Replace the coherent main file first;
-            # a failed replace therefore leaves the old coherent main + empty
-            # sidecars intact. New cctally opens remain blocked by the marker.
-            os.replace(recovered_path, path)
-            _fsync_directory(path.parent)
+            # Release our own SQLite handle before the destructive-edge drain.
+            # The repair marker and maintenance-exclusive hold still fence every
+            # normal cctally opener. A second whole-family scan closes the gap
+            # between the admission scan and this physical replacement.
             close_guard()
-            for suffix in ("-wal", "-shm"):
-                try:
-                    pathlib.Path(str(path) + suffix).unlink()
-                except FileNotFoundError:
-                    pass
+            open_pids = _db_family_open_pids(path)
+            if open_pids is None:
+                eprint(
+                    "cctally: final stats.db repair declined: the second cold "
+                    "drain could not verify open handles. Nothing was moved."
+                )
+                return 3
+            if open_pids:
+                eprint(
+                    "cctally: final stats.db repair declined after a new reader "
+                    "appeared in process(es) "
+                    + ", ".join(str(pid) for pid in sorted(open_pids))
+                    + ". Stop the dashboard and older cctally processes, then "
+                    "retry; nothing was moved."
+                )
+                return 3
+
+            # The old family was copied, fsync'd, and classified before
+            # recovery. Preserve any later survivors under unique post-drain
+            # names; overwriting the exact pre-checkpoint members would destroy
+            # evidence and make their inode/size classification stale.
+            _preserve_post_drain_sidecars(path, backup)
+            os.replace(recovered_path, path)
             _fsync_directory(path.parent)
         except OSError as exc:
             close_guard()
@@ -10128,11 +10213,11 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
             prefix=f".{output.name}.tmp-", dir=output.parent
         ) as scratch_raw:
             temp_path = pathlib.Path(scratch_raw) / output.name
-            # #386: `db backup --db stats` holds this handle across the entire
-            # `source.backup(destination)` loop — a long-lived READ TRANSACTION,
-            # which Stage 1 measured as the only thing that pins the stats WAL —
-            # so it participates in the replacement protocol. The `mode=ro` open
-            # is preserved verbatim through the `connect` seam.
+            # #386/#538: `db backup --db stats` holds this handle across the
+            # entire `source.backup(destination)` loop. In rollback mode that is
+            # a long-lived reader, so it participates in the replacement
+            # protocol. The `mode=ro` open is preserved verbatim through the
+            # `connect` seam.
             def _backup_source_connect(_p, _timeout_ms=timeout_ms):
                 return sqlite3.connect(
                     f"file:{_p}?mode=ro", uri=True,
@@ -10183,8 +10268,7 @@ def cmd_db_backup(args: argparse.Namespace) -> int:
 
 
 def cmd_db_checkpoint(args: argparse.Namespace) -> int:
-    """Fast, non-destructive WAL drain (TRUNCATE checkpoint) for cache.db /
-    stats.db (#297).
+    """Fast, non-destructive WAL drain (TRUNCATE checkpoint) for cache.db.
 
     Opens a RAW existing-file-only connection — NOT open_cache_db()/open_db(),
     which apply schema, run the migration dispatcher, can DELETE Codex rows on a
@@ -10200,17 +10284,29 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
     was not fully truncated through the timeout — an actionable "something is
     still holding it" signal.
     """
-    import _cctally_cache
     from _lib_json_envelope import stamp_schema_version
 
     which = args.db  # "cache" | "stats"
-    if which == "cache":
-        path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
-    else:
-        path, label = _cctally_core.DB_PATH, "stats.db"
+    as_json = bool(getattr(args, "json", False))
+    if which == "stats":
+        reason = (
+            "stats.db uses rollback journaling; no WAL checkpoint is applicable"
+        )
+        if as_json:
+            print(json.dumps(stamp_schema_version({
+                "db": "stats.db",
+                "status": "notApplicable",
+                "reason": reason,
+            }, version=1)))
+        else:
+            eprint(f"cctally: {reason}.")
+        return 2
+
+    import _cctally_cache
+
+    path, label = _cctally_core.CACHE_DB_PATH, "cache.db"
     timeout = int(getattr(args, "busy_timeout_ms", None)
                   or _cctally_cache.CHECKPOINT_CMD_BUSY_TIMEOUT_MS)
-    as_json = bool(getattr(args, "json", False))
 
     # Absent file → nothing to drain; a missing re-derivable cache is not an
     # error (mirrors cmd_db_recover / cmd_db_unskip). Do NOT connect — mode=rw
@@ -10227,20 +10323,10 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
 
     from _lib_cache_writer_lock import acquire_ordered_flocks
 
-    # #386: the stats leg previously took NO advisory lock — the flock branch was
-    # gated `if which == "cache"` — while running a real
-    # `wal_checkpoint(TRUNCATE)` against the live family. Maintenance SHARED is
-    # the right strength: a checkpoint is not a physical replacement, it just
-    # must not overlap one.
-    lock_plan = {
-        "cache": [
-            (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
-            (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
-        ],
-        "stats": [
-            (_cctally_core.STATS_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
-        ],
-    }[which]
+    lock_plan = [
+        (_cctally_core.CACHE_LOCK_MAINTENANCE_PATH, fcntl.LOCK_SH),
+        (_cctally_core.CACHE_LOCK_PATH, fcntl.LOCK_EX),
+    ]
 
     held: list[int] = []
     try:
@@ -10286,7 +10372,7 @@ def cmd_db_checkpoint(args: argparse.Namespace) -> int:
 
 # VACUUM writes a full fresh copy of the database into a temporary file and then
 # swaps it in, so it transiently needs roughly the DB's own size on top of the
-# existing file, plus room for the drained WAL. A short busy_timeout keeps a
+# existing file, plus room for any WAL on WAL-backed stores. A short busy_timeout keeps a
 # contended VACUUM from hanging (F13).
 _VACUUM_BUSY_TIMEOUT_MS = 250
 
@@ -10313,7 +10399,7 @@ def _vacuum_required_free_bytes(path) -> int:
 
 
 def _run_vacuum_exclusive(path, label: str) -> int:
-    """Checkpoint + VACUUM ``path`` under a real SQLite EXCLUSIVE lock (F13).
+    """VACUUM ``path`` under EXCLUSIVE; checkpoint WAL-backed stores first.
 
     ``locking_mode=EXCLUSIVE`` + a short ``busy_timeout`` make a concurrent
     reader/writer FAIL PROMPTLY (no TOCTOU gap — the exclusion is the DB's own
@@ -10326,7 +10412,8 @@ def _run_vacuum_exclusive(path, label: str) -> int:
         before = conn.execute("PRAGMA page_count").fetchone()[0]
         try:
             conn.execute("PRAGMA locking_mode=EXCLUSIVE")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if label != "stats.db":
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("VACUUM")
         except sqlite3.OperationalError as exc:
             if "lock" in str(exc).lower() or "busy" in str(exc).lower():
@@ -10424,6 +10511,17 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
                         )
                         return 3
                     held.append(fh)
+            if stats_store:
+                import _cctally_store
+
+                if _cctally_store._stats_legacy_wal_family_present(path):
+                    eprint(
+                        "cctally: stats.db VACUUM declined: the index still uses "
+                        "legacy WAL. Stop and restart older cctally processes, "
+                        "then run a normal command to complete the epoch rebuild "
+                        "before retrying VACUUM."
+                    )
+                    return 3
             return _run_vacuum_exclusive(path, label)
         finally:
             for fh in held:

@@ -40,9 +40,10 @@ provider flocks (Claude → Codex) → SQLite transactions → ``journal.lock``
 flock; no SQLite write transaction ever spans a flock acquisition.
 
 **Raw-connect escape hatches stay OUT of this module by design** (spec §6.1):
-``db checkpoint``'s ``mode=rw`` connect and ``db vacuum``'s exclusive connect
-deliberately bypass ``open_index``/``open_db`` so they carry no schema-apply /
-migration side effects on maintenance paths.
+the cache checkpoint's ``mode=rw`` connect and ``db vacuum``'s exclusive
+connect deliberately bypass ``open_index``/``open_db`` so they carry no
+schema-apply / migration side effects on maintenance paths. The retired stats
+checkpoint returns before any raw connect.
 
 **#386 narrowed that carve-out for stats.** Skipping the *schema apply* is not
 the same as skipping the *opener protocol*: spec §3.1's third clause requires
@@ -79,11 +80,12 @@ import _cctally_db
 # §6.1 policy table
 # --------------------------------------------------------------------------
 
-# WAL size caps (spec §6.1). Mirror the long-standing per-DB constants
-# (_cctally_core.STATS_WAL_SIZE_LIMIT_BYTES, _cctally_cache.CACHE_WAL_SIZE_LIMIT_BYTES);
-# duplicated here so the store module does not import _cctally_cache (which
+# Journal size limits (spec §6.1). The stats setting applies to rollback
+# journaling (DELETE removes the transient journal after a clean transaction);
+# the cache value remains a persistent WAL cap.
+# Duplicated here so the store module does not import _cctally_cache (which
 # loads this module — that would be a cycle).
-_STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024   # 16 MiB
+_STATS_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024   # 16 MiB
 _CACHE_WAL_SIZE_LIMIT_BYTES = 128 * 1024 * 1024  # 128 MiB
 
 
@@ -91,8 +93,8 @@ _CACHE_WAL_SIZE_LIMIT_BYTES = 128 * 1024 * 1024  # 128 MiB
 class StorePolicy:
     """The §6.1 connection policy for one store."""
 
-    journal_mode: str            # "WAL"
-    synchronous: str             # "NORMAL"
+    journal_mode: str            # "DELETE" | "WAL"
+    synchronous: str             # "FULL" | "NORMAL"
     busy_timeout: int            # milliseconds
     journal_size_limit: int      # bytes
     auto_vacuum: str | None      # "INCREMENTAL", or None to leave unset
@@ -105,8 +107,8 @@ STORE_POLICY: dict[str, StorePolicy] = {
     # from the first epoch rebuild — a populated DB needs a full VACUUM to
     # change modes, so it is deliberately NOT applied at in-place cutover.
     "stats": StorePolicy(
-        journal_mode="WAL", synchronous="NORMAL", busy_timeout=15000,
-        journal_size_limit=_STATS_WAL_SIZE_LIMIT_BYTES, auto_vacuum=None,
+        journal_mode="DELETE", synchronous="FULL", busy_timeout=15000,
+        journal_size_limit=_STATS_JOURNAL_SIZE_LIMIT_BYTES, auto_vacuum=None,
         row_factory="row", uri=False,
     ),
     "cache": StorePolicy(
@@ -170,7 +172,7 @@ def apply_policy(conn: sqlite3.Connection, store: str) -> None:
     """Apply the §6.1 PRAGMA policy for ``store`` to an open connection.
 
     ``auto_vacuum`` (when set) is emitted first: it only takes effect before the
-    first page is written, so it must precede ``journal_mode=WAL`` / any DDL.
+    first page is written, so it must precede ``journal_mode`` / any DDL.
     """
     policy = STORE_POLICY[store]
     if policy.auto_vacuum is not None:
@@ -199,7 +201,7 @@ STATS_FAMILY_MODE = 0o600
 
 
 def _harden_stats_family(path) -> None:
-    """Best-effort `0600` on a stats database and its `-wal`/`-shm` sidecars.
+    """Best-effort `0600` on a stats database and SQLite sidecars.
 
     **This closes a defense-in-depth inconsistency, not a live exposure**
     (§9.1). `ensure_dirs()` chmods the data directory to `0700`, so no other
@@ -214,8 +216,8 @@ def _harden_stats_family(path) -> None:
     installs a new inode behind a memoized path. The comparison is what avoids
     the repeated `chmod`: an `lstat` is cheap, and a `chmod` on an
     already-correct file is the cost being avoided. The statusline opens the
-    index at three sites, so the steady state is three `lstat` triples per
-    render and zero `chmod` calls.
+    index at three sites, so the steady state is twelve family-member `lstat`
+    calls per render and zero `chmod` calls.
 
     The `lstat` does not follow symlinks, and a member that IS a symlink is
     left alone rather than chmod'd through. This function never unlinks and
@@ -226,7 +228,7 @@ def _harden_stats_family(path) -> None:
     `ENOENT`.
     """
     base = str(path)
-    for member in (base, base + "-wal", base + "-shm"):
+    for member in (base, base + "-journal", base + "-wal", base + "-shm"):
         try:
             info = os.lstat(member)
         except OSError:
@@ -1142,7 +1144,7 @@ def _resume_pending_quarantine(db_path: pathlib.Path) -> None:
 
 _STATS_REBUILD_ARTIFACT_RE = re.compile(
     r"^(?P<base>stats\.db\.rebuilding-\d{8}T\d{6}_\d{6})"
-    r"(?P<sidecar>-wal|-shm)?$"
+    r"(?P<sidecar>-journal|-wal|-shm)?$"
 )
 _STATS_QUARANTINE_INCIDENT_RE = re.compile(
     r"^stats\.db-(?:\d{8}T\d{6}Z|\d{8}T\d{6}_\d{6})$"
@@ -1271,7 +1273,7 @@ def _remove_stale_stats_rebuild_artifacts(
 ) -> None:
     """Remove only exact scratch families, failing loudly on incomplete cleanup."""
     for artifact in artifacts:
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-journal", "-wal", "-shm"):
             candidate = pathlib.Path(f"{artifact}{suffix}")
             try:
                 candidate.unlink()
@@ -1282,7 +1284,7 @@ def _remove_stale_stats_rebuild_artifacts(
     leftovers = [
         str(pathlib.Path(f"{artifact}{suffix}"))
         for artifact in artifacts
-        for suffix in ("", "-wal", "-shm")
+        for suffix in ("", "-journal", "-wal", "-shm")
         if pathlib.Path(f"{artifact}{suffix}").exists()
     ]
     if leftovers:
@@ -1539,8 +1541,8 @@ def stats_open_guarded(
                     raise _cctally_db.StatsDbMaintenanceError()
                 # #386 enforcement: EVERY stats connection this module hands out
                 # carries the authorizer. Arming HERE and nowhere else is what
-                # keeps raw `sqlite3.connect` escape hatches (the storm suite's
-                # `_grow_wal`, `db checkpoint`'s `mode=rw`) unaffected — a
+                # keeps raw `sqlite3.connect` escape hatches (such as the storm
+                # suite's legacy `_grow_wal`) unaffected — a
                 # broader arming point would make their writes unsanctioned and
                 # the correct fix would then be to narrow the arming, never to
                 # weaken the guard.
@@ -1572,9 +1574,8 @@ def _acquire_stats_maintenance_reentrant(path) -> "int | None":
     indefinitely. ``run_stats_ingest`` holds maintenance SHARED across its entire
     cycle, and this helper's caller — the epoch resolver — is reachable from a
     nested ``open_db()`` inside that cycle. Without this check that nested open
-    is an unconditional self-deadlock. The corruption heal applies the same
-    ownership-first rule through ``_acquire_stats_maintenance_for_heal``, which
-    additionally BOUNDS the acquire.
+    is an unconditional self-deadlock. The corruption detector no longer
+    acquires maintenance; its detached worker starts in a fresh process.
 
     Proceeding on a shared hold is a deliberate, narrow weakening: the caller
     still runs ``_stats_family_drained`` before any physical replacement, which
@@ -1622,54 +1623,6 @@ def _heal_release_maintenance_flock(fd: int) -> None:
         _cctally_core.note_stats_maintenance_released()
     finally:
         _heal_release_flock(fd)
-
-
-_HEAL_MAINTENANCE_WAIT_S = 5.0
-
-
-def _acquire_stats_maintenance_for_heal(
-    timeout_s: float = _HEAL_MAINTENANCE_WAIT_S,
-) -> "tuple[int | None, bool]":
-    """Ownership-first, mode-aware maintenance for the corruption heal (§6).
-
-    Returns ``(fd, True)`` when the heal may proceed — ``fd`` is ``None`` when
-    an existing hold was REUSED and nothing was acquired — and ``(None,
-    False)`` when the bounded acquire expired.
-
-    **Ownership-first, not mode-first.** ``flock`` conflicts are per open-file-
-    description and apply WITHIN a process, so requesting the lock a second
-    time on a second descriptor blocks this process against itself whenever the
-    hold it already owns is EXCLUSIVE (`_cctally_core` documents that at the
-    maintenance tracker, and ``run_stats_ingest`` can hold exclusive when it
-    calls ``open_db()``). The tracker is a depth counter that records THAT a
-    hold exists and never which mode, and it does not need to: the rule reuses
-    any hold whatever its mode, so the two cases never have to be told apart.
-    Upgrading a shared hold to exclusive is the one operation that would need
-    the mode, and it is exactly the second acquire that deadlocks.
-
-    **Bounded, never blocking, when nothing is held.** The heal runs inside an
-    ordinary open, and the detached worker owns maintenance EXCLUSIVE for the
-    whole of its rebuild. An unbounded acquire here would make every statusline
-    and dashboard open that meets corruption wait out that rebuild — the
-    blocking this architecture exists to remove. A timeout means some OTHER
-    holder owns it, and failing soft is correct: decline, and let a later open
-    retry.
-    """
-    if _cctally_core.holds_stats_maintenance():
-        return (None, True)
-    fd = _heal_flock_bounded(
-        _cctally_core.STATS_LOCK_MAINTENANCE_PATH, timeout_s
-    )
-    if fd is None:
-        return (None, False)
-    _cctally_core.note_stats_maintenance_acquired()
-    return (fd, True)
-
-
-def _release_stats_maintenance_for_heal(fd: "int | None") -> None:
-    """Release what ``_acquire_stats_maintenance_for_heal`` took, if anything."""
-    if fd is not None:
-        _heal_release_maintenance_flock(fd)
 
 
 def _heal_flock_bounded(path, timeout_s: float) -> "int | None":
@@ -1752,6 +1705,51 @@ def _stats_family_drained(path) -> "str | None":
     return None
 
 
+def _stats_header_declares_wal(path) -> bool:
+    """Whether the on-disk SQLite header declares WAL read/write versions.
+
+    This deliberately reads raw bytes instead of opening SQLite.  Opening a
+    previous-epoch WAL family is already enough to materialize SHM, and the
+    #538 transition must prove every old handle is gone before it asks SQLite
+    to convert that family to rollback journaling.
+    """
+    try:
+        with pathlib.Path(path).open("rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        return False
+    return (
+        len(header) == 20
+        and header[:16] == b"SQLite format 3\x00"
+        and (header[18] == 2 or header[19] == 2)
+    )
+
+
+def _stats_legacy_wal_family_present(path) -> bool:
+    """Whether `path` still carries any part of the retired stats WAL mode."""
+    path = pathlib.Path(path)
+    return (
+        _stats_header_declares_wal(path)
+        or pathlib.Path(f"{path}-wal").exists()
+        or pathlib.Path(f"{path}-shm").exists()
+    )
+
+
+def _require_stats_legacy_wal_cold(path) -> None:
+    """Fail before opening/converting a previous-epoch stats WAL family."""
+    if not _stats_legacy_wal_family_present(path):
+        return
+    blocked = _stats_family_drained(path)
+    if blocked is None:
+        return
+    raise _cctally_db.StatsEpochMismatchError(
+        "stats.db still uses the retired WAL format and cannot cross the "
+        f"rollback-journal epoch while its old family is live ({blocked}). "
+        "Stop and restart the dashboard and every older cctally process, then "
+        "retry; the existing stats.db/WAL/SHM bytes were left untouched."
+    )
+
+
 def _heal_release_flock(fd: int) -> None:
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -1806,12 +1804,14 @@ def _stats_heal_hook(
     *,
     post_query: bool = False,
 ) -> bool:
-    """Classifier-gated corruption auto-heal for stats.db (spec §6.3). Returns
-    True when it healed (quarantined + rebuilt) OR a sibling already healed under
-    the maintenance lock; False when it DECLINES — a non-corruption
-    ``DatabaseError`` (BUSY / disk-full / permission), the dev-checkout-on-prod
-    guard, or re-entrancy. A False return leaves ``open_db`` to raise its guided
-    ``StatsDbCorruptError``.
+    """Admit classifier-gated stats corruption recovery without maintenance.
+
+    False means the trigger is ineligible before admission: a non-corruption
+    ``DatabaseError`` (BUSY / disk-full / permission), the dev-on-prod guard,
+    re-entrancy, or no journal. An eligible trigger durably elects or coalesces
+    onto one detached worker and raises ``StatsHealDeferred`` immediately. The
+    worker owns the maintenance wait, authoritative probe, forensics and
+    classifier confirmation before any rebuild.
 
     It can also RAISE ``_cctally_db.StatsPublicationFailedError`` (#496 S1 F1),
     and both callers depend on that: ``_cctally_tui._tui_heal_post_query_stats``
@@ -1845,136 +1845,61 @@ def _stats_heal_hook(
         return False
     _HEAL_ACTIVE = True
     try:
-        # Ownership-first and BOUNDED (#496 S3 §6). A hold this context already
-        # owns is reused whatever its mode; otherwise exclusive is acquired
-        # within a bound, because the detached worker owns maintenance for the
-        # whole of its rebuild and an ordinary open must never wait that out.
-        maint_fd, acquired = _acquire_stats_maintenance_for_heal()
-        if not acquired:
-            probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
-            if probe(path):
-                # Some other maintenance owner already republished a readable
-                # index while we waited — retry the open rather than decline.
-                return True
-            print(
-                "[heal] stats.db auto-heal declined: another maintenance "
-                "owner holds stats.db.maintenance.lock; a later open will "
-                "retry.",
-                file=sys.stderr,
-            )
-            return False
-        import _cctally_retention
+        # #530: admission is the FIRST contended operation. The detector never
+        # asks for maintenance — even non-blockingly — because a rotating set of
+        # shared hook owners can otherwise make every caller lose before a
+        # durable request exists. The elected fresh worker owns the authoritative
+        # maintenance wait, classifier probe, forensics and rebuild.
+        request = _build_stats_heal_request(
+            exc, None, post_query=post_query, high_water=hw,
+        )
+        admission_event = {
+            **build_stats_heal_event(request, "pending-classification"),
+            "outcome": "admitted",
+            "coalescedDetections": 0,
+        }
+        reservation, elected_request = _reserve_stats_corruption_heal(
+            request, admission_event=admission_event,
+        )
+        if reservation == "reserved":
+            active_request = elected_request or request
+        elif reservation == "pending":
+            # The elected request and coalesced count were read and updated
+            # while admission was still held. Never reconstruct identity from
+            # a marker that the worker may not have written yet or may already
+            # have removed.
+            active_request = elected_request or request
+        else:
+            active_request = request
 
-        # #496 S6 §5.3, the parent's phase. SHARED from before the forensics
-        # bundle until either the request marker naming it is fsynced or the
-        # decision is terminal. A decline writes no marker and needs no bridge,
-        # because nothing will act on the bundle later.
-        retention = contextlib.ExitStack()
-        try:
-            probe = _probe_stats_integrity_ok if post_query else _probe_stats_ok
-            if probe(path):
-                return True  # a sibling process already healed it — retry the open
-            retention.enter_context(
-                _cctally_retention.retention_shared(label="stats auto-heal")
-            )
-            # Forensics FIRST — before anything disturbs the evidence. The
-            # trigger pair is what arms the #496 S1 forensics-time WAL capture
-            # and what lets the quarantine incident name the bundle that
-            # preceded it.
-            #
-            forensics = _cctally_db.write_corruption_forensics(
-                path,
-                db_label="stats",
-                trigger_origin="corruption-heal",
-                trigger_exception=exc,
-                return_result=True,
-            )
-            request = _build_stats_heal_request(
-                exc, forensics, post_query=post_query, high_water=hw,
-            )
-            # F4, first point (#496 S3 §7). Classifier gating stays a
-            # PRECONDITION; this narrows within classified triggers exactly as
-            # the cache path does at `_cctally_cache.py`. A disposition other
-            # than CONFIRMED declines: no deferral, no worker, no replacement,
-            # and a printed reason naming the bundle.
-            confirmed = (
-                forensics is not None
-                and forensics.disposition
-                is _cctally_db.CorruptionProbeDisposition.CONFIRMED
-                and forensics.path is not None
-            )
-            if not confirmed:
-                bundle = (
-                    str(forensics.path)
-                    if forensics is not None and forensics.path is not None
-                    else "unavailable"
-                )
-                reason = (
-                    forensics.reason if forensics is not None else "unavailable"
-                )
-                append_stats_heal_event({
-                    **build_stats_heal_event(request, "unconfirmed"),
-                    "outcome": "declined-unconfirmed",
-                    "declineReason": reason,
-                })
-                print(
-                    "[heal] stats.db auto-heal declined for classified "
-                    f"trigger: corruption was not confirmed ({reason}; "
-                    f"forensics: {bundle}); leaving the stats.db file family "
-                    "untouched.",
-                    file=sys.stderr,
-                )
-                return False
-            append_stats_heal_event(build_stats_heal_event(request, "confirmed"))
-            # Phase 1: reserve and persist, UNDER maintenance and the shared
-            # retention hold. The marker is durable when this returns
-            # `reserved`, which is what closes the bundle-to-request gap.
-            reservation = reserve_stats_corruption_heal(request)
-            if reservation != "reserved":
-                # #496 S6 §5.3, the SECOND terminal decision. The shared hold
-                # is about to be released over a forensics bundle the durable
-                # request marker does not name — it names the earlier
-                # detection's bundle. That is legitimate for the same reason a
-                # decline is: nothing will act on THIS bundle later. Rewriting
-                # the marker to name it instead would be worse, because a
-                # worker that has already read the marker would attribute its
-                # incident to a bundle it never captured, and the record would
-                # mix two detections. §3.3 then governs the stranded bundle as
-                # an unreferenced one, which self-classifies from its own
-                # `trigger.origin` and is reclaimable under the ordinary
-                # bounds. Terminalizing it here, inside the hold, is what makes
-                # the decision durable before the hold drops, and stops the
-                # ring entry sitting at `detected` forever.
-                update_stats_heal_event(
-                    request["healId"],
-                    outcome=(
-                        "coalesced" if reservation == "pending"
-                        else "admission-failed"
-                    ),
-                )
-        finally:
-            # Retention is released first: it sits BELOW maintenance in the
-            # lock order, so it must not outlive the hold it was taken under.
-            retention.close()
-            # Maintenance released BEFORE spawning: the worker takes it
-            # EXCLUSIVE as a fresh process holding nothing, and a caller still
-            # holding it here would make that acquire wait for a request it is
-            # itself in the middle of filing.
-            _release_stats_maintenance_for_heal(maint_fd)
-        # Phase 3: spawn, under no lock at all.
+        # Spawn under no lock. A worker is launched only for the elected
+        # request; pending callers coalesce and failed admission stays retryable.
         outcome = complete_stats_corruption_heal(reservation)
         # F15 (#496 S3 §7). Detachment supplies the timing for free: report at
-        # DETECTION, naming the absolute forensics path and the heal id. It
-        # cannot name an incident path, because the quarantine directory is
-        # allocated only during preservation, after the worker has chosen
-        # physical fallback and begun it; the worker adds that to the ring.
-        bundle = request.get("forensicsPath") or "unavailable"
-        print(
-            f"[heal] stats.db is corrupt ({exc}); nothing was replaced by this "
-            f"command. A rebuild from the journal was scheduled to run in the "
-            f"background as heal {request['healId']}. Forensics: {bundle}.",
-            file=sys.stderr,
-        )
+        # admission, naming the elected heal id. Forensics now belongs to the
+        # detached owner so it can capture evidence only after maintenance has
+        # drained and before any publication mutation.
+        bundle = active_request.get("forensicsPath")
+        if outcome == "failed":
+            print(
+                f"[heal] stats.db is corrupt ({exc}); nothing was replaced by "
+                "this command. Recovery could not be durably admitted; a "
+                "later open will retry.",
+                file=sys.stderr,
+            )
+        else:
+            evidence = (
+                f"Forensics: {bundle}."
+                if bundle
+                else "Forensics will be captured by that owner before recovery."
+            )
+            print(
+                f"[heal] stats.db is corrupt ({exc}); nothing was replaced by "
+                f"this command. Recovery was admitted to run in the background "
+                f"as heal {active_request.get('healId') or request['healId']}. "
+                f"{evidence}",
+                file=sys.stderr,
+            )
         # Escalation is REPORT-ONLY: no halt, and no throttle beyond the
         # admission marker's existing retry interval. Halting auto-heal after
         # N occurrences was considered and rejected (§3 Q4).
@@ -1995,8 +1920,8 @@ def _stats_heal_hook(
         # partial report.
         raise _cctally_db.StatsHealDeferred(
             outcome,
-            heal_id=request["healId"],
-            forensics_path=request.get("forensicsPath"),
+            heal_id=str(active_request.get("healId") or request["healId"]),
+            forensics_path=active_request.get("forensicsPath"),
         )
     except Exception as heal_exc:
         print(f"[heal] stats.db auto-heal failed: {heal_exc}", file=sys.stderr)
@@ -2021,8 +1946,9 @@ HEAL_HOOK = _stats_heal_hook
 # #496 S3 §6 — the detached corruption heal
 # --------------------------------------------------------------------------
 #
-# The hook writes forensics and files a REQUEST; a detached worker does the
-# rebuild. Admission copies the three layers of `defer_stats_epoch_rebuild` — a
+# The hook files a preliminary REQUEST; a detached worker captures forensics
+# and does the rebuild. Admission copies the three layers of
+# `defer_stats_epoch_rebuild` — a
 # non-blocking admission flock whose loser returns immediately, a pending
 # marker with a retry window, and a worker-active probe that refreshes the
 # marker instead of spawning a duplicate — over its OWN files, so the two
@@ -2031,8 +1957,9 @@ HEAL_HOOK = _stats_heal_hook
 # The epoch path's marker is an empty touched file. This one is a durable JSON
 # document, because the worker runs later and in another process and needs
 # facts the hook established at detection: the heal id that correlates the
-# durable event record, the trigger evidence, the forensics bundle, the
-# journal information to revalidate, and — load-bearing — WHICH PROBE to run.
+# durable event record, the trigger evidence, the journal information to
+# revalidate, and — load-bearing — WHICH PROBE to run. The elected worker
+# enriches that same marker with its forensics bundle before publication.
 # A `post_query` detection was established by a failed `quick_check` against a
 # file SQLite opens happily, so a worker that always used the cheap readability
 # probe would exit on exactly the readable-but-corrupt population this
@@ -2041,6 +1968,8 @@ HEAL_HOOK = _stats_heal_hook
 STATS_CORRUPTION_HEAL_COMMAND = "_stats-corruption-heal"
 _STATS_HEAL_RETRY_SECONDS = 60.0
 _STATS_HEAL_WORKER_MAINTENANCE_WAIT_S = 120.0
+_STATS_HEAL_ADMISSION_WAIT_S = 0.75
+_STATS_HEAL_ADMISSION_RING_WAIT_S = 0.25
 _STATS_HEAL_PROBE_INTEGRITY = "integrity"
 _STATS_HEAL_PROBE_READABILITY = "readability"
 
@@ -2096,6 +2025,8 @@ def _build_stats_heal_request(
             exc, _cctally_db._FORENSICS_EXCEPTION_MESSAGE_MAX
         ),
         "triggerType": type(exc).__name__,
+        "triggerSqliteErrorCode": getattr(exc, "sqlite_errorcode", None),
+        "triggerSqliteErrorName": getattr(exc, "sqlite_errorname", None),
         "forensicsPath": (
             str(forensics.path)
             if forensics is not None and forensics.path is not None
@@ -2110,6 +2041,62 @@ def _build_stats_heal_request(
             else None
         ),
     }
+
+
+def _stats_heal_trigger_exception(request: dict) -> BaseException:
+    """Reconstitute the classified SQLite trigger for worker-side forensics."""
+    exc_type = getattr(
+        sqlite3, str(request.get("triggerType") or "DatabaseError"),
+        sqlite3.DatabaseError,
+    )
+    if not isinstance(exc_type, type) or not issubclass(
+        exc_type, sqlite3.DatabaseError
+    ):
+        exc_type = sqlite3.DatabaseError
+    exc = exc_type(str(request.get("triggerError") or "database is malformed"))
+    for attr, key in (
+        ("sqlite_errorcode", "triggerSqliteErrorCode"),
+        ("sqlite_errorname", "triggerSqliteErrorName"),
+    ):
+        value = request.get(key)
+        if value is not None:
+            try:
+                setattr(exc, attr, value)
+            except (AttributeError, TypeError):
+                pass
+    return exc
+
+
+def _persist_stats_heal_request(request: dict) -> bool:
+    """Durably enrich the elected request without changing its identity.
+
+    The worker calls this while holding maintenance, ingest and retention
+    SHARED, after forensics and before any publication mutation. A crash after
+    the write therefore leaves the durable marker naming the evidence bundle;
+    a failed write declines recovery rather than stranding an unreferenced
+    bundle and proceeding destructively.
+    """
+    fd = _heal_flock_bounded(_stats_heal_admission_path(), 10.0)
+    if fd is None:
+        return False
+    try:
+        current = _read_stats_heal_request()
+        if not current or current.get("healId") != request.get("healId"):
+            return False
+        # Coalescers update the preliminary marker under admission. Preserve
+        # their newest count when the worker enriches its older in-memory copy.
+        request["coalescedDetections"] = int(
+            current.get("coalescedDetections") or 0
+        )
+        try:
+            _cctally_db._atomic_write_private_json(
+                _stats_heal_marker_path(), request
+            )
+        except OSError:
+            return False
+        return True
+    finally:
+        _heal_release_flock(fd)
 
 
 def _read_stats_heal_request() -> "dict | None":
@@ -2189,68 +2176,126 @@ def _log_stats_heal(
         pass
 
 
-def reserve_stats_corruption_heal(request: dict) -> str:
-    """Phase 1 of the deferral: decide admission and make the marker durable.
+def _reserve_stats_corruption_heal(
+    request: dict, *, admission_event: "dict | None" = None,
+) -> "tuple[str, dict | None]":
+    """Elect one recovery owner before any maintenance acquisition.
 
-    #496 S6 §5.3 splits `defer_stats_corruption_heal` in two so the documented
-    lock order is satisfiable at all. Reservation — the admission flock, the
-    marker-age check, the worker-active probe and the fsynced marker write —
-    must happen while the caller still holds stats maintenance and the SHARED
-    retention lock, because the marker is what bridges the parent-to-worker
-    process boundary and tells reclamation that the forensics bundle it names
-    is still live. The spawn must happen AFTER maintenance is released,
-    because the worker takes maintenance exclusive as a fresh process.
+    The preliminary marker bridges detector to worker and contains no
+    forensics path yet. When supplied, ``admission_event`` is appended before
+    the admission flock is released, so a coalescer cannot observe the marker
+    before the one occurrence event it increments exists. The worker later
+    captures forensics under maintenance/ingest/retention and durably enriches
+    the same marker before any publication mutation.
 
-    The heal ring cannot serve as that bridge: `_mutate_stats_heal_ring`
-    returns False on a mkdir failure, a bounded-lock timeout and an `OSError`
-    during the write, and both hook call sites discard that result — so on a
-    legitimate failure path the ring entry does not exist and the bundle would
-    be unprotected.
-
-    Returns `reserved` (the marker is durable and the caller MUST spawn),
-    `pending` (coalesced onto an existing request) or `failed`.
+    Returns ``(status, elected_request)``. The elected identity is read and any
+    coalesced count is persisted while this function still owns admission; a
+    caller never has to race a later marker read. Admission is bounded well
+    below the old five-second maintenance wait. It succeeds only when both the
+    marker and its required occurrence event are durable.
     """
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
-        admission_fd = os.open(
-            _stats_heal_admission_path(), os.O_WRONLY | os.O_CREAT, 0o600
+        admission_fd = _heal_flock_bounded(
+            _stats_heal_admission_path(), _STATS_HEAL_ADMISSION_WAIT_S
         )
     except OSError:
-        return "failed"
+        return ("failed", None)
+    if admission_fd is None:
+        return ("failed", None)
     try:
-        try:
-            fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return "pending"
         marker = _stats_heal_marker_path()
         try:
             age = time.time() - marker.stat().st_mtime
         except FileNotFoundError:
             age = None
         except OSError:
-            return "failed"
+            return ("failed", None)
         if age is not None and age < _STATS_HEAL_RETRY_SECONDS:
-            return "pending"
+            elected = _read_stats_heal_request()
+            if not elected:
+                return ("failed", None)
+            elected = dict(elected)
+            elected["coalescedDetections"] = int(
+                elected.get("coalescedDetections") or 0
+            ) + 1
+            try:
+                _cctally_db._atomic_write_private_json(marker, elected)
+            except OSError:
+                return ("failed", None)
+            # The marker is the eventual source of truth for this count. Keep
+            # the in-flight event current when its short prompt-safe ring bound
+            # is available; the worker reconciles it before marker removal.
+            update_stats_heal_event(
+                str(elected.get("healId") or ""),
+                wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S,
+                coalescedDetections=elected["coalescedDetections"],
+            )
+            return ("pending", elected)
         if _stats_heal_worker_active():
             # A real rebuild outlives the marker retry interval. Refresh the
             # admission stamp instead of launching a process that can only lose
             # the worker flock and exit.
+            elected = _read_stats_heal_request()
+            if not elected:
+                return ("failed", None)
+            elected = dict(elected)
+            elected["coalescedDetections"] = int(
+                elected.get("coalescedDetections") or 0
+            ) + 1
             try:
-                os.utime(marker, None)
+                _cctally_db._atomic_write_private_json(marker, elected)
             except OSError:
-                pass
-            return "pending"
+                return ("failed", None)
+            update_stats_heal_event(
+                str(elected.get("healId") or ""),
+                wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S,
+                coalescedDetections=elected["coalescedDetections"],
+            )
+            return ("pending", elected)
+        stale_request = _read_stats_heal_request() if age is not None else None
+        if stale_request:
+            if not update_stats_heal_event(
+                str(stale_request.get("healId") or ""),
+                wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S,
+                outcome="stale-retried",
+                coalescedDetections=int(
+                    stale_request.get("coalescedDetections") or 0
+                ),
+            ):
+                return ("failed", None)
+        admitted = dict(request)
+        admitted["coalescedDetections"] = 0
         try:
-            _cctally_db._atomic_write_private_json(marker, request)
+            _cctally_db._atomic_write_private_json(marker, admitted)
         except OSError:
-            return "failed"
-        return "reserved"
+            return ("failed", None)
+        # Keep the marker and its one occurrence event inside the same
+        # admission critical section. A coalescing detector cannot observe the
+        # marker before the event it must increment exists.
+        event = admission_event or {
+            **build_stats_heal_event(admitted, "pending-classification"),
+            "outcome": "admitted",
+            "coalescedDetections": 0,
+        }
+        if not append_stats_heal_event(
+            event, wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S
+        ):
+            _unlink_stats_heal_marker()
+            return ("failed", None)
+        return ("reserved", admitted)
     finally:
-        try:
-            fcntl.flock(admission_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(admission_fd)
+        _heal_release_flock(admission_fd)
+
+
+def reserve_stats_corruption_heal(
+    request: dict, *, admission_event: "dict | None" = None,
+) -> str:
+    """Compatibility wrapper returning only the admission status."""
+    status, _elected = _reserve_stats_corruption_heal(
+        request, admission_event=admission_event,
+    )
+    return status
 
 
 def complete_stats_corruption_heal(reservation: str) -> str:
@@ -2275,33 +2320,68 @@ def complete_stats_corruption_heal(reservation: str) -> str:
     return "failed"
 
 
-def _unlink_stats_heal_marker_under_admission() -> None:
+def _unlink_stats_heal_marker_under_admission() -> bool:
+    """Settle a spawn failure with the final count before allowing retry."""
+    admission_fd = _heal_flock_bounded(
+        _stats_heal_admission_path(), _STATS_HEAL_ADMISSION_WAIT_S
+    )
+    if admission_fd is None:
+        return False
     try:
-        admission_fd = os.open(
-            _stats_heal_admission_path(), os.O_WRONLY | os.O_CREAT, 0o600
-        )
-    except OSError:
-        return
-    try:
-        try:
-            fcntl.flock(admission_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return
+        current = _read_stats_heal_request()
+        if current:
+            heal_id = str(current.get("healId") or "")
+            if not update_stats_heal_event(
+                heal_id,
+                wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S,
+                outcome="spawn-failed",
+                coalescedDetections=int(
+                    current.get("coalescedDetections") or 0
+                ),
+            ):
+                return False
         _unlink_stats_heal_marker()
+        return True
     finally:
-        try:
-            fcntl.flock(admission_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(admission_fd)
+        _heal_release_flock(admission_fd)
+
+
+def _finalize_stats_heal_request(heal_id: str) -> bool:
+    """Reconcile the elected count and remove its marker atomically.
+
+    A coalescer may update the marker after the worker's in-memory request was
+    read. The worker therefore takes admission once more, copies the final
+    count into the already-durable occurrence event, and only then unlinks the
+    marker. If the event cannot be updated, the marker stays retryable.
+    """
+    fd = _heal_flock_bounded(_stats_heal_admission_path(), 10.0)
+    if fd is None:
+        return False
+    try:
+        current = _read_stats_heal_request()
+        if not current:
+            return True
+        if str(current.get("healId") or "") != heal_id:
+            return False
+        if not update_stats_heal_event(
+            heal_id,
+            coalescedDetections=int(
+                current.get("coalescedDetections") or 0
+            ),
+        ):
+            return False
+        _unlink_stats_heal_marker()
+        return True
+    finally:
+        _heal_release_flock(fd)
 
 
 def defer_stats_corruption_heal(request: dict) -> str:
     """Schedule one retryable detached corruption heal without blocking.
 
-    The composed form of the two phases above, kept for callers that hold no
-    maintenance lock and therefore have no handoff to bridge. The auto-heal
-    hook calls the two phases separately (§5.3).
+    The composed form of the two phases above, kept for direct callers. The
+    auto-heal hook calls the phases separately so it can attach the admission
+    event and report the elected occurrence.
     """
     return complete_stats_corruption_heal(
         reserve_stats_corruption_heal(request)
@@ -2358,22 +2438,73 @@ def _run_stats_corruption_heal(request: dict) -> str:
             )
             if ingest_fd is None:
                 return "ingest-busy"
-        # #496 S6 §5.3, the worker's phase: SHARED after maintenance and
-        # ingest, before publication, released after the final rebuild record.
-        # The request marker is cleared last, by the caller, once this returns.
+        # #530 moves the complete evidence/classification phase into the elected
+        # worker. It owns maintenance -> ingest -> retention before capturing
+        # forensics, then durably enriches the request marker before any
+        # publication mutation. The marker is cleared last by the caller.
         import _cctally_retention
 
         try:
-            with _cctally_retention.retention_shared(label="stats heal worker"), \
-                    stats_write_scope("maintenance-heal"):
-                result = _cctally_journal.rebuild_stats_index(
-                    context=_cctally_journal.RebuildContext(
-                        trigger="corruption-heal",
-                        trigger_error=str(request.get("triggerError") or ""),
-                        forensics_path=request.get("forensicsPath"),
-                    ),
-                    high_water=high_water,
+            with _cctally_retention.retention_shared(label="stats heal worker"):
+                trigger_exc = _stats_heal_trigger_exception(request)
+                forensics = _cctally_db.write_corruption_forensics(
+                    path,
+                    db_label="stats",
+                    trigger_origin="corruption-heal",
+                    trigger_exception=trigger_exc,
+                    return_result=True,
                 )
+                enriched = dict(request)
+                enriched["forensicsPath"] = (
+                    str(forensics.path)
+                    if forensics is not None and forensics.path is not None
+                    else None
+                )
+                enriched["forensicsDisposition"] = (
+                    forensics.disposition.value
+                    if forensics is not None else None
+                )
+                confirmed = (
+                    forensics is not None
+                    and forensics.disposition
+                    is _cctally_db.CorruptionProbeDisposition.CONFIRMED
+                    and forensics.path is not None
+                )
+                disposition = "confirmed" if confirmed else "unconfirmed"
+                reason = (
+                    forensics.reason if forensics is not None else "unavailable"
+                )
+                if not _persist_stats_heal_request(enriched):
+                    update_stats_heal_event(
+                        heal_id,
+                        disposition=disposition,
+                        forensicsPath=enriched.get("forensicsPath"),
+                        outcome="request-persist-failed",
+                        declineReason="request marker could not be enriched",
+                    )
+                    return "request-persist-failed"
+                request = enriched
+                update_stats_heal_event(
+                    heal_id,
+                    disposition=disposition,
+                    forensicsPath=request.get("forensicsPath"),
+                    coalescedDetections=int(
+                        request.get("coalescedDetections") or 0
+                    ),
+                    outcome=("confirmed" if confirmed else "declined-unconfirmed"),
+                    declineReason=(None if confirmed else reason),
+                )
+                if not confirmed:
+                    return "declined-unconfirmed"
+                with stats_write_scope("maintenance-heal"):
+                    result = _cctally_journal.rebuild_stats_index(
+                        context=_cctally_journal.RebuildContext(
+                            trigger="corruption-heal",
+                            trigger_error=str(request.get("triggerError") or ""),
+                            forensics_path=request.get("forensicsPath"),
+                        ),
+                        high_water=high_water,
+                    )
         finally:
             if ingest_fd is not None:
                 _heal_release_flock(ingest_fd)
@@ -2418,7 +2549,9 @@ def cmd_stats_corruption_heal_internal(args) -> int:
             return 0
         if outcome != "success":
             _record_stats_heal_outcome(heal_id, outcome)
-        _unlink_stats_heal_marker()
+        if not _finalize_stats_heal_request(heal_id):
+            _log_stats_heal("finalization-pending", heal_id=heal_id)
+            return 0
         _log_stats_heal(outcome, heal_id=heal_id)
         return 0
     finally:
@@ -2545,14 +2678,16 @@ def _write_stats_heal_ring(events: list) -> None:
     )
 
 
-def _mutate_stats_heal_ring(mutate) -> bool:
+def _mutate_stats_heal_ring(
+    mutate, *, wait_s: float = _STATS_HEAL_RING_WAIT_S,
+) -> bool:
     """Read-modify-write the ring under a BOUNDED wait for its lock."""
     try:
         pathlib.Path(_cctally_core.LOG_DIR).mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
     fd = _heal_flock_bounded(
-        _stats_heal_ring_lock_path(), _STATS_HEAL_RING_WAIT_S
+        _stats_heal_ring_lock_path(), wait_s
     )
     if fd is None:
         # Loud, never silent: the ring is the accountability guarantee, so a
@@ -2577,16 +2712,20 @@ def _mutate_stats_heal_ring(mutate) -> bool:
         _heal_release_flock(fd)
 
 
-def append_stats_heal_event(entry: dict) -> bool:
+def append_stats_heal_event(
+    entry: dict, *, wait_s: float = _STATS_HEAL_RING_WAIT_S,
+) -> bool:
     """Append one detection entry. Bounded by count, oldest dropped first."""
     def mutate(events):
         events.append(entry)
         return events
 
-    return _mutate_stats_heal_ring(mutate)
+    return _mutate_stats_heal_ring(mutate, wait_s=wait_s)
 
 
-def update_stats_heal_event(heal_id: str, **fields) -> bool:
+def update_stats_heal_event(
+    heal_id: str, *, wait_s: float = _STATS_HEAL_RING_WAIT_S, **fields,
+) -> bool:
     """Update the entry MATCHING ``heal_id``, and no other.
 
     Admission coalesces several detections into one run, so an update keyed by
@@ -2600,6 +2739,24 @@ def update_stats_heal_event(heal_id: str, **fields) -> bool:
         for event in events:
             if event.get("healId") == heal_id:
                 event.update(fields)
+                event["updatedAtUtc"] = _cctally_core.now_utc_iso()
+                return events
+        return None
+
+    return _mutate_stats_heal_ring(mutate, wait_s=wait_s)
+
+
+def record_stats_heal_coalesced(heal_id: str) -> bool:
+    """Count one losing detector on the elected occurrence's single event."""
+    if not heal_id:
+        return False
+
+    def mutate(events):
+        for event in events:
+            if event.get("healId") == heal_id:
+                event["coalescedDetections"] = (
+                    int(event.get("coalescedDetections") or 0) + 1
+                )
                 event["updatedAtUtc"] = _cctally_core.now_utc_iso()
                 return events
         return None
@@ -2854,24 +3011,29 @@ def cmd_stats_epoch_rebuild_internal(args) -> int:
 
 
 def _raw_user_version(path) -> int:
-    """Read ``PRAGMA user_version`` via a raw RO connect (no open_db side
-    effects). -1 when the file cannot be read."""
+    """Read the SQLite header's user_version without opening the family.
+
+    A raw read-only SQLite connection is not side-effect-free for a WAL
+    database: it can create SHM/WAL paths and, more importantly, it bypasses
+    the maintenance-shared opener fence.  The deferred-epoch probe needs only
+    the fixed big-endian header field, so read exactly that instead.
+    """
     try:
-        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            return c.execute("PRAGMA user_version").fetchone()[0]
-        finally:
-            c.close()
-    except sqlite3.DatabaseError:
+        with pathlib.Path(path).open("rb") as handle:
+            header = handle.read(64)
+    except OSError:
         return -1
+    if len(header) < 64 or header[:16] != b"SQLite format 3\x00":
+        return -1
+    return int.from_bytes(header[60:64], "big", signed=False)
 
 
 def stats_epoch_rebuild_pending(path=None) -> bool:
     """Whether an ordinary live open would require whole-journal replay.
 
-    Missing indexes are cheap fresh installs. Unreadable indexes belong to the
+    Missing indexes are cheap fresh installs. Invalid headers belong to the
     corruption classifier, and legacy indexes take the one-time cutover path.
-    Only a readable post-legacy index at a non-current epoch is deferrable.
+    Only a post-legacy main-file header at a non-current epoch is deferrable.
     """
     candidate = pathlib.Path(
         _cctally_core.DB_PATH if path is None else path
@@ -2908,6 +3070,12 @@ def resolve_stats_epoch_mismatch():
         maint_fd = _acquire_stats_maintenance_reentrant(
             _cctally_core.STATS_LOCK_MAINTENANCE_PATH)
         try:
+            # #538: this is the first operation after maintenance-exclusive
+            # ownership and it performs no SQLite open.  A previous-epoch
+            # dashboard may still hold the WAL/SHM mapping; applying the new
+            # DELETE policy before proving a cold family would attempt an
+            # in-place journal-mode conversion under that old handle.
+            _require_stats_legacy_wal_cold(path)
             # Locked re-check: a sibling process may have already rebuilt it.
             if _raw_user_version(path) != _cctally_core.STATS_INDEX_EPOCH:
                 hw, journal_has_bytes = (

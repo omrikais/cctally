@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1009) — no journal data available
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1010) — no journal data available
       → Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`
   ⚠ Pending migrations       54 pending
       → Run any cctally command — opens the DB and applies pending migrations

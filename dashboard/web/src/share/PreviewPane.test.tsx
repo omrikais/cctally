@@ -96,9 +96,67 @@ describe('<PreviewPane>', () => {
     });
     const iframe = container.querySelector('iframe');
     expect(iframe).not.toBeNull();
-    // Sandboxed, no scripting:
+    // Sandboxed, no scripting.
+    //
+    // #503 S4 F28 — this token is ALSO the Esc bridge's precondition.
+    // `useIframeKeymapBridge` reads `iframe.contentDocument`, which is only
+    // reachable because of `allow-same-origin`. Removing that token would
+    // disable Esc-from-preview with no error and no other failing test: the
+    // bridge's try/catch would swallow it. This assertion is the tripwire.
     expect(iframe!.getAttribute('sandbox')).toBe('allow-same-origin');
     expect(iframe!.getAttribute('srcdoc')).toContain('hello');
+  });
+
+  // #503 S4 F29 — the frame was named "Report preview (decorative)" while
+  // being fully exposed to assistive technology (no aria-hidden, no
+  // presentation role). The word told the user not to bother with the one
+  // thing the docs tell them to review before sharing.
+  describe('accessible name (F29)', () => {
+    async function renderHtmlPreview(artifactLabel: string | null) {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          body: '<html><body>hello</body></html>',
+          content_type: 'text/html',
+          snapshot: {},
+        }),
+      }));
+      const opts: ShareOptions = { ...defaults(), format: 'html' };
+      const out = render(
+        <PreviewPane
+          panel="weekly"
+          templateId="weekly-recap"
+          options={opts}
+          artifactLabel={artifactLabel}
+        />,
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(250);
+      });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      return out;
+    }
+
+    it('names the preview frame for the artifact it shows', async () => {
+      await renderHtmlPreview('Weekly — Recap');
+      const frame = screen.getByTitle('Report preview — Weekly — Recap');
+      expect(frame.tagName).toBe('IFRAME');
+    });
+
+    it('falls back to a plain truthful name before the template label resolves', async () => {
+      // Templates load asynchronously, so the fallback must ALSO be truthful —
+      // never a placeholder that outlives the fetch.
+      await renderHtmlPreview(null);
+      expect(screen.getByTitle('Report preview')).toBeInTheDocument();
+    });
+
+    it('never describes the frame as decorative', async () => {
+      await renderHtmlPreview('Weekly — Recap');
+      expect(document.body.innerHTML).not.toMatch(/decorative/i);
+    });
   });
 
   // #294 S5 §7 (Fix 2) — the source-label chip carries a source-specific

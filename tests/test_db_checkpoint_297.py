@@ -23,6 +23,8 @@ import pathlib
 import sqlite3
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bin"))
 
 
@@ -171,3 +173,44 @@ def test_checkpoint_missing_db_json_present_false(tmp_path, monkeypatch, capsys)
     assert list(obj.keys())[0] == "schemaVersion"
     assert obj["present"] is False
     assert obj["truncated"] is True  # absent re-derivable cache is not an error
+
+
+def test_stats_checkpoint_is_retired_before_file_or_sqlite_access(
+    tmp_path, monkeypatch, capsys,
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    monkeypatch.setattr(core, "DB_PATH", tmp_path / "must-not-be-read.db")
+    monkeypatch.setattr(
+        dbmod.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("retired stats checkpoint opened SQLite"),
+    )
+
+    assert dbmod.cmd_db_checkpoint(_args(db="stats")) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "stats.db uses rollback journaling" in captured.err
+    assert "no WAL checkpoint is applicable" in captured.err
+
+
+def test_stats_checkpoint_json_is_stamped_not_applicable(
+    tmp_path, monkeypatch, capsys,
+):
+    core = _load("_cctally_core")
+    dbmod = _load("_cctally_db")
+    monkeypatch.setattr(core, "DB_PATH", tmp_path / "must-not-be-read.db")
+
+    assert dbmod.cmd_db_checkpoint(_args(db="stats", json=True)) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert list(payload)[0] == "schemaVersion"
+    assert payload == {
+        "schemaVersion": 1,
+        "db": "stats.db",
+        "status": "notApplicable",
+        "reason": (
+            "stats.db uses rollback journaling; no WAL checkpoint is applicable"
+        ),
+    }

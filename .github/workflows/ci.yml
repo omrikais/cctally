@@ -64,6 +64,17 @@ jobs:
 
       - name: Run cctally test suite
         env:
+          # This lane is the authoritative gate for the private tree, so a
+          # missing hard capability is a refusal to start rather than an
+          # `incomplete` classification the run continues past (#529 S1). All
+          # five are provisioned below or by the steps above: pytest,
+          # pytest-timeout and rich by the venv pip install; node/npm from
+          # /opt/homebrew/bin on the pinned PATH (bin/cctally-frontend-test and
+          # the npm-shim harnesses already hard-fail without them); fts5 from
+          # brew python@3.13's SQLite. agentmem is asserted here too, because
+          # this lane declares CCTALLY_AGENTMEM_TEST_POLICY=required and
+          # provisions it onto $HOME/.local/bin below.
+          CCTALLY_AUTHORITATIVE_RUN: "1"
           # Pin Python to brew's 3.13 by prepending its libexec/bin (where
           # python3 -> python3.13 symlinks live) so the runner's PATH —
           # which may include pyenv shims pointing at older system Python —
@@ -239,6 +250,13 @@ jobs:
       group: test-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
+      # A missing hard capability is a refusal to start on this lane too
+      # (#529 S1). pytest, pytest-timeout and rich come from the pip install
+      # step, node/npm from setup-node plus `npm ci`, and fts5 from Ubuntu's
+      # libsqlite3, which Debian builds with --enable-fts5. `agentmem` is not
+      # asserted here: this lane declares hosted-private-unavailable below, and
+      # the capability is gated on the effective policy.
+      CCTALLY_AUTHORITATIVE_RUN: "1"
       # Keep the nested shell-harness pool narrow on the hosted runner without
       # collapsing the later, solo pytest phase to two xdist workers. With the
       # combined CCTALLY_TEST_JOBS=2 knob, two consecutive PR runs spent

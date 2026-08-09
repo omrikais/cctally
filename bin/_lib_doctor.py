@@ -944,10 +944,10 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # gather layer injects the real constant, so this only guards a hand-
             # built DoctorState that omitted it. It sat at 1000 against a current
             # constant of 1008 for eight epochs, which made this guard report a
-            # current index as a mismatch; corrected with the 1009 bump
+            # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1009
+            epoch = 1010
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}

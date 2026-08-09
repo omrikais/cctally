@@ -10,13 +10,13 @@ For the **command-line** share surface (`--format` on reporting subcommands), se
 
 ## Overview
 
-Each share-capable dashboard panel (and its detail modal) renders a header **share icon** (`↗`) next to the existing controls. Click it (or press `S` while the panel is focused) to open the **share modal**, which lets you choose a template, tune knobs, preview the result live, and export.
+Each share-capable dashboard panel (and its detail modal) renders a header **share icon** (`↗`) next to the existing controls. Click it (or Tab to a panel action such as its `↗` icon and press `Shift+S`) to open the **share modal**, which lets you choose a template, tune knobs, preview the result live, and export.
 
 | Surface | Behavior |
 |---|---|
 | Panel header `↗` | Opens the share modal for that panel. |
 | Modal header `↗` | Opens the share modal layered above the panel modal. Closing share returns to the underlying modal — it does not unmount. |
-| Keyboard `S` | Opens the share modal for the currently-focused panel. (See [Keyboard](#keyboard).) |
+| Keyboard `Shift+S` | Opens the share modal for the currently-focused panel. (See [Keyboard](#keyboard).) |
 
 **Not share-capable:** the Alerts panel and the Cache Report panel have no share icon. Alerts is a notification stream rather than a snapshotted data view; Cache Report is the one remaining data panel with no share kernel behind it.
 
@@ -123,21 +123,24 @@ Buttons that don't apply to the selected format are disabled with an explanatory
 
 | Key | Action |
 |---|---|
-| `S` | Open share modal for the currently-focused panel. (Click a panel first to focus it.) |
-| `B` | Open the composer. Works whether the basket is empty or not — an empty composer shows a hint to add sections from any panel's share modal. |
-| `Esc` | Close the topmost overlay (share modal -> composer modal -> preset popover). Underlying layers stay open. |
+| `Shift+S` | Open share modal for the currently-focused panel. Tab to one of the panel's actions — its `↗` icon or Expand — to focus it; clicking the panel body opens the panel modal instead, which makes `Shift+S` inert. |
+| `Shift+B` | Open the composer. Works whether the basket is empty or not — an empty composer shows a hint to add sections from any panel's share modal. |
+| `Esc` | Close the topmost overlay, leaving the layers beneath it open. Innermost first: an armed destructive confirmation, then a composer section's actions disclosure, then the composer modal, then the Manage presets dialog, then the preset dropdown or save popover, then the share modal. Esc also works while focus is inside the live preview — the preview is a sandboxed iframe, and its keydowns are forwarded to the same dispatcher. |
 | `Tab` / `Shift+Tab` | Cycle focus within the active modal. |
 | `Enter` on focused button | Trigger that action. |
 
-**Guards (when `S` / `B` do nothing):**
+**Guards (when `Shift+S` / `Shift+B` do nothing):**
 
 - A share, composer, panel, or update modal is already open (mode-stack guard).
-- A filter / search input has focus.
-- No panel is focused — `S` surfaces a help toast: *"Click a panel first, then press S to share it."*
-- **`S` only:** the focused panel is not share-capable (Alerts or Cache Report). `B` opens the composer and resolves no focused panel at all, so this guard does not apply to it.
+- The Settings or Help overlay is open — those own the keyboard while up.
+- An input owner is active: the sessions filter (`f`) or search (`/`).
 - The viewport is at or below the mobile breakpoint (640 px) — hotkeys are mouse-only on mobile per spec §12.9.
+- **`Shift+S` only:** the focused panel is not share-capable (Alerts or Cache Report). `Shift+B` opens the composer and resolves no focused panel at all, so this guard does not apply to it.
+- **`Shift+S` only:** no panel action is focused. This one is not silent — `Shift+S` surfaces a help toast reading *"Focus a panel action, then press Shift+S to share it."*
 
-Both bindings fire the same dispatch as clicking the corresponding icon (panel `↗` for `S`, header chip for `B`); focus restores to the trigger when the modal closes.
+Both bindings fire the same dispatch as clicking the corresponding icon (panel `↗` for `Shift+S`, header chip for `Shift+B`); focus restores to the trigger when the modal closes.
+
+The bindings are shifted, and only shifted. The dispatcher compares the pressed key literally against the shifted forms, so an unshifted `s` or `b` never reaches them — lowercase `s` belongs to the Settings overlay, and lowercase `b` is unbound.
 
 ## Presets
 
@@ -158,7 +161,7 @@ Build multi-section reports by collecting templates from different panels into a
 1. Open any panel's share modal.
 2. Click **+ Basket** — the section's recipe (no rendered body — see [Privacy](#privacy--anonymization)) is added to the basket.
 3. Repeat from other panels. The header chip 📋 shows the count.
-4. Click the chip (or press `B`) to open the composer.
+4. Click the chip (or press `Shift+B`) to open the composer.
 
 The composer modal:
 
@@ -182,8 +185,8 @@ Clearing history has no GUI control in v2 yet — edit `~/.local/share/cctally/c
 
 **Share this week's cost recap to a teammate in Slack:**
 
-1. Focus the Current Week panel (Tab to it, or just click anywhere in the panel body).
-2. Press `S` (or click `↗`).
+1. Focus one of the Current Week panel's actions by tabbing to it — its `↗` icon or Expand. Clicking the panel body does not focus the panel; it opens the panel modal.
+2. Press `Shift+S` (or click `↗`).
 3. Leave defaults; format `md`; click `Copy`.
 4. Paste into Slack.
 
@@ -219,7 +222,7 @@ cd dashboard/web && nvm use && npm run dev
 
 For each of the 9 share-capable panels (CurrentWeek, Trend, Weekly, Daily, Monthly, Blocks, Forecast, Sessions, Projects):
 
-1. Click the `↗` icon (or focus the panel and press `S`).
+1. Click the `↗` icon (or Tab to a panel action and press `Shift+S`).
 2. In the modal, cycle Recap -> Visual -> Detail.
 3. Toggle `Anon on export`.
 4. Test each format: MD -> Copy; HTML -> Open + Print -> PDF; SVG -> Download + PNG.
@@ -254,12 +257,12 @@ For each of the 9 share-capable panels (CurrentWeek, Trend, Weekly, Daily, Month
 
 ### 4. Keyboard
 
-1. Click a Weekly panel cell to focus the panel. Press `S`. Share modal opens.
+1. Tab to the Weekly panel's `↗` icon. Press `Shift+S`. Share modal opens.
 2. Press `Esc`. Modal closes; focus returns to the share icon.
-3. Press `B`. Composer opens.
+3. Press `Shift+B`. Composer opens.
 4. Press `Esc`. Composer closes.
-5. With a panel modal open (click on a Weekly KPI to deep-dive), press `S`. Spec says guards block this — `S` should be inert.
-6. With nothing focused, press `S`. Toast: "Click a panel first, then press S to share it."
+5. With a panel modal open (click on a Weekly KPI to deep-dive), press `Shift+S`. Guards block this — `Shift+S` should be inert.
+6. With nothing focused, press `Shift+S`. Toast: "Focus a panel action, then press Shift+S to share it."
 
 **Pass:** keyboard behavior matches spec §12.1 guards; no rogue keystrokes.
 

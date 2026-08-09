@@ -337,7 +337,7 @@ def test_next_open_recovers_partial_destination_with_complete_metadata(
 
 
 def _cutover_manifests(app_dir: pathlib.Path) -> list[dict]:
-    """Every `preserve-then-atomic-replace-v1` manifest, oldest first.
+    """Every current cold-quarantine cutover manifest, oldest first.
 
     Selected by protocol so the synthesized legacy incident that sets this
     scenario up is never mistaken for one the recovery cutover wrote.
@@ -351,7 +351,7 @@ def _cutover_manifests(app_dir: pathlib.Path) -> list[dict]:
         if not path.is_file():
             continue
         payload = json.loads(path.read_text())
-        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+        if payload.get("cutoverProtocol") == "cold-quarantine-then-replace-v2":
             out.append(payload)
     return out
 
@@ -461,6 +461,8 @@ def test_legitimate_empty_index_is_not_rebuilt_merely_because_scratch_exists(
     )
     scratch = data / "stats.db.rebuilding-20260726T120000_000000"
     shutil.copy2(db, scratch)
+    scratch_journal = pathlib.Path(f"{scratch}-journal")
+    scratch_journal.write_bytes(b"rollback-journal-evidence")
     inode_before = db.stat().st_ino
     incidents_before = sorted(path.name for path in quarantine.iterdir())
 
@@ -470,6 +472,7 @@ def test_legitimate_empty_index_is_not_rebuilt_merely_because_scratch_exists(
     assert db.stat().st_ino == inode_before
     assert sorted(path.name for path in quarantine.iterdir()) == incidents_before
     assert not scratch.exists()
+    assert not scratch_journal.exists()
     assert db.with_name("stats.db.maintenance.lock").exists()
 
 

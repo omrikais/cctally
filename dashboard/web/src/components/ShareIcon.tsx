@@ -9,8 +9,10 @@
 // a11y:
 //   - `aria-label="Share <panelLabel> report"` — distinct per panel so
 //     screen readers don't read 8 identical "share" buttons.
-//   - `title="Share (S)"` — keyboard shortcut lands in M1.11+; the
-//     tooltip can precede it since the affordance is discoverable.
+//   - `title="Share (Shift+S)"` — names the gesture `keyboardShare.ts`
+//     actually binds. It read "Share (S)" from before the shortcut existed
+//     (#503 F30); the binding compares `e.key` literally, so an unshifted
+//     `s` has never opened the share modal.
 //   - `data-share-panel` — CSS / future keyboard-test hook.
 //   - `triggerId` (optional) — sets `id=<triggerId>` on the button so
 //     `ShareModalRoot`'s focus-restore (spec §12.8) can re-resolve the
@@ -60,7 +62,7 @@ export function ShareIcon({ panel, panelLabel, onClick, triggerId, dataTestId }:
       data-share-panel={panel}
       aria-label={`Share ${panelLabel} report`}
       onClick={handleClick}
-      title="Share (S)"
+      title="Share (Shift+S)"
       {...(triggerId ? { id: triggerId } : {})}
       {...(dataTestId ? { 'data-testid': dataTestId } : {})}
     >

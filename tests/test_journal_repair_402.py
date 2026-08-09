@@ -494,7 +494,7 @@ def test_apply_appends_one_exact_audit_and_rebuilds_usable_index(tmp_path):
 
 
 def _cutover_manifests(app_dir: pathlib.Path) -> list:
-    """Every `preserve-then-atomic-replace-v1` manifest, oldest first."""
+    """Every current cold-quarantine manifest, oldest first."""
     root = pathlib.Path(app_dir) / "quarantine"
     if not root.is_dir():
         return []
@@ -504,7 +504,7 @@ def _cutover_manifests(app_dir: pathlib.Path) -> list:
         if not path.is_file():
             continue
         payload = json.loads(path.read_text())
-        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+        if payload.get("cutoverProtocol") == "cold-quarantine-then-replace-v2":
             out.append(payload)
     return out
 
@@ -1306,12 +1306,10 @@ def _live_cursor(db: pathlib.Path) -> str:
 def test_live_dashboard_reader_keeps_its_snapshot_then_retry_converges(tmp_path):
     """Repair must never replace stats.db beneath the usual live reader.
 
-    #496 S3 delivers that by publishing transactionally into the live file
-    instead of refusing while a reader holds it open. The repair therefore
-    completes with the dashboard running and a pinned read transaction open;
-    the pinned reader keeps the generation it opened on, a fresh reader sees
-    the repaired one, no scratch survives, and an identical retry is still
-    idempotent against the single audit.
+    Under #538 rollback journaling, the pinned reader makes the in-place write
+    fail with a controlled busy result. Once that reader exits, an identical
+    retry converges in place, leaves no scratch, and remains idempotent against
+    the single audit.
     """
     app_dir = tmp_path / "data"
     journal_dir = app_dir / "journal"
@@ -1391,9 +1389,31 @@ def test_live_dashboard_reader_keeps_its_snapshot_then_retry_converges(tmp_path)
             "--yes",
             "--json",
         )
+        assert applied.returncode == 3, applied.stdout + applied.stderr
+        assert json.loads(applied.stdout)["errors"] == ["database is locked"]
+
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == pinned, (
+            "the pinned reader must keep the generation it opened on"
+        )
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
+        holder.wait(timeout=20)
+        holder.stdin.close()
+        holder.stdout.close()
+        holder = None
+
+        applied = _run(
+            app_dir,
+            "--violation",
+            fingerprint,
+            "--yes",
+            "--json",
+        )
         assert applied.returncode == 0, applied.stdout + applied.stderr
         payload = json.loads(applied.stdout)
-        assert payload["status"] == "applied"
+        assert payload["status"] == "recovered"
         assert payload["unacknowledgedViolations"] == []
         assert [
             item["fingerprint"] for item in payload["acknowledgedViolations"]
@@ -1401,23 +1421,10 @@ def test_live_dashboard_reader_keeps_its_snapshot_then_retry_converges(tmp_path)
         assert payload["auditId"] == payload["acknowledgedViolations"][0][
             "auditId"
         ]
-
-        holder.stdin.write("go\n")
-        holder.stdin.flush()
-        assert holder.stdout.readline().strip() == pinned, (
-            "the pinned reader must keep the generation it opened on"
-        )
-        assert _live_cursor(app_dir / "stats.db") != pinned, (
-            "a fresh reader must see the repaired generation"
-        )
+        assert _live_cursor(app_dir / "stats.db") != pinned
+        cleanup = _run_cli(app_dir, "report", "--json")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
         assert sorted(app_dir.glob("stats.db.rebuilding-*")) == []
-        conn = sqlite3.connect(app_dir / "stats.db")
-        try:
-            assert conn.execute(
-                "PRAGMA integrity_check"
-            ).fetchone()[0] == "ok"
-        finally:
-            conn.close()
     finally:
         if holder is not None:
             holder.send_signal(signal.SIGKILL)

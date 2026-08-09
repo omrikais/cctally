@@ -26,8 +26,9 @@ import {
   useSortable,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { dispatch } from '../store/store';
+import { useKeymap } from '../hooks/useKeymap';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import type { BasketItem } from '../store/basketSlice';
 import type { ComposeSectionResult } from './composerApi';
@@ -48,6 +49,37 @@ export function ComposerSectionList({
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
+
+  // #531.1 — each row held its own `kebabOpen` with nothing coordinating them,
+  // so several menus could be open at once and Escape had no owner: it fell
+  // through to the composer's layer-210 binding and closed the whole composer,
+  // taking unsaved title/theme/format edits with it. The open id lives here so
+  // opening one disclosure closes any other.
+  const [openKebabId, setOpenKebabId] = useState<string | null>(null);
+
+  // Layer 215: above the composer's own 210 so this fires first, below an
+  // armed confirmation at 220 which must keep owning Esc. ONE binding at the
+  // parent, not one per row — twenty bindings at the same layer resolve by
+  // insertion order, which is nondeterministic exactly when two are open.
+  //
+  // A local `stopPropagation` handler (as SavePresetPopover does) would bypass
+  // the central ordering; that popover is a deliberately reconciled special
+  // case rather than the house pattern.
+  const bindings = useMemo(
+    () => [{
+      key: 'Escape',
+      scope: 'overlay' as const,
+      layer: 215,
+      when: () => openKebabId !== null,
+      action: () => {
+        const id = openKebabId;
+        setOpenKebabId(null);
+        if (id) document.getElementById(`composer-kebab-${id}`)?.focus();
+      },
+    }],
+    [openKebabId],
+  );
+  useKeymap(bindings);
 
   function handleDragEnd(e: DragEndEvent) {
     if (!e.over || e.active.id === e.over.id) return;
@@ -70,6 +102,10 @@ export function ComposerSectionList({
               kernelVersion={kernelVersion}
               onRefresh={onRefresh}
               onRemove={onRemove}
+              isKebabOpen={openKebabId === item.id}
+              onKebabToggle={() =>
+                setOpenKebabId((p) => (p === item.id ? null : item.id))}
+              onKebabClose={() => setOpenKebabId(null)}
             />
           ))}
         </ul>
@@ -80,12 +116,18 @@ export function ComposerSectionList({
 
 function Row({
   item, result, kernelVersion, onRefresh, onRemove,
+  isKebabOpen, onKebabToggle, onKebabClose,
 }: {
   item: BasketItem;
   result: ComposeSectionResult | undefined;
   kernelVersion: number;
   onRefresh: (id: string) => void;
   onRemove: (id: string) => void;
+  // Lifted to <ComposerSectionList> so at most one disclosure is open and one
+  // Escape binding owns them all (#531.1).
+  isKebabOpen: boolean;
+  onKebabToggle: () => void;
+  onKebabClose: () => void;
 }) {
   const {
     attributes, listeners, setNodeRef, transform, transition, isDragging,
@@ -101,8 +143,6 @@ function Row({
     transition: reducedMotion ? undefined : transition,
     opacity: isDragging ? 0.4 : 1,
   };
-  const [kebabOpen, setKebabOpen] = useState(false);
-
   // Outdated badge sources (spec §7.7):
   //   - data drift: the section's `data_digest_at_add` no longer
   //     matches the freshly-computed digest (server signal).
@@ -149,15 +189,32 @@ function Row({
       <div className="composer-section-actions">
         <button
           type="button"
-          aria-haspopup="menu"
-          aria-expanded={kebabOpen}
-          onClick={() => setKebabOpen((v) => !v)}
+          id={`composer-kebab-${item.id}`}
+          aria-expanded={isKebabOpen}
+          /* Only while the list exists. The <ul> renders conditionally, so an
+             unconditional `aria-controls` points at a missing id whenever the
+             disclosure is closed — which is `aria-valid-attr-value`, an ARIA
+             violation in the very attribute added to make this control honest.
+             Nothing in this repo runs axe, so it would have failed silently. */
+          aria-controls={isKebabOpen ? `composer-kebab-menu-${item.id}` : undefined}
+          onClick={onKebabToggle}
           aria-label={`Actions for ${item.label_hint}`}
         >
           ⋯
         </button>
-        {kebabOpen ? (
-          <ul role="menu" className="composer-section-menu">
+        {isKebabOpen ? (
+          /* #531.3 — this was `role="menu"` whose children were neither
+             `menuitem` nor arrow-navigable. With exactly two actions, both
+             already Tab-reachable, completing the ARIA menu contract would
+             mean roving tabindex, Arrow keys, Home/End and typeahead — new
+             interaction behavior in a corrections-only session. Dropping the
+             claim restores truth at no cost to what works. The repository's
+             reusable roving implementation (conversations/menuKeyboard.ts)
+             stays reserved for surfaces that need menu semantics. */
+          <ul
+            id={`composer-kebab-menu-${item.id}`}
+            className="composer-section-menu"
+          >
             {/* #503 S3 §6 — "Preview only this" is gone. It was a menu item
                 wired to an empty function: clicking it did nothing, with no
                 feedback. That is a broken control, and removing it is the
@@ -168,7 +225,7 @@ function Row({
             <li>
               <button
                 type="button"
-                onClick={() => { onRefresh(item.id); setKebabOpen(false); }}
+                onClick={() => { onRefresh(item.id); onKebabClose(); }}
               >
                 Refresh from current data
               </button>
@@ -176,7 +233,7 @@ function Row({
             <li>
               <button
                 type="button"
-                onClick={() => { onRemove(item.id); setKebabOpen(false); }}
+                onClick={() => { onRemove(item.id); onKebabClose(); }}
                 aria-label={`Remove ${item.label_hint}`}
               >
                 Remove

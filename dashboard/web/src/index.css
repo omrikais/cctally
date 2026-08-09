@@ -311,8 +311,16 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    tap from, and label-expansion for native checkbox/radio boxes. There is NO
    interactive modal model-chip, so none is targeted (the board chip stays S1's
    `.dash-grid button.chip.model-chip`). The pre-existing @media (max-width:640)
-   overrides stay (a harmless duplicate at ≤640). */
-@media (pointer: coarse) {
+   overrides stay (a harmless duplicate at ≤640).
+
+   #503 S4 §4.1 — was `(pointer: coarse)` only. That gates on pointer TYPE, not
+   viewport width, so a narrow window driven by a mouse got no touch floor at
+   all — and a QA pass that resizes without emulating touch measures the bare
+   native box and reports a defect phones do not have (#503 F26; the baseline
+   measured 19.00-23.19px under a fine pointer at 390x844 against exactly
+   44.00px under a coarse one at the same width). Widened rather than
+   duplicated into a second block: two copies of a touch floor drift. */
+@media (pointer: coarse), (max-width: 640px) {
   /* Isolated corner close buttons — real box grow. */
   .modal-close,
   .share-modal-close,
@@ -356,6 +364,22 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
     min-height: var(--tap-target);
     display: inline-flex;
     align-items: center;
+  }
+  /* #503 S4 §4.1 — `min-height` alone does not make a 44x44 target, so a
+     horizontal floor is added as a GUARD against a future short label. It binds
+     nothing today: the baseline measured all eight primary labels at >=46.27px
+     wide (narrowest: the `md` format radio) and widths are identical across
+     pointer types, because this block only ever moved the height axis. No
+     horizontal padding is added — that would move a layout that passes.
+
+     Scoped to the three share-knob label families the baseline measured, NOT
+     to the rule above. `.composer-knobs label` shares the height floor but its
+     widths were never measured, so a width floor there would be an unverified
+     change to a composer layout no finding calls defective. */
+  .share-knob-radio,
+  .share-knob-checkbox,
+  .share-format-radio {
+    min-width: var(--tap-target);
   }
   /* #293 S4 ui-qa follow-up (P1-5): the Composer Title <input> (~174×24) and the
      Theme/Format <select>s (~54×21 / ~53×21) are real native controls INSIDE the
@@ -4135,9 +4159,24 @@ mark.current {
   font-size: var(--fs-kpi); line-height: 1; cursor: pointer; padding: 4px 8px;
 }
 .share-modal-close:hover { color: var(--accent-red); }
+/* #503 S4 §4.4 — the body was a flex COLUMN holding the gallery and a nested
+   `.share-main-section` row; the preview lived inside that row, so a CSS
+   `order` could not hoist it and mobile needed a SECOND <PreviewPane>. A
+   viewport flip then remounted it and discarded its fetched render (#520 item
+   2). Flattened to one wrapping flex line so ONE instance is placed by CSS.
+
+   NOT a grid, deliberately: a grid item's containing block is its GRID AREA,
+   so the sticky mobile preview would have zero travel and `position: sticky`
+   would silently do nothing. A flex item's containing block is the flex
+   container's content box, which is why sticky works here.
+
+   `align-content: flex-start` stops wrapped lines from stretching vertically.
+   The separate row/column gaps preserve today's 14px outer and 18px inner
+   spacing exactly — a single `gap` would apply 14px on both axes. */
 .share-modal-body {
   flex: 1; overflow: auto; padding: 14px 18px;
-  display: flex; flex-direction: column; gap: 14px;
+  display: flex; flex-flow: row wrap; align-content: flex-start;
+  row-gap: 14px; column-gap: 18px;
   scrollbar-gutter: stable;
   /* M1-1: contain scroll so a flick past the boundary doesn't chain to
      the locked body or the lower panel-modal layer. */
@@ -4146,8 +4185,8 @@ mark.current {
 .share-section {
   display: flex; flex-direction: column; gap: 10px;
 }
-.share-main-section {
-  flex-direction: row; gap: 18px;
+.share-gallery-section {
+  flex: 0 0 100%;              /* forces its own line */
 }
 .share-knobs-col {
   flex: 0 0 280px; min-width: 0;
@@ -4294,6 +4333,110 @@ mark.current {
 }
 .share-save-popover .share-confirm {
   margin-top: 6px;
+}
+
+/* Manage presets dialog --------------------------------------------------- */
+/* #503 S4 §3.1 — Manage presets was `role="dialog" aria-modal="true"` while
+   computing to `position: static; z-index: auto`: an in-flow block at the
+   bottom of the share modal that trapped nothing. `.share-modal` sets
+   `position: relative; z-index: 1` and `overflow: hidden` but NO transform /
+   filter / perspective / will-change / contain, so it is not a containing
+   block for a fixed descendant — this overlay resolves against the viewport
+   and escapes that clip without needing a portal (none exists in this app).
+
+   The z-index is NOT optional and the keymap layer does not supply it: at
+   `auto` this fixed overlay stacks below the mobile sticky preview strip,
+   which declares z-index: 2. The number mirrors the keymap layer so the two
+   stay legible together. */
+.share-manage-overlay {
+  position: fixed; inset: 0; z-index: 208;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  overscroll-behavior: none;
+  padding: 16px;
+}
+/* The card had no base rule at all before this session — the class appeared
+   only in the reduced-motion block — so it needs every property a card has:
+   an opaque surface, a border and radius consistent with `.share-modal`, a
+   responsive width, and a bounded height with internal scrolling so the preset
+   table cannot exceed a 390px viewport. */
+.share-manage-modal {
+  position: relative;
+  width: min(560px, 100%);
+  max-height: min(80dvh, 640px);
+  overflow: auto;
+  display: flex; flex-direction: column;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  padding: 0 0 12px;
+}
+/* The header and its close button had NO rule either — the same gap as the
+   card above, and the browser gate is what surfaced it: the `×` rendered as a
+   bordered default-button square on its own line below the heading, because
+   `<ModalHeader>`'s `className` and `closeClassName` REPLACE their defaults
+   rather than extend them. That replacement is deliberate (ModalCloseButton's
+   header explains it: each shell keeps its own hook so positioning is
+   untouched, and .share-modal-close is absolutely positioned), so the fix is
+   the missing rule, not a composed class name that would fight the design.
+
+   Modeled on .composer-modal-header / .composer-modal-close rather than the
+   share-modal pair, because this close sits in normal flow — so there is no
+   absolute positioning and no padding-right reservation to make room for it.
+   The defect predates this session; promoting the dialog to a centered card
+   is what made it the most visible element in it. */
+.share-manage-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 18px; border-bottom: 1px solid var(--border-soft);
+}
+.share-manage-header h2 { margin: 0; font-size: var(--fs-title); font-weight: 500; }
+.share-manage-close {
+  background: none; border: none; color: inherit;
+  font-size: var(--fs-kpi); line-height: 1; cursor: pointer; padding: 4px 8px;
+}
+.share-manage-close:hover { color: var(--accent-red); }
+/* The row actions are the THIRD instance of the same gap, and fixing only the
+   close button above would have left them as they were: Rename and Delete
+   carry no class at all, so they rendered as UA-default light-grey Arial
+   buttons inside a dark modal. Scoped to the cell rather than to those two
+   elements, because <ConfirmAction> renders its own buttons here too — and
+   `.share-confirm-yes` sets only `border-color`, which until now tinted a
+   user-agent border rather than one this stylesheet drew.
+   The declarations are `.ctrl-btn`'s, the established small-button vocabulary
+   in this file; they are repeated rather than reached by adding a class in the
+   TSX, because `disabled` styling below needs a selector here anyway. */
+.share-manage-actions button {
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xs);
+  color: inherit;
+  font-family: inherit;
+  font-size: var(--fs-meta);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.share-manage-actions button:hover:not(:disabled) { border-color: var(--text-dim); }
+.share-manage-actions button:disabled { opacity: 0.5; cursor: default; }
+/* Re-assert the destructive accent, which the rule above outranks.
+   `.share-manage-actions button` is (0,1,1); `.share-confirm-yes` is (0,1,0),
+   and the `border` SHORTHAND plus `color: inherit` overrode both declarations
+   it sets — so the armed Delete confirmation lost its red and read exactly
+   like Cancel. Before that rule existed the accent tinted the user-agent
+   border and the confirm did read red, so adding the base rule REGRESSED it.
+
+   This is the same specificity trap this session fixed for the knob labels
+   (`.share-knob > label` at 0,1,1 beating a 0,1,0 mobile rule), reintroduced
+   by the fix for it. Re-asserted at (0,2,1) rather than by weakening the base
+   rule, because the confirm buttons do want the dark-surface treatment — they
+   want the accent ON TOP of it. Scoped to this cell, so the same classes in
+   the save popover and the composer's Clear-all are untouched.
+
+   Verify by computed style, never by reading these two rules: both were
+   present and correct in isolation, and the browser is the only thing that
+   reports which one won. */
+.share-manage-actions .share-confirm-yes {
+  border-color: var(--accent-red);
+  color: var(--accent-red);
 }
 
 /* Preview pane ------------------------------------------------------------ */
@@ -5651,14 +5794,37 @@ mark.current {
     border-radius: 0;
     border-left: none; border-right: none;
   }
+  /* #503 S4 §4.4 — one flat column. `order` places the SINGLE preview first;
+     no second <PreviewPane> and no useIsMobile() branch.
+
+     #503 S4 §4.3 / #520 item 1 — Mechanism A. The reported cause was a
+     stacking bug; a browser diagnosis DISPROVED it. `elementsFromPoint`
+     returns the strip at index 0 at every sampled point, a 2,520-sample sweep
+     across six scroll offsets and both pointer arms found zero foreign
+     top-elements, and a pixel A/B against a hidden gallery differs only in row
+     0. Raising z-index, adding `isolation: isolate` or hardening the
+     background would change nothing.
+     The 12px of gallery text visible ABOVE the strip was this element's own
+     `padding-top`: overflow clips to the PADDING box (measured top 74.86), but
+     a sticky box may not be offset above its CONTAINING BLOCK, which is this
+     element's CONTENT box (measured top 86.86). `top: 0` therefore parked the
+     strip 12px below the clip edge and scrolled content passed through the
+     gap. Zeroing the top padding makes the two boxes share a top edge so the
+     strip meets the clip edge. Horizontal and bottom padding are unchanged. */
   .share-modal-body {
-    padding: 12px 14px;
+    padding: 0 14px 12px;
+    flex-flow: column nowrap;
   }
-  .share-main-section {
-    flex-direction: column;
+  /* The gallery's `flex: 0 0 100%` basis MUST be reset: in a column the basis
+     applies to the VERTICAL main axis and would give the gallery the full
+     modal height. */
+  .share-gallery-section {
+    flex: 0 0 auto;
+    order: 2;
   }
   .share-knobs-col {
     flex: 0 0 auto;
+    order: 3;
   }
   .share-gallery {
     grid-template-columns: 1fr;
@@ -5674,44 +5840,88 @@ mark.current {
     margin-left: 0;
   }
 
-  /* #293 S4 SHARE-1 — phone Share form. The coarse-pointer block up top already
+  /* #293 S4 SHARE-1 — phone Share form. The touch-floor block up top already
      sizes the modal closes + checkbox/radio label bands; these are the
      phone-only text-size rules (kill iOS focus-zoom) + the Share-specific preset
-     / save / manage controls, plus the bounded lead preview slice that
-     ShareModal's useIsMobile() branch renders first (above the gallery + knobs)
-     so editing a top-of-stack knob gives immediate feedback. */
+     / save / manage controls, plus the bounded preview slice that `order: 1`
+     places first (above the gallery + knobs) so editing a top-of-stack knob
+     gives immediate feedback. #503 S4 §4.4 removed the separate mobile
+     <PreviewPane> instance; placement is CSS order now, not a JS branch. */
   /* #293 S4 gate fallback (§3c): a static leading preview scrolled fully off
      (~654px of gallery + knobs) so the visible edit→preview loop was only
      partial. Pin it as a slim `position:sticky; top:0` strip inside the
      .share-modal-body scroll container so a live preview SLICE stays visible
-     while the gallery/knobs scroll UNDER it. Bounded to ~128px so it never eats
-     the viewport; opaque --panel-bg + a low z-index + a hairline separator make
-     the scrolling content pass beneath. Mobile-only (this element is rendered
-     only by useIsMobile() AND this rule lives in @media (max-width:640px)), so
-     desktop Share's two-pane layout is byte-unchanged. The base .share-preview-col
-     min-height:320px must be zeroed here, else max-height clamps UP to it. */
-  .share-preview-col--lead {
+     while the gallery/knobs scroll UNDER it. Opaque --panel-bg + a low z-index
+     + a separator make the scrolling content pass beneath.
+     `min-height: 0` is load-bearing: without it `max-height` clamps UP to the
+     base `.share-preview-col` `min-height: 320px` and the cap does nothing.
+
+     #503 S4 §4.4 — this was `.share-preview-col--lead`, a modifier only the
+     mobile <PreviewPane> instance carried. With one instance the modifier is
+     gone and these properties move onto `.share-preview-col` inside this
+     media block.
+
+     #503 S4 §4.2 / F27 — the cap was 128px. #293 S4 set that so the strip
+     "never eats the viewport", and #503 S1 (7bbaad7e3) then bought content
+     room by shortening the privacy wording rather than raising it: 37.2px ->
+     58.0px of preview. 58px still shows frontmatter, not the report, on the
+     surface whose documented purpose is reviewing what you are about to share.
+     The operator decided to revise #293 S4's rule rather than work around it
+     (§7 D5), so THIS is the current rule and that one is superseded.
+     `dvh` NOT `vh`: the modal is already `height: 100dvh` here, and browser
+     chrome or an on-screen keyboard shrinks dvh while vh stays pinned to the
+     larger layout viewport — a vh cap would let the strip eat a
+     keyboard-reduced modal. */
+  .share-preview-col {
+    order: 1;
     position: sticky;
     top: 0;
     z-index: 2;
     flex: 0 0 auto;
     min-height: 0;
-    max-height: 128px;
+    max-height: min(45dvh, 320px);
     overflow: hidden;
     background: var(--panel-bg);
-    border-bottom: 1px solid var(--border-soft);
+    /* #503 S4 §4.3 / #520 item 1 — Mechanism B. At the strip's bottom edge
+       `overflow: hidden` cuts its own <pre> mid-line, while the next tile's
+       label box has its top 6.00px hidden and its remaining 10px visible
+       immediately below the cut. Both sides painted --panel-bg-2 (#11131c)
+       with the same 1px solid rgba(255,255,255,0.06) border and the same
+       radius, so the seam was imperceptible and two half-glyph rows read as
+       one overlapping row. A separator in a VISIBLE token plus a downward
+       shadow makes the strip read as a layer above the scrolling content,
+       which is what it is. Raising the cap above independently reduces how
+       often a line is cut.
+       --surface-faint (#5a6070), NOT --border-soft: the whole point is that
+       the seam must be perceptible, and --border-soft is the hairline both
+       sides already painted. There is no `--border` token in this stylesheet;
+       --surface-faint is the documented background/border counterpart to the
+       foreground-only --text-faint, so a border is exactly its purpose. */
+    border-bottom: 1px solid var(--surface-faint);
+    /* --shadow-md is the cards/popovers register and is the right one for a
+       strip floating above scrolling content. A raw literal here fails the
+       #255 no-orphan-literal lint in cardChromeTokens.test.ts, and the fix is
+       to tokenize rather than to `lint-allow:` it — this is not a bespoke
+       drop. */
+    box-shadow: var(--shadow-md);
   }
-  /* #503 S1 B2 — the privacy status line sits INSIDE that fixed 128px, so
-     every pixel it takes comes out of the preview. Measured at 390x844 with
-     the previous box and wording: 37px of preview in the info state, against
-     91px with the line hidden — the line was taking 42% of the budget on the
-     safe default state.
+  /* The modal already states the source above the scrolling body
+     (.share-modal-source), so inside the strip `.share-preview-source` is a
+     second copy of the same chip, spending the budget F27 is about. Mobile
+     only — on desktop there is room and no finding calls it a defect. */
+  .share-preview-col .share-preview-source { display: none; }
+  /* #503 S1 B2 — the privacy status line sits INSIDE the capped strip, so
+     every pixel it takes comes out of the preview. Measured at 390x844
+     against the then-current 128px cap and the previous wording: 37px of
+     preview in the info state, against 91px with the line hidden — the line
+     was taking 42% of the budget on the safe default state.
 
-     Tightened here rather than by raising the cap above, because the cap is
-     #293 S4's rule and its stated purpose is that this strip never eats the
-     viewport. The wording change in `SharePrivacyStatus` does the rest: all
-     three states now render on one line, leaving 58px of preview in every
-     state instead of 37px in the state the user sees first. */
+     S1 tightened the box here rather than raising the cap, because at that
+     time the cap was #293 S4's rule and its stated purpose was that this
+     strip never eats the viewport. #503 S4 §4.2 superseded that rule — the
+     cap above is now `min(45dvh, 320px)` — but this tightening stays on its
+     own merit: all three states render on one line, so the state the user
+     sees first spends no more of the budget than the others. */
   .share-privacy-status {
     padding: 5px 8px;
     margin-bottom: 6px;
@@ -5726,7 +5936,22 @@ mark.current {
     min-height: var(--tap-target);
   }
   /* Radio / checkbox / format label TEXT to 16px (the 44px tap band is in the
-     coarse-pointer block). */
+     touch-floor block up top, which #503 S4 §4.1 widened from
+     `(pointer: coarse)` to `(pointer: coarse), (max-width: 640px)`).
+
+     #503 S4 §4.1 — this rule has NEVER applied to the checkboxes. They are
+     direct children of `.share-knob`, so the earlier base rule
+     `.share-knob > label` (specificity 0,1,1) beat this one at 0,1,0 and
+     `Show chart`, `Show table` and — the one that matters — `Anon on export`
+     all rendered at --fs-meta (12px), under the 16px threshold that stops iOS
+     zooming on focus. The sibling radios escape only because
+     `.share-knob-radiogroup` puts them out of the child combinator's reach,
+     and the format radios sit outside `.share-knob` entirely.
+     Compounded here to 0,2,0 — two classes, no type selector — which beats
+     the base rule's 0,1,1 on class count. Compounded rather than weakening
+     the base rule, which the other knob labels depend on. Verify by computed
+     style in a browser: a CSS-source assertion passes against the defect. */
+  .share-knob > .share-knob-checkbox,
   .share-knob-radio,
   .share-knob-checkbox,
   .share-format-radio {

@@ -227,8 +227,11 @@ describe('S keybinding (share modal)', () => {
       text: UNFOCUSED_TOAST_TEXT,
     });
     // Sanity: the exact spec-mandated text (#293 S4 — describe-only regions).
+    // HARDCODED, deliberately: importing the constant would assert a value
+    // against itself. #503 S4 F30 corrected the second half — the binding
+    // compares `e.key` literally, so an unshifted `s` has never shared.
     expect(UNFOCUSED_TOAST_TEXT).toBe(
-      'Focus a panel action, then press S to share it.',
+      'Focus a panel action, then press Shift+S to share it.',
     );
   });
 

@@ -641,7 +641,7 @@ def test_lower_shm_mxframe_and_disagreeing_header_copy_are_incoherent(
 def test_unproven_wal_shape_is_preserved_without_sqlite_open(
     tmp_path, monkeypatch, wal_bytes, shm_bytes
 ):
-    import _cctally_journal as jr
+    import _lib_stats_wal
 
     db = tmp_path / "stats.db"
     db.write_bytes(b"main-family-byte-proof")
@@ -653,10 +653,10 @@ def test_unproven_wal_shape_is_preserved_without_sqlite_open(
     def forbidden_connect(*_args, **_kwargs):
         raise AssertionError("unproven WAL-index shape reached sqlite3.connect")
 
-    monkeypatch.setattr(jr.sqlite3, "connect", forbidden_connect)
-    outcome = jr._prepare_existing_stats_for_cutover(db)
+    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
+    evidence = _lib_stats_wal.inspect_wal_index_family(db)
 
-    assert outcome == "skipped_unproven_wal_index"
+    assert evidence["verdict"] not in {"coherent", "wal_absent", "wal_empty"}
     assert {path.name: path.read_bytes() for path in paths} == before
 
 
@@ -773,22 +773,15 @@ def test_incoherent_wal_index_is_preserved_without_checkpoint(ns, tmp_path):
     for path in paths:
         assert (incident / path.name).read_bytes() == before[path.name]
 
-    outcome = jr._prepare_existing_stats_for_cutover(db)
-    damage = jr._record_post_checkpoint_damage(incident, db, outcome)
-
     after = {
         path.name: path.read_bytes() if path.exists() else None for path in paths
     }
-    assert outcome == "skipped_incoherent_wal_index"
-    assert after == before, (
-        "classifying an incoherent family must not open, checkpoint, rewrite, "
-        "or remove any family member"
-    )
-    assert damage["checkpointOutcome"] == "skipped_incoherent_wal_index"
+    assert after == {path.name: None for path in paths}
     manifest = json.loads((incident / "manifest.json").read_text())
     assert manifest["sqliteRuntimeVersion"] == sqlite3.sqlite_version
+    assert manifest["cutoverProtocol"] == "cold-quarantine-then-replace-v2"
     assert manifest["damage"]["checkpointOutcome"] == (
-        "skipped_incoherent_wal_index"
+        "not_applicable_cold_quarantine"
     )
 
 
@@ -818,7 +811,7 @@ def test_real_rebuild_records_incoherent_fallback_without_checkpoint(
     assert record["status"] == "ok"
     assert record["publicationMechanism"] == "replace"
     assert record["damageShapeTokens"]["checkpointOutcome"] == (
-        "skipped_incoherent_wal_index"
+        "not_applicable_cold_quarantine"
     )
     conn = sqlite3.connect(str(db), timeout=15)
     try:
@@ -828,6 +821,42 @@ def test_real_rebuild_records_incoherent_fallback_without_checkpoint(
         ).fetchall() == [(7.0,)]
     finally:
         conn.close()
+
+
+def test_inconclusive_legacy_wal_evidence_refuses_replacement(
+    ns, tmp_path, monkeypatch
+):
+    """An inspection limit is not proof that a healthy main is corrupt."""
+    import _cctally_core
+    import _cctally_journal as jr
+    import _lib_stats_wal
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    wal = pathlib.Path(f"{db}-wal")
+    shm = pathlib.Path(f"{db}-shm")
+    wal.write_bytes(b"legacy-wal-evidence")
+    shm.write_bytes(b"legacy-shm-evidence")
+    before = {path.name: path.read_bytes() for path in (db, wal, shm)}
+    monkeypatch.setattr(
+        _lib_stats_wal,
+        "inspect_wal_index_family",
+        lambda _path: {
+            "schemaVersion": 1,
+            "verdict": "analysis_truncated",
+            "captureStable": True,
+            "reason": None,
+        },
+    )
+
+    with pytest.raises(jr.JournalError, match="could not prove.*safe"):
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture")
+        )
+
+    assert {path.name: path.read_bytes() for path in (db, wal, shm)} == before
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
 def test_a_failing_damage_scan_never_breaks_the_heal(ns, monkeypatch):
@@ -897,7 +926,7 @@ def _incident_manifest(app_dir: pathlib.Path) -> dict:
     return json.loads((incidents[0] / "manifest.json").read_text())
 
 
-def test_corrupt_old_family_records_a_skipped_checkpoint(ns):
+def test_corrupt_old_family_records_cold_quarantine(ns):
     import _cctally_core
 
     _seed_live_index()
@@ -907,9 +936,9 @@ def test_corrupt_old_family_records_a_skipped_checkpoint(ns):
     healed.close()
 
     damage = _incident_manifest(_cctally_core.APP_DIR)["damage"]
-    assert damage["checkpointOutcome"] == "skipped_corrupt"
+    assert damage["checkpointOutcome"] == "not_applicable_cold_quarantine"
     assert damage["preserved"]["schemaVersion"] == 1
-    assert damage["postCheckpoint"]["schemaVersion"] == 1
+    assert damage["postCheckpoint"] is None
 
 
 def _fail_in_place_pre_commit(monkeypatch):
@@ -932,23 +961,19 @@ def _fail_in_place_pre_commit(monkeypatch):
     monkeypatch.setattr(jr, "_publish_generation_in_place", stub)
 
 
-def test_healthy_old_family_records_a_completed_checkpoint(ns, monkeypatch):
+def test_healthy_old_family_is_not_replaced_after_precommit_failure(
+    ns, monkeypatch,
+):
     import _cctally_core
 
     _seed_live_index()
     _fail_in_place_pre_commit(monkeypatch)
-    assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=False)) == 0
-
-    damage = _incident_manifest(_cctally_core.APP_DIR)["damage"]
-    assert damage["checkpointOutcome"] == "checkpointed"
-    assert damage["preserved"]["method"] == "raw_scan"
-    assert damage["preserved"]["findings"] == []
-    assert damage["preserved"]["shapeToken"] == "none"
-    assert damage["postCheckpoint"]["method"] == "raw_scan"
-    assert damage["postCheckpoint"]["findings"] == []
+    assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=False)) == 3
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
-def test_preserved_and_post_checkpoint_scans_name_the_damaged_object(ns):
+def test_cold_quarantine_scan_names_the_damaged_object(ns):
     """The retained artifact is described, not just the live one.
 
     The preserved copy is taken BEFORE the explicit checkpoint and the
@@ -966,11 +991,14 @@ def test_preserved_and_post_checkpoint_scans_name_the_damaged_object(ns):
     ) is True
 
     damage = _incident_manifest(_cctally_core.APP_DIR)["damage"]
-    assert damage["checkpointOutcome"] == "checkpointed"
-    for scan in (damage["preserved"], damage["postCheckpoint"]):
-        named = [f for f in scan["findings"] if f["kind"] == "bad_root_page_type"]
-        assert [f["table"] for f in named] == ["quota_projection_state"]
-    assert damage["preserved"]["shapeToken"] == damage["postCheckpoint"]["shapeToken"]
+    assert damage["checkpointOutcome"] == "not_applicable_cold_quarantine"
+    named = [
+        finding
+        for finding in damage["preserved"]["findings"]
+        if finding["kind"] == "bad_root_page_type"
+    ]
+    assert [finding["table"] for finding in named] == ["quota_projection_state"]
+    assert damage["postCheckpoint"] is None
 
 
 # ==========================================================================
@@ -1012,7 +1040,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1009
+    assert _cctally_core.STATS_INDEX_EPOCH == 1010
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -1032,7 +1060,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1009
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1010
     finally:
         conn.close()
 
@@ -1056,7 +1084,9 @@ def test_a_rebuild_still_validates_with_the_stamp_table_present(ns):
         conn.close()
 
 
-def test_a_scratch_damaged_after_the_build_is_refused_before_publication(ns):
+def test_a_scratch_damaged_after_the_build_is_refused_before_publication(
+    ns, monkeypatch,
+):
     """The pre-publication check reads the bytes that will actually be
     published, on a connection that never saw them being written."""
     import _cctally_core
@@ -1065,23 +1095,23 @@ def test_a_scratch_damaged_after_the_build_is_refused_before_publication(ns):
     _seed_live_index()
     before = pathlib.Path(_cctally_core.DB_PATH).read_bytes()
 
-    real_remove = jr._remove_db_sidecars_strict
+    real_assert = jr._assert_stats_wal_sidecars_absent
+    calls = 0
 
-    def remove_then_damage(path):
-        real_remove(path)
+    def assert_then_damage(path, *, phase):
+        nonlocal calls
+        real_assert(path, phase=phase)
+        calls += 1
         candidate = pathlib.Path(path)
-        if ".rebuilding-" in candidate.name:
+        if calls == 1 and ".rebuilding-" in candidate.name:
             with candidate.open("r+b") as handle:
                 handle.write(b"not a database\x00")
 
-    jr._remove_db_sidecars_strict = remove_then_damage
-    try:
-        with pytest.raises(Exception):
-            jr.rebuild_stats_index(
-                context=jr.RebuildContext(trigger="test-fixture")
-            )
-    finally:
-        jr._remove_db_sidecars_strict = real_remove
+    monkeypatch.setattr(jr, "_assert_stats_wal_sidecars_absent", assert_then_damage)
+    with pytest.raises(Exception):
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture")
+        )
 
     assert pathlib.Path(_cctally_core.DB_PATH).read_bytes() == before, (
         "a pre-publication refusal must leave the old family live"
@@ -1117,25 +1147,8 @@ def test_a_successful_rebuild_records_both_verdicts_and_leaves_no_marker(ns):
     assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
-def test_a_published_family_ends_with_a_drained_wal(ns):
-    """This asserted a sidecar-free end state until issue #516.
-
-    Reaching that end state meant unlinking the live `-wal` and `-shm` after
-    the TRUNCATE checkpoint, which is outside SQLite's contract whenever any
-    connection still holds the database open. Re-measured on both LAN runners
-    (macOS, Python 3.13.14, SQLite 3.53.4), that unlink breaks a same-process
-    reader with `OperationalError: disk I/O error` and leaves a cross-process
-    one silently reading a STALE generation, once something writes after the
-    unlink and the reader had read before it — two conditions an earlier
-    thirteen-arrangement run never combined, which is why it reported the
-    sequence as harmless. The publication no longer unlinks anything, so the
-    read-only validation open leaves a drained WAL behind and SQLite removes it
-    on the next clean last close.
-
-    What the publication still owes is the property the old assertion was
-    standing in for: the WAL is DRAINED, so the published bytes are in the main
-    file and a fresh opener needs no recovery to read them.
-    """
+def test_a_published_family_uses_rollback_journaling_without_wal(ns):
+    """A published stats generation is complete in the main file with no WAL."""
     import _cctally_core
     import _cctally_journal as jr
 
@@ -1144,8 +1157,8 @@ def test_a_published_family_ends_with_a_drained_wal(ns):
 
     db = pathlib.Path(_cctally_core.DB_PATH)
     assert db.exists()
-    wal = pathlib.Path(f"{db}-wal")
-    assert not wal.exists() or wal.stat().st_size == 0
+    assert not pathlib.Path(f"{db}-wal").exists()
+    assert not pathlib.Path(f"{db}-shm").exists()
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -1153,15 +1166,10 @@ def test_a_published_family_ends_with_a_drained_wal(ns):
         conn.close()
 
 
-def test_idle_connection_keeps_sidecar_generation_across_in_place_publish(
+def test_idle_legacy_wal_holder_forces_restart_before_transition(
     ns, tmp_path
 ):
-    """A zero WAL is not permission to unlink an idle connection's SHM.
-
-    The production change this catches is any manual in-place-publication
-    cleanup that removes or replaces the visible WAL/SHM inode while a real
-    SQLite connection still owns the mapped generation.
-    """
+    """A zero WAL is not permission to convert an idle holder's generation."""
     import _cctally_core
     import _cctally_journal as jr
 
@@ -1205,107 +1213,15 @@ finally:
         assert shm.exists() and shm.stat().st_size >= 32768
         before = {"wal": wal.stat().st_ino, "shm": shm.stat().st_ino}
 
-        jr.rebuild_stats_index(
-            context=jr.RebuildContext(trigger="test-fixture")
-        )
-        after_publish = {
-            "wal": wal.stat().st_ino if wal.exists() else None,
-            "shm": shm.stat().st_ino if shm.exists() else None,
-        }
-
-        writer_script = """
-import json, sqlite3, sys
-conn = sqlite3.connect(sys.argv[1], timeout=15)
-try:
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS issue514_probe (value INTEGER)")
-    conn.execute("INSERT INTO issue514_probe VALUES (1)")
-    conn.commit()
-    checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    print(json.dumps({"checkpoint": list(checkpoint)}))
-finally:
-    conn.close()
-"""
-        writer = subprocess.run(
-            [sys.executable, "-c", writer_script, str(db)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        now = int(time.time())
-        hook_style = subprocess.run(
-            [
-                sys.executable,
-                str(CCTALLY),
-                "record-usage",
-                "--percent",
-                "8.0",
-                "--resets-at",
-                str(now + 3 * 86400),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        cli_consumer = subprocess.run(
-            [sys.executable, str(CCTALLY), "doctor", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        final_inodes = {
-            "wal": wal.stat().st_ino if wal.exists() else None,
-            "shm": shm.stat().st_ino if shm.exists() else None,
-        }
-        structural = (
-            _test_wal_index_snapshot(db)
-            if wal.exists() and wal.stat().st_size >= 32 and shm.exists()
-            else None
-        )
-        print(
-            "issue514_red_evidence="
-            + json.dumps(
-                {
-                    "beforeInodes": before,
-                    "afterPublishInodes": after_publish,
-                    "finalInodes": final_inodes,
-                    "writerReturncode": writer.returncode,
-                    "writerStdout": writer.stdout.strip(),
-                    "writerStderr": writer.stderr.strip(),
-                    "hookStyleReturncode": hook_style.returncode,
-                    "hookStyleStderr": hook_style.stderr.strip(),
-                    "cliConsumerReturncode": cli_consumer.returncode,
-                    "walIndex": structural,
-                },
-                sort_keys=True,
+        with pytest.raises(jr.JournalError, match="restart the dashboard"):
+            jr.rebuild_stats_index(
+                context=jr.RebuildContext(trigger="test-fixture")
             )
-        )
-
-        assert after_publish == before, (
-            "in-place publication replaced or unlinked sidecars still owned "
-            f"by the idle connection: before={before}, after={after_publish}"
-        )
-        assert writer.returncode == 0, writer.stderr
-        assert json.loads(writer.stdout)["checkpoint"] == [0, 0, 0]
-        assert hook_style.returncode == 0, hook_style.stderr
-        assert cli_consumer.returncode in (0, 2), cli_consumer.stderr
-        assert json.loads(cli_consumer.stdout)["schema_version"] == 1
-        assert final_inodes == before
-        assert structural is not None, "hook traffic must leave a current WAL"
-        assert structural["comparedFrames"] > 0
-        assert structural["walSalt"] == structural["shmSalt"]
-        assert structural["mappingMismatchCount"] == 0
-        probe = sqlite3.connect(str(db), timeout=15)
-        try:
-            assert probe.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
-            assert probe.execute(
-                "SELECT COUNT(*) FROM issue514_probe"
-            ).fetchone()[0] == 1
-            assert probe.execute(
-                "SELECT COUNT(*) FROM weekly_usage_snapshots"
-            ).fetchone()[0] >= 2
-        finally:
-            probe.close()
+        after_refusal = {
+            "wal": wal.stat().st_ino if wal.exists() else None,
+            "shm": shm.stat().st_ino if shm.exists() else None,
+        }
+        assert after_refusal == before
     finally:
         holder.terminate()
         try:
@@ -1313,6 +1229,16 @@ finally:
         except subprocess.TimeoutExpired:
             holder.kill()
             holder.communicate(timeout=10)
+
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    probe = sqlite3.connect(str(db), timeout=15)
+    try:
+        assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert probe.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    finally:
+        probe.close()
+    assert not wal.exists()
+    assert not shm.exists()
 
 
 def test_a_failed_post_publication_verdict_is_durable_and_refuses_the_next_open(
@@ -1802,25 +1728,13 @@ def _age_quarantine_incidents(app_dir: pathlib.Path, minutes: int) -> None:
 
 
 def test_a_later_publication_must_not_destroy_an_earlier_owed_verdict(ns):
-    """#496 S1 F1. Two runs interleave, and the SECOND one destroys the first
-    one's owed verdict by overwriting the single marker slot.
+    """#496 S1 F1. A pre-commit failure must restore the carried verdict.
 
-    KNOWN FAILING, owned by the stamp-resolution task (#496 S3 §5). Run A now
-    publishes in place, which leaves its scratch on disk after a COMMITTED
-    publication, so `_settle_prior_publication_verdict`'s `scratchPath` proxy
-    (`bin/_cctally_journal.py`, the `scratch exists -> owes nothing` branch)
-    and `_cctally_store._pending_stats_publication_never_replaced` both read a
-    committed publication as one that never replaced anything. Making them
-    mechanism-aware — resolving through `stats_publication_stamp` instead — is
-    exactly what that task ships, and this scenario is its acceptance.
-
-    Run A dies between `os.replace` and its verdict, so the marker beside the
-    destination still owes a verdict on bytes that are already live. Run B then
-    begins a fresh publication — `cmd_db_rebuild` takes maintenance EXCLUSIVE
-    without opening the live database through `stats_open_guarded`, so nothing
-    made it resolve A's marker first — and dies before its own `os.replace`.
-    The next opener then sees a pending marker beside run B's own scratch,
-    discards it as never-replaced, and accepts run A's never-validated index.
+    Run A dies after publishing but before its verdict and the live generation
+    is then made invalid. Run B settles that owed verdict, writes its own marker,
+    and dies before changing the live database. Its pre-commit cleanup may
+    reclaim its scratch, but must restore run A's failed marker rather than
+    accepting the invalid generation.
     """
     import _cctally_core
     import _cctally_db
@@ -1843,6 +1757,7 @@ def test_a_later_publication_must_not_destroy_an_earlier_owed_verdict(ns):
     run_a = json.loads(marker_path.read_text())
     assert run_a["status"] == "pending"
     run_a_record = run_a["recordPath"]
+    run_a_scratch = pathlib.Path(run_a["scratchPath"])
 
     # What run A published is invalid. Nothing on the ordinary open path
     # notices: the file carries the current epoch, so `open_db`'s zero-DDL fast
@@ -1865,14 +1780,12 @@ def test_a_later_publication_must_not_destroy_an_earlier_owed_verdict(ns):
     finally:
         jr._stats_rebuild_test_pause = real_pause
 
-    scratches = sorted(db.parent.glob("stats.db.rebuilding-*"))
-    assert scratches, (
-        "run B must leave its own scratch, which is what makes its marker look "
-        "discardable to the next opener"
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == [run_a_scratch], (
+        "run B's scratch must be reclaimed while run A's evidence remains"
     )
-    assert json.loads(marker_path.read_text())["scratchPath"] in [
-        str(path) for path in scratches
-    ], "run B's Phase 1 must have written a marker naming its own scratch"
+    restored = json.loads(marker_path.read_text())
+    assert restored["recordPath"] == run_a_record
+    assert restored["status"] == "failed"
 
     with pytest.raises(_cctally_db.StatsPublicationFailedError) as caught:
         _cctally_core.open_db()

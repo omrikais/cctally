@@ -5,7 +5,8 @@ import { test, expect } from '@playwright/test';
 //   - the off-board coarse-pointer 44px floor (real-box boundingBox ≥44),
 //   - BASKET-1: a non-empty basket stays reachable in the condensed mobile
 //     header after scroll (the @media display:none a JSDOM test can't see),
-//   - SHARE-1: the phone Share modal renders the Live preview before the knobs,
+//   - #503 S4: the phone Share modal renders ONE preview, placed visually
+//     first by CSS `order`, and keeps that instance across a viewport resize,
 //   - the 320px topbar: the doctor chip compacts (label hidden, status kept) and
 //     the document does not x-overflow with a non-empty basket.
 // Each targets S4 CSS/markup that the pre-S4 bundle lacks, so it is RED on the
@@ -97,25 +98,52 @@ test.describe('#293 S4 — off-board coarse-pointer 44px floor (hasTouch @ 768)'
   });
 });
 
-test.describe('#293 S4 SHARE-1 — phone Share renders preview-first (hasTouch @ 390)', () => {
+// #503 S4 §4.4 / #520 item 2 replaced #293 S4 SHARE-1's DOM-order assertion.
+// The share modal body is now ONE flat flex container and the single preview is
+// placed by `order`, so DOM order no longer encodes the visual order — the
+// visual order does, and only a real browser can read it.
+test.describe('#503 S4 — one Share preview, placed by CSS (hasTouch @ 390)', () => {
   test.use({ hasTouch: true, viewport: { width: 390, height: 740 } });
 
-  test('the Live preview precedes the knob stack in the DOM', async ({ page }) => {
+  test('one preview pane, visually first on phone, and it survives a resize', async ({ page }) => {
     await page.goto('/');
     await page.locator('#panel-forecast .share-icon').click();
     const modal = page.locator('.share-modal[role="dialog"]');
     await expect(modal).toBeVisible();
     await expect(modal.locator('.share-preview-col')).toBeVisible();
     await expect(modal.locator('.share-knobs-col')).toBeVisible();
-    const previewLeads = await modal.evaluate((root) => {
-      const p = root.querySelector('.share-preview-col');
-      const k = root.querySelector('.share-knobs-col');
-      // DOCUMENT_POSITION_FOLLOWING (4): knobs FOLLOWS preview → preview leads.
-      return !!(p && k && (p.compareDocumentPosition(k) & 4));
-    });
-    expect(previewLeads).toBe(true);
-    // Exactly one preview pane (no duplicate render across the branch).
+
+    // Exactly one instance — the defect was two, one per viewport branch.
     expect(await modal.locator('.share-preview-col').count()).toBe(1);
+
+    // Visual order, not DOM order: `order: 1` must paint the preview above the
+    // gallery and the knobs. Read the rendered box tops.
+    const tops = await modal.evaluate((root) => {
+      const top = (sel: string) => {
+        const el = root.querySelector(sel);
+        return el ? el.getBoundingClientRect().top : Number.NaN;
+      };
+      return {
+        preview: top('.share-preview-col'),
+        gallery: top('.share-gallery-section'),
+        knobs: top('.share-knobs-col'),
+      };
+    });
+    expect(tops.preview).toBeLessThan(tops.gallery);
+    expect(tops.preview).toBeLessThan(tops.knobs);
+
+    // The instance survives a viewport flip. Before the flattening this
+    // remounted the pane, discarding its fetched render — the privacy line
+    // reverted to its default wording for ~1.2s (#520 item 2). Tag the node
+    // and require the SAME node afterwards: asserting mere presence would pass
+    // against a remount.
+    await modal.evaluate((root) => {
+      root.querySelector('.share-preview-col')?.setAttribute('data-e2e-tag', 'keep');
+    });
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(modal.locator('.share-preview-col')).toBeVisible();
+    expect(await modal.locator('.share-preview-col').count()).toBe(1);
+    expect(await modal.locator('.share-preview-col[data-e2e-tag="keep"]').count()).toBe(1);
   });
 });
 

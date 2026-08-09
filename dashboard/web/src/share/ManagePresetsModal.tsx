@@ -9,11 +9,18 @@
 // record whole under one config writer lock, and answers a collision with
 // HTTP 409 `preset_name_conflict`.
 //
-// Esc closes the modal — registered at `modal` scope. The share
-// modal's overlay-scope Esc binding is gated by `when: () => !manageOpen`
-// (see ShareModal.tsx) so this modal's Esc binding fires first. Focus
-// restoration to the dropdown trigger is part of the M4.4 focus-restore
-// audit, not implemented here.
+// #503 S4 §3.1 / #531 item 2 — this dialog now honours the `aria-modal="true"`
+// it has always claimed. It used to render as a plain descendant of
+// `.share-modal` with no CSS rule of its own, so it computed to
+// `position: static; z-index: auto`: an in-flow block at the bottom of the
+// share modal that contained no focus and covered nothing. It now renders
+// inside a fixed `.share-manage-overlay`, traps Tab with `useModalFocus`, and
+// owns Escape at overlay layer 208 rather than at `modal` scope.
+//
+// ShareModal's `when: () => !manageOpen` guard stays, but it is no longer the
+// mechanism: at overlay/208 the ordering is structural — above the 205 preset
+// popovers, below the 210 composer, and below an armed confirmation at 220,
+// which must keep owning Escape while armed.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   listPresets, deletePreset, renamePreset, PRESET_NAME_CONFLICT,
@@ -22,13 +29,20 @@ import {
 import type { SharePanelId } from './types';
 import { dispatch } from '../store/store';
 import { useKeymap } from '../hooks/useKeymap';
+import { useModalFocus } from '../hooks/useModalFocus';
 import { sharePanelLabel } from './panelLabels';
+import { SHARE_PRESETS_TRIGGER_ID } from './PresetDropdown';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ConfirmAction, useConfirmHost, type ConfirmHost } from './ConfirmAction';
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  // Is the share modal still the store's topmost focus layer? Only the
+  // topmost surface traps Tab, so ShareModal hands the trap over rather than
+  // both surfaces claiming it. Defaults to `true` so a standalone render (and
+  // every existing test that does one) still traps.
+  shareIsTopmost?: boolean;
 }
 
 // Stable id for aria-labelledby — spec §12.4 names the dialog via the
@@ -76,7 +90,7 @@ interface Row {
   record: PresetRecord;
 }
 
-export function ManagePresetsModal({ open, onClose }: Props) {
+export function ManagePresetsModal({ open, onClose, shareIsTopmost = true }: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -84,47 +98,38 @@ export function ManagePresetsModal({ open, onClose }: Props) {
   // why this cannot be per-row state.
   const confirm = useConfirmHost();
 
+  // #503 S4 §3.1 — was scope:'modal', which fired only because ShareModal
+  // gates itself out with `when: () => !manageOpen`. At overlay/208 the
+  // ordering is structural: above the 205 preset popovers, below the 210
+  // composer, and below an armed confirmation at 220, which still owns Esc
+  // while armed.
   const bindings = useMemo(
     () => open
-      ? [{ key: 'Escape', scope: 'modal' as const, action: onClose }]
+      ? [{ key: 'Escape', scope: 'overlay' as const, layer: 208, action: onClose }]
       : [],
     [open, onClose],
   );
   useKeymap(bindings);
 
-  // Focus restoration (spec §12.8 + M4.4). Capture the active element
-  // the moment `open` transitions to true; restore it when `open`
-  // flips back to false. Mirrors <ShareModalRoot> and <ComposerModal>.
-  // We capture on the `open` true → keep the ref while open. The
-  // restore is invoked on the false transition, NOT on unmount, because
-  // the parent <ShareModal> keeps <ManagePresetsModal> rendered with
-  // `open=false` rather than unmounting — so a cleanup-only restore
-  // would never fire.
-  const triggerElementRef = useRef<HTMLElement | null>(null);
-  const wasOpenRef = useRef(false);
-  useEffect(() => {
-    if (open) {
-      if (!wasOpenRef.current) {
-        wasOpenRef.current = true;
-        triggerElementRef.current =
-          document.activeElement as HTMLElement | null;
-      }
-    } else if (wasOpenRef.current) {
-      wasOpenRef.current = false;
-      const el = triggerElementRef.current;
-      triggerElementRef.current = null;
-      if (el && typeof el.focus === 'function' && document.contains(el)) {
-        el.focus();
-      } else {
-        // Detached opener (rare — the share modal stays open above us
-        // while we're mounted). Blur the currently-focused element so
-        // it doesn't outlive the closed manage modal.
-        const active = document.activeElement as HTMLElement | null;
-        if (active && typeof active.blur === 'function') active.blur();
-        document.body.focus();
-      }
-    }
-  }, [open]);
+  // Focus containment + restoration. This REPLACES a hand-rolled effect that
+  // captured `document.activeElement` when `open` turned true — the "Manage
+  // presets…" item inside the preset dropdown, which closes as this dialog
+  // opens. The captured node was therefore always detached and the code always
+  // took its blur-and-focus-body fallback. `useModalFocus` resolves the trigger
+  // by id at restore time, so focus returns to the durable presets trigger.
+  //
+  // Do NOT mark `.share-modal` inert or aria-hidden while this is open:
+  // `useModalFocus`'s getFocusable rejects any element with such an ancestor,
+  // and this card is a descendant, so doing that would empty its own focusable
+  // set and disable the very trap being added.
+  const cardRef = useRef<HTMLDivElement>(null);
+  useModalFocus(cardRef, {
+    active: open,
+    // Only the topmost surface traps. ShareModal yields while we are open.
+    trapEnabled: shareIsTopmost && open,
+    triggerId: SHARE_PRESETS_TRIGGER_ID,
+    initialFocus: 'heading',
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -256,50 +261,56 @@ export function ManagePresetsModal({ open, onClose }: Props) {
 
   if (!open) return null;
   return (
-    <div
-      className="share-manage-modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={MANAGE_PRESETS_TITLE_ID}
-      onClick={(e) => e.stopPropagation()}
-    >
-      <ModalHeader
-        title="Manage presets"
-        titleId={MANAGE_PRESETS_TITLE_ID}
-        className="share-manage-header"
-        onClose={onClose}
-        closeClassName="share-manage-close"
-      />
-      {error ? (
-        <div className="share-manage-error" role="alert">{error}</div>
-      ) : null}
-      {rows.length === 0 && !error ? (
-        <p className="share-manage-empty">No saved presets yet.</p>
-      ) : null}
-      {rows.length > 0 ? (
-        <table className="share-manage-table">
-          <thead>
-            <tr>
-              <th>Panel</th>
-              <th id={MANAGE_PRESETS_HEADING_ID} tabIndex={-1}>Name</th>
-              <th>Saved at</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <ManagePresetRow
-                key={`${row.panel}/${row.name}`}
-                row={row}
-                busy={busy}
-                confirm={confirm}
-                onDelete={() => void handleDelete(row)}
-                onRename={(next, overwrite) => handleRename(row, next, overwrite)}
-              />
-            ))}
-          </tbody>
-        </table>
-      ) : null}
+    // The backdrop blocks pointer interaction with the share modal beneath and
+    // deliberately gains NO click-to-dismiss: that would be a new affordance in
+    // a corrections-only session.
+    <div className="share-manage-overlay">
+      <div
+        className="share-manage-modal"
+        ref={cardRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={MANAGE_PRESETS_TITLE_ID}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <ModalHeader
+          title="Manage presets"
+          titleId={MANAGE_PRESETS_TITLE_ID}
+          className="share-manage-header"
+          onClose={onClose}
+          closeClassName="share-manage-close"
+        />
+        {error ? (
+          <div className="share-manage-error" role="alert">{error}</div>
+        ) : null}
+        {rows.length === 0 && !error ? (
+          <p className="share-manage-empty">No saved presets yet.</p>
+        ) : null}
+        {rows.length > 0 ? (
+          <table className="share-manage-table">
+            <thead>
+              <tr>
+                <th>Panel</th>
+                <th id={MANAGE_PRESETS_HEADING_ID} tabIndex={-1}>Name</th>
+                <th>Saved at</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <ManagePresetRow
+                  key={`${row.panel}/${row.name}`}
+                  row={row}
+                  busy={busy}
+                  confirm={confirm}
+                  onDelete={() => void handleDelete(row)}
+                  onRename={(next, overwrite) => handleRename(row, next, overwrite)}
+                />
+              ))}
+            </tbody>
+          </table>
+        ) : null}
+      </div>
     </div>
   );
 }

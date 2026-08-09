@@ -1363,9 +1363,9 @@ def build(
     create_cache_db(cache_path)
 
     with sqlite3.connect(stats_path) as stats_conn:
-        # WAL is set by create_stats_db() but a fresh connect()
-        # re-asserts the pragma cheaply and matches production posture.
-        stats_conn.execute("PRAGMA journal_mode=WAL")
+        # create_stats_db() establishes production's rollback-journal posture.
+        stats_conn.execute("PRAGMA journal_mode=DELETE")
+        stats_conn.execute("PRAGMA synchronous=FULL")
         stats_conn.execute("PRAGMA foreign_keys = OFF")
         # Seed blocks FIRST so we know the open block's canonical
         # five_hour_window_key, then thread it into _populate_weeks so

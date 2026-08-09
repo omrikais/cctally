@@ -213,8 +213,12 @@ def test_kill_during_real_operator_rebuild_preserves_old_then_retries(
         f"{pause_point} preserved/quarantined a readable old family, which an "
         "in-place publication never does"
     )
-    assert pathlib.Path(f"{db}-wal").read_bytes() == wal_bytes
-    assert len(pathlib.Path(f"{db}-shm").read_bytes()) == len(shm_bytes)
+    if pause_point == "rebuild_before_cutover":
+        assert not pathlib.Path(f"{db}-wal").exists()
+        assert not pathlib.Path(f"{db}-shm").exists()
+    else:
+        assert pathlib.Path(f"{db}-wal").read_bytes() == wal_bytes
+        assert len(pathlib.Path(f"{db}-shm").read_bytes()) == len(shm_bytes)
 
     after_kill = _read_destination_in_separate_process(db)
     assert after_kill == before, (
@@ -270,57 +274,34 @@ raise SystemExit(
 """
 
 
-def test_physical_fallback_preserves_the_committed_wal_family(
+def test_physical_fallback_cold_quarantines_a_corrupt_rollback_family(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The physical fallback still preserves the family it finds, and what it
-    finds no longer includes a stranded WAL.
-
-    S1 ran preservation before the checkpoint so a committed WAL reached the
-    incident. #496 S3 attempts an in-place publish first, and closing that
-    attempt's connection checkpoints and removes the WAL, so a family preserved
-    after a failed attempt is the old generation logically but is not
-    byte-identical to the pre-attempt evidence — which the design states
-    explicitly (§4.1). The pristine WAL evidence now comes only from the heal
-    hook's own forensics bundle, captured before the rebuild starts. The
-    manifest below is what shows this: preservation still runs before the
-    fallback's own checkpoint, so a WAL missing from `movedFiles` was drained
-    by something earlier, and the in-place attempt is the only thing there.
-
-    The fallback is forced by a structural failure raised in the `PRE_COMMIT`
-    phase rather than by corrupting the destination, because a stranded WAL
-    holds page 1 and would mask a corrupted header in the main file.
-    """
+    """Confirmed corruption moves main aside before replacement; no WAL exists."""
     env = _isolated_env(tmp_path)
     db = _seed(env)
-    wal_bytes, _shm_bytes = _strand_committed_wal_family(db, tmp_path)
-    assert wal_bytes
+    before = db.read_bytes()
+    with db.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
+    corrupt = db.read_bytes()
+    assert corrupt != before
 
-    rebuilt = subprocess.run(
-        [sys.executable, "-c", _FORCED_PHYSICAL_REBUILD, str(ROOT)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    rebuilt = _cli(env, "db", "rebuild", "--db", "stats")
     assert rebuilt.returncode == 0, rebuilt.stderr
 
     incidents = sorted((db.parent / "quarantine").glob("stats.db-*"))
     assert len(incidents) == 1
     incident = incidents[-1]
     manifest = json.loads((incident / "manifest.json").read_text())
-    assert manifest["cutoverProtocol"] == "preserve-then-atomic-replace-v1"
+    assert manifest["cutoverProtocol"] == "cold-quarantine-then-replace-v2"
     assert manifest["complete"] is True
     assert manifest["movedFiles"] == ["stats.db"]
     assert manifest["familySizes"]["stats.db"] == (
         (incident / "stats.db").stat().st_size
     )
     assert manifest["familySizes"]["stats.db"] > 0
-    # The preserved main file carries the drained WAL's committed content, so
-    # the generation survived even though its sidecars did not.
-    preserved = _read_destination_in_separate_process(incident / "stats.db")
-    assert preserved["ok"] is True
-    assert preserved["rows"] == [[7.0, preserved["rows"][0][1]]]
+    assert (incident / "stats.db").read_bytes() == corrupt
     assert not pathlib.Path(f"{db}-wal").exists()
     assert not pathlib.Path(f"{db}-shm").exists()
 

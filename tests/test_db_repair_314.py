@@ -212,6 +212,41 @@ def test_repair_preserves_effective_user_version_from_wal(
         repaired.close()
 
 
+def test_repair_refuses_incoherent_wal_before_open_or_checkpoint(
+    monkeypatch, tmp_path
+):
+    import _cctally_db
+    import _lib_stats_wal
+
+    source = tmp_path / "stats.db"
+    _seed_corrupt_stats(source)
+    wal = pathlib.Path(f"{source}-wal")
+    shm = pathlib.Path(f"{source}-shm")
+    wal.write_bytes(b"incoherent-wal")
+    shm.write_bytes(b"incoherent-shm")
+    before = {path.name: path.read_bytes() for path in (source, wal, shm)}
+    monkeypatch.setattr(
+        _lib_stats_wal,
+        "inspect_wal_index_family",
+        lambda _path: {"verdict": "wal_index_mapping_mismatch"},
+    )
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("repair opened an incoherent WAL family")
+
+    monkeypatch.setattr(_cctally_db.sqlite3, "connect", forbidden_connect)
+    rc, counts, version, guard, reason = _cctally_db._repair_preflight_and_copy(
+        source,
+        tmp_path / "backup.db",
+        tmp_path / "snapshot.db",
+        timeout_ms=100,
+    )
+
+    assert (rc, counts, version, guard) == (3, {}, None, None)
+    assert "incoherent" in reason.lower()
+    assert {path.name: path.read_bytes() for path in (source, wal, shm)} == before
+
+
 def test_repair_refuses_healthy_database_without_creating_backup(
     monkeypatch, tmp_path, capsys
 ):
@@ -442,6 +477,117 @@ def test_repair_swap_failure_keeps_checkpointed_live_db_coherent(
     ]
     assert len(backup_mains) == 1
     assert pathlib.Path(str(backup_mains[0]) + "-wal").exists()
+
+
+def test_repair_never_unlinks_live_stats_wal_or_shm(
+    monkeypatch, tmp_path, capsys
+):
+    c = _ns(monkeypatch, tmp_path)
+    source = c._cctally_core.DB_PATH
+    _seed_corrupt_wal_family(source, tmp_path)
+    real_unlink = pathlib.Path.unlink
+
+    def guarded_unlink(path, *args, **kwargs):
+        if str(path) in {f"{source}-wal", f"{source}-shm"}:
+            raise AssertionError("application unlinked a live stats sidecar")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", guarded_unlink)
+    assert c.cmd_db_repair(_repair_args()) == 0, capsys.readouterr().err
+
+
+def test_post_drain_sidecars_never_overwrite_exact_backup_members(tmp_path):
+    import _cctally_db
+
+    source = tmp_path / "stats.db"
+    backup = tmp_path / "stats.db.bak-corrupt-malformed-20260809T120000Z"
+    original = pathlib.Path(str(backup) + "-wal")
+    survivor = pathlib.Path(str(source) + "-wal")
+    original.write_bytes(b"exact pre-checkpoint WAL evidence")
+    survivor.write_bytes(b"post-drain WAL survivor")
+    original_inode = original.stat().st_ino
+
+    moved = _cctally_db._preserve_post_drain_sidecars(source, backup)
+
+    assert original.read_bytes() == b"exact pre-checkpoint WAL evidence"
+    assert original.stat().st_ino == original_inode
+    assert not survivor.exists()
+    assert len(moved) == 1
+    assert moved[0].name.startswith(f"{backup.name}.post-drain-")
+    assert moved[0].name.endswith("-wal")
+    assert moved[0].read_bytes() == b"post-drain WAL survivor"
+
+
+def test_repair_forced_survivor_keeps_classified_wal_exact(
+    monkeypatch, tmp_path, capsys
+):
+    c = _ns(monkeypatch, tmp_path)
+    import _cctally_db
+
+    source = c._cctally_core.DB_PATH
+    _seed_corrupt_wal_family(source, tmp_path)
+    classified = {}
+    real_write_classification = _cctally_db._write_backup_classification_sidecar
+
+    def record_classified_family(stem, **kwargs):
+        member = pathlib.Path(str(stem) + "-wal")
+        classified.update(
+            stem=stem,
+            bytes=member.read_bytes(),
+            inode=member.stat().st_ino,
+        )
+        return real_write_classification(stem, **kwargs)
+
+    real_open_pids = _cctally_db._db_family_open_pids
+    scan_count = 0
+    survivor_bytes = b"forced post-drain WAL survivor"
+
+    def force_survivor_on_final_scan(path):
+        nonlocal scan_count
+        scan_count += 1
+        result = real_open_pids(path)
+        if scan_count == 2:
+            pathlib.Path(str(path) + "-wal").write_bytes(survivor_bytes)
+        return result
+
+    monkeypatch.setattr(
+        _cctally_db,
+        "_write_backup_classification_sidecar",
+        record_classified_family,
+    )
+    monkeypatch.setattr(
+        _cctally_db, "_db_family_open_pids", force_survivor_on_final_scan
+    )
+
+    assert c.cmd_db_repair(_repair_args()) == 0, capsys.readouterr().err
+
+    backup_wal = pathlib.Path(str(classified["stem"]) + "-wal")
+    assert backup_wal.read_bytes() == classified["bytes"]
+    assert backup_wal.stat().st_ino == classified["inode"]
+    post_drain = list(
+        source.parent.glob(f"{classified['stem'].name}.post-drain*-wal")
+    )
+    assert len(post_drain) == 1
+    assert post_drain[0].read_bytes() == survivor_bytes
+
+
+def test_repair_second_cold_drain_aborts_before_family_move(
+    monkeypatch, tmp_path, capsys
+):
+    c = _ns(monkeypatch, tmp_path)
+    import _cctally_db
+
+    source = c._cctally_core.DB_PATH
+    before = _seed_corrupt_stats(source)
+    scans = iter((set(), {4242}))
+    monkeypatch.setattr(
+        _cctally_db, "_db_family_open_pids", lambda _path: next(scans)
+    )
+
+    assert c.cmd_db_repair(_repair_args()) == 3
+    assert "new reader" in capsys.readouterr().err.lower()
+    assert source.read_bytes() == before
+    assert not list((source.parent / "quarantine").glob("stats.db-*"))
 
 
 def test_repair_setup_failure_is_staged_and_releases_marker(

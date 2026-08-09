@@ -49,10 +49,10 @@ def _write_claude_json(path, account_uuid):
 
 # --------------------------------------------------------------------------
 
-def test_epoch_is_1009(ns):
+def test_epoch_is_1010(ns):
     # A deliberate literal tripwire, not a tautology: asserting against
     # `STATS_INDEX_EPOCH` would pass forever and stop reporting a bump.
-    assert _cctally_core.STATS_INDEX_EPOCH == 1009
+    assert _cctally_core.STATS_INDEX_EPOCH == 1010
 
 
 def test_transition_appends_op_with_resolved_identity(ns, tmp_path):

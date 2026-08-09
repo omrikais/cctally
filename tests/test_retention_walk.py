@@ -203,6 +203,22 @@ def test_a_machine_backup_whose_sidecar_no_longer_matches_is_unclassified(
     assert member.classification is None
 
 
+def test_post_drain_evidence_does_not_stale_the_exact_backup_family(
+    tmp_path, monkeypatch,
+):
+    _ns, core, ret = _load(tmp_path, monkeypatch)
+    stem = build_backup(core.APP_DIR, "stats.db", "20260101T000000")
+    survivor = core.APP_DIR / f"{stem.name}.post-drain-wal"
+    survivor.write_bytes(b"late survivor")
+
+    scan = ret.gather_retained_artifacts()
+    by_id = {member.id: member for member in scan.members}
+
+    assert by_id[stem.name].classification == "exact"
+    assert by_id[survivor.name].kind == "backup"
+    assert by_id[survivor.name].classification is None
+
+
 @pytest.mark.parametrize("include", [False, True])
 def test_include_backups_only_reaches_the_user_shaped_stem(
     tmp_path, monkeypatch, include,

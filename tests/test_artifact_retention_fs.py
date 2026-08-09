@@ -408,24 +408,14 @@ def test_a_resume_takes_retention_shared_before_resuming(tmp_path, monkeypatch):
     assert obs.index("resume-ran") < obs.index("retention-released")
 
 
-def test_a_producer_holds_retention_shared_across_both_manifest_writes(
+def test_a_producer_holds_retention_shared_across_cold_quarantine_manifest(
     tmp_path, monkeypatch,
 ):
-    """The rebuild's hold is a deliberate SUPERSET, and both writes are in it.
-
-    `_preserve_stats_family_for_cutover` writes the incident manifest before
-    the explicit checkpoint, and `_record_post_checkpoint_damage` rewrites the
-    same file afterwards with the outcome that did not exist yet. Reclamation
-    observing the gap between them would see the incident half-described, so
-    the hold spans both — which is also why the hold is not narrowed to exclude
-    the quota cache leg (see the lock-order exception in
-    `docs/journal-gotchas.md`).
-    """
+    """The cold-quarantine manifest is durable inside retention SHARED."""
     _ns, _core, _store = _load(tmp_path, monkeypatch)
     import _cctally_journal as jr
     import _lib_journal as lj
     import _lib_accounts
-    import _lib_stats_publish as sp
 
     # A live stats.db family for the cutover to preserve.
     jr.append_record(lj.make_account_observe(
@@ -440,39 +430,26 @@ def test_a_producer_holds_retention_shared_across_both_manifest_writes(
     _trace_retention(monkeypatch, obs)
 
     real_preserve = jr._preserve_stats_family_for_cutover
-    real_post = jr._record_post_checkpoint_damage
 
     def preserve(*a, **kw):
         incident = real_preserve(*a, **kw)
         obs.note("preservation-manifest-written")
         return incident
 
-    def post(*a, **kw):
-        result = real_post(*a, **kw)
-        obs.note("post-checkpoint-manifest-rewritten")
-        return result
-
     monkeypatch.setattr(jr, "_preserve_stats_family_for_cutover", preserve)
-    monkeypatch.setattr(jr, "_record_post_checkpoint_damage", post)
-
-    def fail_structurally(conn, scratch, **kwargs):
-        # Forces the physical fallback, which is the only path that preserves.
-        exc = sqlite3.DatabaseError("database disk image is malformed")
-        setattr(exc, "_cctally_publication_phase", sp.PRE_COMMIT)
-        raise exc
-
-    monkeypatch.setattr(jr, "_publish_generation_in_place", fail_structurally)
+    db = pathlib.Path(_core.DB_PATH)
+    with db.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
 
     jr.rebuild_stats_index(
         context=jr.RebuildContext(trigger="db-rebuild")
     )
 
     assert "preservation-manifest-written" in obs, obs.events
-    assert "post-checkpoint-manifest-rewritten" in obs, obs.events
     assert (
         obs.index("retention-shared-acquired")
         < obs.index("preservation-manifest-written")
-        < obs.index("post-checkpoint-manifest-rewritten")
         < obs.index("retention-released")
     ), obs.events
 
@@ -517,12 +494,11 @@ def test_the_split_exposes_reserve_and_spawn_separately(tmp_path, monkeypatch):
     assert callable(store.complete_stats_corruption_heal)
 
 
-def test_the_heal_marker_is_durable_before_maintenance_is_released(
+def test_the_heal_marker_is_durable_before_the_worker_is_spawned(
     tmp_path, monkeypatch,
 ):
     _ns, core, store = _load(tmp_path, monkeypatch)
     obs = _Observer()
-    _trace_retention(monkeypatch, obs)
 
     real_write = sys.modules["_cctally_db"]._atomic_write_private_json
     marker = store._stats_heal_marker_path()
@@ -535,13 +511,6 @@ def test_the_heal_marker_is_durable_before_maintenance_is_released(
     monkeypatch.setattr(
         sys.modules["_cctally_db"], "_atomic_write_private_json", write
     )
-    real_release = store._release_stats_maintenance_for_heal
-
-    def release(fd):
-        obs.note("maintenance-released")
-        return real_release(fd)
-
-    monkeypatch.setattr(store, "_release_stats_maintenance_for_heal", release)
 
     from _cctally_update import _spawn_detached  # noqa: F401
     import _cctally_update
@@ -555,11 +524,13 @@ def test_the_heal_marker_is_durable_before_maintenance_is_released(
     _drive_heal_hook(store, core, monkeypatch)
 
     assert "request-marker-fsynced" in obs, obs.events
-    assert obs.index("request-marker-fsynced") < obs.index("maintenance-released")
-    assert obs.index("maintenance-released") < obs.index("worker-spawned")
+    assert obs.index("request-marker-fsynced") < obs.index("worker-spawned")
+    assert not any(event.startswith("retention-") for event in obs.events), (
+        "the detector must not wait for maintenance/retention before admission"
+    )
 
 
-def test_a_declined_heal_writes_no_marker_and_needs_no_bridge(
+def test_an_unconfirmed_worker_enriches_then_clears_the_request(
     tmp_path, monkeypatch,
 ):
     _ns, core, store = _load(tmp_path, monkeypatch)
@@ -593,79 +564,46 @@ def test_a_declined_heal_writes_no_marker_and_needs_no_bridge(
         )
 
     monkeypatch.setattr(db_mod, "write_corruption_forensics", unconfirmed)
-    _drive_heal_hook(store, core, monkeypatch, expect_deferral=False)
+    import _cctally_update
+    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: True)
+    _drive_heal_hook(store, core, monkeypatch)
+    assert marker.exists(), "admission precedes worker-side classification"
+    assert json.loads(marker.read_text())["forensicsPath"] is None
+
+    import types
+    assert store.cmd_stats_corruption_heal_internal(types.SimpleNamespace()) == 0
 
     assert not marker.exists()
-    assert "request-marker-fsynced" not in obs
+    assert obs.events.count("request-marker-fsynced") == 2, obs.events
     assert obs.index("retention-released") > obs.index("decision-terminal")
+    assert not (core.APP_DIR / "quarantine").exists()
 
 
-def test_a_coalesced_admission_is_terminalized_before_retention_is_released(
+def test_a_coalesced_detection_counts_on_the_one_admitted_occurrence(
     tmp_path, monkeypatch,
 ):
-    """§5.3's second terminal decision, made explicit.
-
-    A coalesced reservation releases the shared hold over a forensics bundle
-    the durable request marker does not name — the marker names the earlier
-    detection's bundle. That is legitimate only because the decision is
-    TERMINAL for the bundle this process wrote: no worker will ever read it,
-    exactly as for a decline. §3.3 then governs it as an unreferenced bundle,
-    which self-classifies from its own `trigger.origin`.
-
-    What was missing is the record. §5.3 requires that a failed or coalesced
-    admission be terminalized rather than left at `detected` forever, and the
-    ring entry stayed at `detected` with nothing saying the bundle was
-    abandoned.
-    """
+    """A loser writes no duplicate bundle or incident-shaped ring entry."""
     _ns, core, store = _load(tmp_path, monkeypatch)
-    obs = _Observer()
-    _trace_retention(monkeypatch, obs)
     import _cctally_update
 
     monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: True)
 
-    real_update = store.update_stats_heal_event
-
-    def update(heal_id, **fields):
-        if fields.get("outcome"):
-            obs.note(f"terminalized-{fields['outcome']}")
-        return real_update(heal_id, **fields)
-
-    monkeypatch.setattr(store, "update_stats_heal_event", update)
-
-    # The bundle stamp has second precision, so two detections inside one
-    # second would share a path and there would be no second bundle to strand.
-    # Production detections are seconds apart inside the 60s retry window.
-    stamps = iter(("20260101T000001Z", "20260101T000002Z"))
-    monkeypatch.setattr(
-        sys.modules["_cctally_db"], "_db_backup_timestamp", lambda: next(stamps)
-    )
-
     _drive_heal_hook(store, core, monkeypatch)
     first = json.loads(store._stats_heal_marker_path().read_text())
-    obs.events.clear()
 
     # A second detection inside the retry window coalesces onto the first.
     _drive_heal_hook(store, core, monkeypatch)
 
     marker = json.loads(store._stats_heal_marker_path().read_text())
     assert marker["healId"] == first["healId"], marker
-    assert marker["forensicsPath"] == first["forensicsPath"], marker
+    assert marker["forensicsPath"] is None
 
-    events = {e["healId"]: e for e in store.read_stats_heal_events()}
-    fresh = [e for hid, e in events.items() if hid != first["healId"]]
-    assert len(fresh) == 1, events
-    abandoned = fresh[0]
-    assert abandoned["outcome"] == "coalesced", abandoned
-    assert abandoned["forensicsPath"], abandoned
-    assert abandoned["forensicsPath"] != first["forensicsPath"], abandoned
-    # The bundle it names exists and self-classifies (§3.3), which is what
-    # makes releasing the hold over it safe.
-    bundle = json.loads(pathlib.Path(abandoned["forensicsPath"]).read_text())
-    assert bundle["trigger"]["origin"] == "corruption-heal", bundle
-
-    assert "terminalized-coalesced" in obs, obs.events
-    assert obs.index("terminalized-coalesced") < obs.index("retention-released")
+    events = store.read_stats_heal_events()
+    assert len(events) == 1, events
+    assert events[0]["healId"] == first["healId"]
+    assert events[0]["outcome"] == "admitted"
+    assert events[0]["coalescedDetections"] == 1
+    assert list(core.LOG_DIR.glob("stats.db-corruption-forensics-*.json")) == []
 
 
 def test_admission_policy_is_unchanged_by_the_split(tmp_path, monkeypatch):

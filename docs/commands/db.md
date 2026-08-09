@@ -424,29 +424,36 @@ current binary.
 The repair sequence is fail-safe:
 
 1. Create a crash-recoverable repair marker that blocks new cctally stats
-   opens, then refuse unless all earlier main/WAL/SHM handles are closed.
-2. Prove the database is malformed, acquire SQLite's writer lock, and preserve
-   exact `stats.db`, `stats.db-wal`, and `stats.db-shm` bytes under a
+   opens, then refuse unless all earlier main/journal/WAL/SHM handles are closed.
+2. Inspect any legacy WAL/SHM pair before opening SQLite and refuse without
+   mutation unless its mapping is proven coherent. Prove the database is
+   malformed, acquire SQLite's writer lock, and preserve exact `stats.db`,
+   `stats.db-journal`, `stats.db-wal`, and `stats.db-shm` bytes under a
    timestamped `stats.db.bak-corrupt-malformed-*` family before replacing
    anything.
-3. Checkpoint all committed WAL frames into the old main file, acquire one
-   write exclusion that remains held through recovery and replacement, and
-   recover a private same-filesystem main-file copy.
+3. For a proven-coherent legacy WAL only, checkpoint its committed frames into
+   the old main file. Current rollback-journal stats performs no checkpoint.
+   Hold one write exclusion through recovery and recover a private
+   same-filesystem main-file copy.
 4. Restore SQLite's WAL-aware effective `PRAGMA user_version`, run full
    `PRAGMA integrity_check`, and verify `weekly_usage_snapshots` remains
    readable and row-count equal. If the
    source count cannot be read, refuse the automated swap rather than claim
    preservation without proof. Report other table-count losses or unreadable
    source tables explicitly.
-5. Atomically replace the live main file while the continuous writer guard is
-   still held, then close the old handle and remove only the now-empty stale
-   WAL/SHM sidecars. The recovered file is mode `0600`.
+5. Close the writer guard, prove a second cold whole-family drain, move any
+   remaining journal members to unique protected post-drain evidence names
+   without overwriting the classified pre-checkpoint family, then atomically
+   replace `stats.db` and fsync the parent directory. The recovered file is
+   mode `0600`.
 
-A failure before replacement leaves the live logical contents in place (a WAL
-checkpoint may have changed their physical representation) and keeps the exact
-pre-checkpoint corrupt family for manual analysis. Replacement failure leaves
-the coherent old main file and empty sidecars in place. A healthy database is
-refused before a backup or replacement is created. `cache.db` is fully
+A failure before replacement leaves the live logical contents in place (a
+proven-coherent legacy WAL checkpoint may have changed their physical
+representation) and keeps the exact pre-checkpoint corrupt family for manual
+analysis. Replacement failure leaves the coherent old main file in place; any
+journal members remain preserved under separate post-drain evidence names. A
+healthy database is refused before a backup or replacement is created.
+`cache.db` is fully
 re-derivable and is not a repair target; use `cctally cache-sync --rebuild`
 instead.
 
@@ -495,6 +502,13 @@ every write crawl past the busy timeout so `cctally` commands fail with
 the WAL contained; this command is the manual escape hatch and the
 `doctor` `cache.db WAL size` remediation for a pathological case.
 
+`stats.db` no longer has a WAL to drain: it uses `DELETE` / `FULL` rollback
+journaling. `--db stats` is retained only as an explicit retired-command
+response and exits `2` without opening or creating a database. Text mode writes
+`cctally: stats.db uses rollback journaling; no WAL checkpoint is applicable.`
+to stderr. JSON mode emits `schemaVersion`, `db: "stats.db"`,
+`status: "notApplicable"`, and `reason` on stdout, then exits `2`.
+
 It opens the target via a **raw existing-file-only** connection
 (`sqlite3.connect("file:<path>?mode=rw", uri=True)`, guarded by an
 `exists()` check) — explicitly **not** `open_cache_db()` / `open_db()`,
@@ -512,7 +526,7 @@ the dev data dir; the installed binary drains prod).
 
 | Flag | Description |
 | --- | --- |
-| `--db {cache,stats}` | Which DB to drain. Default **`cache`** (the DB that bloats, and the re-derivable one). No `--db all`. |
+| `--db {cache,stats}` | Which target to request. Default **`cache`**. `stats` is a retired target that returns exit 2; there is no `--db all`. |
 | `--json` | Emit a `schemaVersion: 1` envelope instead of text. |
 
 - **`truncated`** = the checkpoint reset the WAL (`busy=0`) **and** the
@@ -530,7 +544,7 @@ the dev data dir; the installed binary drains prod).
 
 ### Exit codes
 
-`0` drained, already-small, or DB absent; `3` (staged) the target stayed
+`0` cache drained, already-small, or absent; `2` stats target is not applicable; `3` (staged) the cache target stayed
 `busy` / the WAL was not fully truncated through the timeout — an
 actionable "something is still holding it" signal.
 
@@ -595,12 +609,15 @@ actually returns that space to the filesystem. `--db` selects `cache` (default),
 `conversations`, `stats`, or `all`.
 
 This is **never automatic** and always explicit. VACUUM needs exclusive access:
-the command drains the WAL and rewrites the file under a real SQLite
-`PRAGMA locking_mode=EXCLUSIVE`, so a running dashboard (or any other cctally
-process reading the DB) makes it **fail promptly** rather than hang or race —
-stop the dashboard and retry. Because VACUUM writes a full temporary copy of the
-database, the command also refuses up front when free disk is below roughly twice
-the file size plus its WAL. On success it reports the space reclaimed.
+the command drains WAL for cache/conversations and rewrites the file under a
+real SQLite `PRAGMA locking_mode=EXCLUSIVE`, so a running dashboard (or any
+other cctally process reading the DB) makes it **fail promptly** rather than
+hang or race — stop the dashboard and retry. Current rollback-journal
+`stats.db` performs no checkpoint. A legacy WAL stats family is refused without
+opening SQLite; complete the epoch rebuild first. Because VACUUM writes a full
+temporary copy of the database, the command also refuses up front when free
+disk is below roughly twice the file size plus any WAL. On success it reports
+the space reclaimed.
 
 ### Exit codes
 

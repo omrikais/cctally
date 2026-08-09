@@ -659,24 +659,37 @@ def test_source_aware_harness_uses_bash_3_compatible_read_loops():
 
 
 def test_source_aware_harness_is_a_required_bundle_gate():
+    """#529 S1 retired the narrow `required_harnesses` list of #446 Task B: the
+    estate manifest now declares EVERY harness and admission requires exact set
+    equality in both directions, so this gate is asserted against the manifest
+    rather than against a hardcoded shell array."""
     root = Path(__file__).resolve().parents[1]
     bundle = (root / "bin" / "cctally-test-all").read_text(encoding="utf-8")
-
-    required_line = next(
-        line for line in bundle.splitlines() if line.startswith("required_harnesses=(")
+    manifest = json.loads(
+        (root / "tests" / "authoritative-test-manifest.json").read_text(
+            encoding="utf-8"
+        )
     )
-    required = set(required_line.removeprefix("required_harnesses=(").removesuffix(")").split())
-    assert {"codex-quota", "source-aware"} <= required
+    rows = {row["name"]: row for row in manifest["harnesses"]}
+
+    assert {"codex-quota", "source-aware"} <= set(rows)
+    assert rows["codex-quota"]["visibility"] == "public"
+    assert rows["source-aware"]["visibility"] == "public"
 
     # test-remote is maintainer-local and deliberately unmirrored, so it is
     # required only where it is supposed to exist: demanding it unconditionally
     # took every public CI job down on the v1.89.0 snapshot before a single
-    # harness ran. The behavioral contract (private tree refuses a missing or
+    # harness ran. Declaring it `private` is what scopes it to the private
+    # profile now. The behavioral contract (private tree refuses a missing or
     # non-executable harness; public subset plans cleanly without it) is pinned
-    # in tests/test_test_all_scheduler.py; guard the conditional here so it
+    # in tests/test_test_all_scheduler.py; guard the discriminator here so it
     # cannot be dropped back to an unconditional literal unnoticed.
-    assert "required_harnesses+=(test-remote)" in bundle
+    assert rows["test-remote"]["visibility"] == "private"
     assert '[ -f "$REPO_ROOT/.mirror-allowlist" ]' in bundle
+    assert "contract_admit_harnesses" in bundle
+    # The retired list must not creep back: two admission mechanisms would
+    # disagree the moment one of them was updated alone.
+    assert "required_harnesses=(" not in bundle
 
 
 def _live_release_version(root: Path) -> str:

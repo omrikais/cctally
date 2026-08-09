@@ -1,13 +1,19 @@
-// #293 S4 SHARE-1 — the phone Share form gets a preview-FIRST render reorder so
-// editing a top-of-stack knob gives immediate feedback. Because .share-preview-col
-// is nested inside .share-main-section (a separate flex parent from the sibling
-// gallery), CSS `order` cannot hoist it — a useIsMobile()-gated render reorder is
-// required. Desktop keeps the two-pane (knobs | preview) layout byte-identical.
+// #293 S4 SHARE-1 gave the phone Share form a preview-FIRST render reorder,
+// because `.share-preview-col` was nested inside `.share-main-section` — a
+// separate flex parent from the sibling gallery — so a CSS `order` could not
+// hoist it and a useIsMobile()-gated render reorder was required.
 //
-// JSDOM can't evaluate the @media 16px / 44px rules (those are the ui-qa /
-// hasTouch Playwright gate); the DOM ORDER is the real, non-vacuous thing to
-// assert here. Non-vacuous: with the reorder absent, the mobile branch renders
-// the desktop knobs-first order and the "preview precedes knobs" case is RED.
+// #503 S4 §4.4 removed that constraint. The body is now ONE flat flex
+// container holding the gallery, knobs and preview as siblings, so a single
+// `<PreviewPane>` is placed by `order` at both breakpoints. The mutually
+// exclusive DOM-order cases are therefore gone: what replaces them asserts one
+// instance and that a viewport flip preserves it, which is the #520 item 2
+// defect (the flip remounted the pane, discarded its fetched render, and
+// reverted the privacy line for ~1.2s).
+//
+// JSDOM cannot evaluate `order` or the @media 16px / 44px rules — those are
+// the ui-qa / hasTouch Playwright gate. Instance identity across a flip is the
+// real, non-vacuous thing to assert here.
 import { render, act, waitFor, cleanup } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShareModalRoot } from './ShareModalRoot';
@@ -113,33 +119,99 @@ async function openShare() {
 
 const FOLLOWING = 4; // Node.DOCUMENT_POSITION_FOLLOWING
 
-describe('#293 S4 SHARE-1 — mobile preview-first render reorder', () => {
-  it('mobile: the Live preview precedes the knob stack in DOM order', async () => {
-    stubMatchMedia(true);
-    await openShare();
-    const preview = document.querySelector('.share-preview-col');
-    const knobs = document.querySelector('.share-knobs-col');
-    expect(preview).not.toBeNull();
-    expect(knobs).not.toBeNull();
-    // knobs FOLLOWS preview → preview leads.
-    expect(preview!.compareDocumentPosition(knobs!) & FOLLOWING).toBeTruthy();
-  });
+// #503 S4 §4.4 / #520 item 2 — a flippable matchMedia. `useIsMobile` reads
+// `mql.matches` in an effect and then follows `change` events, so a plain
+// re-stub cannot move it: the test has to deliver the event the hook listens
+// for. Without that, a "viewport flip" case would assert nothing.
+function stubFlippableMatchMedia(initialMobile: boolean) {
+  const listeners = new Set<(e: { matches: boolean }) => void>();
+  let mobile = initialMobile;
+  vi.stubGlobal('matchMedia', (q: string) => ({
+    get matches() { return mobile && q === MOBILE_MEDIA_QUERY; },
+    media: q,
+    onchange: null,
+    addEventListener: (_t: string, cb: (e: { matches: boolean }) => void) => {
+      if (q === MOBILE_MEDIA_QUERY) listeners.add(cb);
+    },
+    removeEventListener: (_t: string, cb: (e: { matches: boolean }) => void) => {
+      listeners.delete(cb);
+    },
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  }));
+  return {
+    flip(next: boolean) {
+      mobile = next;
+      listeners.forEach((cb) => cb({ matches: next }));
+    },
+    listenerCount() { return listeners.size; },
+  };
+}
 
-  it('desktop: the knob stack precedes the Live preview (two-pane preserved)', async () => {
-    stubMatchMedia(false);
-    await openShare();
-    const preview = document.querySelector('.share-preview-col');
-    const knobs = document.querySelector('.share-knobs-col');
-    expect(preview).not.toBeNull();
-    expect(knobs).not.toBeNull();
-    // preview FOLLOWS knobs → knobs leads (the desktop two-pane order).
-    expect(knobs!.compareDocumentPosition(preview!) & FOLLOWING).toBeTruthy();
-  });
-
-  it('renders exactly one Live preview pane in either layout', async () => {
+describe('#503 S4 §4.4 / #520 item 2 — one PreviewPane, placed by CSS', () => {
+  // These replace the #293 S4 cases that asserted mobile and desktop render
+  // DIFFERENT preview instances in different DOM positions. That premise is
+  // exactly what this session removes: the body is now one flat flex container
+  // and the single instance is placed by `order`, which jsdom cannot evaluate.
+  it('renders exactly one preview pane at either viewport', async () => {
     stubMatchMedia(true);
     await openShare();
     expect(document.querySelectorAll('.share-preview-col').length).toBe(1);
+    cleanup();
+    stubMatchMedia(false);
+    await openShare();
+    expect(document.querySelectorAll('.share-preview-col').length).toBe(1);
+  });
+
+  it('a viewport flip preserves the preview instance and never reverts the privacy line', async () => {
+    // `has_project_names: false` puts the privacy line in its neutral state.
+    // A remount resets the reported answer to `null`, which renders the
+    // DEFAULT wording again — that visible revert is the #520 item 2 defect.
+    stubFetchWithRender(false);
+    const media = stubFlippableMatchMedia(true);
+    await openShare();
+    await waitFor(() => {
+      expect(document.body.textContent)
+        .toContain('This export contains no project names.');
+    });
+    const before = document.querySelector('.share-preview-col');
+    const previewBefore = document.querySelector('.share-preview');
+    expect(previewBefore).not.toBeNull();
+    const renderCallsBefore = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .filter((c) => String(c[0]).includes('/api/share/render')).length;
+    expect(renderCallsBefore).toBeGreaterThan(0);   // guards the count assertion
+
+    // What this test actually guards NOW. §4.4 made the PREVIEW's placement
+    // CSS-only, so the identity assertions below hold trivially against the
+    // FIXED code — they are kept because they were the RED discriminator
+    // against the broken code (two instances at different tree positions, so
+    // a flip built new nodes). The live invariant is this count.
+    //
+    // Exactly ONE subscriber, and it is <ComposerModal>: ShareModalRoot mounts
+    // it unconditionally as a sibling slot and it calls useIsMobile() to pick
+    // its own layout. Nothing on the share-preview path subscribes any more.
+    // The literal is hardcoded so that adding a JS viewport branch anywhere
+    // under <ShareModalRoot> makes this 2 and fails here, instead of silently
+    // reintroducing the remount this session removed. If ComposerModal ever
+    // stops subscribing, this becomes 0 and fails just as loudly — either way
+    // the change gets read rather than absorbed.
+    expect(media.listenerCount()).toBe(1);
+
+    await act(async () => { media.flip(false); });
+
+    // Node IDENTITY, not mere presence: a remount would satisfy a presence
+    // assertion while still discarding the fetched state.
+    expect(document.querySelector('.share-preview-col')).toBe(before);
+    expect(document.querySelector('.share-preview')).toBe(previewBefore);
+    expect(
+      (fetch as ReturnType<typeof vi.fn>).mock.calls
+        .filter((c) => String(c[0]).includes('/api/share/render')).length,
+    ).toBe(renderCallsBefore);
+    expect(document.body.textContent)
+      .toContain('This export contains no project names.');
+    expect(document.body.textContent)
+      .not.toContain('Preview shows real names.');
   });
 
   it('desktop preview renders the source captured when the share flow opened', async () => {
@@ -407,12 +479,15 @@ describe('#503 S1 B1 — the neutral no-project-names state', () => {
 
 // #503 S1 B2 — the mobile preview budget.
 //
-// The mobile layout pins the status line above a preview strip capped at
-// 128px (`.share-preview-col--lead`), so every line the status text wraps to
-// comes straight out of the preview. Measured in a real browser at 390x844:
-// the two-line info wording left 37px of preview against 91px with the line
-// hidden, i.e. the line took 42% of the budget on the state the user sees
-// first. One line in every state leaves 58px.
+// The mobile layout pins the status line above a bounded sticky preview strip
+// (`.share-preview-col` inside the max-width:640px block), so every line the
+// status text wraps to comes straight out of the preview. Measured in a real
+// browser at 390x844 against the then-current 128px cap: the two-line info
+// wording left 37px of preview against 91px with the line hidden, i.e. the line
+// took 42% of the budget on the state the user sees first. One line in every
+// state left 58px. #503 S4 §4.2 has since raised the cap to
+// `min(45dvh, 320px)`, which widens the budget but does not retire this rule —
+// a wrapped line still costs the preview whatever it takes.
 //
 // JSDOM cannot measure the wrap — that is the real-browser gate's job. What
 // it CAN pin, and what actually caused the regression, is the character

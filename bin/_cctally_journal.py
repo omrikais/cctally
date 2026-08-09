@@ -4900,10 +4900,11 @@ def _incremental_selection(conn, records, entries, cursor, covered):
 
     There are TWO read snapshots rather than one, and the gap re-fold sits
     between them deliberately: it is arbitrary journal file I/O, and holding a
-    stats.db read snapshot open across it pins the WAL against checkpointing for
-    the whole read, which is the bloat #297 documents. The second snapshot
-    re-reads the one state row and refuses on any difference, which is what
-    keeps the row groups and the state row from coming out of two generations.
+    stats.db read snapshot open across it would keep a rollback-journal SHARED
+    lock for the whole read and unnecessarily delay a writer. The second
+    snapshot re-reads the one state row and refuses on any difference, which is
+    what keeps the row groups and the state row from coming out of two
+    generations.
 
     That re-read covers in-place publication and any live delta writer, because
     both mutate the state row this connection can see. It does NOT cover
@@ -5668,12 +5669,10 @@ def _run_stats_ingest_once(
             if own_conn and conn is not None:
                 conn.close()
     finally:
-        # §9.2 (#496 S6 F23): the routine stats write. The `-wal`/`-shm`
-        # sidecars are materialized by the FIRST write, not by the connect, so
-        # hardening at open time alone would leave a 0644 WAL behind every
-        # ingest cycle — the exact shape of the cache.db defect #150 fixed.
-        # This runs while the ingest lock is still held, so the sidecars it
-        # inspects are the ones this cycle produced.
+        # §9.2 (#496 S6 F23): harden the routine stats family again after the
+        # write so a transient rollback journal created during the transaction
+        # cannot retain a permissive mode. This runs while the ingest lock is
+        # still held, so any family member it inspects belongs to this cycle.
         #
         # Guarded because it is the FIRST statement of this block and the two
         # lock releases are the last two: anything raised here — including the
@@ -5800,7 +5799,7 @@ def _correction_scratch_mains() -> set[pathlib.Path]:
     return {
         member
         for member in path.parent.glob(prefix + "*")
-        if not member.name.endswith(("-wal", "-shm"))
+        if not member.name.endswith(("-journal", "-wal", "-shm"))
     }
 
 
@@ -6164,23 +6163,26 @@ class RebuildResult:
     stats_quota_projection_incomplete: bool = False
 
 
-def _remove_db_sidecars_strict(path) -> None:
-    """Remove both sidecars or fail before publishing a replacement main file."""
-    for suffix in ("-wal", "-shm"):
-        candidate = pathlib.Path(str(path) + suffix)
-        try:
-            candidate.unlink()
-        except FileNotFoundError:
-            pass
-    _fsync_dir(pathlib.Path(path).parent)
-
-
 def _remove_db_family(path) -> None:
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-journal", "-wal", "-shm"):
         try:
             pathlib.Path(str(path) + suffix).unlink()
         except OSError:
             pass
+
+
+def _assert_stats_wal_sidecars_absent(path, *, phase: str) -> None:
+    """Refuse a rollback stats generation that somehow materialized WAL/SHM."""
+    present = [
+        pathlib.Path(f"{path}{suffix}").name
+        for suffix in ("-wal", "-shm")
+        if pathlib.Path(f"{path}{suffix}").exists()
+    ]
+    if present:
+        raise JournalError(
+            f"stats rollback-journal contract failed during {phase}: "
+            f"unexpected sidecar(s) {present!r}"
+        )
 
 
 def _stats_rebuild_test_pause(point: str) -> None:
@@ -6624,58 +6626,6 @@ def stats_index_matches_journal_prefix(
         return False
 
 
-def _prepare_existing_stats_for_cutover(path: pathlib.Path) -> str:
-    """Checkpoint a readable old index so removing its sidecars is kill-safe.
-
-    Returns what it actually did, so the incident manifest can say whether the
-    explicit checkpoint ran (#496 S1 F8). Failure still RAISES rather than
-    returning an outcome — the caller records `failed` and re-raises, because
-    proceeding past an undrained WAL would pair stale sidecars with the
-    replacement main file.
-    """
-    import _cctally_db
-    import _lib_stats_wal
-
-    wal_index = _lib_stats_wal.inspect_wal_index_family(path)
-    wal_verdict = wal_index.get("verdict")
-    if _lib_stats_wal.is_incoherent_wal_index(wal_index):
-        # The caller has already proved whole-family drain and, for a heal,
-        # preserved the complete pre-checkpoint family. Opening SQLite here
-        # would let a stale aPgno[] map direct valid WAL frames to wrong main
-        # pages before quarantine records the original bytes.
-        return "skipped_incoherent_wal_index"
-    if wal_verdict in {"capture_raced", "analysis_truncated"}:
-        raise JournalError(
-            "old stats index WAL/SHM coherence could not be established "
-            f"before cutover ({wal_verdict})"
-        )
-    if wal_verdict not in {"coherent", "wal_absent", "wal_empty"}:
-        # A malformed/non-empty WAL, missing SHM, or another unrecognized raw
-        # shape is not permission to let SQLite reconstruct or checkpoint it.
-        # The caller has already preserved the complete family and can publish
-        # the independently rebuilt index without mutating these old bytes.
-        return "skipped_unproven_wal_index"
-
-    try:
-        conn = sqlite3.connect(str(path), timeout=15.0)
-        try:
-            conn.execute("PRAGMA schema_version").fetchone()
-            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            if checkpoint is not None and int(checkpoint[0]) != 0:
-                raise JournalError(
-                    "old stats index WAL could not be drained before cutover"
-                )
-        finally:
-            conn.close()
-    except sqlite3.DatabaseError as exc:
-        # Auto-heal necessarily starts from an unreadable family. Preserve its
-        # exact bytes below, then publish the already-validated replacement.
-        if _cctally_db._is_sqlite_corruption_error(exc):
-            return "skipped_corrupt"
-        raise
-    return "checkpointed"
-
-
 def _utc_iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(
         timespec="seconds"
@@ -7011,6 +6961,19 @@ def _remove_publication_marker(destination) -> None:
     _fsync_dir(pathlib.Path(destination).parent)
 
 
+def _restore_prior_publication_marker(destination, prior) -> None:
+    """Undo this run's pre-commit marker without dropping an older verdict."""
+    if isinstance(prior, dict) and prior:
+        import _cctally_db
+
+        _cctally_db._atomic_write_private_json(
+            _publication_marker_path(destination), prior
+        )
+        _fsync_dir(pathlib.Path(destination).parent)
+        return
+    _remove_publication_marker(destination)
+
+
 def _write_rebuild_record(path, payload: dict) -> None:
     import _cctally_db
 
@@ -7046,35 +7009,6 @@ def _scan_stats_damage(path) -> dict:
         }
 
 
-def _record_post_checkpoint_damage(
-    incident: pathlib.Path, destination: pathlib.Path, outcome: str,
-) -> "dict | None":
-    """Add the post-checkpoint scan to an already-written incident manifest.
-
-    A second `_atomic_write_private_json` to the same path is safe: the write
-    is atomic and nothing references the incident yet. It has to be a second
-    write because preservation runs BEFORE the explicit checkpoint, so the
-    outcome this records does not exist when the manifest is first written.
-    """
-    import _cctally_db
-
-    try:
-        manifest_path = incident / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
-        damage = manifest.get("damage") or {}
-        damage["postCheckpoint"] = _scan_stats_damage(destination)
-        damage["checkpointOutcome"] = outcome
-        manifest["damage"] = damage
-        _cctally_db._atomic_write_private_json(manifest_path, manifest)
-        return damage
-    except Exception as exc:  # noqa: BLE001 — enrichment never breaks a rebuild
-        print(
-            f"[rebuild] post-checkpoint damage scan failed: {exc}",
-            file=sys.stderr,
-        )
-        return None
-
-
 def _binary_version() -> "str | None":
     """The running binary's released version, or None when it cannot be read.
 
@@ -7089,54 +7023,37 @@ def _binary_version() -> "str | None":
 def _preserve_stats_family_for_cutover(
     path: pathlib.Path, *, context: RebuildContext,
 ) -> pathlib.Path:
-    """Durably copy the old family into quarantine without removing the main."""
+    """Durably cold-quarantine the old family before physical replacement."""
     import _cctally_db
 
-    root = _cctally_core.APP_DIR / "quarantine"
-    root.mkdir(parents=True, exist_ok=True)
-    # The quarantine entry itself must survive power loss before any old
-    # sidecar can be removed. fsyncing only the new root/incident cannot make
-    # the root's directory entry durable in APP_DIR.
-    _fsync_dir(_cctally_core.APP_DIR)
-    try:
-        os.chmod(root, 0o700)
-    except OSError:
-        pass
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-    incident = root / f"{path.name}-{stamp}"
-    incident.mkdir(mode=0o700)
-    destination = incident / path.name
+    path = pathlib.Path(path)
     members = [
         pathlib.Path(str(path) + suffix).name
-        for suffix in ("", "-wal", "-shm")
+        for suffix in ("-journal", "-wal", "-shm", "")
         if pathlib.Path(str(path) + suffix).exists()
     ]
     if not members:
         raise OSError(f"no database family exists to preserve at {path}")
-    # Observed sizes are read BEFORE the copy, so the empty-WAL case in the
-    # routine corruption heal is evidenced rather than assumed (#496 S1 F2).
     family_sizes = {}
     for name in members:
         try:
             family_sizes[name] = path.with_name(name).stat().st_size
         except OSError:
             family_sizes[name] = None
-    # Read from the raw header rather than by opening the file: the file this
-    # is asked about is typically one SQLite refuses to open, which is exactly
-    # when the epoch it carried is worth recording (#496 S1).
     preserved_user_version = _cctally_db._read_user_version_header(path)
-    _cctally_db._copy_db_family(path, destination)
-    manifest = {
-        "schemaVersion": 2,
-        "quarantinedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z"),
-        "originalPath": str(path),
-        "movedFiles": members,
-        "complete": True,
-        "cutoverProtocol": "preserve-then-atomic-replace-v1",
-        # #496 S1 additive fields. Every key above keeps its v1 name and
-        # meaning, so a v1 reader is unaffected by the bump.
+    incident = _cctally_db.quarantine_db_family(
+        path,
+        strict=True,
+        context=_cctally_db.quarantine_context(
+            trigger=context.trigger,
+            trigger_error=context.trigger_error,
+            forensics_path=context.forensics_path,
+        ),
+    )
+    manifest_path = incident / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update({
+        "cutoverProtocol": "cold-quarantine-then-replace-v2",
         "trigger": context.trigger,
         "triggerError": context.trigger_error,
         "forensicsPath": context.forensics_path,
@@ -7146,19 +7063,14 @@ def _preserve_stats_family_for_cutover(
         "sqliteRuntimeVersion": sqlite3.sqlite_version,
         "preservedUserVersion": preserved_user_version,
         "familySizes": family_sizes,
-        # The retained COPY is described, not the live file, because the copy
-        # is the artifact that actually survives. `postCheckpoint` and
-        # `checkpointOutcome` are filled in by the caller once the explicit
-        # checkpoint has run (#496 S1 F8 section 6.3).
         "damage": {
-            "preserved": _scan_stats_damage(destination),
+            "preserved": _scan_stats_damage(incident / path.name),
             "postCheckpoint": None,
-            "checkpointOutcome": None,
+            "checkpointOutcome": "not_applicable_cold_quarantine",
         },
-    }
-    _cctally_db._atomic_write_private_json(incident / "manifest.json", manifest)
+    })
+    _cctally_db._atomic_write_private_json(manifest_path, manifest)
     _fsync_dir(incident)
-    _fsync_dir(root)
     return incident
 
 
@@ -7183,7 +7095,7 @@ def _open_publication_connection(destination) -> sqlite3.Connection:
     disk right now and is not an interruption to recover from.
 
     `stats_open_guarded` does NOT apply connection policy — `open_db` does that
-    separately — so the busy timeout, journal mode and WAL size limit are
+    separately — so the busy timeout, rollback journal mode and durability are
     applied here rather than assumed.
 
     The connection is opened with `uri=True` because the publisher ATTACHes the
@@ -7391,58 +7303,10 @@ def _publish_generation_in_place(
     return phase
 
 
-def _checkpoint_after_publication(conn: sqlite3.Connection) -> str:
-    """Drain the WAL after a committed in-place publish — BEST EFFORT.
-
-    `wal_checkpoint(TRUNCATE)` returns a busy ROW rather than raising, and this
-    repository has measured it taking about 16 seconds against a 15-second
-    `busy_timeout` under a pinned reader. Its result is recorded and never
-    interpreted as a transaction failure, and it is never a reason to fall back
-    after a commit.
-    """
-    try:
-        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    except sqlite3.Error as exc:
-        return f"error:{type(exc).__name__}"
-    if row is None:
-        return "unknown"
-    return "checkpointed" if int(row[0]) == 0 else "busy"
-
-
-# An in-place publication used to unlink the live `-wal` and `-shm` here once
-# the TRUNCATE checkpoint had emptied the WAL, to reach a sidecar-free end
-# state. That is issue #516 and the call is gone: unlinking the sidecars of a
-# database other connections still hold open is outside SQLite's contract, and
-# what it cost is a data-correctness fault and a crash, NOT a cosmetic end
-# state. Two conditions have to combine, and an earlier thirteen-arrangement
-# run never combined them: something must WRITE after the unlink, and the
-# reader must already have READ before it. Re-measured on both LAN runners
-# (macOS, Python 3.13.14, SQLite 3.53.4, byte-identical on each):
-#
-#   - later writer in the SAME process — a reader that had read before the
-#     unlink, read-write or `mode=ro`, raises `OperationalError: disk I/O
-#     error`; and a connection that keeps writing through the unlinked inodes
-#     breaks the NEXT connection opened in that process the same way;
-#   - later writer in a CHILD process — that reader silently reads a STALE
-#     generation, and so does a freshly opened connection in the parent;
-#   - a reader that had NOT read before the unlink reads the current value,
-#     which is why the earlier run observed nothing;
-#   - a reader holding a pinned read transaction makes the checkpoint busy, so
-#     the unlink is refused before it can happen.
-#
-# One mechanism seen from three ends: whichever connection holds an fd on the
-# stale `-wal` inode while the shared wal-index describes frames in the other
-# `-wal` inode takes the short read. A clean last close removes both sidecars
-# by itself, so nothing is leaked; only the case where a handle is open, which
-# is exactly the case that must not be unlinked, now leaves a zero-length WAL
-# behind.
-
-
-#: Probe 2 measured the live WAL peaking at 1.01x the main file across five
-#: successive in-place publishes, so the projection is that plus a margin.
-_PUBLICATION_WAL_PROJECTION = 1.05
-#: Headroom for the rollback journal and freelist churn of an abandoned attempt.
-_PUBLICATION_ROLLBACK_MARGIN = 0.25
+#: A DELETE-mode in-place publication can temporarily hold a rollback journal
+#: roughly the size of the live generation. Keep additional headroom for
+#: freelist churn and for cold-quarantining a corrupt destination.
+_PUBLICATION_ROLLBACK_PROJECTION = 1.25
 
 
 def _free_disk_bytes(directory) -> int:
@@ -7454,7 +7318,7 @@ def _free_disk_bytes(directory) -> int:
 
 def _db_family_bytes(path) -> int:
     total = 0
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-journal", "-wal", "-shm"):
         try:
             total += pathlib.Path(str(path) + suffix).stat().st_size
         except OSError:
@@ -7465,14 +7329,15 @@ def _db_family_bytes(path) -> int:
 def _publication_required_free_bytes(scratch, destination) -> int:
     """Conservative free-space floor for publishing ``scratch``.
 
-    The live attempt adds a database-sized WAL while the scratch still exists,
-    and a physical fallback would then add a full quarantine copy of the old
-    family on top of that. All three are counted, because the run cannot know
-    at this point which mechanism it will end up using.
+    The live attempt can add a database-sized rollback journal while the
+    scratch still exists, and a corrupt destination may then require a cold
+    quarantine move before replacement.
     """
     scratch_bytes = _db_family_bytes(scratch)
-    projected = _PUBLICATION_WAL_PROJECTION + _PUBLICATION_ROLLBACK_MARGIN
-    return int(scratch_bytes * projected) + _db_family_bytes(destination)
+    return (
+        int(scratch_bytes * _PUBLICATION_ROLLBACK_PROJECTION)
+        + _db_family_bytes(destination)
+    )
 
 
 def _preflight_publication_space(scratch, destination) -> None:
@@ -7528,6 +7393,8 @@ def _publish_stats_index_in_place(
                 file=sys.stderr,
             )
             return _FALL_BACK
+        _remove_db_family(scratch)
+        _fsync_dir(pathlib.Path(destination).parent)
         raise
 
     # Readability is not structural health. An integrity failure may consist
@@ -7557,6 +7424,8 @@ def _publish_stats_index_in_place(
                 "error": f"{type(exc).__name__}: {exc}"[:500],
             }
             return _FALL_BACK
+        _remove_db_family(scratch)
+        _fsync_dir(pathlib.Path(destination).parent)
         raise
     if destination_integrity != ["ok"]:
         try:
@@ -7611,28 +7480,31 @@ def _publish_stats_index_in_place(
             conn.close()
         except Exception:
             pass
+        # A healthy readable destination is never physically replaced merely
+        # because its transactional publication was busy or failed. Physical
+        # replacement is reserved for an absent or integrity-corrupt main.
         phase = publication_phase_of(exc)
-        if phase == sp.PRE_COMMIT and sp.may_fall_back_to_replacement(exc):
-            print(
-                "[rebuild] the in-place stats publication rolled back "
-                f"({exc}); publishing by replacement instead",
-                file=sys.stderr,
-            )
-            record["inPlaceAttempt"] = {
-                "phase": phase, "error": f"{type(exc).__name__}: {exc}"[:500],
-            }
-            return _FALL_BACK
+        if phase is None or phase == sp.PRE_COMMIT:
+            live["status"] = "failed"
+            live["completedAtUtc"] = _utc_iso_now()
+            live["publicationError"] = f"{type(exc).__name__}: {exc}"[:500]
+            _write_rebuild_record(record_path, live)
+            # The live generation did not change. Remove this run's marker, but
+            # restore any verdict it was carrying for an earlier generation;
+            # otherwise a busy/pre-commit failure would erase the load-bearing
+            # publication failure that this run settled before Phase 1.
+            _restore_prior_publication_marker(destination, prior)
+            _remove_db_family(scratch)
+            _fsync_dir(pathlib.Path(destination).parent)
         raise
 
-    checkpoint_outcome = _checkpoint_after_publication(conn)
     try:
         conn.close()
     except Exception:
         pass
     # §9.2 (#496 S6 F23): the in-place publisher never touches the destination
     # file's mode — it mutates objects inside it — so a family that was 0644
-    # before the publication is still 0644 after it. The checkpoint above is
-    # also the last thing that can re-materialize a sidecar.
+    # before the publication is still 0644 after it.
     _cctally_store._harden_stats_family(destination)
     _stats_rebuild_test_pause("rebuild_after_publication_replace")
 
@@ -7644,7 +7516,10 @@ def _publish_stats_index_in_place(
         destination, high_water, expected_record_path=str(record_path),
     )
 
-    live["publicationCheckpoint"] = checkpoint_outcome
+    # Kept as an additive compatibility field in retained rebuild records. The
+    # live protocol no longer calls a WAL checkpoint; DELETE/FULL commits are
+    # durable before control returns and SQLite owns any transient `-journal`.
+    live["publicationCheckpoint"] = "not_applicable_rollback_journal"
     live["postPublicationValidation"] = {
         "ok": post_error is None, "error": post_error,
     }
@@ -7722,7 +7597,33 @@ def _publish_rebuilt_stats_index(
             fired.append(True)
             before_swap()
 
-    if pathlib.Path(destination).exists():
+    legacy_wal = _cctally_store._stats_legacy_wal_family_present(destination)
+    skip_in_place = False
+    if legacy_wal:
+        blocked = _cctally_store._stats_family_drained(destination)
+        if blocked is not None:
+            raise JournalError(
+                "stats.db rollback-journal transition declined: "
+                f"{blocked}. Stop and restart the dashboard and every older "
+                "cctally process, then retry; the legacy WAL family is "
+                "untouched."
+            )
+        import _lib_stats_wal
+
+        legacy_evidence = _lib_stats_wal.inspect_wal_index_family(destination)
+        verdict = legacy_evidence.get("verdict")
+        skip_in_place = _lib_stats_wal.is_incoherent_wal_index(legacy_evidence)
+        if not skip_in_place and verdict not in {
+            "coherent", "wal_absent", "wal_empty"
+        }:
+            raise JournalError(
+                "stats.db rollback-journal transition could not prove the "
+                f"legacy WAL family safe ({verdict or 'unknown'}). The family "
+                "is untouched; stop and restart the dashboard and every older "
+                "cctally process, then retry."
+            )
+
+    if pathlib.Path(destination).exists() and not skip_in_place:
         published = _publish_stats_index_in_place(
             scratch=scratch, destination=destination, context=context,
             high_water=high_water, record=record,
@@ -7733,7 +7634,7 @@ def _publish_rebuilt_stats_index(
 
     family_exists = any(
         pathlib.Path(str(destination) + suffix).exists()
-        for suffix in ("", "-wal", "-shm")
+        for suffix in ("", "-journal", "-wal", "-shm")
     )
     incident = None
     damage_tokens = None
@@ -7742,49 +7643,34 @@ def _publish_rebuilt_stats_index(
         if blocked is not None:
             raise JournalError(f"stats.db cutover declined: {blocked}")
         _cctally_store._stats_storm_test_pause("stats_replace_drained")
+        fire_before_swap()
+        # Close the exact TOCTOU seam #538 reproduced: the first scan is not a
+        # proof once a pre-transition dashboard can open after it. Re-check at
+        # the destructive edge, before moving even one family member.
+        blocked = _cctally_store._stats_family_drained(destination)
+        if blocked is not None:
+            raise JournalError(
+                "stats.db cold recovery declined after a new reader appeared: "
+                f"{blocked}. Stop and restart the dashboard and every older "
+                "cctally process, then retry; no family member was moved."
+            )
         if preserve_existing:
-            # Preserve the exact pre-cutover family, including a committed WAL
-            # and SHM, before checkpointing mutates or removes those sidecars.
             incident = _preserve_stats_family_for_cutover(
                 destination, context=context
             )
-        checkpoint_outcome = "skipped_absent"
-        if destination.exists():
-            try:
-                checkpoint_outcome = _prepare_existing_stats_for_cutover(
-                    destination
-                )
-            except BaseException:
-                if incident is not None:
-                    _record_post_checkpoint_damage(
-                        incident, destination, "failed"
-                    )
-                raise
-        if incident is not None:
-            # Scanned BEFORE the sidecars are removed, so this and the
-            # preserved scan bracket the explicit checkpoint.
-            damage = _record_post_checkpoint_damage(
-                incident, destination, checkpoint_outcome
-            )
-            if damage:
-                damage_tokens = {
-                    "forensics": _forensics_shape_token(context.forensics_path),
-                    "preserved": (damage.get("preserved") or {}).get(
-                        "shapeToken"
-                    ),
-                    "postCheckpoint": (damage.get("postCheckpoint") or {}).get(
-                        "shapeToken"
-                    ),
-                    "checkpointOutcome": damage.get("checkpointOutcome"),
-                }
-        # The old main stays present and, when it was readable, fully
-        # checkpointed. A kill from here until os.replace therefore still
-        # leaves a usable old destination while preventing stale sidecars from
-        # being paired with the replacement main.
-        _remove_db_sidecars_strict(destination)
-        _cctally_store._stats_storm_test_pause("stats_replace_sidecars_removed")
-
-    fire_before_swap()
+            damage = json.loads(
+                (incident / "manifest.json").read_text()
+            ).get("damage") or {}
+            damage_tokens = {
+                "forensics": _forensics_shape_token(context.forensics_path),
+                "preserved": (damage.get("preserved") or {}).get("shapeToken"),
+                "postCheckpoint": None,
+                "checkpointOutcome": damage.get("checkpointOutcome"),
+            }
+        else:
+            _remove_db_family(destination)
+    else:
+        fire_before_swap()
 
     # Phase 1 of the publication transaction: the record and then the marker,
     # each fsynced, BEFORE the replacement becomes visible.
@@ -7820,15 +7706,10 @@ def _publish_rebuilt_stats_index(
     # Phase 2: validate the bytes that are now live, on a connection that never
     # saw them being written.
     post_error = validate_published_stats_index(destination, high_water)
-    # The validation opened the family read-only, which materializes sidecars
-    # the removal below deletes; harden the destination itself while they are
-    # still present so neither the main nor a surviving sidecar stays 0644.
     _cctally_store._harden_stats_family(destination)
-    # The read-only open above creates a zero-byte WAL and a 32 KiB SHM.
-    # Remove them so the documented no-post-publication-stale-sidecar end state
-    # still holds; an empty WAL is consistent with the freshly published main,
-    # so a crash between validation and removal is harmless.
-    _remove_db_sidecars_strict(destination)
+    _assert_stats_wal_sidecars_absent(
+        destination, phase="post-publication validation"
+    )
 
     record["postPublicationValidation"] = {
         "ok": post_error is None,
@@ -8989,11 +8870,9 @@ def rebuild_stats_index(
 ) -> RebuildResult:
     """Rebuild the stats index under a SHARED `artifact-retention.lock` hold.
 
-    #496 S6 §5.3. A rebuild publishes three artifacts that reclamation must not
-    mark while they are being written: the preserved-family incident manifest,
-    the second manifest write `_record_post_checkpoint_damage` performs after
-    the explicit checkpoint, and the rebuild record that names both. The hold
-    spans all three, so no observer ever sees the incident half-described.
+    #496 S6 §5.3. A rebuild holds retention SHARED while publishing the
+    cold-quarantine incident manifest and the rebuild record that names it, so
+    no observer sees the incident half-described.
 
     The hold is taken here rather than only at the producer call sites because
     `db rebuild` and the auto-heal worker are not the only callers — the epoch
@@ -9519,10 +9398,6 @@ def _rebuild_stats_index_locked(
                     f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
             except sqlite3.Error:
                 rows_by_table[tbl] = 0
-        # Drain the WAL into the main file so the atomic rename carries all data.
-        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        if checkpoint is not None and int(checkpoint[0]) != 0:
-            raise JournalError("rebuilt stats index WAL could not be drained")
         _validate_rebuilt_stats_index(conn, hw)
         # The SEMANTIC half (#496 S5b §6.2). The structural checks above cover
         # the new tables' existence and definition; without this, a scratch
@@ -9548,23 +9423,25 @@ def _rebuild_stats_index_locked(
             _close_coverage_snapshot(_retained)
         quota_snapshot = []
 
-    # Closed, drained, validated, and durable before the old family is touched.
-    _remove_db_sidecars_strict(scratch)
+    # Closed, committed, validated, and durable before the old family is
+    # touched. DELETE/FULL has no WAL drain step; WAL/SHM presence is a contract
+    # failure, never something application code repairs by unlinking.
+    _assert_stats_wal_sidecars_absent(scratch, phase="scratch validation")
     with scratch.open("rb") as handle:
         os.fsync(handle.fileno())
     _fsync_dir(scratch.parent)
 
     # Extract the compact result data and RELEASE the replay structures before
-    # publication begins (#496 S3 §4.2). The in-place attempt adds a
-    # database-sized WAL while the scratch still exists, so the measured
+    # publication begins (#496 S3 §4.2). The in-place attempt can add a
+    # database-sized rollback journal while the scratch still exists, so the
     # multi-gigabyte replay peak must not still be resident on top of it.
     segments_read = len(segments)
     conflicts = effective.conflicts
     protocol_violations = effective.protocol_violations
     acknowledged = effective.acknowledged_protocol_violations
     # The pre-publication window is what F9's memory acceptance is measured
-    # over: everything after this point is publication, whose own WAL cost S3
-    # already accounts for.
+    # over: everything after this point is publication, whose rollback-journal
+    # cost S3 already accounts for through projected headroom.
     peak_heap_bytes = (
         tracemalloc.get_traced_memory()[1] if tracing else 0)
     decoded = effective = stream = structural = tail = None
@@ -9578,10 +9455,9 @@ def _rebuild_stats_index_locked(
         raise JournalError(
             f"rebuilt stats index failed pre-publication validation: {pre_error}"
         )
-    # That read-only open recreated the scratch sidecars; publication requires
-    # a sidecar-free scratch, and a leftover pair would also survive the
-    # `os.replace` as a stray artifact.
-    _remove_db_sidecars_strict(scratch)
+    _assert_stats_wal_sidecars_absent(
+        scratch, phase="fresh pre-publication validation"
+    )
 
     publication_started = time.monotonic()
     incident = _publish_rebuilt_stats_index(

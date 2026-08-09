@@ -17,6 +17,7 @@
 // preview. `allow-same-origin` keeps blob/data behaviors stable across
 // engines without unlocking attack surface.
 import { useEffect, useRef, useState } from 'react';
+import { useIframeKeymapBridge } from '../hooks/useIframeKeymapBridge';
 import { renderShare, ShareApiError } from './api';
 import type { ShareOptions, SharePanelId } from './types';
 import { SELECTION_LABEL } from './types';
@@ -51,6 +52,11 @@ interface Props {
   // Lifted through props rather than `shareSlice`, which deliberately holds
   // only modal identity plus the captured source and account.
   onPreviewFailed?: (failed: boolean) => void;
+  // #503 S4 F29 — "<panel label> — <template label>", computed by ShareModal,
+  // which already resolves the selected template object. `null` while the
+  // templates fetch is still in flight; the frame then falls back to a plain
+  // name that is truthful at every moment rather than a placeholder.
+  artifactLabel?: string | null;
 }
 
 interface PreviewState {
@@ -72,8 +78,16 @@ const initialPreviewState: PreviewState = {
 };
 
 export function PreviewPane({ panel, source = 'claude', account = null, templateId, options,
-                              onProjectNamesResolved, onPreviewFailed }: Props) {
+                              onProjectNamesResolved, onPreviewFailed,
+                              artifactLabel = null }: Props) {
   const [preview, setPreview] = useState<PreviewState>(initialPreviewState);
+  // #503 S4 F28 — a state-backed callback ref, NOT a RefObject: the iframe
+  // renders conditionally (html/svg only, and only once a render resolves), so
+  // a RefObject's `.current` would change without re-running the bridge's
+  // effect. State re-runs it on every mount and unmount, which is what the
+  // attach/detach lifecycle needs.
+  const [previewFrame, setPreviewFrame] = useState<HTMLIFrameElement | null>(null);
+  useIframeKeymapBridge(previewFrame);
   // Per-fetch AbortController, set when a fetch starts and aborted when
   // the next fetch starts (or the component unmounts).
   const abortRef = useRef<AbortController | null>(null);
@@ -246,17 +260,30 @@ export function PreviewPane({ panel, source = 'claude', account = null, template
     );
   }
 
+  // F29 — the frame was named "Report preview (decorative)" while being fully
+  // exposed to assistive technology: no aria-hidden, no presentation role. The
+  // word told the user not to bother with the one thing the docs tell them to
+  // review before sharing. Templates load async, so the fallback must also be
+  // truthful — never a placeholder that outlives the fetch.
+  const previewTitle = artifactLabel
+    ? `Report preview — ${artifactLabel}`
+    : 'Report preview';
+
   // html / svg
   return (
     <div className="share-preview-wrap">
       {sourceChrome}
       <iframe
         className="share-preview share-preview-iframe"
-        title="Report preview (decorative)"
+        title={previewTitle}
         tabIndex={-1}
-        // Static kernel output — no scripts needed.
+        // Static kernel output — no scripts needed. `allow-same-origin` is
+        // ALSO the Esc bridge's precondition (useIframeKeymapBridge reads
+        // contentDocument); removing it would disable Esc-from-preview
+        // silently. See docs/share-gotchas.md.
         sandbox="allow-same-origin"
         srcDoc={preview.body}
+        ref={setPreviewFrame}
       />
     </div>
   );

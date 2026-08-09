@@ -726,6 +726,17 @@ _unknown_codex_model_warnings: set[str] = set()
 # directly comparable.
 CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"
 
+# OpenAI's model catalog describes ``codex-auto-review`` as the hidden model
+# used by the Guardian approval-review subagent, not as a public billable model
+# with its own rate card.  The canonical ccusage Codex adapter resolves that
+# identifier to the model current when it appeared; its 2026-04-23-and-later
+# mapping is gpt-5.5, which covers every retained auto-review event observed for
+# issue #535.  Keep this as a normalization map rather than a duplicate pricing
+# row so pricing drift continues to have one source of truth per rate card.
+CODEX_MODEL_ALIASES: dict[str, str] = {
+    "codex-auto-review": "gpt-5.5",
+}
+
 # Per-model fast-tier price multipliers, ported from ryoppippi/ccusage
 # fast-multiplier-overrides.json ("exact" map — Codex/gpt entries only; the
 # upstream claude-opus-* entries are for ccusage's Claude adapter and never
@@ -742,7 +753,14 @@ CODEX_FAST_MULTIPLIER_FALLBACK = 2.0
 
 def _codex_fast_multiplier(model: str) -> float:
     """Fast-tier price multiplier for a Codex model (standard tier = 1.0)."""
-    return CODEX_FAST_MULTIPLIER_OVERRIDES.get(model, CODEX_FAST_MULTIPLIER_FALLBACK)
+    return CODEX_FAST_MULTIPLIER_OVERRIDES.get(
+        _canonical_codex_model(model), CODEX_FAST_MULTIPLIER_FALLBACK,
+    )
+
+
+def _canonical_codex_model(model: str) -> str:
+    """Return the priced model name for a known Codex runtime alias."""
+    return CODEX_MODEL_ALIASES.get(model, model)
 
 
 def _codex_config_requests_fast_service_tier(content: str) -> bool:
@@ -768,12 +786,13 @@ def _codex_config_requests_fast_service_tier(content: str) -> bool:
 def _resolve_codex_pricing(model: str) -> tuple[dict[str, Any] | None, bool]:
     """Return (pricing_dict, is_fallback).
 
-    Returns (entry, False) when the model has a direct pricing entry. Returns
-    (gpt-5-entry, True) when the model is unknown — matches upstream's
-    LEGACY_FALLBACK_MODEL semantics. Returns (None, True) only if the fallback
-    model itself is missing from the pricing dict (programming error; warn once).
+    Returns (entry, False) when the model has a direct pricing entry or a known
+    canonical alias. Returns (gpt-5-entry, True) when the model is unknown —
+    matches upstream's LEGACY_FALLBACK_MODEL semantics. Returns (None, True)
+    only if the fallback model itself is missing from the pricing dict
+    (programming error; warn once).
     """
-    direct = CODEX_MODEL_PRICING.get(model)
+    direct = CODEX_MODEL_PRICING.get(_canonical_codex_model(model))
     if direct is not None:
         return direct, False
     fallback = CODEX_MODEL_PRICING.get(CODEX_LEGACY_FALLBACK_MODEL)
@@ -782,7 +801,7 @@ def _resolve_codex_pricing(model: str) -> tuple[dict[str, Any] | None, bool]:
 
 def _is_codex_fallback(model: str) -> bool:
     """True iff `model` would resolve via the LEGACY_FALLBACK_MODEL path."""
-    return model not in CODEX_MODEL_PRICING
+    return _canonical_codex_model(model) not in CODEX_MODEL_PRICING
 
 
 def _resolve_model_pricing(model: str, warn: bool = True) -> dict[str, Any] | None:

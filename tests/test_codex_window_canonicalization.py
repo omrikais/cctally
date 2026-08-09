@@ -1075,7 +1075,7 @@ def test_the_projection_body_converges_a_jittered_window_without_a_rebuild(
         cache.close()
 
 
-def test_the_stats_index_epoch_is_unchanged(stats_ns):
+def test_the_stats_index_epoch_tripwire(stats_ns):
     """Guard-rail, deliberately labelled as one: it pins the DECISION, not a
     behaviour. #416 Slice 2 changes no stats schema — the only schema change is
     cache migration 032, and the cache registry is not frozen — so the epoch
@@ -1090,9 +1090,10 @@ def test_the_stats_index_epoch_is_unchanged(stats_ns):
     publication identity the in-place protocol resolves a pending marker
     against, so 1007 -> 1008. #496 S5b is the current one: durable selector
     state adds three `journal_selector_*` tables plus the reserved
-    `stats_quota_projection_state`, so 1008 -> 1009."""
+    `stats_quota_projection_state`, so 1008 -> 1009. #538 advances to 1010 for
+    the rollback-journal transition without another schema change."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1009
+    assert _cctally_core.STATS_INDEX_EPOCH == 1010
 
 
 # --------------------------------------------------------------------------

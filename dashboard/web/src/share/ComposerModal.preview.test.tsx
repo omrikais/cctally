@@ -68,6 +68,12 @@ describe('Composer preview frame (M1-4)', () => {
     expect(frame).not.toBeNull();
     const iframe = frame!.querySelector('iframe.composer-preview');
     expect(iframe).not.toBeNull();
+    // #503 S4 F28 — the Esc bridge (useIframeKeymapBridge) reads
+    // `iframe.contentDocument`, which is ONLY reachable because of
+    // `allow-same-origin`. Removing that token would disable Esc-from-preview
+    // with no error and no other failing test — the bridge's try/catch would
+    // swallow it. This assertion is the tripwire.
+    expect(iframe!.getAttribute('sandbox')).toBe('allow-same-origin');
     const label = frame!.querySelector('.composer-preview-label');
     // Default export theme is light -> caption reads "Preview · light".
     expect(label?.textContent).toMatch(/^Preview · (light|dark)$/);

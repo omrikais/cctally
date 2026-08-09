@@ -36,7 +36,6 @@ import { sharePanelLabel } from './panelLabels';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
 import { useScrollLock } from '../hooks/useScrollLock';
-import { useIsMobile } from '../hooks/useIsMobile';
 import {
   getState,
   subscribeStore,
@@ -164,12 +163,14 @@ function SharePrivacyStatus({
   const severity = neutral ? 'neutral' : revealProjects ? 'warn' : 'info';
   // #503 S1 B2 — every string here fits ONE line at 390px.
   //
-  // The mobile layout pins this line above a preview strip capped at 128px,
-  // so each wrapped line comes straight out of the preview. Measured at
-  // 390x844: the previous info wording took two lines and left 37px of
-  // preview — about two lines of the artifact, on a control whose documented
-  // purpose is letting the user verify what they are about to share. At one
-  // line all three states leave 58px.
+  // The mobile layout pins this line above a capped preview strip, so each
+  // wrapped line comes straight out of the preview. Measured at 390x844
+  // against the then-current 128px cap: the previous info wording took two
+  // lines and left 37px of preview — about two lines of the artifact, on a
+  // control whose documented purpose is letting the user verify what they are
+  // about to share. At one line all three states left 58px. #503 S4 §4.2
+  // raised that cap to `min(45dvh, 320px)`; the one-line rule stays, because
+  // it is what keeps the three states costing the same.
   //
   // The share modal inherits the monospace stack, so the budget is a
   // character count: 47 characters at 12px in the 359px column. (Not every
@@ -240,22 +241,30 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
   // Share is a store-tracked layer above panel/source-detail modals. Move focus
   // to its heading on mount and own Tab only while it remains topmost (the
   // composer can layer above it). ShareModalRoot retains trigger restoration.
-  const trapEnabled = useSyncExternalStore(
+  const shareIsTopmost = useSyncExternalStore(
     subscribeStore,
     () => topmostStoreFocusLayer(getState()) === 'share',
   );
   useModalFocus(cardRef, {
     active: true,
-    trapEnabled,
+    // #503 S4 §3.1 — yield the Tab trap to the Manage presets dialog while it
+    // is open. That dialog is a DESCENDANT of this card, so without the
+    // handoff this trap cycles the whole share modal and Tab walks straight
+    // out of the nested dialog.
+    trapEnabled: shareIsTopmost && !manageOpen,
     initialFocus: 'heading',
   });
 
-  // SHARE-1 (#293 S4): on phone the Live preview leads the body so editing any
-  // top-of-stack knob gives immediate feedback. `.share-preview-col` is nested
-  // inside `.share-main-section` — a separate flex parent from the sibling
-  // gallery — so a CSS `order` cannot hoist it; a render reorder is required.
-  // Desktop keeps the two-pane (knobs | preview) layout byte-identical.
-  const isMobile = useIsMobile();
+  // SHARE-1 (#293 S4) put the Live preview first on phone with a render
+  // reorder, because `.share-preview-col` was nested inside
+  // `.share-main-section` — a separate flex parent from the sibling gallery —
+  // so a CSS `order` could not hoist it.
+  //
+  // #503 S4 §4.4 removed that nesting: the gallery, knobs and preview are now
+  // direct children of the one flex container `.share-modal-body`, so `order`
+  // places the SINGLE `<PreviewPane>` at both breakpoints. The two-instance
+  // branch is gone, and with it the remount that discarded the fetched render
+  // on every viewport flip (#520 item 2).
 
   // Esc-to-close at overlay scope. Overlay > modal in SCOPE_ORDER so
   // Esc closes the share modal first when layered atop a panel modal.
@@ -284,7 +293,9 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
       // Documentary (#159): mirrors `z-index: 200`. The when() guard already
       // gates this out whenever the composer is layered on top, so the layer
       // is never consulted today; it preserves the order if that guard is
-      // ever removed. (`!manageOpen` is a separate cross-scope correction.)
+      // ever removed. #503 S4 §3.1 moved Manage's own Esc to overlay layer
+      // 208, so `!manageOpen` is now retained belt-and-suspenders rather than
+      // the mechanism — the ordering above us is structural.
       layer: 200,
       when: () => !manageOpen && getState().composerModal === null,
       action: onClose,
@@ -339,6 +350,17 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
     setOptions((prev) => mergeOptions(prev, tmpl.default_options));
   }, [selectedTemplateId, templates]);
 
+  // #503 S4 F29 — the accessible name of the preview iframe. Computed here
+  // because this component already resolves the selected template object;
+  // `null` while the templates fetch is in flight, which PreviewPane renders
+  // as a plain "Report preview" rather than a placeholder.
+  const artifactLabel = useMemo(() => {
+    if (!templates || !selectedTemplateId) return null;
+    const tmpl = templates.find((t) => t.id === selectedTemplateId);
+    if (!tmpl) return null;
+    return `${panelLabel} — ${tmpl.label}`;
+  }, [templates, selectedTemplateId, panelLabel]);
+
   const handleOptionsChange = (next: ShareOptions) => {
     userTouchedOptionsRef.current = true;
     setOptions(next);
@@ -374,31 +396,6 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
       </div>
 
       <div className="share-modal-body">
-        {isMobile && (
-          <div className="share-preview-col share-preview-col--lead" aria-label="Live preview">
-            {/* #503 S3 §5 — the privacy line is GATED OFF, not changed.
-                With `hasProjectNames === null` on a failed preview it still
-                renders a definite claim, including "Preview shows real
-                names" — which is false when the preview shows an error. The
-                export's privacy state is genuinely unknown here and the line
-                has no state for unknown; S1's derivation is untouched. */}
-            {previewFailed ? null : (
-              <SharePrivacyStatus
-                revealProjects={!!options.reveal_projects}
-                hasProjectNames={hasProjectNames}
-              />
-            )}
-            <PreviewPane
-              panel={panel}
-              source={source}
-              account={account}
-              templateId={selectedTemplateId}
-              options={options}
-              onProjectNamesResolved={setHasProjectNames}
-              onPreviewFailed={setPreviewFailed}
-            />
-          </div>
-        )}
         <section className="share-section share-gallery-section" aria-label="Template gallery">
           <div className="share-gallery-header">
             <PresetDropdown
@@ -422,30 +419,34 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
           />
         </section>
 
-        <section className="share-section share-main-section">
-          <div className="share-knobs-col" aria-label="Render options">
-            <Knobs options={options} onChange={handleOptionsChange} />
-          </div>
-          {!isMobile && (
-            <div className="share-preview-col" aria-label="Live preview">
-              {previewFailed ? null : (
-                <SharePrivacyStatus
-                  revealProjects={!!options.reveal_projects}
-                  hasProjectNames={hasProjectNames}
-                />
-              )}
-              <PreviewPane
-                panel={panel}
-                source={source}
-                account={account}
-                templateId={selectedTemplateId}
-                options={options}
-                onProjectNamesResolved={setHasProjectNames}
-                onPreviewFailed={setPreviewFailed}
-              />
-            </div>
+        <div className="share-knobs-col" aria-label="Render options">
+          <Knobs options={options} onChange={handleOptionsChange} />
+        </div>
+
+        <div className="share-preview-col" aria-label="Live preview">
+          {/* #503 S3 §5 — the privacy line is GATED OFF, not changed.
+              With `hasProjectNames === null` on a failed preview it still
+              renders a definite claim, including "Preview shows real
+              names" — which is false when the preview shows an error. The
+              export's privacy state is genuinely unknown here and the line
+              has no state for unknown; S1's derivation is untouched. */}
+          {previewFailed ? null : (
+            <SharePrivacyStatus
+              revealProjects={!!options.reveal_projects}
+              hasProjectNames={hasProjectNames}
+            />
           )}
-        </section>
+          <PreviewPane
+            panel={panel}
+            source={source}
+            account={account}
+            templateId={selectedTemplateId}
+            options={options}
+            artifactLabel={artifactLabel}
+            onProjectNamesResolved={setHasProjectNames}
+            onPreviewFailed={setPreviewFailed}
+          />
+        </div>
       </div>
 
       <footer className="share-modal-footer">
@@ -474,6 +475,7 @@ export function ShareModal({ panel, source = 'claude', account = null, onClose, 
 
       <ManagePresetsModal
         open={manageOpen}
+        shareIsTopmost={shareIsTopmost}
         onClose={() => setManageOpen(false)}
       />
     </div>

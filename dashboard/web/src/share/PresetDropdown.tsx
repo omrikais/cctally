@@ -35,6 +35,13 @@ interface Props {
   onManage: () => void;
 }
 
+// #503 S4 §3.1 — a DURABLE focus-restore target for <ManagePresetsModal>.
+// The dialog used to restore to whatever was active when it opened, which is
+// the "Manage presets…" menuitem below; that menuitem unmounts as the dialog
+// opens, so the captured node was always detached and the restore always fell
+// into its blur-and-focus-body fallback. This trigger outlives the dropdown.
+export const SHARE_PRESETS_TRIGGER_ID = 'share-presets-trigger';
+
 // Render the dropdown's history timestamp in the user's locale. Falls
 // back to the raw ISO string when the parse fails (defensive — the
 // server always emits valid ISO-8601, but a future schema change
@@ -126,6 +133,7 @@ export function PresetDropdown({ panel, onPick, onManage }: Props) {
     <div className="share-presets-dropdown" ref={containerRef}>
       <button
         type="button"
+        id={SHARE_PRESETS_TRIGGER_ID}
         className="share-presets-trigger"
         aria-haspopup="menu"
         aria-expanded={open}

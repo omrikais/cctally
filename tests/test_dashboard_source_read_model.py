@@ -193,6 +193,39 @@ def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters
     assert report["by_model"][0]["key"] == "gpt-5"
 
 
+def test_codex_cache_report_uses_canonical_fast_multiplier_for_auto_review(
+    tmp_path, monkeypatch,
+):
+    """Passing the raw alias to the shared multiplier must still select 2.5x."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    entry = SimpleNamespace(
+        timestamp=NOW - dt.timedelta(hours=1),
+        source_root_key="root-a",
+        source_path="/private/guardian.jsonl",
+        project_label="cctally-dev",
+        model="codex-auto-review",
+        input_tokens=100,
+        cached_input_tokens=80,
+        output_tokens=10,
+        reasoning_output_tokens=2,
+        total_tokens=110,
+        cost_usd=0.01,
+    )
+
+    report = source_module._codex_cache_report_wire(
+        (entry,), metadata={}, now_utc=NOW,
+        display_tz_name="UTC", speed="fast",
+    )
+
+    measured = next(row for row in report["days"] if row["observed"])
+    assert measured["saved_usd"] == pytest.approx(
+        80 * (5e-6 - 5e-7) * 2.5
+    )
+    assert report["fourteen_day_counterfactual_usd"] == measured["saved_usd"]
+
+
 def test_codex_empty_report_carries_codex_vocabulary(tmp_path, monkeypatch):
     """#443 S2 F18 — the empty early return goes through the shared builder.
 

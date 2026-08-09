@@ -76,12 +76,18 @@ export function ShareModalRoot() {
   }, [slot]);
 
   const close = () => dispatch(closeShareModal());
-  // ComposerModal mounts in a sibling slot — it can layer above the
-  // share modal (the "Customize…" path opens the composer while the
-  // share modal is still up) and it can be opened independently via
-  // the `B` keystroke or the BasketChip click. Its mount/unmount is
-  // driven by `state.composerModal` (the ComposerModal component
-  // subscribes itself and returns null when the slot is empty).
+  // ComposerModal mounts in a sibling slot so it CAN layer above the share
+  // modal, and the Escape layer table (docs/share-gotchas.md) orders the two
+  // on that basis. Its mount/unmount is driven by `state.composerModal` (the
+  // component subscribes itself and returns null when the slot is empty).
+  //
+  // #503 S4 — this comment used to name a "Customize…" path that opens the
+  // composer from inside the share modal. No such path exists: the only two
+  // entry points are `Shift+B` (which keyboardShare/keyboardBasket REFUSE
+  // while the share modal is open) and the header BasketChip. The layering
+  // support is real and stays; the entry point was aspirational. The gesture
+  // is also `Shift+B`, not the bare `B` this previously advertised — an
+  // unshifted key reaches a different surface entirely (#503 F30).
   return (
     <>
       {slot ? (

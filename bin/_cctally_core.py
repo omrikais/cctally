@@ -321,14 +321,6 @@ OAUTH_BACKOFF_CAP_SECONDS = 3600.0
 _init_paths_from_env()
 
 
-# stats.db WAL cap (#297). Bounds the persistent WAL file so a resetting
-# checkpoint truncates it back down instead of leaving it at its high-water
-# size. stats.db writes are small (its -wal was observed at 0 bytes even under
-# the contention that bloated cache.db to multi-GB), so a tighter 16 MB cap is
-# ample. See docs/superpowers/specs/2026-07-13-cache-db-wal-hardening-design.md.
-STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
-
-
 # === stats.db epoch-rebuild versioning (DB journal redesign §7.1/§8) ==
 #
 # stats.db is no longer a versioned migration target — it is a DISPOSABLE index
@@ -393,7 +385,12 @@ STATS_WAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024  # 16777216
 # before any schema work, so an `add_column_if_missing` would never run on an
 # upgraded install and the column would simply never appear. The registry stays
 # frozen at 13 and an epoch mismatch resolves by rebuild.
-STATS_INDEX_EPOCH = 1009
+# 1009 -> 1010 (#538 Task A): retire WAL for the disposable stats index. Every
+# stats connection now uses DELETE/FULL rollback journaling, structurally
+# removing the shared-memory WAL page map implicated by the retained corruption
+# bundles. The one-time rebuild is the mode transition; no stats migration is
+# added and cache/conversations remain WAL/NORMAL.
+STATS_INDEX_EPOCH = 1010
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -773,8 +770,8 @@ def ensure_dirs() -> None:
 #   bin/_cctally_store.py    _heal_flock_blocking, reached through
 #                            _acquire_stats_maintenance_reentrant by the epoch
 #                            resolver
-#   bin/_cctally_store.py    _acquire_stats_maintenance_for_heal, the corruption
-#                            heal's ownership-first BOUNDED acquire (#496 S3)
+#   bin/_cctally_store.py    detached corruption-heal worker maintenance acquire
+#                            (the detector itself never acquires it; #530)
 #   bin/_cctally_db.py       cmd_db_rebuild, _acquire_db_admin_writer_flocks
 #                            (db skip / db unskip), _cmd_db_repair_exclusive,
 #                            _vacuum_one_db
@@ -1647,11 +1644,12 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # #453: probe the live index before the maintenance-shared opener. During
     # a large detached rebuild that opener can wait for its bounded 5-second
     # guard; a statusline arriving mid-replay would otherwise pay that delay
-    # (and can reach more than one stats opener in a single render). The raw
-    # probe is read-only and deliberately recognizes only a readable,
-    # post-legacy wrong epoch. Missing/unreadable/legacy indexes retain their
-    # established guarded-open paths. The post-open epoch gate below remains a
-    # race-closing defense if the version changes after this probe.
+    # (and can reach more than one stats opener in a single render). The probe
+    # reads only the fixed user_version field in the main-file header; it never
+    # opens SQLite or bypasses the maintenance opener fence. Missing, invalid-
+    # header and legacy indexes retain their established guarded-open paths.
+    # The post-open epoch gate below remains a race-closing defense if the
+    # version changes after this probe.
     if (
         _target_path is None
         and _cctally_store.stats_epoch_enabled()
@@ -1682,18 +1680,16 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     # (corruption that only surfaces mid-DDL stays a raw error; the probe
     # catches the common case).
     try:
-        # §6.1 PRAGMA policy via the shared table (stats: WAL / NORMAL /
+        # §6.1 PRAGMA policy via the shared table (stats: DELETE / FULL /
         # busy_timeout 15000 / journal_size_limit 16 MiB / auto_vacuum unset).
         # #297: busy_timeout 15000 lets a writer wait out a slow-but-normal sync
-        # (>5 s) instead of erroring "database is locked"; it does NOT absorb
-        # SQLITE_BUSY_SNAPSHOT (defended by BEGIN IMMEDIATE / write-first at the
-        # write sites, cctally-dev#87). journal_size_limit bounds the persistent
-        # WAL. The corruption probe (SELECT 1) stays here inside the narrow
+        # (>5 s) instead of erroring "database is locked". The corruption probe
+        # (SELECT 1) stays here inside the narrow
         # StatsDbCorruptError boundary.
         _cctally_store.apply_policy(conn, "stats")
         conn.execute("SELECT 1").fetchone()
-        # §9.2 (#496 S6 F23). AFTER `apply_policy`, because that is what sets
-        # journal_mode=WAL and so what can materialize the sidecars.
+        # §9.2 (#496 S6 F23). AFTER `apply_policy`, so any rollback journal
+        # materialized during the transition is included in family hardening.
         _cctally_store._harden_stats_family(db_path)
     except sqlite3.DatabaseError as exc:
         try:
@@ -1714,7 +1710,15 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # it — all of which fall through to the original guided
         # StatsDbCorruptError so the manual path still applies.
         heal = getattr(_cctally_store, "HEAL_HOOK", None)
-        if _target_path is None and heal is not None and heal("stats", exc):
+        heal_enabled = (
+            os.environ.get("CCTALLY_TEST_DISABLE_STATS_AUTO_HEAL") != "1"
+        )
+        if (
+            _target_path is None
+            and heal is not None
+            and heal_enabled
+            and heal("stats", exc)
+        ):
             # #386: the post-heal retry is an opener too. The heal released the
             # maintenance lock before returning, so another maintenance path can
             # legitimately own the family by now.

@@ -43,10 +43,10 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 # schema
 # --------------------------------------------------------------------------
 
-def test_epoch_1009_creates_the_four_new_tables(core, tmp_path):
+def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1009
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1010
         names = {
             row[0]
             for row in conn.execute(

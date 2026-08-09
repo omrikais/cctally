@@ -1528,21 +1528,29 @@ def test_s3_control_all_mode_codex_only_change_moves_the_digest(
         thread.join(timeout=2)
 
 
+@pytest.mark.parametrize(
+    ("panel", "template_id"),
+    (
+        ("current-week", "current-week-recap"),
+        ("trend", "trend-recap"),
+        ("forecast", "forecast-recap"),
+        ("daily", "daily-recap"),
+        ("monthly", "monthly-recap"),
+        ("weekly", "weekly-recap"),
+        ("blocks", "blocks-recap"),
+        ("sessions", "sessions-recap"),
+        ("projects", "projects-recap"),
+    ),
+)
 @pytest.mark.parametrize("availability", ("partial", "empty"))
 def test_s3_control_codex_availability_change_moves_the_digest(
-    monkeypatch, tmp_path, availability,
+    monkeypatch, tmp_path, panel, template_id, availability,
 ):
-    """Control 3. Codex-only: Claude does not copy state availability into
-    its template-produced snapshot, so mutating Claude's is not a rendered
-    change. Assert the snapshot fields and the body chrome moved first.
+    """Control 3. Every Codex panel projects state availability into its
+    built snapshot, visible source chrome, and version-2 drift digest.
 
-    `projects` rather than `sessions`: only the three Codex panels that
-    return early from `_build_codex_source_share_snapshot` (`forecast`,
-    `projects`, `blocks`) copy state availability onto the snapshot. The
-    other six route through `_cctally_codex._build_codex_share_snapshot`,
-    which derives availability from its own row count and drops the
-    state's value — so on those panels an availability change is not a
-    rendered change either.
+    Keep all underlying rows fixed: this isolates the state transition from
+    the generic Codex builder's row-count-derived default.
     """
     ns = load_script()
     share_lib = ns["_share_load_lib"]()
@@ -1558,8 +1566,8 @@ def test_s3_control_codex_availability_change_moves_the_digest(
     _s3_pin_clock(ns, monkeypatch)
     try:
         before, first = _s3_digest(
-            server, source_marker="codex", panel="projects",
-            template_id="projects-recap",
+            server, source_marker="codex", panel=panel,
+            template_id=template_id,
         )
         assert rendered[-1].availability == "ok"
         assert rendered[-1].availability_reason is None
@@ -1568,11 +1576,20 @@ def test_s3_control_codex_availability_change_moves_the_digest(
         _s3_replace_source(ns, "codex", replace(state, availability=availability))
 
         after, second = _s3_digest(
-            server, source_marker="codex", panel="projects",
-            template_id="projects-recap",
+            server, source_marker="codex", panel=panel,
+            template_id=template_id,
         )
         expected = "unavailable" if availability == "partial" else "empty"
+        expected_reason = (
+            "source data unavailable" if expected == "unavailable" else None
+        )
+        expected_chrome = (
+            "Unavailable: source data unavailable"
+            if expected == "unavailable" else "No data"
+        )
         assert rendered[-1].availability == expected
+        assert rendered[-1].availability_reason == expected_reason
+        assert expected_chrome in second["body"]
         assert second["body"] != first["body"]
         assert after != before
     finally:

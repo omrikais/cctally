@@ -7,6 +7,7 @@ below the ~2x-file margin.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sqlite3
 import sys
 import time
@@ -92,3 +93,62 @@ def test_vacuum_absent_db_is_noop(tmp_path, monkeypatch, capsys):
     rc = ns["cmd_db_vacuum"](argparse.Namespace(db="stats"))
     assert rc == 0
     assert "nothing to reclaim" in capsys.readouterr().out.lower()
+
+
+def test_vacuum_current_stats_never_runs_a_wal_checkpoint(
+    tmp_path, monkeypatch
+):
+    ns = _load(tmp_path, monkeypatch)
+    ns["open_db"]().close()
+    import _cctally_db
+
+    real_connect = _cctally_db.sqlite3.connect
+    statements = []
+
+    class RecordingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            statements.append(str(sql))
+            return self.inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    monkeypatch.setattr(
+        _cctally_db.sqlite3,
+        "connect",
+        lambda *args, **kwargs: RecordingConnection(
+            real_connect(*args, **kwargs)
+        ),
+    )
+
+    assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 0
+    assert not any("wal_checkpoint" in sql.lower() for sql in statements)
+
+
+def test_vacuum_refuses_legacy_stats_wal_without_opening_it(
+    tmp_path, monkeypatch, capsys
+):
+    ns = _load(tmp_path, monkeypatch)
+    import _cctally_core
+    import _cctally_db
+
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+    finally:
+        conn.close()
+    before = path.read_bytes()
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("vacuum opened a legacy stats WAL family")
+
+    monkeypatch.setattr(_cctally_db.sqlite3, "connect", forbidden_connect)
+    assert ns["cmd_db_vacuum"](argparse.Namespace(db="stats")) == 3
+    assert "legacy wal" in capsys.readouterr().err.lower()
+    assert path.read_bytes() == before

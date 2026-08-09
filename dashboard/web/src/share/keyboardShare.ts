@@ -50,7 +50,7 @@ import { isSharePanelAllowed, type SharePanelId } from './types';
 // #293 S4 — card regions are no longer focusable (describe-only); the real Tab
 // target is a panel action (Expand / Share icon). Copy reflects that.
 export const UNFOCUSED_TOAST_TEXT =
-  'Focus a panel action, then press S to share it.';
+  'Focus a panel action, then press Shift+S to share it.';
 
 // S2 (#264): the `history` grid card is gone — daily/weekly/monthly are
 // independent grid tiles again, and each is BOTH a PanelId and a SharePanelId.

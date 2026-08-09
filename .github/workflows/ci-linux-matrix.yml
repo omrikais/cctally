@@ -27,6 +27,13 @@ jobs:
       matrix:
         python-version: ['3.11', '3.12', '3.13']
     env:
+      # This lane's green is meant to be believed, so a missing hard capability
+      # (pytest, fts5, pytest-timeout, rich, node/npm) is a refusal to start
+      # rather than an `incomplete` classification that lets the run continue
+      # (#529 S1). Every one of those is provisioned by the steps below —
+      # setup-python plus the pip install, setup-node plus `npm ci` — and FTS5
+      # comes from Ubuntu's libsqlite3, which Debian builds with --enable-fts5.
+      CCTALLY_AUTHORITATIVE_RUN: "1"
       CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2, release auto-capped via the runner (#292)
       # Hosted Actions cannot read the separate private agentmem repository.
       # The self-hosted macOS lane owns that integration gate; this matrix

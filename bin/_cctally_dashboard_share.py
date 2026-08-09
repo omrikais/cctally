@@ -1763,9 +1763,15 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
         display_tz_label=display_tz,
     )
     codex_module = sys.modules["cctally"]._load_sibling("_cctally_codex")
+    # The canonical CLI adapter derives availability from its row count, but
+    # this source-aware path has an authoritative provider state. Project the
+    # normalized state after adapting the rows so all nine panels carry the
+    # same source chrome and built-snapshot digest signal (#533).
     return replace(
         codex_module._build_codex_share_snapshot(command, view, normalized_rows),
         template_id=template_id,
+        availability=availability,
+        availability_reason=reason,
     )
 
 

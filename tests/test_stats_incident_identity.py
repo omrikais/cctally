@@ -372,7 +372,7 @@ def test_preservation_manifest_is_schema_version_2_with_trigger_identity(ns):
     assert manifest["originalPath"] == str(_cctally_core.DB_PATH)
     assert manifest["movedFiles"][0] == "stats.db"
     assert manifest["complete"] is True
-    assert manifest["cutoverProtocol"] == "preserve-then-atomic-replace-v1"
+    assert manifest["cutoverProtocol"] == "cold-quarantine-then-replace-v2"
 
     assert manifest["trigger"] == "corruption-heal"
     assert manifest["triggerError"] == "database disk image is malformed"
@@ -463,7 +463,7 @@ def _destroy_header_magic(db: pathlib.Path) -> None:
 
 
 def _cutover_manifests(app_dir: pathlib.Path) -> list:
-    """Every `preserve-then-atomic-replace-v1` manifest under `quarantine/`.
+    """Every current cold-quarantine manifest under `quarantine/`.
 
     Selected by protocol rather than by name so a synthesized legacy incident
     in the same directory is never mistaken for one this cutover wrote.
@@ -480,7 +480,7 @@ def _cutover_manifests(app_dir: pathlib.Path) -> list:
             payload = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+        if payload.get("cutoverProtocol") == "cold-quarantine-then-replace-v2":
             out.append(payload)
     return out
 

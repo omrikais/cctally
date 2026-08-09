@@ -235,9 +235,9 @@ def create_stats_db(path: Path) -> None:
         path.unlink()
     register_fixture_db(path)
     with contextlib.closing(sqlite3.connect(path)) as conn, conn:
-        # Match production's open_db(): fixtures must be WAL so a first
+        # Match production's open_db(): fixtures use rollback journaling so a first
         # open by the harness doesn't flip bytes 18/19 of the DB header.
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.executescript("""
             CREATE TABLE weekly_usage_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -555,7 +555,7 @@ def _self_test_create_stats_db() -> None:
             tables = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
-        assert mode == "wal", f"stats.db journal_mode not WAL: {mode}"
+        assert mode == "delete", f"stats.db journal_mode not DELETE: {mode}"
         expected = {
             "weekly_usage_snapshots", "weekly_cost_snapshots",
             "percent_milestones", "week_reset_events",

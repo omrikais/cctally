@@ -69,10 +69,10 @@ Database
         stats_quick_check: ok
         cache_quick_check: None
         conversations_quick_check: None
-  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1009) — no journal data available
+  ⚠ Version ahead            stats.db index mismatch (v99 ≠ epoch v1010) — no journal data available
       → Restore the journal/ directory from backup, then run `cctally db rebuild --db stats`
       details:
-        stats.db: {'user_version': 99, 'legacy_head': 13, 'epoch': 1009, 'mismatch': True, 'journal_present': False, 'journal_has_bytes': False}
+        stats.db: {'user_version': 99, 'legacy_head': 13, 'epoch': 1010, 'mismatch': True, 'journal_present': False, 'journal_has_bytes': False}
         cache.db: {'user_version': 0, 'registry_size': 41, 'ahead': False}
   ✓ Migrations               0/54 applied
       details:

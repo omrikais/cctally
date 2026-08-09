@@ -19,8 +19,10 @@ import os
 import pathlib
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -784,18 +786,13 @@ def _stats_migration_name() -> str:
 
 @pytest.mark.parametrize(
     "argv_factory,busy_rc",
-    [
-        (lambda: ("db", "vacuum", "--db", "stats"), 3),
-        (
-            lambda: ("db", "checkpoint", "--db", "stats",
-                     "--busy-timeout-ms", "300"),
-            3,
-        ),
-        (lambda: ("db", "skip", _stats_migration_name()), 3),
+        [
+            (lambda: ("db", "vacuum", "--db", "stats"), 3),
+            (lambda: ("db", "skip", _stats_migration_name()), 3),
         (lambda: ("db", "unskip", _stats_migration_name()), 3),
         (lambda: ("db", "repair", "--db", "stats", "--yes"), 3),
     ],
-    ids=["vacuum", "checkpoint", "skip", "unskip", "repair"],
+        ids=["vacuum", "skip", "unskip", "repair"],
 )
 def test_admin_commands_serialize_on_the_stats_maintenance_lock(
     tmp_path, argv_factory, busy_rc
@@ -841,17 +838,158 @@ def test_admin_commands_serialize_on_the_stats_maintenance_lock(
 
 
 def test_h1_multiwriter_baseline_stays_intact(tmp_path):
-    """N concurrent real writers, no kills. Must end integrity_check ok."""
+    """Production-shaped rollback storm: live integrity, latency, no sidecars."""
     env = _storm_env(tmp_path / "data")
+    env["CCTALLY_TEST_DISABLE_STATS_AUTO_HEAL"] = "1"
     _seed_journal(env, 3)
     db = _resolved_app_dir(env) / "stats.db"
     assert db.exists()
 
-    procs = [_spawn_writer(env, *_tick_args(3 + i)) for i in range(STORM_WRITERS)]
-    procs.append(_spawn_writer(env, "sync-week"))
-    procs.append(_spawn_writer(env, "sync-week"))
-    for p in procs:
-        p.wait(timeout=180)
+    stop_probe = threading.Event()
+    probe = {"quick": 0, "full": 0, "errors": [], "sidecars": []}
+
+    def integrity_probe() -> None:
+        iteration = 0
+        while not stop_probe.is_set():
+            try:
+                for suffix in ("-wal", "-shm"):
+                    if pathlib.Path(f"{db}{suffix}").exists():
+                        probe["sidecars"].append(suffix)
+                conn = sqlite3.connect(str(db), timeout=15)
+                try:
+                    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                    probe["quick"] += 1
+                    if iteration % 4 == 0:
+                        assert conn.execute(
+                            "PRAGMA integrity_check"
+                        ).fetchone()[0] == "ok"
+                        probe["full"] += 1
+                finally:
+                    conn.close()
+            except Exception as exc:  # pragma: no cover - asserted below
+                probe["errors"].append(f"{type(exc).__name__}: {exc}")
+            iteration += 1
+            time.sleep(0.01)
+
+    probe_thread = threading.Thread(
+        target=integrity_probe, name="stats-integrity-probe", daemon=True
+    )
+    probe_thread.start()
+
+    started = time.monotonic()
+    writer_procs = [
+        _spawn_writer(env, *_tick_args(3 + i))
+        for i in range(STORM_WRITERS)
+    ]
+    writer_procs.extend([
+        _spawn_writer(env, "sync-week"),
+        _spawn_writer(env, "sync-week"),
+    ])
+
+    status_payload = json.dumps({
+        "model": {"display_name": "Sonnet", "id": "claude-sonnet-4-5"},
+        "cost": {"total_cost_usd": 0.0},
+    })
+    hook_payload = json.dumps({
+        "hook_event_name": "PostToolBatch",
+        "session_id": "538-storm",
+        "transcript_path": "",
+        "cwd": str(tmp_path),
+    })
+    reader_specs = (
+        ("statusline", ("statusline",), status_payload),
+        ("hook-tick", ("hook-tick", "--foreground", "--no-oauth"), hook_payload),
+        ("report", ("report",), None),
+    )
+    reader_procs = []
+    for surface, argv, payload in reader_specs:
+        for _ in range(2):
+            process = subprocess.Popen(
+                [sys.executable, str(CCTALLY), *argv],
+                env=env,
+                stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            if payload is not None:
+                assert process.stdin is not None
+                process.stdin.write(payload)
+                process.stdin.close()
+            reader_procs.append((surface, process))
+
+    active = {
+        process: ("writer", time.monotonic()) for process in writer_procs
+    }
+    active.update({
+        process: (surface, time.monotonic())
+        for surface, process in reader_procs
+    })
+    latencies = {"writer": [], "statusline": [], "hook-tick": [], "report": []}
+    deadline = time.monotonic() + 180
+    while active and time.monotonic() < deadline:
+        now = time.monotonic()
+        for process, (surface, process_started) in list(active.items()):
+            if process.poll() is not None:
+                latencies[surface].append(now - process_started)
+                del active[process]
+        time.sleep(0.01)
+    stop_probe.set()
+    probe_thread.join(timeout=30)
+    assert not probe_thread.is_alive()
+    assert not active, f"storm processes exceeded 180 s: {list(active)}"
+    all_procs = writer_procs + [process for _, process in reader_procs]
+    returncodes = [process.returncode for process in all_procs]
+    busy_count = sum(code != 0 for code in returncodes)
+    latency_summary = {}
+    for surface, values in latencies.items():
+        ordered = sorted(values)
+        latency_summary[surface] = {
+            "p50": statistics.median(ordered),
+            "p95": ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)],
+            "max": max(ordered),
+        }
+
+    baseline_summary = {}
+    for surface, argv, payload in reader_specs:
+        samples = []
+        for _ in range(2):
+            baseline_started = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, str(CCTALLY), *argv],
+                env=env,
+                input=payload,
+                stdin=subprocess.DEVNULL if payload is None else None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0
+            samples.append(time.monotonic() - baseline_started)
+        baseline_summary[surface] = {
+            "p50": statistics.median(samples),
+            "p95": max(samples),
+            "max": max(samples),
+        }
+    print(
+        "[538-storm] "
+        f"processes={len(all_procs)} busy={busy_count} "
+        f"elapsed={time.monotonic() - started:.3f}s "
+        f"quick={probe['quick']} integrity={probe['full']} "
+        f"stormLatency={json.dumps(latency_summary, sort_keys=True)} "
+        f"baselineLatency={json.dumps(baseline_summary, sort_keys=True)}"
+    )
+    assert busy_count == 0, returncodes
+    assert probe["quick"] >= 2
+    assert probe["full"] >= 1
+    assert probe["errors"] == []
+    assert probe["sidecars"] == []
+    for surface in ("statusline", "hook-tick", "report"):
+        assert latency_summary[surface]["p95"] < 5.0, latency_summary
+        assert latency_summary[surface]["p95"] <= max(
+            2.0, baseline_summary[surface]["p95"] * 4
+        ), (surface, latency_summary, baseline_summary)
 
     ok, text = _integrity_ok(db)
     assert ok, f"baseline storm corrupted stats.db: {text}"
@@ -860,6 +998,9 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
     # no-ops every child would pass the integrity assertion trivially.
     conn = sqlite3.connect(str(db))
     try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         rows = conn.execute(
             "SELECT count(*) FROM weekly_usage_snapshots").fetchone()[0]
         blocks = conn.execute(
@@ -868,6 +1009,8 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
         conn.close()
     assert rows >= 4, f"storm wrote nothing: {rows} snapshots"
     assert blocks >= 1, f"storm never exercised five_hour_blocks: {blocks}"
+    assert not pathlib.Path(str(db) + "-wal").exists()
+    assert not pathlib.Path(str(db) + "-shm").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -876,58 +1019,51 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
 
 
 def test_h2_sigkill_mid_transaction_recovers_clean(tmp_path):
-    """SIGKILL landed while the child's OWN uncheckpointed frames were on disk.
-    Expected structurally clean — incomplete WAL frames are checksummed and
-    ignored on recovery.
-
-    The kill is WAL-triggered, not timer-triggered, and the WAL is drained to
-    zero before every round so the trigger cannot fire on the previous round's
-    corpse. The reported hit count is therefore the number of rounds in which
-    THIS round's child grew the WAL before dying.
-
-    **What this does NOT prove (#374).** A non-empty `-wal` means the child had
-    uncheckpointed frames; it does not identify which transaction the signal
-    landed in. A ``record-usage`` tick runs several (journal append, the ingest
-    cycle's ``BEGIN IMMEDIATE``, the 5h upsert, the milestone folds), so a kill
-    at the first frame very likely lands inside a LATER transaction — but this
-    test cannot say which one, and does not claim to.
-    """
+    """SIGKILL with a hot rollback journal preserves the committed generation."""
     env = _storm_env(tmp_path / "data")
     _seed_journal(env, 4)
     db = _resolved_app_dir(env) / "stats.db"
-    wal = _wal_path(db)
-
-    hits = []
-    for r in range(KILL_ROUNDS):
-        baseline = _drain_wal(db)
-        assert baseline == 0, (
-            f"H2 round {r} started against a {baseline}-byte stranded WAL; the "
-            "kill trigger would fire on the corpse, not on the child"
-        )
-        p = _spawn_writer(env, *_tick_args(100 + r))
-        observed = _kill_when_wal_active(p, wal, baseline=baseline)
-        if observed:
-            hits.append(observed)
-
-    # A later normal open must recover the family.
-    res = _cctally(env, "doctor", "--json")
-    assert res.returncode in (0, 2), res.stderr
-    _seed_journal(env, 1)
-
-    ok, text = _integrity_ok(db)
-    print(f"[H2] rounds={KILL_ROUNDS} in-window kills={len(hits)} "
-          f"wal_at_kill_bytes={hits}")
-    assert ok, f"H2 produced corruption after {len(hits)} in-window kills: {text}"
-
-    # Non-vacuity gate: if NO kill landed while the child's own frames were on
-    # disk, the clean result is meaningless. Fail loudly rather than report a
-    # false negative (#374). Distinct sizes across rounds are the tell that the
-    # trigger is tracking the live child; a constant list means it is not.
-    assert hits, (
-        "H2 is vacuous: no SIGKILL landed while the child's own stats.db-wal "
-        "frames were on disk, so the test never entered the window it claims "
-        "to characterise"
+    before = db.read_bytes()
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sqlite3, sys, time\n"
+            "c=sqlite3.connect(sys.argv[1], timeout=15)\n"
+            "assert c.execute('PRAGMA journal_mode').fetchone()[0]=='delete'\n"
+            "c.execute('BEGIN IMMEDIATE')\n"
+            "c.execute('UPDATE weekly_usage_snapshots SET weekly_percent=99')\n"
+            "print('ROLLBACK-HOT', flush=True)\n"
+            "time.sleep(300)\n",
+            str(db),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
     )
+    try:
+        assert child.stdout.readline().strip() == "ROLLBACK-HOT"
+        journal = pathlib.Path(str(db) + "-journal")
+        assert journal.exists() and journal.stat().st_size > 0
+        child.send_signal(signal.SIGKILL)
+        child.wait(timeout=30)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+        if child.stdout is not None:
+            child.stdout.close()
+
+    probe = sqlite3.connect(str(db))
+    try:
+        assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert probe.execute(
+            "SELECT MAX(weekly_percent) FROM weekly_usage_snapshots"
+        ).fetchone()[0] != 99
+    finally:
+        probe.close()
+    assert db.read_bytes() == before
+    assert not pathlib.Path(str(db) + "-wal").exists()
+    assert not pathlib.Path(str(db) + "-shm").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1080,14 @@ def _grow_wal(db: pathlib.Path, commits: int, pad: int = 400) -> int:
     merely-open autocommit connection, the WAL plateaus at ~4 MiB (~1000
     frames); only an OPEN READ TRANSACTION defeats the autocheckpoint.
     """
+    transition = sqlite3.connect(str(db))
+    try:
+        assert transition.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0] == "wal"
+    finally:
+        transition.close()
+
     holder = subprocess.Popen(
         [sys.executable, "-c",
          "import sqlite3, sys, time\n"
@@ -959,7 +1103,6 @@ def _grow_wal(db: pathlib.Path, commits: int, pad: int = 400) -> int:
         assert holder.stdout.readline().strip() == "held"
         conn = sqlite3.connect(str(db))
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=15000")
             for i in range(commits):
                 conn.execute("BEGIN IMMEDIATE")
@@ -1025,6 +1168,7 @@ def _wait_for_stats_maintenance_hold(
         os.close(lock_fd)
 
 
+@pytest.mark.skip(reason="#538 retired the live stats WAL checkpoint path")
 def test_h3_sigkill_mid_checkpoint_recovers_clean(tmp_path):
     """SIGKILL a real `db checkpoint --db stats` mid-TRUNCATE on a grown WAL.
 
@@ -1278,146 +1422,6 @@ def test_h4_new_opener_after_pid_scan(tmp_path):
     assert len(_quarantine_incidents(app)) == 1, _quarantine_incidents(app)
 
 
-def test_contender_after_sidecar_removal_is_excluded(tmp_path, record_property):
-    """The window #496 S2 identified: the destination's sidecars are gone and
-    the old main file is still at that path, with `os.replace` not yet run.
-
-    The assertion is EXCLUSION, mirroring test_h4_new_opener_after_pid_scan.
-    This test records what a contender actually experiences there — whether its
-    open completed and whether it was refused — together with the parent's view
-    of the destination's inode and sidecars, so a later protocol change cannot
-    quietly open the window. It does NOT reproduce damage and must not be read
-    as having tried and failed to. The contender's own view of the inode is not
-    captured; only the parent's.
-
-    test_h4_new_opener_after_pid_scan pins the same property at
-    `stats_replace_drained`, which is earlier: before the preservation copy,
-    before the checkpoint and before the sidecar removal. Nothing pinned this
-    later point, which is the one S2's file-ordering analysis names.
-
-    #496 S3: a readable destination publishes in place and never reaches this
-    seam, so the destination is corrupted first to reach the physical fallback
-    it belongs to. The spec keeps both pause points on that path precisely so
-    this test stays meaningful rather than vacuous.
-    """
-    sys.path.insert(0, str(ROOT / "bin"))
-    import _lib_stats_damage as dmg
-
-    env = _storm_env(tmp_path / "data")
-    _seed_journal(env, 4)
-    app = _resolved_app_dir(env)
-    db = app / "stats.db"
-    _drain_wal(db)
-    _corrupt_header(db)
-    marker = tmp_path / "paused.pid"
-
-    rebuild = subprocess.Popen(
-        [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
-        env=_storm_pause_env(env, "stats_replace_sidecars_removed", marker),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    opener = None
-    opener_rc = None
-    opener_err = ""
-    try:
-        _await_marker(marker, rebuild)
-        # State at the pause. These three alone do NOT locate it: a fixture
-        # seeded by clean CLI runs has no sidecars at `stats_replace_drained`
-        # either, and all three hold again after the post-publication removal.
-        assert db.exists(), (
-            "the old main file left the destination before the rename"
-        )
-        parked_inode = db.stat().st_ino
-        assert not _wal_path(db).exists(), (
-            "the destination still carries a -wal, so the pause is BEFORE the "
-            "sidecar removal"
-        )
-        assert not pathlib.Path(str(db) + "-shm").exists(), (
-            "the destination still carries a -shm, so the pause is BEFORE the "
-            "sidecar removal"
-        )
-        # THESE two bracket the pause to exactly the window S2 named. The
-        # incident directory is created by the preservation copy, which runs
-        # strictly after `stats_replace_drained`, so it is absent at the earlier
-        # seam the existing test covers. The publication marker is written in
-        # Phase 1 strictly before `os.replace` and removed only on success, so
-        # its absence rules out every seam from the rename onwards.
-        assert len(_quarantine_incidents(app)) == 1, (
-            "no incident preserved yet, so the pause is BEFORE the preservation "
-            f"copy: {_quarantine_incidents(app)}"
-        )
-        assert not pathlib.Path(str(db) + ".publication").exists(), (
-            "a publication marker exists, so the pause is at or AFTER the "
-            "rename rather than inside the window"
-        )
-
-        # The replacement is parked in that window. Race a contender into it.
-        opener = subprocess.Popen(
-            [sys.executable, str(CCTALLY), "report"],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if opener.poll() is not None:
-                break
-            time.sleep(0.05)
-        opener_rc = opener.poll()
-        if opener_rc is not None:
-            opener_out, opener_err = opener.communicate(timeout=30)
-            assert opener_rc != 0, (
-                "a contender completed while a replacement was parked with the "
-                "destination's sidecars removed and its rename not yet run — "
-                f"the window is open to guarded openers: {opener_out}"
-            )
-            # Attribute the refusal, so an unrelated crash cannot satisfy it.
-            assert "maintenance" in opener_err.lower(), opener_err
-        # Whatever the contender did, the old generation is still the file at
-        # the destination: no rename can have happened behind the refusal.
-        assert db.stat().st_ino == parked_inode
-        # RECORDED, NOT ASSERTED. A refused contender still creates a `-wal`
-        # beside the old main file here, so the destination is not sidecar-free
-        # for the whole window even though every guarded open is declined. The
-        # spec states in section 4 that sidecar creation alone does not imply
-        # page mixing, so this is evidence for S3 rather than a property this
-        # test claims. Asserting the sidecars stay absent would assert something
-        # the design does not promise, and it fails.
-        sidecars_after_contender = {
-            path.name: (path.stat().st_size if path.exists() else None)
-            for path in (_wal_path(db), pathlib.Path(str(db) + "-shm"))
-        }
-        # `print` alone is captured and discarded on a passing run, and this
-        # test is expected to pass, so the observation would never be visible.
-        record_property("s2_contender_rc", opener_rc)
-        record_property(
-            "s2_sidecars_in_window", repr(sidecars_after_contender)
-        )
-        print(
-            f"[496-S2] contender rc={opener_rc} sidecars_in_window="
-            f"{sidecars_after_contender}"
-        )
-    finally:
-        rebuild.send_signal(signal.SIGCONT)
-        rebuild.wait(timeout=120)
-        if opener is not None and opener.poll() is None:
-            opener.communicate(timeout=120)
-
-    assert rebuild.returncode == 0
-    # Control: with the replacement finished, the SAME command succeeds. Without
-    # this, "the contender was excluded" could be satisfied by a contender that
-    # is simply broken.
-    res = _cctally(env, "report")
-    assert res.returncode == 0, res.stderr
-
-    ok, text = _integrity_ok(db)
-    assert ok, text
-    assert _no_orphan_sidecars(db)
-    assert dmg.scan_sqlite_file(db)["findings"] == []
-
-
 def test_h4_resume_of_partial_quarantine(tmp_path):
     """A half-completed strict quarantine must be COMPLETED, never recreated.
 
@@ -1492,20 +1496,7 @@ def test_h4_resume_of_partial_quarantine(tmp_path):
 
 
 def test_h4_live_handle_spans_rebuild_swap(tmp_path):
-    """A reader held open across a rebuild keeps the generation it opened on.
-
-    Before #496 S3 the correct outcome was that the swap never happened while
-    the handle was live, because `os.replace` of the scratch main and the
-    sidecar `unlink` are exactly the surgery that invalidates a live mapping.
-    In-place publication removes that surgery, so the rebuild now SUCCEEDS
-    under the live reader and the destination's inode never changes.
-
-    This is the CROSS-PROCESS snapshot-isolation claim, which the design
-    deliberately refused to inherit from its single-process probe. It is
-    non-vacuous because the generation actually differs: two further ticks land
-    between the pin and the rebuild, so a reader that saw the publish would
-    report a different number from the one it pinned.
-    """
+    """A rollback-journal reader makes writers fail soft without replacement."""
     env = _storm_env(tmp_path / "data")
     _seed_journal(env, 4)
     app = _resolved_app_dir(env)
@@ -1520,22 +1511,10 @@ def test_h4_live_handle_spans_rebuild_swap(tmp_path):
         pinned_rows = int(pinned.split()[1])
         assert pinned_rows > 0, "the reader pinned an empty index"
 
-        # Change the generation the rebuild will publish. The tick indices
-        # CONTINUE from the seed: `_seed_journal` always restarts at 0, and
-        # replaying a lower 7d percent adds no snapshot row at all.
-        for i in range(4, 6):
-            res = _cctally(env, *_tick_args(i))
-            assert res.returncode == 0, res.stderr
-
-        for _ in range(3):
-            res = _cctally(env, "db", "rebuild", "--db", "stats")
-            assert res.returncode == 0, (
-                "an in-place publish must not decline under a live reader: "
-                + res.stderr
-            )
-            assert db.stat().st_ino == ino_before, (
-                "the destination inode changed, so the file was replaced"
-            )
+        res = _cctally(env, *_tick_args(4))
+        assert res.returncode != 0
+        assert "locked" in res.stderr.lower()
+        assert db.stat().st_ino == ino_before
         gate.write_text("go\n")
 
         during = reader.stdout.readline().strip()
@@ -1544,11 +1523,7 @@ def test_h4_live_handle_spans_rebuild_swap(tmp_path):
             f"(pinned {pinned_rows})"
         )
         after = reader.stdout.readline().strip()
-        after_rows = int(after.split()[1])
-        assert after_rows > pinned_rows, (
-            "the published generation is identical to the pinned one, so the "
-            f"isolation assertion proves nothing: {after!r}"
-        )
+        assert after == f"after {pinned_rows}"
     finally:
         if reader.poll() is None:
             reader.send_signal(signal.SIGKILL)
@@ -1560,6 +1535,9 @@ def test_h4_live_handle_spans_rebuild_swap(tmp_path):
         "an in-place publish never preserves: "
         + str(_quarantine_incidents(app))
     )
+    for i in range(4, 6):
+        res = _cctally(env, *_tick_args(i))
+        assert res.returncode == 0, res.stderr
     res = _cctally(env, "db", "rebuild", "--db", "stats")
     assert res.returncode == 0, res.stderr
     db = _resolved_app_dir(env) / "stats.db"
@@ -1622,6 +1600,7 @@ def test_h4_two_concurrent_heals(tmp_path):
     assert rows >= 5, f"heal rebuilt an empty index: {rows} snapshots"
 
 
+@pytest.mark.skip(reason="#538 retired stats WAL checkpoint operation")
 def test_h4_reader_pinned_wal(tmp_path):
     """A long-lived reader pinning the WAL across repeated checkpoint attempts.
 
@@ -1673,13 +1652,14 @@ def test_h4_reader_pinned_wal(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Issue #393 — dashboard-shaped reader must not pin the live stats WAL
+# Issue #393/#538 — dashboard reader releases rollback snapshots
 # ---------------------------------------------------------------------------
 
 
-_SANCTIONED_WAL_WRITER = """
+_ROLLBACK_WRITER = """
 import pathlib
 import sys
+import time
 
 sys.path.insert(0, sys.argv[1])
 import _cctally_store as store
@@ -1689,6 +1669,7 @@ commits = int(sys.argv[3])
 pad = "x" * 400
 conn = store.stats_open_guarded(db)
 try:
+    started = time.monotonic()
     with store.stats_write_scope("issue-393-acceptance"):
         for i in range(commits):
             conn.execute(
@@ -1696,17 +1677,22 @@ try:
                 (f"{i}:{pad}",),
             )
             conn.commit()
-    wal = pathlib.Path(str(db) + "-wal")
-    print(f"commits={commits} wal={wal.stat().st_size}", flush=True)
+    print(
+        f"commits={commits} elapsed={time.monotonic() - started:.6f} "
+        f"mode={conn.execute('PRAGMA journal_mode').fetchone()[0]} "
+        f"wal={int(pathlib.Path(str(db) + '-wal').exists())} "
+        f"shm={int(pathlib.Path(str(db) + '-shm').exists())}",
+        flush=True,
+    )
 finally:
     conn.close()
 """
 
 
-def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
+def test_dashboard_source_reader_releases_rollback_snapshot(
     tmp_path, monkeypatch,
 ):
-    """Sustained sanctioned writes stay bounded during a live source build.
+    """Sustained writes complete during a live dashboard source build.
 
     This is the direct #393 product gate, not a generic SQLite simulation:
     ``_tui_build_source_bundle`` is the dashboard sync thread's production
@@ -1715,10 +1701,10 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
     sanctioned scope.  The provider builder is reduced to a slow operation
     only so the writer can finish while the dashboard-shaped reader is live.
 
-    With the pre-fix explicit ``BEGIN``, the first signature read pins one
-    snapshot for the entire build and 2,600 one-row commits grow the WAL past
-    8 MiB.  Autocommit statement snapshots release after each SELECT, leaving
-    SQLite's default 1,000-page autocheckpoint as the real ~4 MiB bound.
+    With the pre-#393 explicit ``BEGIN``, the first signature read held one
+    snapshot for the entire build. In #538 rollback mode, autocommit statement
+    snapshots must release after each SELECT so the writer can finish without
+    a live WAL/SHM family.
     """
     data_dir = tmp_path / "data"
     env = _storm_env(data_dir)
@@ -1741,7 +1727,8 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
 
     seed = sqlite3.connect(db)
     try:
-        assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        assert seed.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        seed.execute("PRAGMA synchronous=FULL")
         seed.execute(
             "CREATE TABLE wal_probe ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)"
@@ -1782,8 +1769,8 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
     )
 
     # The actual SELECT is load-bearing: under the pre-fix BEGIN it establishes
-    # the snapshot that pins WAL frames.  Returning a constant digest keeps the
-    # test focused on transaction lifetime rather than source invalidation.
+    # the snapshot whose SHARED lock blocks a rollback writer. Returning a
+    # constant digest keeps the test focused on transaction lifetime.
     def stats_digest(conn):
         conn.execute("SELECT count(*) FROM wal_probe").fetchone()
         return "fixed"
@@ -1820,7 +1807,7 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
             [
                 sys.executable,
                 "-c",
-                _SANCTIONED_WAL_WRITER,
+                _ROLLBACK_WRITER,
                 str(ROOT / "bin"),
                 str(db),
                 "2600",
@@ -1835,7 +1822,10 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
             field.split("=", 1) for field in child.stdout.strip().split()
         )
         observed["commits"] = int(fields["commits"])
+        observed["elapsed"] = float(fields["elapsed"])
+        observed["mode"] = fields["mode"]
         observed["wal"] = int(fields["wal"])
+        observed["shm"] = int(fields["shm"])
         return tui.SourceDashboardState(
             source="codex",
             availability="empty",
@@ -1858,6 +1848,7 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
 
     stats_conn = _cctally_store.stats_open_guarded(db)
     try:
+        storm_started = time.monotonic()
         bundle = tui._tui_build_source_bundle(
             stats_conn=stats_conn,
             now_utc=ns["dt"].datetime.now(ns["dt"].timezone.utc),
@@ -1867,18 +1858,36 @@ def test_dashboard_source_reader_does_not_pin_unbounded_stats_wal(
             claude_total_tokens=0,
             raw_config={},
         )
+        storm_elapsed = time.monotonic() - storm_started
         assert bundle.sources["codex"].source == "codex"
         assert observed["commits"] == 2600
-        assert observed["wal"] > 0, "writer never produced live WAL frames"
+        assert observed["mode"] == "delete"
+        assert observed["wal"] == 0
+        assert observed["shm"] == 0
+        monkeypatch.setattr(
+            tui,
+            "build_codex_source_state",
+            lambda *_args, **_kwargs: bundle.sources["codex"],
+        )
+        baseline_started = time.monotonic()
+        baseline_bundle = tui._tui_build_source_bundle(
+            stats_conn=stats_conn,
+            now_utc=ns["dt"].datetime.now(ns["dt"].timezone.utc),
+            display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0,
+            claude_total_tokens=0,
+            raw_config={},
+        )
+        baseline_elapsed = time.monotonic() - baseline_started
+        assert baseline_bundle.sources["codex"].source == "codex"
         print(
-            "dashboard_wal_acceptance: "
-            f"commits={observed['commits']} wal_bytes={observed['wal']} "
-            f"bound_bytes={8 * 1024 * 1024}"
+            "dashboard_rollback_acceptance: "
+            f"commits={observed['commits']} writer={observed['elapsed']:.3f}s "
+            f"storm={storm_elapsed:.3f}s baseline={baseline_elapsed:.3f}s"
         )
-        assert observed["wal"] <= 8 * 1024 * 1024, (
-            "dashboard source build pinned an unbounded stats WAL: "
-            f"{observed['wal']} bytes for {observed['commits']} commits"
-        )
+        assert observed["elapsed"] < 10.0
+        assert storm_elapsed <= max(2.0, baseline_elapsed * 4)
     finally:
         stats_conn.close()
 

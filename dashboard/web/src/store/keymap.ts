@@ -58,42 +58,55 @@ export function registerKeymap(list: Binding[]): () => void {
 }
 
 /** Read-only snapshot of currently-registered bindings (test/introspection
- *  use; #207 D1). Pure — does not mutate the Set. */
-export function registeredBindings(): ReadonlyArray<Pick<Binding, 'key' | 'scope' | 'view'>> {
-  return [...bindings].map(({ key, scope, view }) => ({ key, scope, view }));
+ *  use; #207 D1). Pure — does not mutate the Set.
+ *
+ *  `layer` is included (#503 S4) so a test can assert the NUMBER a surface
+ *  registered at, not merely that its scope changed. Without it, the share
+ *  family's layer table was prose: every ordering assertion still passed with
+ *  a layer moved by ten in either direction. */
+export function registeredBindings(): ReadonlyArray<Pick<Binding, 'key' | 'scope' | 'view' | 'layer'>> {
+  return [...bindings].map(({ key, scope, view, layer }) => ({ key, scope, view, layer }));
+}
+
+/** Resolve one keydown against the registered bindings.
+ *
+ *  Exported because the preview-iframe bridge (useIframeKeymapBridge) must
+ *  reach the SAME resolution — a second copy of the scope/layer ordering
+ *  would drift from this one. Safe to call without installGlobalKeydown().
+ */
+export function dispatchKeydown(e: KeyboardEvent): void {
+  // Bail on OS/browser modifier shortcuts so the native action (tab switch,
+  // find, reload, etc.) is never shadowed by a bound letter/digit.
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  // Input-mode suppression: single-char keys are swallowed when focus is in
+  // an INPUT/TEXTAREA/contenteditable. Escape, Enter, and other named keys
+  // pass through so modals/input-owners can close/confirm.
+  if (isTextInputFocused(e.target) && e.key.length === 1) return;
+
+  const currentView = getState().view;
+  const ordered = [...bindings].sort((a, b) => {
+    const byScope = SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope];
+    if (byScope !== 0) return byScope;
+    // Same scope: higher layer (z-index) fires first (#159). Layerless
+    // bindings (default 0) tie here and keep stable-sort insertion order.
+    return (b.layer ?? 0) - (a.layer ?? 0);
+  });
+  for (const b of ordered) {
+    if (b.key !== e.key) continue;
+    // Central view gate (#156): a binding fires only in its view (or 'any').
+    const bv = b.view ?? defaultView(b.scope);
+    if (bv !== 'any' && bv !== currentView) continue;
+    if (b.when && !b.when()) continue;
+    b.action();
+    e.preventDefault();
+    return;
+  }
 }
 
 export function installGlobalKeydown(): void {
   if (handler) return;
-  handler = (e: KeyboardEvent): void => {
-    // Bail on OS/browser modifier shortcuts so the native action (tab switch,
-    // find, reload, etc.) is never shadowed by a bound letter/digit.
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-
-    // Input-mode suppression: single-char keys are swallowed when focus is in
-    // an INPUT/TEXTAREA/contenteditable. Escape, Enter, and other named keys
-    // pass through so modals/input-owners can close/confirm.
-    if (isTextInputFocused(e.target) && e.key.length === 1) return;
-
-    const currentView = getState().view;
-    const ordered = [...bindings].sort((a, b) => {
-      const byScope = SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope];
-      if (byScope !== 0) return byScope;
-      // Same scope: higher layer (z-index) fires first (#159). Layerless
-      // bindings (default 0) tie here and keep stable-sort insertion order.
-      return (b.layer ?? 0) - (a.layer ?? 0);
-    });
-    for (const b of ordered) {
-      if (b.key !== e.key) continue;
-      // Central view gate (#156): a binding fires only in its view (or 'any').
-      const bv = b.view ?? defaultView(b.scope);
-      if (bv !== 'any' && bv !== currentView) continue;
-      if (b.when && !b.when()) continue;
-      b.action();
-      e.preventDefault();
-      return;
-    }
-  };
+  handler = dispatchKeydown;
   document.addEventListener('keydown', handler);
 }
 

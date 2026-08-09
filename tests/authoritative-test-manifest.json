@@ -1,0 +1,393 @@
+{
+  "schemaVersion": 1,
+  "seededAt": "2026-08-08",
+  "minHarnessRows": 56,
+  "harnesses": [
+    {
+      "name": "5h-canonical",
+      "visibility": "public",
+      "minCases": 9,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "account",
+      "visibility": "public",
+      "minCases": 15,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "alerts-dispatch",
+      "visibility": "public",
+      "minCases": 22,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "alerts",
+      "visibility": "public",
+      "minCases": 125,
+      "countPolicy": "variable",
+      "countAxis": "uname-s"
+    },
+    {
+      "name": "bench",
+      "visibility": "public",
+      "minCases": 7,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "blocks",
+      "visibility": "public",
+      "minCases": 48,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "budget",
+      "visibility": "public",
+      "minCases": 42,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "cache-report",
+      "visibility": "public",
+      "minCases": 28,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "chokepoint",
+      "visibility": "public",
+      "minCases": 11,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "codex-daily",
+      "visibility": "public",
+      "minCases": 18,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "codex-monthly",
+      "visibility": "public",
+      "minCases": 4,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "codex-quota",
+      "visibility": "public",
+      "minCases": 91,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "codex-session",
+      "visibility": "public",
+      "minCases": 7,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "codex-weekly",
+      "visibility": "public",
+      "minCases": 4,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "config",
+      "visibility": "public",
+      "minCases": 109,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "conversation",
+      "visibility": "public",
+      "minCases": 1,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "daily-instances",
+      "visibility": "public",
+      "minCases": 12,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "daily",
+      "visibility": "public",
+      "minCases": 8,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "dashboard",
+      "visibility": "public",
+      "minCases": 31,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "diff",
+      "visibility": "public",
+      "minCases": 26,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "doc-lint",
+      "visibility": "public",
+      "minCases": 10,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "doctor",
+      "visibility": "public",
+      "minCases": 170,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "five-hour-blocks",
+      "visibility": "public",
+      "minCases": 38,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "fixture-cache",
+      "visibility": "public",
+      "minCases": 7,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "forecast",
+      "visibility": "public",
+      "minCases": 27,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "frontend",
+      "visibility": "public",
+      "minCases": 15,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "hook-tick",
+      "visibility": "public",
+      "minCases": 15,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "kill-server",
+      "visibility": "public",
+      "minCases": 8,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "migrations",
+      "visibility": "public",
+      "minCases": 12,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "mirror-public",
+      "visibility": "private",
+      "minCases": 8,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "mirror-snapshot",
+      "visibility": "private",
+      "minCases": 40,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "monthly",
+      "visibility": "public",
+      "minCases": 8,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "npm-postinstall",
+      "visibility": "public",
+      "minCases": 5,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "npm-shim",
+      "visibility": "public",
+      "minCases": 6,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "percent-milestone-idempotency",
+      "visibility": "public",
+      "minCases": 7,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "pricing-check",
+      "visibility": "public",
+      "minCases": 10,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "project",
+      "visibility": "public",
+      "minCases": 36,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "reconcile",
+      "visibility": "public",
+      "minCases": 76,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "record-credit",
+      "visibility": "public",
+      "minCases": 9,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "record-usage-selfheal",
+      "visibility": "public",
+      "minCases": 15,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "rederive",
+      "visibility": "public",
+      "minCases": 6,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "release-harness-isolation",
+      "visibility": "private",
+      "minCases": 1,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "release",
+      "visibility": "private",
+      "minCases": 75,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "report",
+      "visibility": "public",
+      "minCases": 2,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "session",
+      "visibility": "public",
+      "minCases": 22,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "settings-api",
+      "visibility": "public",
+      "minCases": 78,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "setup",
+      "visibility": "public",
+      "minCases": 53,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "share",
+      "visibility": "public",
+      "minCases": 20,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "share-v2",
+      "visibility": "private",
+      "minCases": 226,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "source-aware",
+      "visibility": "public",
+      "minCases": 190,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "statusline",
+      "visibility": "public",
+      "minCases": 33,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "subgroup",
+      "visibility": "public",
+      "minCases": 63,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "test-remote",
+      "visibility": "private",
+      "minCases": 391,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "tui",
+      "visibility": "public",
+      "minCases": 18,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "update",
+      "visibility": "public",
+      "minCases": 32,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "weekly",
+      "visibility": "public",
+      "minCases": 33,
+      "countPolicy": "fixed"
+    }
+  ],
+  "capabilities": [
+    {
+      "name": "pytest",
+      "probe": "pytest",
+      "hard": true
+    },
+    {
+      "name": "fts5",
+      "probe": "fts5",
+      "hard": true
+    },
+    {
+      "name": "pytest-timeout",
+      "probe": "python-import:pytest_timeout",
+      "hard": true
+    },
+    {
+      "name": "rich",
+      "probe": "python-import:rich",
+      "hard": true
+    },
+    {
+      "name": "node",
+      "probe": "node",
+      "hard": true
+    },
+    {
+      "name": "pytest-xdist",
+      "probe": "python-import:xdist",
+      "hard": false
+    },
+    {
+      "name": "agentmem",
+      "probe": "command:agentmem",
+      "hard": "policy",
+      "visibility": "private"
+    }
+  ],
+  "forbiddenRegeneration": [
+    "CCTALLY_REGEN_GOLDENS",
+    "REGEN",
+    "HARNESS_REGEN",
+    "CCTALLY_DOCTOR_REGENERATE",
+    "CCTALLY_MIGRATIONS_REGENERATE",
+    "CCTALLY_SETUP_REGENERATE",
+    "CCTALLY_PRICING_CHECK_REGENERATE",
+    "CCTALLY_UPDATE_TEST_REGEN"
+  ],
+  "seededFrom": "Two-axis observation (macOS and Linux, floors are the minimum of the two) for the 50 public rows: macOS = TZ=Etc/UTC bin/cctally-test-remote --watch bin/cctally-test-all on omri-lan-cmd at feat/529-s1-green-means-green d2c0cc21f; Linux = omrikais/cctally ci-linux-matrix.yml run 31248367622 (v1.94.2), identical across python 3.11/3.12/3.13. Exactly one row differs between the two operating systems: alerts (139 Darwin, 125 Linux), which is why it is the only countPolicy=variable row. ONE-AXIS observation (macOS only) for the 6 private rows -- mirror-public, mirror-snapshot, release, release-harness-isolation, share-v2, test-remote: the public mirror ships none of them, so that Linux run could not observe them and their floors rest on the macOS count alone. They are declared fixed on evidence rather than assumption -- none of the six contains a uname -s or Darwin gate, so no operating-system axis exists for them to vary on -- but a private Linux lane has not yet confirmed it."
+}

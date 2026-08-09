@@ -20,6 +20,7 @@ therefore grabs the fresh sibling modules from ``sys.modules`` AFTER
 """
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -52,6 +53,30 @@ class _DdlCounter:
 def _fresh_siblings():
     """The reloaded store/db modules that the current bin/cctally uses."""
     return sys.modules["_cctally_store"], sys.modules["_cctally_db"]
+
+
+def test_raw_epoch_probe_reads_the_header_without_opening_sqlite(
+    tmp_path, monkeypatch
+):
+    """The deferred-epoch probe must not bypass maintenance opener fencing."""
+    path = tmp_path / "stats.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA user_version=1009")
+        conn.commit()
+    finally:
+        conn.close()
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    store, _db = _fresh_siblings()
+
+    def forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("raw epoch probe opened SQLite")
+
+    monkeypatch.setattr(store.sqlite3, "connect", forbidden_connect)
+    assert store._raw_user_version(path) == 1009
 
 
 # --------------------------------------------------------------------------
@@ -251,13 +276,15 @@ def test_pragma_policy_stats(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     conn = ns["open_db"]()
     try:
-        assert _pragma(conn, "journal_mode") == "wal"
-        assert _pragma(conn, "synchronous") == 1  # NORMAL
+        assert _pragma(conn, "journal_mode") == "delete"
+        assert _pragma(conn, "synchronous") == 2  # FULL
         assert _pragma(conn, "busy_timeout") == 15000
         assert _pragma(conn, "journal_size_limit") == 16 * 1024 * 1024
         # stats auto_vacuum stays NONE on a normal open (§6.1: INCREMENTAL only
         # from the first epoch rebuild, never at in-place cutover).
         assert _pragma(conn, "auto_vacuum") == 0
+        assert not Path(str(ns["DB_PATH"]) + "-wal").exists()
+        assert not Path(str(ns["DB_PATH"]) + "-shm").exists()
     finally:
         conn.close()
 

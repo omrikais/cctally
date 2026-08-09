@@ -9,17 +9,18 @@
 #            CCTALLY_RELEASE_TEST_JOBS). Prevents the B^2 nesting where B
 #            outer harnesses each spawn B (or, for release, nproc) inner
 #            workers.
-#   PYTEST — pytest-xdist worker count for the solo, post-pool pytest phase.
+#   PYTEST — pytest-xdist worker count for the bulk post-pool pytest phase.
 # Unset, OUTER auto-tunes below the core count (round(NCPU*0.45)) to stop the
 # pool oversubscribing; PYTEST keeps the full core count because pytest runs
-# alone after the pool. Explicit CCTALLY_TEST_JOBS=B preserves today's
+# after the pool. The wall-clock rebuild benchmark then runs serially, without
+# xdist contention. Explicit CCTALLY_TEST_JOBS=B preserves today's
 # behavior (OUTER=PYTEST=B). Each role has an explicit override:
 # CCTALLY_OUTER_JOBS / CCTALLY_INNER_JOBS / CCTALLY_PYTEST_JOBS.
 # CCTALLY_TEST_JOBS=1 forces fully serial (1/1/1).
 #
 # reconcile runs INSIDE the pool (its build fixtures are scratch-built; it
 # opens tests/fixtures/projects read-only and no suite harness rewrites that
-# dir). pytest runs AFTER the pool completes, solo — NO overlap (a pytest/
+# dir). pytest runs AFTER the pool completes — NO overlap (a pytest/
 # pool overlap races in-place fixture rebuilds; deferred, see the #292 spec).
 # Continues on per-harness failure for maximum coverage; exits non-zero iff
 # any harness or pytest had any failure.
@@ -32,6 +33,17 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
+# The verdict contract is sourced HERE, before the worker-budget checks, so a
+# usage error can write its own outcome record. Sourcing is read-only and
+# defines functions only, so it does not disturb plan mode's side-effect-free
+# contract; the admission calls that DO have side effects still run after it.
+if [ ! -r "$REPO_ROOT/bin/_lib-test-contract.sh" ]; then
+    echo "cctally-test-all: the verdict contract library bin/_lib-test-contract.sh is missing or unreadable; refusing to run" >&2
+    exit 3
+fi
+# shellcheck source=/dev/null
+source "$REPO_ROOT/bin/_lib-test-contract.sh"
+
 # ---- worker-budget resolution ------------------------------------------
 
 # A non-empty worker var must be a positive integer, else exit 2 (a bad value
@@ -41,12 +53,10 @@ _require_pos_int_or_empty() {
     [ -z "$val" ] && return 0
     case "$val" in
         *[!0-9]*|'')
-            echo "cctally-test-all: $name must be a positive integer (got: '$val')" >&2
-            exit 2 ;;
+            contract_usage_abort "$name must be a positive integer (got: '$val')" "$name" ;;
     esac
     if [ "$val" -lt 1 ]; then
-        echo "cctally-test-all: $name must be >= 1 (got: '$val')" >&2
-        exit 2
+        contract_usage_abort "$name must be >= 1 (got: '$val')" "$name"
     fi
 }
 _require_pos_int_or_empty CCTALLY_TEST_JOBS         "${CCTALLY_TEST_JOBS:-}"
@@ -54,6 +64,26 @@ _require_pos_int_or_empty CCTALLY_OUTER_JOBS        "${CCTALLY_OUTER_JOBS:-}"
 _require_pos_int_or_empty CCTALLY_INNER_JOBS        "${CCTALLY_INNER_JOBS:-}"
 _require_pos_int_or_empty CCTALLY_PYTEST_JOBS       "${CCTALLY_PYTEST_JOBS:-}"
 _require_pos_int_or_empty CCTALLY_TEST_ALL_FAKE_NCPU "${CCTALLY_TEST_ALL_FAKE_NCPU:-}"
+
+# ---- seam hardening (#529 S1) ------------------------------------------
+# CCTALLY_TEST_ALL_FAKE_NCPU is a PLAN-MODE seam. A real run must never take
+# its core count from an environment variable, because that would let a caller
+# reshape the pool of a run whose green is meant to be believed.
+if [ -n "${CCTALLY_TEST_ALL_FAKE_NCPU:-}" ] && [ "${CCTALLY_TEST_ALL_PLAN:-}" != "1" ]; then
+    contract_usage_abort "CCTALLY_TEST_ALL_FAKE_NCPU is a plan-mode seam; it is honoured only with CCTALLY_TEST_ALL_PLAN=1" \
+        CCTALLY_TEST_ALL_FAKE_NCPU
+fi
+# Plan mode may never coexist with machine outcome mode, and may never emit an
+# authoritative pass. Keeping the two mutually exclusive — rather than silently
+# precedence-ordering them — is what stops plan mode becoming a bypass of the
+# admission that deliberately runs after it.
+if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ] && [ -n "${CCTALLY_TEST_ALL_OUTCOME_FILE:-}" ]; then
+    # No record is written for this one: contract_emit_outcome refuses under
+    # plan mode, which is what makes "a plan is never an authoritative outcome"
+    # true of the refusal itself and not only of the plan.
+    contract_usage_abort "CCTALLY_TEST_ALL_PLAN cannot be combined with CCTALLY_TEST_ALL_OUTCOME_FILE; a plan is never an authoritative outcome" \
+        CCTALLY_TEST_ALL_PLAN
+fi
 
 _detect_ncpu() {
     local n
@@ -96,25 +126,13 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # ---- harness discovery (read-only; safe in plan mode) ------------------
 # reconcile is kept in final_harnesses ONLY as a summary-ordering device so it
 # stays the last row; it now runs inside the pool, not as a serial phase.
-# S2's canonical nested quota surface is a required deterministic harness.
-# Discovery still supplies its ordering, while this guard prevents an
-# accidental executable-bit regression from silently dropping it from every
-# bundle run.
-required_harnesses=(codex-quota source-aware)
-# test-remote's harness is maintainer-local and deliberately unmirrored, so it
-# is required only in the private checkout. .mirror-allowlist excludes itself,
-# which makes its presence the discriminator: absent means this tree IS the
-# shipped public subset, where demanding a file the mirror never carries would
-# fail CI before a single harness runs (#131).
-if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
-    required_harnesses+=(test-remote)
-fi
-for required in "${required_harnesses[@]}"; do
-    if [ ! -x "$REPO_ROOT/bin/cctally-${required}-test" ]; then
-        echo "cctally-test-all: required harness is not executable: $required" >&2
-        exit 2
-    fi
-done
+#
+# The deliberately narrow `required_harnesses` gate of #446 Task B is retired:
+# tests/authoritative-test-manifest.json now declares the WHOLE estate, and
+# contract_admit_harnesses (below, after plan mode) requires exact set equality
+# in both directions plus a separate executable-bit check. Discovery here is
+# ordering only, and must stay read-only so plan mode keeps its side-effect-free
+# contract.
 final_harnesses=(reconcile)
 parallel_harnesses=()
 final_set=" ${final_harnesses[*]} "
@@ -141,17 +159,53 @@ if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
     exit 0
 fi
 
+# ---- admission (#529 S1) -----------------------------------------------
+# AFTER plan mode by design: the block above exits "before ANY side effect" and
+# tests/test_test_all_scheduler.py depends on that, while these checks parse a
+# manifest, import the allowlist classifier and (from Task 3) launch capability
+# probes. Admission runs before LOGDIR so a refusal creates nothing. The library
+# itself is sourced near the top of this file, because the worker-budget checks
+# need contract_usage_abort; only the calls below have side effects.
+CONTRACT_PROFILE=public
+# .mirror-allowlist excludes itself, so its presence is exactly the private
+# discriminator: absent means this tree IS the shipped public subset.
+if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
+    CONTRACT_PROFILE=private
+fi
+contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
+contract_admit_harnesses "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
+# Covers CI, which invokes this aggregator directly. The canonical
+# bin/cctally-test-remote path needs its OWN guard as well, because the wrapper
+# forwards none of these variables over SSH — see _guard_regeneration_env there.
+contract_admit_regeneration || contract_abort
+# Capability hardness belongs to the AUTHORITATIVE profile, not to the
+# aggregator unconditionally: tests/requirements-dev.txt documents pytest-xdist
+# and pytest-timeout as optional-by-detection, and making them unconditionally
+# hard would break legitimate local invocations. An authoritative run refuses to
+# start; a local one records the gap, is classified `incomplete`, and continues
+# — never green either way.
+if ! contract_admit_capabilities "$CONTRACT_PROFILE"; then
+    contract_is_authoritative && contract_abort
+fi
+
 LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
 trap 'rm -rf "$LOGDIR"' EXIT
 
 run_one() {
-    local h=$1 start=$SECONDS
+    local h=$1 start=$SECONDS rc
     # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update
     # read CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS. INNER
     # is exported below so it is non-empty in this xargs-spawned subshell.
     env CCTALLY_TEST_JOBS="$INNER" CCTALLY_RELEASE_TEST_JOBS="$INNER" \
-        "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1 || true
+        "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1
+    rc=$?
+    echo "$rc" > "$LOGDIR/${h}.exit"                   # one file per harness
     echo "$((SECONDS - start))" > "$LOGDIR/${h}.time"  # one file per harness
+    # Return 0 so xargs -P keeps running the estate. The old `|| true` did this
+    # AND discarded the status; only this half was ever wanted, and discarding
+    # the status is what let a harness exit non-zero while printing a clean
+    # summary and still land as a pass (#529 finding F5).
+    return 0
 }
 export -f run_one
 export REPO_ROOT LOGDIR INNER
@@ -171,17 +225,19 @@ declare -a rows
 
 for h in "${all_harnesses[@]}"; do
     log="$LOGDIR/${h}.log"
-    summary=$(grep '^passed:' "$log" | tail -1)
-    if [ -z "$summary" ]; then
-        # Harness crashed before summary; flag loudly.
-        rows+=("$(printf '%5s/%s   %s  (NO SUMMARY — see log)' '?' '?' "$h")")
+    # The verdict comes from the classifier (exit sidecar + summary grammar +
+    # the manifest floor); this loop keeps only the human row render.
+    contract_classify_harness "$h" "$log" "$LOGDIR/${h}.exit" "$(contract_min_cases "$h")"
+    p=$CONTRACT_LAST_PASSED
+    f=$CONTRACT_LAST_FAILED
+    if [ "$CONTRACT_LAST_SUMMARY_OK" != 1 ]; then
+        # Never finished, or finished without a readable summary; flag loudly.
+        rows+=("$(printf '%5s/%s   %s  (%s — see log)' '?' '?' "$h" "$CONTRACT_LAST_CODE")")
         total_fail=$((total_fail + 1))
-        echo "---- $h output (crashed) ----" >&2
+        echo "---- $h output ($CONTRACT_LAST_CODE) ----" >&2
         cat "$log" >&2
         continue
     fi
-    p=$(echo "$summary" | awk '{print $2}')
-    f=$(echo "$summary" | awk '{print $4}')
     total_pass=$((total_pass + p))
     total_fail=$((total_fail + f))
     rows+=("$(printf '%5s/%s   %s' "$p" "$f" "$h")")
@@ -201,19 +257,26 @@ for h in "${all_harnesses[@]}"; do
     fi
 done
 
-# pytest tests/ (solo, after the pool; skipped if pytest unavailable). When
-# pytest-xdist is importable, pass -n "$PYTEST" (its own decoupled worker
-# count — pytest has the whole machine to itself here). Falls back to serial
-# silently if xdist is absent.
+# pytest tests/ after the pool (skipped if pytest is unavailable). The bulk
+# estate uses pytest-xdist when available. The rebuild benchmark asserts a
+# wall-clock lock-hold ceiling, so it is excluded from that CPU-saturated phase
+# and run once afterward without xdist; otherwise scheduler contention, rather
+# than the code under test, can consume the ceiling.
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
 pytest_wall=0
 if python3 -m pytest --version >/dev/null 2>&1; then
+    pytest_status="PASS"
     pytest_log="$LOGDIR/pytest.log"
+    pytest_benchmark="tests/test_rebuild_benchmark.py"
+    pytest_timeout_args=()
     # -rfE forces the "short test summary info" section to emit FAILED/ERROR
     # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
     # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
     pytest_args=(tests/ -q -rfE)
+    if [ -f "$REPO_ROOT/$pytest_benchmark" ]; then
+        pytest_args+=(--ignore="$pytest_benchmark")
+    fi
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$PYTEST")
     fi
@@ -222,19 +285,51 @@ if python3 -m pytest --version >/dev/null 2>&1; then
     # a wedged C call / uncatchable loop still trips it. Absent => today's
     # behavior exactly (no flag).
     if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
-        pytest_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
+        pytest_timeout_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
     fi
+    pytest_args+=("${pytest_timeout_args[@]}")
     pytest_start=$SECONDS
-    if (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1; then
-        pytest_status="PASS"
-    else
+    (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1
+    pytest_rc=$?
+    if [ "$pytest_rc" -ne 0 ]; then
         pytest_status="FAIL"
-        total_fail=$((total_fail + 1))
         echo "---- pytest FAIL details ----" >&2
         cat "$pytest_log" >&2
         pytest_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_log" || true)
+        # Read for MEANING, not as a boolean: 1 is product, 5 (nothing
+        # collected) is incomplete, 2/3/4 (interrupted, internal error, usage)
+        # are infrastructure.
+        contract_classify_pytest "$pytest_rc" "pytest"
+    fi
+    if [ -f "$REPO_ROOT/$pytest_benchmark" ]; then
+        pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
+        pytest_benchmark_args=("$pytest_benchmark" -q -rfE)
+        pytest_benchmark_args+=("${pytest_timeout_args[@]}")
+        (cd "$REPO_ROOT" && python3 -m pytest "${pytest_benchmark_args[@]}") > "$pytest_benchmark_log" 2>&1
+        pytest_benchmark_rc=$?
+        if [ "$pytest_benchmark_rc" -ne 0 ]; then
+            pytest_status="FAIL"
+            contract_classify_pytest "$pytest_benchmark_rc" "benchmark"
+            echo "---- pytest benchmark FAIL details ----" >&2
+            cat "$pytest_benchmark_log" >&2
+            benchmark_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_benchmark_log" || true)
+            if [ -n "$benchmark_failed_nodes" ]; then
+                if [ -n "$pytest_failed_nodes" ]; then
+                    pytest_failed_nodes+=$'\n'
+                fi
+                pytest_failed_nodes+="$benchmark_failed_nodes"
+            fi
+        fi
+    fi
+    if [ "$pytest_status" = "FAIL" ]; then
+        total_fail=$((total_fail + 1))
     fi
     pytest_wall=$((SECONDS - pytest_start))
+else
+    # Unreachable on an authoritative run: pytest is an admission precondition.
+    # On a local run it is RECORDED rather than silently swallowing all 550
+    # test files behind a "SKIPPED" row.
+    contract_fail incomplete pytest-unavailable "" pytest
 fi
 
 echo "----"
@@ -263,4 +358,16 @@ echo "Slowest harnesses:"
     printf '  %4ss  %s\n' "$t" "$h"
 done
 
-[ "$total_fail" -eq 0 ]
+# One verdict line, because `Total:` counts only summary-line failures and a
+# run refused for `case-floor-unmet` has none — the scrollback would otherwise
+# read `failed=0` above an exit 3 and contradict itself.
+echo "----"
+if [ "$CONTRACT_CLASS" = "none" ]; then
+    echo "Verdict: PASS (exit $(contract_exit_code))"
+else
+    printf 'Verdict: FAIL — %s (exit %s); reasons: %s\n' \
+        "$CONTRACT_CLASS" "$(contract_exit_code)" \
+        "$(printf '%s' "$CONTRACT_REASONS" | awk -F'\t' 'NF{printf "%s%s%s", sep, $1, ($3=="" ? "" : "(" $3 ")"); sep=", "}')"
+fi
+
+contract_finish

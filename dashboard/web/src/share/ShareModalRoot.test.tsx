@@ -214,11 +214,18 @@ describe('<ShareModalRoot>', () => {
     // would close the entire share modal (its overlay-scope Esc binding
     // fired first via SCOPE_ORDER) instead of just the nested modal.
     //
-    // The keymap dispatcher iterates bindings by scope, NOT DOM focus:
-    // overlay-scope handlers always preempt modal-scope ones unless the
-    // overlay binding gates itself out with `when:`. The fix wires
-    // <ShareModal>'s Esc binding with `when: () => !manageOpen` so its
-    // nested `modal`-scope Esc can fire while the manage modal is open.
+    // The keymap dispatcher iterates bindings by scope, NOT DOM focus, so an
+    // overlay-scope handler preempts a modal-scope one. The original fix wired
+    // <ShareModal>'s Esc with `when: () => !manageOpen` so the nested dialog's
+    // `modal`-scope Esc could fire — a cross-scope workaround.
+    //
+    // #503 S4 §3.1 replaced the mechanism: <ManagePresetsModal> now registers
+    // its own Esc at `scope: 'overlay', layer: 208`, above ShareModal's 200 and
+    // the 205 preset popovers, below the 210 composer and below an armed
+    // confirmation at 220. The ordering is therefore structural rather than a
+    // guard on the surface below. ShareModal's `!manageOpen` gate is retained
+    // as belt-and-suspenders — it is tested and costs nothing — but this case
+    // now passes because of the layer, not because of that gate.
     stubFetchForNestedModal();
     render(<ShareModalRoot />);
     await act(async () => {

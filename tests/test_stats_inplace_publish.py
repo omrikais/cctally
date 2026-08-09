@@ -378,7 +378,8 @@ def _build_generation(path, *, values, deleted=(), epoch=None):
         epoch = _cctally_core.STATS_INDEX_EPOCH
     conn = sqlite3.connect(str(path))
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        conn.execute("PRAGMA synchronous=FULL")
         conn.execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
         )
@@ -394,13 +395,8 @@ def _build_generation(path, *, values, deleted=(), epoch=None):
             conn.execute("DELETE FROM t WHERE id = ?", (rowid,))
         conn.execute(f"PRAGMA user_version = {int(epoch):d}")
         conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
-    for suffix in ("-wal", "-shm"):
-        sidecar = pathlib.Path(str(path) + suffix)
-        if sidecar.exists():
-            sidecar.unlink()
 
 
 def _publisher_connection(path, *, busy_timeout_ms=15000):
@@ -424,7 +420,6 @@ def _append_unreferenced_page(path: pathlib.Path) -> int:
     """
     conn = sqlite3.connect(str(path))
     try:
-        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
         page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
         page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
     finally:
@@ -669,17 +664,12 @@ def test_the_scratch_is_attached_read_only(ns, tmp_path):
         conn.close()
 
     assert scratch.read_bytes() == before
-    # A read-only attach still creates sidecars — S2 measured exactly that,
-    # and it is why the publisher removes the scratch FAMILY rather than the
-    # main file. What `mode=ro` guarantees is that no frame is ever committed
-    # through them, so a WAL left beside the scratch is empty.
-    wal = pathlib.Path(str(scratch) + "-wal")
-    assert not wal.exists() or wal.stat().st_size == 0
+    assert not pathlib.Path(str(scratch) + "-wal").exists()
+    assert not pathlib.Path(str(scratch) + "-shm").exists()
 
 
 def test_pinned_reader_keeps_the_old_generation_across_a_publish(ns, tmp_path):
-    """WAL gives snapshot isolation natively; a reader inside a transaction
-    must not observe the swap."""
+    """Rollback publication fails soft until a pinned reader releases."""
     import _cctally_journal as jr
 
     scratch = tmp_path / "scratch.db"
@@ -691,12 +681,13 @@ def test_pinned_reader_keeps_the_old_generation_across_a_publish(ns, tmp_path):
     reader.execute("BEGIN DEFERRED")
     assert reader.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
 
-    conn = _publisher_connection(dest)
+    conn = _publisher_connection(dest, busy_timeout_ms=100)
     try:
-        jr._publish_generation_in_place(
-            conn, scratch, record_path="/r.json",
-            started_at="2026-08-05T00:00:00Z",
-        )
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            jr._publish_generation_in_place(
+                conn, scratch, record_path="/r.json",
+                started_at="2026-08-05T00:00:00Z",
+            )
     finally:
         conn.close()
 
@@ -706,13 +697,26 @@ def test_pinned_reader_keeps_the_old_generation_across_a_publish(ns, tmp_path):
         )
         fresh = sqlite3.connect(str(dest))
         try:
-            assert fresh.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 3
+            assert fresh.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
         finally:
             fresh.close()
         reader.rollback()
-        assert reader.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 3
     finally:
         reader.close()
+
+    retry = _publisher_connection(dest)
+    try:
+        jr._publish_generation_in_place(
+            retry, scratch, record_path="/r.json",
+            started_at="2026-08-05T00:00:00Z",
+        )
+    finally:
+        retry.close()
+    fresh = sqlite3.connect(str(dest))
+    try:
+        assert fresh.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 3
+    finally:
+        fresh.close()
 
 
 def test_busy_failure_does_not_authorize_replacement(ns, tmp_path):
@@ -827,6 +831,7 @@ def test_a_rebuild_publishes_into_the_live_file_without_replacing_it(ns):
 
     _seed_live_index()
     db = pathlib.Path(_cctally_core.DB_PATH)
+    original_inode = db.stat().st_ino
     inode = db.stat().st_ino
 
     result = jr.rebuild_stats_index(
@@ -907,6 +912,80 @@ def test_readable_destination_with_an_orphan_page_publishes_by_replacement(ns):
     assert record["publicationMechanism"] == "replace"
 
 
+def test_physical_fallback_cannot_split_a_new_idle_reader_generation(
+    ns, record_property,
+):
+    """#538 RED: a real reader enters after the cold-drain scan.
+
+    The destination is readable but structurally corrupt, so the real rebuild
+    reaches physical fallback. ``before_swap`` fires after the old sidecars
+    have been removed and before ``os.replace``; opening SQLite there models an
+    older dashboard that does not know the new maintenance protocol. On the
+    pre-#538 WAL tree that idle reader creates a fresh WAL/SHM generation which
+    can then be paired with the replacement main.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    original_inode = db.stat().st_ino
+    damaged_page = _append_unreferenced_page(db)
+    held: list[sqlite3.Connection] = []
+    sidecars_at_seam: dict[str, int | None] = {}
+
+    def open_idle_stale_reader() -> None:
+        reader = sqlite3.connect(str(db))
+        reader.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots"
+        ).fetchone()
+        held.append(reader)
+        sidecars_at_seam.update({
+            suffix: (
+                pathlib.Path(f"{db}{suffix}").stat().st_size
+                if pathlib.Path(f"{db}{suffix}").exists()
+                else None
+            )
+            for suffix in ("-wal", "-shm")
+        })
+        record_property("issue_538_sidecars_at_seam", repr(sidecars_at_seam))
+        print(
+            f"[538-RED] damaged_page={damaged_page} "
+            f"sidecars_at_seam={sidecars_at_seam}"
+        )
+
+    try:
+        with pytest.raises(jr.JournalError, match="new reader appeared"):
+            jr.rebuild_stats_index(
+                context=jr.RebuildContext(trigger="db-rebuild"),
+                before_swap=open_idle_stale_reader,
+            )
+        assert held, "the idle reader seam never fired"
+        assert sidecars_at_seam == {"-wal": None, "-shm": None}, (
+            "the post-drain idle reader minted a new WAL/SHM generation: "
+            f"{sidecars_at_seam}"
+        )
+        assert db.stat().st_ino == original_inode
+        quarantine = _cctally_core.APP_DIR / "quarantine"
+        assert not quarantine.exists() or list(quarantine.iterdir()) == []
+        assert held[0].execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots"
+        ).fetchone()[0] >= 1
+    finally:
+        for reader in held:
+            reader.close()
+
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="db-rebuild")
+    )
+    assert result.quarantine_dir is not None
+    fresh = sqlite3.connect(str(db))
+    try:
+        assert fresh.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        fresh.close()
+
+
 def test_interrupted_recovery_registers_its_hold_for_the_publisher(ns, monkeypatch):
     """The recovery branch takes maintenance EXCLUSIVE and then rebuilds, and
     the in-place publisher reopens the destination through `stats_open_guarded`.
@@ -971,10 +1050,8 @@ def _structural_failure(phase):
     return stub
 
 
-def test_publisher_connection_is_absent_from_the_drain_scan(ns, monkeypatch):
-    """The physical fallback's drain gate is a whole-system handle scan, so
-    the publisher's own connection must be closed before it runs or the gate
-    either fails or stops meaning anything."""
+def test_healthy_precommit_failure_never_escalates_to_replacement(ns, monkeypatch):
+    """Only absent or confirmed-corrupt destinations may be replaced."""
     import _cctally_core
     import _cctally_db
     import _cctally_journal as jr
@@ -996,23 +1073,13 @@ def test_publisher_connection_is_absent_from_the_drain_scan(ns, monkeypatch):
     )
     monkeypatch.setattr(_cctally_db, "_db_family_open_pids", spy)
 
-    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+        jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
 
-    assert observed, "the physical fallback must run the drain gate"
-    for pids in observed:
-        assert pids is not None, (
-            "the drain gate refused because the platform could not answer"
-        )
-        assert os.getpid() not in pids, (
-            "the publisher's own descriptor reached the drain scan"
-        )
-    assert db.stat().st_ino != inode, (
-        "a PRE_COMMIT structural failure must publish by replacement"
-    )
-    record = _newest_record(_cctally_core.LOG_DIR)
-    assert record["publicationMechanism"] == "replace"
-    assert record["inPlaceAttempt"]["phase"] == sp.PRE_COMMIT
-    assert record["incidentPath"]
+    assert observed == [], "a healthy pre-commit failure reached physical recovery"
+    assert db.stat().st_ino == inode
+    quarantine = _cctally_core.APP_DIR / "quarantine"
+    assert not quarantine.exists() or list(quarantine.iterdir()) == []
 
 
 def test_post_commit_failure_never_falls_back(ns, monkeypatch):
@@ -1091,10 +1158,10 @@ def test_a_failed_verdict_keeps_the_scratch_as_the_last_validated_copy(
     assert marker["mechanism"] == "in_place"
 
 
-def test_a_busy_post_commit_checkpoint_is_recorded_not_raised(ns, monkeypatch):
-    """`wal_checkpoint(TRUNCATE)` returns a busy ROW rather than raising, and
-    has been measured at about 16 seconds against a 15-second timeout under a
-    pinned reader. It is never a transaction failure."""
+def test_a_pinned_reader_blocks_without_triggering_physical_replacement(
+    ns, monkeypatch,
+):
+    """Rollback journaling fails soft when a reader pins the healthy index."""
     import _cctally_core
     import _cctally_journal as jr
 
@@ -1115,48 +1182,39 @@ def test_a_busy_post_commit_checkpoint_is_recorded_not_raised(ns, monkeypatch):
     reader = sqlite3.connect(str(db))
     reader.execute("BEGIN DEFERRED")
     reader.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()
+    inode = db.stat().st_ino
     try:
-        jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            jr.rebuild_stats_index(
+                context=jr.RebuildContext(trigger="db-rebuild")
+            )
+        assert db.stat().st_ino == inode
+        quarantine = _cctally_core.APP_DIR / "quarantine"
+        assert not quarantine.exists() or list(quarantine.iterdir()) == []
     finally:
         reader.rollback()
         reader.close()
 
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
     record = _newest_record(_cctally_core.LOG_DIR)
-    assert record["status"] == "ok", "a busy checkpoint is not a failure"
-    assert record["publicationCheckpoint"] == "busy"
+    assert record["status"] == "ok"
+    assert record["publicationCheckpoint"] == "not_applicable_rollback_journal"
     assert record["postPublicationValidation"] == {"ok": True, "error": None}
-    wal = pathlib.Path(str(db) + "-wal")
-    assert not wal.exists() or wal.stat().st_size >= 0
+    assert not pathlib.Path(str(db) + "-wal").exists()
+    assert not pathlib.Path(str(db) + "-shm").exists()
 
 
-def test_a_non_empty_wal_is_never_deleted_after_publication(ns, monkeypatch):
-    """Unlike the physical path, an in-place publish leaves a LEGITIMATE WAL;
-    deleting a non-empty one would discard committed frames."""
+def test_in_place_publication_never_calls_a_wal_checkpoint(ns, monkeypatch):
+    """The current rollback-journal publisher has no live WAL operation."""
     import _cctally_core
     import _cctally_journal as jr
 
     _seed_live_index()
+    assert not hasattr(jr, "_checkpoint_after_publication")
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
     db = pathlib.Path(_cctally_core.DB_PATH)
-    monkeypatch.setattr(jr, "_checkpoint_after_publication", lambda conn: "busy")
-
-    reader = sqlite3.connect(str(db))
-    reader.execute("BEGIN DEFERRED")
-    reader.execute("SELECT COUNT(*) FROM weekly_usage_snapshots").fetchone()
-    try:
-        jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
-        wal = pathlib.Path(str(db) + "-wal")
-        assert wal.exists() and wal.stat().st_size > 0, (
-            "the pinned reader should have kept the WAL from draining"
-        )
-    finally:
-        reader.rollback()
-        reader.close()
-
-    probe = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    try:
-        assert probe.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        probe.close()
+    assert not pathlib.Path(str(db) + "-wal").exists()
+    assert not pathlib.Path(str(db) + "-shm").exists()
 
 
 def test_the_preflight_aborts_before_any_live_mutation(ns, monkeypatch):
@@ -1179,7 +1237,7 @@ def test_the_preflight_aborts_before_any_live_mutation(ns, monkeypatch):
     assert not (_cctally_core.APP_DIR / "stats.db.publication").exists()
 
 
-def test_the_preflight_counts_the_wal_margin_and_a_quarantine_copy(tmp_path):
+def test_the_preflight_counts_the_rollback_margin_and_old_family(tmp_path):
     import _cctally_journal as jr
 
     scratch = tmp_path / "scratch.db"
@@ -1189,7 +1247,7 @@ def test_the_preflight_counts_the_wal_margin_and_a_quarantine_copy(tmp_path):
     pathlib.Path(str(dest) + "-wal").write_bytes(b"w" * 100)
 
     needed = jr._publication_required_free_bytes(scratch, dest)
-    assert needed == int(1000 * 1.30) + 500
+    assert needed == int(1000 * 1.25) + 500
 
 
 def _newest_record(log_dir):

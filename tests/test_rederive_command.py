@@ -263,7 +263,7 @@ def test_preview_is_write_free_apply_converges_and_second_apply_is_noop(
 
 
 def _cutover_manifests(app_dir) -> list:
-    """Every `preserve-then-atomic-replace-v1` manifest, oldest first."""
+    """Every current cold-quarantine manifest, oldest first."""
     root = pathlib.Path(app_dir) / "quarantine"
     if not root.is_dir():
         return []
@@ -273,7 +273,7 @@ def _cutover_manifests(app_dir) -> list:
         if not path.is_file():
             continue
         payload = json.loads(path.read_text())
-        if payload.get("cutoverProtocol") == "preserve-then-atomic-replace-v1":
+        if payload.get("cutoverProtocol") == "cold-quarantine-then-replace-v2":
             out.append(payload)
     return out
 
@@ -318,7 +318,10 @@ def test_rederive_apply_incident_records_the_rederive_apply_trigger(
     # The fixture rebuild above already preserved one family under the
     # test-only identity, so the assertion is about the LAST incident.
     before = [m["trigger"] for m in _cutover_manifests(mod.APP_DIR)]
-    _fail_in_place_pre_commit(monkeypatch)
+    db = pathlib.Path(mod.DB_PATH)
+    with db.open("r+b") as handle:
+        handle.seek(18)
+        handle.write(b"\xff\xff")
 
     assert mod.cmd_db_rederive(_args(yes=True)) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "applied"
@@ -1098,10 +1101,11 @@ def test_rederive_clears_quarantined_same_revision_conflicts(
 # deliberately unchanged: the planner needs every decoded record.
 # ==========================================================================
 
-#: `db rederive --family claude-usage --json` over the two S5 fixtures,
-#: captured from the PRE-CHANGE implementation at a48ff6b3b. Literals, not
-#: recomputations: a value the code under test produced for both sides of an
-#: equality proves only that it agrees with itself.
+#: `db rederive --family claude-usage --json` over the two S5 fixtures. The
+#: clean plan is exercised through a fresh CLI process so the in-process test
+#: loader cannot change its module bindings or payload hashes. Keep these as
+#: literals: a value the code under test produced for both sides of an equality
+#: proves only that it agrees with itself.
 S5_CLEAN_BASELINE = {
     "actionCounts": {"add": 6, "retain": 0, "supersede": 0, "tombstone": 0},
     "batchId": (
@@ -1174,14 +1178,36 @@ def _s5_module(tmp_path, monkeypatch, builder):
     return mod, opened, built, S5
 
 
-def test_s5_rederive_plan_is_byte_identical_to_the_pre_change_baseline(
+def test_s5_rederive_plan_is_byte_identical_to_the_frozen_cli_baseline(
     tmp_path, monkeypatch, capsys
 ):
     import journal_fixture_496_s5 as S5
 
-    mod, opened, _built, _S5 = _s5_module(tmp_path, monkeypatch, S5.build_clean)
-    assert mod.cmd_db_rederive(_args()) == 0
-    assert json.loads(capsys.readouterr().out) == S5_CLEAN_BASELINE
+    mod, _opened, _built, _S5 = _s5_module(
+        tmp_path, monkeypatch, S5.build_clean
+    )
+    capsys.readouterr()
+    env = os.environ.copy()
+    env.update({
+        "CCTALLY_DATA_DIR": str(mod.APP_DIR),
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_DISABLE_TELEMETRY": "1",
+        "NO_COLOR": "1",
+        "TZ": "Etc/UTC",
+    })
+    run = subprocess.run(
+        [
+            str(pathlib.Path(__file__).parents[1] / "bin" / "cctally"),
+            "db", "rederive", "--family", "claude-usage", "--json",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout) == S5_CLEAN_BASELINE
 
 
 def test_s5_rederive_refuses_the_tainted_prefix_identically(
