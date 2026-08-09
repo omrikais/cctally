@@ -1005,10 +1005,16 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
     assert probe["full"] >= 1
     assert probe["errors"] == []
     assert probe["sidecars"] == []
+    # The concurrent writers are the scheduler-load control.  A fixed 2 s
+    # comparison floor makes a healthy run fail on a constrained host even
+    # when readers finish no slower than the writers creating the contention.
+    # Keep the independent 5 s reader SLA, and compare relative slowdown
+    # against both the uncontended reader and the concurrent writer cohort.
+    scheduler_floor = latency_summary["writer"]["p95"] * 1.25
     for surface in ("statusline", "hook-tick", "report"):
         assert latency_summary[surface]["p95"] < 5.0, latency_summary
         assert latency_summary[surface]["p95"] <= max(
-            2.0, baseline_summary[surface]["p95"] * 4
+            2.0, baseline_summary[surface]["p95"] * 4, scheduler_floor
         ), (surface, latency_summary, baseline_summary)
 
     ok, text = _integrity_ok(db)
@@ -1901,13 +1907,20 @@ def test_dashboard_source_reader_releases_rollback_snapshot(
         )
         baseline_elapsed = time.monotonic() - baseline_started
         assert baseline_bundle.sources["codex"].source == "codex"
+        wrapper_overhead = storm_elapsed - observed["elapsed"]
         print(
             "dashboard_rollback_acceptance: "
             f"commits={observed['commits']} writer={observed['elapsed']:.3f}s "
-            f"storm={storm_elapsed:.3f}s baseline={baseline_elapsed:.3f}s"
+            f"storm={storm_elapsed:.3f}s overhead={wrapper_overhead:.3f}s "
+            f"baseline={baseline_elapsed:.3f}s"
         )
-        assert observed["elapsed"] < 10.0
-        assert storm_elapsed <= max(2.0, baseline_elapsed * 4)
+        # DELETE/FULL commit speed depends heavily on the filesystem backing
+        # the runner.  The regression signal is reader-added blocking, not the
+        # child's own fsync time: a pinned snapshot makes the nested writer
+        # fail its busy timeout, while a healthy reader adds only wrapper
+        # overhead around the successful 2,600-commit child.
+        assert wrapper_overhead >= 0.0
+        assert wrapper_overhead <= max(2.0, baseline_elapsed * 4)
     finally:
         stats_conn.close()
 

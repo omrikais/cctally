@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.95.2] - 2026-08-09
+
+### Fixed
+- Linux release validation now distinguishes rollback-journal contention from hosted-runner storage and scheduler speed, while retaining the reader latency, integrity, and no-sidecar acceptance gates.
+
 ## [1.95.1] - 2026-08-09
 
 ### Fixed

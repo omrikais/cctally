@@ -35,6 +35,14 @@ def _serve(ns, host="127.0.0.1", port=0):
     return srv, t, srv.server_address[1]
 
 
+def _stop_server(srv, thread):
+    """Stop the fixture server and release its listener deterministically."""
+    srv.shutdown()
+    srv.server_close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
 def _wire_handlers(ns):
     """Minimal wiring so the POST settings handler can run (mirrors
     tests/test_config_cache_report.py)."""
@@ -52,23 +60,29 @@ def _wire_handlers(ns):
 
 def _post_json(host, port, path, body, *, origin_host=None):
     """POST a JSON body with matched Host + Origin (loopback CSRF contract)."""
-    c = http.client.HTTPConnection(host, port, timeout=2)
-    raw = json.dumps(body).encode()
-    host_header = f"{host}:{port}"
-    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-    c.putheader("Content-Type", "application/json")
-    c.putheader("Content-Length", str(len(raw)))
-    c.putheader("Host", host_header)
-    c.putheader("Origin", f"http://{origin_host or host_header}")
-    c.endheaders()
-    c.send(raw)
-    r = c.getresponse()
-    payload = r.read().decode("utf-8", errors="replace")
+    # This is a hang guard, not a response-time assertion.  Two seconds is
+    # below the observed scheduling delay of the authoritative xdist estate on
+    # hosted Linux; five seconds matches the dashboard integration-test norm.
+    c = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        parsed = json.loads(payload) if payload else None
-    except json.JSONDecodeError:
-        parsed = payload
-    return r.status, parsed
+        raw = json.dumps(body).encode()
+        host_header = f"{host}:{port}"
+        c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        c.putheader("Content-Type", "application/json")
+        c.putheader("Content-Length", str(len(raw)))
+        c.putheader("Host", host_header)
+        c.putheader("Origin", f"http://{origin_host or host_header}")
+        c.endheaders()
+        c.send(raw)
+        r = c.getresponse()
+        payload = r.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(payload) if payload else None
+        except json.JSONDecodeError:
+            parsed = payload
+        return r.status, parsed
+    finally:
+        c.close()
 
 
 def test_http_budget_valid_round_trip(monkeypatch, tmp_path):
@@ -104,7 +118,7 @@ def test_http_budget_valid_round_trip(monkeypatch, tmp_path):
         assert cfg.get("budget", {}).get("weekly_usd") == 300.0
         assert cfg["budget"]["alert_thresholds"] == [90, 100]
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_unset_via_null_weekly_usd(monkeypatch, tmp_path):
@@ -127,7 +141,7 @@ def test_http_budget_unset_via_null_weekly_usd(monkeypatch, tmp_path):
         # Sibling thresholds preserved (partial-PUT merge).
         assert body["budget"]["alert_thresholds"] == [80, 95]
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_invalid_weekly_usd_returns_400(monkeypatch, tmp_path):
@@ -149,7 +163,7 @@ def test_http_budget_invalid_weekly_usd_returns_400(monkeypatch, tmp_path):
             ns["CONFIG_PATH"].read_text()
         )
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_threshold_over_100_returns_400(monkeypatch, tmp_path):
@@ -166,7 +180,7 @@ def test_http_budget_threshold_over_100_returns_400(monkeypatch, tmp_path):
         assert status == 400, body
         assert "[1, 100]" in body.get("error", "")
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_non_dict_block_returns_400(monkeypatch, tmp_path):
@@ -183,7 +197,7 @@ def test_http_budget_non_dict_block_returns_400(monkeypatch, tmp_path):
         assert status == 400, body
         assert body.get("error") == "budget must be an object"
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_partial_save_preserves_untouched_leaves(monkeypatch, tmp_path):
@@ -209,7 +223,7 @@ def test_http_budget_partial_save_preserves_untouched_leaves(monkeypatch, tmp_pa
         cfg = json.loads(ns["CONFIG_PATH"].read_text())
         assert cfg["budget"]["weekly_usd"] == 250.0
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_budget_combined_save_with_display(monkeypatch, tmp_path):
@@ -230,7 +244,7 @@ def test_http_budget_combined_save_with_display(monkeypatch, tmp_path):
         assert body["budget"]["weekly_usd"] == 400.0
         assert body["display"]["resolved_tz"] == "Etc/UTC"
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 # ── Fix #3: POST /api/alerts/test accepts the `budget` axis (mirrors CLI) ──
@@ -275,7 +289,7 @@ def test_http_alerts_test_budget_axis_returns_200_payload(monkeypatch, tmp_path)
         assert abs(ctx["consumption_pct"] - 100.0) < 1e-9
         assert body["dispatch"] == "queued"
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
 
 
 def test_http_alerts_test_invalid_axis_400_message_lists_budget(monkeypatch, tmp_path):
@@ -292,4 +306,4 @@ def test_http_alerts_test_invalid_axis_400_message_lists_budget(monkeypatch, tmp
         assert status == 400, body
         assert "budget" in body.get("error", "")
     finally:
-        srv.shutdown()
+        _stop_server(srv, t)
