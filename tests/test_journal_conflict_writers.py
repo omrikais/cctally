@@ -1194,6 +1194,73 @@ def test_conflict_never_materializes_a_row_that_no_longer_exists(ns, capsys):
         conn.close()
 
 
+def test_usage_pipeline_stops_when_duplicate_snapshot_was_suppressed(
+    ns, monkeypatch
+):
+    """A suppressed Model-A row is absent by design, so derive nothing from it."""
+    import _cctally_record as record_runtime
+
+    jr = _jr()
+    conn = jr._cctally_core.open_db()
+    reset = dt.datetime(2026, 7, 27, 0, 0, tzinfo=dt.timezone.utc)
+    record = J.make_obs(
+        at=AT,
+        src="record-usage",
+        provider="claude",
+        payload={
+            "captured_at": AT,
+            "source": "statusline",
+            "weekly_percent": 42.0,
+            "resets_at": int(reset.timestamp()),
+            "five_hour_percent": 12.0,
+            "five_hour_resets_at": "2026-07-25T18:00:00Z",
+        },
+    )
+    derived_snapshot_ids = []
+
+    monkeypatch.setitem(ns, "detect_reset_and_credit", lambda *a, **k: None)
+    monkeypatch.setitem(
+        ns,
+        "maybe_record_milestone",
+        lambda saved, **kwargs: derived_snapshot_ids.append(saved["id"]),
+    )
+    monkeypatch.setitem(
+        ns,
+        "maybe_update_five_hour_block",
+        lambda saved, **kwargs: derived_snapshot_ids.append(saved["id"]),
+    )
+    monkeypatch.setattr(record_runtime, "_run_dollar_axes", lambda *a, **k: None)
+
+    try:
+        _run_in_cycle(
+            conn, lambda ctx: record_runtime._pipeline_claude_usage(ctx, record)
+        )
+        first_row = conn.execute(
+            "SELECT id FROM weekly_usage_snapshots WHERE journal_id = ?",
+            (f"sa:{record['id']}",),
+        ).fetchone()
+        assert first_row is not None
+        assert derived_snapshot_ids == [int(first_row[0]), int(first_row[0])]
+
+        conn.execute(
+            "DELETE FROM weekly_usage_snapshots WHERE journal_id = ?",
+            (f"sa:{record['id']}",),
+        )
+        conn.commit()
+
+        _run_in_cycle(
+            conn, lambda ctx: record_runtime._pipeline_claude_usage(ctx, record)
+        )
+
+        assert derived_snapshot_ids == [int(first_row[0]), int(first_row[0])]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots WHERE journal_id = ?",
+            (f"sa:{record['id']}",),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_duplicate_stamps_and_stops_reharvesting(ns):
     """An exact-duplicate emission still appends (crash-replay contract) but now
     STAMPS the row, so the next cycle re-harvests nothing. Today it returns

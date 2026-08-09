@@ -357,6 +357,41 @@ def test_strict_stats_quarantine_preserves_a_hot_rollback_journal(
     assert manifest["movedFiles"] == [rollback.name, path.name]
 
 
+def test_strict_quarantine_allocates_a_unique_same_second_incident(
+    tmp_path, monkeypatch,
+):
+    """A second recovery in one second must not reuse retained evidence."""
+    _ns, core, _cache_mod = _load(tmp_path, monkeypatch)
+    db_mod = sys.modules["_cctally_db"]
+    path = pathlib.Path(core.CACHE_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = "20260101T000000Z"
+
+    path.write_bytes(b"first damaged generation")
+    first = db_mod.quarantine_db_family(
+        path,
+        strict=True,
+        ts=stamp,
+        context=db_mod.quarantine_context(trigger="test.first_generation"),
+    )
+
+    path.write_bytes(b"second damaged generation")
+    second = db_mod.quarantine_db_family(
+        path,
+        strict=True,
+        ts=stamp,
+        context=db_mod.quarantine_context(trigger="test.second_generation"),
+    )
+
+    assert first != second
+    assert first.name == "cache.db-20260101T000000Z"
+    assert second.name == "cache.db-20260101T000000_000001"
+    assert (first / path.name).read_bytes() == b"first damaged generation"
+    assert (second / path.name).read_bytes() == b"second damaged generation"
+    assert _manifest(first)["trigger"] == "test.first_generation"
+    assert _manifest(second)["trigger"] == "test.second_generation"
+
+
 def test_a_legacy_pending_record_without_context_finalizes_as_v1(
     tmp_path, monkeypatch,
 ):

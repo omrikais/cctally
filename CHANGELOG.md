@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.95.1] - 2026-08-09
+
+### Fixed
+- Corruption recovery now preserves both incidents when two database families are quarantined within the same second. The second incident atomically reserves a distinct retention-compatible directory instead of reusing the first incident's path and failing because the old and new `stats.db` generations both exist.
+- The authoritative test gate now runs its rollback-contention wall-clock checks after the parallel pytest estate, alongside the existing serial rebuild benchmark. Whole-estate CPU contention can no longer consume those latency ceilings while isolated regressions still fail the release.
+- Concurrent usage ingestion no longer derives five-hour blocks or milestones from a snapshot that a retained suppression event deliberately removed. A duplicate observation now respects the absent Model-A target instead of passing `None` into the derivation path and repeatedly failing every ingester behind it.
+
 ## [1.95.0] - 2026-08-09
 
 ### Changed

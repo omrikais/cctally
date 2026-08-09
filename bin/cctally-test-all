@@ -12,8 +12,8 @@
 #   PYTEST — pytest-xdist worker count for the bulk post-pool pytest phase.
 # Unset, OUTER auto-tunes below the core count (round(NCPU*0.45)) to stop the
 # pool oversubscribing; PYTEST keeps the full core count because pytest runs
-# after the pool. The wall-clock rebuild benchmark then runs serially, without
-# xdist contention. Explicit CCTALLY_TEST_JOBS=B preserves today's
+# after the pool. Wall-clock benchmarks then run serially, without xdist
+# contention. Explicit CCTALLY_TEST_JOBS=B preserves today's
 # behavior (OUTER=PYTEST=B). Each role has an explicit override:
 # CCTALLY_OUTER_JOBS / CCTALLY_INNER_JOBS / CCTALLY_PYTEST_JOBS.
 # CCTALLY_TEST_JOBS=1 forces fully serial (1/1/1).
@@ -258,24 +258,36 @@ for h in "${all_harnesses[@]}"; do
 done
 
 # pytest tests/ after the pool (skipped if pytest is unavailable). The bulk
-# estate uses pytest-xdist when available. The rebuild benchmark asserts a
-# wall-clock lock-hold ceiling, so it is excluded from that CPU-saturated phase
-# and run once afterward without xdist; otherwise scheduler contention, rather
-# than the code under test, can consume the ceiling.
+# estate uses pytest-xdist when available. Wall-clock benchmarks are excluded
+# from that CPU-saturated phase and run once afterward without xdist; otherwise
+# scheduler contention, rather than the code under test, can consume their
+# ceilings.
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
 pytest_wall=0
 if python3 -m pytest --version >/dev/null 2>&1; then
     pytest_status="PASS"
     pytest_log="$LOGDIR/pytest.log"
-    pytest_benchmark="tests/test_rebuild_benchmark.py"
+    pytest_rebuild_benchmark="tests/test_rebuild_benchmark.py"
+    pytest_contention_benchmark="tests/test_stats_writer_storm_386.py"
+    pytest_serial_targets=()
     pytest_timeout_args=()
     # -rfE forces the "short test summary info" section to emit FAILED/ERROR
     # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
     # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
     pytest_args=(tests/ -q -rfE)
-    if [ -f "$REPO_ROOT/$pytest_benchmark" ]; then
-        pytest_args+=(--ignore="$pytest_benchmark")
+    if [ -f "$REPO_ROOT/$pytest_rebuild_benchmark" ]; then
+        pytest_args+=(--ignore="$pytest_rebuild_benchmark")
+        pytest_serial_targets+=("$pytest_rebuild_benchmark")
+    fi
+    if [ -f "$REPO_ROOT/$pytest_contention_benchmark" ]; then
+        for node in \
+            "$pytest_contention_benchmark::test_h1_multiwriter_baseline_stays_intact" \
+            "$pytest_contention_benchmark::test_dashboard_source_reader_releases_rollback_snapshot"
+        do
+            pytest_args+=(--deselect="$node")
+            pytest_serial_targets+=("$node")
+        done
     fi
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$PYTEST")
@@ -301,9 +313,9 @@ if python3 -m pytest --version >/dev/null 2>&1; then
         # are infrastructure.
         contract_classify_pytest "$pytest_rc" "pytest"
     fi
-    if [ -f "$REPO_ROOT/$pytest_benchmark" ]; then
+    if [ "${#pytest_serial_targets[@]}" -gt 0 ]; then
         pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
-        pytest_benchmark_args=("$pytest_benchmark" -q -rfE)
+        pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE)
         pytest_benchmark_args+=("${pytest_timeout_args[@]}")
         (cd "$REPO_ROOT" && python3 -m pytest "${pytest_benchmark_args[@]}") > "$pytest_benchmark_log" 2>&1
         pytest_benchmark_rc=$?

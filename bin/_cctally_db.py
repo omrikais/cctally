@@ -1300,6 +1300,37 @@ def _load_pending_quarantine(db_path: pathlib.Path) -> "dict[str, Any] | None":
 _QUARANTINE_MISSING_CONTEXT_WARNED = False  # one-shot warn flag
 
 
+def _reserve_quarantine_incident(
+    root: pathlib.Path, db_name: str, timestamp: str
+) -> pathlib.Path:
+    """Atomically reserve a retention-compatible incident directory."""
+    root.mkdir(parents=True, exist_ok=True)
+    primary = root / f"{db_name}-{timestamp}"
+    try:
+        primary.mkdir()
+        return primary
+    except FileExistsError:
+        pass
+
+    match = re.fullmatch(r"(\d{8}T\d{6})(?:Z|_(\d{6}))", timestamp)
+    if match is None:
+        stem = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+        first = 1
+    else:
+        stem = match.group(1)
+        first = int(match.group(2) or "0") + 1
+    for microsecond in range(first, 1_000_000):
+        candidate = root / f"{db_name}-{stem}_{microsecond:06d}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError(
+        f"could not allocate a unique quarantine incident for {db_name}"
+    )
+
+
 def _warn_quarantine_created_without_context(incident: pathlib.Path) -> None:
     """Report a creation that supplied no `QuarantineContext` (#496 S6 §4.2).
 
@@ -1352,8 +1383,7 @@ def _quarantine_db_family_strict(
     if state is None:
         ts = ts or _db_backup_timestamp()
         root = _cctally_core.APP_DIR / "quarantine"
-        incident = root / f"{db_path.name}-{ts}"
-        incident.mkdir(parents=True, exist_ok=True)
+        incident = _reserve_quarantine_incident(root, db_path.name, ts)
         for directory in (root, incident):
             try:
                 os.chmod(directory, 0o700)

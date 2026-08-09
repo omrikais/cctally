@@ -877,14 +877,20 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
     probe_thread.start()
 
     started = time.monotonic()
-    writer_procs = [
-        _spawn_writer(env, *_tick_args(3 + i))
-        for i in range(STORM_WRITERS)
-    ]
-    writer_procs.extend([
-        _spawn_writer(env, "sync-week"),
-        _spawn_writer(env, "sync-week"),
-    ])
+    process_details = {}
+    writer_procs = []
+    writer_specs = [tuple(_tick_args(3 + i)) for i in range(STORM_WRITERS)]
+    writer_specs.extend([("sync-week",), ("sync-week",)])
+    for argv in writer_specs:
+        process = subprocess.Popen(
+            [sys.executable, str(CCTALLY), *argv],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        writer_procs.append(process)
+        process_details[process] = ("writer", argv)
 
     status_payload = json.dumps({
         "model": {"display_name": "Sonnet", "id": "claude-sonnet-4-5"},
@@ -909,7 +915,7 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
                 env=env,
                 stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
             )
             if payload is not None:
@@ -917,6 +923,7 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
                 process.stdin.write(payload)
                 process.stdin.close()
             reader_procs.append((surface, process))
+            process_details[process] = (surface, argv)
 
     active = {
         process: ("writer", time.monotonic()) for process in writer_procs
@@ -941,6 +948,19 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
     all_procs = writer_procs + [process for _, process in reader_procs]
     returncodes = [process.returncode for process in all_procs]
     busy_count = sum(code != 0 for code in returncodes)
+    failures = []
+    for process in all_procs:
+        assert process.stderr is not None
+        stderr = process.stderr.read()
+        process.stderr.close()
+        if process.returncode != 0:
+            surface, argv = process_details[process]
+            failures.append({
+                "surface": surface,
+                "argv": argv,
+                "returncode": process.returncode,
+                "stderr": stderr[-2000:],
+            })
     latency_summary = {}
     for surface, values in latencies.items():
         ordered = sorted(values)
@@ -980,7 +1000,7 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
         f"stormLatency={json.dumps(latency_summary, sort_keys=True)} "
         f"baselineLatency={json.dumps(baseline_summary, sort_keys=True)}"
     )
-    assert busy_count == 0, returncodes
+    assert busy_count == 0, failures[0] if failures else returncodes
     assert probe["quick"] >= 2
     assert probe["full"] >= 1
     assert probe["errors"] == []

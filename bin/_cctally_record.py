@@ -5812,6 +5812,15 @@ def _pipeline_claude_usage(ctx, rec):
             columns=cols,
             at=capture_at,
         )
+        # An exact retry can meet effective event metadata whose physical row a
+        # later suppression deliberately deleted.  emit_model_a must not
+        # resurrect that row and therefore returns None; deriving milestones or
+        # blocks from the absent target would either create dangling references
+        # or attempt int(None).  This is distinct from an ordinary fold-decision
+        # skip, which resolves a real latest snapshot below and still runs the
+        # idempotent side-effect chokepoints.
+        if rowid is None:
+            return
         saved["id"] = rowid
     else:
         latest = conn.execute(

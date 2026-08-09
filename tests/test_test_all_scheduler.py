@@ -262,8 +262,8 @@ def test_public_subset_tree_does_not_require_the_private_test_remote_harness(
     assert "test-remote" not in _kv(p.stdout)["harnesses"].split()
 
 
-def test_wall_clock_rebuild_benchmark_runs_outside_xdist(tmp_path):
-    """The lock-hold SLA must not compete with the parallel pytest estate."""
+def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
+    """Wall-clock SLAs must not compete with the parallel pytest estate."""
     repo = tmp_path / "repo"
     bindir = repo / "bin"
     tests_dir = repo / "tests"
@@ -307,6 +307,10 @@ def test_wall_clock_rebuild_benchmark_runs_outside_xdist(tmp_path):
     )
 
     (tests_dir / "test_rebuild_benchmark.py").write_text(
+        "# execution is represented by the fake pytest below\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_stats_writer_storm_386.py").write_text(
         "# execution is represented by the fake pytest below\n",
         encoding="utf-8",
     )
@@ -354,6 +358,22 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
     bulk, benchmark = invocations
     assert "tests/" in bulk
     assert "--ignore=tests/test_rebuild_benchmark.py" in bulk
+    assert (
+        "--deselect=tests/test_stats_writer_storm_386.py::"
+        "test_h1_multiwriter_baseline_stays_intact"
+    ) in bulk
+    assert (
+        "--deselect=tests/test_stats_writer_storm_386.py::"
+        "test_dashboard_source_reader_releases_rollback_snapshot"
+    ) in bulk
     assert " -n 2" in bulk
     assert "tests/test_rebuild_benchmark.py" in benchmark
+    assert (
+        "tests/test_stats_writer_storm_386.py::"
+        "test_h1_multiwriter_baseline_stays_intact"
+    ) in benchmark
+    assert (
+        "tests/test_stats_writer_storm_386.py::"
+        "test_dashboard_source_reader_releases_rollback_snapshot"
+    ) in benchmark
     assert " -n " not in benchmark
