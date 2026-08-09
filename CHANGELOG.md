@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.95.3] - 2026-08-09
+
+### Fixed
+- Linux writer-storm validation now recognizes a pending `sync_week` journal operation's documented fail-closed account-attribution sequence during concurrent cache ingestion, even when another authoritative writer picks up that operation, while still requiring a successful cost sync and rejecting every reader, unknown diagnostic, SQLite lock, integrity, or sidecar failure.
+
 ## [1.95.2] - 2026-08-09
 
 ### Fixed

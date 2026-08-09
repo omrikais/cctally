@@ -41,6 +41,40 @@ SOAK = os.environ.get("CCTALLY_RUN_STORM_SOAK") == "1"
 STORM_WRITERS = 24 if SOAK else 8
 KILL_ROUNDS = 40 if SOAK else 6
 
+_REQUIRED_SYNC_WEEK_CONTENTION = {
+    "[cache] sync already in progress; using existing cache",
+    (
+        "cctally: account attribution unavailable (cache required): "
+        "concurrent ingest"
+    ),
+}
+_ALLOWED_SYNC_WEEK_CONTENTION = _REQUIRED_SYNC_WEEK_CONTENTION | {
+    (
+        "[cache] concurrent ingest in progress; falling back to direct JSONL "
+        "parse for correctness"
+    ),
+}
+
+
+def _is_expected_writer_cache_contention(detail: dict) -> bool:
+    """Recognize only the account-safe refusal documented by #341.
+
+    A scoped ``sync_week`` journal op cannot fall back to identity-less JSONL
+    while another process is ingesting the cache. Any authoritative writer can
+    pick up that pending op, so the exit may surface from ``record-usage`` as
+    well as the process that appended it. That exit-3 refusal is a correctness
+    result, not stats.db rollback-journal contention. Exact-line matching and
+    the writer-only gate keep reader failures, every SQLite busy/locked error,
+    and every other child failure load-bearing in the storm gate.
+    """
+    lines = {line.strip() for line in detail["stderr"].splitlines() if line.strip()}
+    return (
+        detail["surface"] == "writer"
+        and detail["returncode"] == 3
+        and _REQUIRED_SYNC_WEEK_CONTENTION <= lines
+        and lines <= _ALLOWED_SYNC_WEEK_CONTENTION
+    )
+
 
 def _storm_env(data_dir: pathlib.Path) -> dict:
     """Environment for a storm child: pinned data dir, dev-autodetect off.
@@ -947,7 +981,6 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
     assert not active, f"storm processes exceeded 180 s: {list(active)}"
     all_procs = writer_procs + [process for _, process in reader_procs]
     returncodes = [process.returncode for process in all_procs]
-    busy_count = sum(code != 0 for code in returncodes)
     failures = []
     for process in all_procs:
         assert process.stderr is not None
@@ -961,6 +994,19 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
                 "returncode": process.returncode,
                 "stderr": stderr[-2000:],
             })
+    expected_cache_contention = [
+        detail for detail in failures
+        if _is_expected_writer_cache_contention(detail)
+    ]
+    unexpected_failures = [
+        detail for detail in failures
+        if not _is_expected_writer_cache_contention(detail)
+    ]
+    successful_sync_weeks = sum(
+        process.returncode == 0
+        for process in writer_procs
+        if process_details[process][1] == ("sync-week",)
+    )
     latency_summary = {}
     for surface, values in latencies.items():
         ordered = sorted(values)
@@ -994,13 +1040,19 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
         }
     print(
         "[538-storm] "
-        f"processes={len(all_procs)} busy={busy_count} "
+        f"processes={len(all_procs)} "
+        f"expectedCacheContention={len(expected_cache_contention)} "
+        f"unexpectedFailures={len(unexpected_failures)} "
+        f"successfulSyncWeeks={successful_sync_weeks} "
         f"elapsed={time.monotonic() - started:.3f}s "
         f"quick={probe['quick']} integrity={probe['full']} "
         f"stormLatency={json.dumps(latency_summary, sort_keys=True)} "
         f"baselineLatency={json.dumps(baseline_summary, sort_keys=True)}"
     )
-    assert busy_count == 0, failures[0] if failures else returncodes
+    if failures:
+        print("[538-storm-failures] " + json.dumps(failures, sort_keys=True))
+    assert unexpected_failures == [], unexpected_failures[0]
+    assert successful_sync_weeks >= 1, failures or returncodes
     assert probe["quick"] >= 2
     assert probe["full"] >= 1
     assert probe["errors"] == []
