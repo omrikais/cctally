@@ -1193,6 +1193,13 @@ def _s3_pin_clock(ns, monkeypatch, moment=_S3_T0):
         ns, "_share_now_utc_iso",
         lambda: clock.moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+    # Template builders have their own clock seam. Keep artifact metadata at
+    # the initial instant while individual tests move the dashboard data clock;
+    # otherwise two equivalent bodies can differ when wall time crosses a
+    # second between HTTP requests.
+    monkeypatch.setenv(
+        "CCTALLY_AS_OF", moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
     # Deterministic + DB-free: the current-week builder aggregates
     # `[week_start, now]` through this helper on every call.
     monkeypatch.setitem(ns, "_share_top_projects_for_range",

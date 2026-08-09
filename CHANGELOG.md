@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.95.5] - 2026-08-09
+
+### Fixed
+- Dashboard share-digest validation now pins the template artifact clock as well as the dashboard data clock, so two equivalent renders cannot fail Linux CI merely because their frontmatter and footer crossed a one-second wall-clock boundary.
+
 ## [1.95.4] - 2026-08-09
 
 ### Fixed
