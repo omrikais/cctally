@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.95.4] - 2026-08-09
+
+### Fixed
+- Linux lock-serialization validation now uses explicit acquisition/release handshakes instead of elapsed-time inference, and retries only `db rederive`'s exact documented five-second busy outcome to the required audited no-op when a production-shaped rebuild legitimately outlasts that bound.
+
 ## [1.95.3] - 2026-08-09
 
 ### Fixed

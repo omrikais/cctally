@@ -25,7 +25,7 @@ DISPATCHER seams to their defaults per test, so appending a synthetic hook to
 import datetime as dt
 import multiprocessing as mp
 import os
-import time
+import threading
 
 import pytest
 
@@ -369,16 +369,15 @@ def test_malformed_midfile_line_skipped_and_counted(tmp_path, monkeypatch):
 # (f) opportunistic skips / authoritative blocks (spec §5.1)
 # --------------------------------------------------------------------------
 
-def _hold_ingest_lock(lock_path, ready_path, hold_s):
+def _hold_ingest_lock(lock_path, ready, release):
     import fcntl as _fcntl
     import os as _os
-    import time as _time
 
     fd = _os.open(lock_path, _os.O_RDWR | _os.O_CREAT, 0o600)
     _fcntl.flock(fd, _fcntl.LOCK_EX)
-    with open(ready_path, "w") as fh:
-        fh.write("ready")
-    _time.sleep(hold_s)
+    ready.set()
+    if not release.wait(10.0):
+        raise AssertionError("parent never released the ingest lock holder")
     _fcntl.flock(fd, _fcntl.LOCK_UN)
     _os.close(fd)
 
@@ -391,29 +390,60 @@ def test_authoritative_blocks_opportunistic_skips(tmp_path, monkeypatch):
     jr.append_record(_usage_obs(J, 10.0), now_utc=FIXED)
 
     lock_path = str(_cctally_core.JOURNAL_INGEST_LOCK_PATH)
-    ready_path = str(tmp_path / "ingest-lock-ready")
 
     ctx = mp.get_context("spawn")
-    holder = ctx.Process(target=_hold_ingest_lock, args=(lock_path, ready_path, 1.0))
+    ready = ctx.Event()
+    release = ctx.Event()
+    holder = ctx.Process(target=_hold_ingest_lock, args=(lock_path, ready, release))
     holder.start()
     try:
-        deadline = time.time() + 5.0
-        while not os.path.exists(ready_path):
-            if time.time() > deadline:
-                raise AssertionError("holder never acquired the ingest lock")
-            time.sleep(0.02)
+        assert ready.wait(5.0), "holder never acquired the ingest lock"
 
         opp = jr.run_stats_ingest(mode="opportunistic")
         assert opp.ran is False
         assert _usage_count(ns) == 0  # nothing consumed while skipped
 
-        t0 = time.monotonic()
-        auth = jr.run_stats_ingest(mode="authoritative", timeout_s=10.0)
-        waited = time.monotonic() - t0
+        real_acquire = jr._acquire_ingest_lock
+        authoritative_attempted = threading.Event()
+
+        def observed_acquire(mode, timeout_s):
+            if mode == "authoritative":
+                authoritative_attempted.set()
+            return real_acquire(mode, timeout_s)
+
+        monkeypatch.setattr(jr, "_acquire_ingest_lock", observed_acquire)
+        auth_results = []
+        auth_errors = []
+
+        def run_authoritative():
+            try:
+                auth_results.append(
+                    jr.run_stats_ingest(mode="authoritative", timeout_s=10.0)
+                )
+            except BaseException as exc:
+                auth_errors.append(exc)
+
+        authoritative = threading.Thread(
+            target=run_authoritative,
+            name="authoritative-ingest-test",
+        )
+        authoritative.start()
+        assert authoritative_attempted.wait(5.0), (
+            "authoritative lock attempt was not observed"
+        )
+        assert authoritative.is_alive(), (
+            "authoritative ingest completed while the child still owned the lock"
+        )
+        release.set()
+        authoritative.join(10.0)
+        assert not authoritative.is_alive(), "authoritative ingest did not unblock"
+        assert auth_errors == []
+        assert len(auth_results) == 1
+        auth = auth_results[0]
         assert auth.ran is True
-        assert waited >= 0.3, "authoritative did not wait for the lock"
         assert _usage_count(ns) == 1
     finally:
+        release.set()
         holder.join(10)
         assert holder.exitcode == 0
 

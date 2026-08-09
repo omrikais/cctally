@@ -339,24 +339,97 @@ else
     sed -n '1,120p' "$SCRATCH/unsupported.err"
 fi
 
+rebuild_pause_marker="$SCRATCH/rederive-apply-paused.pid"
 (
+    CCTALLY_TEST_STATS_REBUILD_PAUSE_AT=rebuild_fold_started \
+    CCTALLY_TEST_STATS_REBUILD_MARKER="$rebuild_pause_marker" \
     "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
         >"$SCRATCH/apply-1.json" 2>"$SCRATCH/apply-1.err"
     echo "$?" >"$SCRATCH/apply-1.rc"
 ) &
 apply_pid_1=$!
+
+rebuild_paused=0
+for _ in $(seq 1 200); do
+    if [ -s "$rebuild_pause_marker" ]; then
+        rebuild_paused=1
+        break
+    fi
+    if ! kill -0 "$apply_pid_1" 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+done
+
 (
     "$REPO_ROOT/bin/cctally" db rederive --family claude-usage --yes --json \
         >"$SCRATCH/apply-2.json" 2>"$SCRATCH/apply-2.err"
     echo "$?" >"$SCRATCH/apply-2.rc"
 ) &
 apply_pid_2=$!
-wait "$apply_pid_1"
-wait "$apply_pid_2"
+
+if [ "$rebuild_paused" -eq 1 ]; then
+    wait "$apply_pid_2"
+    paused_pid="$(sed -n '1p' "$rebuild_pause_marker")"
+    case "$paused_pid" in
+        ''|*[!0-9]*)
+            fail "concurrent apply pause marker contains a process id"
+            ;;
+        *)
+            kill -CONT "$paused_pid" 2>/dev/null || \
+                fail "concurrent apply resumes the paused rebuild"
+            ;;
+    esac
+    wait "$apply_pid_1"
+else
+    fail "concurrent apply reaches the deterministic rebuild pause"
+    wait "$apply_pid_1"
+    wait "$apply_pid_2"
+fi
 apply_json_1="$(cat "$SCRATCH/apply-1.json")"
 apply_json_2="$(cat "$SCRATCH/apply-2.json")"
 apply_rc_1="$(cat "$SCRATCH/apply-1.rc")"
 apply_rc_2="$(cat "$SCRATCH/apply-2.rc")"
+retry_slot="$(
+    APPLY_JSON_1="$apply_json_1" APPLY_JSON_2="$apply_json_2" \
+    APPLY_RC_1="$apply_rc_1" APPLY_RC_2="$apply_rc_2" python3 - <<'PY'
+import json
+import os
+
+busy_error = (
+    "another database sync or maintenance operation holds the "
+    "rederive lock set; retry shortly"
+)
+results = [
+    json.loads(os.environ["APPLY_JSON_1"]),
+    json.loads(os.environ["APPLY_JSON_2"]),
+]
+returncodes = [int(os.environ["APPLY_RC_1"]), int(os.environ["APPLY_RC_2"])]
+if sorted(result["status"] for result in results) == ["applied", "failed"]:
+    failed_index = next(
+        index for index, result in enumerate(results)
+        if result["status"] == "failed"
+    )
+    applied_index = 1 - failed_index
+    if (
+        returncodes[applied_index] == 0
+        and returncodes[failed_index] == 3
+        and results[failed_index]["errors"] == [busy_error]
+    ):
+        print(failed_index + 1)
+PY
+)"
+if [ "$retry_slot" = "1" ]; then
+    echo "INFO concurrent rederive busy loser: retrying apply slot 1"
+    apply_json_1="$("$REPO_ROOT/bin/cctally" db rederive \
+        --family claude-usage --yes --json 2>"$SCRATCH/apply-1.retry.err")"
+    apply_rc_1=$?
+elif [ "$retry_slot" = "2" ]; then
+    echo "INFO concurrent rederive busy loser: retrying apply slot 2"
+    apply_json_2="$("$REPO_ROOT/bin/cctally" db rederive \
+        --family claude-usage --yes --json 2>"$SCRATCH/apply-2.retry.err")"
+    apply_rc_2=$?
+fi
 if [ "$apply_rc_1" -eq 0 ] && [ "$apply_rc_2" -eq 0 ] && \
    PREVIEW_JSON="$preview_json" APPLY_JSON_1="$apply_json_1" \
    APPLY_JSON_2="$apply_json_2" python3 - <<'PY'
@@ -381,6 +454,12 @@ else
     printf '%s\n%s\n' "$apply_json_1" "$apply_json_2"
     sed -n '1,120p' "$SCRATCH/apply-1.err"
     sed -n '1,120p' "$SCRATCH/apply-2.err"
+    if [ -f "$SCRATCH/apply-1.retry.err" ]; then
+        sed -n '1,120p' "$SCRATCH/apply-1.retry.err"
+    fi
+    if [ -f "$SCRATCH/apply-2.retry.err" ]; then
+        sed -n '1,120p' "$SCRATCH/apply-2.retry.err"
+    fi
 fi
 apply_json="$(
     APPLY_JSON_1="$apply_json_1" APPLY_JSON_2="$apply_json_2" python3 - <<'PY'
