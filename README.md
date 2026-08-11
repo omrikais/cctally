@@ -30,11 +30,9 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.92.0** (2026-08-05)
+**Latest stable: v1.95.5** (2026-08-09)
 
-- Add per-run bearer authentication for non-loopback dashboards, with fragment-to-HttpOnly-cookie browser bootstrap and a restart-only Settings/CLI opt-out (#282).
-- Add account-scoped conversation browsing, search, reading, export, and permalinks to the dashboard and `cctally transcript`, while preserving the existing all-account and single-account output shapes (#347).
-- Long Codex conversations now open with two concurrent data requests instead of issuing a third detail request just to repeat totals already available from the outline. On the same 3,733-row conversation, the first painted row improved from 784 ms to 421, 429 ms while live-tail streaming remained connected (#477).
+- Dashboard share-digest validation now pins the template artifact clock as well as the dashboard data clock, so two equivalent renders cannot fail Linux CI merely because their frontmatter and footer crossed a one-second wall-clock boundary.
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
