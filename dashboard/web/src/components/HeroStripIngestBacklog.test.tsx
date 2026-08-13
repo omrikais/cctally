@@ -33,7 +33,12 @@ import {
   makeDecoratedCodexSourceData,
   makeSourceEnvelope,
 } from '../test-utils/sourceEnvelope';
-import type { CodexSourceData, Envelope, SourcesMap } from '../types/envelope';
+import type {
+  AllCombinedQualification,
+  CodexSourceData,
+  Envelope,
+  SourcesMap,
+} from '../types/envelope';
 
 describe('codexIngestBacklogNote', () => {
   it('is absent when the field is absent — the zero state is omission', () => {
@@ -170,9 +175,33 @@ function renderCodex(codexData: CodexSourceData, focus?: string): HTMLElement {
   return container.querySelector('.hero-spent') as HTMLElement;
 }
 
-function renderAll(codexData: CodexSourceData, combinedAvailable = true) {
+// #556 S1 §4.3 — All's disclosure comes from `combined.qualifications`, which
+// composition LIFTS from the provider. `qualifications` is therefore an explicit
+// argument here: deriving it from `codexData.ingest_backlog` would rebuild
+// inside the harness the very coupling the change removes, and the inverse tests
+// below could not distinguish the two sources.
+function renderAll(
+  codexData: CodexSourceData,
+  {
+    combinedAvailable = true,
+    qualifications,
+  }: {
+    combinedAvailable?: boolean;
+    qualifications?: AllCombinedQualification[];
+  } = {},
+) {
   const env = envWith(codexData);
-  if (!combinedAvailable) env.sources!.all.data!.combined = null;
+  const allData = env.sources!.all.data!;
+  if (!combinedAvailable) {
+    allData.combined = null;
+    allData.combined_unavailable = {
+      code: 'codex_cycle_unavailable',
+      message: 'Codex native reset cycle is unavailable.',
+      causes: [{ provider: 'codex', code: 'codex_cycle_unavailable' }],
+    };
+  } else if (qualifications != null) {
+    allData.combined!.qualifications = qualifications;
+  }
   updateSnapshot(env);
   dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
   const rendered = render(<HeroStrip />);
@@ -180,6 +209,20 @@ function renderAll(codexData: CodexSourceData, combinedAvailable = true) {
     ...rendered,
     spent: rendered.getByTestId('shared-hero-spent'),
   };
+}
+
+const BACKLOG_QUALIFICATION: AllCombinedQualification = {
+  code: 'codex_ingest_backlog',
+  message: 'Codex has pending accounting to ingest, so its cycle total may be '
+    + 'incomplete.',
+  provider: 'codex',
+};
+
+function qualificationsIn(spent: HTMLElement): string[] {
+  return Array.from(
+    spent.querySelectorAll('[data-testid="hero-combined-qualification"]'),
+    (el) => el.getAttribute('data-code') ?? '',
+  );
 }
 
 function noteIn(spent: HTMLElement): HTMLElement | null {
@@ -332,56 +375,60 @@ describe('<HeroStrip /> ingest-backlog disclosure — visibility', () => {
   });
 });
 
-describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#456)', () => {
-  it('qualifies the Combined spend with the same visible short note', () => {
-    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()));
-    const note = noteIn(spent);
+describe('<HeroStrip /> ingest-backlog disclosure — Combined hero (#556 §4.3)', () => {
+  it('qualifies the Combined spend from combined.qualifications', () => {
+    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+      qualifications: [BACKLOG_QUALIFICATION],
+    });
 
-    expect(note).not.toBeNull();
-    expect(note!.textContent).toContain('+3 sessions still loading');
-    expect(note!.className).toContain('hs-sub');
-    expect(note!.getAttribute('aria-hidden')).toBe('true');
+    expect(qualificationsIn(spent)).toEqual(['codex_ingest_backlog']);
+    const chip = spent.querySelector(
+      '[data-testid="hero-combined-qualification"]',
+    ) as HTMLElement;
+    // Visible text, not a hover-only tooltip: `title` alone is unreachable on
+    // touch, which is the defect the visible short label exists to fix.
+    expect(chip.textContent).toContain('Codex still loading');
+    expect(chip.getAttribute('title')).toMatch(/pending accounting/i);
+    expect(chip.getAttribute('aria-label')).toMatch(/pending accounting/i);
     expect(spent.textContent).toContain('$20.70');
   });
 
-  it('exposes the full disclosure as a title and accessible group name', () => {
-    const { spent, getByRole } = renderAll(
-      withBacklog(makeDecoratedCodexSourceData()),
-    );
+  // The two inverse directions. The provider field stays published for the
+  // Codex tab's own use, so a test that only checks the happy path cannot tell
+  // which of the two sources All is actually reading.
+  it('follows combined.qualifications even when the provider field disagrees', () => {
+    const { spent } = renderAll(makeDecoratedCodexSourceData(), {
+      qualifications: [BACKLOG_QUALIFICATION],
+    });
 
-    expect(spent.getAttribute('title')).toMatch(/still loading/i);
-    expect(spent.getAttribute('aria-label')).toMatch(/still loading/i);
-    expect(getByRole('group', { name: /still loading/i })).toBe(spent);
+    expect(qualificationsIn(spent)).toEqual(['codex_ingest_backlog']);
   });
 
-  it('does not widen the account-scoped stale-cycle note to Combined', () => {
-    const { spent } = renderAll(withBacklog(
-      withStaleParentCycle(makeDecoratedCodexSourceData()),
-    ));
+  it('renders no qualification carried only by the provider field', () => {
+    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+      qualifications: [],
+    });
 
-    expect(spent.getAttribute('aria-label')).toMatch(/still loading/i);
-    expect(spent.getAttribute('aria-label')).not.toMatch(/forecast is paused/i);
-    expect(spent.getAttribute('title')).not.toMatch(/forecast is paused/i);
+    expect(qualificationsIn(spent)).toEqual([]);
+    expect(spent.textContent).not.toMatch(/still loading/i);
   });
 
-  it('omits every backlog channel when no work is owed', () => {
+  it('omits every qualification channel when no work is owed', () => {
     const { spent } = renderAll(makeDecoratedCodexSourceData());
 
-    expect(noteIn(spent)).toBeNull();
+    expect(qualificationsIn(spent)).toEqual([]);
     expect(spent.getAttribute('title')).toBeNull();
-    expect(spent.getAttribute('aria-label')).toBeNull();
-    expect(spent.getAttribute('role')).toBeNull();
   });
 
-  it('lets the existing unavailable warning win when Combined has no number', () => {
-    const { spent } = renderAll(
-      withBacklog(makeDecoratedCodexSourceData()),
-      false,
-    );
+  it('shows the withheld reason rather than a qualification when there is no number', () => {
+    const { spent } = renderAll(withBacklog(makeDecoratedCodexSourceData()), {
+      combinedAvailable: false,
+    });
 
-    expect(noteIn(spent)).toBeNull();
-    expect(spent.getAttribute('title')).toBeNull();
-    expect(spent.getAttribute('aria-label')).toBeNull();
-    expect(spent.textContent).toContain('Combined unavailable');
+    // With no figure on screen there is nothing for a qualification to qualify.
+    expect(qualificationsIn(spent)).toEqual([]);
+    expect(spent.textContent).toContain('Combined withheld');
+    expect(spent.getAttribute('title'))
+      .toBe('Codex native reset cycle is unavailable.');
   });
 });

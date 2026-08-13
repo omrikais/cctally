@@ -4310,6 +4310,16 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_codex_entries_ts_root_conversation "
         "ON codex_session_entries(timestamp_utc, source_root_key, conversation_key)"
     )
+    # The per-file alias join in `_codex_conversation_metadata` matches on
+    # (source_root_key, source_path). `idx_codex_entries_source_root` cannot
+    # serve it: a machine normally has ONE provider root, so a root-only search
+    # visits every entry row for every file and the join costs files x entries
+    # on every dashboard snapshot build. Re-derivable, so it belongs on the
+    # unconditional path with the S3 index above rather than in a migration.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_entries_root_path "
+        "ON codex_session_entries(source_root_key, source_path)"
+    )
     # The per-file terminal thread facts seed a later append without rereading
     # the prefix. They are nullable for old cache rows; migration 024 never
     # fabricates these source facts and instead clears/rederives them.

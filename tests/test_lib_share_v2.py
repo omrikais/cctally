@@ -1036,7 +1036,7 @@ def test_a_composed_html_chart_keeps_its_size_inside_a_scroll_box():
 # to their light counterparts and asserted in its own docstring that the
 # data colours were "legible on white". Measured against white paper they
 # are not: dark `ref_warn` #fbbf24 is 1.67:1 (its light counterpart
-# #d97706 is 3.19:1), dark `ref_alarm` #f87171 is 2.77:1 (light #dc2626
+# #b45309 is 5.02:1), dark `ref_alarm` #f87171 is 2.77:1 (light #dc2626
 # is 4.83:1), and dark `series_primary` #60a5fa is 2.54:1 (light #2563eb
 # is 5.17:1). So a printed dark forecast showed its 90% ceiling line
 # essentially invisible while the light artifact of the same report
@@ -1060,6 +1060,26 @@ def _s2r_relative_luminance(hex_colour: str) -> float:
 
 def _s2r_contrast_on_white(hex_colour: str) -> float:
     return 1.05 / (_s2r_relative_luminance(hex_colour) + 0.05)
+
+
+def test_the_rendered_light_warning_label_clears_wcag_aa_on_white():
+    """The on-screen 90% label is text, so its threshold is 4.5:1."""
+    import xml.etree.ElementTree as ET
+
+    chart = _LS.LineChart(
+        points=(_LS.ChartPoint(x_label="now", x_value=0.0, y_value=50.0),),
+        y_label="%",
+        reference_lines=((90.0, "90%", "warn"),),
+    )
+    out = _LS._render_line_chart_svg(
+        chart, palette=_LS.PALETTE_LIGHT,
+        x=0, y=0, width=400, height=200,
+    )
+    root = ET.fromstring(f"<svg>{out}</svg>")
+    label = next(node for node in root.iter("text") if node.text == "90%")
+
+    ratio = _s2r_contrast_on_white(label.attrib["fill"])
+    assert ratio >= 4.5, round(ratio, 2)
 
 
 _S2R_DARK_DATA_ROLES = ("ref_warn", "ref_alarm", "series_primary",
@@ -1104,6 +1124,30 @@ def test_print_rules_map_every_dark_data_colour_to_its_light_counterpart():
                            _LS.PALETTE_LIGHT["series_palette"]):
         assert dark in css, dark
         assert light in css, light
+
+
+def test_print_map_disambiguates_shared_warning_and_series_paint():
+    """One dark value has different light targets in different SVG roles."""
+    css = _LS._print_stylesheet()
+    shared_dark = _LS.PALETTE_DARK["ref_warn"]
+    light_warning = _LS.PALETTE_LIGHT["ref_warn"]
+    light_series = _LS.PALETTE_LIGHT["series_palette"][3]
+
+    assert shared_dark == _LS.PALETTE_DARK["series_palette"][3]
+    assert (
+        f'svg rect[fill="{shared_dark}"],'
+        f' svg path[fill="{shared_dark}"],'
+        f' svg polyline[fill="{shared_dark}"]'
+        f' {{ fill: {light_series} !important; }}'
+    ) in css
+    assert (
+        f'svg line[stroke="{shared_dark}"]'
+        f' {{ stroke: {light_warning} !important; }}'
+    ) in css
+    assert (
+        f'svg text[fill="{shared_dark}"]'
+        f' {{ fill: {light_warning} !important; }}'
+    ) in css
 
 
 def test_a_reference_label_and_its_line_print_the_same_colour():

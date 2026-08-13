@@ -848,9 +848,15 @@ def test_claude_serializer_output_is_byte_stable(monkeypatch):
 
 
 def test_source_schema_version_moves_with_the_retired_s2_transition():
-    """#465 changes published values and retires a field, so the version is 4."""
+    """A published value changing MEANING bumps the version.
+
+    #465 retired a field and changed published figures, which took this to 4.
+    #556 S1 took it to 5: Claude's `hero.cost_usd` / `hero.total_tokens` were a
+    thirty-day rollup and are now current-cycle actuals, and `data.combined`
+    gained a required `legs` object.
+    """
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 4
+    assert SOURCE_SCHEMA_VERSION == 5
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

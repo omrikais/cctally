@@ -476,6 +476,25 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .hu-num--sm { font-size: var(--fs-kpi); color: var(--accent-cyan); }
 .hu-reset { flex-basis: 100%; font-size: var(--fs-meta); color: var(--text-dim); }
 .hu-reset span { color: var(--text); font-weight: 600; }
+/* #556 S1 §5 — on the All selection each provider block carries its OWN
+   labelled reset, so the reset line is a child of `.hu-block` rather than a
+   full-width sibling. `flex-basis: 100%` is meaningless inside a flex COLUMN
+   and would fight the block's own width, so it is reset here. The two blocks
+   are otherwise identical in structure and size: one label, one `.hu-num` at
+   one precision, one reset. Equal blocks make `align-items: flex-end` align
+   what a reader expects it to align. */
+.hero-usage .hu-block > .hu-reset {
+  flex-basis: auto;
+  margin-top: var(--space-1);
+}
+/* Both blocks now end with a reset line of the same height, so the zone aligns
+   them from the TOP. `flex-end` was compensating for one tall block beside one
+   short one, which is the mismatch the equalised structure removes.
+   This is the DESKTOP flex row only. Its specificity (0,2,1) also beats the
+   `@media (max-width: 640px)` `align-items: end` at (0,1,0), so the mobile
+   block below re-states the value it wants at matching specificity rather than
+   leaving the phone layout silently governed by this rule. */
+.hero-strip[data-source="all"] .hero-usage { align-items: flex-start; }
 /* #416 D6 — "All accounts" merges only spend and tokens. Under All accounts
    the headline percent + reset are deliberately blank and this points at the
    per-account cards; independent quota percentages are never blended into one
@@ -521,6 +540,40 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-weight: inherit;
 }
 .hero-ingest-backlog-label-compact { display: none; }
+/* #556 S1 A7 — the same deliberate-absence treatment `.hu-num` already had.
+   Without it the em-dash rendered in the bright accent-green of a real figure,
+   which reads as a value rather than as an intentional blank. */
+.hs-big.is-blank { color: var(--text-dim); }
+/* The named reason a combined figure is withheld, and the notes that qualify a
+   published one. Both wrap: they are sentences, not metrics. */
+.hs-sub.hero-combined-reason {
+  color: var(--text-dim);
+  white-space: normal;
+}
+.hs-sub.hero-combined-qualifications {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.hero-leg-no-data {
+  font-style: italic;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+/* A qualification is INFORMATIONAL: the figure beside it is published and
+   correct, and the note says what it does and does not cover. It previously
+   borrowed `.chip-stale`, which is the amber freshness vocabulary of the
+   `Stale quota` marker this session retired — so a reader who had learned that
+   amber means "these numbers may be out of date" read the wrong thing from
+   `Claude no data`. The design system's informational tier is indigo
+   (`dashboard/design-system/components/alert-severity.html`: info / warn /
+   critical), which is what this uses. */
+.chip.hero-combined-qualification {
+  background: color-mix(in srgb, var(--accent-indigo) 14%, transparent);
+  color: var(--accent-indigo);
+  border: 1px solid color-mix(in srgb, var(--accent-indigo) 34%, transparent);
+  font-weight: 700;
+}
 
 /* support zone — Forecast @ reset · $/1% vs last week · Snapshot age. */
 .hero-support {
@@ -4889,11 +4942,48 @@ mark.current {
     align-items: end;
   }
   .hero-usage .hu-reset { grid-column: 1 / -1; }
-  /* Three compact semantic slots make the support transformation identical in
-     Claude, Codex and All without hiding values or growing a second row. */
+  /* #556 S1 QA P0 — the template above describes ONE primary block beside one
+     small secondary metric: `fit-content(110px)` pins the first column at the
+     width a 34px one-decimal percentage needs, and the 5-hour metric that
+     follows it renders at `--fs-kpi` in whatever is left. The All selection
+     puts two FULL-SIZE peers in that zone, so the second one absorbed the whole
+     shortfall — at 390px the Codex column measured 39px against a 90px numeral,
+     which painted "41.0%" across the zone border, and the sweep got worse the
+     narrower the phone (4px of column at 320px).
+     Two peers do not fit side by side at these widths at any credible KPI size:
+     the zone's content box is 161px at 390px and 126px at 320px, while
+     "100.0%" inks at 122.8px at 34px — measured in the browser, not estimated.
+     So the All zone stacks them, one provider per row, which is also what the
+     support zone below it does. The Codex label stops wrapping to four lines at
+     the same time, so the zone is no taller than the broken layout it replaces.
+     Note how thin the remaining margin is: 122.8px of ink in the 126px box at
+     320px leaves 3.2px. "100.0%" is the widest value this element can ever hold,
+     so nothing overflows today, but a font-stack or font-metric change has
+     almost no room before it does. Re-measure this rather than reasoning about
+     it if either changes. */
+  .hero-strip[data-source="all"] .hero-usage {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-3);
+    /* Each row now holds exactly one block, so the two values of `align-items`
+       are indistinguishable here. Stated anyway, at the same (0,2,1)
+       specificity as the desktop rule above, so the phone layout is governed
+       by a rule inside the phone block rather than by a desktop one that
+       happens to outrank the media query. */
+    align-items: end;
+  }
+  /* One compact semantic slot per support row, and the track count FOLLOWS the
+     row count: `grid-auto-flow: column` with `grid-auto-columns` creates one
+     implicit 1fr track per child. The fixed `repeat(3, ...)` this replaces was
+     the canonical hero's row count written into the template, so the All
+     selection's two rows were each squeezed into a third of the zone — and
+     because `.sup-l` was `nowrap` with visible overflow, "Claude · week to
+     date" (139px natural) painted 28px of itself over the next cell's label
+     (#556 S1 QA P1). Three rows still produce three equal tracks, so the
+     canonical hero is unchanged. */
   .hero-support {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
     gap: var(--space-2);
     align-items: start;
   }
@@ -4904,7 +4994,14 @@ mark.current {
     gap: 0;
   }
   .hero-support .sup-l,
-  .hero-support .sup-v { font-size: var(--fs-eyebrow); white-space: nowrap; }
+  .hero-support .sup-v { font-size: var(--fs-eyebrow); }
+  /* The value is a short metric and must stay on one line. The LABEL is prose
+     of unbounded length, so it wraps instead of overflowing its cell: a cell
+     narrower than its label is a wrapped label, never text drawn on top of a
+     neighbour. This also removes the same overlap the canonical labels reach at
+     the narrowest widths, where "$/1% vs last week" exceeds an 88px cell. */
+  .hero-support .sup-v { white-space: nowrap; }
+  .hero-support .sup-l { white-space: normal; overflow-wrap: anywhere; }
 
   /* #293 S1 (MOBILE-2) — sanctioned secondary lever (spec §3c): tighten ONLY the
      dashboard, unscrolled topbar's inter-row gap so the first board card clears
@@ -7651,12 +7748,6 @@ mark.current {
   font-size: var(--fs-meta);
   line-height: 1.45;
 }
-.all-stale-disclosure {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
 .provider-summary-kpis {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -7820,7 +7911,6 @@ mark.current {
 .codex-token-list .ctl-k { color: var(--text-faint); }
 .codex-blocks-list { list-style: none; margin: 0; padding: 0; }
 .codex-blocks-list li { display: flex; justify-content: space-between; gap: var(--space-2); font-size: var(--fs-data); }
-.combined-unavailable { color: var(--text-dim); }
 .codex-detail-open {
   appearance: none;
   border: none;

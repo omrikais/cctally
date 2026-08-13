@@ -1864,7 +1864,34 @@ def _sum_cost_for_range(
     by the per-account ``sync-week`` cost materialization + per-account budget
     ladders so a snapshot / budget carries genuinely per-account cost.
     """
+    return _sum_cost_and_tokens_for_range(
+        start, end, mode, project, skip_sync=skip_sync, account_key=account_key,
+    )[0]
+
+
+def _sum_cost_and_tokens_for_range(
+    start: dt.datetime,
+    end: dt.datetime,
+    mode: str = "auto",
+    project: str | None = None,
+    *,
+    skip_sync: bool = False,
+    account_key: "str | None" = None,
+) -> "tuple[float, int]":
+    """Sum USD cost and #104 total tokens over ONE walk of the same entries.
+
+    #556 S1 §3.3. The two halves must describe the SAME entry set, so they are
+    accumulated together rather than by a second read: a separate read runs on
+    another connection with its own end-boundary semantics and can legitimately
+    disagree with this one.
+
+    Tokens follow the #104 convention (`input + output + cache_create +
+    cache_read`). `cache_creation_1h_input_tokens` is deliberately absent — it
+    is a TTL SUBDIVISION of `cache_creation_input_tokens` (#195), so adding it
+    would double-count every 1-hour cache write.
+    """
     total = 0.0
+    tokens = 0
     for entry in get_entries(start, end, project=project, skip_sync=skip_sync,
                              account_key=account_key):
         total += _calculate_entry_cost(
@@ -1873,7 +1900,14 @@ def _sum_cost_for_range(
             mode=mode,
             cost_usd=entry.cost_usd,
         )
-    return total
+        usage = entry.usage
+        tokens += (
+            int(usage.get("input_tokens", 0) or 0)
+            + int(usage.get("output_tokens", 0) or 0)
+            + int(usage.get("cache_creation_input_tokens", 0) or 0)
+            + int(usage.get("cache_read_input_tokens", 0) or 0)
+        )
+    return total, tokens
 
 
 def _bridge_z_into_tz(args: argparse.Namespace,

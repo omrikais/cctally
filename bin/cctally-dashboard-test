@@ -857,6 +857,143 @@ if d.get("code") != "unknown_key":
         fi
     fi
 
+    # #556 S1 §6.3 — the All combined headline. `/api/data` is the arithmetic
+    # and bounds oracle and is already diffed above (the envelope always
+    # carries all three sources; there is no `?source=` selector on that
+    # route), so this leg asserts the combined block BY VALUE for the two
+    # scenarios built for it. A golden diff alone would go green again if a
+    # future rebaseline regenerated both sides from a broken build.
+    case "$name" in
+      all-combined|all-combined-decorated)
+        if [ -n "${raw:-}" ]; then
+            local combined_check
+            combined_check=$(printf '%s' "$raw" | CCTALLY_SCENARIO="$name" python3 -c '
+import json, os, sys
+scenario = os.environ["CCTALLY_SCENARIO"]
+env = json.load(sys.stdin)
+data = ((env.get("sources") or {}).get("all") or {}).get("data") or {}
+combined = data.get("combined")
+errs = []
+if scenario == "all-combined-decorated":
+    # Spec 3.2: decoration withholds the figure with a NAMED reason.
+    if combined is not None:
+        errs.append("decorated scenario published a combined figure")
+    unavailable = data.get("combined_unavailable") or {}
+    if unavailable.get("code") != "multi_account_unsupported":
+        errs.append("combined_unavailable.code == %r" % (unavailable.get("code"),))
+    causes = unavailable.get("causes") or []
+    if not any(
+        c.get("provider") == "claude"
+        and (c.get("detail") or {}).get("account_count") == 2
+        for c in causes
+    ):
+        errs.append("no claude cause naming 2 accounts: %r" % (causes,))
+else:
+    if not isinstance(combined, dict):
+        errs.append("combined withheld: %r" % (data.get("combined_unavailable"),))
+    else:
+        if "combined_unavailable" in data:
+            errs.append("combined_unavailable emitted beside a published figure")
+        legs = combined.get("legs") or {}
+        if set(legs) != {"claude", "codex"}:
+            errs.append("legs == %r" % (sorted(legs),))
+        for name in ("claude", "codex"):
+            leg = legs.get(name) or {}
+            if leg.get("state") != "current":
+                errs.append("%s leg state == %r" % (name, leg.get("state")))
+            if not leg.get("cost_usd"):
+                errs.append("%s leg cost_usd is zero/absent" % (name,))
+            if not (leg.get("period") or {}).get("start_at"):
+                errs.append("%s leg names no period" % (name,))
+        # Each leg names its OWN cycle: the two periods must differ.
+        claude_period = (legs.get("claude") or {}).get("period") or {}
+        codex_period = (legs.get("codex") or {}).get("period") or {}
+        if claude_period.get("start_at") == codex_period.get("start_at"):
+            errs.append("both legs claim the same start_at")
+        # Unequal, non-zero totals, so a swapped leg moves the golden.
+        if (legs.get("claude") or {}).get("cost_usd") == (
+                legs.get("codex") or {}).get("cost_usd"):
+            errs.append("the two legs carry equal cost, so a swap is invisible")
+        total = round(
+            (legs.get("claude") or {}).get("cost_usd", 0.0)
+            + (legs.get("codex") or {}).get("cost_usd", 0.0), 9)
+        if round(combined.get("cost_usd", -1.0), 9) != total:
+            errs.append("cost_usd %r != leg sum %r" % (combined.get("cost_usd"), total))
+        # Acceptance 5: both percent clocks are stale in this fixture and both
+        # cycles resolve, so the figure publishes UNQUALIFIED.
+        if "qualifications" in combined:
+            errs.append("unexpected qualifications: %r" % (combined["qualifications"],))
+        allst = (env.get("sources") or {}).get("all") or {}
+        if [w.get("code") for w in (allst.get("warnings") or [])]:
+            errs.append("All carries warnings: %r" % (allst.get("warnings"),))
+        if (allst.get("domain_freshness") or {}).get("hero") != "fresh":
+            errs.append("domain_freshness.hero != fresh: %r"
+                        % (allst.get("domain_freshness"),))
+        if (allst.get("domain_freshness") or {}).get("quota") != "stale":
+            errs.append("domain_freshness.quota != stale: %r"
+                        % (allst.get("domain_freshness"),))
+if errs:
+    sys.exit("; ".join(errs))
+print("ok")
+' 2>&1)
+            if [ "$combined_check" != "ok" ]; then
+                echo "FAIL $name: combined headline assertion: $combined_check"
+                ok=0
+            fi
+        fi
+
+        # Spec 6.3: `source: "all"` on the two share POST routes. Not added to
+        # `/api/source/all/...`, which returns 400 by design.
+        local share_all_code
+        share_all_code=$(curl -s -o "$scratch_home/share-all.json" -w "%{http_code}" \
+            --max-time 10 -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"source":"all","panel":"current-week","template_id":"current-week-recap"}' \
+            "$base/api/share/render")
+        if [ "$share_all_code" != "200" ]; then
+            echo "FAIL $name: POST /api/share/render source=all returned $share_all_code"
+            ok=0
+        else
+            local share_all_check
+            share_all_check=$(python3 -c '
+import json, sys
+result = json.load(open(sys.argv[1]))
+body = result.get("body") or ""
+missing = [name for name in ("Claude", "Codex") if name not in body]
+if missing:
+    sys.exit("rendered body names neither provider: missing %r" % (missing,))
+# Spec 4.7: the note is SOURCE-SPECIFIC and reads each provider its own
+# evidence. Both are stale by construction in this fixture (Claude percent
+# capture 600s old against a 90s bound; Codex weekly observation 3601s old
+# against a 3600s one), so both notes must appear. That is the disclosure
+# the SHARE artifact owes; it is deliberately NOT the same question as the
+# combined headline, whose accounting axis stays fresh because both cycles
+# still resolve.
+for provider in ("Claude", "Codex"):
+    note = provider + " current-week spend is based on stale provider-cycle evidence."
+    if note not in body:
+        sys.exit("missing the %s stale-evidence note" % (provider,))
+print("ok")
+' "$scratch_home/share-all.json" 2>&1)
+            if [ "$share_all_check" != "ok" ]; then
+                echo "FAIL $name: share render source=all: $share_all_check"
+                ok=0
+            fi
+        fi
+
+        local compose_all_code
+        compose_all_code=$(curl -s -o "$scratch_home/compose-all.json" -w "%{http_code}" \
+            --max-time 10 -X POST -H "Origin: http://127.0.0.1:$port" \
+            -H "Content-Type: application/json" \
+            -d '{"source":"all","title":"All combined","format":"md","sections":[{"snapshot":{"panel":"current-week","template_id":"current-week-recap"}}]}' \
+            "$base/api/share/compose")
+        if [ "$compose_all_code" != "200" ]; then
+            echo "FAIL $name: POST /api/share/compose source=all returned $compose_all_code"
+            ok=0
+        fi
+        ;;
+    esac
+
     # /api/session/:id negative + URL-encoding smokes (Task 3.3). Runs
     # on every scenario — including no-data, where only the bogus-id
     # 404 check is meaningful (no fixture session exists to collide
@@ -909,11 +1046,11 @@ run_scenario () {
     fi
 }
 
-# Dispatch the eleven fixture scenarios in parallel. Each scenario's
+# Dispatch the thirteen fixture scenarios in parallel. Each scenario's
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle)
+fixture_scenarios=(ok warn over reset-week no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.

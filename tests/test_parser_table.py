@@ -37,6 +37,44 @@ def _top_choices(parser):
     return {}
 
 
+def test_root_and_setup_help_describe_both_providers(mod):
+    parser = mod.build_parser()
+    root_help = parser.format_help()
+    setup_help = _top_choices(parser)["setup"].format_help()
+
+    assert "Track Claude and Codex subscription usage" in root_help
+    assert "--source {claude,codex,all}" in root_help
+    assert "cctally codex quota" in root_help
+    assert "Claude hook entries" in setup_help
+    assert "native Codex handlers" in setup_help
+    assert "configured Codex home" in setup_help
+
+
+def test_root_provider_discovery_is_derived_from_source_choices(mod, monkeypatch):
+    parser_module = sys.modules["_cctally_parser"]
+    monkeypatch.setattr(
+        parser_module,
+        "_PHYSICAL_PROVIDER_SOURCES",
+        ("claude", "codex", "nova"),
+        raising=False,
+    )
+
+    root_help = mod.build_parser().format_help()
+
+    assert "Claude, Codex, and Nova" in root_help
+    assert "--source {claude,codex,nova,all}" in root_help
+    assert "keep Claude, Codex, and Nova quota percentages" in root_help
+    assert "cctally report --source nova" in root_help
+
+    project_parser = _top_choices(mod.build_parser())["project"]
+    source_action = next(
+        action for action in project_parser._actions
+        if "--source" in action.option_strings
+    )
+    assert tuple(source_action.choices) == ("claude", "codex", "nova", "all")
+    assert source_action.help == "Analytics provider."
+
+
 def test_current_shape_matches_preview_availability(mod):
     choices = _top_choices(mod.build_parser())
     assert ("__preview" in choices) is (mod.cmd_preview is not None)

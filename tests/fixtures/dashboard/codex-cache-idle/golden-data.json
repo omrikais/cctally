@@ -133,7 +133,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 4,
+  "source_schema_version": 5,
   "sources": {
     "all": {
       "availability": "partial",
@@ -160,6 +160,20 @@
           "rows": []
         },
         "combined": null,
+        "combined_unavailable": {
+          "causes": [
+            {
+              "code": "codex_projection_incoherent",
+              "provider": "codex"
+            },
+            {
+              "code": "codex_cycle_unavailable",
+              "provider": "codex"
+            }
+          ],
+          "code": "codex_projection_incoherent",
+          "message": "Codex quota projection is unavailable."
+        },
         "providers": {
           "claude": {
             "alerts": {
@@ -191,7 +205,7 @@
               }
             },
             "hero": {
-              "cost_usd": 0.0,
+              "cost_usd": null,
               "current_week": {},
               "forecast": null,
               "header": {
@@ -203,7 +217,7 @@
                 "vs_last_week_delta": null,
                 "week_label": null
               },
-              "total_tokens": 0,
+              "total_tokens": null,
               "trend": null
             },
             "periods": {
@@ -997,7 +1011,7 @@
       },
       "data_version": "__VER__",
       "domain_freshness": {
-        "hero": "fresh",
+        "hero": "stale",
         "quota": "fresh",
         "sessions": "fresh"
       },
@@ -1090,7 +1104,7 @@
           }
         },
         "hero": {
-          "cost_usd": 0.0,
+          "cost_usd": null,
           "current_week": {},
           "forecast": null,
           "header": {
@@ -1102,7 +1116,7 @@
             "vs_last_week_delta": null,
             "week_label": null
           },
-          "total_tokens": 0,
+          "total_tokens": null,
           "trend": null
         },
         "periods": {
@@ -1160,7 +1174,7 @@
       },
       "data_version": "__VER__",
       "domain_freshness": {
-        "hero": "fresh",
+        "hero": "stale",
         "quota": "fresh",
         "sessions": "fresh"
       },
@@ -1948,7 +1962,7 @@
       },
       "data_version": "__VER__",
       "domain_freshness": {
-        "hero": "fresh",
+        "hero": "stale",
         "quota": "fresh",
         "sessions": "fresh"
       },

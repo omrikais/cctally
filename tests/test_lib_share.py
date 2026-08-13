@@ -1487,6 +1487,38 @@ def test_bar_chart_renders_stacks_when_present():
     assert a_idx < b_idx, "expected sorted-key ordering in legend"
 
 
+def test_stacked_bar_segments_have_a_non_colour_boundary():
+    """Adjacent fills must remain separable when their hues are unavailable."""
+    import xml.etree.ElementTree as ET
+
+    chart = BarChart(
+        points=(ChartPoint(x_label="W1", x_value=0.0, y_value=30.0),),
+        y_label="$",
+        stacks={
+            "model-a": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=10.0),
+            ),
+            "model-b": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=20.0),
+            ),
+        },
+    )
+
+    for palette in (_lib_share.PALETTE_LIGHT, _lib_share.PALETTE_DARK):
+        out = _lib_share._render_bar_chart_svg(
+            chart, palette=palette, x=0, y=0, width=400, height=200,
+        )
+        root = ET.fromstring(f"<svg>{out}</svg>")
+        segments = [
+            node for node in root.iter("rect")
+            if float(node.attrib["width"]) > 8.0
+        ]
+        assert len(segments) == 2
+        assert {node.attrib.get("stroke") for node in segments} == {
+            palette["bg"]
+        }
+
+
 def test_stacked_bar_legend_is_reserved_outside_the_plot():
     """The legend key must not be painted over the bars it identifies."""
     import xml.etree.ElementTree as ET

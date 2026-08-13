@@ -231,6 +231,14 @@ def _current_week_recipe(source, digest):
 
 
 def _set_hero_freshness(ns, *, claude=None, codex=None):
+    """Stale ONE provider's own current-cycle evidence.
+
+    #556 S1 §4.7 makes the share note source-specific, so this writes each
+    provider's own field rather than the shared `domain_freshness.hero` axis
+    (which now means accounting resolvability): Claude's percent-observation
+    label under `hero.current_week.freshness`, Codex's additive
+    `hero.cycle_freshness`, which is omitted while fresh.
+    """
     snap = ns["DashboardHTTPHandler"].snapshot_ref.get()
     old_claude = snap.source_bundle.sources["claude"]
     old_codex = snap.source_bundle.sources["codex"]
@@ -238,9 +246,21 @@ def _set_hero_freshness(ns, *, claude=None, codex=None):
     def changed(state, value):
         if value is None:
             return state
-        domain_freshness = dict(state.domain_freshness)
-        domain_freshness["hero"] = value
-        return replace(state, domain_freshness=domain_freshness)
+        data = dict(state.data)
+        hero = dict(data["hero"])
+        if state.source == "claude":
+            current_week = dict(hero.get("current_week") or {})
+            current_week["freshness"] = {
+                "label": value, "age_seconds": 900,
+                "captured_at": "2026-07-16T00:00:00Z",
+            }
+            hero["current_week"] = current_week
+        elif value == "stale":
+            hero["cycle_freshness"] = "stale"
+        else:
+            hero.pop("cycle_freshness", None)
+        data["hero"] = hero
+        return replace(state, data=data)
 
     new_claude = changed(old_claude, claude)
     new_codex = changed(old_codex, codex)
@@ -501,6 +521,58 @@ def test_all_current_week_disclosure_stays_provider_local(
             assert "Claude" in result["body"]
             assert "Codex" in result["body"]
             assert "$2.00" in result["body"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_the_current_week_share_note_ignores_the_shared_freshness_axes(
+    monkeypatch, tmp_path,
+):
+    """#556 S1 §4.7 — the note is source-specific, not axis-driven.
+
+    `domain_freshness.hero` was repointed to accounting resolvability, so it no
+    longer describes the evidence this note is about. The aggregate `quota`
+    axis is NOT the substitute either: a stale five-hour row stales it
+    independently of the weekly cycle. Moving both axes to `stale` while every
+    provider-local field stays fresh must therefore produce no note.
+    """
+    ns = load_script()
+    server, thread = _boot(ns, tmp_path, monkeypatch)
+    try:
+        snap = ns["DashboardHTTPHandler"].snapshot_ref.get()
+        staled = {
+            source: replace(
+                state,
+                domain_freshness={
+                    "hero": "stale", "quota": "stale", "sessions": "fresh"},
+            )
+            for source, state in (
+                ("claude", snap.source_bundle.sources["claude"]),
+                ("codex", snap.source_bundle.sources["codex"]),
+            )
+        }
+        snap.source_bundle = SourceDashboardBundle(
+            source_schema_version=SOURCE_SCHEMA_VERSION,
+            default_source="claude",
+            source_order=("claude", "codex", "all"),
+            sources={
+                **staled,
+                "all": compose_all_state(staled["claude"], staled["codex"]),
+            },
+        )
+        ns["DashboardHTTPHandler"].snapshot_ref = ns["_SnapshotRef"](snap)
+
+        for marker in ("claude", "codex"):
+            status, result = _render(
+                server,
+                source_marker=marker,
+                panel="current-week",
+                template_id="current-week-recap",
+            )
+            assert status == 200
+            assert "stale provider-cycle evidence" not in result["body"]
     finally:
         server.shutdown()
         server.server_close()

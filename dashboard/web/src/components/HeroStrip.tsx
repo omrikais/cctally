@@ -8,13 +8,23 @@ import { humanizeAge } from '../lib/syncFreshness';
 import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
-import { sourceDomainFreshness, warningForDomain } from '../lib/sourceGating';
+import { combinedHeading, combinedPresentation, warningForDomain } from '../lib/sourceGating';
 import { resolveSourceView } from '../store/sourceView';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { sourceAccounts } from '../store/accountFocus';
 import { AccountHeroCards } from './AccountHeroCards';
 import { dispatch, getState, subscribeStore } from '../store/store';
-import type { AllSourceData, CodexSourceData, Envelope, FreshnessEnvelope } from '../types/envelope';
+import type {
+  AllCombinedLeg,
+  AllCombinedPeriod,
+  AllSourceData,
+  CodexSourceData,
+  DashboardSelection,
+  Envelope,
+  FreshnessEnvelope,
+  SourceEntry,
+  SourceName,
+} from '../types/envelope';
 
 // HeroStrip (#264 S1, spec §4; #294 S5 §6.1) — the dashboard's full-width
 // at-a-glance hero. The shared three-zone component keeps Claude's canonical
@@ -77,6 +87,14 @@ export function joinHeroNotes(...notes: Array<string | null>): string | null {
   return kept.length ? kept.join(' ') : null;
 }
 
+// Per-source region names (§5). Each selection says which cycle it summarizes,
+// so a screen-reader user landing on the region learns that before the numbers.
+const HERO_REGION_NAME: Record<DashboardSelection, string> = {
+  all: 'Combined usage summary',
+  claude: 'Claude week usage summary',
+  codex: 'Codex cycle usage summary',
+};
+
 export function HeroStrip() {
   const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
@@ -121,7 +139,7 @@ export function HeroStrip() {
       className="hero-strip"
       role="region"
       tabIndex={0}
-      aria-label="Week usage summary"
+      aria-label={HERO_REGION_NAME[activeSource]}
       data-hero-strip=""
       data-source={activeSource}
       onClick={cardRegionClick(activate)}
@@ -133,6 +151,10 @@ export function HeroStrip() {
         }
       }}
     >
+      {/* #556 S1 §5 — criterion 10 cannot be verified by screenshot, so the
+          region carries a real heading as well as an accessible name. Visually
+          hidden: nothing about the hero's appearance changes. */}
+      <h2 className="sr-only">{HERO_REGION_NAME[activeSource]}</h2>
       {body}
       {/* #341 Task 4 — per-account hero cards (Q6 Option A). Self-hides unless
           the active physical source is decorated (>1 real account). */}
@@ -157,6 +179,14 @@ function SharedHero({
   const h = env?.header;
   const cw = env?.current_week ?? null;
   const scope = useAccountScope();
+  // Every countdown on this hero is measured from the SERVER's snapshot
+  // instant, never from the browser clock. The Claude tab already prints a
+  // server-computed `current_week.reset_in_sec`, so a skewed client clock used
+  // to make the same Claude cycle read differently on the All tab than on the
+  // Claude tab. `generated_at` is refreshed on every tick, so a countdown
+  // anchored to it ages exactly the way `reset_in_sec` does. `Date.now()`
+  // remains the fallback for an envelope that carries no instant.
+  const nowMs = snapshotNowMs(env);
   if (source === 'claude') {
     const claudeEntry = resolveSourceView(env, 'claude').entry;
     const accounts = sourceAccounts(claudeEntry);
@@ -164,9 +194,7 @@ function SharedHero({
       ? null
       : accounts?.find((card) => card.accountKey === scope.requestedKey) ?? null;
     const perAccount = accounts != null && focusedCard == null;
-    const focusedResetInSec = focusedCard?.resetsAt == null
-      ? null
-      : Math.max(0, (Date.parse(focusedCard.resetsAt) - Date.now()) / 1000);
+    const focusedResetInSec = remainingSeconds(focusedCard?.resetsAt, nowMs);
     const mergedSpendUsd = accounts?.reduce((sum, card) => sum + card.spendUsd, 0) ?? null;
     return (
       <CanonicalHero
@@ -224,7 +252,7 @@ function SharedHero({
   const codexBacklogCompactLabel = codexIngestBacklogCompactLabel(codex?.ingest_backlog);
   const warning = warningForDomain(codexEntry?.warnings, 'hero');
   const quotaForecast = quota?.histories.find((row) => row.key === weekly?.key)?.forecast;
-  const resetSeconds = weekly?.current.resets_at ? Math.max(0, (Date.parse(weekly.current.resets_at) - Date.now()) / 1000) : null;
+  const resetSeconds = remainingSeconds(weekly?.current.resets_at, nowMs);
   const capturedMs = weekly ? Date.parse(weekly.current.captured_at) : Number.NaN;
   const ageSeconds = Number.isFinite(capturedMs)
     ? Math.max(0, (Date.now() - capturedMs) / 1000)
@@ -319,25 +347,41 @@ function SharedHero({
     );
   }
 
-  const allEntry = resolveSourceView(env, 'all').entry;
-  const all = allEntry?.data as AllSourceData | undefined;
-  const combined = all?.combined ?? null;
-  // #456 — Combined contains the same incomplete Codex spend/tokens as the
-  // Codex hero while bounded ingest is catching up. The backlog condition is
-  // store-wide, so crossing the provider boundary does not make the caveat
-  // disappear. Keep it subordinate to the existing unavailable state: with no
-  // combined number on screen there is nothing for the backlog to qualify.
-  const combinedBacklogNote = combined == null ? null : codexBacklogNote;
-  const combinedBacklogLabel = combined == null ? null : codexBacklogLabel;
-  const combinedBacklogCompactLabel = combined == null ? null : codexBacklogCompactLabel;
-  const allWarning = warningForDomain(allEntry?.warnings, 'hero');
-  const allWarningDetail = allWarning?.message
-    ?? 'Combined totals are unavailable while a provider is degraded.';
-  const combinedStale = combined != null
-    && allEntry != null
-    && sourceDomainFreshness(allEntry, 'hero') === 'stale';
-  const combinedStaleNote = combinedStale ? allWarningDetail : null;
-  const combinedDisclosureNote = joinHeroNotes(combinedStaleNote, combinedBacklogNote);
+  // #556 S1 §4.4 / §5 — the All hero reads the combined figure through ONE
+  // predicate and through nothing else. It does not consult
+  // `sourceDomainFreshness(allEntry, 'hero')`, `allEntry.freshness` or the
+  // warning tuple: pairing any of those with a published number is what put
+  // "Combined totals are unavailable" beside a figure that was on screen.
+  const allEntry = resolveSourceView(env, 'all').entry as
+    SourceEntry<AllSourceData> | undefined;
+  const combined = combinedPresentation(allEntry ?? null);
+  // Three states, not two. A figure is PUBLISHED, or it is WITHHELD for a named
+  // reason, or the entry has not produced either yet — a hydrating All entry
+  // reaches here with `data: null` and no warnings, so it has no figure AND no
+  // reason. Treating "no figure" alone as withheld printed the withheld chip
+  // and "A combined total is not published for this state." over a still-empty
+  // bootstrap, where an honest blank is the whole answer.
+  const published = combined.value != null;
+  const withheldReason = published ? null : combined.unavailable;
+  const claudeLeg = combined.legs?.claude ?? null;
+  const codexLeg = combined.legs?.codex ?? null;
+  // A WITHHELD figure is not "no data". Under decoration both providers have
+  // accounting and the composition declines to sum it, pointing at the
+  // per-account cards instead; telling the reader there is no data would be
+  // false. `CURRENT CYCLES · NO DATA` is reserved for the published both-empty
+  // state, where the answer really is that nothing was spent and nothing is
+  // known.
+  const heading = published
+    ? combinedHeading(combined.contributors)
+    : 'COMBINED · CURRENT CYCLES';
+  // A resolved zero is DATA. Both legs empty is the one state that publishes a
+  // number the reader must not see as observed spend, so the figure blanks
+  // while the heading says `CURRENT CYCLES · NO DATA`. A zero inside a resolved
+  // cycle keeps printing `$0`.
+  const figure = published && combined.contributors.length > 0
+    ? combined.value
+    : null;
+
   // #416 QA — the COMBINED tab carries the same defect the Codex tab just shed,
   // one surface further out. `weekly` is joined off the PARENT hero, whose
   // `cycle` is `cycles_all[0]` — one representative account's window — so with
@@ -346,144 +390,260 @@ function SharedHero({
   //
   // D6 forbids blending independent allowances, and no summary statistic over
   // them (a max, a mean, "the most urgent") is the quantity the slot claims to
-  // hold. So the three slots blank and the per-account strip — which now renders
-  // on this tab too — carries each account's own percent, 5h, reset and spend
+  // hold. So those slots blank and the per-account strip — which now renders on
+  // this tab too — carries each account's own percent, 5h, reset and spend
   // directly beneath them. Nothing is lost by the blanks: the strip is strictly
   // more information than the one number it replaces.
   //
   // Spend and tokens are untouched. They are the only axes D6 lets All merge,
-  // the merge already happens server-side (a sum of the same cards), and
-  // COMBINED SPEND is this tab's headline — blanking it would be the opposite
-  // failure. Gated on Codex decoration, so a <=1-real-account install is
+  // and COMBINED SPEND is this tab's headline — blanking it would be the
+  // opposite failure. Gated on decoration, so a <=1-real-account install is
   // byte-identical (R8).
   const codexPerAccount = codexDecorated;
   const claudeEntry = resolveSourceView(env, 'claude').entry;
   const claudePerAccount = sourceAccounts(claudeEntry) != null;
-  const codexPerAccountValue = codexPerAccount ? (
-    <span
-      className="hero-per-account-value"
-      data-testid="hero-per-account-value"
-      title="Each Codex account has its own quota cycle — independent percentages are never blended."
-    >
-      per account
-    </span>
-  ) : null;
+
+  // Each provider block carries its OWN labelled reset (§5, retiring A6).
+  //
+  // For a CONTRIBUTING leg the instant comes from THAT leg's published period
+  // and from nowhere else, so the countdown and the heading always describe the
+  // same cycle. A contributing leg that cannot name its cycle therefore shows
+  // no reset line, which is the only thing rev5 suppresses about it — it still
+  // counts toward the sum and is still named in the heading.
+  //
+  // Everywhere else the provider's OWN reset is the honest remaining answer:
+  // the quota cycle did not stop existing because the two providers' spend will
+  // not be summed. That covers the withheld figure (no legs at all) and equally
+  // an `empty` leg, which names no cycle because the provider contributed no
+  // accounting — not because its cycle is unknown. `One provider empty` is a
+  // published row of the matrix, so without this an install with Codex quota
+  // observations but no Codex accounting rows showed a percentage with no
+  // countdown beneath it, where the previous hero showed one.
+  const claudeResetSeconds = claudeLeg?.state === 'current'
+    ? periodResetSeconds(claudeLeg.period, nowMs)
+    : cw?.reset_in_sec ?? null;
+  const codexResetSeconds = codexLeg?.state === 'current'
+    ? periodResetSeconds(codexLeg.period, nowMs)
+    : resetSeconds;
 
   return (
     <>
       <div className="hero-zone hero-usage" data-testid="shared-hero-usage">
-        <div className="hu-block">
+        <div className="hu-block" data-provider-block="claude">
           <div className="hu-label">
-            CLAUDE 7-DAY
+            CLAUDE · WEEK
             {claudePerAccount ? <span className="hu-week"> · per account</span> : null}
           </div>
-          <div className="hu-num">{claudePerAccount ? '—' : fmt.pct1(h?.used_pct)}</div>
+          {/* A7 — the deliberate blank carries `.is-blank`, so it reads as an
+              intentional absence rather than an unfinished load. */}
+          <div className={claudePerAccount ? 'hu-num is-blank' : 'hu-num'}>
+            {claudePerAccount ? '—' : fmt.pct1(h?.used_pct)}
+          </div>
+          <ProviderReset
+            provider="claude"
+            perAccount={claudePerAccount}
+            resetInSec={claudeResetSeconds}
+          />
         </div>
-        <div className="hu-block">
+        <div className="hu-block" data-provider-block="codex">
           <div className="hu-label">
-            CODEX 7-DAY
+            CODEX · 7-DAY CYCLE
             {codexPerAccount ? <span className="hu-week"> · per account</span> : null}
           </div>
-          <div className="hu-num hu-num--sm">
-            {codexPerAccount ? '—' : fmt.pct0(weekly?.current.current_percent)}
+          {/* One precision across both blocks, and no `.hu-num--sm`: two
+              quantities of the same kind, rendered the same size. */}
+          <div className={codexPerAccount ? 'hu-num is-blank' : 'hu-num'}>
+            {codexPerAccount ? '—' : fmt.pct1(weekly?.current.current_percent)}
           </div>
+          <ProviderReset
+            provider="codex"
+            perAccount={codexPerAccount}
+            resetInSec={codexResetSeconds}
+          />
         </div>
-        {codexPerAccount ? (
-          // This countdown has always been the CODEX reset (Claude's own reset
-          // is not shown on this tab), so the replacement names Codex — dropping
-          // the provider would read as though Claude's reset were per-account too.
-          <div
-            className="hu-reset hu-reset--per-account"
-            data-testid="hero-per-account-note"
-            title="Each Codex account has its own quota cycle — independent resets are never blended."
-          >
-            Codex usage + reset <span>per account</span>
-          </div>
-        ) : (
-          <div className="hu-reset">resets in <span>{fmt.ddhh(resetSeconds)}</span></div>
-        )}
       </div>
 
       <div
         className="hero-zone hero-spent"
         data-testid="shared-hero-spent"
-        title={combinedDisclosureNote ?? undefined}
-        role={combinedDisclosureNote == null ? undefined : 'group'}
-        aria-label={combinedDisclosureNote == null
-          ? undefined
-          : `Combined spend. ${combinedDisclosureNote}`}
+        title={withheldReason?.message}
       >
-        <div className="hs-label">COMBINED SPEND</div>
-        <div className="hs-big">{combined?.cost_usd == null ? '—' : fmt.usd0(combined.cost_usd)}</div>
+        <div className="hs-label" data-testid="hero-combined-heading">{heading}</div>
+        <div className={figure == null ? 'hs-big is-blank' : 'hs-big'}>
+          {figure == null ? '—' : fmt.usd0(figure.costUsd)}
+        </div>
         <div className="hs-sub">
-          {combined == null
+          {withheldReason != null
             ? (
               <span
-                className="panel-degraded-chip hero-warning-chip"
+                className="panel-degraded-chip"
                 data-testid="shared-hero-warning"
-                title={allWarningDetail}
-                aria-label={`Combined totals unavailable: ${allWarningDetail}`}
+                title={withheldReason.message}
+                aria-label={`Combined total withheld: ${withheldReason.message}`}
               >
-                Combined unavailable
+                Combined withheld
               </span>
             )
-            : <><span>{fmt.tokens(combined.total_tokens)}</span> total tokens</>}
+            : figure != null
+              ? <><span>{fmt.tokens(figure.totalTokens)}</span> total tokens</>
+              : published
+                ? (
+                  <span data-testid="hero-combined-no-data">
+                    no accounting in either current cycle
+                  </span>
+                )
+                : null}
         </div>
-        {combinedStaleNote != null ? (
-          <div className="hs-sub">
-            <span
-              className="chip chip-stale"
-              data-testid="shared-hero-stale-marker"
-              title={combinedStaleNote}
-              aria-label={combinedStaleNote}
-            >
-              Stale quota
-            </span>
+        {withheldReason != null ? (
+          <div className="hs-sub hero-combined-reason" data-testid="hero-combined-reason">
+            {withheldReason.message}
           </div>
         ) : null}
-        {combinedBacklogLabel != null ? (
-          <div className="hs-sub" data-testid="hero-spent-note" aria-hidden="true">
-            <span className={combinedBacklogCompactLabel == null
-              ? undefined : 'hero-ingest-backlog-label-full'}>{combinedBacklogLabel}</span>
-            {combinedBacklogCompactLabel == null ? null : (
-              <span className="hero-ingest-backlog-label-compact">
-                {combinedBacklogCompactLabel}
+        {combined.qualifications.length > 0 ? (
+          <div className="hs-sub hero-combined-qualifications">
+            {combined.qualifications.map((qualification) => (
+              <span
+                key={qualification.code + (qualification.provider ?? '')}
+                className="chip hero-combined-qualification"
+                data-testid="hero-combined-qualification"
+                data-code={qualification.code}
+                title={qualification.message}
+                aria-label={qualification.message}
+              >
+                {qualificationChipLabel(qualification)}
               </span>
-            )}
+            ))}
           </div>
         ) : null}
       </div>
 
       <div className="hero-zone hero-support" data-testid="shared-hero-support">
         <div className="sup-row">
-          <span className="sup-l">Claude quota</span>
-          <span className="sup-v">
-            {claudePerAccount
-              ? (
-                <span
-                  className="hero-per-account-value"
-                  data-testid="hero-per-account-value"
-                  title="Each Claude account has its own quota cycle — independent percentages are never blended."
-                >
-                  per account
-                </span>
-              )
-              : fmt.pct1(h?.used_pct)}
+          <span className="sup-l">Claude · week to date</span>
+          <span className="sup-v" data-testid="hero-leg-claude">
+            <LegAmount leg={claudeLeg} perAccount={claudePerAccount} provider="claude" />
           </span>
         </div>
         <div className="sup-row">
-          <span className="sup-l">Codex quota</span>
-          <span className="sup-v">
-            {codexPerAccountValue ?? fmt.pct1(weekly?.current.current_percent)}
+          <span className="sup-l">Codex · cycle to date</span>
+          <span className="sup-v" data-testid="hero-leg-codex">
+            <LegAmount leg={codexLeg} perAccount={codexPerAccount} provider="codex" />
           </span>
-        </div>
-        <div className="sup-row">
-          <span className="sup-l">Providers</span>
-          <span className="sup-v">Claude · Codex</span>
         </div>
       </div>
     </>
   );
+}
+
+const PROVIDER_LABEL: Record<SourceName, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+};
+
+// The server's own snapshot instant, which is what every hero countdown is
+// measured from. It is refreshed on each tick beside the values it bounds, so
+// the pair always come from one clock; a browser whose clock is wrong can no
+// longer make one tab's countdown disagree with another's. An envelope with no
+// usable instant falls back to the browser clock, which is the previous
+// behaviour and the best available answer.
+function snapshotNowMs(env: Envelope | null): number {
+  // `Date.parse('')` is NaN, so the absent and the unparseable instant take the
+  // same branch without a separate null test.
+  const parsed = Date.parse(env?.generated_at ?? '');
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function remainingSeconds(
+  instant: string | null | undefined, nowMs: number,
+): number | null {
+  if (instant == null) return null;
+  const endMs = Date.parse(instant);
+  return Number.isFinite(endMs) ? Math.max(0, (endMs - nowMs) / 1000) : null;
+}
+
+function periodResetSeconds(
+  period: AllCombinedPeriod | undefined, nowMs: number,
+): number | null {
+  if (period == null) return null;
+  const remaining = remainingSeconds(period.end_at, nowMs);
+  // A leg whose named cycle has already ended AT THE SERVER'S OWN snapshot
+  // instant has no countdown to print. `fmt.ddhh(0)` renders "resets in 0d 0h",
+  // which reads as "resetting right now" rather than as evidence that the
+  // published bounds are behind the data. Suppressing the line is what §5
+  // already does for a contributing leg that cannot name its cycle at all.
+  return remaining != null && remaining > 0 ? remaining : null;
+}
+
+// The per-provider labelled reset. Naming the provider is the whole point: the
+// single unlabelled countdown this replaces was A6, and a reader could not tell
+// which of the two cycles it belonged to.
+function ProviderReset({
+  provider,
+  perAccount,
+  resetInSec,
+}: {
+  provider: SourceName;
+  perAccount: boolean;
+  resetInSec: number | null;
+}) {
+  const label = PROVIDER_LABEL[provider];
+  if (perAccount) {
+    return (
+      <div
+        className="hu-reset hu-reset--per-account"
+        data-testid={`hero-${provider}-reset`}
+        title={`Each ${label} account has its own quota cycle — independent resets are never blended.`}
+      >
+        {label} reset <span>per account</span>
+      </div>
+    );
+  }
+  if (resetInSec == null) return null;
+  return (
+    <div className="hu-reset" data-testid={`hero-${provider}-reset`}>
+      {label} resets in <span>{fmt.ddhh(resetInSec)}</span>
+    </div>
+  );
+}
+
+// One provider's contribution to the figure beside it. `no data` is the honest
+// reading for both an absent leg and an `empty` one: neither adds spend.
+function LegAmount({
+  leg,
+  perAccount,
+  provider,
+}: {
+  leg: AllCombinedLeg | null;
+  perAccount: boolean;
+  provider: SourceName;
+}) {
+  if (perAccount) {
+    return (
+      <span
+        className="hero-per-account-value"
+        data-testid="hero-per-account-value"
+        title={`Each ${PROVIDER_LABEL[provider]} account has its own cycle — independent spend is shown per account below.`}
+      >
+        per account
+      </span>
+    );
+  }
+  if (leg == null || leg.state === 'empty') {
+    return <span className="hero-leg-no-data">no data</span>;
+  }
+  return <>{fmt.usd2(leg.cost_usd)}</>;
+}
+
+// Qualifications arrive as `{code, message}`. The chip is the short sighted
+// form; the full sentence stays in `title` and the accessible name.
+function qualificationChipLabel(
+  qualification: { code: string; provider?: SourceName },
+): string {
+  if (qualification.code === 'codex_ingest_backlog') return 'Codex still loading';
+  if (qualification.code === 'provider_empty') {
+    return `${qualification.provider ? PROVIDER_LABEL[qualification.provider] : 'A provider'} no data`;
+  }
+  return 'Qualified';
 }
 
 // ---- Canonical provider hero (Claude is the structure reference) -------

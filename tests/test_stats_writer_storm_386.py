@@ -1384,6 +1384,18 @@ def _quarantine_incidents(app: pathlib.Path) -> list:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+def _heal_log(app: pathlib.Path) -> str:
+    try:
+        return (app / "logs" / "stats-corruption-heal.log").read_text()
+    except FileNotFoundError:
+        return ""
+
+
+def _heal_success_recorded(app: pathlib.Path) -> bool:
+    """The worker's terminal event, written after it clears its request."""
+    return "result=success" in _heal_log(app)
+
+
 def _corrupt_header(db: pathlib.Path) -> None:
     """Destroy the SQLite header magic in place.
 
@@ -1645,19 +1657,23 @@ def test_h4_two_concurrent_heals(tmp_path):
 
     # #496 S3: both detections DEFER, and admission admits exactly one of them.
     # The replacement itself happens in the detached worker that admission
-    # spawned, so wait for it to converge before judging how many replacements
-    # occurred. A poll rather than a fixed sleep: the property is "exactly one",
-    # and reading it before the worker finishes would assert nothing.
+    # spawned.  Its terminal event is written after the request marker clears
+    # and after the rebuild returns, so it is the completion boundary.  The
+    # earlier integrity/quarantine state can be visible while the worker is
+    # still finishing under load (#552/#559).
     db = _resolved_app_dir(env) / "stats.db"
     deadline = time.monotonic() + 110
     while time.monotonic() < deadline:
-        try:
-            ok, _text = _integrity_ok(db)
-        except sqlite3.DatabaseError:
-            ok = False  # still the corrupt original
-        if ok and _quarantine_incidents(app):
+        if _heal_success_recorded(app):
             break
         time.sleep(0.5)
+    assert _heal_success_recorded(app), (
+        "heal worker did not record terminal success: " + _heal_log(app)
+    )
+    assert not (app / "stats-corruption-heal.pending").exists(), (
+        "the successful worker left its request marker behind: "
+        + _heal_log(app)
+    )
 
     incidents = _quarantine_incidents(app)
     assert len(incidents) == 1, (

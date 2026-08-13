@@ -13,8 +13,12 @@
 // builders) must encode the flat/top-level shape so unit tests can never again
 // validate a wire shape the server does not produce.
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import fixture from './fixtures/envelope.json';
 import { makeSourceEnvelope } from '../src/test-utils/sourceEnvelope';
+import type { AllSourceData } from '../src/types/envelope';
 
 describe('S4 source envelope wire shape (guard)', () => {
   it('the JSON fixture spreads the source fields at the envelope TOP level', () => {
@@ -89,5 +93,93 @@ describe('S4 source envelope wire shape (guard)', () => {
       quota: 'fresh',
       sessions: 'fresh',
     });
+  });
+});
+
+// #556 S1 Unit 2 — the v5 combined contract, checked against a REAL captured
+// envelope rather than against a client fixture. `tests/fixtures/dashboard/
+// <scenario>/golden-data.json` is the byte-stable `/api/data` body the Python
+// harness diffs, so it is the one artifact in this repository that cannot drift
+// from what the server emits. Transcribing the TypeScript interfaces from a
+// client fixture is how the #294 S5 phantom nested bundle happened.
+//
+// The assertions below read the golden THROUGH `AllSourceData`, so a missing or
+// wrong interface field is a `tsc --noEmit` failure in the frontend harness's
+// typecheck leg, not merely an untyped runtime read that would pass either way.
+//
+// The path is assembled at RUNTIME. `new URL('<literal>', import.meta.url)` is
+// statically analysed by Vite and rewritten into an asset import, which its
+// `server.fs` allowlist then denies for a file outside `dashboard/web`.
+const GOLDEN_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..', '..', '..', 'tests', 'fixtures', 'dashboard',
+);
+
+function allSourceData(scenario: string): AllSourceData {
+  const golden = JSON.parse(readFileSync(
+    path.join(GOLDEN_ROOT, scenario, 'golden-data.json'), 'utf8',
+  )) as { sources: { all: { data: AllSourceData } } };
+  return golden.sources.all.data;
+}
+
+describe('v5 combined wire shape (guard)', () => {
+  it('a published combined carries legs, each naming its own cycle', () => {
+    const combined = allSourceData('all-combined').combined;
+    if (combined == null) throw new Error('all-combined must publish a figure');
+
+    expect(typeof combined.cost_usd).toBe('number');
+    expect(typeof combined.total_tokens).toBe('number');
+    expect(Object.keys(combined.legs).sort()).toEqual(['claude', 'codex']);
+    for (const [provider, kind] of [
+      ['claude', 'subscription_week'],
+      ['codex', 'native_7_day_cycle'],
+    ] as const) {
+      const leg = combined.legs[provider];
+      expect(leg.state).toBe('current');
+      expect(typeof leg.cost_usd).toBe('number');
+      expect(typeof leg.total_tokens).toBe('number');
+      expect(leg.period?.kind).toBe(kind);
+      expect(typeof leg.period?.label).toBe('string');
+      // ONE parser suffices: both bounds are always `...Z`, on both providers.
+      expect(leg.period?.start_at).toMatch(/Z$/);
+      expect(leg.period?.end_at).toMatch(/Z$/);
+    }
+    expect(combined.cost_usd).toBeCloseTo(
+      combined.legs.claude.cost_usd + combined.legs.codex.cost_usd, 9);
+    expect(combined.total_tokens).toBe(
+      combined.legs.claude.total_tokens + combined.legs.codex.total_tokens);
+  });
+
+  it('omits qualifications and combined_unavailable when inapplicable', () => {
+    const data = allSourceData('all-combined');
+
+    expect('combined_unavailable' in data).toBe(false);
+    expect(data.combined_unavailable).toBeUndefined();
+    expect('qualifications' in (data.combined as object)).toBe(false);
+  });
+
+  it('a withheld combined is null BESIDE a typed, ordered cause list', () => {
+    const data = allSourceData('all-combined-decorated');
+
+    // `combined` stays PRESENT as null; only `combined_unavailable` is
+    // omitted-when-inapplicable.
+    expect('combined' in data).toBe(true);
+    expect(data.combined).toBeNull();
+    const unavailable = data.combined_unavailable;
+    expect(unavailable?.code).toBe('multi_account_unsupported');
+    expect(typeof unavailable?.message).toBe('string');
+    // The list is precedence-ordered, so `causes[0]` always equals the winner.
+    expect(unavailable?.causes[0].code).toBe(unavailable?.code);
+    expect(unavailable?.causes[0].provider).toBe('claude');
+    expect(unavailable?.causes[0].detail).toEqual({ account_count: 2 });
+  });
+
+  it('lists EVERY co-occurring cause, not just the winner', () => {
+    const data = allSourceData('codex-cache-active');
+
+    expect(data.combined).toBeNull();
+    expect(data.combined_unavailable?.causes.map((cause) => cause.code)).toEqual([
+      'codex_projection_incoherent', 'codex_cycle_unavailable',
+    ]);
   });
 });

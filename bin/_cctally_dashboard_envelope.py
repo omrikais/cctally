@@ -1188,6 +1188,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
 
     week_lbl: "str | None" = None
     reset_at_utc: "dt.datetime | None" = None
+    week_start_at_utc: "dt.datetime | None" = None
     if cw is not None:
         ws = getattr(cw, "week_start_at", None)
         we = getattr(cw, "week_end_at", None)
@@ -1203,6 +1204,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         elif ws is not None:
             week_lbl = format_display_dt(ws, resolved_tz_obj, fmt='%b %d', suffix=False)
         reset_at_utc = we
+        week_start_at_utc = ws
 
     # Header forecast_pct should match the projection that drove the
     # verdict pill next to it. The View (issue #57) carries the
@@ -1616,7 +1618,19 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
                     None if cw.five_hour_resets_at is None
                     else max(0, int((cw.five_hour_resets_at - now_utc).total_seconds())),
                 "spent_usd":                cw.spent_usd,
+                # #556 S1 §3.3 — the token half of the same accumulation pass
+                # that produced `spent_usd`. `getattr` keeps legacy fixture
+                # modules that construct `TuiCurrentWeek` without the field
+                # serializing, the same way `five_hour_block` does.
+                "total_tokens":             getattr(cw, "total_tokens", 0),
                 "dollar_per_pct":           cw.dollars_per_percent,
+                # #556 S1 §3.5 — the effective cycle start, the companion of
+                # the already-published `reset_at_utc` end. Composition needs
+                # BOTH bounds to label the Claude leg's period, and the source
+                # version needs them to detect a nominal rollover (§3.6).
+                # Effective, not nominal: `_tui_build_current_week` stores this
+                # AFTER `_apply_midweek_reset_override`.
+                "week_start_at":            _iso_z(week_start_at_utc),
                 "reset_at_utc":             _iso_z(reset_at_utc),
                 "reset_in_sec":
                     None if reset_at_utc is None

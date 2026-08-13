@@ -74,7 +74,9 @@ asserts the stamped state per scenario.
 from __future__ import annotations
 
 import datetime as dt
+import importlib.machinery
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -83,9 +85,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _fixture_builders import (  # noqa: E402
+    bump_codex_physical_mutation_seq,
     create_cache_db,
     create_stats_db,
+    seed_account,
     seed_codex_conversation_thread,
+    seed_codex_quota_snapshot,
     seed_codex_session_entry,
     seed_codex_session_file,
     seed_codex_source_root,
@@ -1638,6 +1643,435 @@ def build_cache_report_qa(as_of: dt.datetime) -> None:
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
 
 
+# === #556 S1 — the both-provider combined-headline scenarios ==============
+#
+# Every pre-existing scenario leaves the All hero's `combined` either withheld
+# or Claude-only, so no golden ever showed the figure the issue is about. These
+# two do: `all-combined` is the ordinary undecorated install where BOTH legs
+# publish, and `all-combined-decorated` is the multi-account install where the
+# figure is withheld with a named reason (spec §3.2).
+
+# AS_OF is 2026-04-16T14:00:00Z for both. The two cycles deliberately do NOT
+# share a range — that is the property under test — and Claude's starts first.
+_AC_CLAUDE_WEEK_START = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
+_AC_CLAUDE_WEEK_END = _AC_CLAUDE_WEEK_START + dt.timedelta(days=7)
+_AC_CODEX_RESETS_AT = dt.datetime(2026, 4, 21, 8, 0, 0, tzinfo=dt.timezone.utc)
+_AC_CODEX_CYCLE_START = _AC_CODEX_RESETS_AT - dt.timedelta(minutes=10_080)
+
+_AC_CODEX_ROOT_KEY = "fixture-all-combined-root"
+_AC_CODEX_ROOT_PATH = "/fake/codex-all-combined"
+_AC_CODEX_CWD = "/fake/repos/all-combined-codex"
+_AC_CODEX_SESSION_ID = "fixture-allcomb-0000-0000-000000000001"
+
+
+def _seed_all_combined_claude(
+    stats_conn: sqlite3.Connection,
+    cache_conn: sqlite3.Connection,
+    as_of: dt.datetime,
+) -> None:
+    """Seed Claude's subscription week, its percent history and its spend.
+
+    The last percent capture is 600 seconds old, comfortably past the
+    90-second `_OAUTH_USAGE_DEFAULTS["stale_after_seconds"]` bound, so the
+    percent-observation clock reads STALE while the week itself is unexpired.
+    That is the state that used to keep All's combined caveat permanently on.
+    """
+    for hours, pct in ((6, 5.0), (30, 18.0), (54, 29.0)):
+        _insert_usage_snapshot(
+            stats_conn,
+            captured_at=_AC_CLAUDE_WEEK_START + dt.timedelta(hours=hours),
+            week_start=_AC_CLAUDE_WEEK_START, week_end=_AC_CLAUDE_WEEK_END,
+            pct=pct,
+        )
+    _insert_usage_snapshot(
+        stats_conn,
+        captured_at=as_of - dt.timedelta(seconds=600),
+        week_start=_AC_CLAUDE_WEEK_START, week_end=_AC_CLAUDE_WEEK_END,
+        pct=34.0,
+    )
+
+    next_off = 0
+    # OUT OF RANGE, before the week: proves the lower bound is applied at all.
+    next_off = _seed_session(
+        cache_conn,
+        session_id="allcomb-claude-before-week-0000-0000-0000",
+        project_path="/fake/repos/all-combined-claude",
+        model="claude-sonnet-4-6",
+        entries=[
+            (_AC_CLAUDE_WEEK_START - dt.timedelta(hours=6), 400_000, 60_000, 0, 0),
+        ],
+        line_offset_start=next_off,
+    )
+    # THE PREFIX ROW (spec §6.2). Inside Claude's week, OUTSIDE Codex's cycle.
+    # Applying Codex's bounds to the Claude leg drops it, which is one of the
+    # two directional mutations the oracle has to catch.
+    next_off = _seed_session(
+        cache_conn,
+        session_id="allcomb-claude-prefix-0000-0000-0000-00",
+        project_path="/fake/repos/all-combined-claude",
+        model="claude-sonnet-4-6",
+        entries=[
+            (_AC_CLAUDE_WEEK_START + dt.timedelta(hours=4), 180_000, 26_000, 0, 0),
+        ],
+        line_offset_start=next_off,
+    )
+    # Inside BOTH cycles.
+    _seed_session(
+        cache_conn,
+        session_id="allcomb-claude-overlap-0000-0000-0000-0",
+        project_path="/fake/repos/all-combined-claude",
+        model="claude-sonnet-4-6",
+        entries=[
+            (_AC_CODEX_CYCLE_START + dt.timedelta(hours=6), 90_000, 14_000, 40_000, 25_000),
+            (as_of - dt.timedelta(hours=5), 60_000, 9_000, 0, 30_000),
+        ],
+        line_offset_start=next_off,
+    )
+
+
+def _seed_all_combined_codex(
+    cache_conn: sqlite3.Connection, as_of: dt.datetime,
+) -> None:
+    """Seed Codex's native 7-day cycle, its observation and its spend.
+
+    The weekly observation is captured 3601 seconds before AS_OF — one second
+    past `stale_after_seconds(10_080) == 3600` — with a reset strictly AFTER
+    AS_OF. So the boundary is stale-but-still-future: resolvable, and the spend
+    it bounds is correct.
+    """
+    seed_codex_source_root(
+        cache_conn,
+        source_root_key=_AC_CODEX_ROOT_KEY,
+        canonical_root_path=_AC_CODEX_ROOT_PATH,
+    )
+    conversation_key = f"v1.{_AC_CODEX_ROOT_KEY}.{_AC_CODEX_SESSION_ID}"
+    file_path = f"{_AC_CODEX_ROOT_PATH}/sessions/{_AC_CODEX_SESSION_ID}.jsonl"
+    seed_codex_session_file(
+        cache_conn,
+        path=file_path,
+        last_session_id=_AC_CODEX_SESSION_ID,
+        last_model="gpt-5",
+        source_root_key=_AC_CODEX_ROOT_KEY,
+        last_native_thread_id=_AC_CODEX_SESSION_ID,
+        last_conversation_key=conversation_key,
+    )
+    seed_codex_conversation_thread(
+        cache_conn,
+        conversation_key=conversation_key,
+        source_root_key=_AC_CODEX_ROOT_KEY,
+        native_thread_id=_AC_CODEX_SESSION_ID,
+        source_path=file_path,
+        cwd=_AC_CODEX_CWD,
+    )
+    # (timestamp, input, cached, output, reasoning) — the first row is THE
+    # OUT-OF-CYCLE SENTINEL (spec §6.2): it sits inside Claude's week and
+    # before Codex's cycle start, so applying Claude's bounds to the Codex leg
+    # picks it up. That is the other directional mutation. The two providers'
+    # accounting lives in separate tables, so one row could only ever catch one
+    # direction — hence a provider-specific row for each.
+    rows = (
+        (_AC_CLAUDE_WEEK_START + dt.timedelta(hours=6), 310_000, 120_000, 24_000, 6_000),
+        (_AC_CODEX_CYCLE_START + dt.timedelta(hours=9), 140_000, 55_000, 11_000, 2_500),
+        (as_of - dt.timedelta(hours=3), 95_000, 30_000, 8_000, 1_500),
+    )
+    for line_offset, (ts, inp, cached, out, reasoning) in enumerate(rows):
+        seed_codex_session_entry(
+            cache_conn,
+            source_path=file_path,
+            line_offset=line_offset,
+            timestamp_utc=_iso(ts),
+            session_id=_AC_CODEX_SESSION_ID,
+            model="gpt-5",
+            input_tokens=inp,
+            cached_input_tokens=cached,
+            output_tokens=out,
+            reasoning_output_tokens=reasoning,
+            total_tokens=inp + out,
+            source_root_key=_AC_CODEX_ROOT_KEY,
+            conversation_key=conversation_key,
+        )
+    seed_codex_quota_snapshot(
+        cache_conn,
+        source_root_key=_AC_CODEX_ROOT_KEY,
+        source_path=f"{_AC_CODEX_ROOT_PATH}/sessions/weekly-quota.jsonl",
+        line_offset=0,
+        captured_at_utc=_iso(as_of - dt.timedelta(seconds=3601)),
+        logical_limit_key="fixture-all-combined-weekly",
+        window_minutes=10_080,
+        used_percent=41.0,
+        resets_at_utc=_iso(_AC_CODEX_RESETS_AT),
+        limit_name="Fixture weekly quota",
+    )
+    bump_codex_physical_mutation_seq(cache_conn)
+
+
+def _reconcile_fixture_quota_projection(
+    app_dir: Path, *, root_key: str, now: dt.datetime,
+) -> None:
+    """Run the real quota projector against one scenario's databases.
+
+    Without this the source adapter finds no `quota_projection_state` row,
+    `codex_projection_coherence` returns `missing_projection_state`, and the
+    Codex hero publishes as `codex_projection_incoherent` — which is what every
+    pre-existing Codex dashboard fixture does, and which would withhold the
+    very combined figure this scenario exists to pin.
+
+    The projector reads its databases through the process-wide path constants,
+    so pin `CCTALLY_DATA_DIR` and re-run `_init_paths_from_env` before calling
+    it. This mirrors `bin/build-bench-fixtures.py::_pin_env`; the re-init is
+    what lets a second scenario in the same process target its own directory.
+
+    The pin is UNDONE on the way out. The path constants are process-wide, so
+    leaving `CCTALLY_DATA_DIR` pointed at this scenario would make any later
+    builder that reaches the real modules write into the wrong directory. That
+    is latent rather than live only because the two scenarios that call this
+    are currently last in `SCENARIOS`, which is not a property a builder added
+    later can rely on.
+    """
+    import importlib.util
+
+    previous_data_dir = os.environ.get("CCTALLY_DATA_DIR")
+    os.environ["CCTALLY_DATA_DIR"] = str(app_dir)
+    os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    bin_dir = str(Path(__file__).resolve().parent)
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    if "cctally" not in sys.modules:
+        spec = importlib.util.spec_from_loader(
+            "cctally",
+            importlib.machinery.SourceFileLoader("cctally", str(Path(bin_dir) / "cctally")),
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["cctally"] = module
+        spec.loader.exec_module(module)
+    import _cctally_core
+    import _cctally_quota
+
+    _cctally_core._init_paths_from_env()
+    try:
+        _cctally_quota.reconcile_codex_quota_projection(
+            source_root_keys=(root_key,), now=now,
+        )
+    finally:
+        _pin_reconcile_nondeterminism(app_dir)
+        _prune_reconcile_side_artifacts(app_dir)
+        if previous_data_dir is None:
+            os.environ.pop("CCTALLY_DATA_DIR", None)
+        else:
+            os.environ["CCTALLY_DATA_DIR"] = previous_data_dir
+        _cctally_core._init_paths_from_env()
+
+
+# One literal in place of the projector's per-pass random token. The token is a
+# "which pass stamped this row" marker used only to orphan rows the CURRENT
+# pass did not re-stamp; nothing cross-checks it against a stats-global value,
+# and `codex_stats_digest` does not select it. Pinning it therefore changes no
+# behaviour and makes the committed fixture reproducible.
+_FIXTURE_QUOTA_GENERATION = "fixturegenerationfixturegeneration00"
+
+
+def _pin_reconcile_nondeterminism(app_dir: Path) -> None:
+    """Replace the two values a real projector pass cannot repeat.
+
+    `tests/test_fixture_builder_contract.py` requires the committed tree to be
+    exactly what the builder produces AND the builder to produce the same tree
+    twice. A real pass writes `secrets.token_hex(16)` into every row's
+    `generation` and records the wall-clock-named bootstrap journal segment in
+    `journal_cursor`, so without this the two new scenarios would redden that
+    contract on every run.
+    """
+    conn = sqlite3.connect(app_dir / "stats.db")
+    try:
+        for table in (
+            "quota_projection_state", "quota_window_blocks",
+            "quota_percent_milestones", "quota_threshold_events",
+        ):
+            try:
+                conn.execute(
+                    f"UPDATE {table} SET generation = ? "
+                    "WHERE generation IS NOT NULL",
+                    (_FIXTURE_QUOTA_GENERATION,),
+                )
+            except sqlite3.OperationalError:
+                continue
+        try:
+            # The segment it names is deleted below with the rest of the
+            # journal, so an empty cursor is the honest state, not a loss.
+            conn.execute("DELETE FROM journal_cursor")
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+# Everything a projector pass mints beside the two databases, enumerated.
+# Opening the real databases writes an append-only journal directory, a log
+# directory, several flock files and a `config.json`. Those are runtime state,
+# not fixture input, and the journal's bootstrap file carries a wall-clock
+# name — so a committed copy would differ on every rebuild and a `--out`
+# scratch build would not match the tracked tree.
+_RECONCILE_KEEP: frozenset[str] = frozenset({"stats.db", "cache.db"})
+#
+# `cache.db-wal` / `cache.db-shm` appear only from the SECOND scenario onward in
+# one builder process, because the previous scenario's registered cache
+# connection is still open when the next scenario opens its own file. Removing
+# them is what the previous delete-by-exclusion rule already did, and the built
+# tree is byte-identical either way, because the projector writes only to
+# stats.db — the cache WAL it leaves behind carries no frames of its own.
+# `_drain_cache_wal` below ENFORCES that last clause rather than trusting it:
+# unlinking a WAL that does hold frames discards committed rows silently.
+_RECONCILE_SIDE_ARTIFACTS: frozenset[str] = frozenset({
+    "cache.db-shm",
+    "cache.db-wal",
+    "config.json",
+    "config.json.lock",
+    "journal",
+    "journal.ingest.lock",
+    "journal.lock",
+    "logs",
+    "stats.db.maintenance.lock",
+})
+
+
+def _drain_cache_wal(app_dir: Path) -> None:
+    """Fold any cache WAL frames into `cache.db` before the WAL is unlinked.
+
+    The prune list deletes `cache.db-wal` while a registered cache connection
+    from the projector pass is still open, which is safe only because that pass
+    writes to stats.db and leaves the cache WAL frameless. Nothing checked it.
+    A `TRUNCATE` checkpoint makes the claim true instead of assumed: frames are
+    written into the main database first, and a non-zero count is REPORTED
+    rather than deleted, because a WAL that holds committed rows means the
+    committed fixture is missing them.
+    """
+    if not (app_dir / "cache.db-wal").exists():
+        return
+    conn = sqlite3.connect(app_dir / "cache.db")
+    try:
+        busy, frames, _checkpointed = conn.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+    finally:
+        conn.close()
+    if busy or frames:
+        raise RuntimeError(
+            f"{app_dir / 'cache.db-wal'} holds {frames} frame(s) "
+            f"(busy={busy}) at prune time. The prune list assumes the cache WAL "
+            "is empty because the projector writes only stats.db; that no "
+            "longer holds, so pruning here would discard committed rows."
+        )
+
+
+def _prune_reconcile_side_artifacts(app_dir: Path) -> None:
+    """Remove the enumerated side artifacts, and refuse anything unexpected.
+
+    This asserts the expected set rather than deleting by exclusion. A
+    delete-everything-but-two-names rule silently destroys whatever a future
+    scenario legitimately places in the app dir, and it would do so most
+    readily on exactly the mistake it is easiest to make — pointing this
+    function at the wrong directory.
+    """
+    import shutil
+
+    _drain_cache_wal(app_dir)
+    unexpected = sorted(
+        child.name for child in app_dir.iterdir()
+        if child.name not in _RECONCILE_KEEP
+        and child.name not in _RECONCILE_SIDE_ARTIFACTS
+    )
+    if unexpected:
+        raise RuntimeError(
+            f"unexpected entries in {app_dir}: {', '.join(unexpected)}. "
+            "Add each to _RECONCILE_SIDE_ARTIFACTS if a projector pass really "
+            "mints it; otherwise this function is pointed at the wrong "
+            "directory."
+        )
+    for name in sorted(_RECONCILE_SIDE_ARTIFACTS):
+        child = app_dir / name
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+
+def build_all_combined(as_of: dt.datetime) -> None:
+    """Both providers populated, undecorated, both cycles resolvable.
+
+    This is the state the issue is about: two percent clocks stale (Claude's
+    90-second bound and Codex's 3600-second one), both cycles resolvable, and
+    the combined figure published unqualified with each leg naming its own
+    cycle. It is also the only state in which spec §4.7's Forecast
+    reason-string change is observable.
+    """
+    scenario_dir, app_dir = _scenario_dirs("all-combined")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        _seed_all_combined_claude(stats_conn, cache_conn, as_of)
+        _seed_all_combined_codex(cache_conn, as_of)
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+    _reconcile_fixture_quota_projection(
+        app_dir, root_key=_AC_CODEX_ROOT_KEY, now=as_of,
+    )
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
+def build_all_combined_decorated(as_of: dt.datetime) -> None:
+    """The same install with TWO real Claude accounts.
+
+    Spec §3.2 withholds the combined figure under decoration rather than
+    publishing one it cannot make checkable, so the withholding path and its
+    named reason need a golden of their own.
+    """
+    scenario_dir, app_dir = _scenario_dirs("all-combined-decorated")
+    stats_path = app_dir / "stats.db"
+    cache_path = app_dir / "cache.db"
+    create_stats_db(stats_path)
+    create_cache_db(cache_path)
+    stats_conn = sqlite3.connect(stats_path)
+    cache_conn = sqlite3.connect(cache_path)
+    try:
+        _seed_all_combined_claude(stats_conn, cache_conn, as_of)
+        _seed_all_combined_codex(cache_conn, as_of)
+        for key, natural, email, label, plan in (
+            ("a" * 32, "uuid-allcomb-work", "work@example.com", "work", "max"),
+            ("b" * 32, "uuid-allcomb-home", "home@example.com", "home", "pro"),
+        ):
+            seed_account(
+                stats_conn,
+                account_key=key,
+                provider="claude",
+                natural_id=natural,
+                email=email,
+                label=label,
+                plan_type=plan,
+                label_source="user",
+                first_seen_utc=_iso(_AC_CLAUDE_WEEK_START),
+                last_seen_utc=_iso(as_of),
+            )
+        _stamp_and_verify(stats_conn)
+        stats_conn.commit()
+        cache_conn.commit()
+    finally:
+        stats_conn.close()
+        cache_conn.close()
+    _reconcile_fixture_quota_projection(
+        app_dir, root_key=_AC_CODEX_ROOT_KEY, now=as_of,
+    )
+    (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+
+
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "ok": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
@@ -1686,6 +2120,14 @@ SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {
     "cache-report-qa": (
         dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         build_cache_report_qa,
+    ),
+    "all-combined": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_all_combined,
+    ),
+    "all-combined-decorated": (
+        dt.datetime(2026, 4, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
+        build_all_combined_decorated,
     ),
 }
 

@@ -1261,6 +1261,24 @@ def _codex_cache_report_wire(
     )
 
 
+#: Per-file terminal thread aliases, joined to their first accounting entry.
+#: The ``(source_root_key, source_path)`` join predicate needs the composite
+#: ``idx_codex_entries_root_path`` to stay linear: a single-column root index
+#: cannot discriminate when every rollout resolves to one provider root, so the
+#: join degenerates to files x entries. Module-level so the query-plan
+#: regression asserts THIS text rather than a copy that can drift from it.
+_CODEX_FILE_ALIAS_SQL = (
+    "SELECT f.source_root_key, f.path, f.last_native_thread_id, "
+    "f.last_session_id, MIN(e.timestamp_utc) "
+    "FROM codex_session_files AS f "
+    "LEFT JOIN codex_session_entries AS e "
+    "ON e.source_root_key=f.source_root_key AND e.source_path=f.path "
+    "WHERE f.last_native_thread_id IS NOT NULL AND f.last_native_thread_id != '' "
+    "GROUP BY f.source_root_key, f.path, f.last_native_thread_id, f.last_session_id "
+    "ORDER BY f.last_ingested_at DESC, f.path DESC"
+)
+
+
 def _codex_conversation_metadata(
     cache_conn: sqlite3.Connection,
 ) -> dict[tuple[str, str], dict[str, object]]:
@@ -1302,16 +1320,7 @@ def _codex_conversation_metadata(
                 cwd, git_json, first_seen_at, _last_seen_at,
             ) in core_rows
         )
-        file_aliases = tuple(cache_conn.execute(
-            "SELECT f.source_root_key, f.path, f.last_native_thread_id, "
-            "f.last_session_id, MIN(e.timestamp_utc) "
-            "FROM codex_session_files AS f "
-            "LEFT JOIN codex_session_entries AS e "
-            "ON e.source_root_key=f.source_root_key AND e.source_path=f.path "
-            "WHERE f.last_native_thread_id IS NOT NULL AND f.last_native_thread_id != '' "
-            "GROUP BY f.source_root_key, f.path, f.last_native_thread_id, f.last_session_id "
-            "ORDER BY f.last_ingested_at DESC, f.path DESC"
-        ))
+        file_aliases = tuple(cache_conn.execute(_CODEX_FILE_ALIAS_SQL))
         native_ids = tuple(sorted({
             str(native_thread_id) for _, _, native_thread_id, *_ in rows
             if isinstance(native_thread_id, str) and native_thread_id
@@ -2393,6 +2402,11 @@ def refresh_codex_source_clock(
                 "hero",
             ),)
             availability = "partial"
+            # #556 S1 §4.1: an EXPIRED boundary is exactly the state the
+            # accounting axis reports as stale. Build time can never see it
+            # (`_resolve_codex_weekly_cycle` retains only `resets_at > now`),
+            # so this clock is the only writer of that value.
+            domain_freshness["hero"] = "stale"
             cycle_changed = True
         # 3. budget last
         if refreshed_budget is not None:
@@ -2411,6 +2425,10 @@ def refresh_codex_source_clock(
         data=data,
         domain_freshness=domain_freshness,
         clock_data=state.clock_data,
+        # #556 S1 §3.8: this constructor lists every field explicitly, so an
+        # omission silently drops the authoritative account count and makes the
+        # combined figure fail closed on an idle tick that changed nothing else.
+        account_scope=state.account_scope,
         private_session_labels=state.private_session_labels,
     )
     return state if refreshed_state == state else refreshed_state
@@ -3408,7 +3426,6 @@ def build_codex_source_state(
             cache_conn=context.cache_conn,
         )
     budget_entries = _codex_entries_from_accounting(accounting_entries)
-    cycle_reason: str | None = None
     cycles_all: list[CodexCycleBoundary] = []
     try:
         # Per-account list (#341 Task 2). ``cycles_all`` drives the per-account
@@ -3419,9 +3436,12 @@ def build_codex_source_state(
         # `conflicting`.
         cycles_all = _resolve_codex_weekly_cycle(quota_observations, context.now_utc)
         cycle = cycles_all[0] if cycles_all else None
-    except CodexCycleUnavailable as exc:
+    except CodexCycleUnavailable:
+        # #556 S1 §4.1: the reason no longer moves a freshness axis. A
+        # `stale` reason is observation AGE, which `quota` owns; every reason
+        # here leaves `cycle` unresolved, which `cycle_failure` below turns
+        # into the hero failure the accounting axis actually reports.
         cycle = None
-        cycle_reason = exc.reason
     cycle_failure = cycle is None and has_cached_codex_accounting_entries(
         cache_conn=context.cache_conn,
     )
@@ -3826,16 +3846,17 @@ def build_codex_source_state(
                if ingest_backlog is not None else {}),
         },
         domain_freshness={
-            "hero": (
-                "stale"
-                if cycle_reason == "stale"
-                or (
-                    cycle is not None
-                    and not hero_failure
-                    and cycle.evidence_stale
-                )
-                else "fresh"
-            ),
+            # #556 S1 §4.1: `hero` means current-cycle ACCOUNTING
+            # resolvability, not observation age. A stale-but-still-future
+            # boundary stays RESOLVED — the spend it bounds is correct, and
+            # Codex has no background quota poll, so `stale_after_seconds`
+            # (3600) makes an idle weekly observation stale within the hour
+            # while nothing about the accounting changed. The percent age is
+            # already carried by `quota` below and by the additive hero-local
+            # `cycle_freshness` field. `_resolve_codex_weekly_cycle` retains
+            # only boundaries with `resets_at > now`, so a resolved cycle is
+            # never expired at build time; the idle clock owns expiry.
+            "hero": "stale" if hero_failure else "fresh",
             "quota": (
                 "stale"
                 if quota["summary"]["freshness"] == "stale"

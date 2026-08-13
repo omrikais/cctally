@@ -228,6 +228,21 @@ def _doctor_check(payload: dict, check_id: str) -> dict:
     raise AssertionError(f"missing doctor check {check_id}")
 
 
+def _irrelevant_obs(percent: float) -> dict:
+    return journal.make_obs(
+        at=AT,
+        src="record-usage",
+        provider="claude",
+        account="acct-a",
+        payload={
+            "captured_at": AT,
+            "source": "statusline",
+            "weekly_percent": percent,
+            "resets_at": 1785196800,
+        },
+    )
+
+
 def _await_marker(
     marker: pathlib.Path,
     process: subprocess.Popen,
@@ -279,6 +294,145 @@ def test_preview_lists_exact_violation_without_persistent_writes(tmp_path):
     assert payload["auditId"] is None
     assert payload["rebuild"] is None
     assert _tree(app_dir) == before
+
+
+def test_doctor_repair_and_rebuild_share_sequence_bearing_fingerprints(
+    tmp_path,
+):
+    """Irrelevant observations must consume positions without being retained.
+
+    The three violation kinds below embed selector sequence numbers in their
+    evidence.  Repair and rebuild already use the physical decoded-line
+    positions; deep doctor historically dropped observations and renumbered
+    the same records.  A real resolution op makes that drift fail closed as an
+    unknown durable fingerprint instead of merely changing display output.
+    """
+    app_dir = tmp_path / "data"
+    journal_dir = app_dir / "journal"
+    journal_dir.mkdir(parents=True)
+    segment_a = journal_dir / "observations-2026-05.jsonl"
+    segment_b = journal_dir / "observations-2026-06.jsonl"
+    segment_c = journal_dir / "observations-2026-07.jsonl"
+
+    records_a = [
+        *(_irrelevant_obs(1.0 + index / 1_000) for index in range(300)),
+        *_invalid_batch("commit_without_begin", index=1),
+        *(_irrelevant_obs(2.0 + index / 1_000) for index in range(200)),
+    ]
+    records_b = [
+        *_invalid_batch("marker_manifest_mismatch", index=2),
+        *(_irrelevant_obs(3.0 + index / 1_000) for index in range(250)),
+        *_invalid_batch("record_order_violation", index=3),
+    ]
+    segment_a.write_bytes(
+        b"".join(journal.encode_line(record) for record in records_a)
+    )
+    segment_b.write_bytes(
+        b"".join(journal.encode_line(record) for record in records_b)
+    )
+
+    pre_audit_records = [*records_a, *records_b]
+    selection = journal.resolve_effective_events(pre_audit_records)
+    by_kind = {item.kind: item for item in selection.protocol_violations}
+    assert set(by_kind) == {
+        "commit_without_begin",
+        "marker_manifest_mismatch",
+        "record_order_violation",
+    }
+    reviewed_high_water = (segment_b.name, segment_b.stat().st_size)
+    reviewed_hash = S5._prefix_digest(journal_dir, reviewed_high_water)
+    audit = journal.make_protocol_resolution(
+        at=AT,
+        violations=[by_kind["commit_without_begin"]],
+        journal_high_water=reviewed_high_water,
+        journal_prefix_hash=reviewed_hash,
+    )
+    segment_c.write_bytes(
+        b"".join(
+            journal.encode_line(record)
+            for record in [
+                audit,
+                *(
+                    _irrelevant_obs(4.0 + index / 1_000)
+                    for index in range(150)
+                ),
+            ]
+        )
+    )
+
+    before_preview = _tree(app_dir)
+    preview = _run(app_dir, "--json")
+    assert preview.returncode == 0, preview.stderr
+    assert _tree(app_dir) == before_preview
+    preview_payload = json.loads(preview.stdout)
+
+    rebuilt = _run_cli(app_dir, "db", "rebuild", "--db", "stats", "--json")
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    rebuild_payload = json.loads(rebuilt.stdout)
+
+    before_doctor = _tree(app_dir)
+    doctor = _run_cli(app_dir, "doctor", "--json")
+    assert doctor.returncode == 2
+    assert _tree(app_dir) == before_doctor
+    doctor_leg = _doctor_check(json.loads(doctor.stdout), "journal.protocol")
+
+    expected_unacknowledged = preview_payload["unacknowledgedViolations"]
+    expected_acknowledged = preview_payload["acknowledgedViolations"]
+    assert {
+        item["kind"] for item in expected_unacknowledged
+    } == {"marker_manifest_mismatch", "record_order_violation"}
+    assert [item["kind"] for item in expected_acknowledged] == [
+        "commit_without_begin"
+    ]
+    assert rebuild_payload["journalProtocolViolations"] == (
+        expected_unacknowledged
+    )
+    assert rebuild_payload["journalAcknowledgedProtocolViolations"] == (
+        expected_acknowledged
+    )
+    assert doctor_leg["details"]["violations"] == expected_unacknowledged
+    assert doctor_leg["details"]["acknowledgedViolations"] == (
+        expected_acknowledged
+    )
+
+    apply_args = [
+        token
+        for item in expected_unacknowledged
+        for token in ("--violation", item["fingerprint"])
+    ]
+    applied = _run(app_dir, *apply_args, "--yes", "--json")
+    assert applied.returncode == 0, applied.stderr
+    applied_payload = json.loads(applied.stdout)
+    assert applied_payload["status"] == "applied"
+    assert applied_payload["selectedViolations"] == expected_unacknowledged
+    assert applied_payload["unacknowledgedViolations"] == []
+    assert applied_payload["rebuild"]["journalProtocolViolations"] == []
+
+    after_doctor = _run_cli(app_dir, "doctor", "--json")
+    after_leg = _doctor_check(json.loads(after_doctor.stdout), "journal.protocol")
+    assert after_leg["severity"] == "warn"
+    assert after_leg["details"]["violations"] == []
+
+    after_rebuild = _run_cli(
+        app_dir, "db", "rebuild", "--db", "stats", "--json"
+    )
+    assert after_rebuild.returncode == 0, after_rebuild.stderr
+    after_rebuild_payload = json.loads(after_rebuild.stdout)
+    assert after_rebuild_payload["journalProtocolViolations"] == []
+    expected_fingerprints = {
+        item["fingerprint"]
+        for item in [*expected_acknowledged, *expected_unacknowledged]
+    }
+    assert {
+        item["fingerprint"]
+        for item in after_leg["details"]["acknowledgedViolations"]
+    } == expected_fingerprints
+    assert {
+        item["fingerprint"]
+        for item in after_rebuild_payload[
+            "journalAcknowledgedProtocolViolations"
+        ]
+    } == expected_fingerprints
 
 
 def test_exact_audit_acknowledges_violation_without_untainting_batch():
@@ -1754,18 +1908,23 @@ def test_a_cutover_op_in_the_prefix_resolves_the_same_legacy_account(
         payload={"captured_at": "2026-07-27T05:30:00Z", "source": "statusline",
                  "weekly_percent": 5.0},
     )
+    legacy_event = _valid_base_event()
+    legacy_event["payload"].pop("account_key", None)
     with open(_cctally_core.JOURNAL_DIR / S5.SEG_C, "ab") as handle:
         handle.write(journal.encode_line(cutover))
         handle.write(journal.encode_line(legacy))
+        handle.write(journal.encode_line(legacy_event))
 
     assert jr.resolve_cutover_claude_account() == "acct-legacy-claude"
     records, _evidence, _hash, _ends = repair._read_prefix(
         repair._read_only_high_water())
+    assert records[-2] is None
     stamped = [
-        record for record in records if record.get("id") == legacy["id"]
+        record for record in records
+        if record is not None and record.get("id") == legacy_event["id"]
     ]
     assert len(stamped) == 1
-    assert stamped[0]["account"] == "acct-legacy-claude"
+    assert stamped[0]["payload"]["account_key"] == "acct-legacy-claude"
 
 
 def test_the_recovery_coordinate_costs_no_further_traversal(s5_repair):

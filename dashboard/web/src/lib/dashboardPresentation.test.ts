@@ -186,6 +186,28 @@ describe('provider-neutral dashboard presentation adapters', () => {
     });
   });
 
+  it('names QUOTA, not hero, when a Claude percent observation goes stale', () => {
+    // #556 S1 §4.7 — a consequence of repointing the axes, taken by S1 because
+    // S1 causes it. `hero` now means current-cycle accounting resolvability and
+    // `quota` means percent-observation age, so the Forecast section still
+    // degrades on the same evidence but names the axis that actually described
+    // it. `freshnessDomains` is `['hero', 'quota']` and `find` returns the
+    // FIRST stale one, so before the repointing this read "Claude hero data is
+    // stale."
+    const env = cloneFixture();
+    env.sources!.claude.domain_freshness = {
+      hero: 'fresh',
+      quota: 'stale',
+      sessions: 'fresh',
+    };
+
+    expect(presentationForecastComposition(env, 'claude').sections[0]).toMatchObject({
+      source: 'claude',
+      status: 'degraded',
+      reason: 'Claude quota data is stale.',
+    });
+  });
+
   it('keeps the accounting-backed Cache report available when Sessions is fresh', () => {
     const env = cloneFixture();
     env.sources!.codex.data!.cache_report = structuredClone(env.cache_report!);

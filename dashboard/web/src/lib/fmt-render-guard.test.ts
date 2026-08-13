@@ -28,7 +28,12 @@ const GUARDED_FILES = [
 //   - formatHHMMSS( — HeroStrip's visible "as of HH:MM:SS" body stamp, a
 //     deliberately host-local CLOCK freshness reading (C5, out of SH-1 scope
 //     per the spec), NOT a calendar-date / instant render.
-const SKIP = /(?:data-|key=|aria-|===|!==|Date\.parse|new Date\(|getState\(|formatHHMMSS\(|fmt\.)/;
+//   - remainingSeconds( — HeroStrip's instant-to-DURATION helper. It consumes
+//     an `*_at` bound and returns a number of seconds; what reaches the screen
+//     is `fmt.ddhh` of that number, never the instant. These lines carried
+//     `Date.parse` inline until the parse moved into the shared helper, which
+//     is the only reason they were skipped before.
+const SKIP = /(?:data-|key=|aria-|===|!==|Date\.parse|new Date\(|getState\(|formatHHMMSS\(|remainingSeconds\(|fmt\.)/;
 
 // Raw datetime render/assignment: an *_utc / *_at member, or a `.date`
 // member (incl. `.date.slice(...)`), used as a value.

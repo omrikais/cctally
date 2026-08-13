@@ -156,13 +156,39 @@ def _without_cache_report(state: dict) -> dict:
                      if key != "cache_report"}}
 
 
+# #556 S1 §4.1 repointed `domain_freshness.hero` from percent-observation age
+# to current-cycle ACCOUNTING resolvability. This fixture's Codex hero cannot
+# resolve a cycle, so the axis reads `stale` where the pre-change oracle
+# recorded `fresh`.
+#
+# Regenerating the oracle is NOT the fix, for exactly the reason stated in
+# `_without_cache_report`: it was captured with `bin/` reverted to before the
+# ingest-backlog change, and that provenance is the only reason it can falsify
+# anything. This carve-out is one named leaf with an asserted expected value,
+# so it cannot mask a second axis moving.
+_REPOINTED_HERO_AXIS = "stale"
+
+
+def _with_repointed_hero_axis(state: dict) -> dict:
+    return {
+        **state,
+        "domain_freshness": {
+            **state["domain_freshness"], "hero": _REPOINTED_HERO_AXIS,
+        },
+    }
+
+
 def test_a_store_with_no_backlog_matches_the_pre_change_oracle(codex_state):
     """The byte-identity claim, against a snapshot taken before the field."""
     _ns, _cache, build = codex_state
-    oracle = json.loads(ORACLE.read_text())
-    assert _without_cache_report(build()) == _without_cache_report(oracle)
+    oracle = _with_repointed_hero_axis(json.loads(ORACLE.read_text()))
+    built = build()
+    # The repointing carve-out is CHECKED, not assumed: the built state must
+    # actually carry the new value, so a third axis moving still reddens.
+    assert built["domain_freshness"]["hero"] == _REPOINTED_HERO_AXIS
+    assert _without_cache_report(built) == _without_cache_report(oracle)
     # The carve-out is scoped to one subtree, not to the field's own claim.
-    assert "ingest_backlog" not in build()["data"]
+    assert "ingest_backlog" not in built["data"]
 
 
 def test_a_backlog_adds_exactly_one_subtree_and_nothing_else(codex_state):
@@ -173,7 +199,7 @@ def test_a_backlog_adds_exactly_one_subtree_and_nothing_else(codex_state):
     is that no shared signal has to degrade for it.
     """
     _ns, cache, build = codex_state
-    oracle = json.loads(ORACLE.read_text())
+    oracle = _with_repointed_hero_axis(json.loads(ORACLE.read_text()))
     _set_backlog(cache, {
         "files": 4, "bytes": 8192, "since": "2026-07-16T09:00:00Z"})
     after = build()

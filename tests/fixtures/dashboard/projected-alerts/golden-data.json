@@ -172,6 +172,7 @@
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
     "spent_usd": 0.63,
+    "total_tokens": 138000,
     "used_pct": 50.0,
     "week_index": [
       {
@@ -185,7 +186,8 @@
         "segment_count": 0,
         "start_at_utc": "2026-04-13T14:00:00Z"
       }
-    ]
+    ],
+    "week_start_at": "2026-04-13T14:00:00Z"
   },
   "daily": {
     "peak": {
@@ -816,7 +818,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 4,
+  "source_schema_version": 5,
   "sources": {
     "all": {
       "availability": "ok",
@@ -897,6 +899,31 @@
         },
         "combined": {
           "cost_usd": 0.63,
+          "legs": {
+            "claude": {
+              "cost_usd": 0.63,
+              "period": {
+                "end_at": "2026-04-20T14:00:00Z",
+                "kind": "subscription_week",
+                "label": "Claude subscription week",
+                "start_at": "2026-04-13T14:00:00Z"
+              },
+              "state": "current",
+              "total_tokens": 138000
+            },
+            "codex": {
+              "cost_usd": 0.0,
+              "state": "empty",
+              "total_tokens": 0
+            }
+          },
+          "qualifications": [
+            {
+              "code": "provider_empty",
+              "message": "Codex has no accounting in its current cycle.",
+              "provider": "codex"
+            }
+          ],
           "total_tokens": 138000
         },
         "providers": {
@@ -1059,6 +1086,7 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 345600,
                 "spent_usd": 0.63,
+                "total_tokens": 138000,
                 "used_pct": 50.0,
                 "week_index": [
                   {
@@ -1072,7 +1100,8 @@
                     "segment_count": 0,
                     "start_at_utc": "2026-04-13T14:00:00Z"
                   }
-                ]
+                ],
+                "week_start_at": "2026-04-13T14:00:00Z"
               },
               "forecast": {
                 "budget_100_per_day_usd": 0.1575,
@@ -1769,6 +1798,7 @@
                 "reset_at_utc": "2026-04-20T14:00:00Z",
                 "reset_in_sec": 345600,
                 "spent_usd": 0.63,
+                "total_tokens": 138000,
                 "used_pct": 50.0,
                 "week_index": [
                   {
@@ -1782,7 +1812,8 @@
                     "segment_count": 0,
                     "start_at_utc": "2026-04-13T14:00:00Z"
                   }
-                ]
+                ],
+                "week_start_at": "2026-04-13T14:00:00Z"
               },
               "five_hour_milestones": [],
               "milestones": []
@@ -2134,6 +2165,7 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
             "spent_usd": 0.63,
+            "total_tokens": 138000,
             "used_pct": 50.0,
             "week_index": [
               {
@@ -2147,7 +2179,8 @@
                 "segment_count": 0,
                 "start_at_utc": "2026-04-13T14:00:00Z"
               }
-            ]
+            ],
+            "week_start_at": "2026-04-13T14:00:00Z"
           },
           "forecast": {
             "budget_100_per_day_usd": 0.1575,
@@ -2844,6 +2877,7 @@
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
             "spent_usd": 0.63,
+            "total_tokens": 138000,
             "used_pct": 50.0,
             "week_index": [
               {
@@ -2857,7 +2891,8 @@
                 "segment_count": 0,
                 "start_at_utc": "2026-04-13T14:00:00Z"
               }
-            ]
+            ],
+            "week_start_at": "2026-04-13T14:00:00Z"
           },
           "five_hour_milestones": [],
           "milestones": []

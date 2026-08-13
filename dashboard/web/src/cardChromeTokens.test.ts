@@ -136,11 +136,34 @@ describe('#312 mobile source-layout containment', () => {
     expect(mobile).toMatch(/#panel-blocks\.blocks-collapsed:has\(\.blocks-row\)\s*\{(?=[^}]*height:\s*216px)(?=[^}]*max-height:\s*216px)/);
   });
 
-  it('keeps both quota values separated and the three support slots in one shared hero grid', () => {
+  it('keeps both quota values separated and the support slots in one shared hero grid', () => {
     expect(mobile).toMatch(
       /\.hero-usage\s*\{(?=[^}]*grid-template-columns:\s*fit-content\(110px\)\s+minmax\(0,\s*1fr\))(?=[^}]*column-gap:\s*var\(--space-3\))/,
     );
-    expect(mobile).toMatch(/\.hero-support\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    // #556 S1 QA P1 — the support track count FOLLOWS the row count instead of
+    // being the canonical hero's three written into the template. The All
+    // selection supplies two rows, and a fixed three-track grid squeezed each
+    // of its longer labels into a third of the zone.
+    expect(mobile).toMatch(
+      /\.hero-support\s*\{(?=[^}]*grid-auto-flow:\s*column)(?=[^}]*grid-auto-columns:\s*minmax\(0,\s*1fr\))/,
+    );
+    expect(mobile).not.toMatch(/\.hero-support\s*\{[^}]*grid-template-columns:/);
+    // A label that outgrows its cell wraps. It must never keep one line and
+    // paint itself over the next cell's label, which is what `nowrap` with
+    // visible overflow did.
+    expect(mobile).toMatch(/\.hero-support \.sup-l\s*\{[^}]*white-space:\s*normal/);
+    expect(mobile).toMatch(/\.hero-support \.sup-v\s*\{[^}]*white-space:\s*nowrap/);
+  });
+
+  it('stacks the All hero\'s two full-size provider blocks one per row', () => {
+    // #556 S1 QA P0 — the canonical template above sizes ONE primary block
+    // beside one small secondary metric. Two full-size peers do not fit side by
+    // side at phone widths at any credible KPI size, so the second one was
+    // crushed to a fraction of its numeral's width and painted across the zone
+    // border.
+    expect(mobile).toMatch(
+      /\.hero-strip\[data-source="all"\] \.hero-usage\s*\{(?=[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*;)/,
+    );
   });
 
   it('bounds native quota and period bodies with their own mobile vertical scroller', () => {

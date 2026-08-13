@@ -133,7 +133,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 4,
+  "source_schema_version": 5,
   "sources": {
     "all": {
       "availability": "empty",
@@ -161,6 +161,30 @@
         },
         "combined": {
           "cost_usd": 0.0,
+          "legs": {
+            "claude": {
+              "cost_usd": 0.0,
+              "state": "empty",
+              "total_tokens": 0
+            },
+            "codex": {
+              "cost_usd": 0.0,
+              "state": "empty",
+              "total_tokens": 0
+            }
+          },
+          "qualifications": [
+            {
+              "code": "provider_empty",
+              "message": "Claude has no accounting in its current cycle.",
+              "provider": "claude"
+            },
+            {
+              "code": "provider_empty",
+              "message": "Codex has no accounting in its current cycle.",
+              "provider": "codex"
+            }
+          ],
           "total_tokens": 0
         },
         "providers": {
@@ -194,7 +218,7 @@
               }
             },
             "hero": {
-              "cost_usd": 0.0,
+              "cost_usd": null,
               "current_week": {},
               "forecast": null,
               "header": {
@@ -206,7 +230,7 @@
                 "vs_last_week_delta": null,
                 "week_label": null
               },
-              "total_tokens": 0,
+              "total_tokens": null,
               "trend": null
             },
             "periods": {
@@ -381,7 +405,7 @@
       },
       "data_version": "__VER__",
       "domain_freshness": {
-        "hero": "fresh",
+        "hero": "stale",
         "quota": "fresh",
         "sessions": "fresh"
       },
@@ -463,7 +487,7 @@
           }
         },
         "hero": {
-          "cost_usd": 0.0,
+          "cost_usd": null,
           "current_week": {},
           "forecast": null,
           "header": {
@@ -475,7 +499,7 @@
             "vs_last_week_delta": null,
             "week_label": null
           },
-          "total_tokens": 0,
+          "total_tokens": null,
           "trend": null
         },
         "periods": {
@@ -533,7 +557,7 @@
       },
       "data_version": "__VER__",
       "domain_freshness": {
-        "hero": "fresh",
+        "hero": "stale",
         "quota": "fresh",
         "sessions": "fresh"
       },

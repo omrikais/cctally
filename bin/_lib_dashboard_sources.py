@@ -36,7 +36,16 @@ CapabilityStatus = Literal[
 # 3 -> 4 (#465): the Codex cache report retired its transitional
 # `cache_hit_percent` alias and changed structurally inapplicable figures from
 # numeric placeholders to null.
-SOURCE_SCHEMA_VERSION = 4
+# 4 -> 5 (#556 S1): Claude's `hero.cost_usd` / `hero.total_tokens` changed
+# MEANING — they were a thirty-day accounting rollup and are now current-cycle
+# actuals, matching what the same-named Codex fields have always meant. The All
+# source's `data.combined` also gained a required `legs` object and the optional
+# `qualifications` / `combined_unavailable` companions, which supersedes normal-
+# payload byte identity for this version (spec §3.5). No client branches on this
+# number; after an in-place `execvp` update a still-loaded old client renders the
+# new figure under old copy until it reloads, and that one-reconnect transient is
+# accepted, consistent with the 2 -> 3 precedent above.
+SOURCE_SCHEMA_VERSION = 5
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -133,6 +142,20 @@ class SourceDashboardState:
     # They are deliberately separate from ``data`` so no internal accounting
     # evidence becomes part of the public source-envelope contract.
     clock_data: Mapping[str, object] | None = None
+    # #556 S1 §3.8 — the provider's authoritative REAL account count, resolved
+    # by the builder and carried here so `compose_all_state` can apply the
+    # single-account gate. Server-only, in the same class as `clock_data`:
+    # deliberately outside `data`, so no account cardinality enters the public
+    # source envelope. Shape: ``{"real_account_count": int}``.
+    #
+    # ``None`` means UNRESOLVED and must fail closed (withhold the combined
+    # figure), never "undecorated". Inferring decoration from the published
+    # `data.accounts` is forbidden for exactly this reason: both physical
+    # builders swallow a decoration-read failure and fall back to the
+    # undecorated shape, so a two-account install whose account read failed
+    # would present as single-account and publish the one number §3.2 forbids,
+    # on precisely the install where it is wrong.
+    account_scope: Mapping[str, object] | None = None
     # Request-gated transcript content. This mapping is frozen with the source
     # generation but is deliberately outside ``data``: source serialization
     # publishes only ``data``, then the HTTP/SSE envelope layer injects a label
@@ -181,6 +204,8 @@ class SourceDashboardState:
             object.__setattr__(self, "data", _freeze(self.data))
         if self.clock_data is not None:
             object.__setattr__(self, "clock_data", _freeze(self.clock_data))
+        if self.account_scope is not None:
+            object.__setattr__(self, "account_scope", _freeze(self.account_scope))
         if self.private_session_labels is not None:
             private_session_labels = {
                 _nonempty_string(key, "private session label key"):
@@ -295,6 +320,10 @@ def degrade_source_state(
             domain: "stale" for domain in SOURCE_FRESHNESS_DOMAINS
         },
         clock_data=prior.clock_data,
+        # #556 S1 §3.8: a degraded generation must not LOSE the count. Dropping
+        # it here would turn a transient provider failure into
+        # `account_scope_unresolved` on an install whose count read fine.
+        account_scope=prior.account_scope,
         private_session_labels=prior.private_session_labels,
     )
 
@@ -365,67 +394,332 @@ def reuse_coherent_source_state(
     return prior if _coherent_provider(prior) and prior.data_version == data_version else None
 
 
-def _hero_cycle_is_stale(state: SourceDashboardState) -> bool:
-    """Whether a provider's hero is bounded by STALE quota evidence (#350 §3.4).
+# === #556 S1 — the typed combined outcome (spec §3.5, §3.7) =================
+#
+# `combined` is the sum, over both providers, of that provider's accounting
+# actuals within its OWN current cycle: Claude's subscription week and Codex's
+# native 7-day cycle. The two legs are deliberately not one shared range — the
+# property bought is that each leg reconciles with its provider tab, and each
+# leg therefore names the cycle it covers.
 
-    ``hero.cycle_freshness`` is additive and OMITTED while the cycle is fresh, so
-    this is false for every provider and every generation that predates #350.
-    """
-    if source_domain_freshness(state, "hero") == "stale":
-        return True
-    if not isinstance(state.data, Mapping):
-        return False
-    hero = state.data.get("hero")
-    return isinstance(hero, Mapping) and hero.get("cycle_freshness") == "stale"
-
-
-def _stale_cycle_providers(
-    claude: SourceDashboardState,
-    codex: SourceDashboardState,
-) -> tuple[str, ...]:
-    return tuple(
-        label for label, state in (("Claude", claude), ("Codex", codex))
-        if _hero_cycle_is_stale(state)
-    )
+_PROVIDER_LABELS: Mapping[str, str] = MappingProxyType(
+    {"claude": "Claude", "codex": "Codex"},
+)
+_LEG_PERIOD_KINDS: Mapping[str, tuple[str, str, str, str]] = MappingProxyType({
+    # provider -> (kind, label, hero container key, (start key, end key))
+    "claude": ("subscription_week", "Claude subscription week",
+               "current_week", "week_start_at|reset_at_utc"),
+    "codex": ("native_7_day_cycle", "Codex native 7-day cycle",
+              "cycle", "start_at|resets_at"),
+})
 
 
-def _combined_metrics(
-    claude: SourceDashboardState,
-    codex: SourceDashboardState,
-) -> Mapping[str, object] | None:
-    if not (_coherent_provider(claude) and _coherent_provider(codex)):
+@dataclass(frozen=True)
+class _CombinedCause:
+    """One reason the combined figure is withheld, with its precedence rank."""
+
+    precedence: int
+    provider: PhysicalSource
+    code: str
+    detail: Mapping[str, object] | None = None
+
+
+def _cause_message(cause: _CombinedCause) -> str:
+    """Public-safe prose for one cause. Never echoes a rejected value."""
+    provider = _PROVIDER_LABELS.get(cause.provider, cause.provider)
+    detail = cause.detail or {}
+    if cause.code == "provider_incoherent":
+        return (
+            f"{provider} data is not current, so a combined total is withheld."
+        )
+    if cause.code == "account_scope_unresolved":
+        return (
+            f"{provider}'s account count could not be read, so a combined "
+            "total is withheld."
+        )
+    if cause.code == "multi_account_unsupported":
+        count = detail.get("account_count")
+        return (
+            f"{provider} has {count} accounts on separate cycles, so a "
+            "combined total is not published; see the per-account cards."
+        )
+    if cause.code == "claude_cycle_unresolved":
+        return "Claude's current subscription week could not be resolved."
+    if cause.code == "codex_projection_incoherent":
+        return "Codex quota projection is unavailable."
+    if cause.code == "codex_cycle_unavailable":
+        return "Codex native reset cycle is unavailable."
+    if cause.code == "invalid_counter":
+        return (
+            f"{provider} reported an unusable {detail.get('field')} counter "
+            f"({detail.get('reason')})."
+        )
+    return f"{provider} data cannot contribute to a combined total."
+
+
+def _combined_hero(state: SourceDashboardState) -> Mapping[str, object] | None:
+    data = state.data
+    if not isinstance(data, Mapping):
         return None
-    # #359: the hero counters are backward-looking accounting actuals. A stale
-    # but still-live quota boundary pauses projections; it does not invalidate
-    # the retained cost/token sums that each provider already keeps visible.
-    # Composition therefore retains the compatible number and discloses the
-    # stale boundary through All's hero-domain freshness + local warning.
-    for state in (claude, codex):
-        hero_capability = state.capabilities.get("hero")
-        if hero_capability is None or hero_capability.status not in {"supported", "derived"}:
-            return None
+    hero = data.get("hero")
+    return hero if isinstance(hero, Mapping) else None
+
+
+def _real_account_count(state: SourceDashboardState) -> int | None:
+    """The provider's authoritative REAL account count, or ``None``.
+
+    ``None`` is UNRESOLVED and fails closed (§3.8). Decoration is never
+    inferred from published data, because both physical builders swallow a
+    decoration-read failure and fall back to the undecorated shape.
+    """
+    scope = getattr(state, "account_scope", None)
+    if not isinstance(scope, Mapping):
+        return None
+    count = scope.get("real_account_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def _counter_reason(value: object, *, integral: bool) -> str | None:
+    """Return why ``value`` is unusable as a counter, or ``None`` if it is fine.
+
+    Booleans are rejected: ``True`` is an ``int`` in Python, and a flag that
+    leaked into a counter slot would otherwise be summed as 1.
+    """
+    if value is None:
+        return "missing"
+    if isinstance(value, bool):
+        return "non_integer"
+    if integral:
+        if not isinstance(value, int):
+            return "non_integer"
+    else:
+        if not isinstance(value, (int, float)):
+            return "non_integer"
+        if not math.isfinite(value):
+            return "non_finite"
+    return "negative" if value < 0 else None
+
+
+def _period_instant(value: object) -> str | None:
+    """One canonical UTC spelling for a published period bound.
+
+    The two providers reach this with different spellings of the same
+    convention — Claude's bounds arrive from the legacy envelope's `_iso_z`
+    (`...Z`) and Codex's from `datetime.isoformat()` (`...+00:00`). Publishing
+    both would make every client parse two forms of one field for no reason.
+    """
+    if not isinstance(value, str) or not value:
+        return None
     try:
-        claude_hero = claude.data["hero"]
-        codex_hero = codex.data["hero"]
-        if not isinstance(claude_hero, Mapping) or not isinstance(codex_hero, Mapping):
-            return None
-        claude_cost = claude_hero["cost_usd"]
-        codex_cost = codex_hero["cost_usd"]
-        claude_tokens = claude_hero["total_tokens"]
-        codex_tokens = codex_hero["total_tokens"]
-        if (
-            isinstance(claude_cost, bool) or not isinstance(claude_cost, (int, float))
-            or isinstance(codex_cost, bool) or not isinstance(codex_cost, (int, float))
-            or isinstance(claude_tokens, bool) or not isinstance(claude_tokens, int)
-            or isinstance(codex_tokens, bool) or not isinstance(codex_tokens, int)
-        ):
-            return None
-    except (KeyError, TypeError):
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _leg_period(
+    provider: PhysicalSource, hero: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    """The named cycle a `current` leg covers, or ``None`` when unresolvable."""
+    kind, label, container_key, bound_keys = _LEG_PERIOD_KINDS[provider]
+    container = hero.get(container_key) if isinstance(hero, Mapping) else None
+    if not isinstance(container, Mapping):
+        return None
+    start_key, end_key = bound_keys.split("|")
+    start_at = _period_instant(container.get(start_key))
+    end_at = _period_instant(container.get(end_key))
+    if start_at is None or end_at is None:
         return None
     return {
-        "cost_usd": float(claude_cost) + float(codex_cost),
-        "total_tokens": claude_tokens + codex_tokens,
+        "kind": kind, "label": label, "start_at": start_at, "end_at": end_at,
     }
+
+
+_CODEX_HERO_FAILURE_ORDER: tuple[str, ...] = (
+    "codex_projection_incoherent", "codex_cycle_unavailable",
+)
+
+
+def _codex_hero_failure_codes(state: SourceDashboardState) -> tuple[str, ...]:
+    """EVERY Codex hero failure present, in the order §3.7 fixes.
+
+    Codex computes projection coherence and cycle resolution independently and
+    emits BOTH warnings, so §3.5 lists both as causes and §3.7 fixes their
+    order: an incoherent projection certificate invalidates the evidence the
+    cycle resolution rests on, and is therefore the earlier cause. The first
+    element is the winner, so the top-level `code` is unchanged by listing the
+    rest.
+    """
+    codes = {warning.code for warning in state.warnings}
+    found = tuple(code for code in _CODEX_HERO_FAILURE_ORDER if code in codes)
+    if found:
+        return found
+    # No warning names the failure — fall back to the hero capability's own
+    # semantics, which can only describe one of the two.
+    capability = state.capabilities.get("hero")
+    semantics = capability.semantics if capability is not None else None
+    if semantics == "projection-incoherent":
+        return ("codex_projection_incoherent",)
+    return ("codex_cycle_unavailable",)
+
+
+def _combined_leg(
+    state: SourceDashboardState, provider: PhysicalSource,
+) -> tuple[Mapping[str, object] | None, tuple[_CombinedCause, ...]]:
+    """Build one leg, or the causes that stop it contributing.
+
+    A leg is `empty` when the provider reports no accounting AND no cycle:
+    `availability == "empty"` and no period resolves. Both halves are needed.
+    `availability` alone is not the fact, because it is computed over the
+    dashboard's VISIBLE range while Codex's hero is a separate cycle-bounded
+    read — a Codex provider can be `empty` in the visible range while its
+    current cycle holds real spend. An unresolved period alone is not the fact
+    either, because for Claude that is a FAILURE when accounting exists
+    (§3.7, "empty versus unresolved").
+    """
+    hero = _combined_hero(state)
+    capability = state.capabilities.get("hero")
+    if capability is None or capability.status not in {"supported", "derived"}:
+        codes = (
+            _codex_hero_failure_codes(state) if provider == "codex"
+            else ("claude_cycle_unresolved",)
+        )
+        return None, tuple(
+            _CombinedCause(4, provider, code) for code in codes
+        )
+    cost = hero.get("cost_usd") if hero is not None else None
+    tokens = hero.get("total_tokens") if hero is not None else None
+    period = _leg_period(provider, hero)
+    if period is None and state.availability == "empty":
+        # Numeric zeros and no period, so nothing presents `$0` as observed
+        # spend inside a named cycle.
+        return {"state": "empty", "cost_usd": 0.0, "total_tokens": 0}, ()
+    if provider == "claude" and cost is None and tokens is None:
+        # Accounting exists but no subscription week resolved. Claude's hero
+        # capability stays `supported` in that state, so this is its own
+        # detection rather than the capability branch above.
+        return None, (_CombinedCause(4, provider, "claude_cycle_unresolved"),)
+    causes = tuple(
+        _CombinedCause(
+            5, provider, "invalid_counter", {"field": field, "reason": reason},
+        )
+        for field, reason in (
+            ("cost_usd", _counter_reason(cost, integral=False)),
+            ("total_tokens", _counter_reason(tokens, integral=True)),
+        )
+        if reason is not None
+    )
+    if causes:
+        return None, causes
+    return {
+        "state": "current",
+        "cost_usd": float(cost),
+        "total_tokens": int(tokens),
+        **({"period": period} if period is not None else {}),
+    }, ()
+
+
+def _combined_qualifications(
+    legs: Mapping[str, Mapping[str, object]],
+    claude: SourceDashboardState,
+    codex: SourceDashboardState,
+) -> tuple[Mapping[str, object], ...]:
+    """Notes that qualify a PUBLISHED figure (§4.3). Empty means omit the key."""
+    qualifications: list[Mapping[str, object]] = []
+    for provider in ("claude", "codex"):
+        if legs[provider].get("state") == "empty":
+            label = _PROVIDER_LABELS[provider]
+            qualifications.append({
+                "code": "provider_empty",
+                "message": f"{label} has no accounting in its current cycle.",
+                "provider": provider,
+            })
+    # public #5: the Codex ingest backlog is LIFTED here rather than read from
+    # the provider field by the All surfaces, so the figure and its disclosure
+    # cannot disagree. The provider field stays published for the Codex tab.
+    data = codex.data
+    backlog = data.get("ingest_backlog") if isinstance(data, Mapping) else None
+    if isinstance(backlog, Mapping) and backlog:
+        qualifications.append({
+            "code": "codex_ingest_backlog",
+            "message": (
+                "Codex has pending accounting to ingest, so its cycle total "
+                "may be incomplete."
+            ),
+            "provider": "codex",
+        })
+    return tuple(qualifications)
+
+
+def _combined_outcome(
+    claude: SourceDashboardState,
+    codex: SourceDashboardState,
+) -> tuple[Mapping[str, object] | None, Mapping[str, object] | None]:
+    """Return ``(combined, combined_unavailable)`` — exactly one is not None.
+
+    Cause precedence (§3.7), first match wins, Claude before Codex at equal
+    precedence: provider incoherence, unresolved account scope, decoration, a
+    hero capability outside {supported, derived} reported as the provider's own
+    reason, then an invalid counter. Every cause found is listed, ordered so
+    that `causes[0]` is always the winner.
+    """
+    pairs: tuple[tuple[PhysicalSource, SourceDashboardState], ...] = (
+        ("claude", claude), ("codex", codex),
+    )
+    causes: list[_CombinedCause] = []
+    for provider, state in pairs:
+        if not _coherent_provider(state):
+            causes.append(_CombinedCause(1, provider, "provider_incoherent"))
+    for provider, state in pairs:
+        count = _real_account_count(state)
+        if count is None:
+            causes.append(
+                _CombinedCause(2, provider, "account_scope_unresolved"))
+        elif count > 1:
+            causes.append(_CombinedCause(
+                3, provider, "multi_account_unsupported",
+                {"account_count": count},
+            ))
+    legs: dict[str, Mapping[str, object]] = {}
+    for provider, state in pairs:
+        if not _coherent_provider(state):
+            # An incoherent generation's data cannot be trusted to yield a leg
+            # OR a leg-level cause; precedence 1 already withholds the figure.
+            continue
+        leg, leg_causes = _combined_leg(state, provider)
+        causes.extend(leg_causes)
+        if leg is not None:
+            legs[provider] = leg
+    if causes:
+        ordered = sorted(
+            causes,
+            key=lambda cause: (
+                cause.precedence, 0 if cause.provider == "claude" else 1,
+            ),
+        )
+        return None, {
+            "code": ordered[0].code,
+            "message": _cause_message(ordered[0]),
+            "causes": tuple(
+                {
+                    "provider": cause.provider,
+                    "code": cause.code,
+                    **({"detail": cause.detail} if cause.detail else {}),
+                }
+                for cause in ordered
+            ),
+        }
+    qualifications = _combined_qualifications(legs, claude, codex)
+    return {
+        "cost_usd": float(legs["claude"]["cost_usd"]) + float(legs["codex"]["cost_usd"]),
+        "total_tokens": int(legs["claude"]["total_tokens"]) + int(legs["codex"]["total_tokens"]),
+        "legs": legs,
+        **({"qualifications": qualifications} if qualifications else {}),
+    }, None
 
 
 def _combined_alert_rows(
@@ -461,35 +755,18 @@ def compose_all_state(
     """Compose provider-labeled sections without inventing blended semantics."""
     if claude.source != "claude" or codex.source != "codex":
         raise ValueError("all composition requires Claude and Codex provider states")
-    combined = _combined_metrics(claude, codex)
+    combined, combined_unavailable = _combined_outcome(claude, codex)
     providers_coherent = _coherent_provider(claude) and _coherent_provider(codex)
-    stale_cycle_providers = (
-        _stale_cycle_providers(claude, codex) if providers_coherent else ()
-    )
-    # #359: the warning qualifies a retained combined actual. It stays
-    # All-local and keeps the composed source partial so the header status also
-    # names the caveat; provider envelopes remain independently coherent.
-    all_local_warnings: tuple[SourceDashboardWarning, ...] = ()
-    if stale_cycle_providers:
-        all_local_warnings = (SourceDashboardWarning(
-            "combined_totals_stale",
-            f"{' and '.join(stale_cycle_providers)} quota evidence is stale; "
-            "combined totals use retained actuals.",
-            "hero",
-        ),)
     if providers_coherent:
-        if stale_cycle_providers:
-            availability: Availability = "partial"
-        else:
-            availability = (
-                "partial"
-                if combined is None or "partial" in (claude.availability, codex.availability)
-                else (
-                    "empty"
-                    if claude.availability == "empty" and codex.availability == "empty"
-                    else "ok"
-                )
+        availability: Availability = (
+            "partial"
+            if combined is None or "partial" in (claude.availability, codex.availability)
+            else (
+                "empty"
+                if claude.availability == "empty" and codex.availability == "empty"
+                else "ok"
             )
+        )
         freshness: Freshness = "fresh"
     else:
         availability = "partial"
@@ -506,22 +783,33 @@ def compose_all_state(
                 source_domain_freshness(codex, domain)
                 for domain in SOURCE_FRESHNESS_DOMAINS
             ],
-            combined is not None,
+            # #556 S1: the WHOLE outcome, not merely whether one exists. The
+            # legs, their periods, the qualifications and the withheld cause
+            # are all published, and the account scope and hero counters that
+            # produce them are not otherwise in this material — so hashing only
+            # `combined is not None` would leave materially different All
+            # states sharing one `data_version` (invariant 6).
+            combined, combined_unavailable,
         ],
         separators=(",", ":"),
+        sort_keys=True,
     ).encode("utf-8")
     data_version = "all:" + hashlib.sha256(version_material).hexdigest()[:24]
-    successes = (item for item in (claude.last_success_at, codex.last_success_at) if item is not None)
-    last_success_at = min(successes, default=None)
+    successes = (claude.last_success_at, codex.last_success_at)
+    # §4.6: `None` unless BOTH providers have one, otherwise the older.
+    # Filtering `None` before `min` let one provider's success masquerade as
+    # All's while the client keys "no successful snapshot yet" on null.
+    last_success_at = None if None in successes else min(successes)
     return SourceDashboardState(
         source="all",
         availability=availability,
         freshness=freshness,
-        # All-LOCAL warnings lead: `warningForSource` on the client falls back to
-        # the FIRST warning, so a merely-partial provider warning (e.g.
-        # `codex_metadata_incomplete`) would otherwise pre-empt the chip label
-        # and hide the stale qualification on the combined actual.
-        warnings=tuple((*all_local_warnings, *claude.warnings, *codex.warnings)),
+        # §4.2: the All-local `combined_totals_stale` warning is retired. The
+        # combined figure's own disclosure now travels in `data.combined`
+        # (`qualifications`) and `data.combined_unavailable`, which is typed and
+        # has provenance — All flattens both providers' warnings into one tuple
+        # with no provenance field, so warning order could never carry it.
+        warnings=tuple((*claude.warnings, *codex.warnings)),
         data_version=data_version,
         last_success_at=last_success_at,
         capabilities={
@@ -532,6 +820,9 @@ def compose_all_state(
         },
         data={
             "combined": combined,
+            # Emitted iff the figure is withheld; omitted-when-inapplicable.
+            **({"combined_unavailable": combined_unavailable}
+               if combined is None else {}),
             "alerts": {"rows": _combined_alert_rows(claude, codex)},
             "providers": {
                 "claude": claude.data,

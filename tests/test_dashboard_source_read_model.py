@@ -1056,11 +1056,16 @@ def test_stale_weekly_baseline_retains_the_hero_and_stamps_cycle_freshness(
             context, data_version="stale-cycle-v1",
         )
 
-        # Provider metadata remains coherent; the hero/quota axes move.
+        # Provider metadata remains coherent; the QUOTA axis moves.
+        # #556 S1 §4.1 repointed `hero` to current-cycle accounting
+        # resolvability, and this boundary is stale-but-still-FUTURE — the
+        # spend it bounds is correct, so the accounting axis stays fresh. The
+        # observation age it used to report is carried by `quota` and by the
+        # additive hero-local `cycle_freshness` asserted below.
         assert state.availability == "ok"
         assert state.freshness == "fresh"
         assert dict(state.domain_freshness) == {
-            "hero": "stale",
+            "hero": "fresh",
             "quota": "stale",
             "sessions": "fresh",
         }
@@ -1406,7 +1411,11 @@ def test_claude_idle_clock_advances_only_weekly_domain_freshness(monkeypatch):
         data={"hero": {}, "quota": {}, "sessions": {"rows": ()}},
         domain_freshness={"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
     )
-    current_week = SimpleNamespace(latest_snapshot_at=NOW)
+    # #556 S1 §4.1: the clock now advances two axes from different evidence,
+    # so the fixture has to carry the boundary as well as the capture.
+    current_week = SimpleNamespace(
+        latest_snapshot_at=NOW, week_end_at=NOW + dt.timedelta(days=3),
+    )
     monkeypatch.setattr(tui, "_get_oauth_usage_config", lambda _config: {})
     monkeypatch.setattr(
         tui,
@@ -1427,7 +1436,7 @@ def test_claude_idle_clock_advances_only_weekly_domain_freshness(monkeypatch):
     assert same is state
     assert stale.freshness == "fresh"
     assert dict(stale.domain_freshness) == {
-        "hero": "stale",
+        "hero": "fresh",
         "quota": "stale",
         "sessions": "fresh",
     }
@@ -3596,8 +3605,11 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
         }
         assert before_bundle.sources["all"].data["combined"] is not None
         assert before_bundle.sources["all"].warnings == ()
+        # All aggregates both providers with `all(... == "fresh")`. This
+        # fixture seeds no Claude `weekly_usage_snapshots`, so no subscription
+        # week resolves and Claude's accounting axis is stale — All's follows.
         assert dict(before_bundle.sources["all"].domain_freshness) == {
-            "hero": "fresh",
+            "hero": "stale",
             "quota": "stale",
             "sessions": "fresh",
         }
@@ -3629,24 +3641,33 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
         assert after.capabilities["hero"].status == "supported"
         assert after.availability == "ok"
         assert after.freshness == "fresh"
+        # #556 S1 §4.1: the boundary is stale-but-still-FUTURE, so it stays
+        # RESOLVED and the accounting axis stays fresh. The observation age is
+        # reported by `quota` and by the hero-local `cycle_freshness` above.
         assert dict(after.domain_freshness) == {
-            "hero": "stale",
+            "hero": "fresh",
             "quota": "stale",
             "sessions": "fresh",
         }
 
-        # #359: All retains the compatible backward-looking actuals and states
-        # that their quota boundary is stale, without degrading Codex itself.
+        # #359 published the actuals and marked them with an All-local
+        # `combined_totals_stale` warning. #556 S1 §4.2 RETIRES that warning:
+        # the counters are backward-looking accounting that a stale percent
+        # clock does not invalidate, and the marker was gated on two clocks
+        # forty times apart so it was on nearly always. The actuals still
+        # publish; nothing qualifies them.
         all_after = after_bundle.sources["all"]
         assert all_after.data["combined"] is not None
-        assert [warning.code for warning in all_after.warnings] == [
-            "combined_totals_stale",
+        assert [warning.code for warning in all_after.warnings] == []
+        # This fixture seeds no Claude accounting, so the only qualification is
+        # that empty leg — nothing about the stale Codex boundary.
+        assert [q["code"] for q in all_after.data["combined"]["qualifications"]] == [
+            "provider_empty",
         ]
-        assert all_after.warnings[0].domain == "hero"
-        assert all_after.warnings[0].message == (
-            "Codex quota evidence is stale; combined totals use retained actuals."
-        )
-        assert (all_after.availability, all_after.freshness) == ("partial", "fresh")
+        assert all_after.data["combined"]["qualifications"][0]["provider"] == "claude"
+        assert (all_after.availability, all_after.freshness) == ("ok", "fresh")
+        # Claude has no resolvable week in this fixture, so All's aggregate
+        # accounting axis is stale even though Codex's is fresh.
         assert dict(all_after.domain_freshness) == {
             "hero": "stale",
             "quota": "stale",
@@ -3655,7 +3676,7 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
         after_envelope = envelope_module._source_bundle_to_envelope(after_bundle)
         assert after_envelope["sources"]["codex"]["freshness"] == "fresh"
         assert after_envelope["sources"]["codex"]["domain_freshness"] == {
-            "hero": "stale",
+            "hero": "fresh",
             "quota": "stale",
             "sessions": "fresh",
         }
@@ -4192,9 +4213,39 @@ CODEX_SCOPED_DELTAS = {
 }
 
 
+# #556 S1 — the v5 combined contract. FULLY-QUALIFIED paths, not bare leaf
+# names, for the same reason `CODEX_SCOPED_DELTAS` is path-gated: `legs`,
+# `qualifications` and `hero` are not names this oracle should stop watching
+# everywhere. Each entry below is one intentional change:
+#
+#   * `combined.legs` — the required new field (spec §3.5), which is the one
+#     place v5 deliberately supersedes normal-payload byte identity.
+#   * `combined.qualifications` — this fixture seeds no Claude accounting, so
+#     its leg is explicitly empty and says so.
+#   * `domain_freshness.hero` on Claude and on All — repointed from
+#     percent-observation age to current-cycle accounting resolvability
+#     (spec §4.1). No Claude week resolves in this fixture, so the axis is
+#     stale; All aggregates it.
+#
+# NOT listed, and deliberately: Claude's `hero.cost_usd` / `hero.total_tokens`
+# changed MEANING in this session, but this oracle cannot witness it. Its
+# capture path calls `_tui_build_source_bundle` with no `claude_data`, so the
+# Claude hero comes from the synthetic fallback rather than a projected legacy
+# envelope. The meaning change is covered by
+# `tests/test_556_combined_headline.py` and by the `all-combined` golden.
+S1_556_SCOPED_DELTAS = frozenset({
+    "sources.all.data.combined.legs",
+    "sources.all.data.combined.qualifications",
+    "sources.all.domain_freshness.hero",
+    "sources.claude.domain_freshness.hero",
+})
+
+
 def _is_allowed_delta(path):
     segments = path.split(".")
     if segments[-1] in ALLOWED_DELTAS:
+        return True
+    if path in S1_556_SCOPED_DELTAS:
         return True
     return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
@@ -4293,12 +4344,80 @@ def test_undecorated_envelope_changes_only_in_allowed_fields(tmp_path, monkeypat
 
 
 def test_claude_source_state_is_unchanged(tmp_path, monkeypatch):
-    """#429 AC4: the Claude side is not in scope and must be bit-identical."""
+    """#429 AC4: the Claude side must not move outside a stated change.
+
+    This was raw equality, because #429 touched only Codex. #556 S1 repoints
+    `domain_freshness.hero` on BOTH providers, so exactly one Claude delta is
+    admitted — the fully-qualified path in `S1_556_SCOPED_DELTAS`.
+
+    It deliberately does NOT reuse `_is_allowed_delta`. That predicate also
+    admits the bare leaf names in `ALLOWED_DELTAS`, none of which #429 or #556
+    intends on the Claude side, so reusing it would quietly widen this
+    assertion from "one named path" to "one named path plus three leaf names
+    anywhere in the Claude subtree".
+    """
     import json as _json
 
     before = _json.loads(_429_PRE_CHANGE_ENVELOPE.read_text())
     after = _capture_undecorated_codex_envelope(tmp_path, monkeypatch)
-    strip = lambda entry: {
-        key: value for key, value in entry.items() if key not in VOLATILE_FIELDS
-    }
-    assert strip(after["sources"]["claude"]) == strip(before["sources"]["claude"])
+    unexpected = _unexpected_claude_deltas(
+        before["sources"]["claude"], after["sources"]["claude"],
+    )
+    assert unexpected == [], f"unintended Claude envelope changes: {unexpected}"
+
+
+def _unexpected_claude_deltas(before_claude, after_claude):
+    """Every Claude-subtree delta this oracle does not admit."""
+    return [
+        (path, old, new)
+        for path, old, new in _deep_diff(
+            before_claude, after_claude, "sources.claude",
+        )
+        if path.split(".")[-1] not in VOLATILE_FIELDS
+        and path not in S1_556_SCOPED_DELTAS
+    ]
+
+
+def test_claude_delta_oracle_reports_an_injected_change():
+    """The tightened predicate REJECTS something — passing does not show that.
+
+    `test_claude_source_state_is_unchanged` gained `path not in
+    S1_556_SCOPED_DELTAS` in this session and was verified only by continuing to
+    pass, which a predicate that admitted everything would also do. This mutates
+    the Claude subtree and asserts each mutation is reported, and separately
+    that the one exempt path is NOT — so the exemption is shown to be exactly as
+    wide as it claims.
+    """
+    import copy
+    import json as _json
+
+    before = _json.loads(_429_PRE_CHANGE_ENVELOPE.read_text())["sources"]["claude"]
+
+    ordinary = copy.deepcopy(before)
+    ordinary["availability"] = "__mutated__"
+    assert _unexpected_claude_deltas(before, ordinary) == [
+        ("sources.claude.availability", before["availability"], "__mutated__"),
+    ]
+
+    # A leaf whose BARE NAME sits in `ALLOWED_DELTAS`. This oracle deliberately
+    # does not reuse `_is_allowed_delta`, so the leaf-name amnesty must not
+    # reach the Claude subtree; without that property the assertion above would
+    # be blind to any Claude change named `captured_at`.
+    named = copy.deepcopy(before)
+    named["data"]["hero"]["captured_at"] = "__mutated__"
+    assert _unexpected_claude_deltas(before, named) == [
+        ("sources.claude.data.hero.captured_at", None, "__mutated__"),
+    ]
+
+    # A leaf REMOVED, not changed: a field that disappears is a wire break too.
+    removed = copy.deepcopy(before)
+    del removed["freshness"]
+    assert _unexpected_claude_deltas(before, removed) == [
+        ("sources.claude.freshness", before["freshness"], None),
+    ]
+
+    # And the exempt path stays exempt, so the two assertions above are not
+    # simply "any difference is reported".
+    exempt = copy.deepcopy(before)
+    exempt["domain_freshness"]["hero"] = "__mutated__"
+    assert _unexpected_claude_deltas(before, exempt) == []

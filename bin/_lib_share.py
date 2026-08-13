@@ -381,7 +381,7 @@ PALETTE_LIGHT = {
         "#dc2626",  # red-600
         "#0891b2",  # cyan-600
     ),
-    "ref_warn": "#d97706",           # amber-600
+    "ref_warn": "#b45309",           # amber-700
     "ref_alarm": "#dc2626",          # red-600
     "table_header_bg": "#f3f4f6",
     "table_row_alt": "#f9fafb",
@@ -903,7 +903,10 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
                 seg_bot_y = iy + scale_y(y_running)
                 seg_h = seg_bot_y - seg_top_y
                 color = series_palette[k_idx % len(series_palette)]
-                elements.append(svg_rect(bx, seg_top_y, bar_w, seg_h, fill=color))
+                elements.append(svg_rect(
+                    bx, seg_top_y, bar_w, seg_h,
+                    fill=color, stroke=palette["bg"],
+                ))
                 y_running += seg_v
         else:
             by = iy + scale_y(p.y_value)
@@ -1965,7 +1968,9 @@ def _merge_inventories(
 # original project labels.
 #
 # Half two — unambiguous classes, scanned document-wide. Only identifier
-# classes that cannot plausibly occur as legitimate artifact content.
+# classes that cannot plausibly occur as legitimate artifact content. The two
+# reveal-basename exceptions are masked at typed project sites before the
+# complete document reaches this unchanged detector, then restored afterward.
 #
 # Original project labels are deliberately NOT in half two. A project
 # legitimately named `cctally` collides with the static branding string this
@@ -2177,11 +2182,10 @@ def _scan_forbidden_classes(text: str) -> "list[tuple[str, str]]":
     """Return `(class label, matched value)` per unambiguous class in `text`.
 
     The matched value is carried out of the scan, not just the class name.
-    Naming only the class leaves the user nothing to act on: the accepted
-    limitation in `docs/share-gotchas.md` is that a project whose basename is
-    itself a canonical UUID or a 32-character hex token cannot be rendered in
-    reveal mode, and "canonical UUID" alone does not tell that user which of
-    their directories to rename.
+    Naming only the class leaves the user nothing to act on when an untyped
+    field leaks a value. The narrow reveal-basename exception is handled by
+    provenance-aware masking before a complete document reaches this scanner;
+    direct scanner calls remain fail-closed.
     """
     findings: list[tuple[str, str]] = []
     match = _UUID_RE.search(text)
@@ -2238,11 +2242,12 @@ def _verify_output(
     handler's exception converter turns it into the generic 500 envelope and
     the CLI converts it to a stderr refusal and exit 3.
 
-    Takes NO privacy mode. Both halves are mode-independent — half one
-    compares against the allowlist preparation itself built under whichever
-    mode was asked for, and half two's classes are forbidden in reveal mode
-    too, because reveal discloses a project's basename and never its path.
-    The parameter existed and was read by nothing.
+    Takes NO privacy mode. Both halves are mode-independent — half one compares
+    against the allowlist preparation itself built under whichever mode was
+    asked for, while the entry points mask the two provenance-qualified reveal
+    basename shapes before calling this unchanged document-wide detector. A
+    direct call still rejects every forbidden class. The former mode parameter
+    was read by nothing.
     """
     # Half one — provenance. Every project display value the prepared snapshot
     # carries must be one preparation was allowed to write. This catches a
@@ -2278,6 +2283,127 @@ def _verify_output(
                 "share artifact would disclose: " + _describe_findings(findings),
                 classes=sorted({label for label, _value in findings}),
             )
+
+
+def _reveal_basename_token(label: str) -> "str | None":
+    """Return the narrowly exemptible token from one raw project label.
+
+    The exception is for a directory whose BASENAME is exactly a UUID or a
+    source-root-shaped token. A label that merely contains either shape is not
+    eligible. Parent qualifiers added later by `disambiguate_basenames` do not
+    broaden this decision because eligibility is derived from the raw label.
+    """
+    segments = _path_segments(label)
+    basename = segments[-1] if segments else label
+    if _UUID_RE.fullmatch(basename) or _SOURCE_ROOT_KEY_RE.fullmatch(basename):
+        return basename
+    return None
+
+
+def _width_safe_hex_mask(token: str, ordinal: int) -> str:
+    """Build a detector-safe token that never under-reserves SVG width.
+
+    Helvetica's ``g``/``h`` are each 556 units wide: equal to digits and at
+    least as wide as every lowercase hex letter. ``H``/``N`` are each 722
+    units wide, at least as wide as every uppercase hex letter. Hyphens retain
+    their real width. The binary ordinal makes equal-shaped UUID/source-root
+    masks unique without introducing another hexadecimal run. NUL sentinels
+    keep the placeholder distinct from every ordinary renderer string; they
+    exist only in the intermediate Python value and add safe width headroom.
+    """
+    chars = [
+        char if char == "-" else ("H" if char.isupper() else "g")
+        for char in token
+    ]
+    slots = [index for index, char in enumerate(chars) if char != "-"]
+    bits = f"{ordinal + 1:b}"
+    for index, bit in zip(reversed(slots), reversed(bits)):
+        if token[index].isupper():
+            chars[index] = "N" if bit == "1" else "H"
+        else:
+            chars[index] = "h" if bit == "1" else "g"
+    return "\x00" + "".join(chars) + "\x00"
+
+
+def _mask_reveal_basename_mapping(
+    snaps: "Sequence[ShareSnapshot]",
+    mapping: "dict[_ProjectAnonKey, str]",
+    *,
+    reveal_projects: bool,
+    reserved_strings: "Sequence[str]" = (),
+) -> "tuple[dict[_ProjectAnonKey, str], tuple[tuple[str, str], ...]]":
+    """Mask only provenance-qualified UUID/hex basenames before rendering.
+
+    This is deliberately a mapping transformation, not a document allowlist.
+    Untyped fields retain their bytes and therefore remain visible to the
+    unchanged document-wide detector. The returned substitutions are applied
+    only after that detector accepts the complete document.
+    """
+    if not reveal_projects:
+        return mapping, ()
+
+    raw_tokens: dict[_ProjectAnonKey, set[str | None]] = {}
+    reserved: set[str] = set(mapping.values()) | set(reserved_strings)
+    for snap in snaps:
+        def _record_token(site: _ProjectDisplaySite) -> "str | None":
+            if site.keyed and site.value:
+                key = _project_anon_key(site.value, site.identity)
+                raw_tokens.setdefault(key, set()).add(
+                    _reveal_basename_token(site.value))
+            return site.value
+
+        # Visit every typed site directly. `_project_label_by_key` is a display
+        # helper and intentionally keeps only the first label per identity;
+        # security eligibility must instead hear every raw label.
+        _map_project_display(snap, _record_token)
+        _walk_strings(snap, reserved, set())
+
+    eligible_by_key: dict[_ProjectAnonKey, str] = {}
+    eligible: dict[str, str] = {}
+    for key, displayed in mapping.items():
+        candidates = raw_tokens.get(key, set())
+        token = next(iter(candidates)) if len(candidates) == 1 else None
+        if token is not None and token in displayed:
+            eligible_by_key[key] = token
+            eligible.setdefault(token, "")
+    if not eligible:
+        return mapping, ()
+
+    substitutions: list[tuple[str, str]] = []
+    ordinal = 0
+    for token in sorted(eligible):
+        while True:
+            placeholder = _width_safe_hex_mask(token, ordinal)
+            ordinal += 1
+            if all(placeholder not in value for value in reserved):
+                break
+        eligible[token] = placeholder
+        substitutions.append((placeholder, token))
+        reserved.add(placeholder)
+
+    masked: dict[_ProjectAnonKey, str] = {}
+    for key, displayed in mapping.items():
+        token = eligible_by_key.get(key)
+        placeholder = eligible.get(token or "")
+        masked[key] = (
+            displayed.replace(token, placeholder, 1)
+            if token is not None and placeholder is not None
+            else displayed
+        )
+    return masked, tuple(substitutions)
+
+
+def _verify_and_restore_reveal_basenames(
+    text: str,
+    *,
+    inventory: SensitiveInventory,
+    substitutions: "Sequence[tuple[str, str]]",
+) -> str:
+    """Verify the masked complete document, then restore approved basenames."""
+    _verify_output(text, inventory=inventory)
+    for placeholder, token in substitutions:
+        text = text.replace(placeholder, token)
+    return text
 
 
 def _encode_probe_identity_key() -> str:
@@ -3633,7 +3759,7 @@ def _print_stylesheet() -> str:
 
     THE DATA COLOURS ARE MAPPED TOO (#503 S2 review F1/F2), because they
     are not legible on white: dark `ref_warn` #fbbf24 measures 1.67:1
-    where its light counterpart #d97706 measures 3.19:1, dark `ref_alarm`
+    where its light counterpart #b45309 measures 5.02:1, dark `ref_alarm`
     #f87171 measures 2.77:1 against 4.83:1, and dark `series_primary`
     #60a5fa measures 2.54:1 against 5.17:1. A reference LABEL is mapped
     alongside its LINE, so the colour that encodes severity stays paired;
@@ -3708,18 +3834,20 @@ def _print_stylesheet() -> str:
     """
     light = PALETTE_LIGHT
     dark = PALETTE_DARK
-    # Data roles, mapped index-wise so a re-picked palette stays paired.
-    data_pairs = [(dark[role], light[role])
-                  for role in ("series_primary", "series_secondary",
-                               "ref_warn", "ref_alarm")]
-    data_pairs += list(zip(dark["series_palette"], light["series_palette"]))
-    seen: set = set()
+    # Fill and stroke roles are mapped separately. A dark source value may
+    # intentionally mean different things in those channels: #fbbf24 is both
+    # the warning stroke/text and the fourth stacked-series fill, whose light
+    # counterparts are #b45309 and #d97706 respectively (#524). Deduplicating
+    # them in one value-only map silently assigns one role the other's target.
+    fill_pairs = [(dark[role], light[role])
+                  for role in ("series_primary", "series_secondary")]
+    fill_pairs += list(zip(dark["series_palette"], light["series_palette"]))
     fills = []
-    strokes = []
-    for dark_value, light_value in data_pairs:
-        if dark_value in seen:
+    fill_seen: set = set()
+    for dark_value, light_value in fill_pairs:
+        if dark_value in fill_seen:
             continue
-        seen.add(dark_value)
+        fill_seen.add(dark_value)
         # `rect` is the only element this kernel currently fills with a
         # data colour, but `path` and `polyline` are filled elements too,
         # so a future filled area chart would otherwise print dark. Named
@@ -3730,6 +3858,16 @@ def _print_stylesheet() -> str:
             f' svg path[fill="{dark_value}"],'
             f' svg polyline[fill="{dark_value}"]'
             f' {{ fill: {light_value} !important; }}')
+
+    stroke_pairs = [(dark[role], light[role])
+                    for role in ("series_primary", "series_secondary",
+                                 "ref_warn", "ref_alarm")]
+    strokes = []
+    stroke_seen: set = set()
+    for dark_value, light_value in stroke_pairs:
+        if dark_value in stroke_seen:
+            continue
+        stroke_seen.add(dark_value)
         strokes.append(
             f' svg line[stroke="{dark_value}"] {{ stroke: {light_value} !important; }}'
             f' svg polyline[stroke="{dark_value}"] {{ stroke: {light_value} !important; }}'
@@ -3996,8 +4134,9 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
 
     The second complete-document boundary that owns the privacy contract
     (#503 S1). `sections` must carry RAW snapshots: `compose()` prepares them
-    itself under `opts.reveal_projects`, stitches, and then verifies the whole
-    composed document. Callers must not pre-scrub — a pre-scrubbed section
+    itself under `opts.reveal_projects`, stitches, verifies the whole composed
+    document, and only then restores provenance-qualified reveal basenames.
+    Callers must not pre-scrub — a pre-scrubbed section
     reaching a second aliasing pass merges two distinct projects that each
     mapped locally to `project-1` into one alias.
     """
@@ -4009,10 +4148,15 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
     # a handler-only fix would miss the CLI `source=all` path.
     merged = _merged_project_mapping(
         [sec.snap for sec in sections], reveal_projects=opts.reveal_projects)
+    render_mapping, reveal_substitutions = _mask_reveal_basename_mapping(
+        [sec.snap for sec in sections], merged,
+        reveal_projects=opts.reveal_projects,
+        reserved_strings=(opts.title,),
+    )
     prepared = tuple(
         ComposedSection(
             snap=_prepare(sec.snap, reveal_projects=opts.reveal_projects,
-                          mapping=merged),
+                          mapping=render_mapping),
             drift_detected=sec.drift_detected,
         )
         for sec in sections
@@ -4040,10 +4184,13 @@ def compose(sections: tuple[ComposedSection, ...], *, opts: ComposeOptions) -> s
         body = _stitch_svg(prepared, opts=opts)
     else:
         raise ValueError(f"unknown format: {fmt!r}")
-    _verify_output(body, inventory=_merge_inventories([
-        (raw.snap, out.snap) for raw, out in zip(sections, prepared)
-    ]))
-    return body
+    return _verify_and_restore_reveal_basenames(
+        body,
+        inventory=_merge_inventories([
+            (raw.snap, out.snap) for raw, out in zip(sections, prepared)
+        ]),
+        substitutions=reveal_substitutions,
+    )
 
 
 def _stitch_html(sections: tuple[ComposedSection, ...], *,
@@ -4255,8 +4402,8 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool,
     responsible for emitting the result (stdout/file/clipboard/open).
 
     One of the two complete-document boundaries that own the privacy contract
-    (#503 S1). It runs inventory -> prepare -> render -> verify. The gate goes
-    here and in `compose()`, not in `_render_fragment` and not in
+    (#503 S1). It runs inventory -> prepare/mask -> render -> verify -> restore.
+    The gate goes here and in `compose()`, not in `_render_fragment` and not in
     `_wrap_document`, because composition bypasses the latter and a fragment
     is not a complete document.
 
@@ -4270,11 +4417,19 @@ def render(snap: ShareSnapshot, *, format: str, theme: str, branding: bool,
     snapshot renumbers aliases on the legacy path, so preparation refuses it.
     """
     inventory_source = snap
-    prepared = _prepare(snap, reveal_projects=reveal_projects)
+    resolved = _resolved_project_labels(
+        snap, reveal_projects=reveal_projects)
+    render_mapping, reveal_substitutions = _mask_reveal_basename_mapping(
+        [snap], resolved, reveal_projects=reveal_projects)
+    prepared = _prepare(
+        snap, reveal_projects=reveal_projects, mapping=render_mapping)
     out = _render_prepared(prepared, format=format, theme=theme,
                            branding=branding)
-    _verify_output(out, inventory=_inventory_for(inventory_source, prepared))
-    return out
+    return _verify_and_restore_reveal_basenames(
+        out,
+        inventory=_inventory_for(inventory_source, prepared),
+        substitutions=reveal_substitutions,
+    )
 
 
 def _render_prepared(snap: ShareSnapshot, *, format: str, theme: str,

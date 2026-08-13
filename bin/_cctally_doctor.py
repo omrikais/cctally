@@ -38,6 +38,7 @@ import sys
 
 import _cctally_core
 import _lib_changelog
+import _lib_journal_router
 from _cctally_core import _now_utc, eprint, now_utc_iso, parse_iso_datetime
 from _lib_dashboard_json import encode_dashboard_json
 
@@ -46,10 +47,10 @@ from _lib_dashboard_json import encode_dashboard_json
 #: (`_lib_journal.resolve_effective_events`) reads only `evt`, `correction` and
 #: `correction_batch`; `op` is kept because the rebuild-equivalent account
 #: normalization is defined over evt/op records. Everything else — above all the
-#: `obs` lines, ~97% of a real journal — is dropped as it is decoded, so the deep
-#: gather's peak RSS tracks the decision history rather than the whole journal.
-_CONFLICT_SCAN_RECORD_TYPES = frozenset(
-    {"evt", "correction", "correction_batch", "op"})
+#: `obs` lines, ~97% of a real journal — becomes a `None` positional slot as it
+#: is decoded, so peak RSS tracks decision dictionaries plus one pointer per
+#: decoded line rather than the whole decoded journal.
+_CONFLICT_SCAN_RECORD_TYPES = _lib_journal_router.RETAINED_RECORD_TYPES
 
 #: Doctor needs only recent evidence for this diagnostic. Bound both line count
 #: and bytes so a corrupt single-line file cannot defeat the tail limit.
@@ -1798,10 +1799,13 @@ def _doctor_gather_state_impl(
                         # RETAIN ONLY what the selector consumes. `obs` lines are
                         # ~97% of a real journal (984k of 1.02M) and
                         # `resolve_effective_events` ignores them entirely —
-                        # keeping them cost 4.3 GB of peak RSS for an identical
-                        # result (#374 review).
-                        if record.get("t") in _CONFLICT_SCAN_RECORD_TYPES:
-                            decoded_records.append(record)
+                        # keeping their dictionaries cost 4.3 GB of peak RSS for
+                        # an identical result (#374 review). They still consume a
+                        # lightweight slot because their physical sequence is
+                        # part of three durable violation fingerprints (#508).
+                        decoded_records.append(
+                            _lib_journal_router.selector_slot(record)
+                        )
                         prior_high_water = (
                             seg,
                             offset + len(raw) + 1,
@@ -1821,8 +1825,9 @@ def _doctor_gather_state_impl(
                         else _jr.resolve_cutover_claude_account()
                     )
                     for record in decoded_records:
-                        _jr._normalize_legacy_account_stamp(
-                            record, cutover_claude)
+                        if record is not None:
+                            _jr._normalize_legacy_account_stamp(
+                                record, cutover_claude)
                     selection = _jl.resolve_effective_events(
                         decoded_records,
                         protocol_prefix_evidence=protocol_evidence,

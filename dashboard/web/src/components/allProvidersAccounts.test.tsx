@@ -65,12 +65,15 @@ function renderAll(codexData?: CodexSourceData) {
   return render(<HeroStrip />);
 }
 
-function codexQuotaRow(): HTMLElement {
+// #556 S1 §5 — the support zone's duplicated quota rows are gone. It now
+// carries one spend row per provider, which is the per-leg breakdown of the
+// figure beside it.
+function codexLegRow(): HTMLElement {
   const support = screen.getByTestId('shared-hero-support');
   const row = [...support.querySelectorAll('.sup-row')].find(
-    (el) => (el.textContent ?? '').startsWith('Codex quota'),
+    (el) => (el.textContent ?? '').startsWith('Codex · cycle to date'),
   );
-  if (row == null) throw new Error('no Codex quota row');
+  if (row == null) throw new Error('no Codex leg row');
   return row as HTMLElement;
 }
 
@@ -94,15 +97,16 @@ describe('All providers — a decorated Codex provider is never one account', ()
   it('does not publish the representative account reset as the countdown', () => {
     renderAll(makeDecoratedCodexSourceData());
     const usage = screen.getByTestId('shared-hero-usage');
-    expect(usage.textContent).not.toMatch(/resets in \d/);
-    expect(screen.getByTestId('hero-per-account-note').textContent)
+    // The Claude block keeps its own labelled reset; only the Codex one blanks.
+    expect(usage.textContent).not.toMatch(/Codex resets in \d/);
+    expect(screen.getByTestId('hero-codex-reset').textContent)
       .toContain('per account');
   });
 
-  it('does not publish the representative account percent as the Codex quota row', () => {
+  it('does not publish the representative account spend as the Codex leg row', () => {
     renderAll(makeDecoratedCodexSourceData());
-    const row = codexQuotaRow();
-    expect(row.textContent).not.toContain('61.0%');
+    const row = codexLegRow();
+    expect(row.textContent).not.toContain('$12.30');
     expect(row.textContent).toContain('per account');
   });
 
@@ -145,13 +149,14 @@ describe('All providers — a decorated Codex provider is never one account', ()
 });
 
 describe('All providers — an undecorated Codex provider is unchanged (R8)', () => {
-  it('keeps the single-account percent, countdown and quota row', () => {
+  it('keeps the single-account percent, countdown and leg row', () => {
     renderAll();
     const usage = screen.getByTestId('shared-hero-usage');
-    expect(usage.textContent).toContain('61%');
-    expect(usage.textContent).toContain('resets in 5d 10h');
+    // One precision across both blocks now (§5), so `61%` became `61.0%`.
+    expect(usage.textContent).toContain('61.0%');
+    expect(usage.textContent).toContain('Codex resets in 5d 10h');
     expect(usage.textContent).not.toContain('per account');
-    expect(codexQuotaRow().textContent).toBe('Codex quota61.0%');
+    expect(codexLegRow().textContent).toBe('Codex · cycle to date$12.30');
   });
 
   it('renders no per-account strip and no caption', () => {

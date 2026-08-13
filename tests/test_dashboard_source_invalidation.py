@@ -1080,10 +1080,20 @@ def test_source_bundle_hero_uses_native_cycle_while_periods_respect_visible_rang
 
         assert bundle.sources["codex"].data["hero"] == historical.data["hero"]
         assert bundle.sources["codex"].data["periods"]["daily"]["rows"] == ()
-        assert bundle.sources["all"].data["combined"] == {
-            "cost_usd": pytest.approx(historical.data["hero"]["cost_usd"] + 1.25),
-            "total_tokens": historical.data["hero"]["total_tokens"] + 25,
-        }
+        # #556 S1: Codex's provider `availability` is `empty` here — the
+        # VISIBLE range holds nothing — but its hero is a separate
+        # cycle-bounded read that holds real spend, so its leg is `current`
+        # and contributes. An empty LEG means no accounting at all.
+        assert bundle.sources["codex"].availability == "empty"
+        combined = bundle.sources["all"].data["combined"]
+        assert combined["legs"]["codex"]["state"] == "current"
+        assert combined["cost_usd"] == pytest.approx(
+            historical.data["hero"]["cost_usd"] + 1.25)
+        assert combined["total_tokens"] == (
+            historical.data["hero"]["total_tokens"] + 25)
+        assert combined["legs"]["codex"]["cost_usd"] == pytest.approx(
+            historical.data["hero"]["cost_usd"])
+        assert combined["legs"]["claude"]["cost_usd"] == 1.25
     finally:
         cache.close()
         stats.close()
@@ -1342,8 +1352,13 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
         assert first_codex.capabilities["hero"].status == "unavailable"
         assert first_codex.data["hero"]["cycle"] is None
         assert first_codex.warnings[0].code == "codex_projection_incoherent"
+        # #556 S1 §4.1: `hero` means current-cycle accounting resolvability.
+        # An incoherent projection certificate leaves the cycle unresolvable
+        # and the counters unpublishable, which is exactly what this axis now
+        # reports. Provider `availability` and `freshness` are untouched, per
+        # the standing prohibition on degrading them for a domain-local fact.
         assert dict(first_codex.domain_freshness) == {
-            "hero": "fresh",
+            "hero": "stale",
             "quota": "stale",
             "sessions": "fresh",
         }
@@ -1392,8 +1407,10 @@ def test_dashboard_idle_retries_persistently_unavailable_codex_without_rebuildin
             assert codex.capabilities["hero"].status == "unavailable"
             assert codex.data["hero"]["cycle"] is None
             assert codex.warnings[0].code == "codex_projection_incoherent"
+            # #556 S1 §4.1, as above: an unresolvable cycle stales the
+            # accounting axis while provider metadata stays coherent.
             assert dict(codex.domain_freshness) == {
-                "hero": "fresh",
+                "hero": "stale",
                 "quota": "stale",
                 "sessions": "fresh",
             }
@@ -1838,16 +1855,16 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         assert all(idle.source_bundle.sources["claude"] is first.source_bundle.sources["claude"]
                    for idle in idles)
         assert all(idle.source_bundle.sources["codex"] is codex for idle in idles)
-        assert math.isclose(
-            combined["cost_usd"],
-            first.source_bundle.sources["claude"].data["hero"]["cost_usd"]
-            + codex.data["hero"]["cost_usd"],
-            rel_tol=0.0, abs_tol=1e-9,
-        )
-        assert combined["total_tokens"] == (
-            first.source_bundle.sources["claude"].data["hero"]["total_tokens"]
-            + codex.data["hero"]["total_tokens"]
-        )
+        # #556 S1 §3.7 "empty versus unresolved": this fixture seeds Claude
+        # accounting (the provider is `ok`) but no `weekly_usage_snapshots`, so
+        # no subscription week resolves. That is a FAILURE, not emptiness, and
+        # the combined figure is withheld with Claude's own named reason rather
+        # than published as if the missing leg were zero.
+        assert first.source_bundle.sources["claude"].availability == "ok"
+        assert combined is None
+        unavailable = first.source_bundle.sources["all"].data["combined_unavailable"]
+        assert unavailable["code"] == "claude_cycle_unresolved"
+        assert codex.data["hero"]["cost_usd"] > 0
         source_detail_lookup(
             first.source_bundle, "codex", "project", codex.data["projects"]["rows"][0]["key"],
         )
@@ -2127,3 +2144,151 @@ def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
                 == first.sources["claude"].data_version)
     finally:
         stats.close()
+
+
+# --- #556 S1 Task 4 — period identity in `claude_version` (spec §3.6) -------
+
+
+_ROLLOVER_WEEK_START = "2026-07-13T14:00:00Z"
+_ROLLOVER_WEEK_END = "2026-07-20T14:00:00Z"
+_ROLLOVER_NEXT_END = "2026-07-27T14:00:00Z"
+
+
+def _claude_data_for_week(tui_module, *, week_start: str, week_end: str):
+    """Project a minimal legacy envelope whose current week is [start, end).
+
+    The production caller builds this from ``snapshot_to_envelope``; the shape
+    that matters here is the pair of effective bounds ``_tui_build_current_week``
+    stores AFTER ``_apply_midweek_reset_override``.
+    """
+    return tui_module._tui_project_claude_source_data({
+        "daily": {"total_cost_usd": 99.0, "total_tokens": 9_000},
+        "current_week": {
+            "week_start_at": week_start,
+            "reset_at_utc": week_end,
+            "spent_usd": 12.5,
+            "total_tokens": 1_000,
+            "used_pct": 40.0,
+            "milestones": [],
+            "five_hour_milestones": [],
+        },
+    })
+
+
+def _frozen_signature_bundle_builder(ns, monkeypatch):
+    """Pin every database signature so only the clock can move a version."""
+    from _lib_snapshot_cache import SnapshotSignature
+
+    frozen = SnapshotSignature(
+        max_entry_id=7,
+        max_wus_id=3,
+        max_wcs_id=2,
+        reset_sig=(1, 4),
+        max_codex_id=5,
+        generation=0,
+        entry_mutation_seq=11,
+        codex_physical_mutation_seq=6,
+    )
+    monkeypatch.setitem(ns, "compute_signature", lambda *a, **k: frozen)
+    monkeypatch.setattr(
+        ns["_cctally_tui"], "codex_stats_digest", lambda _conn: "c" * 64,
+    )
+    monkeypatch.setattr(
+        ns["_cctally_tui"], "accounts_identity_digest", lambda _conn: "",
+    )
+    return ns["_cctally_tui"]
+
+
+def test_claude_source_version_changes_on_a_clock_only_week_rollover(
+    tmp_path, monkeypatch,
+):
+    """#556 S1 §3.6 — a nominal rollover must invalidate the generation.
+
+    This is CLOCK-ONLY on purpose: every database signature
+    (`max_entry_id`, `entry_mutation_seq`, `max_wus_id`, `max_wcs_id`,
+    `reset_sig`, `generation`), the Codex stats digest and the accounts digest
+    are all pinned, and the only differences between the two builds are
+    `now_utc` crossing `week_end_at` and the newly-resolved week that crossing
+    produces. A test that also changed a row would pass against the bug,
+    because the row would move the signature on its own.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    tui_module = _frozen_signature_bundle_builder(ns, monkeypatch)
+    stats = ns["open_db"]()
+    before = ns["dt"].datetime(2026, 7, 19, 12, 0, tzinfo=ns["dt"].timezone.utc)
+    after = ns["dt"].datetime(2026, 7, 20, 15, 0, tzinfo=ns["dt"].timezone.utc)
+    try:
+        first = tui_module._tui_build_source_bundle(
+            stats_conn=stats, now_utc=before, display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0,
+            claude_data=_claude_data_for_week(
+                tui_module,
+                week_start=_ROLLOVER_WEEK_START, week_end=_ROLLOVER_WEEK_END,
+            ),
+        )
+        rolled = tui_module._tui_build_source_bundle(
+            stats_conn=stats, now_utc=after, display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0,
+            claude_data=_claude_data_for_week(
+                tui_module,
+                week_start=_ROLLOVER_WEEK_END, week_end=_ROLLOVER_NEXT_END,
+            ),
+            prior_bundle=first,
+        )
+    finally:
+        stats.close()
+
+    assert after >= ns["parse_iso_datetime"](_ROLLOVER_WEEK_END, "week_end_at")
+    assert (rolled.sources["claude"].data_version
+            != first.sources["claude"].data_version)
+    assert rolled.sources["claude"] is not first.sources["claude"]
+    # The rollover is Claude-local: Codex must not be dragged into it.
+    assert (rolled.sources["codex"].data_version
+            == first.sources["codex"].data_version)
+
+
+def test_an_unchanged_claude_period_does_not_churn_the_source_version(
+    tmp_path, monkeypatch,
+):
+    """The identity must not defeat reuse on an ordinary tick.
+
+    The second build spells the same instants with a UTC offset instead of a
+    trailing `Z`, which is the spelling difference legacy rows actually carry
+    (`_tui_build_current_week` collects both variants), so the identity has to
+    normalize rather than hash the raw text.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    tui_module = _frozen_signature_bundle_builder(ns, monkeypatch)
+    stats = ns["open_db"]()
+    now = ns["dt"].datetime(2026, 7, 19, 12, 0, tzinfo=ns["dt"].timezone.utc)
+    try:
+        first = tui_module._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now, display_tz_name="UTC",
+            codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0,
+            claude_data=_claude_data_for_week(
+                tui_module,
+                week_start=_ROLLOVER_WEEK_START, week_end=_ROLLOVER_WEEK_END,
+            ),
+        )
+        again = tui_module._tui_build_source_bundle(
+            stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=5),
+            display_tz_name="UTC", codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0,
+            claude_data=_claude_data_for_week(
+                tui_module,
+                week_start="2026-07-13T16:00:00+02:00",
+                week_end="2026-07-20T16:00:00+02:00",
+            ),
+            prior_bundle=first,
+        )
+    finally:
+        stats.close()
+
+    assert (again.sources["claude"].data_version
+            == first.sources["claude"].data_version)
+    assert again.sources["claude"] is first.sources["claude"]

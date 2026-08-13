@@ -334,6 +334,10 @@ def _sum_cost_for_range(*args, **kwargs):
     return sys.modules["cctally"]._sum_cost_for_range(*args, **kwargs)
 
 
+def _sum_cost_and_tokens_for_range(*args, **kwargs):
+    return sys.modules["cctally"]._sum_cost_and_tokens_for_range(*args, **kwargs)
+
+
 def _compute_cost_for_weekref(*args, **kwargs):
     return sys.modules["cctally"]._compute_cost_for_weekref(*args, **kwargs)
 
@@ -869,6 +873,11 @@ class TuiCurrentWeek:
     # default `None` keeps fixture modules that construct TuiCurrentWeek
     # directly (without this field) backwards-compatible.
     five_hour_block: dict | None = None
+    # #556 S1 §3.3 — the current cycle's #104 token total, accumulated in the
+    # SAME pass that produces `spent_usd` so the two halves describe one entry
+    # set. Appended last with a default so fixture modules that construct
+    # `TuiCurrentWeek` positionally stay valid.
+    total_tokens: int = 0
 
 
 # ---- View-model row dataclasses moved to bin/_lib_view_models.py ----
@@ -1607,7 +1616,11 @@ def _tui_build_current_week(
     latest = samples[-1]
     used_pct = float(latest[1])
     five_hr_pct = float(latest[2]) if latest[2] is not None else None
-    spent = _sum_cost_for_range(
+    # #556 S1 §3.3: one walk yields both halves. The range is whatever
+    # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
+    # above, so a mid-week reset shortens the accumulation and the published
+    # period together.
+    spent, total_tokens = _sum_cost_and_tokens_for_range(
         week_start_at, now_utc, mode="auto", skip_sync=skip_sync
     )
     dpp = (spent / used_pct) if used_pct > 0 else None
@@ -1678,6 +1691,7 @@ def _tui_build_current_week(
         five_hour_block=_select_current_block_for_envelope(
             conn, current_used_pct=used_pct, now_utc=now_utc,
         ),
+        total_tokens=total_tokens,
     )
 
 
@@ -2449,8 +2463,6 @@ def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object
             identity=(ordinal, raw.get("axis"), raw.get("threshold"), raw.get("alerted_at")),
         ))
 
-    daily_total = daily.get("total_cost_usd", 0.0)
-    daily_tokens = daily.get("total_tokens", 0)
     budget_settings = _tui_source_copy(legacy.get("alerts_settings"))
     if isinstance(budget_settings, dict):
         # The legacy top-level settings mirror contains Codex capability flags
@@ -2465,8 +2477,15 @@ def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object
             budget_settings.pop(key, None)
     return {
         "hero": {
-            "cost_usd": daily_total,
-            "total_tokens": daily_tokens,
+            # #556 S1 §3.4: current-cycle accounting, NOT the thirty-day
+            # rollup. Both providers' `hero.cost_usd` / `hero.total_tokens`
+            # now mean the same thing; the thirty-day figures keep their own
+            # home in `periods.daily`. `None` when no current week resolves —
+            # composition distinguishes an empty provider from an unresolved
+            # cycle by the provider's availability, and a zero here would make
+            # both read as observed spend.
+            "cost_usd": current_week.get("spent_usd"),
+            "total_tokens": current_week.get("total_tokens"),
             "header": _tui_source_copy(legacy.get("header")),
             "current_week": _tui_source_copy(current_week),
             "forecast": _tui_source_copy(legacy.get("forecast")),
@@ -2499,15 +2518,41 @@ def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object
     }
 
 
+def _tui_claude_cycle_is_resolved(
+    current_week: object, now_utc: dt.datetime,
+) -> bool:
+    """Whether Claude's current week resolves AND has not expired (#556 §4.1).
+
+    A stale percent observation does not enter this: the boundary can be
+    perfectly resolved while the number that reports progress against it is an
+    hour old.
+    """
+    if not isinstance(current_week, dict):
+        return False
+    end = _tui_normalized_period_instant(current_week.get("reset_at_utc"))
+    if end is None:
+        return False
+    return now_utc.astimezone(dt.timezone.utc) < dt.datetime.fromisoformat(end)
+
+
 def _tui_claude_domain_freshness(
     source_data: dict[str, object] | None,
+    *,
+    now_utc: dt.datetime,
 ) -> dict[str, str]:
-    """Derive Claude axes from its selected weekly snapshot evidence.
+    """Derive Claude's axes from its selected weekly snapshot evidence.
+
+    #556 S1 §4.1 repoints the two axes it publishes. ``quota`` carries the
+    percent-OBSERVATION age, which is what it always described. ``hero`` now
+    carries current-cycle ACCOUNTING resolvability: fresh while the boundary
+    resolves and has not expired, so the backward-looking counters inside it
+    are publishable. Pointing ``hero`` at the percent age is what kept All's
+    combined caveat permanently on, because that clock's 90-second bound is
+    forty times tighter than the Codex weekly one it was joined with.
 
     The legacy current-week label has a third presentation-only ``aging``
     state. The source contract deliberately keeps the frozen fresh/stale
-    vocabulary: only the exact stale label moves the weekly hero/quota axes.
-    Missing evidence remains a capability/availability concern.
+    vocabulary: only the exact stale label moves the quota axis.
     """
     data = source_data if isinstance(source_data, dict) else {}
     hero = data.get("hero")
@@ -2516,12 +2561,15 @@ def _tui_claude_domain_freshness(
         current_week.get("freshness")
         if isinstance(current_week, dict) else None
     )
-    weekly = (
+    quota = (
         "stale"
         if isinstance(freshness, dict) and freshness.get("label") == "stale"
         else "fresh"
     )
-    return {"hero": weekly, "quota": weekly, "sessions": "fresh"}
+    accounting = (
+        "fresh" if _tui_claude_cycle_is_resolved(current_week, now_utc) else "stale"
+    )
+    return {"hero": accounting, "quota": quota, "sessions": "fresh"}
 
 
 def _refresh_claude_source_clock(
@@ -2536,34 +2584,140 @@ def _refresh_claude_source_clock(
         return state
     if now_utc.tzinfo is None or now_utc.utcoffset() is None:
         raise ValueError("now_utc must be timezone-aware")
-    captured = getattr(current_week, "latest_snapshot_at", None)
-    if not isinstance(captured, dt.datetime):
-        return state
-    if captured.tzinfo is None or captured.utcoffset() is None:
-        captured = captured.replace(tzinfo=dt.timezone.utc)
-    age_seconds = max(
-        0.0,
-        (
-            now_utc.astimezone(dt.timezone.utc)
-            - captured.astimezone(dt.timezone.utc)
-        ).total_seconds(),
-    )
-    try:
-        freshness_config = _get_oauth_usage_config(raw_config)
-    except Exception:
-        freshness_config = _OAUTH_USAGE_DEFAULTS
-    weekly = (
-        "stale"
-        if _freshness_label(age_seconds, freshness_config) == "stale"
-        else "fresh"
-    )
     domain_freshness = dict(state.domain_freshness or {})
-    domain_freshness.update({"hero": weekly, "quota": weekly})
+    # #556 S1 §4.1: the two axes advance from DIFFERENT evidence. Both legs run
+    # on every tick — this used to write one percent-derived label to both, and
+    # it also returned early on a missing capture, which left the accounting
+    # axis frozen at its build-time value for the whole idle stretch.
+    week_end = getattr(current_week, "week_end_at", None)
+    domain_freshness["hero"] = (
+        "fresh"
+        if isinstance(week_end, dt.datetime)
+        and now_utc.astimezone(dt.timezone.utc) < (
+            week_end if week_end.tzinfo is not None
+            else week_end.replace(tzinfo=dt.timezone.utc)
+        ).astimezone(dt.timezone.utc)
+        else "stale"
+    )
+    captured = getattr(current_week, "latest_snapshot_at", None)
+    if isinstance(captured, dt.datetime):
+        if captured.tzinfo is None or captured.utcoffset() is None:
+            captured = captured.replace(tzinfo=dt.timezone.utc)
+        age_seconds = max(
+            0.0,
+            (
+                now_utc.astimezone(dt.timezone.utc)
+                - captured.astimezone(dt.timezone.utc)
+            ).total_seconds(),
+        )
+        try:
+            freshness_config = _get_oauth_usage_config(raw_config)
+        except Exception:
+            freshness_config = _OAUTH_USAGE_DEFAULTS
+        domain_freshness["quota"] = (
+            "stale"
+            if _freshness_label(age_seconds, freshness_config) == "stale"
+            else "fresh"
+        )
     refreshed = dataclasses.replace(
         state,
         domain_freshness=domain_freshness,
     )
     return state if refreshed == state else refreshed
+
+
+def _tui_normalized_period_instant(value: object) -> str | None:
+    """One canonical UTC spelling for a published cycle bound (#556 S1 §3.6).
+
+    Legacy rows carry local-offset spellings and current rows carry `Z`, so the
+    raw text is not an identity: hashing it would rebuild the Claude source on
+    a spelling change that moved no boundary. Returns ``None`` for anything
+    that does not parse as an instant.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return parse_iso_datetime(value, "period bound").astimezone(
+            dt.timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+def _tui_claude_period_identity(claude_data: object) -> str:
+    """The effective current-cycle bounds, as a version fragment (§3.6).
+
+    `claude_version` carried the database signatures, the semantics identity
+    and the accounts digest but no period, and `reuse_coherent_source_state`
+    returns the exact prior object on an unchanged version — so a week that
+    rolled over with no database movement could be republished as current.
+    The snapshot-level `_snapshot_period_rolled_over` gate already covers the
+    undecorated case; this is the second layer, so provider reuse cannot
+    outlive the cycle even if that gate is later changed.
+
+    The bounds are read from the SAME resolved object the aggregation used
+    (`current_week`, stored after `_apply_midweek_reset_override`), so a stale
+    identity can never accompany a shortened range.
+
+    The literal `"none"` degradation is deliberate and is NOT an oversight. A
+    caller that holds no `claude_data` — the capture and QA paths — contributes
+    a constant fragment, so layer two adds no rollover protection there. Those
+    paths are still covered by the snapshot-level `_snapshot_period_rolled_over`
+    gate, which is layer one and is what production reuse actually runs behind.
+    """
+    data = claude_data if isinstance(claude_data, dict) else {}
+    hero = data.get("hero")
+    current_week = hero.get("current_week") if isinstance(hero, dict) else None
+    if not isinstance(current_week, dict):
+        return "none"
+    start = _tui_normalized_period_instant(current_week.get("week_start_at"))
+    end = _tui_normalized_period_instant(current_week.get("reset_at_utc"))
+    if start is None and end is None:
+        return "none"
+    return f"{start or ''}~{end or ''}"
+
+
+def _tui_resolve_account_scope(stats_conn, provider: str) -> dict[str, object] | None:
+    """Read one provider's authoritative REAL account count (#556 S1 §3.8).
+
+    Returns ``None`` when the count cannot be read. That is the FAIL-CLOSED
+    path: composition withholds the combined figure rather than assuming a
+    single account. It is deliberately the opposite of the builders' existing
+    swallow-and-degrade behaviour for the accounts WIRE, where the fallback
+    loses decoration styling; here it would publish a wrong number.
+
+    The catch is narrow on purpose. ``real_account_count`` is one SELECT over
+    ``accounts`` — no file I/O, no label lookups — so ``sqlite3.Error`` covers
+    every failure the CALL can produce, and anything else is a real defect that
+    must not be swallowed into a silent withholding. ``ImportError`` is caught
+    alongside it because the deferred import is a different failure class from
+    the query: an unimportable module is exactly the "count cannot be read"
+    state this function exists to report, and letting it propagate would fail
+    the whole dashboard tick instead of withholding one figure.
+    """
+    try:
+        import _cctally_account
+        return {
+            "real_account_count": int(
+                _cctally_account.real_account_count(stats_conn, provider)
+            ),
+        }
+    except (ImportError, sqlite3.Error):
+        return None
+
+
+def _tui_with_account_scope(
+    state: SourceDashboardState, scope: dict[str, object] | None,
+) -> SourceDashboardState:
+    """Attach ``scope`` without breaking reuse-by-identity.
+
+    ``reuse_coherent_source_state`` returns the EXACT prior object, and callers
+    assert on that identity, so an unconditional ``dataclasses.replace`` would
+    defeat reuse on every tick. Frozen mappings compare equal to plain dicts,
+    so an unchanged count returns the prior object untouched.
+    """
+    if state.account_scope == scope:
+        return state
+    return dataclasses.replace(state, account_scope=scope)
 
 
 def _tui_build_source_bundle(
@@ -2659,11 +2813,15 @@ def _tui_build_source_bundle(
             f"{signature.codex_physical_mutation_seq}:{stats_digest}:"
             f"{semantics.codex_identity}{_acct_suffix}{_backlog_suffix}"
         )
+        # #556 S1 §3.6: normalized period identity, so a nominal week rollover
+        # invalidates the generation even when no database signature moved.
+        _period_identity = _tui_claude_period_identity(claude_data)
         claude_version = (
             f"claude:{signature.max_entry_id}:{signature.entry_mutation_seq}:"
             f"{signature.max_wus_id}:{signature.max_wcs_id}:"
             f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
-            f"{signature.generation}:{semantics.claude_identity}{_acct_suffix}"
+            f"{signature.generation}:{semantics.claude_identity}"
+            f":p{_period_identity}{_acct_suffix}"
         )
         prior_claude = (
             prior_bundle.sources.get("claude")
@@ -2754,7 +2912,9 @@ def _tui_build_source_bundle(
                     ),
                     **({"accounts": claude_accounts} if claude_accounts else {}),
                 },
-                domain_freshness=_tui_claude_domain_freshness(claude_data),
+                domain_freshness=_tui_claude_domain_freshness(
+                    claude_data, now_utc=now_utc,
+                ),
             )
         if codex_ingest_failed:
             warning = SourceDashboardWarning(
@@ -2838,6 +2998,15 @@ def _tui_build_source_bundle(
         # guard, so a freshly built state is handed back unchanged. Claude is
         # deliberately untouched.
         codex = refresh_codex_source_clock(codex, now_utc=now_utc)
+        # #556 S1 §3.8: the decoration fact reaches composition as authoritative
+        # server-only metadata. It is attached HERE, after every build / reuse /
+        # degrade / clock branch, so no branch can publish a state without it.
+        claude = _tui_with_account_scope(
+            claude, _tui_resolve_account_scope(stats_conn, "claude"),
+        )
+        codex = _tui_with_account_scope(
+            codex, _tui_resolve_account_scope(stats_conn, "codex"),
+        )
         combined = compose_all_state(claude, codex)
         bundle = SourceDashboardBundle(
             source_schema_version=SOURCE_SCHEMA_VERSION,

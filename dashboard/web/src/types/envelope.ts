@@ -417,6 +417,15 @@ export interface CurrentWeekEnvelope {
   // envelopes omit it). Historical milestone rows are fetched on demand via
   // GET /api/milestones/claude/week/<key>, never carried on the envelope.
   week_index?: WeekIndexEntry[];
+  // #556 S1 §3.3 — the token total accumulated in the SAME pass that produces
+  // `spent_usd`, so the two halves describe exactly one entry set. Optional for
+  // pre-v5 envelopes.
+  total_tokens?: number | null;
+  // #556 S1 §3.5 — the effective cycle START, beside the already-published end
+  // (`reset_at_utc`). Taken after `_apply_midweek_reset_override`, so a mid-week
+  // reset shortens the range and the published period together. Composition
+  // labels the Claude leg's period from the pair.
+  week_start_at?: string | null;
 }
 
 // ── Hero-modal historical milestones (spec §1a/§1c/§2/§3) ──────────────
@@ -1489,13 +1498,80 @@ export interface ClaudeSourceData {
 
 // ---- The `all` composition (compose_all_state) ------------------------
 
+// #556 S1 §3.5 — the v5 combined contract, transcribed from
+// `bin/_lib_dashboard_sources.py::_combined_outcome` / `_combined_leg`, not from
+// a fixture. `combined` is the sum, over both providers, of that provider's
+// accounting actuals within its OWN current cycle: Claude's subscription week
+// and Codex's native 7-day cycle. The two legs are deliberately not one shared
+// range, so each leg names the cycle it covers and reconciles with its provider
+// tab. The figure steps down twice a week, at two different reset instants, and
+// is not comparable against itself across a reset.
+
+// A leg's named cycle. Both bounds are ALWAYS `...Z`: the server normalizes
+// Claude's `_iso_z` spelling and Codex's `isoformat()` spelling to one
+// canonical UTC form, so one parser suffices.
+export interface AllCombinedPeriod {
+  kind: 'subscription_week' | 'native_7_day_cycle';
+  label: string;
+  start_at: string;
+  end_at: string;
+}
+
+// `period` is OPTIONAL on every state, including `current`. A leg whose counters
+// validate but whose bounds do not resolve still counts toward the sum and is
+// still named in the heading; only its reset line is suppressed.
+export interface AllCombinedLeg {
+  state: 'current' | 'empty';
+  cost_usd: number;
+  total_tokens: number;
+  period?: AllCombinedPeriod;
+}
+
+// A note that qualifies a PUBLISHED figure. Launch codes: `codex_ingest_backlog`
+// (lifted here by composition so All never reads the Codex provider field for
+// this purpose) and `provider_empty`. `code` stays `string` because the client
+// renders `message` and must tolerate a code it has not heard of.
+export interface AllCombinedQualification {
+  code: string;
+  message: string;
+  provider?: 'claude' | 'codex';
+}
+
+// One reason the figure is withheld. `detail` never echoes a rejected value:
+// `invalid_counter` carries `{field, reason}`, `multi_account_unsupported`
+// carries `{account_count}`.
+export interface CombinedUnavailableCause {
+  provider: 'claude' | 'codex';
+  code: string;
+  detail?: Record<string, unknown>;
+}
+
+// `causes` is PRECEDENCE-ORDERED, not an unordered bag: `causes[0].code` always
+// equals `code`, Claude before Codex at equal precedence, and one provider may
+// contribute several causes (Codex emits projection incoherence and cycle
+// failure independently).
+export interface CombinedUnavailable {
+  code: string;
+  message: string;
+  causes: CombinedUnavailableCause[];
+}
+
 export interface AllCombined {
   cost_usd: number;
   total_tokens: number;
+  // Both providers are always present on a published figure: a leg that cannot
+  // be built contributes a cause instead, and any cause withholds the figure.
+  legs: { claude: AllCombinedLeg; codex: AllCombinedLeg };
+  // Omitted entirely when empty (omit-when-inapplicable), never `[]`.
+  qualifications?: AllCombinedQualification[];
 }
 
 export interface AllSourceData {
+  // Stays PRESENT as `null` when withheld. Only `combined_unavailable` is
+  // omitted-when-inapplicable.
   combined: AllCombined | null;
+  // Emitted if and only if `combined` is null.
+  combined_unavailable?: CombinedUnavailable;
   // The provider-native union (Claude + Codex source-owned rows). The toast
   // pipeline's discriminated `SourceAlertRow` union lands in Stage 2 (§6.7);
   // until then the rows stay `unknown` (each is one provider's own alert row

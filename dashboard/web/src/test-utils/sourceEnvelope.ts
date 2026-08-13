@@ -13,11 +13,17 @@
 // basket fixture builders).
 import type {
   AccountCard,
+  AllCombined,
+  AllCombinedLeg,
+  AllCombinedPeriod,
   AllSourceData,
   ClaudeSourceData,
   CodexAccountScope,
+  CodexCycle,
   CodexQuotaForecast,
   CodexSourceData,
+  CombinedUnavailable,
+  CurrentWeekEnvelope,
   SourceEntry,
   SourcesMap,
 } from '../types/envelope';
@@ -863,7 +869,31 @@ export function makeClaudeSourceData(): ClaudeSourceData {
       cost_usd: 8.4,
       total_tokens: 9950400,
       header: null,
-      current_week: null,
+      // #556 S1 — the real wire always carries this when a week resolves, and
+      // the Claude leg's period is built from its `week_start_at` /
+      // `reset_at_utc` pair. Leaving it null made every All fixture model a
+      // provider whose cycle could not be named, which is a real state but not
+      // the ordinary one. The counters match `hero.cost_usd` / `total_tokens`
+      // because production accumulates both in the same pass.
+      current_week: {
+        used_pct: 17.4,
+        five_hour_pct: null,
+        five_hour_resets_in_sec: null,
+        spent_usd: 8.4,
+        total_tokens: 9950400,
+        dollar_per_pct: 0.48,
+        week_start_at: '2026-04-21T00:00:00Z',
+        reset_at_utc: '2026-04-28T00:00:00Z',
+        reset_in_sec: 298_800,
+        last_snapshot_age_sec: 420,
+        milestones: [],
+        freshness: {
+          label: 'fresh',
+          captured_at: '2026-04-24T13:00:00Z',
+          age_seconds: 420,
+        },
+        five_hour_block: null,
+      },
       forecast: null,
       trend: null,
     },
@@ -998,15 +1028,28 @@ export function makeAllSourceEntry(
   overrides?: Partial<SourceEntry<AllSourceData>>,
 ): SourceEntry<AllSourceData> {
   const codexHero = codex.data?.hero;
-  const combined =
-    claude.data && codexHero
-    && codexHero.cost_usd != null
-    && codexHero.total_tokens != null
-      ? {
-          cost_usd: claude.data.hero.cost_usd + codexHero.cost_usd,
-          total_tokens: claude.data.hero.total_tokens + codexHero.total_tokens,
-        }
-      : null;
+  const claudeLeg = claude.data == null ? null : combinedLeg(
+    claude.data.hero.cost_usd,
+    claude.data.hero.total_tokens,
+    claudePeriod(claude.data.hero.current_week),
+  );
+  const codexLeg = codexHero == null ? null : combinedLeg(
+    codexHero.cost_usd, codexHero.total_tokens, codexPeriod(codexHero.cycle),
+  );
+  const combined: AllCombined | null = claudeLeg && codexLeg
+    ? {
+        cost_usd: claudeLeg.cost_usd + codexLeg.cost_usd,
+        total_tokens: claudeLeg.total_tokens + codexLeg.total_tokens,
+        legs: { claude: claudeLeg, codex: codexLeg },
+      }
+    : null;
+  // #556 S1 §3.5 — `combined_unavailable` is emitted IF AND ONLY IF the figure
+  // is withheld, so the factory must not carry it beside a published number.
+  const unavailable: CombinedUnavailable | null = combined != null ? null : {
+    code: 'claude_cycle_unresolved',
+    message: "Claude's current subscription week could not be resolved.",
+    causes: [{ provider: 'claude', code: 'claude_cycle_unresolved' }],
+  };
   // The `all` alert union mirrors the Python `_combined_alert_rows`: each
   // provider's OWN rows (filtered to `source === provider`) concatenated in
   // declared source order, then sorted by `created_at` desc (rows without a
@@ -1041,11 +1084,92 @@ export function makeAllSourceEntry(
     },
     data: {
       combined,
+      ...(unavailable == null ? {} : { combined_unavailable: unavailable }),
       alerts: { rows: unionAlertRows },
       providers: { claude: claude.data, codex: codex.data },
     },
     ...overrides,
   } satisfies SourceEntry<AllSourceData>;
+}
+
+// #556 S1 §3.5 — the leg builders, mirroring `_combined_leg`. A leg with no
+// usable counters cannot contribute, which is what withholds the figure; a leg
+// whose counters validate but whose bounds do not resolve is still `current`
+// and still counts, with `period` simply omitted.
+function combinedLeg(
+  costUsd: number | null | undefined,
+  totalTokens: number | null | undefined,
+  period: AllCombinedPeriod | undefined,
+): AllCombinedLeg | null {
+  if (costUsd == null || totalTokens == null) return null;
+  return {
+    state: 'current',
+    cost_usd: costUsd,
+    total_tokens: totalTokens,
+    ...(period == null ? {} : { period }),
+  };
+}
+
+function claudePeriod(
+  currentWeek: CurrentWeekEnvelope | null | undefined,
+): AllCombinedPeriod | undefined {
+  const startAt = currentWeek?.week_start_at;
+  const endAt = currentWeek?.reset_at_utc;
+  if (startAt == null || endAt == null) return undefined;
+  return {
+    kind: 'subscription_week',
+    label: 'Claude subscription week',
+    start_at: startAt,
+    end_at: endAt,
+  };
+}
+
+function codexPeriod(
+  cycle: CodexCycle | null | undefined,
+): AllCombinedPeriod | undefined {
+  if (cycle?.start_at == null || cycle.resets_at == null) return undefined;
+  return {
+    kind: 'native_7_day_cycle',
+    label: 'Codex native 7-day cycle',
+    start_at: cycle.start_at,
+    end_at: cycle.resets_at,
+  };
+}
+
+// An `empty` leg: no accounting at all in the provider's current cycle. Numeric
+// zeros with no period, so nothing presents `$0` as observed spend inside a
+// named cycle. A RESOLVED zero is data and stays a `current` leg.
+export function makeEmptyCombinedLeg(): AllCombinedLeg {
+  return { state: 'empty', cost_usd: 0, total_tokens: 0 };
+}
+
+// Build a `combined` object directly, for the states the two provider entries
+// cannot express (an empty leg, a qualification, a leg with no period).
+export function makeAllCombined(
+  overrides: Partial<AllCombined> & {
+    legs?: { claude: AllCombinedLeg; codex: AllCombinedLeg };
+  } = {},
+): AllCombined {
+  const legs = overrides.legs ?? {
+    claude: combinedLeg(8.4, 9_950_400, {
+      kind: 'subscription_week',
+      label: 'Claude subscription week',
+      start_at: '2026-04-21T00:00:00Z',
+      end_at: '2026-04-28T00:00:00Z',
+    })!,
+    codex: combinedLeg(12.3, 480_000, {
+      kind: 'native_7_day_cycle',
+      label: 'Codex native 7-day cycle',
+      start_at: '2026-04-23T00:00:00Z',
+      end_at: '2026-04-30T00:00:00Z',
+    })!,
+  };
+  return {
+    cost_usd: legs.claude.cost_usd + legs.codex.cost_usd,
+    total_tokens: legs.claude.total_tokens + legs.codex.total_tokens,
+    legs,
+    ...overrides,
+  };
 }
 
 // ---- Hydrating (§5.2 bootstrap detection) -----------------------------

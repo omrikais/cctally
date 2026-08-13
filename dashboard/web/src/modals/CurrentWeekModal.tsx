@@ -22,7 +22,7 @@ import type { Binding } from '../store/keymap';
 import { openShareModal } from '../store/shareSlice';
 import { shouldShowMilestoneTicks } from '../lib/milestoneTicks';
 import { codexLiveQuotaKeys } from '../lib/dashboardPresentation';
-import { sourceDomainFreshness, warningForDomain } from '../lib/sourceGating';
+import { combinedPresentation, warningForDomain } from '../lib/sourceGating';
 import { SourceChip } from '../panels/sourcePanel';
 import { fetchWeekDetail, stepWeek } from './milestoneHistory';
 import type {
@@ -33,6 +33,7 @@ import type {
   Milestone,
   FiveHourMilestone,
   FiveHourCredit,
+  SourceEntry,
   WeekDetailBlock,
   WeekDetailPayload,
   WeekIndexEntry,
@@ -1430,16 +1431,15 @@ function AllCurrentWeekModal({
 }) {
   const claudeReason = providerReason(env, 'claude');
   const codexReason = providerReason(env, 'codex');
-  // #359: the All-local reason qualifying the retained combined actual lives on
-  // the `all` source, NOT on either provider — `providerReason` reads only
-  // provider warnings and would leave this modal the one fully silent surface
-  // when a provider's cycle evidence is stale.
-  const allEntry = env?.sources?.all;
-  const allReason = warningForDomain(allEntry?.warnings, 'hero')?.message ?? null;
-  const allCombined = (allEntry?.data as AllSourceData | null | undefined)?.combined;
-  const allCombinedStale = allEntry != null
-    && allCombined != null
-    && sourceDomainFreshness(allEntry, 'hero') === 'stale';
+  // #556 S1 §4.4 — the combined figure's disclosure comes from ONE predicate,
+  // shared with `HeroStrip` and `SourceStatusChip`, so the three cannot
+  // disagree. This modal previously derived it from
+  // `sourceDomainFreshness(allEntry, 'hero')`, which is an aggregate over both
+  // providers' accounting resolvability: with `combined_totals_stale` retired
+  // that expression would have printed "Combined totals are unavailable" beside
+  // a published figure on any install whose Claude week failed to resolve.
+  const allEntry = env?.sources?.all as SourceEntry<AllSourceData> | undefined;
+  const combined = combinedPresentation(allEntry ?? null);
   return (
     <Modal
       title="Current Usage — provider cycles"
@@ -1454,24 +1454,32 @@ function AllCurrentWeekModal({
         />
       }
     >
-      {allReason && (
+      {combined.unavailable != null && (
         <p
-          className={`provider-section-reason${allCombinedStale ? ' all-stale-disclosure' : ''}`}
+          className="provider-section-reason"
           data-testid="all-current-week-reason"
         >
-          {allCombinedStale ? (
-            <span
-              className="chip chip-stale"
-              data-testid="all-current-week-stale-marker"
-              title={allReason}
-              aria-label={allReason}
-            >
-              Stale quota
-            </span>
-          ) : null}
-          <span>{allReason}</span>
+          <span
+            className="panel-degraded-chip"
+            data-testid="all-current-week-withheld-marker"
+            title={combined.unavailable.message}
+            aria-label={combined.unavailable.message}
+          >
+            Combined withheld
+          </span>
+          <span>{combined.unavailable.message}</span>
         </p>
       )}
+      {combined.qualifications.map((qualification) => (
+        <p
+          className="provider-section-reason"
+          data-testid="all-current-week-qualification"
+          data-code={qualification.code}
+          key={qualification.code + (qualification.provider ?? '')}
+        >
+          <span>{qualification.message}</span>
+        </p>
+      ))}
       <div className="provider-composition provider-composition--modal current-week-provider-composition">
         <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="claude">
           <div className="source-provider-head provider-composition-head">

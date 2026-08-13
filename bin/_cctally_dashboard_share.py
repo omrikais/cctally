@@ -50,7 +50,6 @@ from _cctally_config import save_config, _load_config_unlocked
 from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost, claude_usage_dict
 from _lib_five_hour import _canonical_5h_window_key
-from _lib_dashboard_sources import source_domain_freshness
 from _lib_display_tz import _resolve_tz, resolve_display_tz_name
 
 
@@ -1783,12 +1782,33 @@ def _build_codex_source_share_snapshot(ls, *, state, panel: str,
     )
 
 
+def _share_current_week_evidence_is_stale(state) -> bool:
+    """Whether ONE provider's own current-cycle evidence is stale (#556 §4.7).
+
+    This used to read the shared ``domain_freshness.hero`` axis, which #556 S1
+    repointed to accounting resolvability. The aggregate ``quota`` axis is not
+    the substitute: a stale five-hour row stales it independently of the weekly
+    cycle this note describes. So each provider is read on its own field —
+    Claude's percent-observation label under ``hero.current_week.freshness``,
+    Codex's additive ``hero.cycle_freshness``, which is omitted while fresh.
+    """
+    data = getattr(state, "data", None)
+    hero = data.get("hero") if isinstance(data, Mapping) else None
+    if not isinstance(hero, Mapping):
+        return False
+    if getattr(state, "source", None) == "claude":
+        current_week = hero.get("current_week")
+        freshness = (
+            current_week.get("freshness")
+            if isinstance(current_week, Mapping) else None
+        )
+        return isinstance(freshness, Mapping) and freshness.get("label") == "stale"
+    return hero.get("cycle_freshness") == "stale"
+
+
 def _share_apply_current_week_freshness(snapshot, state, panel: str):
     """Qualify retained current-week actuals with provider-local evidence age."""
-    if (
-        panel != "current-week"
-        or source_domain_freshness(state, "hero") != "stale"
-    ):
+    if panel != "current-week" or not _share_current_week_evidence_is_stale(state):
         return snapshot
     provider = "Claude" if state.source == "claude" else "Codex"
     note = (

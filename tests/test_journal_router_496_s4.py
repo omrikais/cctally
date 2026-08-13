@@ -42,6 +42,26 @@ def test_retained_types_do_not_drift_from_the_doctor_scan():
     assert R.RETAINED_RECORD_TYPES == D._CONFLICT_SCAN_RECORD_TYPES
 
 
+def test_selector_slot_keeps_positions_without_retaining_observation_dicts():
+    """The selector input is one pointer per decoded line, not one decoded map.
+
+    A large observation population must therefore grow only the positional
+    placeholder list; the retained decoded objects track decision history.
+    """
+    observations = [
+        {"t": "obs", "payload": {"blob": "x" * 4096}, "id": f"o:{index}"}
+        for index in range(2_000)
+    ]
+    decision = {"t": "evt", "id": "sa:decision", "payload": {}}
+
+    slots = [R.selector_slot(record) for record in [*observations, decision]]
+
+    assert len(slots) == len(observations) + 1
+    assert slots[:-1] == [None] * len(observations)
+    assert slots[-1] is decision
+    assert [slot for slot in slots if slot is not None] == [decision]
+
+
 def test_stamped_record_contributes_under_its_own_key():
     acc = R.LastSeenAccumulator()
     acc.observe({"t": "obs", "account": "a1", "at": "2026-01-02T00:00:00Z"},

@@ -27,6 +27,20 @@ import hashlib
 RETAINED_RECORD_TYPES = frozenset({"evt", "correction", "correction_batch", "op"})
 
 
+def selector_slot(record):
+    """Return one position-preserving input slot for the shared selector.
+
+    Every successfully decoded journal line consumes one sequence number in
+    ``resolve_effective_events``.  Decision records therefore stay decoded,
+    while observations and other irrelevant records become ``None`` rather
+    than being dropped (which renumbers durable protocol fingerprints) or kept
+    as dictionaries (which makes memory follow observation volume).
+    """
+    if record.get("t") in RETAINED_RECORD_TYPES:
+        return record
+    return None
+
+
 class LastSeenAccumulator:
     """Reproduce `_derive_account_last_seen`'s contribution set from a stream.
 

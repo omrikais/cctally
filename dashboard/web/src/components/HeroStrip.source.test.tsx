@@ -9,6 +9,7 @@ import {
   ACCOUNT_B,
   makeAllSourceEntry,
   makeDecoratedCodexSourceData,
+  makeHydratingEntry,
   makeSourceEnvelope,
   withSharedRootWeeklyWindows,
 } from '../test-utils/sourceEnvelope';
@@ -342,16 +343,41 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     expect(combined).not.toHaveTextContent('unavailable');
   });
 
-  it('keeps stale-cycle combined actuals with a visible mobile-safe marker (#359)', () => {
+  it('publishes an unqualified figure with BOTH percent clocks stale (#556 acceptance 5)', () => {
+    // The state the issue is about. `domain_freshness.hero` used to mean
+    // percent-observation age, so this combination kept a staleness marker
+    // permanently on. It now means current-cycle accounting resolvability, and
+    // the client reads neither axis for combined disclosure.
     updateSnapshot(envWith((b) => {
       const codex = b.sources.codex.data!;
       codex.hero.cycle_freshness = 'stale';
-      b.sources.codex.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
+      b.sources.codex.domain_freshness = { hero: 'fresh', quota: 'stale', sessions: 'fresh' };
+      b.sources.all.domain_freshness = { hero: 'fresh', quota: 'stale', sessions: 'fresh' };
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    const combined = screen.getByTestId('shared-hero-spent');
+    expect(combined).toHaveTextContent('$20.70');
+    expect(combined.textContent).not.toMatch(/withheld|unavailable/i);
+    expect(screen.queryByTestId('shared-hero-stale-marker')).toBeNull();
+    expect(screen.queryByTestId('hero-combined-reason')).toBeNull();
+    expect(combined).not.toHaveAttribute('title');
+  });
+
+  it('never pairs a published figure with an unavailability sentence (#556 B3)', () => {
+    // The exact regression the retired `combined_totals_stale` machinery would
+    // reintroduce: hero freshness stale, the source degraded, a hero-domain
+    // warning present — and a real number on screen. Deriving disclosure from
+    // any of those three would print "Combined totals are unavailable" beside
+    // it.
+    updateSnapshot(envWith((b) => {
       b.sources.all.availability = 'partial';
-      b.sources.all.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
+      b.sources.all.freshness = 'stale';
+      b.sources.all.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'stale' };
       b.sources.all.warnings = [{
-        code: 'combined_totals_stale',
-        message: 'Codex quota evidence is stale; combined totals use retained actuals.',
+        code: 'claude_week_unresolved',
+        message: "Claude's current subscription week could not be resolved.",
         domain: 'hero',
       }];
     }));
@@ -360,33 +386,75 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
 
     const combined = screen.getByTestId('shared-hero-spent');
     expect(combined).toHaveTextContent('$20.70');
-    expect(combined).not.toHaveTextContent('unavailable');
-    expect(combined).toHaveAttribute('title', expect.stringMatching(/retained actuals/i));
-    expect(combined).toHaveAttribute('aria-label', expect.stringMatching(/stale/i));
-    const marker = screen.getByTestId('shared-hero-stale-marker');
-    expect(marker).toHaveTextContent(/stale quota/i);
-    expect(marker).toHaveAttribute('title', expect.stringMatching(/stale/i));
+    expect(combined.textContent).not.toMatch(/unavailable|withheld|not published/i);
+    expect(screen.queryByTestId('shared-hero-warning')).toBeNull();
   });
 
-  it('shows an explicit combined-unavailable state when combined is null', () => {
+  it('states the named reason when the figure is withheld', () => {
     updateSnapshot(
       envWith((b) => {
         b.sources.all = {
           ...b.sources.all,
-          warnings: [{ code: 'source_ingest_contended', message: 'Codex ingest is in progress.' }],
-          data: { ...b.sources.all.data!, combined: null },
+          data: {
+            ...b.sources.all.data!,
+            combined: null,
+            combined_unavailable: {
+              code: 'multi_account_unsupported',
+              message: 'Claude has 2 accounts on separate cycles, so a combined '
+                + 'total is not published; see the per-account cards.',
+              causes: [{
+                provider: 'claude',
+                code: 'multi_account_unsupported',
+                detail: { account_count: 2 },
+              }],
+            },
+          },
         };
       }),
     );
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
+
     const warning = screen.getByTestId('shared-hero-warning');
-    expect(warning).toHaveTextContent('Combined unavailable');
-    expect(warning).toHaveAttribute('title', 'Codex ingest is in progress.');
-    expect(warning).toHaveAttribute('aria-label', 'Combined totals unavailable: Codex ingest is in progress.');
+    expect(warning).toHaveTextContent('Combined withheld');
+    expect(warning).toHaveAttribute('aria-label', expect.stringMatching(/2 accounts/));
+    // The reason is VISIBLE, not only in a hover-only title.
+    expect(screen.getByTestId('hero-combined-reason'))
+      .toHaveTextContent(/per-account cards/);
+    // A withheld figure is not "no data": the accounting exists on both sides.
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('COMBINED · CURRENT CYCLES');
   });
 
-  it('uses the hero warning for an unavailable combined hero instead of an earlier panel warning', () => {
+  it('prefers the typed reason over any warning on the same entry', () => {
+    updateSnapshot(
+      envWith((b) => {
+        b.sources.all = {
+          ...b.sources.all,
+          warnings: [
+            { code: 'projects', message: 'Projects metadata is incomplete.', domain: 'projects' },
+            { code: 'other_hero', message: 'A different hero reason.', domain: 'hero' },
+          ],
+          data: {
+            ...b.sources.all.data!,
+            combined: null,
+            combined_unavailable: {
+              code: 'codex_cycle_unavailable',
+              message: 'Codex native reset cycle is unavailable.',
+              causes: [{ provider: 'codex', code: 'codex_cycle_unavailable' }],
+            },
+          },
+        };
+      }),
+    );
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-reason'))
+      .toHaveTextContent('Codex native reset cycle is unavailable.');
+  });
+
+  it('falls back to the hero warning for a LEGACY envelope with no typed reason', () => {
     updateSnapshot(
       envWith((b) => {
         b.sources.all = {
@@ -401,10 +469,254 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
     );
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
     render(<HeroStrip />);
-    const warning = screen.getByTestId('shared-hero-warning');
-    expect(warning).toHaveTextContent('Combined unavailable');
-    expect(warning).toHaveAttribute('title', 'Codex native reset cycle is unavailable.');
-    expect(warning).toHaveAttribute('aria-label', 'Combined totals unavailable: Codex native reset cycle is unavailable.');
+
+    expect(screen.getByTestId('hero-combined-reason'))
+      .toHaveTextContent('Codex native reset cycle is unavailable.');
+  });
+
+  it('names its contributors in the heading and splits the legs in the support zone', () => {
+    updateSnapshot(envWith());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('COMBINED · CURRENT CYCLES');
+    // Criterion 4 — the split is on the hero, without opening a modal.
+    expect(screen.getByTestId('hero-leg-claude')).toHaveTextContent('$8.40');
+    expect(screen.getByTestId('hero-leg-codex')).toHaveTextContent('$12.30');
+    const support = screen.getByTestId('shared-hero-support');
+    expect(support).toHaveTextContent('Claude · week to date');
+    expect(support).toHaveTextContent('Codex · cycle to date');
+    // The duplicated quota rows and the constant `Providers` row are gone.
+    expect(support.textContent).not.toContain('Claude · Codex');
+    expect(support.textContent).not.toContain('Claude quota');
+  });
+
+  it('names only the contributing provider when the other leg is empty', () => {
+    updateSnapshot(envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.legs.claude = { state: 'empty', cost_usd: 0, total_tokens: 0 };
+      combined.cost_usd = combined.legs.codex.cost_usd;
+      combined.total_tokens = combined.legs.codex.total_tokens;
+      combined.qualifications = [{
+        code: 'provider_empty',
+        message: 'Claude has no accounting in its current cycle.',
+        provider: 'claude',
+      }];
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('CODEX · CURRENT CYCLE');
+    expect(screen.getByTestId('hero-leg-claude')).toHaveTextContent('no data');
+    expect(screen.getByTestId('hero-leg-codex')).toHaveTextContent('$12.30');
+    const qualification = screen.getByTestId('hero-combined-qualification');
+    expect(qualification).toHaveTextContent('Claude no data');
+    // A qualification is informational: the figure beside it is published and
+    // correct. `chip-stale` is the amber freshness vocabulary of the retired
+    // `Stale quota` marker, so wearing it re-teaches the category error this
+    // session removed.
+    expect(qualification.className).not.toContain('chip-stale');
+  });
+
+  it('keeps the EMPTY provider\'s own reset beside its percentage', () => {
+    // `One provider empty` is a published row of the matrix, so this hero is
+    // on screen for real installs — Codex quota observations, no Codex
+    // accounting rows, or the mirror image. An `empty` leg names no cycle
+    // because the provider contributed nothing, not because its cycle is
+    // unknown, so the provider's own reset is still the honest answer. §5's
+    // suppression rule is about a CURRENT leg that cannot resolve its bounds.
+    const env = envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.legs.claude = { state: 'empty', cost_usd: 0, total_tokens: 0 };
+      combined.cost_usd = combined.legs.codex.cost_usd;
+      combined.total_tokens = combined.legs.codex.total_tokens;
+    });
+    // The legacy top-level block is Claude's, and it is where the provider's
+    // own server-computed countdown lives.
+    (env as { current_week: unknown }).current_week = {
+      used_pct: 17.4,
+      five_hour_pct: null,
+      five_hour_resets_in_sec: null,
+      spent_usd: 0,
+      dollar_per_pct: null,
+      reset_at_utc: '2026-04-28T00:00:00Z',
+      reset_in_sec: 216_000,
+      last_snapshot_age_sec: 420,
+      milestones: [],
+      freshness: { label: 'fresh', captured_at: '2026-04-24T13:00:00Z', age_seconds: 420 },
+      five_hour_block: null,
+    };
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-claude-reset'))
+      .toHaveTextContent('Claude resets in 2d 12h');
+  });
+
+  it('blanks the figure when BOTH legs are empty, rather than presenting $0', () => {
+    updateSnapshot(envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.legs.claude = { state: 'empty', cost_usd: 0, total_tokens: 0 };
+      combined.legs.codex = { state: 'empty', cost_usd: 0, total_tokens: 0 };
+      combined.cost_usd = 0;
+      combined.total_tokens = 0;
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('CURRENT CYCLES · NO DATA');
+    const spent = screen.getByTestId('shared-hero-spent');
+    expect(spent.textContent).not.toContain('$0');
+    // Not an unavailability either: the figure is not withheld, it is empty.
+    expect(screen.queryByTestId('shared-hero-warning')).toBeNull();
+  });
+
+  it('keeps a resolved ZERO as ordinary spend inside a named cycle', () => {
+    updateSnapshot(envWith((b) => {
+      const combined = b.sources.all.data!.combined!;
+      combined.legs.claude.cost_usd = 0;
+      combined.legs.codex.cost_usd = 0;
+      combined.cost_usd = 0;
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('COMBINED · CURRENT CYCLES');
+    expect(screen.getByTestId('shared-hero-spent')).toHaveTextContent('$0');
+  });
+
+  it('gives each provider block its own labelled reset (retiring A6)', () => {
+    // The server instant must sit INSIDE both fixture cycles. Without it the
+    // envelope's periods are years behind the wall clock, both countdowns
+    // resolve to elapsed, and this assertion would be measuring the elapsed
+    // branch instead of the labelled-reset one it exists for.
+    const env = envWith();
+    (env as { generated_at: string }).generated_at = '2026-04-24T13:07:00Z';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.getByTestId('hero-claude-reset')).toHaveTextContent(/^Claude resets in /);
+    expect(screen.getByTestId('hero-codex-reset')).toHaveTextContent(/^Codex resets in /);
+  });
+
+  it('suppresses only the reset line of a contributing leg with no period', () => {
+    // The provider's own quota window still resolves here. The block's
+    // countdown must still disappear, because the leg is what the heading and
+    // the figure describe, and it cannot name a cycle.
+    const env = envWith((b) => {
+      delete b.sources.all.data!.combined!.legs.codex.period;
+    });
+    (env as { generated_at: string }).generated_at = '2026-04-24T13:07:00Z';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    // It still counts toward the sum and is still named in the heading.
+    expect(screen.getByTestId('hero-combined-heading'))
+      .toHaveTextContent('COMBINED · CURRENT CYCLES');
+    expect(screen.getByTestId('hero-leg-codex')).toHaveTextContent('$12.30');
+    expect(screen.queryByTestId('hero-codex-reset')).toBeNull();
+    // ONLY that one. Without this the assertion above passes just as well when
+    // every countdown is suppressed for an unrelated reason.
+    expect(screen.getByTestId('hero-claude-reset'))
+      .toHaveTextContent('Claude resets in 3d 10h');
+  });
+
+  it('measures both countdowns from the SERVER instant, not the browser clock', () => {
+    // A browser clock two days fast used to shorten the All tab's Claude
+    // countdown while the Claude tab, which prints the server-computed
+    // `reset_in_sec`, kept the right one. Both instants now come from the
+    // server, so the two tabs cannot disagree.
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-04-26T13:07:00Z'));
+    const env = envWith();
+    (env as { generated_at: string }).generated_at = '2026-04-24T13:07:00Z';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    // Claude's week ends 2026-04-28T00:00Z → 3d 10h from the server instant
+    // (1d 10h from the browser's). Codex's cycle ends 2026-04-30T00:00Z.
+    expect(screen.getByTestId('hero-claude-reset'))
+      .toHaveTextContent('Claude resets in 3d 10h');
+    expect(screen.getByTestId('hero-codex-reset'))
+      .toHaveTextContent('Codex resets in 5d 10h');
+  });
+
+  it('prints no countdown for a cycle that already ended at the server instant', () => {
+    // `fmt.ddhh(0)` renders "resets in 0d 0h", which a reader takes as
+    // "resetting right now" rather than as evidence that the published bounds
+    // are behind the data.
+    const env = envWith();
+    (env as { generated_at: string }).generated_at = '2026-05-02T00:00:00Z';
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.queryByTestId('hero-claude-reset')).toBeNull();
+    expect(screen.queryByTestId('hero-codex-reset')).toBeNull();
+  });
+
+  it('renders a hydrating All entry blank, not withheld', () => {
+    // `data: null` with no warnings produces no figure AND no reason. Reading
+    // "no figure" alone as withheld printed the withheld chip and a sentence
+    // claiming a combined total is not published for this state, over a
+    // bootstrap that has simply not finished.
+    updateSnapshot(envWith((b) => {
+      b.sources.all = makeHydratingEntry() as unknown as typeof b.sources.all;
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<HeroStrip />);
+
+    expect(screen.queryByTestId('shared-hero-warning')).toBeNull();
+    expect(screen.queryByTestId('hero-combined-reason')).toBeNull();
+    // Nor the published both-empty sentence: nothing is known yet, so claiming
+    // there is no accounting would be a different false statement.
+    expect(screen.queryByTestId('hero-combined-no-data')).toBeNull();
+    const spent = screen.getByTestId('shared-hero-spent');
+    expect(spent).not.toHaveAttribute('title');
+    expect(spent.querySelector('.hs-big')).toHaveTextContent('—');
+  });
+
+  it('renders both provider blocks at one precision and one size', () => {
+    updateSnapshot(envWith());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<HeroStrip />);
+
+    const nums = Array.from(
+      container.querySelectorAll('[data-testid="shared-hero-usage"] .hu-num'),
+    );
+    expect(nums).toHaveLength(2);
+    // A5 — `.hu-num--sm` is gone: two quantities of the same kind, same size.
+    expect(nums.every((n) => !n.className.includes('hu-num--sm'))).toBe(true);
+    // One precision: `pct1` on both.
+    expect(nums.map((n) => n.textContent)).toEqual(['17.4%', '61.0%']);
+  });
+});
+
+// #556 S1 §5 / acceptance 10 — criterion 9's heading requirement cannot be
+// verified by screenshot, so role, level and region name are asserted directly,
+// for every source selection.
+describe('HeroStrip — region heading (§5)', () => {
+  it.each([
+    ['all', 'Combined usage summary'],
+    ['claude', 'Claude week usage summary'],
+    ['codex', 'Codex cycle usage summary'],
+  ] as const)('names the %s region and gives it a level-2 heading', (source, name) => {
+    updateSnapshot(envWith());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source });
+    render(<HeroStrip />);
+
+    expect(screen.getByRole('region', { name })).toBeInTheDocument();
+    const heading = screen.getByRole('heading', { level: 2, name });
+    expect(heading.tagName).toBe('H2');
+    // Visually hidden: nothing about the hero's appearance changes.
+    expect(heading.className).toContain('sr-only');
   });
 });
 

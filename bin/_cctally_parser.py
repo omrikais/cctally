@@ -58,6 +58,24 @@ class CLIHelpFormatter(
         super().__init__(prog, **kwargs)  # type: ignore[arg-type]
 
 
+_PHYSICAL_PROVIDER_SOURCES = ("claude", "codex")
+
+
+def _analytics_source_choices() -> tuple[str, ...]:
+    """Return physical providers plus the provider-separated combined view."""
+    return (*_PHYSICAL_PROVIDER_SOURCES, "all")
+
+
+def _provider_display_names() -> str:
+    """Render the canonical physical-provider tuple for user-facing help."""
+    labels = tuple(source.title() for source in _PHYSICAL_PROVIDER_SOURCES)
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return " and ".join(labels)
+    return f"{', '.join(labels[:-1])}, and {labels[-1]}"
+
+
 def _argparse_has_arg(parser, option_string: str) -> bool:
     """Return True if ``parser`` already registered ``option_string``."""
     for action in parser._actions:
@@ -288,11 +306,12 @@ def _add_source_args(
     """Attach the source selector or pin a nested provider alias."""
     if fixed_source is None:
         parser.add_argument(
-            "--source", choices=("claude", "codex", "all"), default="claude",
-            help="Analytics provider: claude (default), codex, or all.",
+            "--source", choices=_analytics_source_choices(),
+            default=_PHYSICAL_PROVIDER_SOURCES[0],
+            help="Analytics provider.",
         )
     else:
-        if fixed_source not in {"claude", "codex"}:
+        if fixed_source not in _PHYSICAL_PROVIDER_SOURCES:
             raise ValueError(f"unsupported fixed source {fixed_source!r}")
         parser.set_defaults(source=fixed_source)
     if speed:
@@ -2717,8 +2736,9 @@ def _build_setup_parser(subparsers, name, *, help_text, xref=None):
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
                     """\
-                    Install cctally into Claude Code by adding hook entries to
-                    ~/.claude/settings.json (additive, idempotent) and creating
+                    Install cctally for local providers by adding Claude hook entries
+                    to ~/.claude/settings.json and native Codex handlers to every
+                    configured Codex home (all additive and idempotent). Also create
                     user-facing symlinks under ~/.local/bin/.
 
                     Modes (mutually exclusive):
@@ -2823,7 +2843,7 @@ def _build_transcript_parser(subparsers, name, *, help_text, xref=None):
         formatter_class=CLIHelpFormatter)
     t_search.add_argument("query", metavar="QUERY", help="Search text")
     t_search.add_argument(
-        "--source", choices=("claude", "codex"), default="claude",
+        "--source", choices=_PHYSICAL_PROVIDER_SOURCES, default="claude",
         help="Which provider's conversations to search (default: claude)")
     t_search.add_argument(
         "--account", metavar="REF", default=None,
@@ -3270,7 +3290,7 @@ def _build_hook_tick_parser(subparsers, name, *, help_text, xref=None):
                     help=argparse.SUPPRESS)  # JSON string fed to mock fetch (tests only)
     ht.add_argument("--foreground", action="store_true",
                     help=argparse.SUPPRESS)  # Codex native hook wrapper
-    ht.add_argument("--source", choices=("claude", "codex"), default="claude",
+    ht.add_argument("--source", choices=_PHYSICAL_PROVIDER_SOURCES, default="claude",
                     help=argparse.SUPPRESS)  # setup-managed native Codex hook
     ht.set_defaults(func=c.cmd_hook_tick)
 
@@ -3572,7 +3592,7 @@ _REGISTRATION = (
     _Reg('account', _build_account_parser, "Inspect per-provider account registry (list / show / label)", None, None),
     _Reg('telemetry', _build_telemetry_parser, "Show or change anonymous install-count telemetry", None, None),
     _Reg('alerts', _build_alerts_parser, "Manage threshold alerts", None, None),
-    _Reg('setup', _build_setup_parser, "Install cctally into Claude Code (hooks + symlinks)", None, None),
+    _Reg('setup', _build_setup_parser, "Install provider hooks/handlers + symlinks", None, None),
     _Reg('db', _build_db_parser, "Migration / DB management (status, skip, unskip)", None, None),
     _Reg('doctor', _build_doctor_parser, "Diagnose data freshness and install state", None, None),
     _Reg('pricing-check', _build_pricing_check_parser, "Detect stale or missing embedded model pricing", None, None),
@@ -3592,28 +3612,33 @@ _REGISTRATION = (
 
 def build_parser() -> argparse.ArgumentParser:
     c = _cctally()
+    providers = _provider_display_names()
+    source_choices = ",".join(_analytics_source_choices())
+    quick_start_reports = "\n".join(
+        f"  cctally report --source {source}"
+        for source in _PHYSICAL_PROVIDER_SOURCES
+    )
     p = argparse.ArgumentParser(
         prog="cctally",
         formatter_class=CLIHelpFormatter,
         description=textwrap.dedent(
-            """\
-            Track Claude subscription weekly usage percent and weekly cost
-            in a local SQLite database.
+            f"""\
+            Track {providers} subscription usage and local USD cost in SQLite.
 
             Data flow:
-              1) Claude Code status line captures rate limit data after each API call.
-              2) record-usage stores usage snapshots and triggers percent milestones.
-              3) sync-week computes weekly USD cost from Claude Code session data.
-              4) report computes dollars per 1% and shows trend history.
+              1) Claude Code hooks and status lines retain Claude usage and sessions.
+              2) Native Codex handlers retain Codex sessions and quota windows.
+              3) Provider-aware project, diff, range-cost, cache-report, and report
+                 commands accept --source {{{source_choices}}}.
+              4) Provider-native reports keep {providers} quota percentages and
+                 reset windows separate; `cctally codex quota` exposes Codex windows.
             """
         ),
-        epilog=textwrap.dedent(
-            """\
-            Quick start:
-              # Add record-usage call to ~/.claude/statusline-command.sh (see record-usage --help)
-              cctally sync-week
-              cctally report
-            """
+        epilog=(
+            "Quick start:\n"
+            "  cctally setup\n"
+            f"{quick_start_reports}\n"
+            "  cctally codex quota statusline"
         ),
     )
     p.add_argument(

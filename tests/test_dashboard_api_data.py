@@ -72,6 +72,9 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
         last_success_at=now,
         capabilities={"hero": CapabilityRecord("supported", "subscription-week")},
         data={"hero": {"cost_usd": 1.25, "total_tokens": 42}},
+        # #556 S1 §3.8: composition fails closed without an authoritative
+        # count, so an undecorated single account has to be stated.
+        account_scope={"real_account_count": 1},
     )
     codex = SourceDashboardState(
         source="codex",
@@ -82,6 +85,7 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
         last_success_at=now,
         capabilities={"hero": CapabilityRecord("supported", "calendar-week")},
         data={"hero": {"cost_usd": 0.0, "total_tokens": 0}},
+        account_scope={"real_account_count": 1},
     )
     snap.source_bundle = SourceDashboardBundle(
         source_schema_version=SOURCE_SCHEMA_VERSION,
@@ -99,10 +103,25 @@ def test_envelope_appends_frozen_source_bundle_without_changing_legacy_values():
     assert envelope["sources"]["claude"]["data"] == {
         "hero": {"cost_usd": 1.25, "total_tokens": 42},
     }
+    # #556 S1 §3.5: the Codex provider is `empty`, so its leg is explicit and
+    # the published figure is the Claude leg alone. Neither leg carries a
+    # period here — this snapshot publishes no cycle bounds.
     assert envelope["sources"]["all"]["data"]["combined"] == {
         "cost_usd": 1.25,
         "total_tokens": 42,
+        "legs": {
+            "claude": {"state": "current", "cost_usd": 1.25, "total_tokens": 42},
+            "codex": {"state": "empty", "cost_usd": 0.0, "total_tokens": 0},
+        },
+        "qualifications": [
+            {
+                "code": "provider_empty",
+                "message": "Codex has no accounting in its current cycle.",
+                "provider": "codex",
+            },
+        ],
     }
+    assert "combined_unavailable" not in envelope["sources"]["all"]["data"]
     json.dumps(envelope)
 
 

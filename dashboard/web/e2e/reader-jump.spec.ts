@@ -83,7 +83,11 @@ test('a transient drain request failure backs off and still lands the linked tur
   await settleScroller(page);
   await findJump(page, m.jump_target_needle);
 
+  // `toBeVisible` only proves the target MOUNTED — the backward walk is still
+  // scrolling toward it, so the reader-viewport geometry below must wait for the
+  // scroll to stop the way every other jump assertion in this file does.
   await expect(page.locator(uuidSel(m.jump_target_uuid))).toBeVisible({ timeout: 15_000 });
+  await settleScroller(page, READER_BODY, { anchorSel: uuidSel(m.jump_target_uuid) });
   expect(await turnVisibleInReader(page, m.jump_target_uuid), 'target visible after recovery').toBe(true);
   expect(failures, 'one failed attempt plus at least one recovered page').toBeGreaterThanOrEqual(2);
   await expect(page.getByTestId('conv-jump-load-failed')).toHaveCount(0);

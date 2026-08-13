@@ -54,10 +54,10 @@ def _read_prefix(high_water):
     inline exactly as `rebuild_stats_index` captures it. Before this, those were
     four separate whole-prefix traversals on top of this one (#496 S5 §4).
 
-    Every record stays decoded. Unlike the rebuild, the selector here feeds an
-    acknowledgement the repair command may then mint, and unlike the rebuild's
-    filtered retention there is no placeholder scheme to keep the `enumerate`
-    numbering identical — so the list is unfiltered, exactly as before.
+    Every decoded line contributes one selector slot. Decision records stay
+    decoded; observations and other irrelevant records become ``None``
+    placeholders, preserving the `enumerate` numbering that durable violation
+    fingerprints hash without retaining whole-prefix decoded history.
     """
     if high_water is None:
         return [], (), None, {}
@@ -106,7 +106,7 @@ def _read_prefix(high_water):
             and record.get("id") == _journal.CUTOVER_OP_ID
         ):
             cutover_captured = _journal._cutover_value_of(record)
-        records.append(record)
+        records.append(_lib_journal_router.selector_slot(record))
         prior_high_water = record_end
     prefix_hash = hasher.digest_at(high_water)
     # The accumulator buffers the segment it is reading — 410 MB on the
@@ -136,7 +136,8 @@ def _read_prefix(high_water):
     else:
         cutover_claude = cutover_captured
     for record in records:
-        _journal._normalize_legacy_account_stamp(record, cutover_claude)
+        if record is not None:
+            _journal._normalize_legacy_account_stamp(record, cutover_claude)
     return records, tuple(evidence), prefix_hash, audit_ends
 
 

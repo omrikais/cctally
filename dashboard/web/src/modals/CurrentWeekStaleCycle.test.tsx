@@ -41,13 +41,28 @@ function staleCycleEnv(): Envelope {
     b.sources.codex.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
     b.sources.all.domain_freshness = { hero: 'stale', quota: 'stale', sessions: 'fresh' };
     b.sources.all.availability = 'partial';
-    // What compose_all_state emits alongside retained combined actuals: an
-    // All-LOCAL warning, on the `all` source rather than either provider.
-    b.sources.all.warnings = [{
-      code: 'combined_totals_stale',
-      message: 'Codex quota evidence is stale; combined totals use retained actuals.',
-      domain: 'hero',
-    }];
+    // #556 S1 §4.2 — `combined_totals_stale` is retired. Stale Codex quota
+    // evidence does not withhold the figure and does not qualify it: the cycle
+    // still resolves and the actuals inside it are correct. What the modal must
+    // now show for this state is NOTHING about the combined figure.
+  });
+}
+
+// The state that DOES withhold the figure, so the modal has a reason to state.
+function withheldCombinedEnv(): Envelope {
+  return envWith((b) => {
+    b.sources.all.availability = 'partial';
+    b.sources.all.data!.combined = null;
+    b.sources.all.data!.combined_unavailable = {
+      code: 'multi_account_unsupported',
+      message: 'Claude has 2 accounts on separate cycles, so a combined total '
+        + 'is not published; see the per-account cards.',
+      causes: [{
+        provider: 'claude',
+        code: 'multi_account_unsupported',
+        detail: { account_count: 2 },
+      }],
+    };
   });
 }
 
@@ -105,21 +120,31 @@ describe('CurrentWeekModal — stale Codex cycle disclosure (#350)', () => {
     expect(container.querySelector('.mcw-mini')!.textContent).toContain('$12.30');
   });
 
-  it('replaces the per-provider note with an All-local visible marker and reason', () => {
+  it('says nothing about the combined figure while stale evidence bounds it', () => {
     const { container } = renderFor('all', staleCycleEnv());
 
     // The per-provider note stays suppressed when embedded (spec §3.7).
     expect(
       container.querySelector('[data-testid="codex-cycle-stale-note"]'),
     ).toBeNull();
-    // ...but the All-local reason must appear, or this modal is the one
-    // surface that shows a stale-evidence spend figure with zero disclosure.
+    // #556 B2/B3 — the figure is published and correct, so pairing it with an
+    // unavailability sentence would be false. This is the modal half of the
+    // hero's own assertion.
+    expect(
+      container.querySelector('[data-testid="all-current-week-reason"]'),
+    ).toBeNull();
+  });
+
+  it('states the named reason when the figure is WITHHELD', () => {
+    const { container } = renderFor('all', withheldCombinedEnv());
+
     const reason = container.querySelector('[data-testid="all-current-week-reason"]');
     expect(reason).not.toBeNull();
-    expect(reason!.textContent).toMatch(/combined totals use retained actuals/i);
-    const marker = container.querySelector('[data-testid="all-current-week-stale-marker"]');
-    expect(marker).toHaveTextContent(/stale quota/i);
-    expect(marker).toHaveAttribute('title', expect.stringMatching(/stale/i));
+    expect(reason!.textContent).toMatch(/2 accounts on separate cycles/i);
+    const marker = container.querySelector(
+      '[data-testid="all-current-week-withheld-marker"]');
+    expect(marker).toHaveTextContent(/combined withheld/i);
+    expect(marker).toHaveAttribute('title', expect.stringMatching(/2 accounts/));
   });
 
   it('renders no All-local reason when both provider cycles are fresh', () => {
@@ -166,8 +191,31 @@ describe('CurrentWeekModal — Codex ingest backlog disclosure (#456)', () => {
     expect(
       codexSection.querySelector('[data-testid="codex-cycle-stale-note"]'),
     ).toBeNull();
-    expect(container.querySelector('[data-testid="all-current-week-reason"]'))
-      .toHaveTextContent(/combined totals use retained actuals/i);
+  });
+
+  it('states the combined qualification from the wire, not the provider field', () => {
+    // #556 §4.3 inverse pair, at the modal. The provider field carries the
+    // backlog for the Codex section's own note; the All-level qualification is
+    // the one composition lifted, and only that reaches the combined figure.
+    const withQualification = withBacklog(envWith());
+    withQualification.sources!.all.data!.combined!.qualifications = [{
+      code: 'codex_ingest_backlog',
+      message: 'Codex has pending accounting to ingest, so its cycle total may '
+        + 'be incomplete.',
+      provider: 'codex',
+    }];
+    const { container } = renderFor('all', withQualification);
+
+    expect(container.querySelector('[data-testid="all-current-week-qualification"]'))
+      .toHaveTextContent(/pending accounting/i);
+  });
+
+  it('renders no combined qualification carried only by the provider field', () => {
+    const { container } = renderFor('all', withBacklog(envWith()));
+
+    expect(
+      container.querySelector('[data-testid="all-current-week-qualification"]'),
+    ).toBeNull();
   });
 
   it('omits the caveat and its element when the backlog field is absent', () => {

@@ -175,9 +175,12 @@ describe('decorated Claude hero disclosure (#423 items 15 and 21)', () => {
     const usage = screen.getByTestId('shared-hero-usage');
     const support = screen.getByTestId('shared-hero-support');
     expect(usage).not.toHaveTextContent('64.0%');
-    expect(usage).toHaveTextContent('CLAUDE 7-DAY · per account');
-    expect(support).not.toHaveTextContent('Claude quota64.0%');
-    expect(support).toHaveTextContent('Claude quotaper account');
+    // #556 S1 §5 — the block label names the cycle it covers, and the support
+    // zone's duplicated quota row became the provider's own spend leg. The
+    // decoration contract itself is unchanged: both still blank to per account.
+    expect(usage).toHaveTextContent('CLAUDE · WEEK · per account');
+    expect(support).toHaveTextContent('Claude · week to dateper account');
+    expect(screen.getByTestId('hero-claude-reset')).toHaveTextContent('per account');
     expect(screen.getByText(/Claude accounts — each has its own quota cycle/))
       .toBeInTheDocument();
     expect(screen.getByText('claude-main')).toBeInTheDocument();

@@ -150,6 +150,14 @@ for (const viewport of MATRIX) {
         message: LONG_HERO_WARNING,
       }];
       envelope.sources.all.data.combined = null;
+      // #556 S1 §3.5 — the v5 server always names its reason beside a withheld
+      // figure, so the browser case exercises the typed diagnostic rather than
+      // the legacy warning fallback (which its own unit test covers).
+      envelope.sources.all.data.combined_unavailable = {
+        code: 'codex_cycle_unavailable',
+        message: LONG_HERO_WARNING,
+        causes: [{ provider: 'codex', code: 'codex_cycle_unavailable' }],
+      };
     });
 
     await page.setViewportSize(viewport);
@@ -165,10 +173,48 @@ for (const viewport of MATRIX) {
     await selectSource(page, 'all');
     const warning = page.getByTestId('shared-hero-warning');
     await expect(warning).toBeVisible();
-    await expect(warning).toHaveText('Combined unavailable');
+    await expect(warning).toHaveText('Combined withheld');
     await expect(warning).toHaveAttribute('title', LONG_HERO_WARNING);
-    await expect(warning).toHaveAttribute('aria-label', `Combined totals unavailable: ${LONG_HERO_WARNING}`);
-    await expect(page.getByTestId('shared-hero-spent')).not.toContainText(LONG_HERO_WARNING);
+    await expect(warning).toHaveAttribute('aria-label', `Combined total withheld: ${LONG_HERO_WARNING}`);
+    // #556 S1 §5 — the reason is now rendered VISIBLY. It previously reached
+    // only a `title` on a non-interactive div, which is hover-only and so
+    // unreachable by touch at this very viewport.
+    //
+    // The shipped assertion this inverts protected the layout, and inverting it
+    // alone would have removed that protection: the reason wraps inside an
+    // `overflow: hidden` ancestor, so it grows the hero VERTICALLY, which no
+    // document-width check can see, and `toContainText` matches `textContent`
+    // without requiring the element to be visible at all. The four checks below
+    // replace what the inversion gave up.
+    const reason = page.getByTestId('hero-combined-reason');
+    await expect(reason).toContainText(LONG_HERO_WARNING);
+    await expect(reason).toBeVisible();
+    const reasonGeometry = await reason.evaluate((node) => {
+      const strip = node.closest('.hero-strip') as HTMLElement;
+      const own = node.getBoundingClientRect();
+      const outer = strip.getBoundingClientRect();
+      return {
+        clientWidth: node.clientWidth,
+        scrollWidth: node.scrollWidth,
+        clientHeight: node.clientHeight,
+        scrollHeight: node.scrollHeight,
+        containedX: own.left >= outer.left - 1 && own.right <= outer.right + 1,
+        containedY: own.top >= outer.top - 1 && own.bottom <= outer.bottom + 1,
+        stripHeight: outer.height,
+      };
+    });
+    expect(reasonGeometry.scrollWidth).toBeLessThanOrEqual(reasonGeometry.clientWidth + 1);
+    expect(reasonGeometry.scrollHeight).toBeLessThanOrEqual(reasonGeometry.clientHeight + 1);
+    expect(reasonGeometry.containedX).toBe(true);
+    expect(reasonGeometry.containedY).toBe(true);
+    // A ceiling on the withheld hero itself. The reason is the tallest thing
+    // this state adds, and the hero is the page's first card — a sentence that
+    // pushes the whole board below the fold is a regression no width check can
+    // report. Half the viewport is deliberately generous against the ~280px
+    // this state measures at 390x844: it is a blow-up guard for a sentence that
+    // stops wrapping or a zone that stops bounding it, not a pixel budget that
+    // a font-metric change should redden.
+    expect(reasonGeometry.stripHeight).toBeLessThanOrEqual(viewport.height * 0.5);
     await assertPageGeometry(page);
     await page.screenshot({ path: screenshotPath(viewport, 'all-bounded-warning'), fullPage: true });
   });
