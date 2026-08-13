@@ -576,11 +576,14 @@ def _resolve_one_account_budget_ref(
     import re as _re
     import _lib_accounts
     if not isinstance(ref, str) or not ref:
-        raise _BudgetConfigError(f"{label} keys must be non-empty strings")
+        raise _BudgetConfigError(
+            f"{label} keys must be non-empty strings", field=label
+        )
     if ref in (_lib_accounts.UNATTRIBUTED, _lib_accounts.VENDOR_WIDE):
         raise _BudgetConfigError(
             f"{label} cannot target the reserved {ref!r} bucket "
-            "(per-account budgets target real accounts only)"
+            "(per-account budgets target real accounts only)",
+            field=label,
         )
     if _re.fullmatch(r"[0-9a-f]{32}", ref):
         return ref  # already an immutable account_key
@@ -589,17 +592,19 @@ def _resolve_one_account_budget_ref(
             raise _BudgetConfigError(
                 f"{label}: cannot resolve account ref {ref!r} while stats.db "
                 "maintenance is in progress; retry after it completes or use "
-                "the 32-hex account key"
+                "the 32-hex account key",
+                field=label,
             )
         raise _BudgetConfigError(
             f"{label}: cannot resolve account ref {ref!r} — no accounts observed "
-            "yet; use the 32-hex account key"
+            "yet; use the 32-hex account key",
+            field=label,
         )
     try:
         return _lib_accounts.resolve_account_ref(conn, ref, provider)
     except _lib_accounts.AccountRefError:
         raise _BudgetConfigError(
-            f"{label}: unknown or ambiguous account ref {ref!r}"
+            f"{label}: unknown or ambiguous account ref {ref!r}", field=label
         )
 
 
@@ -662,9 +667,11 @@ def _parse_account_budget_value(raw_value: str, provider: str,
     try:
         parsed = json.loads(raw_value)
     except (json.JSONDecodeError, ValueError):
-        raise _BudgetConfigError(f"{label} must be a JSON object, got {raw_value!r}")
+        raise _BudgetConfigError(
+            f"{label} must be a JSON object, got {raw_value!r}", field=label
+        )
     if not isinstance(parsed, dict):
-        raise _BudgetConfigError(f"{label} must be a JSON object")
+        raise _BudgetConfigError(f"{label} must be a JSON object", field=label)
     return _normalize_account_budget_refs(parsed, provider, label)
 
 
@@ -678,7 +685,8 @@ def _parse_codex_budget_leaf_value(leaf: str, raw_value: str) -> object:
             return float(raw_value)
         except ValueError as exc:
             raise _BudgetConfigError(
-                "budget.codex.amount_usd must be a finite number > 0"
+                "budget.codex.amount_usd must be a finite number > 0",
+                field="budget.codex.amount_usd",
             ) from exc
     if leaf == "period":
         return raw_value.strip()
@@ -688,7 +696,10 @@ def _parse_codex_budget_leaf_value(leaf: str, raw_value: str) -> object:
             return True
         if normalized in {"false", "no", "off", "0"}:
             return False
-        raise _BudgetConfigError(f"budget.codex.{leaf} must be a boolean")
+        raise _BudgetConfigError(
+            f"budget.codex.{leaf} must be a boolean",
+            field=f"budget.codex.{leaf}",
+        )
     if leaf == "alert_thresholds":
         if not raw_value.strip():
             return []
@@ -699,10 +710,13 @@ def _parse_codex_budget_leaf_value(leaf: str, raw_value: str) -> object:
             except ValueError as exc:
                 raise _BudgetConfigError(
                     "budget.codex.alert_thresholds must be a comma-separated "
-                    "list of integers"
+                    "list of integers",
+                    field="budget.codex.alert_thresholds",
                 ) from exc
         return parsed
-    raise _BudgetConfigError(f"unknown Codex budget leaf {leaf!r}")
+    raise _BudgetConfigError(
+        f"unknown Codex budget leaf {leaf!r}", field=f"budget.codex.{leaf}"
+    )
 
 
 def _set_codex_budget_leaf(config: dict, key: str, raw_value: str) -> dict:
@@ -713,13 +727,17 @@ def _set_codex_budget_leaf(config: dict, key: str, raw_value: str) -> dict:
     becomes a partially repaired write.
     """
     if not key.startswith(_CODEX_BUDGET_LEAF_PREFIX):
-        raise _BudgetConfigError(f"unknown Codex budget leaf {key!r}")
+        raise _BudgetConfigError(
+            f"unknown Codex budget leaf {key!r}", field=key
+        )
     leaf = key.removeprefix(_CODEX_BUDGET_LEAF_PREFIX)
     if leaf not in CODEX_BUDGET_LEAVES:
-        raise _BudgetConfigError(f"unknown Codex budget leaf {key!r}")
+        raise _BudgetConfigError(
+            f"unknown Codex budget leaf {key!r}", field=key
+        )
     budget = config.get("budget")
     if budget is not None and not isinstance(budget, dict):
-        raise _BudgetConfigError("budget must be an object")
+        raise _BudgetConfigError("budget must be an object", field="budget")
     existing = (budget or {}).get("codex")
     if existing is None:
         # `accounts` (#341) is valid without a vendor-wide amount_usd, so it —
@@ -727,13 +745,15 @@ def _set_codex_budget_leaf(config: dict, key: str, raw_value: str) -> dict:
         if leaf not in ("amount_usd", "accounts"):
             raise _BudgetConfigError(
                 "budget.codex.amount_usd must be configured before setting "
-                f"budget.codex.{leaf}"
+                f"budget.codex.{leaf}",
+                field=f"budget.codex.{leaf}",
             )
         prospective: dict = {}
     else:
         if not isinstance(existing, dict):
             raise _BudgetConfigError(
-                f"budget.codex must be an object or null, got {type(existing).__name__}"
+                f"budget.codex must be an object or null, got {type(existing).__name__}",
+                field="budget.codex",
             )
         # Strictly validate first: malformed existing data must abort without
         # mutation, while valid unknown siblings retain the validator's
@@ -762,8 +782,8 @@ _QUOTA_RULE_KEYS = {
 }
 
 
-def _quota_alert_error(message: str) -> None:
-    raise _cctally_core._AlertsConfigError(message)
+def _quota_alert_error(message: str, *, field: str = "alerts.quota") -> None:
+    raise _cctally_core._AlertsConfigError(message, field=field)
 
 
 def _validate_quota_thresholds(name: str, value: object) -> list[int]:
@@ -795,7 +815,10 @@ def _get_quota_alerts_config(cfg: "dict | None") -> dict:
     if alerts is None:
         alerts = {}
     if not isinstance(alerts, dict):
-        _quota_alert_error("alerts must be an object")
+        # The helper's default names `alerts.quota`, which is right for every
+        # other call here and wrong for this one: the block that is not an
+        # object is `alerts` itself.
+        _quota_alert_error("alerts must be an object", field="alerts")
     quota = alerts.get("quota", {})
     if quota is None or not isinstance(quota, dict):
         _quota_alert_error("alerts.quota must be an object")
@@ -1316,7 +1339,7 @@ def _cmd_config_set(args: argparse.Namespace) -> int:
                 configured = _set_codex_budget_leaf(config, key, raw)
                 budget = config.get("budget")
                 if budget is not None and not isinstance(budget, dict):
-                    raise _BudgetConfigError("budget must be an object")
+                    raise _BudgetConfigError("budget must be an object", field="budget")
                 block = dict(budget or {})
                 block["codex"] = configured
                 config["budget"] = block
@@ -2206,13 +2229,14 @@ def _cmd_config_unset(args: argparse.Namespace) -> int:
                 config = _load_config_unlocked()
                 budget = config.get("budget")
                 if budget is not None and not isinstance(budget, dict):
-                    raise _BudgetConfigError("budget must be an object")
+                    raise _BudgetConfigError("budget must be an object", field="budget")
                 existing = (budget or {}).get("codex")
                 if existing is None:
                     return 0
                 if not isinstance(existing, dict):
                     raise _BudgetConfigError(
-                        f"budget.codex must be an object or null, got {type(existing).__name__}"
+                        f"budget.codex must be an object or null, got {type(existing).__name__}",
+                        field="budget.codex",
                     )
                 validated_existing = _validate_codex_budget_block(existing)
                 assert validated_existing is not None

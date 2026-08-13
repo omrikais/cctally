@@ -12,34 +12,91 @@ cctally config unset <key>
 
 ## Allowed keys
 
-| Key | Values | Default |
-|-----|--------|---------|
-| `dashboard.bind` | `loopback` (= `127.0.0.1`, default), `lan` (= `0.0.0.0`), or any literal host string (IPv4, IPv6, hostname). Resolution order: `--host` flag > config > default. Applies only at server startup. | `loopback` |
-| `dashboard.lan_auth` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Requires the per-run bearer token on every `/api/*` request when the dashboard binds to a non-loopback address. `true` (default) is fail-safe; set `false` only for a trusted LAN. Also toggleable from the dashboard Settings overlay. The running server keeps its startup access mode, so a change applies **only after restarting the dashboard**. | `true` |
-| `dashboard.expose_transcripts` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). The LAN opt-in for the conversation-viewer transcript endpoints. When `false` (default) those routes are served **only** over loopback; set `true` to also serve them on a LAN bind. Even then an anti-DNS-rebinding `Host` allowlist applies — see [`dashboard.md`](dashboard.md#conversation-viewer-endpoints-plan-2). | `false` |
-| `dashboard.cache_failure_markers` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the conversation-viewer cache-rebuild markers (the amber `⚡` chip on a turn that re-created the bulk of its cached prefix). `true` (default) shows them; set `false` to hide every marker, the outline landmark/jump button, and the stats count. Absence is treated as ON. Also toggleable from the dashboard settings modal. | `true` |
-| `dashboard.live_tail` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the conversation-viewer live-tail. `true` (default) lets the open reader follow an active session in near-real time via a dedicated per-conversation SSE stream (new turns within ~1s of the session's file changing); set `false` to fall back to the periodic 5-second snapshot tick. Absence is treated as ON. Also toggleable from the dashboard settings modal. See [`dashboard.md`](dashboard.md#live-tail). | `true` |
-| `telemetry.enabled` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). Opt-out for the anonymous install-count telemetry. `true` (default) sends an anonymous once-a-day install beat (a rotating monthly token + version + OS family); set `false` to disable it. Absence is treated as ON. Also disabled by `CCTALLY_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1`, and dev checkouts. `cctally telemetry off`/`on` is a thin wrapper over this key. See [`telemetry.md`](telemetry.md) and the full [`../telemetry.md`](../telemetry.md) privacy page. | `true` |
-| `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`) | `local` |
-| `update.channel` | `stable` or `beta` — the release channel `cctally update` tracks. `beta` receives every release as it ships; `stable` only the maintainer-promoted ones. Install-method-independent (Homebrew always tracks stable). Also toggleable from the dashboard settings modal. See [`update.md`](update.md#beta-channel). | `stable` |
-| `conversation.retention_days` | Positive integer, or `off` / `0` to disable (keep transcripts forever). How many days of conversation transcripts the dashboard/CLI retains before pruning them from `cache.db`; the underlying cost/usage history is never affected and transcripts are re-derivable from the JSONL. Config-only (not dashboard-mirrored). A malformed persisted value resolves to the `90` default. See [`cache-sync.md`](cache-sync.md#--prune-conversations) and [`db.md`](db.md#db-vacuum). | `90` |
-| `storage.artifact_retention` | JSON object bounding the on-disk evidence corruption recovery retains (quarantined incident directories, forensics bundles, rebuild records, and the backups `db repair` writes). Fields: `max_age_days`, `max_count_per_family`, `max_total_mib`, `min_free_mib` — each a positive integer, or `null` to disable that rule — and `max_shape_examples`, a positive integer that is **never** nullable because the last surviving example of a distinct damage shape is always kept. Omitted fields inherit their default, so you can write one field without restating the rest. At least one of `max_age_days`, `max_count_per_family` and `max_total_mib` must stay enabled. A malformed persisted block turns automatic reclamation OFF, FAILs `doctor`'s `db.retained_artifacts` leg, and makes both `cctally db prune` and `cctally db prune --yes` exit 2 without deleting anything — cctally never falls back to a policy you did not write. Unclassified, active or referenced evidence is never deleted under any policy. Config-only (not dashboard-mirrored). See [`db.md`](db.md#db-prune). | `{"max_age_days": 30, "max_count_per_family": 20, "max_total_mib": 4096, "min_free_mib": 10240, "max_shape_examples": 8}` |
-| `codex.hook.ingest_budget_seconds` | Positive number, strictly below 20 (Codex kills a hook at 30 seconds). The wall-clock ceiling on the native Codex hook's rollout-ingest leg — the hook stops at the deadline, records where it stopped, and resumes there on the next tick. Applies to the hook path ONLY: `cctally cache-sync --source codex` is unbudgeted and always runs to completion. A value at or above the cap is rejected (exit 2) rather than clamped; a malformed *persisted* value resolves to the default. Surfaced by `doctor`'s `data.codex_ingest_backlog` leg. Config-only (not dashboard-mirrored). | `5` |
-| `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. See [Alerts dispatch keys](#alerts-dispatch-keys). | `auto` |
-| `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. See [Alerts dispatch keys](#alerts-dispatch-keys). | `null` |
-| `budget.codex` | Whole Codex budget object, or `null` for no Codex budget. This compatibility key remains round-trippable; the leaf keys below are preferred for partial edits. | `null` |
-| `budget.codex.amount_usd` | Finite decimal strictly greater than zero. Writing it creates a missing Codex block with every default below. Unsetting it removes the whole Codex block. | `null` |
-| `budget.codex.period` | `calendar-week` or `calendar-month`; Codex never uses `subscription-week`. | `calendar-month` |
-| `budget.codex.alerts_enabled` | Boolean (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`). | `false` |
-| `budget.codex.alert_thresholds` | Comma-separated base-10 integers in `[1,100]`; values are sorted/deduplicated and an empty string means `[]`. | `90,100` |
-| `budget.codex.projected_enabled` | Boolean controlling the Codex projected-budget alert. | `false` |
+Every key `cctally config set` accepts, in the order the CLI's own allowlist
+declares them. `cctally config get` with no key prints the same set.
+
+The **Dashboard writable** column says what `POST /api/settings` does with the
+key, and it has three states rather than two:
+
+- **Yes** — the dashboard Settings overlay writes it, and a direct POST
+  persists it.
+- **Ignored** — the endpoint accepts the key, does not persist it, and now
+  reports it back in the response's `ignored_fields` array. Use
+  `cctally config set` to change it for real.
+- **No** — the endpoint rejects it with HTTP 400 and a `field` pointer. Some
+  of these are CLI-only because they hold secrets or arm destructive
+  behavior; others apply only at server startup.
+
+| Key | Values | Default | Dashboard writable | Notes |
+|-----|--------|---------|--------------------|-------|
+| `display.tz` | `local`, `utc`, or any IANA name (e.g. `America/New_York`). | `local` | Yes | The render zone for every subcommand that prints a clock instant, and the parse zone for naive `--since`/`--until` on the date-bucketing commands. A per-call `--tz` flag wins for that one invocation. See [How `display.tz` interacts with subcommands](#how-displaytz-interacts-with-subcommands). |
+| `alerts.enabled` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). | `false` | Yes | The master switch for threshold alerts. See [`alerts.md`](alerts.md). |
+| `alerts.projected_enabled` | Boolean. | `false` | Yes | Opt-in for projected-pace alerts, so an upgrade fires no surprise notifications. See [`alerts.md`](alerts.md). |
+| `alerts.notifier` | `auto`, `osascript`, `notify-send`, `command`, `none` — the OS-popup backend for threshold alerts. | `auto` | Yes | See [Alerts dispatch keys](#alerts-dispatch-keys). |
+| `alerts.command_template` | JSON: a non-empty list of argv strings (e.g. `["notify-send","{title}","{body}"]`) or `null` to clear. | `null` | No | Trusted local command execution, and it routinely holds secrets, so the dashboard refuses it and redacts it from every echo as the boolean `command_configured`. See [Alerts dispatch keys](#alerts-dispatch-keys). |
+| `alerts.quota` | JSON object with `enabled`, `actual_thresholds`, `projected_thresholds` and `rules`. | `{"enabled": false, "actual_thresholds": [90, 95], "projected_thresholds": [], "rules": []}` | No | The Codex quota alert axis. The block is absent from `config.json` until you write it, and disabled until `enabled` is true. Written as a whole object from the CLI. See [`codex-quota.md`](codex-quota.md). |
+| `dashboard.bind` | `loopback` (= `127.0.0.1`), `lan` (= `0.0.0.0`), or any literal host string (IPv4, IPv6, hostname). Resolution order: `--host` flag > config > default. | `loopback` | No | Applies only at server startup, so the running server keeps its bind. See [`dashboard.md`](dashboard.md). |
+| `dashboard.expose_transcripts` | Boolean (`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`). The LAN opt-in for the conversation-viewer transcript endpoints. When `false` those routes are served **only** over loopback. | `false` | No | A privacy gate, not live-mutable. Even when `true` an anti-DNS-rebinding `Host` allowlist applies — see [`dashboard.md`](dashboard.md#conversation-viewer-endpoints-plan-2). |
+| `dashboard.cache_failure_markers` | Boolean. Opt-out for the conversation-viewer cache-rebuild markers (the amber `⚡` chip on a turn that re-created the bulk of its cached prefix). Absence is treated as ON. | `true` | Yes | `false` hides every marker, the outline landmark/jump button, and the stats count. Also toggleable from the dashboard settings modal. |
+| `dashboard.live_tail` | Boolean. Opt-out for the conversation-viewer live-tail. Absence is treated as ON. | `true` | Yes | `true` lets an open reader follow an active session within ~1s via a per-conversation SSE stream; `false` falls back to the 5-second snapshot tick. See [`dashboard.md`](dashboard.md#live-tail). |
+| `dashboard.lan_auth` | Boolean. Requires the per-run bearer token on every `/api/*` request when the dashboard binds to a non-loopback address. | `true` | Yes | `true` is fail-safe; set `false` only for a trusted LAN. The running server keeps its startup access mode, so a change applies **only after restarting the dashboard**. |
+| `update.check.enabled` | Boolean (a JSON boolean over the API; a string is rejected). | `true` | Yes | Whether the background update check runs at all. See [`update.md`](update.md). |
+| `update.check.ttl_hours` | Integer in `[1, 720]`. A JSON integer, not a string; a boolean is rejected because `bool` is an `int` subclass. | `24` | Yes | How long one update-check result is reused before the next check. See [`update.md`](update.md). |
+| `update.channel` | `stable` or `beta` — the release channel `cctally update` tracks. `beta` receives every release as it ships; `stable` only the maintainer-promoted ones. | `stable` | Yes | Install-method-independent (Homebrew always tracks stable). Also toggleable from the dashboard settings modal. See [`update.md`](update.md#beta-channel). |
+| `statusline.visual_burn_rate` | `off`, `emoji`, `text`, `emoji-text`. | `off` | No | The segment-3 visual indicator; the `-B`/`--visual-burn-rate` flag wins per call. See [`statusline.md`](statusline.md). |
+| `statusline.cost_source` | `auto`, `cctally`, `cc`, `both`. The legacy `ccusage` value is rejected with a rename hint. | `auto` | No | Which session-cost source the status line renders. See [`statusline.md`](statusline.md). |
+| `statusline.cctally_extensions` | Boolean (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`). | `true` | No | Appends or suppresses the cctally extension segment. See [`statusline.md`](statusline.md). |
+| `statusline.usage_only` | Boolean. | `false` | No | Renders only the `5h X% · 7d Y%` subscription percentages. See [`statusline.md`](statusline.md). |
+| `budget.weekly_usd` | A finite number greater than zero, or `null` for no budget. | `null` | Yes | The Claude equivalent-spend budget. See [`budget.md`](budget.md). |
+| `budget.alerts_enabled` | Boolean. | `true` | Yes | On when a budget is set. See [`budget.md`](budget.md). |
+| `budget.alert_thresholds` | Comma-separated base-10 integers in `[1,100]`; values are sorted and deduplicated, and an empty string means `[]` (silenced). | `90,100` | Yes | The percentages of the budget that fire an alert. See [`budget.md`](budget.md). |
+| `budget.projected_enabled` | Boolean. | `false` | Yes | Opt-in for the projected-pace budget alert. See [`budget.md`](budget.md). |
+| `budget.period` | `subscription-week`, `calendar-week`, or `calendar-month`. | `subscription-week` | Ignored | The dashboard accepts this leaf and runs the same forward-only reconcile the CLI does, but never stores it — the response discloses that in `ignored_fields`. Set it with `cctally config set`. See [`budget.md`](budget.md). |
+| `budget.projects` | JSON object of `{canonical git-root path: usd}`; each value a finite number greater than zero. | `{}` | No | Per-project weekly budgets, CLI-only. See [`budget.md`](budget.md). |
+| `budget.project_alerts_enabled` | Boolean. | `false` | Yes | Opt-in for per-project budget alerts. See [`budget.md`](budget.md). |
+| `budget.accounts` | JSON object of `{account ref: usd}`; each value a finite number greater than zero. | `{}` | No | Per-account Claude budgets. Refs are resolved to immutable account keys at write time, which is why this is CLI-only. See [`account.md`](account.md). |
+| `budget.codex` | Whole Codex budget object, or `null` for no Codex budget. | `null` | No | This compatibility key remains round-trippable; the leaf keys below are preferred for partial edits. See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.amount_usd` | Finite decimal strictly greater than zero. | `null` | Ignored | Writing it creates a missing Codex block with every default below; unsetting it removes the whole block. Amounts are never invented from a browser, so the endpoint accepts and drops this leaf. See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.period` | `calendar-week` or `calendar-month`; Codex never uses `subscription-week`. | `calendar-month` | Ignored | Accepted and dropped by the dashboard, like every other CLI-only Codex leaf. See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.alerts_enabled` | Boolean (`true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0`). | `false` | Yes | Over the API this must be a JSON boolean; a string is rejected exactly as its Claude sibling is. See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.alert_thresholds` | Comma-separated base-10 integers in `[1,100]`; sorted and deduplicated, empty string means `[]`. | `90,100` | Ignored | Accepted and dropped by the dashboard. See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.projected_enabled` | Boolean controlling the Codex projected-budget alert. | `false` | Yes | See [Codex budget leaf writes](#codex-budget-leaf-writes). |
+| `budget.codex.accounts` | JSON object of `{account ref: usd}`; each value a finite number greater than zero. | `{}` | No | Per-account Codex budgets. Refs are resolved to immutable account keys at write time. See [`account.md`](account.md). |
+| `telemetry.enabled` | Boolean. Opt-out for the anonymous install-count telemetry; absence is treated as ON. | `true` | No | Also disabled by `CCTALLY_DISABLE_TELEMETRY=1`, `DO_NOT_TRACK=1`, and dev checkouts. `cctally telemetry off`/`on` is a thin wrapper over this key. See [`telemetry.md`](telemetry.md) and the [privacy page](../telemetry.md). |
+| `conversation.retention_days` | Positive integer, or `off` / `0` to keep transcripts forever. | `90` | No | How many days of conversation transcripts are retained in `cache.db`. Cost and usage history is never affected, and transcripts are re-derivable from the JSONL. A malformed persisted value resolves to the default. See [`cache-sync.md`](cache-sync.md#--prune-conversations) and [`db.md`](db.md#db-vacuum). |
+| `storage.artifact_retention` | JSON object bounding the on-disk evidence corruption recovery retains. Fields: `max_age_days`, `max_count_per_family`, `max_total_mib`, `min_free_mib` — each a positive integer or `null` to disable that rule — and `max_shape_examples`, a positive integer that is **never** nullable. Omitted fields inherit their default. At least one of `max_age_days`, `max_count_per_family` and `max_total_mib` must stay enabled. | `{"max_age_days": 30, "max_count_per_family": 20, "max_total_mib": 4096, "min_free_mib": 10240, "max_shape_examples": 8}` | No | A destructive-retention policy, managed through `cctally config` and `cctally db prune`, and never browser-writable. A malformed persisted block turns automatic reclamation OFF, FAILs `doctor`'s `db.retained_artifacts` leg, and makes `cctally db prune` exit 2 without deleting anything — cctally never falls back to a policy you did not write. Unclassified, active or referenced evidence is never deleted under any policy. See [`db.md`](db.md#db-prune). |
+| `codex.hook.ingest_budget_seconds` | Positive number, strictly below 20 (Codex kills a hook at 30 seconds). A value at or above the cap is rejected (exit 2) rather than clamped. | `5` | No | The wall-clock ceiling on the native Codex hook's rollout-ingest leg: the hook stops at the deadline, records where it stopped, and resumes there next tick. Applies to the hook path ONLY — `cctally cache-sync --source codex` always runs to completion. A malformed persisted value resolves to the default. Surfaced by `doctor`'s `data.codex_ingest_backlog` leg. |
+
+`cache_report.anomaly_threshold_pp` is deliberately **not** in this table. The
+dashboard writes it and both the dashboard and the TUI read it, but it is not
+a `cctally config set` key and the `cache-report` CLI does not read it — see
+[`cache-report.md`](cache-report.md#anomaly-threshold-sources).
+
+`tests/test_config_documentation.py` ties this table to the runtime: the keys
+and their order come from the CLI's allowlist, the **Dashboard writable**
+column from the endpoint's own disposition map, and every default the code can
+hand over is compared against its cell. Adding a config key without adding a
+row here fails that check.
 
 ## Examples
+
+Bare `cctally config get` prints one `key=value` line for every key in the
+table above, resolved to its effective value:
 
 ```bash
 cctally config get
 # display.tz=local
+# alerts.enabled=false
+# alerts.projected_enabled=false
+# alerts.notifier=auto
+# alerts.command_template=null
+# ... one line per allowed key, in the same order as the table ...
+# codex.hook.ingest_budget_seconds=5.0
+```
 
+Pass a key to print just that one:
+
+```bash
 cctally config set display.tz America/New_York
 cctally config get display.tz
 # display.tz=America/New_York
@@ -206,14 +263,37 @@ the dashboard without `--tz` to re-enable Settings-driven changes.
 
 ## Dashboard mirror
 
-The web dashboard's Settings overlay (`s` key) mirrors `display.tz` and the
-dashboard preferences. Its **Require LAN access token** toggle controls
+`POST /api/settings` accepts six blocks: `display`, `alerts`, `budget`,
+`dashboard`, `update`, and `cache_report`. The **Dashboard writable** column
+in [Allowed keys](#allowed-keys) is the per-key authority — the Settings
+overlay itself sends only a subset of what the endpoint accepts, so the
+column describes the endpoint, not the current overlay.
+
+The overlay's **Require LAN access token** toggle controls
 `dashboard.lan_auth`; saving it does not alter the running server, and the
 new access mode begins only after the dashboard restarts. Saving hits
 `POST /api/settings` (gated by Origin-vs-Host parity CSRF; see
 [`docs/commands/dashboard.md`](dashboard.md#threat-model)); the change
-propagates to all open tabs via SSE within ~100ms. Disabled while pinned
-by a startup `--tz` (see "Dashboard pin behavior" above).
+propagates to all open tabs via SSE within ~100ms. The display form is
+disabled while pinned by a startup `--tz` (see "Dashboard pin behavior"
+above).
+
+Three rules govern what the endpoint does with a key you send it:
+
+- A key marked **Yes** is validated and persisted.
+- A key marked **Ignored** answers `200` and appears in the response's
+  `ignored_fields` array, a sorted list of the accepted-but-not-persisted
+  paths in that request. The field is omitted entirely when the request
+  contained none, so an ordinary save is unchanged.
+- Any other path answers `400` with `{"error": ..., "field": "<dotted
+  path>"}`. Whole-document failures — a body over 4 KB, an empty body,
+  malformed JSON, a payload that is not an object, or an object naming no
+  known block — use `"$"` as the field.
+
+A named block carrying no leaves is a no-op that still echoes that block, so
+a combined save may include `{"cache_report": {}}` for a tab the user never
+opened without clobbering anything. `{"display": {}}` is the one exception:
+`display.tz` is required, so it answers `400`.
 
 ## Display timezone behavior
 
@@ -230,13 +310,9 @@ For the parse-time tz rules on `--since`/`--until` and friends, see the per-subc
 
 - `cctally config: invalid IANA zone '<X>'` (exit 2) — the value is
   neither `local` nor `utc` nor a recognized IANA name.
-- `cctally config: unknown config key '<X>'` (exit 2) — the key is not
-  in the allowlist (`display.tz`, `dashboard.bind`,
-  `dashboard.lan_auth`, `dashboard.expose_transcripts`,
-  `dashboard.cache_failure_markers`, `dashboard.live_tail`,
-  `telemetry.enabled`, the `alerts.*` keys
-  including `alerts.notifier` / `alerts.command_template`, the `statusline.*`
-  keys, the `budget.*` keys, and the `update.check.*` keys).
+- `cctally config: unknown config key '<X>'` (exit 2) — the key is not one
+  of the keys listed under [Allowed keys](#allowed-keys). That table is the
+  allowlist; nothing outside it is settable.
 - `cctally: alerts config error: <detail>` (exit 2) — an
   `alerts.notifier` / `alerts.command_template` value failed validation
   (bad enum, malformed template, or `notifier='command'` with no

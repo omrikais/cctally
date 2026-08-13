@@ -37,47 +37,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import journal_fixture_496_s4 as F
 
 
-#: Spec §6.3 pre-commits a 20-second ceiling on the cache-leg flock hold AT
-#: PRODUCTION SCALE, over the 1,954,007-line journal measured in §2.2.
-_PRODUCTION_LOCK_CEILING_S = 20.0
-_PRODUCTION_JOURNAL_LINES = 1_954_007
-#: The constant term of the Tier 1 ceiling. Asserting the raw 20 s against a
-#: 12,000-line fixture — 1/163rd of the production journal — could not fail even
-#: for a leg already breaching the ceiling in production, which is why §8.3 asks
-#: for the ceiling "scaled to fixture size".
-#:
-#: WHY THE CONSTANT DOMINATES AT THIS SIZE, AND WHY IT HAS TO. The production
-#: ceiling implies a budget of 10.2 us per journal line, which over this fixture
-#: is only 0.12 s. The leg does not run at that rate here: measured three times
-#: on both LAN runners, the hold is 1.08-1.16 s over 12,053 lines and 1.98-2.06
-#: s over 23,153, which fits 0.23 s of fixed cost plus 80 us per observation
-#: against production's 9.2 us. The gap is scale, not a defect — production
-#: replays 1.81M observations into a large warm cache.db in one transaction,
-#: while this fixture pays fresh-index costs on a small one. A purely
-#: proportional bound would therefore fail on every run.
-#:
-#: 6.0 s is three times the worst hold observed at the larger of the two
-#: fixtures, which is the binding one. That leaves a 3.0x margin there and 5.3x
-#: at the smaller one, against the 9.7x and 17.2x the flat 20 s left — so the
-#: gate now fails a leg that costs three times what this one does. It will NOT
-#: detect a few percent of drift, and it is not meant to: what it exists to
-#: catch is the structural regression §6.2 refuted, where file input or a second
-#: traversal moves inside the flocks and multiplies the hold rather than nudging
-#: it. The margin is sized for the LAN runners' variable load, because this
-#: repository treats a flaky test as a defect worth filing.
-_TIER1_LOCK_FIXED_S = 6.0
+#: `quotaLockHoldSeconds` is reported in the opt-in Tier 2 output and must not
+#: become an assertion. `bench/README.md` states that rule; the flock property
+#: it would be measuring is asserted structurally in `tests/test_quota_journal.py`.
 
-
-def _lock_ceiling(dump) -> float:
-    """The §6.3 ceiling at this dump's own size, plus the constant term.
-
-    Scaled per dump rather than per fixture, because the slope gate's doubled
-    fixture is nearly twice the size of the base one and must be judged against
-    its own line count.
-    """
-    lines = dump["shape"]["total_lines"]
-    return _TIER1_LOCK_FIXED_S + (
-        _PRODUCTION_LOCK_CEILING_S * lines / _PRODUCTION_JOURNAL_LINES)
 #: Per-observation allocation that survives to the peak BEYOND the encoded byte
 #: length of the retained line. Measured on this fixture at roughly 986 bytes,
 #: of which about 41 is the `bytes` object header plus the list slot and the
@@ -210,16 +173,6 @@ def test_peak_allocation_grows_only_by_the_added_observation_bytes(tier1_slope):
         f"peak allocation grew {growth} bytes for {added_records} added "
         f"observations totalling {added_bytes} encoded bytes; allowance "
         f"{allowance}")
-
-
-def test_the_cache_leg_flock_hold_stays_within_the_ceiling(tier1_slope):
-    for dump in tier1_slope:
-        held = dump["quota_lock_hold_seconds"]
-        ceiling = _lock_ceiling(dump)
-        assert held <= ceiling, (
-            f"cache-leg flock hold {held:.3f}s over "
-            f"{dump['shape']['total_lines']} lines exceeds the scaled "
-            f"§6.3 ceiling of {ceiling:.3f}s")
 
 
 # ==========================================================================

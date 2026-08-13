@@ -9290,7 +9290,7 @@ def _process_start_identity(pid: int) -> "str | None":
             stderr=subprocess.DEVNULL,
             text=True,
             check=False,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
         )
     except OSError:
         return None

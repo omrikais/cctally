@@ -27,8 +27,9 @@ CLI:
 cctally config set alerts.enabled true
 ```
 
-Or in the dashboard: open Settings (`s`) → **Threshold alerts** → check
-**Enable threshold alerts**. The dashboard mirrors via `POST
+Or in the dashboard: open Settings (`s`) → **Alerts** → **Claude alerts**
+→ check **Enable threshold alerts**. The overlay has a filter, so typing
+`alerts.enabled` finds the row directly. The dashboard mirrors via `POST
 /api/settings`; both paths share the same `config.json` writer lock.
 
 ## Defaults
@@ -71,7 +72,8 @@ The notifier is resolved the same way a real crossing resolves it (see
 host. This line is informational — it prints even when the dispatch
 itself produces no OS popup (`notifier: none`).
 
-Or click **Send test alert** in the dashboard Settings overlay; the
+Or click **Send test alert** in the dashboard Settings overlay, under
+**Alerts**; the
 backend's `POST /api/alerts/test` echoes the synthetic payload back so
 the dashboard can render a toast even if no native notifier is available.
 

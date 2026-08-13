@@ -487,16 +487,26 @@ def _get_oauth_usage_config(cfg: dict) -> dict:
 # Statusline cache bust + freshness + rate-limit handler
 # =========================================================================
 
-_STATUSLINE_OAUTH_CACHE = "/tmp/claude-statusline-usage-cache.json"
+# Kept as a module alias for backward compatibility with readers that import
+# the name. The AUTHORITATIVE value is _cctally_core.STATUSLINE_OAUTH_CACHE_PATH,
+# resolved at CALL time below.
+_STATUSLINE_OAUTH_CACHE = _cctally_core.STATUSLINE_OAUTH_CACHE_PATH
 
 
-def _bust_statusline_cache(path: str = _STATUSLINE_OAUTH_CACHE) -> str:
+def _bust_statusline_cache(path: str | None = None) -> str:
     """Best-effort delete of the statusline OAuth cache file.
 
     Returns one of: ``"busted"`` (file existed and was removed),
     ``"absent"`` (file did not exist), ``"error"`` (delete failed for
     a non-FileNotFoundError reason — logged via eprint, does NOT raise).
+
+    ``path`` defaults to None and is resolved from the kernel here rather than
+    in the signature: a default argument binds at import, so it could not be
+    redirected by patching either constant, and the only defence was a stub
+    replacing this whole function at each of ten call sites (#529 S4).
     """
+    if path is None:
+        path = _cctally_core.STATUSLINE_OAUTH_CACHE_PATH
     try:
         os.remove(path)
         return "busted"

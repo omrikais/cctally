@@ -1283,6 +1283,14 @@ def _share_source_selection(req: dict) -> tuple[str, bool]:
     return source, explicit
 
 
+def _share_json_bool(payload: dict, key: str, *, default: bool = False) -> bool:
+    """Read a strict JSON boolean instead of applying Python truthiness."""
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise TypeError(key)
+    return value
+
+
 _ACCOUNT_KEY_RE = re.compile(r"[0-9a-f]{32}|unattributed|\*")
 
 
@@ -2182,6 +2190,14 @@ def _handle_share_render_post_impl(handler) -> None:
             "field": "options.theme",
         })
         return
+    try:
+        reveal = _share_json_bool(options, "reveal_projects")
+    except TypeError:
+        handler._respond_json(400, {
+            "error": "reveal_projects must be a boolean",
+            "field": "options.reveal_projects",
+        })
+        return
     # `top_n` may be explicit-null when the UI's Top-N input is
     # cleared (Knobs.tsx:43); treat null as "use template default"
     # rather than 400-ing every preview/export until the user types
@@ -2258,7 +2274,6 @@ def _handle_share_render_post_impl(handler) -> None:
     # a default belongs here; it must resolve to anonymize, matching
     # /api/share/compose, which already defaulted closed. The kernel itself
     # has no default at all, so a fourth site cannot get this wrong.
-    reveal = bool(options.get("reveal_projects", False))
     # No pre-scrub: the kernel's `render()` / `compose()` own the privacy
     # contract and require RAW snapshots (#503 S1). Pre-scrubbing here
     # renumbers aliases on the legacy path, and in the `source=all` branch it
@@ -2409,7 +2424,14 @@ def _handle_share_compose_post_impl(handler) -> None:
     theme = req.get("theme", "light")
     fmt = req.get("format", "html")
     no_branding = bool(req.get("no_branding", False))
-    reveal_projects = bool(req.get("reveal_projects", False))
+    try:
+        reveal_projects = _share_json_bool(req, "reveal_projects")
+    except TypeError:
+        handler._respond_json(400, {
+            "error": "reveal_projects must be a boolean",
+            "field": "reveal_projects",
+        })
+        return
     sections_in = req.get("sections")
     if not isinstance(title, str) or not title:
         handler._respond_json(400, {"error": "missing title", "field": "title"})
@@ -2769,7 +2791,13 @@ def _handle_share_presets_post_impl(handler) -> None:
     # #503 S3 §1. Absent means false, which is the fail-safe direction and is
     # what makes this compatible with a caller written before the field
     # existed: an unwitting save can no longer destroy a stored recipe.
-    overwrite = bool(req.get("overwrite", False))
+    try:
+        overwrite = _share_json_bool(req, "overwrite")
+    except TypeError:
+        handler._respond_json(400, {
+            "error": "overwrite must be a boolean", "field": "overwrite",
+        })
+        return
 
     saved_at = _share_now_utc_iso()
     record = {
@@ -2867,7 +2895,13 @@ def _handle_share_presets_rename_post_impl(handler) -> None:
     panel = req.get("panel")
     from_name = req.get("from_name")
     to_name = req.get("to_name")
-    overwrite = bool(req.get("overwrite", False))
+    try:
+        overwrite = _share_json_bool(req, "overwrite")
+    except TypeError:
+        handler._respond_json(400, {
+            "error": "overwrite must be a boolean", "field": "overwrite",
+        })
+        return
 
     if not isinstance(panel, str) or not panel:
         handler._respond_json(400, {

@@ -1,0 +1,41 @@
+{
+  "note": "#513 S2 Task 11. Every one of the 94 baseline cases maps to a survivor in the three canonical suites. 90 map by exact callback hash. The four below map by fully-qualified name with a deliberate, minimal edit, recorded here because a deletion is not allowed on matching assertion text alone.",
+  "equivalences": [
+    {
+      "qualifiedName": "<SettingsOverlay /> > `s` is a no-op while a modal is open (no stacked overlay)",
+      "from": "__tests__/SettingsOverlay.test.tsx",
+      "to": "src/components/SettingsOverlay.test.tsx",
+      "setup": "identical",
+      "stimulus": "identical",
+      "assertions": "identical",
+      "edit": "The in-body `await import('../src/store/store')` became `'../store/store'`, because the file moved one directory closer to the module. Nothing else in the callback changed."
+    },
+    {
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > renders read-only threshold summary line from alertsConfig (spec §8.1)",
+      "from": "__tests__/SettingsOverlay.test.tsx",
+      "to": "src/components/SettingsOverlay.test.tsx",
+      "setup": "identical",
+      "stimulus": "identical",
+      "assertions": "identical",
+      "edit": "Same single import-specifier rewrite as above."
+    },
+    {
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > test alert button surfaces toast AND error when dispatch returns spawn_error",
+      "from": "__tests__/SettingsOverlay.test.tsx",
+      "to": "src/components/SettingsOverlay.test.tsx",
+      "setup": "identical",
+      "stimulus": "identical",
+      "assertions": "same two facts — the toast still surfaces AND the error text still contains 'spawn_error' — read from a different element",
+      "edit": "The selector moved from `.modal-error` to `.settings-error-summary`. §2.3 protocol 3 moved the test action's output to the persistent error region, because a response can arrive after its row has been filtered away."
+    },
+    {
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > renders both toggles disabled + a CLI hint when no Codex budget is configured",
+      "from": "src/components/SettingsOverlay.test.tsx",
+      "to": "src/components/SettingsOverlay.test.tsx",
+      "setup": "identical",
+      "stimulus": "identical",
+      "assertions": "same three facts, with the third scoped",
+      "edit": "The `cctally budget set 200 --vendor codex` assertion is scoped to the Codex fieldset with `within(...)`. The CLI-only manifest rows added in Task 7 legitimately name the same command, so the unscoped query now matches more than one node."
+    }
+  ]
+}

@@ -1037,6 +1037,62 @@ def test_a_codex_blocks_artifact_states_a_full_iso_block_start(tmp_path, monkeyp
     assert "May" not in cell.text
 
 
+@pytest.mark.parametrize(
+    "zone,now,start_at,resets_at,expected_facts",
+    [
+        (
+            "America/New_York",
+            dt.datetime(2026, 5, 8, 6, 0, tzinfo=UTC),
+            dt.datetime(2026, 5, 7, 2, 0, tzinfo=UTC),
+            dt.datetime(2026, 5, 7, 7, 0, tzinfo=UTC),
+            "_2026-05-07 → 2026-05-08 (America/New\\_York)_",
+        ),
+        (
+            "Asia/Tokyo",
+            dt.datetime(2026, 5, 7, 10, 0, tzinfo=UTC),
+            dt.datetime(2026, 5, 7, 13, 0, tzinfo=UTC),
+            dt.datetime(2026, 5, 8, 18, 0, 0, 500000, tzinfo=UTC),
+            "_2026-05-07 → 2026-05-08 (Asia/Tokyo)_",
+        ),
+    ],
+)
+def test_codex_blocks_frontmatter_contains_every_printed_instant_outside_utc(
+        zone, now, start_at, resets_at, expected_facts, tmp_path, monkeypatch):
+    """The reachable #528 surface pins both offset directions."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    ls = ns["_share_load_lib"]()
+    share = ns["_load_sibling"]("_cctally_dashboard_share")
+    state = _m5_blocks_state(now)
+    block = {
+        **state.data["quota"]["blocks"][0],
+        "start_at": start_at.isoformat(),
+        "resets_at": resets_at.isoformat(),
+    }
+    data = dict(state.data)
+    data["quota"] = {**data["quota"], "blocks": (block,)}
+    state = replace(state, data=data)
+    snap = share._build_codex_source_share_snapshot(
+        ls, state=state, panel="blocks", template_id="blocks-recap",
+        options={"format": "md", "theme": "light",
+                 "reveal_projects": False, "display_tz": zone},
+    )
+
+    markdown = ls.render(
+        snap, format="md", theme="light", branding=True,
+        reveal_projects=False)
+    period_line = next(
+        line.removeprefix("period: ") for line in markdown.splitlines()
+        if line.startswith("period: "))
+    raw_start, raw_end = period_line.split("..", 1)
+    bound_start = dt.datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+    bound_end = dt.datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+
+    assert bound_start <= start_at <= bound_end
+    assert bound_start <= resets_at <= bound_end
+    assert expected_facts in markdown
+
+
 @pytest.mark.parametrize("row,expected", [
     # No usable start AND no reset: nothing identifies the row.
     ({"label": "13:00 May 07 UTC"}, None),

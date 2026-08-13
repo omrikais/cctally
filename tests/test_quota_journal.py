@@ -1231,6 +1231,88 @@ class _LockTracker:
         return self
 
 
+class _JournalIOWatch:
+    """Journal opens, and which of them happened while a cache flock was held.
+
+    `os.open` is intercepted alongside `builtins.open` because the journal
+    readers in `bin/_cctally_journal.py` use it directly — segment append at
+    `:446` and `:546`, segment read at `:9868` — and a `builtins.open` patch
+    cannot see any of them. `journal_opens` is the count that makes an empty
+    `violations` list mean something.
+    """
+
+    _SUFFIX = ".jsonl"
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.journal_opens = 0
+        self.violations: list = []
+        # A journal segment, and nothing else. Any `.jsonl`, `.ndjson` or `.log`
+        # counted as one, so the `journal_opens > 0` reading that makes an empty
+        # `violations` list mean something could have been satisfied by a log
+        # file the replay never read from the journal at all.
+        self.prefix = importlib.import_module("_lib_journal").SEGMENT_PREFIX
+
+    def _note(self, path) -> None:
+        try:
+            text = os.fsdecode(path)
+        except TypeError:
+            return  # An open relative to a directory fd, not a path.
+        name = os.path.basename(text)
+        if not (name.startswith(self.prefix) and name.endswith(self._SUFFIX)):
+            return
+        self.journal_opens += 1
+        if self.tracker.held:
+            self.violations.append("opened %s under the flocks" % text)
+
+    def install(self, monkeypatch):
+        real_open, real_os_open = open, os.open
+
+        def guarded_open(file, *args, **kwargs):
+            self._note(file)
+            return real_open(file, *args, **kwargs)
+
+        def guarded_os_open(path, *args, **kwargs):
+            self._note(path)
+            return real_os_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", guarded_open)
+        monkeypatch.setattr(os, "open", guarded_os_open)
+        return self
+
+
+def test_the_journal_io_guard_reports_an_open_taken_under_a_hold(
+    tmp_path, monkeypatch,
+):
+    """The mutation the silence above is only meaningful against.
+
+    Moving a journal open under the flocks is the regression the deleted
+    wall-clock ceiling existed to catch, so the guard has to be shown reporting
+    it. Both interception arms are exercised, because the readers this is
+    guarding use `os.open` and a `builtins.open` patch alone reports nothing at
+    all — which is indistinguishable from the property holding.
+    """
+    tracker = _LockTracker()
+    watch = _JournalIOWatch(tracker).install(monkeypatch)
+    segment = tmp_path / "observations-000001.jsonl"
+    segment.write_bytes(b"{}\n")
+
+    tracker.held = False
+    with open(segment, "rb"):
+        pass
+    os.close(os.open(str(segment), os.O_RDONLY))
+    assert watch.journal_opens == 2, watch.journal_opens
+    assert watch.violations == []
+
+    tracker.held = True
+    with open(segment, "rb"):
+        pass
+    os.close(os.open(str(segment), os.O_RDONLY))
+    assert watch.journal_opens == 4, watch.journal_opens
+    assert len(watch.violations) == 2, watch.violations
+    assert all("observations-000001.jsonl" in line for line in watch.violations)
+
+
 def _count_applies(jr, monkeypatch, tracker):
     """Attribute each applied observation to the hold it landed in."""
     real = jr._apply_quota_records
@@ -1332,6 +1414,154 @@ def test_recovery_chunks_and_every_hold_respects_the_byte_cap(
         hold["records"] <= jr._RECOVERY_CHUNK_RECORDS
         for hold in tracker.holds), tracker.holds
     assert [row[1] for row in _quota_rows(ns)] == list(range(10, 17))
+
+
+def test_no_journal_input_or_record_decoding_happens_under_the_flocks(
+    tmp_path, monkeypatch,
+):
+    """The structural replacement for the deleted wall-clock ceiling.
+
+    `tests/test_rebuild_benchmark.py` used to bound the flock hold in seconds.
+    That measured the machine: at fixture scale the hold is one to two seconds
+    against a production budget of ten microseconds per line, so a bound loose
+    enough to survive a loaded runner could not fail a real regression. What the
+    ceiling existed to catch is a structural change — file input or a second
+    traversal moving inside the flocks — and that is a property, not a duration.
+
+    Two things must never happen while either cache writer flock is held: a
+    journal segment must not be opened, and a quota record must not be decoded.
+    Both are asserted by observing the calls, not by timing them.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    _tiny_caps(jr, monkeypatch)
+    _seed_observations(jr, jl, 7)
+
+    tracker = _LockTracker().install(monkeypatch)
+    watch = _JournalIOWatch(tracker).install(monkeypatch)
+
+    lib = importlib.import_module("_lib_journal")
+    real_decode = lib.decode_line
+    decodes = {"total": 0, "under_lock": 0}
+
+    def guarded_decode(raw, *args, **kwargs):
+        decodes["total"] += 1
+        if tracker.held:
+            decodes["under_lock"] += 1
+        return real_decode(raw, *args, **kwargs)
+
+    monkeypatch.setattr(lib, "decode_line", guarded_decode)
+
+    result = _rebuild(jr)
+    assert result.quota_cache_coverage["status"] == "recovered"
+    assert len(tracker.holds) > 1, "the fixture must span more than one chunk"
+    assert not watch.violations, watch.violations
+    assert decodes["under_lock"] == 0
+    # Both guards must have had something to observe, or the two readings above
+    # are absences of observation rather than absences of the thing. The open
+    # count is the half that was missing: the recovery function receives
+    # `quota_raw` already in memory, so a guard that saw zero journal opens
+    # anywhere would report exactly the same silence whether the property held
+    # or the interception was simply on the wrong function.
+    assert decodes["total"] > 0
+    assert watch.journal_opens > 0, (
+        "no journal file was opened by either `open` or `os.open` during the "
+        "replay, so the open guard observed nothing"
+    )
+
+
+def _replay_against_a_competitor(jr, monkeypatch):
+    """Replay while an outside party takes both flocks in every released window.
+
+    Returns the tracker, one entry per successful outside acquisition recording
+    how many leg holds had happened by then, and the rebuild result.
+
+    The competitor uses the primitives captured BEFORE any tracking is
+    installed. Routing it through the tracker instead is what made the earlier
+    form unfailable: its acquisition appended a hold of its own, so a replay
+    that took the locks exactly once still reported more than one hold.
+    """
+    import _lib_cache_writer_lock as lock
+
+    raw_acquire = lock.acquire_cache_writer_flocks
+    raw_release = lock.release_cache_writer_flocks
+
+    tracker = _LockTracker().install(monkeypatch)
+    tracked_acquire = lock.acquire_cache_writer_flocks
+    tracked_release = lock.release_cache_writer_flocks
+
+    paths: dict = {}
+    contended: list = []
+
+    def remember(global_path, provider_path, **kwargs):
+        paths["global"], paths["provider"] = global_path, provider_path
+        return tracked_acquire(global_path, provider_path, **kwargs)
+
+    def release_then_contend(handle):
+        outcome = tracked_release(handle)
+        if paths:
+            other = raw_acquire(paths["global"], paths["provider"], timeout=0.5)
+            if other is not None:
+                contended.append(len(tracker.holds))
+                raw_release(other)
+        return outcome
+
+    monkeypatch.setattr(lock, "acquire_cache_writer_flocks", remember)
+    monkeypatch.setattr(lock, "release_cache_writer_flocks", release_then_contend)
+    return tracker, contended, _rebuild(jr)
+
+
+def test_a_competitor_can_take_both_flocks_between_two_chunks(
+    tmp_path, monkeypatch,
+):
+    """Chunking is only useful if the gap between chunks is a real one.
+
+    A leg that released and immediately re-acquired without ever yielding would
+    satisfy every cap while still holding the locks for the whole replay. The
+    competitor here takes both flocks itself in the released window, which no
+    duration bound could distinguish from a leg that never let go.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    _tiny_caps(jr, monkeypatch)
+    _seed_observations(jr, jl, 7)
+
+    tracker, contended, result = _replay_against_a_competitor(jr, monkeypatch)
+
+    assert result.quota_cache_coverage["status"] == "recovered"
+    assert len(tracker.holds) > 1, "the fixture must span more than one chunk"
+    between = [taken for taken in contended if taken < len(tracker.holds)]
+    assert between, (
+        "no competitor took the flocks in a gap that still had a chunk after "
+        "it, so the chunking yields nothing: %r holds, contended after %r"
+        % (len(tracker.holds), contended)
+    )
+
+
+def test_the_between_chunks_guard_fails_when_the_replay_never_chunks(
+    tmp_path, monkeypatch,
+):
+    """The single-chunk scaffold the guard above has to be able to fail on.
+
+    Two separate defects made the old form unfailable. The tracker was
+    installed twice and the competitor's own acquisition went through it, so
+    `len(tracker.holds)` read three on a replay that took the locks once. And
+    "a competitor acquired at all" is satisfied by the release at the END of a
+    single chunk, which is not a gap between chunks. This pins both: one chunk,
+    one hold, and the outside acquisition that follows it is not counted as
+    happening between anything.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    monkeypatch.setattr(jr, "_RECOVERY_CHUNK_RECORDS", 1000)
+    monkeypatch.setattr(jr, "_RECOVERY_CHUNK_BYTES", 1 << 30)
+    _seed_observations(jr, jl, 7)
+
+    tracker, contended, result = _replay_against_a_competitor(jr, monkeypatch)
+
+    assert result.quota_cache_coverage["status"] == "recovered"
+    assert len(tracker.holds) == 1, tracker.holds
+    assert [taken for taken in contended if taken < len(tracker.holds)] == []
 
 
 def _leave_the_cache_covered(ns, jr):

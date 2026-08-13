@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Seconds-scale static pre-flight for a full-suite round trip (#529 S5 §5).
+
+Three checks, in order:
+
+  1. Compile every Python file under bin/ without writing bytecode. Files are
+     selected by `.py` extension OR by a Python shebang: bin/cctally is
+     EXTENSIONLESS, so an extension-keyed scan would skip the most important
+     file in the tree, and bin/codex-session-metrics shows that is a class
+     rather than one special case.
+  2. Syntax-check every shell script under bin/, with the interpreter chosen
+     per file from its own shebang rather than assumed.
+  3. Invoke bin/cctally-test-owners --verify.
+
+Exit 0 clean, 2 invalid invocation, 3 for any detected defect or for an
+inability to complete the verification. An inability to verify fails; it never
+passes. There is no --json envelope, because nothing consumes one.
+
+This is an EARLY EXIT, not a gate with unique coverage. bin/cctally-preflight-test
+runs the same three checks inside the suite, which is what makes
+CCTALLY_SKIP_PREFLIGHT=1 safe: skipping removes a duplicate rather than
+removing coverage. A gate that can fail the operation it guards turns a
+detector into an outage.
+
+No timing assertion exists anywhere for this tool. It is fast because it parses
+and does nothing else, and a wall-clock ceiling on a shared, contended box is
+the defect class #529 S3 has just removed.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_DEFECT = 3
+
+_OWNERS = "cctally-test-owners"
+
+
+def _shebang(path: pathlib.Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            first = handle.readline(512)
+    except OSError:
+        return ""
+    if not first.startswith(b"#!"):
+        return ""
+    return first.decode("utf-8", "replace").strip()
+
+
+def classify(path: pathlib.Path) -> str:
+    """``"python"``, ``"shell"`` or ``""`` for one file under ``bin/``."""
+    shebang = _shebang(path)
+    if path.suffix == ".py" or "python" in shebang:
+        return "python"
+    if path.suffix == ".sh":
+        return "shell"
+    if shebang:
+        # The interpreter word, so `#!/usr/bin/env bash` and `#!/bin/sh` are
+        # both recognised while `#!/usr/bin/env node` is not.
+        word = shebang.replace("#!", "").split()
+        for token in reversed(word):
+            base = os.path.basename(token)
+            if base in ("bash", "sh", "dash", "ksh", "zsh"):
+                return "shell"
+    return ""
+
+
+def shell_interpreter(path: pathlib.Path) -> str:
+    """`bash -n` or `sh -n`, chosen from the file's OWN shebang.
+
+    A `.sh` file with no shebang is a sourced fragment: every one of them in
+    this tree is sourced by a bash harness, so bash is the interpreter that
+    will actually parse it and the one whose grammar must accept it.
+    """
+    shebang = _shebang(path)
+    for token in reversed(shebang.replace("#!", "").split()):
+        base = os.path.basename(token)
+        if base in ("sh", "dash"):
+            return "sh"
+        if base in ("bash", "ksh", "zsh"):
+            return "bash"
+    return "bash"
+
+
+def check_python(bin_dir: pathlib.Path) -> list[str]:
+    problems: list[str] = []
+    for path in sorted(p for p in bin_dir.rglob("*") if p.is_file()):
+        if classify(path) != "python":
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append("%s could not be read as UTF-8 source: %s" % (path, exc))
+            continue
+        try:
+            compile(source, str(path), "exec", dont_inherit=True)
+        except SyntaxError as exc:
+            problems.append("%s:%s: %s" % (path, exc.lineno, exc.msg))
+        except ValueError as exc:
+            problems.append("%s: %s" % (path, exc))
+    return problems
+
+
+def check_shell(bin_dir: pathlib.Path) -> list[str]:
+    problems: list[str] = []
+    for path in sorted(p for p in bin_dir.rglob("*") if p.is_file()):
+        if classify(path) != "shell":
+            continue
+        interpreter = shell_interpreter(path)
+        try:
+            proc = subprocess.run(
+                [interpreter, "-n", str(path)], capture_output=True, text=True
+            )
+        except OSError as exc:
+            problems.append(
+                "%s could not be syntax-checked: %s -n is unavailable (%s)"
+                % (path, interpreter, exc)
+            )
+            continue
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            problems.append(
+                "%s: %s" % (path, detail[0] if detail else "%s -n exited %d"
+                            % (interpreter, proc.returncode))
+            )
+    return problems
+
+
+def check_ownership(root: pathlib.Path, owners: pathlib.Path) -> list[str]:
+    if not owners.is_file():
+        return ["%s is absent, so harness ownership cannot be verified" % owners]
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(owners), "--verify", "--repo-root", str(root)],
+            capture_output=True, text=True,
+        )
+    except OSError as exc:
+        return ["%s could not be run: %s" % (owners, exc)]
+    if proc.returncode == 0:
+        return []
+    lines = [ln for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
+    if not lines:
+        lines = ["%s --verify exited %d with no diagnostic" % (owners, proc.returncode)]
+    return lines
+
+
+def run(root: pathlib.Path) -> tuple[int, list[str]]:
+    bin_dir = root / "bin"
+    if not bin_dir.is_dir():
+        return EXIT_DEFECT, ["%s has no bin/ directory, so nothing can be checked" % root]
+    problems = check_python(bin_dir)
+    problems += check_shell(bin_dir)
+    problems += check_ownership(root, pathlib.Path(__file__).resolve().parent / _OWNERS)
+    return (EXIT_DEFECT if problems else EXIT_OK), problems
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="cctally-preflight",
+        description=(
+            "Compile every Python file under bin/, syntax-check every shell "
+            "script, and verify harness ownership — before a remote round trip."
+        ),
+    )
+    parser.add_argument(
+        "--repo-root", metavar="DIR",
+        help="check this tree instead of the one containing this script",
+    )
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_OK if exc.code == 0 else EXIT_USAGE
+
+    root = pathlib.Path(args.repo_root) if args.repo_root \
+        else pathlib.Path(__file__).resolve().parents[1]
+    if not root.is_dir():
+        sys.stderr.write("preflight: %s is not a directory\n" % root)
+        return EXIT_USAGE
+
+    code, problems = run(root)
+    for problem in problems:
+        sys.stderr.write("preflight: %s\n" % problem)
+    if code == EXIT_OK:
+        sys.stdout.write("preflight: clean\n")
+    else:
+        sys.stderr.write(
+            "preflight: %d problem(s); fix them before the round trip, or set "
+            "CCTALLY_SKIP_PREFLIGHT=1 if the pre-flight itself is what is "
+            "broken (the suite runs the same checks)\n" % len(problems)
+        )
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

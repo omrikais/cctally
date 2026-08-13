@@ -108,7 +108,6 @@ PY
     local merged_flags="$flags $FLAGS"
     local actual
 
-    # shellcheck disable=SC2086
     if [ -n "${FORCE_COLOR:-}" ]; then
         if [ -n "${COLUMNS_OVERRIDE:-}" ]; then
             actual=$(HOME="$FAKE_HOME" TZ=Etc/UTC COLUMNS="$COLUMNS_OVERRIDE" \
@@ -162,4 +161,3 @@ PY
     pass_count=$((pass_count + 1))
     return 0
 }
-

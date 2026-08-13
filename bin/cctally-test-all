@@ -25,8 +25,18 @@
 # Continues on per-harness failure for maximum coverage; exits non-zero iff
 # any harness or pytest had any failure.
 #
-# CCTALLY_TEST_ALL_PLAN=1 prints the resolved plan and exits 0 without running
-# anything (test seam). CCTALLY_TEST_ALL_FAKE_NCPU pins the core count for
+# Arguments (#529 S5): --harness NAME, repeatable, runs only the named
+# harnesses; --with-pytest, at most once, re-enables the pytest phase a subset
+# otherwise skips. Any run carrying --harness is classified `incomplete` for
+# `deliberate-subset` and exits 3 even when everything selected passes, so it
+# is never green and never a gate. With no arguments the run is a full one.
+#
+# CCTALLY_TEST_ALL_PLAN=1 prints the resolved plan and exits without running
+# anything (test seam). It exits 0 for a plan it could resolve, but a plan is
+# still refused for the same reasons a run is: with --harness it exits 2 for a
+# malformed or unknown harness name and 3 when the manifest those names are
+# validated against cannot be read, because a plan for a set that cannot be run
+# is not a plan. CCTALLY_TEST_ALL_FAKE_NCPU pins the core count for
 # deterministic plan tests.
 
 set -uo pipefail
@@ -41,6 +51,7 @@ if [ ! -r "$REPO_ROOT/bin/_lib-test-contract.sh" ]; then
     echo "cctally-test-all: the verdict contract library bin/_lib-test-contract.sh is missing or unreadable; refusing to run" >&2
     exit 3
 fi
+# The contract library path is computed from the checked-out repository root.
 # shellcheck source=/dev/null
 source "$REPO_ROOT/bin/_lib-test-contract.sh"
 
@@ -101,12 +112,10 @@ _clamp() {  # _clamp value lo hi
 
 if [ -n "${CCTALLY_TEST_JOBS:-}" ]; then
     # Explicit budget: today's meaning — outer and pytest both = budget.
-    BUDGET=$CCTALLY_TEST_JOBS
-    OUTER_default=$BUDGET
-    PYTEST_default=$BUDGET
+    OUTER_default=$CCTALLY_TEST_JOBS
+    PYTEST_default=$CCTALLY_TEST_JOBS
 else
     # Unset: auto-tune OUTER below the core count; pytest (solo) gets the lot.
-    BUDGET=$NCPU
     lo=2; [ "$NCPU" -lt 2 ] && lo=$NCPU
     OUTER_default=$(_clamp "$(( (9 * NCPU + 10) / 20 ))" "$lo" "$NCPU")  # round(NCPU*0.45)
     PYTEST_default=$NCPU
@@ -117,6 +126,158 @@ OUTER=${CCTALLY_OUTER_JOBS:-$OUTER_default}
 inner_cap=4; [ "$OUTER" -lt 4 ] && inner_cap=$OUTER
 INNER=${CCTALLY_INNER_JOBS:-$inner_cap}
 PYTEST=${CCTALLY_PYTEST_JOBS:-$PYTEST_default}
+
+# ---- profile discrimination --------------------------------------------
+# .mirror-allowlist excludes itself, so its presence is exactly the private
+# discriminator: absent means this tree IS the shipped public subset. Resolved
+# HERE rather than inside the admission block below, because subset selection
+# validates the caller's names against the manifest rows this profile requires
+# and that happens before plan mode.
+CONTRACT_PROFILE=public
+if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
+    CONTRACT_PROFILE=private
+fi
+
+# ---- subset invocation (#529 S5 sections 4.1-4.4) ----------------------
+#
+# `--harness NAME` (repeatable) selects one harness by manifest name;
+# `--with-pytest` (at most once) re-enables the pytest phase a subset run
+# otherwise skips. Any run carrying `--harness` is classified `incomplete`
+# with reason `deliberate-subset` and exits 3 EVEN WHEN EVERY SELECTED HARNESS
+# PASSES, so it can never be green and can never be cited as a gate. Naming
+# all of them is still a subset: the mode is set by the presence of the flag,
+# not by how many names follow it, or the exit-3 contract would have an
+# obvious loophole.
+#
+# Every rejection below exits 2 through the existing usage path, which
+# publishes a record like every other terminal path. An unknown name is an
+# error rather than a silent no-op, because running nothing and reporting
+# success is the failure class #529 S1 closed.
+SUBSET_MODE=0
+SUBSET_SET=" "               # " name name ", the caller's set
+SUBSET_SEEN=()               # the same names, one array element each, for the duplicate test
+COVERAGE_MODE=full
+COVERAGE_SELECTED=""         # space-separated, MANIFEST order
+COVERAGE_OMITTED=""          # space-separated, MANIFEST order
+COVERAGE_PYTEST=full
+# 1 once a selection has been resolved. The coverage object is published from
+# that point on and never before, so a usage refusal that never parsed a
+# selection carries none rather than describing one it does not have.
+COVERAGE_RESOLVED=0
+_with_pytest_seen=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --harness)
+            # Three separate refusals, because they are three separate
+            # mistakes and a caller can only fix the one they made. The count
+            # test alone let `--harness ""` through: the value is present, so
+            # the arity is right, and every downstream loop then iterated over
+            # whitespace and selected nobody — a run that executed nothing and
+            # reported the same `deliberate-subset` an all-passing subset does.
+            if [ $# -lt 2 ]; then
+                contract_usage_abort "--harness requires a harness name and none followed it" --harness
+            fi
+            case "$2" in
+                '')
+                    contract_usage_abort "--harness was given an empty value; an empty selection runs nothing, and running nothing is not a subset" --harness ;;
+                -*)
+                    # A manifest harness name never begins with `-`, so a token
+                    # that does is the NEXT option and this one's value is
+                    # missing. Accepting it produced `unknown harness
+                    # '--with-pytest'`, which names the wrong mistake.
+                    contract_usage_abort "--harness was given the option '$2' instead of a harness name, so its value is missing" --harness ;;
+            esac
+            # Literal comparison against each name given so far, held one per
+            # ARRAY ELEMENT rather than packed into a delimited string, so no
+            # character a caller can type is a separator. The first form asked
+            # whether " $2 " appeared anywhere in the space-delimited
+            # `$SUBSET_SET`, which made `--harness 'a b'` followed by
+            # `--harness a` report "given more than once"; the second packed
+            # the names into a newline-delimited record, which moved that
+            # defect to a name containing a newline instead of closing it.
+            # Both inputs still exited 2, so no run could go green on one, but
+            # each named the wrong mistake and a caller can only fix the one
+            # they made. The `${a[@]+…}` form is what keeps an empty array
+            # legal under `set -u` on bash 3.2.
+            for _seen in ${SUBSET_SEEN[@]+"${SUBSET_SEEN[@]}"}; do
+                if [ "$_seen" = "$2" ]; then
+                    contract_usage_abort "--harness $2 was given more than once" "$2"
+                fi
+            done
+            SUBSET_SEEN+=("$2")
+            SUBSET_SET="$SUBSET_SET$2 "
+            SUBSET_MODE=1
+            shift 2 ;;
+        --with-pytest)
+            if [ "$_with_pytest_seen" = 1 ]; then
+                contract_usage_abort "--with-pytest may be given at most once" --with-pytest
+            fi
+            _with_pytest_seen=1
+            shift ;;
+        *)
+            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable) and --with-pytest" "$1" ;;
+    esac
+done
+
+if [ "$_with_pytest_seen" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
+    contract_usage_abort "--with-pytest requires at least one --harness; it is not a way to run the full suite" --with-pytest
+fi
+
+if [ "$SUBSET_MODE" = 1 ]; then
+    # Names are validated against the MANIFEST, which is the declared estate.
+    # Admission reloads it below and still compares it against the whole disk
+    # in both directions — a subset narrows what executes and never what is
+    # checked for existence.
+    contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
+    _manifest_names=$(contract_manifest_harness_names "$CONTRACT_PROFILE")
+    # `$SUBSET_SET` and `$COVERAGE_SELECTED` below are deliberately unquoted,
+    # because word splitting is how each set is walked. Pathname expansion is
+    # NOT wanted and is disabled around both loops: `--harness '*'` otherwise
+    # expanded against the working directory and refused a name the caller
+    # never typed ("unknown harness 'AGENTS.md'").
+    set -f
+    for _want in $SUBSET_SET; do
+        _found=0
+        while IFS= read -r _n; do
+            [ "$_n" = "$_want" ] && { _found=1; break; }
+        done <<EOF
+$_manifest_names
+EOF
+        if [ "$_found" != 1 ]; then
+            contract_usage_abort "unknown harness '$_want'; it has no row in tests/authoritative-test-manifest.json for the $CONTRACT_PROFILE profile" "$_want"
+        fi
+    done
+    set +f
+    # Reported in MANIFEST order rather than caller order, so two invocations
+    # naming the same set produce byte-identical records.
+    while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
+        case "$SUBSET_SET" in
+            *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
+            *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
+        esac
+    done <<EOF
+$_manifest_names
+EOF
+    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+    COVERAGE_OMITTED=${COVERAGE_OMITTED% }
+    COVERAGE_MODE=subset
+    if [ "$_with_pytest_seen" = 1 ]; then
+        COVERAGE_PYTEST=full
+    else
+        COVERAGE_PYTEST=skipped
+    fi
+    COVERAGE_RESOLVED=1
+    # Belt-and-suspenders over bin/cctally-test-remote's _is_canonical_command,
+    # which already recognises only the exact no-argument command as
+    # authoritative. This closes the path where a direct caller sets the
+    # variable by hand, and it refuses BEFORE anything executes.
+    if contract_is_authoritative; then
+        contract_usage_abort "CCTALLY_AUTHORITATIVE_RUN=1 cannot accompany --harness: a subset run is deliberately incomplete and can never carry an authoritative verdict" CCTALLY_AUTHORITATIVE_RUN
+    fi
+    contract_fail incomplete deliberate-subset "" admission
+fi
 
 # Backstop dev-autodetect suppressor for the whole suite run (see the
 # tests/test_harness_dev_autodetect_coverage.py note: NOT a substitute for
@@ -145,19 +306,751 @@ for path in "$REPO_ROOT"/bin/cctally-*-test; do
     case "$final_set" in *" $name "*) continue ;; esac
     parallel_harnesses+=("$name")
 done
-all_harnesses=("${parallel_harnesses[@]}" "${final_harnesses[@]}")
+# `${a[@]+"${a[@]}"}` throughout, because macOS system bash is 3.2, where a
+# bare `"${a[@]}"` on an EMPTY array is an `unbound variable` error under
+# `set -u`. The aggregator would exit 1 from the middle of a run having written
+# no outcome record, which is the one failure shape the verdict contract cannot
+# describe. `parallel_harnesses` is empty for an estate carrying no pool
+# harness at all.
+all_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harnesses[@]}")
+
+# A subset narrows the EXECUTED set only, in manifest order. A selected name
+# that has no file on disk (or lost its executable bit) leaves nothing here,
+# and admission below refuses the run for that reason before the pool starts.
+if [ "$SUBSET_MODE" = 1 ]; then
+    subset_harnesses=()
+    set -f                       # see the note on $SUBSET_SET above
+    for name in $COVERAGE_SELECTED; do
+        for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
+            if [ "$h" = "$name" ]; then
+                subset_harnesses+=("$name")
+                break
+            fi
+        done
+    done
+    set +f
+    all_harnesses=(${subset_harnesses[@]+"${subset_harnesses[@]}"})
+fi
 
 # ---- plan mode: emit the resolved plan and exit before ANY side effect --
 if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
+    plan_harnesses=${all_harnesses[*]+"${all_harnesses[*]}"}
     printf 'ncpu=%s\n'   "$NCPU"
-    printf 'budget=%s\n' "$BUDGET"
+    # The EFFECTIVE configuration, not the dead BUDGET intermediate that used
+    # to report the host's core count here. With all three roles explicitly
+    # exported, that number influenced no worker count, so two runners printed
+    # different plans for identical effective configurations (#529 S5 §2.3).
+    printf 'budget=%s/%s/%s\n' "$OUTER" "$INNER" "$PYTEST"
     printf 'outer=%s\n'  "$OUTER"
     printf 'inner=%s\n'  "$INNER"
     printf 'pytest=%s\n' "$PYTEST"
     printf 'reconcile_in_pool=1\n'
-    printf 'harnesses=%s\n' "${all_harnesses[*]}"
+    # `harnesses=` is the single carrier of what a subset selected, and it
+    # reports the on-disk EXECUTION order, which is what the pool will receive.
+    # A second `selected=` line printing the same variable used to sit here; it
+    # carried no information the line above does not, while inviting a reader
+    # to equate it with the record's `coverage.selectedHarnesses`, which is the
+    # MANIFEST-ordered name list and a different thing. Set equality between
+    # the two is forced by admission; their order and their source are not.
+    printf 'harnesses=%s\n' "$plan_harnesses"
+    printf 'mode=%s\n' "$COVERAGE_MODE"
+    printf 'pytest_disposition=%s\n' "$COVERAGE_PYTEST"
     exit 0
 fi
+
+# ---- the evidence bridge (#529 S2) -------------------------------------
+# ONE entry point into the Python kernels, invoked by ABSOLUTE PATH derived
+# from REPO_ROOT rather than through an ambient PYTHONPATH, so a runner's
+# environment cannot redirect it. The public kernel bin/_lib_test_evidence.py
+# is required; the private bin/_lib_test_remote_observability.py supplies the
+# public-path predicate and the disclosure vocabulary and is absent from the
+# published tree, where its absence makes the transformer redact everything
+# it cannot vouch for. That is the fail-closed default, not a degradation to
+# be worked around.
+EVIDENCE_KERNEL="$REPO_ROOT/bin/_lib_test_evidence.py"
+EVIDENCE_PRIVATE="$REPO_ROOT/bin/_lib_test_remote_observability.py"
+
+_ev() {   # _ev <mode> [args...]
+    python3 - "$EVIDENCE_KERNEL" "$EVIDENCE_PRIVATE" "$@" <<'EVPY'
+import fcntl
+import importlib.util
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
+import time
+
+
+LOAD_ERROR = ""
+
+
+def _load(path, name):
+    global LOAD_ERROR
+    if not path or not os.path.exists(path):
+        LOAD_ERROR = "the file does not exist"
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            LOAD_ERROR = "no import spec"
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:                            # noqa: BLE001
+        LOAD_ERROR = "%s: %s" % (exc.__class__.__name__, exc)
+        return None
+
+
+# Every name this bridge reaches for. Checked as a SET at load, so a kernel
+# that imports but is not this kernel — a truncated copy, a rename that left
+# the entry point behind — is diagnosed here rather than raising an
+# AttributeError inside whichever mode happened to touch the missing name
+# first, whose non-zero status the caller then attributes to that mode's own
+# arguments.
+REQUIRED = (
+    "DEFAULT_MAX_AGE_DAYS", "DEFAULT_MAX_BYTES", "RUN_STATES", "ScrubContext",
+    "allocate_budget", "bound_extract_lines", "build_scrubbed_extract",
+    "plan_evidence_evictions", "render_retention_notice",
+    "resolve_evidence_layout", "resolve_run_id", "select_failure_windows",
+    "validate_export",
+)
+
+KERNEL, PRIVATE, MODE = sys.argv[1], sys.argv[2], sys.argv[3]
+ARGS = sys.argv[4:]
+
+EV = _load(KERNEL, "_lib_test_evidence")
+if EV is not None:
+    missing = [name for name in REQUIRED if not hasattr(EV, name)]
+    if missing:
+        EV = None
+        LOAD_ERROR = "the module defines none of: %s" % ", ".join(missing)
+# Exit 9 is reserved for "this bridge has no usable kernel" and is the ONLY
+# status the caller reads as that. It must not collide with a mode's own
+# argument errors, which use 2.
+if EV is None:
+    sys.stderr.write(
+        "cctally-test-all: the evidence kernel %s could not be loaded (%s)\n"
+        % (KERNEL, LOAD_ERROR or "unknown reason")
+    )
+    raise SystemExit(9)
+PRIV = _load(PRIVATE, "_lib_test_remote_observability")
+
+
+def _env(name, default=""):
+    return os.environ.get(name) or default
+
+
+def _int(name, default=0):
+    try:
+        return int(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _process_start(pid):
+    """The estate's existing locale-pinned process-identity idiom.
+
+    A pid alone is not an identity, because the kernel recycles pids and a
+    recycled pid would keep a dead run marked `active`, and therefore
+    protected from eviction, for good.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, LC_ALL="C", TZ="UTC"),
+        )
+    except Exception:                                   # noqa: BLE001
+        return ""
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _roots():
+    """Every prefix whose disclosure would name this machine.
+
+    The repository root and the home directory come from the caller; the
+    temporary roots are read here because they are the same on every caller.
+    """
+    roots = {
+        "repo": _env("EV_REPO_ROOT"),
+        "home": _env("HOME"),
+        "tmp": "/tmp",
+        "private-tmp": "/private/tmp",
+        "runner-temp": _env("RUNNER_TEMP"),
+        "tmpdir": _env("TMPDIR"),
+    }
+    out = {}
+    for token, prefix in roots.items():
+        prefix = (prefix or "").rstrip("/")
+        if prefix and prefix != "":
+            out[token] = prefix
+    return out
+
+
+def _context():
+    """The ScrubContext, with both private facts injected or neither.
+
+    `is_public_path` and `known_tokens` are None when the private kernel is
+    absent or refuses, which redacts more rather than less.
+    """
+    is_public = None
+    tokens = None
+    repo = _env("EV_REPO_ROOT")
+    if PRIV is not None:
+        builder = getattr(PRIV, "build_disclosure_predicate", None) or getattr(
+            PRIV, "build_public_path_predicate", None
+        )
+        if builder is not None:
+            try:
+                is_public = builder(repo)
+            except Exception:                           # noqa: BLE001
+                is_public = None
+        try:
+            tokens = PRIV.build_known_tokens(repo)
+        except Exception:                               # noqa: BLE001
+            tokens = None
+    return EV.ScrubContext(
+        roots=_roots(), is_public_path=is_public, known_tokens=tokens
+    )
+
+
+def _write_atomic(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    previous = os.umask(0o077)
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    finally:
+        os.umask(previous)
+
+
+def _harness_table(logdir):
+    rows = []
+    try:
+        names = sorted(n[:-5] for n in os.listdir(logdir) if n.endswith(".exit"))
+    except OSError:
+        return rows
+    for name in names:
+        row = {"name": name}
+        for key, suffix in (("exitCode", ".exit"), ("durationSeconds", ".time")):
+            row[key] = None
+            try:
+                with open(os.path.join(logdir, name + suffix), encoding="utf-8") as h:
+                    row[key] = int(h.read().strip())
+            except (OSError, ValueError):
+                pass
+        rows.append(row)
+    return rows
+
+
+def _read_log(path):
+    """One subject's log as text lines, or None when it is not text.
+
+    STRICT decoding. `errors="replace"` turned undecodable bytes into U+FFFD
+    and let an export be published over content nothing had decoded, which
+    spec section 3 forbids in the same sentence as a parse error and a failed
+    validation: each of the three leaves no export file at all.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+# The block's own header, and the `[OMITTED: …]` notice it writes when it
+# truncates, are LINES IN THE EMITTED FILE and the kernel charges them to the
+# subject's budget. A caller that requested only the cluster lines therefore
+# lost two lines of real content off the end of every block, including on a
+# nine-line log with a six-hundred-line cap. The overhead is requested here so
+# the accounting is the caller's rather than a surprise in the kernel.
+BLOCK_OVERHEAD_LINES = 2
+
+
+def _subject_windows(lines):
+    """`(clusters, hard_lines, supplemental_lines)` for one subject's log."""
+    windows = EV.select_failure_windows(lines, failing=True)
+    hard = sum(
+        win["end"] - win["start"] + 1 for win in windows if win["kind"] == "hard"
+    )
+    supplemental = sum(
+        win["end"] - win["start"] + 1 for win in windows if win["kind"] != "hard"
+    )
+    return windows, hard, supplemental
+
+
+if MODE == "pid-start":
+    sys.stdout.write(_process_start(ARGS[0]) + "\n")
+    raise SystemExit(0)
+
+if MODE == "scrub-log":
+    # One subject's sanitized block, for the CONSOLE. Same transformer and
+    # same validator as the export, so the two cannot drift; the budget is
+    # per-subject here and run-wide there, which is the only difference.
+    subject, logfile = ARGS[0], ARGS[1]
+    lines = _read_log(logfile)
+    if lines is None:
+        sys.stdout.write("[REDACTED: %s log unreadable]\n" % subject)
+        raise SystemExit(0)
+    clusters, hard, supplemental = _subject_windows(lines)
+    allocation = EV.allocate_budget(
+        [
+            {
+                "name": subject,
+                "hard": hard + BLOCK_OVERHEAD_LINES,
+                "supplemental": supplemental,
+            }
+        ]
+    )
+    context = _context()
+    body = EV.build_scrubbed_extract(
+        {subject: lines},
+        context,
+        allocation,
+        log_names={subject: "logs/%s.log" % subject},
+        clusters={subject: clusters},
+    )
+    # The parent already printed `---- <subject> … ----`, so the kernel's own
+    # subject header would nest a block inside a block.
+    if body and body[0] == "---- %s ----" % subject:
+        body = body[1:]
+    body, _stats = EV.bound_extract_lines(body)
+    violations = EV.validate_export(body, _roots())
+    if violations:
+        sys.stdout.write(
+            "[REDACTED: %s context refused by the validator, %d violations]\n"
+            % (subject, len(violations))
+        )
+    elif body:
+        sys.stdout.write("\n".join(body) + "\n")
+    raise SystemExit(0)
+
+if MODE == "export":
+    # The whole-run extract: ONE allocation across every failed subject, so a
+    # noisy harness cannot consume the run budget before another subject's
+    # decisive failure is reached.
+    evidence_dir = ARGS[0]
+    subject_lines = {}
+    clusters = {}
+    log_names = {}
+    subjects = []
+    listing = _env("EV_FAILED_LIST")
+    seen = set()
+    try:
+        with open(listing, encoding="utf-8") as handle:
+            rows = handle.read().splitlines()
+    except OSError:
+        rows = []
+    for row in rows:
+        name, _, path = row.partition("\t")
+        if not name or name in seen:
+            continue
+        lines = _read_log(path)
+        if lines is None:
+            # Refusing the WHOLE export rather than dropping this subject: an
+            # export missing one failed subject with nothing saying so is the
+            # silent half-answer the validator exists to prevent. Nothing is
+            # lost — the raw logs are retained and the caller prints where.
+            sys.stderr.write(
+                "cctally-test-all: %s's log could not be read as text, so no "
+                "export file was written; the complete unsanitized logs are "
+                "retained under logs/\n" % name
+            )
+            raise SystemExit(1)
+        seen.add(name)
+        window, hard, supplemental = _subject_windows(lines)
+        subject_lines[name] = lines
+        clusters[name] = window
+        log_names[name] = "logs/%s" % os.path.basename(path)
+        subjects.append(
+            {
+                "name": name,
+                "hard": hard + BLOCK_OVERHEAD_LINES,
+                "supplemental": supplemental,
+            }
+        )
+    context = _context()
+    header = [
+        "[cctally-test-all] run %s: sanitized failure extract over %d subjects"
+        % (_env("EV_RUN_ID"), len(subjects)),
+        "[cctally-test-all] the complete unsanitized logs are retained "
+        "under logs/ on the runner",
+    ]
+    coverage = _env("EV_COVERAGE_NOTE")
+    if coverage:
+        header.append(coverage)
+    body = EV.build_scrubbed_extract(
+        subject_lines, context, EV.allocate_budget(subjects),
+        log_names=log_names, clusters=clusters,
+    )
+    if not body:
+        body = [
+            "[cctally-test-all] 0 subject logs were recorded for this run; "
+            "see the run manifest for the verdict"
+        ]
+    out, _stats = EV.bound_extract_lines(header + body)
+    violations = EV.validate_export(out, _roots())
+    if violations:
+        sys.stderr.write(
+            "cctally-test-all: the sanitized extract was refused by the "
+            "validator (%d violations, first: %s); no export file was "
+            "written\n" % (len(violations), violations[0]["reason"])
+        )
+        raise SystemExit(1)
+    _write_atomic(
+        os.path.join(evidence_dir, "export", "failure-context.txt"),
+        "\n".join(out) + "\n",
+    )
+    raise SystemExit(0)
+
+if MODE == "run-id":
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    try:
+        sys.stdout.write(
+            EV.resolve_run_id(
+                os.environ, stamp, os.getpid(), random.randint(0, 99999)
+            )
+            + "\n"
+        )
+    except ValueError as exc:
+        sys.stderr.write("cctally-test-all: %s\n" % exc)
+        raise SystemExit(2)
+    raise SystemExit(0)
+
+if MODE == "layout":
+    try:
+        layout = EV.resolve_evidence_layout(ARGS[0], ARGS[1], ARGS[2])
+    except ValueError as exc:
+        sys.stderr.write("cctally-test-all: %s\n" % exc)
+        raise SystemExit(2)
+    sys.stdout.write(layout["run_dir"] + "\n")
+    raise SystemExit(0)
+
+if MODE == "manifest":
+    state, rc = ARGS[0], ARGS[1]
+    evidence_dir = _env("EV_EVIDENCE_DIR")
+    if not evidence_dir:
+        raise SystemExit(0)
+    failure_class = _env("EV_CLASS", "none")
+    # A verdict exists only for a run that REACHED one, which is `completed`
+    # and nothing else. `active`, `aborted` and `abandoned` all describe a run
+    # whose estate never finished, and claiming an outcome for any of them
+    # would let the next run's eviction pass rank an unfinished run as a pass —
+    # `plan_evidence_evictions` orders `outcome == "pass"` first for cap
+    # eviction, so the false pass is discarded ahead of a genuine failure. An
+    # interrupted run reported `outcome: "pass"` and `failureClass: "none"`
+    # for exactly this reason: the rule was written against `active` alone
+    # while its justification covered every unfinished state.
+    settled = state == "completed"
+    # The same metric the outcome record carries, so a reader holding either
+    # artifact alone can normalize this run's cost. Numerator and denominator
+    # are both present beside it rather than only their quotient.
+    # An EMPTY EV_PASSED_CASES means the denominator could not be assembled —
+    # pytest's passed-item count was not readable — which is a different answer
+    # from a denominator of zero and is recorded as null rather than as the
+    # shell half alone.
+    passed_cases = _int("EV_PASSED_CASES") if _env("EV_PASSED_CASES") else None
+    total_wall = _int("EV_SECONDS")
+    doc = {
+        "schemaVersion": 1,
+        "runId": _env("EV_RUN_ID"),
+        "remoteDir": _env("EV_REMOTE_DIR"),
+        "state": state,
+        "outcome": ("pass" if failure_class == "none" else "fail")
+        if settled
+        else None,
+        "failureClass": failure_class if settled else None,
+        "exitCode": int(rc) if rc.isdigit() else None,
+        "pid": _int("EV_PID"),
+        "pidStart": _env("EV_PID_START"),
+        "startedEpoch": _int("EV_STARTED"),
+        # Deliberately NOT `settled`: an aborted run did stop, and the age
+        # rule evicts on `finished_epoch or started_epoch`, so withholding the
+        # moment it stopped would age it from its start instead.
+        "finishedEpoch": None if state == "active" else int(time.time()),
+        "budget": {
+            "outer": _int("EV_OUTER"),
+            "inner": _int("EV_INNER"),
+            "pytest": _int("EV_PYTEST"),
+        },
+        "phaseWallSeconds": {
+            "total": total_wall,
+            "shellPool": _int("EV_POOL_WALL"),
+            "pytest": _int("EV_PYTEST_WALL"),
+        },
+        "passedCases": passed_cases,
+        "secondsPerThousandCases": (
+            None if not passed_cases else round(total_wall / passed_cases * 1000, 1)
+        ),
+        "harnesses": _harness_table(_env("EV_LOGDIR")),
+    }
+    _write_atomic(
+        os.path.join(evidence_dir, "manifest.json"), json.dumps(doc) + "\n"
+    )
+    raise SystemExit(0)
+
+def _dir_bytes(path):
+    total = 0
+    for base, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(base, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _load_runs(root):
+    """Every retained run, read from its own manifest."""
+    runs = []
+    try:
+        remote_dirs = sorted(os.listdir(root))
+    except OSError:
+        return runs
+    for remote_dir in remote_dirs:
+        base = os.path.join(root, remote_dir)
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for run_id in entries:
+            run_dir = os.path.join(base, run_id)
+            try:
+                with open(
+                    os.path.join(run_dir, "manifest.json"), encoding="utf-8"
+                ) as handle:
+                    doc = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            state = doc.get("state")
+            if state not in EV.RUN_STATES:
+                # A manifest this binary cannot classify is left alone rather
+                # than evicted: deleting evidence on the strength of an
+                # unrecognised field is the one irreversible mistake here.
+                continue
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "remote_dir": remote_dir,
+                    "dir": run_dir,
+                    "state": state,
+                    "outcome": doc.get("outcome"),
+                    "started_epoch": doc.get("startedEpoch") or 0,
+                    "finished_epoch": doc.get("finishedEpoch"),
+                    "bytes": _dir_bytes(run_dir),
+                    "pid": doc.get("pid"),
+                    "pid_start": doc.get("pidStart") or None,
+                }
+            )
+    return runs
+
+
+def _merge_intervals(gaps):
+    """The UNION of every coverage hole ever recorded.
+
+    `plan_evidence_evictions` reports the gaps of ONE pass, and coverage is
+    cumulative over the store's whole life. A surface that rendered a single
+    pass's intervals would report a store full of holes as complete after any
+    pass that evicted nothing.
+    """
+    OPEN = float("inf")
+    spans = []
+    for gap in gaps:
+        low = gap.get("fromEpoch", gap.get("from_epoch"))
+        high = gap.get("toEpoch", gap.get("to_epoch"))
+        if low is None:
+            continue
+        spans.append((int(low), OPEN if high is None else int(high)))
+    spans.sort()
+    merged = []
+    for low, high in spans:
+        if merged and low <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], high)
+        else:
+            merged.append([low, high])
+    return [
+        {"fromEpoch": low, "toEpoch": None if high == OPEN else high}
+        for low, high in merged
+    ]
+
+
+# The whole pass — read the record, plan, evict, write the record back — is
+# ONE critical section. The evidence root is machine-wide by design, so
+# several worktrees run against it at once, and the record is a
+# read-modify-write: without the lock the last writer won, a pass that evicted
+# nothing overwrote the gaps of a pass that had, and the store reported
+# `complete` over holes whose runs no longer exist to be rediscovered.
+RETENTION_LOCK_SECONDS = 60
+
+
+def _acquire_retention_lock(path):
+    """An exclusive flock on `path`, or None if it could not be taken.
+
+    Bounded rather than blocking. Retention is non-deciding by the spec's
+    freeze point, so skipping this pass is a legitimate outcome the next run
+    reclaims; hanging the aggregator behind a wedged holder is not.
+    """
+    previous = os.umask(0o077)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    finally:
+        os.umask(previous)
+    deadline = time.time() + RETENTION_LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
+
+
+def _retention_pass(root, current_run, record_path):
+    try:
+        with open(record_path, encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, ValueError):
+        previous = {}
+
+    runs = _load_runs(root)
+    live = {}
+    for run in runs:
+        pid = run.get("pid")
+        if run.get("state") == "active" and pid:
+            live[pid] = _process_start(pid)
+    plan = EV.plan_evidence_evictions(
+        runs,
+        int(time.time()),
+        live_pids=live,
+        max_age_days=_int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS),
+        max_bytes=_int("EV_MAX_BYTES", EV.DEFAULT_MAX_BYTES),
+        protect_ids=(current_run,),
+    )
+
+    removed = []
+    for run in plan["evict"]:
+        try:
+            shutil.rmtree(run["dir"])
+            removed.append(run)
+        except OSError as exc:
+            sys.stderr.write(
+                "cctally-test-all: could not evict %s (%s)\n"
+                % (run["run_id"], exc.__class__.__name__)
+            )
+    plan["evict"] = removed
+
+    gaps = _merge_intervals(
+        list(previous.get("gaps") or []) + list(plan.get("gaps") or [])
+    )
+    record = {
+        "schemaVersion": 1,
+        "updatedAt": int(time.time()),
+        "passes": int(previous.get("passes") or 0) + 1,
+        "coverage": "degraded" if gaps else "complete",
+        "gaps": gaps,
+        "overCap": bool(plan.get("over_cap")),
+        "bytesAfter": int(plan.get("bytes_after") or 0),
+        "retainedRuns": len(plan.get("keep") or []),
+        "lastEvictedRuns": len(removed),
+        # The MECHANISM, not just the outcome. Age and cap eviction remove
+        # runs identically from the outside, so a test that asserted only
+        # "fewer runs survive" could pass on age eviction while claiming to
+        # exercise the cap — which is exactly what it did.
+        "lastEvictionReasons": sorted(
+            {run.get("reason") for run in removed if run.get("reason")}
+        ),
+    }
+    _write_atomic(record_path, json.dumps(record) + "\n")
+
+    notice = EV.render_retention_notice(plan)
+    if notice:
+        sys.stderr.write(notice + "\n")
+    if gaps:
+        # Emitted on stdout so the caller can put the same sentence at the
+        # head of the extract a CI artifact consumer is handed.
+        sys.stdout.write(
+            "[cctally-test-all] evidence coverage is degraded: %d gaps across "
+            "%d retained runs\n" % (len(gaps), record["retainedRuns"])
+        )
+        sys.stderr.write(
+            "[cctally-test-all] evidence coverage is degraded: %d gaps across "
+            "%d retained runs\n" % (len(gaps), record["retainedRuns"])
+        )
+
+
+if MODE == "retention":
+    root, current_run = ARGS[0], ARGS[1]
+    lock_fd = _acquire_retention_lock(os.path.join(root, ".retention.lock"))
+    if lock_fd is None:
+        sys.stderr.write(
+            "cctally-test-all: the evidence retention lock could not be taken "
+            "within %ds, so this run's retention pass was skipped; the next "
+            "run reclaims it\n" % RETENTION_LOCK_SECONDS
+        )
+        raise SystemExit(0)
+    try:
+        _retention_pass(root, current_run, os.path.join(root, ".retention.json"))
+    finally:
+        # Released by CLOSING rather than by LOCK_UN, so the lock cannot
+        # outlive this process even if the write above raised.
+        os.close(lock_fd)
+    raise SystemExit(0)
+
+sys.stderr.write("cctally-test-all: unknown evidence mode %r\n" % MODE)
+raise SystemExit(9)
+EVPY
+}
+
+# ---- run identity and the opening banner (#529 S2) ----------------------
+# AFTER plan mode, which exits before any side effect, and BEFORE admission,
+# so a run refused by a capability probe or a manifest delta is not silent
+# either. Resolving the identity is pure: nothing is created until admission
+# has passed.
+_evidence_kernel_abort() {
+    contract_note "evidence: bin/_lib_test_evidence.py is missing, unreadable or not importable at $EVIDENCE_KERNEL — bin/cctally-test-all imports it for run identity, failure-window selection and sanitization, so the run cannot start. The bridge's own message above names the reason. On a public checkout, confirm the module is allowlisted for the mirror."
+    contract_fail infrastructure evidence-kernel-missing "bin/_lib_test_evidence.py" admission
+    contract_abort
+}
+
+if [ ! -r "$EVIDENCE_KERNEL" ]; then
+    _evidence_kernel_abort
+fi
+
+# The readability probe above answers only "can this path be opened", which is
+# the case a public checkout hits. It cannot see the likelier one — the file is
+# present and readable and importing it raises, from a syntax error or an
+# interpreter incompatibility. The bridge reserves status 9 for exactly that,
+# so it is read here as its own diagnosis; without the branch the run-id call's
+# non-zero status was blamed on the run-id grammar, and the operator was told
+# to change a variable that had nothing to do with it.
+RUN_ID=$(_ev run-id)
+case $? in
+    0) ;;
+    9) _evidence_kernel_abort ;;
+    *) contract_usage_abort "CCTALLY_TEST_RUN_ID must be a safe single path component matching ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\$" CCTALLY_TEST_RUN_ID ;;
+esac
+
+printf '[cctally-test-all] run %s — %s harnesses, outer=%s inner=%s pytest=%s\n' \
+    "$RUN_ID" "${#all_harnesses[@]}" "$OUTER" "$INNER" "$PYTEST" >&2
 
 # ---- admission (#529 S1) -----------------------------------------------
 # AFTER plan mode by design: the block above exits "before ANY side effect" and
@@ -166,18 +1059,33 @@ fi
 # probes. Admission runs before LOGDIR so a refusal creates nothing. The library
 # itself is sourced near the top of this file, because the worker-budget checks
 # need contract_usage_abort; only the calls below have side effects.
-CONTRACT_PROFILE=public
-# .mirror-allowlist excludes itself, so its presence is exactly the private
-# discriminator: absent means this tree IS the shipped public subset.
-if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
-    CONTRACT_PROFILE=private
-fi
+# CONTRACT_PROFILE is resolved with the subset block near the top of this file,
+# because selection validates names against the rows this profile requires.
+#
+# This is the SECOND load on a subset run, and the repetition is deliberate:
+# keep it unconditional. `_contract_index_manifest` assigns its three lookup
+# tables rather than appending to them, so reloading is idempotent and cannot
+# double-count; making the call conditional on `COVERAGE_RESOLVED` would leave
+# selection and admission reading manifest state captured at two different
+# moments, free to disagree about the estate they are each deciding on.
 contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
+# A full run's selection is the whole declared estate. It is recorded HERE
+# rather than before plan mode, so plan mode still exits without parsing the
+# manifest; a subset resolved its own coverage earlier and is left alone.
+if [ "$COVERAGE_RESOLVED" != 1 ]; then
+    COVERAGE_SELECTED=$(contract_manifest_harness_names "$CONTRACT_PROFILE" | tr '\n' ' ')
+    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
+    COVERAGE_RESOLVED=1
+fi
 contract_admit_harnesses "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
 # Covers CI, which invokes this aggregator directly. The canonical
 # bin/cctally-test-remote path needs its OWN guard as well, because the wrapper
 # forwards none of these variables over SSH — see _guard_regeneration_env there.
 contract_admit_regeneration || contract_abort
+# #529 S6 M4 (exception X1). A caller that KNOWS it degraded this run says so in
+# the contract's own vocabulary. Recorded rather than fatal: the run completes,
+# and only its verdict changes.
+contract_admit_external_reason
 # Capability hardness belongs to the AUTHORITATIVE profile, not to the
 # aggregator unconditionally: tests/requirements-dev.txt documents pytest-xdist
 # and pytest-timeout as optional-by-detection, and making them unconditionally
@@ -188,11 +1096,404 @@ if ! contract_admit_capabilities "$CONTRACT_PROFILE"; then
     contract_is_authoritative && contract_abort
 fi
 
-LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
-trap 'rm -rf "$LOGDIR"' EXIT
+# ---- evidence resolution (#529 S2) -------------------------------------
+# AFTER admission, so a refused run creates nothing at all.
+#
+# The root is machine-wide and lives OUTSIDE every synced worktree, keyed by
+# {remoteDir, runId}: the remote wrapper keys its locks and handles by
+# (host, remote_dir), so several worktrees run concurrently on one runner and
+# a cap enforced from inside one remote directory could not be a per-runner
+# cap. With no root at all — a bare local run — the log directory stays a
+# mktemp -d deleted on exit, because nothing leaves this machine.
+#
+# CCTALLY_TEST_EVIDENCE_ROOT is the ONLY way in, and CI is not an exception.
+# The aggregator used to derive a root from GITHUB_ACTIONS and RUNNER_TEMP,
+# which turned the whole subsystem — including console sanitization — on for
+# every published workflow. That was a regression rather than a feature: no
+# workflow uploads the directory, and $RUNNER_TEMP is destroyed when the job
+# ends, so the sanitized console was the ONLY surviving copy and the raw log
+# the sanitizing rule promises is retained did not outlive the job. Requiring
+# the variable makes a workflow set the root and upload export/ in one change.
+EVIDENCE_ROOT=${CCTALLY_TEST_EVIDENCE_ROOT:-}
+EVIDENCE_REMOTE_DIR=${CCTALLY_REMOTE_DIR:-local}
+EVIDENCE_DIR=""
+LOGDIR_IS_TEMPORARY=1
+RUN_STARTED_EPOCH=$(date +%s)
+RUN_PID=$$
+RUN_PID_START=$(_ev pid-start "$$" 2>/dev/null || printf '')
+
+export EV_REPO_ROOT="$REPO_ROOT"
+
+_write_manifest() {   # _write_manifest <state> <exit-code>
+    [ -n "$EVIDENCE_DIR" ] || return 0
+    local wall passed_cases
+    # ONE sample of the run's wall clock, shared with the outcome record.
+    # contract_finish freezes it at the verdict and this function is reached
+    # afterwards from the EXIT trap, so sampling $SECONDS again here let a
+    # single run publish two different secondsPerThousandCases values. Before
+    # the verdict — the `active` write — nothing is frozen yet and the live
+    # value is the right one.
+    wall=${CONTRACT_WALL_SECONDS:-$SECONDS}
+    # Empty, not zero, when pytest's half of the denominator could not be read:
+    # the sum of a known number and an unknown one is unknown, and the manifest
+    # records that as null rather than as the shell half alone.
+    if [ "${CONTRACT_PYTEST_UNPARSED:-0}" = 1 ]; then
+        passed_cases=""
+    else
+        passed_cases=$((CONTRACT_PASSED + CONTRACT_PYTEST_PASSED))
+    fi
+    # Exported inside a SUBSHELL. The variables have to be exported, because
+    # `_ev` is a shell function and only exported variables reach the python3
+    # it spawns; the subshell is what keeps that export from outliving the
+    # call. The first manifest is written before the pool starts, so exporting
+    # in this shell put a dozen EV_* variables into the environment of every
+    # harness for the rest of the run.
+    (
+        export EV_EVIDENCE_DIR="$EVIDENCE_DIR" EV_RUN_ID="$RUN_ID" \
+               EV_REMOTE_DIR="$EVIDENCE_REMOTE_DIR" EV_STARTED="$RUN_STARTED_EPOCH" \
+               EV_PID="$RUN_PID" EV_PID_START="$RUN_PID_START" \
+               EV_CLASS="$CONTRACT_CLASS" EV_LOGDIR="$LOGDIR" \
+               EV_OUTER="$OUTER" EV_INNER="$INNER" EV_PYTEST="$PYTEST" \
+               EV_SECONDS="$wall" EV_POOL_WALL="${pool_wall:-0}" \
+               EV_PYTEST_WALL="${pytest_wall:-0}" \
+               EV_PASSED_CASES="$passed_cases"
+        _ev manifest "$1" "$2"
+    ) || true
+}
+
+if [ -n "$EVIDENCE_ROOT" ]; then
+    EVIDENCE_DIR=$(_ev layout "$EVIDENCE_ROOT" "$EVIDENCE_REMOTE_DIR" "$RUN_ID") \
+        || contract_usage_abort "CCTALLY_REMOTE_DIR must be a safe single path component (got: '$EVIDENCE_REMOTE_DIR')" CCTALLY_REMOTE_DIR
+    # Refused, never reused: two runs writing one evidence directory would
+    # interleave their logs, their sidecars and their manifests, and neither
+    # could then be read. The kernel cannot enforce this — it imports only
+    # `re` and performs no I/O — so the aggregator does.
+    if [ -e "$EVIDENCE_DIR" ]; then
+        contract_usage_abort "an evidence directory already existed for run id '$RUN_ID' at $EVIDENCE_DIR before this run started — two runs sharing one directory would corrupt both, so this run refuses rather than reuse it; pass a distinct CCTALLY_TEST_RUN_ID or remove the directory" "$RUN_ID"
+    fi
+    # `mkdir` on the leaf without -p is the atomic claim: a concurrent run that
+    # passed the check above loses the race here rather than silently sharing.
+    # The two messages are deliberately different, and each states only what
+    # its own branch can know. Reaching this one means the directory did NOT
+    # exist a moment ago and does now, which is a live race; the branch above
+    # means it was already there when this run started. Saying "concurrently"
+    # in both would tell an operator holding a stale directory to look for a
+    # second run that never existed.
+    if ! ( umask 077 && mkdir -p "${EVIDENCE_DIR%/*}" && mkdir "$EVIDENCE_DIR" ); then
+        if [ -e "$EVIDENCE_DIR" ]; then
+            contract_usage_abort "run id '$RUN_ID' was claimed concurrently at $EVIDENCE_DIR, between this run's check and its own mkdir — another run is using the same CCTALLY_TEST_RUN_ID; pass a distinct one" "$RUN_ID"
+        fi
+        contract_note "evidence: could not create the evidence directory $EVIDENCE_DIR — check that CCTALLY_TEST_EVIDENCE_ROOT is writable"
+        contract_fail infrastructure evidence-init-failed "$EVIDENCE_DIR" admission
+        contract_abort
+    fi
+    if ! ( umask 077 && mkdir "$EVIDENCE_DIR/logs" "$EVIDENCE_DIR/timings" "$EVIDENCE_DIR/export" ); then
+        contract_note "evidence: could not create the evidence subdirectories under $EVIDENCE_DIR"
+        contract_fail infrastructure evidence-init-failed "$EVIDENCE_DIR" admission
+        contract_abort
+    fi
+    LOGDIR="$EVIDENCE_DIR/logs"
+    LOGDIR_IS_TEMPORARY=0
+    # S1's outcome record lands inside the evidence tree by default, so the
+    # wrapper and CI fetch it and the extract from one place. An explicit
+    # CCTALLY_TEST_ALL_OUTCOME_FILE still wins: the wrapper pins that path.
+    CCTALLY_TEST_ALL_OUTCOME_FILE="${CCTALLY_TEST_ALL_OUTCOME_FILE:-$EVIDENCE_DIR/export/outcome.json}"
+    export CCTALLY_TEST_ALL_OUTCOME_FILE
+    _write_manifest active ""
+else
+    LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
+    if [ -z "$LOGDIR" ] || [ ! -d "$LOGDIR" ]; then
+        contract_note "evidence: could not allocate a temporary log directory (mktemp failed; check TMPDIR)"
+        contract_fail infrastructure evidence-init-failed "" admission
+        contract_abort
+    fi
+fi
+
+PROGRESS_DIR="$LOGDIR/.progress"
+mkdir -p "$PROGRESS_DIR" 2>/dev/null || true
+
+# ---- the progress reporter (#529 S2) -----------------------------------
+# ONE writer of progress output, so two concurrent workers cannot interleave a
+# partial line — interleaving is removed structurally rather than made
+# unlikely. Everything goes to stderr: the deterministic aggregated block on
+# stdout stays byte-stable, and tests/test_authoritative_test_contract.py
+# parses that block.
+PROGRESS_INTERVAL=${CCTALLY_PROGRESS_INTERVAL:-30}
+case "$PROGRESS_INTERVAL" in *[!0-9]*|'') PROGRESS_INTERVAL=30 ;; esac
+[ "$PROGRESS_INTERVAL" -lt 1 ] && PROGRESS_INTERVAL=30
+# The seam exists for tests only. An authoritative run keeps the fixed
+# cadence, so no caller can make a run whose green is meant to be believed
+# quieter than this.
+contract_is_authoritative && PROGRESS_INTERVAL=30
+
+ALL_HARNESS_NAMES=${all_harnesses[*]+"${all_harnesses[*]}"}
+HARNESS_TOTAL=${#all_harnesses[@]}
+REPORTER_PID=""
+POOL_PID=""
+PHASE_PID=""
+
+_phase_set() {   # atomic replacement: the reporter may read at any instant
+    printf '%s' "$1" > "$PROGRESS_DIR/phase.tmp" 2>/dev/null \
+        && mv -f "$PROGRESS_DIR/phase.tmp" "$PROGRESS_DIR/phase" 2>/dev/null
+    return 0
+}
+
+# Runs INSIDE the reporter subshell, so its mutations of the contract globals
+# never reach the parent. That is deliberate: the parent reclassifies every
+# harness in deterministic order afterwards, so a completion line is a preview
+# of the authoritative verdict and never a second source of truth. The
+# accumulator is reset per harness, or the line would report the worst class
+# seen so far rather than this harness's own.
+_report_completion() {   # $1 harness, $2 index
+    local h=$1 idx=$2 dur
+    dur=$(cat "$LOGDIR/${h}.time" 2>/dev/null || printf '?')
+    CONTRACT_CLASS=none
+    CONTRACT_LAST_CODE=""
+    contract_classify_harness "$h" "$LOGDIR/${h}.log" "$LOGDIR/${h}.exit" \
+        "$(contract_min_cases "$h")"
+    if [ "$CONTRACT_CLASS" = none ]; then
+        printf '[%3s/%s] PASS  %-22s %6s cases %6ss\n' \
+            "$idx" "$HARNESS_TOTAL" "$h" "$CONTRACT_LAST_PASSED" "$dur" >&2
+    else
+        printf '[%3s/%s] FAIL  %-22s %-14s %-24s %6ss\n' \
+            "$idx" "$HARNESS_TOTAL" "$h" "$CONTRACT_CLASS" "$CONTRACT_LAST_CODE" \
+            "$dur" >&2
+    fi
+}
+
+_reporter_loop() {   # $1 parent pid
+    local parent=$1 last=$SECONDS last_phase="" done_n running queued names h phase elapsed
+    local final=0
+    # Monotonic across ticks, and deliberately NOT the scan position. Counting
+    # completions during the in-estate-order scan made the index go BACKWARDS
+    # under concurrency — a harness late in the estate that finished first got
+    # a higher number than one earlier in the estate that finished later, so a
+    # real run printed `[ 2/56] bench` above `[ 1/56] account`.
+    local reported=0
+    while :; do
+        # Exits on its own if the parent disappears, so a killed aggregator
+        # cannot leave a reporter writing into a directory being removed.
+        kill -0 "$parent" 2>/dev/null || final=1
+        [ -d "$PROGRESS_DIR" ] || return 0
+        # Shutdown is requested, not taken immediately: one more scan follows,
+        # or every harness that finished between the last tick and the join
+        # would never get its completion line. A fast estate finishes the whole
+        # pool inside one tick, so that is the ordinary case rather than a race.
+        [ -f "$PROGRESS_DIR/stop" ] && final=1
+        done_n=0; running=0; queued=0; names=""
+        for h in $ALL_HARNESS_NAMES; do
+            if [ -f "$LOGDIR/${h}.done" ]; then
+                done_n=$((done_n + 1))
+                if [ ! -f "$PROGRESS_DIR/${h}.reported" ]; then
+                    : > "$PROGRESS_DIR/${h}.reported"
+                    reported=$((reported + 1))
+                    _report_completion "$h" "$reported"
+                fi
+            elif [ -f "$LOGDIR/${h}.started" ]; then
+                running=$((running + 1)); names="$names $h"
+            else
+                queued=$((queued + 1))
+            fi
+        done
+        [ "$final" = 1 ] && return 0
+        elapsed=$SECONDS
+        phase=$(cat "$PROGRESS_DIR/phase" 2>/dev/null || printf '')
+        if [ "$phase" != "$last_phase" ] \
+            || [ "$((elapsed - last))" -ge "$PROGRESS_INTERVAL" ]; then
+            last=$elapsed
+            last_phase=$phase
+            case "$phase" in
+                pool)
+                    printf '[cctally-test-all] %ss — %s/%s done, %s running:%s; %s queued\n' \
+                        "$elapsed" "$done_n" "$HARNESS_TOTAL" "$running" \
+                        "${names:- none}" "$queued" >&2 ;;
+                pytest|benchmark)
+                    printf '[cctally-test-all] %ss — %s running\n' \
+                        "$elapsed" "$phase" >&2 ;;
+            esac
+            : > "$PROGRESS_DIR/phase-${phase}.reported" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+}
+
+_reporter_start() {   # $1 phase
+    _phase_set "$1"
+    rm -f "$PROGRESS_DIR/stop" 2>/dev/null || true
+    _reporter_loop "$$" &
+    REPORTER_PID=$!
+    _reporter_wait_phase "$1"
+}
+
+# A fast phase must not finish before the reporter has stated that it began.
+# The acknowledgement also makes the phase-transition pulse part of the
+# thirty-second ceiling rather than an eventual best effort.
+_reporter_wait_phase() {   # $1 phase
+    local phase=$1 waited=0
+    while [ ! -f "$PROGRESS_DIR/phase-${phase}.reported" ]; do
+        kill -0 "$REPORTER_PID" 2>/dev/null || return 1
+        [ "$waited" -lt 50 ] || return 1
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# Bounded, so the wait can never hang the suite.
+_reporter_join() {
+    local waited=0
+    [ -n "$REPORTER_PID" ] || return 0
+    : > "$PROGRESS_DIR/stop" 2>/dev/null || true
+    while kill -0 "$REPORTER_PID" 2>/dev/null; do
+        if [ "$waited" -ge 10 ]; then
+            kill -TERM "$REPORTER_PID" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$REPORTER_PID" 2>/dev/null || true
+    REPORTER_PID=""
+    return 0
+}
+
+# A negative pid signals the whole PROCESS GROUP. The pool and each pytest leg
+# are launched under `set -m` so they lead their own group, which is what makes
+# `xargs`, every `bash -c` worker and every harness descendant reachable here.
+# Signalling only the leader would leave harnesses running into a directory
+# teardown is about to remove.
+_reap_group() {   # $1 group leader pid
+    local pid=$1 waited=0
+    [ -n "$pid" ] || return 0
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge 20 ]; then
+            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.25 2>/dev/null || sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null || true
+    return 0
+}
+
+# Teardown is an ORDERED state machine, not a single trap action. Freeze
+# progress, stop producing children and reap them, join the reporter, finalize
+# the manifest with the correct terminal state, remove reporter state, and only
+# then remove the log directory — and only when it is temporary.
+_cleanup_run() {
+    local rc=$? state=completed
+    _phase_set "done"
+    _reap_group "${POOL_PID:-}"
+    _reap_group "${PHASE_PID:-}"
+    _reporter_join
+    if [ -n "$EVIDENCE_DIR" ]; then
+        # Marking an interrupted run `completed` would be false, and an
+        # `active` run that is never reconciled is protected from eviction for
+        # good. ONE test: every signal path leaves through `exit 128+signal`,
+        # including the untrapped ones bash still runs this trap for, so the
+        # status is the whole answer. A second `$PROGRESS_DIR/interrupted`
+        # marker file used to sit here, and it could not decide a case the
+        # status did not already decide — deleting either line left every
+        # interrupt test green, which is the definition of an uncovered line.
+        [ "$rc" -ge 128 ] && state=aborted
+        _collect_timings
+        _write_manifest "$state" "$rc"
+        _harden_evidence_modes
+    fi
+    rm -rf "$PROGRESS_DIR" 2>/dev/null || true
+    if [ "$LOGDIR_IS_TEMPORARY" = 1 ]; then
+        rm -rf "$LOGDIR"
+    fi
+    return $rc
+}
+
+# The signal handlers exist so the run leaves through `exit`, which is what
+# fires the EXIT trap and runs the ordered teardown above; the status they take
+# is also what tells that teardown the run was interrupted.
+_interrupted() {   # $1 exit status to take
+    exit "$1"
+}
+
+# 0600 files under 0700 directories, applied once at teardown rather than by
+# raising the umask for the whole run. Raising it would reach every harness and
+# every pytest subprocess and change the modes of the databases, sidecars and
+# fixtures they create — and the mode is the assertion in nineteen pytest
+# files, tests/test_stats_perms.py and tests/test_conversation_perms.py among
+# them. No shell harness asserts a mode; the goldens compare content, so they
+# are not the consumer this protects. S1's contract_emit_outcome writes the
+# record under the ambient umask and is not modified here.
+_harden_evidence_modes() {
+    [ -n "$EVIDENCE_DIR" ] || return 0
+    find "$EVIDENCE_DIR" -type d -exec chmod 700 {} + 2>/dev/null || true
+    find "$EVIDENCE_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
+    return 0
+}
+
+_collect_timings() {
+    [ -n "$EVIDENCE_DIR" ] || return 0
+    local t h
+    for t in "$LOGDIR"/*.time; do
+        [ -f "$t" ] || continue
+        h=$(basename "$t" .time)
+        cp -f "$t" "$EVIDENCE_DIR/timings/${h}.seconds" 2>/dev/null || true
+    done
+    {
+        printf 'total\t%s\n' "$SECONDS"
+        printf 'shell-pool\t%s\n' "${pool_wall:-0}"
+        printf 'pytest\t%s\n' "${pytest_wall:-0}"
+    } > "$EVIDENCE_DIR/timings/phases.tsv" 2>/dev/null || true
+    return 0
+}
+
+trap '_cleanup_run' EXIT
+trap '_interrupted 130' INT
+trap '_interrupted 143' TERM
+
+# ---- sanitized console output (#529 S2) --------------------------------
+# The aggregator writes raw bytes to stderr in four places: the
+# unreadable-summary dump, the FAIL-details window, and the two pytest dumps.
+# In CI that stream IS the GitHub Actions log, which leaves the runner exactly
+# as an artifact does, so sanitizing only the uploaded file would leave the
+# larger channel open. All four therefore emit the same validated sanitized
+# bytes the export contains, WHENEVER an evidence root exists.
+#
+# With no evidence root — a bare local run, and any CI job that has not set
+# CCTALLY_TEST_EVIDENCE_ROOT — stderr stays raw, because nothing leaves the
+# machine that produced it and the temporary log is the operator's only copy.
+# The rule is that sanitization applies exactly where bytes leave the machine
+# that produced them, and it never destroys information: in every sanitized
+# case the raw log is retained under logs/ beside the sanitized copy. That
+# second half is why the root is never inferred — a root a caller did not ask
+# for is a root nobody collects, and sanitizing against an uncollected log
+# destroys the information it claims to preserve.
+_record_failed_subject() {   # $1 subject, $2 logfile
+    [ -n "$EVIDENCE_DIR" ] || return 0
+    printf '%s\t%s\n' "$1" "$2" >> "$PROGRESS_DIR/failed-subjects" 2>/dev/null || true
+    return 0
+}
+
+_emit_failure_context() {   # $1 subject, $2 logfile
+    _record_failed_subject "$1" "$2"
+    if [ -z "$EVIDENCE_DIR" ]; then
+        cat "$2" >&2
+        return 0
+    fi
+    _ev scrub-log "$1" "$2" >&2 \
+        || printf '[REDACTED: the sanitizer failed for %s; the raw log is retained under logs/]\n' "$1" >&2
+    return 0
+}
 
 run_one() {
     local h=$1 start=$SECONDS rc
+    # `started` before execution and `done` last. Three states follow — no
+    # `started` means queued, `started` without `done` means running, `done`
+    # means complete — and distinguishing queued from running is what lets the
+    # heartbeat NAME a hung harness rather than leave it as a line that never
+    # arrives.
+    : > "$LOGDIR/${h}.started"
     # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update
     # read CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS. INNER
     # is exported below so it is non-empty in this xargs-spawned subshell.
@@ -201,6 +1502,7 @@ run_one() {
     rc=$?
     echo "$rc" > "$LOGDIR/${h}.exit"                   # one file per harness
     echo "$((SECONDS - start))" > "$LOGDIR/${h}.time"  # one file per harness
+    : > "$LOGDIR/${h}.done"                            # published LAST
     # Return 0 so xargs -P keeps running the estate. The old `|| true` did this
     # AND discarded the status; only this half was ever wanted, and discarding
     # the status is what let a harness exit non-zero while printing a clean
@@ -212,10 +1514,32 @@ export REPO_ROOT LOGDIR INNER
 
 # Shell-harness pool (reconcile included; no serial phase). xargs -I {} runs
 # one bash per harness; -P "$OUTER" bounds concurrency.
+#
+# The pipeline is wrapped in a subshell and backgrounded under `set -m` for two
+# reasons: `$!` then names a process-group LEADER that teardown can signal as a
+# group, and the parent waits with `wait`, which a trapped signal interrupts —
+# an ordinary foreground pipeline defers every trap until it finishes, so an
+# interrupted run would sit through the whole estate before tearing down.
 pool_start=$SECONDS
-printf '%s\n' "${all_harnesses[@]}" \
-    | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {}
+_reporter_start pool
+set -m
+# Two guards with two jobs. The `${a[@]+…}` form keeps bash 3.2 from erroring
+# on an empty array under `set -u`; the emptiness test keeps `printf '%s\n'`
+# with no arguments from emitting the single blank line it would otherwise
+# print, which xargs implementations do not agree about.
+{ { [ "$HARNESS_TOTAL" -eq 0 ] || printf '%s\n' ${all_harnesses[@]+"${all_harnesses[@]}"} ; } \
+    | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {} ; } &
+POOL_PID=$!
+set +m
+wait "$POOL_PID"
+POOL_PID=""
 pool_wall=$((SECONDS - pool_start))
+# The reporter is joined BEFORE the parent writes any multiline diagnostic. A
+# heartbeat landing inside a `---- … ----` block would split a diagnostic the
+# operator is reading, which is F8's defect reintroduced from the other side.
+_reporter_join
+printf '[cctally-test-all] shell pool finished — %ss; classifying %s harnesses\n' \
+    "$pool_wall" "$HARNESS_TOTAL" >&2
 
 # Aggregate in original harness order so output stays deterministic
 # regardless of which harness finished first under parallelism.
@@ -223,7 +1547,7 @@ total_pass=0
 total_fail=0
 declare -a rows
 
-for h in "${all_harnesses[@]}"; do
+for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
     log="$LOGDIR/${h}.log"
     # The verdict comes from the classifier (exit sidecar + summary grammar +
     # the manifest floor); this loop keeps only the human row render.
@@ -235,7 +1559,8 @@ for h in "${all_harnesses[@]}"; do
         rows+=("$(printf '%5s/%s   %s  (%s — see log)' '?' '?' "$h" "$CONTRACT_LAST_CODE")")
         total_fail=$((total_fail + 1))
         echo "---- $h output ($CONTRACT_LAST_CODE) ----" >&2
-        cat "$log" >&2
+        _emit_failure_context "$h" "$log"
+        echo "---- end $h ----" >&2
         continue
     fi
     total_pass=$((total_pass + p))
@@ -243,19 +1568,19 @@ for h in "${all_harnesses[@]}"; do
     rows+=("$(printf '%5s/%s   %s' "$p" "$f" "$h")")
     if [ "$f" -ne 0 ]; then
         echo "---- $h FAIL details ----" >&2
-        # Print up to 200 lines of context after each FAIL marker so the
-        # harness's diff output (emitted immediately after the FAIL line
-        # via `diff -u | head -200`) survives into stderr — without this,
-        # CI logs show only the FAIL header and the actual unexpected
-        # output is lost. Resets `lines` on each new marker so multiple
-        # failures in one harness all surface their diffs.
-        awk '
-            /^(FAIL|MISSING GOLDEN|RECONCILE FAIL)/ { flag = 1; lines = 200 }
-            flag && lines > 0                       { print; lines-- }
-            flag && lines == 0                      { flag = 0 }
-        ' "$log" >&2 || true
+        # The forward-only awk rule this replaces started AT the marker, so a
+        # harness that prints its explanation BEFORE the marker had that
+        # explanation discarded and the window filled with the next case's
+        # output instead (#529 finding F7). The kernel selects forty preceding
+        # lines, the marker and two hundred following ones, merges overlapping
+        # windows, and allocates a bounded budget across every failed subject.
+        _emit_failure_context "$h" "$log"
+        echo "---- end $h ----" >&2
     fi
 done
+
+printf '[cctally-test-all] shell pool complete — %s passed, %s failed, %ss\n' \
+    "$total_pass" "$total_fail" "$pool_wall" >&2
 
 # pytest tests/ after the pool (skipped if pytest is unavailable). The bulk
 # estate uses pytest-xdist when available. Wall-clock benchmarks are excluded
@@ -265,7 +1590,61 @@ done
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
 pytest_wall=0
-if python3 -m pytest --version >/dev/null 2>&1; then
+
+# pytest's own passed-ITEM count, read from its summary line — or the EMPTY
+# STRING when no count could be read at all.
+#
+# The two answers are deliberately different. A lost count does not zero the
+# denominator of the normalized metric, because the shell half is non-zero on
+# any real run: it HALVES it, which roughly doubles the recorded metric while
+# the record still looks well formed. So "not parsed" propagates a null, while
+# a pytest run that legitimately passed nothing still records 0.
+#
+# Telling those apart needs the summary LINE, not a `N passed` match. pytest
+# closes every run it reached the end of with a line ending `in <n>s`, whatever
+# the verbosity and whatever the outcome, and an all-skipped or nothing-
+# collected run's summary carries no `passed` at all. A grep for `N passed`
+# cannot see that difference, and it answered `Binary file … matches` — which
+# `cut` then flattened to a wrong 0 — for a log carrying a NUL byte, a shape
+# this estate already has a `binary-log` reason code for.
+_parse_pytest_passed() {   # <logfile>
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        data = handle.read()
+except OSError:
+    # Never written, or unreadable. No count exists to report.
+    print("")
+    raise SystemExit(0)
+
+# The LAST such line wins: a test's own output can carry the same shape, and
+# the summary is always last.
+summary = None
+for line in data.splitlines():
+    if re.search(rb"\bin \d+(\.\d+)?s\b", line):
+        summary = line
+if summary is None:
+    # pytest never got as far as reporting — an internal error, a truncated
+    # log. That is not a passed count of zero.
+    print("")
+    raise SystemExit(0)
+match = re.search(rb"(\d+) passed", summary)
+print(match.group(1).decode() if match else "0")
+PY
+}
+
+if [ "$COVERAGE_PYTEST" = "skipped" ]; then
+    # A subset run skips the pytest phase, and the serial benchmark leg with
+    # it, unless --with-pytest was given (section 4.3). Nothing is recorded
+    # here: the run is ALREADY classified `incomplete` for `deliberate-subset`,
+    # and this is not the `pytest-unavailable` shape, where an estate that
+    # should have run silently did not. This is safe only because every subset
+    # path is unconditionally incomplete and exits 3.
+    printf '[cctally-test-all] pytest phase skipped — deliberate subset (pass --with-pytest to run it)\n' >&2
+elif python3 -m pytest --version >/dev/null 2>&1; then
     pytest_status="PASS"
     pytest_log="$LOGDIR/pytest.log"
     pytest_rebuild_benchmark="tests/test_rebuild_benchmark.py"
@@ -299,31 +1678,56 @@ if python3 -m pytest --version >/dev/null 2>&1; then
     if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
         pytest_timeout_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
     fi
-    pytest_args+=("${pytest_timeout_args[@]}")
+    pytest_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
     pytest_start=$SECONDS
-    (cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}") > "$pytest_log" 2>&1
+    # Each leg runs as its own process group for the reasons given at the pool:
+    # `wait` is interruptible by a trapped signal and the group is reapable.
+    printf '[cctally-test-all] pytest phase started — %s xdist workers\n' "$PYTEST" >&2
+    _reporter_start pytest
+    set -m
+    { cd "$REPO_ROOT" && python3 -m pytest "${pytest_args[@]}" ; } \
+        > "$pytest_log" 2>&1 &
+    PHASE_PID=$!
+    set +m
+    wait "$PHASE_PID"
     pytest_rc=$?
+    PHASE_PID=""
+    pytest_dump_main=0
+    pytest_dump_benchmark=0
+    # Called UNCONDITIONALLY, including on a clean run: the classification is
+    # unchanged (rc 0 returns immediately), and the call is what records the
+    # leg's passed-item count for the normalized metric. Gating it on failure
+    # would leave the denominator at zero on exactly the runs that produce it.
+    # Read for MEANING, not as a boolean: 1 is product, 5 (nothing collected)
+    # is incomplete, 2/3/4 (interrupted, internal error, usage) are
+    # infrastructure.
+    contract_classify_pytest "$pytest_rc" "pytest" "$(_parse_pytest_passed "$pytest_log")"
     if [ "$pytest_rc" -ne 0 ]; then
         pytest_status="FAIL"
-        echo "---- pytest FAIL details ----" >&2
-        cat "$pytest_log" >&2
+        pytest_dump_main=1
         pytest_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_log" || true)
-        # Read for MEANING, not as a boolean: 1 is product, 5 (nothing
-        # collected) is incomplete, 2/3/4 (interrupted, internal error, usage)
-        # are infrastructure.
-        contract_classify_pytest "$pytest_rc" "pytest"
     fi
     if [ "${#pytest_serial_targets[@]}" -gt 0 ]; then
+        printf '[cctally-test-all] benchmark phase started — serial targets: %s\n' \
+            "${#pytest_serial_targets[@]}" >&2
+        _phase_set benchmark
+        _reporter_wait_phase benchmark
         pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
         pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE)
-        pytest_benchmark_args+=("${pytest_timeout_args[@]}")
-        (cd "$REPO_ROOT" && python3 -m pytest "${pytest_benchmark_args[@]}") > "$pytest_benchmark_log" 2>&1
+        pytest_benchmark_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
+        set -m
+        { cd "$REPO_ROOT" && python3 -m pytest "${pytest_benchmark_args[@]}" ; } \
+            > "$pytest_benchmark_log" 2>&1 &
+        PHASE_PID=$!
+        set +m
+        wait "$PHASE_PID"
         pytest_benchmark_rc=$?
+        PHASE_PID=""
+        contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
+            "$(_parse_pytest_passed "$pytest_benchmark_log")"
         if [ "$pytest_benchmark_rc" -ne 0 ]; then
             pytest_status="FAIL"
-            contract_classify_pytest "$pytest_benchmark_rc" "benchmark"
-            echo "---- pytest benchmark FAIL details ----" >&2
-            cat "$pytest_benchmark_log" >&2
+            pytest_dump_benchmark=1
             benchmark_failed_nodes=$(grep -E '^(FAILED|ERROR) ' "$pytest_benchmark_log" || true)
             if [ -n "$benchmark_failed_nodes" ]; then
                 if [ -n "$pytest_failed_nodes" ]; then
@@ -333,10 +1737,24 @@ if python3 -m pytest --version >/dev/null 2>&1; then
             fi
         fi
     fi
+    pytest_wall=$((SECONDS - pytest_start))
+    # Both dumps are DEFERRED until the reporter has been joined, so the
+    # pytest phase keeps its heartbeats and no heartbeat can land inside
+    # either multiline block.
+    _reporter_join
+    if [ "$pytest_dump_main" = 1 ]; then
+        echo "---- pytest FAIL details ----" >&2
+        _emit_failure_context pytest "$pytest_log"
+        echo "---- end pytest ----" >&2
+    fi
+    if [ "$pytest_dump_benchmark" = 1 ]; then
+        echo "---- pytest benchmark FAIL details ----" >&2
+        _emit_failure_context benchmark "$pytest_benchmark_log"
+        echo "---- end pytest benchmark ----" >&2
+    fi
     if [ "$pytest_status" = "FAIL" ]; then
         total_fail=$((total_fail + 1))
     fi
-    pytest_wall=$((SECONDS - pytest_start))
 else
     # Unreachable on an authoritative run: pytest is an admission precondition.
     # On a local run it is RECORDED rather than silently swallowing all 550
@@ -345,7 +1763,7 @@ else
 fi
 
 echo "----"
-for row in "${rows[@]}"; do echo "$row"; done
+for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done
 printf '%5s   %s\n' "$pytest_status" "pytest"
 if [ "$pytest_status" = "FAIL" ]; then
     if [ -n "$pytest_failed_nodes" ]; then
@@ -362,7 +1780,7 @@ echo "----"
 echo "Timing: total=${SECONDS}s  shell-pool=${pool_wall}s  pytest=${pytest_wall}s  (outer=$OUTER inner=$INNER pytest=$PYTEST)"
 echo "Slowest harnesses:"
 {
-    for h in "${all_harnesses[@]}"; do
+    for h in ${all_harnesses[@]+"${all_harnesses[@]}"}; do
         t=$(cat "$LOGDIR/${h}.time" 2>/dev/null || echo 0)
         printf '%s %s\n' "$t" "$h"
     done
@@ -374,12 +1792,65 @@ done
 # run refused for `case-floor-unmet` has none — the scrollback would otherwise
 # read `failed=0` above an exit 3 and contradict itself.
 echo "----"
+# 0 when `deliberate-subset` is the ONLY reason recorded, which is the case the
+# reassuring wording below is reserved for. A subset carrying a real failure
+# keeps the ordinary FAIL verdict.
+_subset_other_reasons=$(printf '%s' "$CONTRACT_REASONS" \
+    | awk -F'\t' 'NF && $1 != "deliberate-subset"' | wc -l | tr -d ' ')
+# An empty selection is refused at parse time, so this fallback should never be
+# printed. It is here because the alternative to a name is a blank — the line
+# read "a deliberate subset run over  and is NOT a gate" — and a sentence with
+# a hole in it tells an operator nothing about which case they are in.
+_selected_display=$COVERAGE_SELECTED
+[ -n "$_selected_display" ] || _selected_display='(none)'
 if [ "$CONTRACT_CLASS" = "none" ]; then
     echo "Verdict: PASS (exit $(contract_exit_code))"
+elif [ "$COVERAGE_MODE" = "subset" ] && [ "$_subset_other_reasons" = "0" ]; then
+    # Exiting 3 on an all-passing targeted run is deliberately surprising, so
+    # this states in plain terms what happened. Exiting 0 and recording the
+    # incompleteness only in the machine-readable record was considered and
+    # rejected: the exit code carries the verdict, and a partial run exiting 0
+    # is the soft pass this epic exists to eliminate.
+    printf 'Verdict: INCOMPLETE — deliberate subset (exit %s)\n' "$(contract_exit_code)"
+    printf '  every selected harness PASSED: %s\n' "$_selected_display"
+    printf '  this run is deliberately incomplete — %s harness(es) were not run and the pytest estate was %s\n' \
+        "$(printf '%s' "$COVERAGE_OMITTED" | wc -w | tr -d ' ')" "$COVERAGE_PYTEST"
+    printf '  it is NOT a gate and can never be cited as one; run bin/cctally-test-all with no arguments for a verdict\n'
 else
     printf 'Verdict: FAIL — %s (exit %s); reasons: %s\n' \
         "$CONTRACT_CLASS" "$(contract_exit_code)" \
         "$(printf '%s' "$CONTRACT_REASONS" | awk -F'\t' 'NF{printf "%s%s%s", sep, $1, ($3=="" ? "" : "(" $3 ")"); sep=", "}')"
+    if [ "$COVERAGE_MODE" = "subset" ]; then
+        printf '  this was a deliberate subset run over %s and is NOT a gate, whatever its verdict\n' \
+            "$_selected_display"
+    fi
+fi
+
+# ---- retention and eviction (#529 S2) ----------------------------------
+# Runs BEFORE the extract, so the coverage sentence the operator sees on
+# stderr is the same one a CI artifact consumer finds at the head of the file
+# they are handed. Retention covers every run, pass and failure alike: keeping
+# only failures would leave "which harness flakes most" and "is the suite
+# getting slower" unanswerable for want of a denominator.
+EV_COVERAGE_NOTE=""
+if [ -n "$EVIDENCE_DIR" ]; then
+    export EV_MAX_AGE_DAYS="${CCTALLY_TEST_EVIDENCE_MAX_AGE_DAYS:-}" \
+           EV_MAX_BYTES="${CCTALLY_TEST_EVIDENCE_MAX_BYTES:-}"
+    EV_COVERAGE_NOTE=$(_ev retention "$EVIDENCE_ROOT" "$RUN_ID") || EV_COVERAGE_NOTE=""
+    export EV_COVERAGE_NOTE
+fi
+
+# ---- the sanitized failure extract (#529 S2) ---------------------------
+# NON-DECIDING by the spec's freeze point: the extract, the run manifest and
+# eviction all happen after the verdict is settled, so a failure here is
+# reported through a diagnostic line and the artifact's own absence and never
+# changes the class or the exit code. Letting an observability subsystem fail
+# the merge gate would convert a detector into an outage.
+if [ -n "$EVIDENCE_DIR" ] && [ "$CONTRACT_CLASS" != "none" ]; then
+    export EV_FAILED_LIST="$PROGRESS_DIR/failed-subjects" EV_RUN_ID="$RUN_ID"
+    if ! _ev export "$EVIDENCE_DIR"; then
+        contract_note "evidence: the sanitized failure extract was not published for run $RUN_ID — the complete unsanitized logs are retained at $EVIDENCE_DIR/logs"
+    fi
 fi
 
 contract_finish

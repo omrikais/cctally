@@ -24,6 +24,15 @@ from test_retention_walk import (
 def _load(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    # The subject of this file IS the admission predicate, and
+    # `maybe_defer_artifact_retention` returns "" immediately when
+    # CCTALLY_DISABLE_RETENTION_SWEEP is truthy. Clear it per test rather than
+    # depending on the process environment happening not to carry it: the
+    # root conftest pins it to "1" for every worker (#529 S4), and before that
+    # pin these tests already failed for any maintainer who exported it.
+    # `test_the_env_kill_switch_disables_scheduling` sets it back with
+    # monkeypatch.setenv, which runs after this and still wins.
+    monkeypatch.delenv("CCTALLY_DISABLE_RETENTION_SWEEP", raising=False)
     import _cctally_core
     import _cctally_retention
 

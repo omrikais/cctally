@@ -26,6 +26,10 @@ import datetime as dt
 import sys
 from dataclasses import dataclass
 
+from _lib_dashboard_settings_contract import (
+    SETTINGS_LEAF_DISPOSITIONS as _SETTINGS_LEAF_DISPOSITIONS,
+    WRITABLE as _WRITABLE,
+)
 from _lib_fmt import stable_sum
 from _lib_pricing import _calculate_entry_cost
 from _lib_pricing import claude_usage_dict as _claude_usage_dict
@@ -58,7 +62,19 @@ class _CacheReportConfigError(Exception):
         self.field = field
 
 
-_CACHE_REPORT_ALLOWED_KEYS = frozenset({"anomaly_threshold_pp"})
+#: Derived from the one settings contract rather than restated here, so this
+#: validator and ``POST /api/settings``'s classification pass cannot disagree
+#: about what the ``cache_report`` block may carry (#513 S1).
+#:
+#: The disposition is part of the filter, not just the prefix: a future
+#: ``cache_report.*`` leaf marked ``KNOWN_IGNORED`` is by definition one the
+#: endpoint does not write, and admitting it here would let this validator
+#: treat it as settable.
+_CACHE_REPORT_ALLOWED_KEYS = frozenset(
+    path.split(".", 1)[1]
+    for path, disposition in _SETTINGS_LEAF_DISPOSITIONS.items()
+    if path.startswith("cache_report.") and disposition == _WRITABLE
+)
 
 
 def _validate_cache_report_settings(block: dict) -> dict:
@@ -81,6 +97,13 @@ def _validate_cache_report_settings(block: dict) -> dict:
         raise _CacheReportConfigError(
             "cache_report must be an object", field="cache_report",
         )
+    # Defense in depth, and no longer the message an HTTP client sees. Since
+    # #513 S1 the endpoint classifies every submitted path first, so a POST of
+    # `{"cache_report": {"foo": 1}}` is answered by the classification pass
+    # with `unknown settings key: cache_report.foo` and
+    # `field: "cache_report.foo"` before this validator runs. This branch is
+    # retained for callers that reach the validator directly, which is how
+    # `bin/cctally`'s re-export surface exposes it.
     for key in block:
         if key not in _CACHE_REPORT_ALLOWED_KEYS:
             raise _CacheReportConfigError(

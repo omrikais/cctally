@@ -1,4 +1,4 @@
-import type { AlertEntry, DashboardSelection, Envelope, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
+import type { AlertEntry, AlertsSettingsEnvelope, DashboardSelection, Envelope, SessionRow, SourceAlertRow, SourceName } from '../types/envelope';
 import type { SourceResource } from '../hooks/useSourceDetail';
 import { seedFormsForRow, toastAlertId } from '../lib/alertIdentity';
 import {
@@ -300,6 +300,13 @@ export interface AlertsConfig {
   // its thresholds + enabled-reflection into alerts_settings.
   budget_thresholds: number[];
   budget_enabled?: boolean;
+  // The Claude weekly budget amount (#513 S2 §5.1). REQUIRED here even though
+  // the wire leaf is optional: the SSE seam passes a present `alerts_settings`
+  // block through wholesale, so a server predating the mirror would otherwise
+  // leave this `undefined` and every consumer would re-derive the same
+  // defaulting. `normalizeAlertsSettings` is the one place that collapses
+  // absent and explicit-null into `null`.
+  weekly_usd: number | null;
   // Projected axis (issue #121): the two opt-in toggles mirrored from the
   // envelope's alerts_settings block. Both default false.
   projected_weekly_enabled?: boolean;
@@ -626,6 +633,18 @@ export function defaultPrefs(): Prefs {
   };
 }
 
+// The one place the optional wire leaf becomes the required store leaf
+// (#513 S2 §5.1). Both alerts actions run their payload through this, so a
+// tick from a server predating the `weekly_usd` mirror stores a canonical
+// `null` rather than `undefined`, and a tick that clears the budget on the
+// server clears it here (the slice is replaced wholesale — the server is the
+// source of truth).
+export function normalizeAlertsSettings(
+  wire: AlertsSettingsEnvelope,
+): AlertsConfig {
+  return { ...wire, weekly_usd: wire.weekly_usd ?? null };
+}
+
 function defaultAlertsConfig(): AlertsConfig {
   // Default direction matches the Python source-of-truth at
   // bin/cctally::_validate_alerts_config (`block.get("enabled", False)`)
@@ -642,6 +661,7 @@ function defaultAlertsConfig(): AlertsConfig {
     five_hour_thresholds: [90, 95],
     budget_thresholds: [90, 100],
     budget_enabled: false,
+    weekly_usd: null,
     projected_weekly_enabled: false,
     projected_budget_enabled: false,
     project_alerts_enabled: false,
@@ -1101,7 +1121,7 @@ export type Action =
       // takes effect immediately on the next tick. SSE handler
       // synthesizes a sensible default if the field is missing
       // (back-compat for envelopes from a Python without T5).
-      alertsSettings: AlertsConfig;
+      alertsSettings: AlertsSettingsEnvelope;
       isFirstTick: boolean;
     }
   // #294 S5 §6.7 — the source-aware toast pipeline. `rows` is the union of the
@@ -1113,7 +1133,7 @@ export type Action =
   | {
       type: 'INGEST_SOURCE_ALERTS';
       rows: SourceAlertRow[];
-      alertsSettings: AlertsConfig;
+      alertsSettings: AlertsSettingsEnvelope;
       isFirstTick: boolean;
     }
   // cache-failure-markers spec §5 — mirror the snapshot's `dashboard_prefs`
@@ -1874,7 +1894,7 @@ export function dispatch(action: Action): void {
           ...state,
           alerts: action.alerts,
           seenAlertIds: seen,
-          alertsConfig: action.alertsSettings,
+          alertsConfig: normalizeAlertsSettings(action.alertsSettings),
           alertToastQueue: [],
         };
         break;
@@ -1902,7 +1922,7 @@ export function dispatch(action: Action): void {
         ...state,
         alerts: action.alerts,
         seenAlertIds: seen,
-        alertsConfig: action.alertsSettings,
+        alertsConfig: normalizeAlertsSettings(action.alertsSettings),
         alertToastQueue: queue,
         toast,
       };
@@ -1923,7 +1943,7 @@ export function dispatch(action: Action): void {
         state = {
           ...state,
           seenAlertIds: seen,
-          alertsConfig: action.alertsSettings,
+          alertsConfig: normalizeAlertsSettings(action.alertsSettings),
           alertToastQueue: [],
         };
         break;
@@ -1944,7 +1964,7 @@ export function dispatch(action: Action): void {
       state = {
         ...state,
         seenAlertIds: seen,
-        alertsConfig: action.alertsSettings,
+        alertsConfig: normalizeAlertsSettings(action.alertsSettings),
         alertToastQueue: queue,
         toast,
       };

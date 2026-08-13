@@ -788,13 +788,11 @@ def test_a_repeated_refusal_does_not_grow_the_per_tick_gap_read(
     """The gap re-fold is capped, so a refusal that repeats cannot turn the
     live path back into the whole-prefix read §3.3 removed.
 
-    A single degraded tick closes on the next one. The shape this guards is a
-    refusal that never realigns the durable prefix: `merge_delta`'s
-    durably-completed-batch refusal falls back to `_full_effective_selection`,
-    whose loop acts only on winners whose `batch_id` is not `None` — and after a
-    taint the winner reverts to the base journal event, whose `batch_id` IS
-    `None` (#510). No `CorrectionRebuildRequired` is raised, so no rebuild
-    follows, and every later tick re-reads a monotonically growing range.
+    A single degraded tick normally closes on the next one. The shape this
+    guards is any conservative refusal that never realigns the durable prefix;
+    without the cap, every later tick re-reads a monotonically growing range.
+    The concrete completed-to-tainted refusal that originally motivated this
+    guard now signals a rebuild from both selector paths (#510).
 
     The assertion counts RECORDS the gap read decoded, per tick. Wall-clock
     would certify nothing at fixture scale, and neither would asserting that the
@@ -998,6 +996,45 @@ def _append_conflicting_commit(core, live):
     return records, entries, coordinate
 
 
+def _append_conflicting_action(core, live):
+    """A byte-different duplicate action for the completed batch (#510)."""
+    action = next(
+        record for record in live["records"]
+        if record.get("t") == "correction"
+        and record.get("batch") == F.BATCH_COMPLETED
+    )
+    conflicting = {**action, "at": "2026-09-09T09:09:09Z"}
+    coordinate = F.append_to_segment(
+        core.APP_DIR, F.SEG_B, [conflicting])[0]
+    records = [*live["delta"], conflicting]
+    entries = [*live["delta_entries"], coordinate]
+    return records, entries, coordinate
+
+
+def _invalidate_selector_generation(core):
+    conn = _live_conn(core)
+    try:
+        conn.execute(
+            "UPDATE journal_selector_state SET generation_record_path = NULL"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _snapshot_percent(core, event_id):
+    conn = _live_conn(core)
+    try:
+        row = conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots "
+            "WHERE journal_id = ?",
+            (event_id,),
+        ).fetchone()
+        return None if row is None else float(row[0])
+    finally:
+        conn.close()
+
+
 def _capture_signal(core, live, records, entries):
     jr = _jr()
     conn = _live_conn(core)
@@ -1027,6 +1064,63 @@ def test_a_taint_of_a_completed_batch_signals_at_the_causal_record(core, live):
     earliest_commit = live["coordinates"][7]
     assert jr._coordinate_covers(signal.high_water, earliest_commit)
     assert signal.high_water != earliest_commit
+
+
+def test_full_fallback_taint_signals_at_the_conflicting_action(core, live):
+    """A stale/invalid selector generation takes the full-selection fallback.
+
+    The stored rev-1 metadata still names the formerly completed batch, while
+    the full selector has withdrawn it and reverted to the base rev-0 event.
+    The fallback must detect that negative transition and rebuild through the
+    action that established the taint, not through the earlier commit.
+    """
+    jr = _jr()
+    records, entries, coordinate = _append_conflicting_action(core, live)
+    _invalidate_selector_generation(core)
+    conn = _live_conn(core)
+    try:
+        with pytest.raises(jr.CorrectionRebuildRequired) as caught:
+            jr._preflight_live_events(
+                conn,
+                records,
+                coordinate,
+                cursor=live["cursor"],
+                entries=entries,
+            )
+    finally:
+        conn.close()
+    signal = caught.value
+    assert signal.kind == jr.CORRECTION_KIND_COMPLETED_TO_TAINTED
+    assert signal.batch_id == F.BATCH_COMPLETED
+    assert signal.high_water == coordinate
+    assert signal.recovery_eligible is True
+
+
+def test_full_fallback_live_tick_matches_a_fresh_rebuild(
+    core, live, tmp_path
+):
+    """The stale corrected effect must not survive a degraded live tick."""
+    jr = _jr()
+    ks = importlib.import_module("_lib_selector_state")
+    _records, _entries, coordinate = _append_conflicting_action(core, live)
+    _invalidate_selector_generation(core)
+    assert _snapshot_percent(core, F.EVENT_CORRECTED) == 44.0, (
+        "the completed correction must be materialized before it is tainted"
+    )
+
+    result = jr.run_stats_ingest(mode="authoritative")
+    assert result.error is None
+    assert _snapshot_percent(core, F.EVENT_CORRECTED) == 20.0
+
+    oracle = tmp_path / "tainted-full-fallback-oracle.db"
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(oracle),
+        high_water=coordinate,
+    )
+    assert ks.comparable(_read_selector(core.DB_PATH)) == ks.comparable(
+        _read_selector(oracle)
+    )
 
 
 def test_it_fails_closed_without_a_causal_offset(core, live, monkeypatch):

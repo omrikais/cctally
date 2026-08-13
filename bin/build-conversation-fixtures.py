@@ -1180,6 +1180,16 @@ def build(scenario: str) -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    _parser = argparse.ArgumentParser(description=__doc__)
+    _parser.add_argument(
+        "--out", type=Path, default=None,
+        help="Override the output directory (defaults to tests/fixtures/conversation/). Harnesses build into a per-run scratch dir so the committed fixtures stay byte-stable and a test run leaves the tracked tree unchanged.",
+    )
+    _args = _parser.parse_args()
+    if _args.out is not None:
+        FIXTURES_DIR = _args.out
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     build(SCENARIO)
     print(f"built: {SCENARIO}")

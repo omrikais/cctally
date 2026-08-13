@@ -1,7 +1,15 @@
 // CacheReportSettings — inline popover anchored to the modal header
 // gear icon.
 //
-// Single user-configurable threshold in v1 (``anomaly_threshold_pp``).
+// Single user-configurable threshold in v1, whose full dotted path is
+// ``cache_report.anomaly_threshold_pp``. That leaf is deliberately NOT a
+// ``cctally config set`` key: it is the ONE path ``POST /api/settings`` can
+// write that the CLI allowlist does not carry, which is why the main Settings
+// overlay's disposition manifest accounts for it separately rather than
+// rendering a row for it. This popover is its only editor (#513 S1/S2).
+// The stored value is honored by the dashboard and the TUI and NOT by
+// ``cctally cache-report``, so the popover states that on screen (#513 F4):
+// this comment and the manifest are both read by developers only.
 // Save dispatches ``POST /api/settings`` with body
 // ``{ cache_report: { anomaly_threshold_pp: N } }``; the server returns
 // HTTP 400 on invalid values (per Implementor 1's
@@ -132,6 +140,7 @@ export function CacheReportSettings({
       <label htmlFor="cr-threshold">Anomaly threshold (pp)</label>
       <input
         id="cr-threshold"
+        aria-describedby="cr-threshold-hint"
         type="number"
         inputMode="numeric"
         min={1}
@@ -146,6 +155,15 @@ export function CacheReportSettings({
       />
       {err && <div className="err">{err}</div>}
       {saved && <div className="saved">Saved · next sync will re-evaluate</div>}
+      {/* #513 F4 — the divergence stated where the user meets it. The header
+          comment above and the Settings disposition manifest both record it,
+          and a user reads neither. Wording follows the manifest's per-key
+          voice: the fact, then the remedy, in plain words. */}
+      <p className="hint" id="cr-threshold-hint">
+        This threshold applies to the dashboard and the TUI.{' '}
+        <code>cctally cache-report</code> does not read it: that command has its
+        own <code>--anomaly-threshold-pp</code> flag, which defaults to 15.
+      </p>
       <div className="actions">
         <button onClick={onClose} type="button">
           Close

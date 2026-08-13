@@ -27,7 +27,7 @@ CONTRACT_LIB = BIN / "_lib-test-contract.sh"
 PRIVATE_TREE = (REPO / ".mirror-allowlist").exists()
 
 
-def _plan(env_overrides, fake_ncpu="16", runner=RUNNER):
+def _plan(env_overrides, fake_ncpu="16", runner=RUNNER, args=()):
     env = {
         "PATH": __import__("os").environ["PATH"],
         "CCTALLY_TEST_ALL_PLAN": "1",
@@ -35,7 +35,7 @@ def _plan(env_overrides, fake_ncpu="16", runner=RUNNER):
     }
     env.update(env_overrides)
     proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=30
+        [str(runner), *args], env=env, capture_output=True, text=True, timeout=30
     )
     return proc
 
@@ -148,7 +148,18 @@ def _tree(tmp_path, *, private, test_remote_mode):
     # at admission (#529 S1), so a synthetic checkout must carry both or every
     # non-plan-mode case in this module fails on the fixture rather than on the
     # property it asserts.
-    shutil.copy2(CONTRACT_LIB, bindir / "_lib-test-contract.sh")
+    # Matched as a CLASS: bin/_lib-test-contract.sh sources bin/_lib-fts5-probe.sh
+    # and refuses without it (#529 S6, exception X2), so an estate that copied
+    # one library by name refuses to start the moment the contract grows a
+    # second. The failure is silent-looking rather than obvious — the estate
+    # aborts with the contract's own diagnostic, and every assertion about what
+    # the aggregator SHOULD have said then reads as a behaviour change.
+    for lib in sorted(BIN.glob("_lib-*.sh")):
+        shutil.copy2(lib, bindir / lib.name)
+    # bin/cctally-test-all imports the evidence kernels (#529 S2); matched as
+    # a CLASS because the vocabulary producer is maintainer-local.
+    for kernel in sorted(BIN.glob("_lib_test_*.py")):
+        shutil.copy2(kernel, bindir / kernel.name)
 
     for name in ("codex-quota", "source-aware"):
         harness = bindir / f"cctally-{name}-test"
@@ -273,7 +284,18 @@ def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
     fake_bin.mkdir()
     runner = bindir / "cctally-test-all"
     shutil.copy2(RUNNER, runner)
-    shutil.copy2(CONTRACT_LIB, bindir / "_lib-test-contract.sh")
+    # Matched as a CLASS: bin/_lib-test-contract.sh sources bin/_lib-fts5-probe.sh
+    # and refuses without it (#529 S6, exception X2), so an estate that copied
+    # one library by name refuses to start the moment the contract grows a
+    # second. The failure is silent-looking rather than obvious — the estate
+    # aborts with the contract's own diagnostic, and every assertion about what
+    # the aggregator SHOULD have said then reads as a behaviour change.
+    for lib in sorted(BIN.glob("_lib-*.sh")):
+        shutil.copy2(lib, bindir / lib.name)
+    # bin/cctally-test-all imports the evidence kernels (#529 S2); matched as
+    # a CLASS because the vocabulary producer is maintainer-local.
+    for kernel in sorted(BIN.glob("_lib_test_*.py")):
+        shutil.copy2(kernel, bindir / kernel.name)
 
     for name in ("codex-quota", "source-aware", "reconcile"):
         harness = bindir / f"cctally-{name}-test"
@@ -377,3 +399,111 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
         "test_dashboard_source_reader_releases_rollback_snapshot"
     ) in benchmark
     assert " -n " not in benchmark
+
+
+# ------------------------------------------- the effective-configuration plan
+#
+# With all three roles explicitly exported, the internal BUDGET intermediate no
+# longer influences any worker count (#529 S5 section 2.3). Left reporting the
+# host's core count, plan output would carry a host-dependent number that
+# decides nothing, and two runners would print different plans for identical
+# effective configurations.
+
+
+def test_plan_budget_reports_the_effective_configuration_not_the_core_count():
+    env = {
+        "CCTALLY_OUTER_JOBS": "4",
+        "CCTALLY_INNER_JOBS": "2",
+        "CCTALLY_PYTEST_JOBS": "10",
+    }
+    small = _plan(env, fake_ncpu="8")
+    large = _plan(env, fake_ncpu="16")
+    assert small.returncode == 0, small.stderr
+    assert large.returncode == 0, large.stderr
+    assert _kv(small.stdout)["budget"] == "4/2/10", small.stdout
+    assert _kv(large.stdout)["budget"] == "4/2/10", large.stdout
+    # Every plan line except `ncpu=` is identical across the two hosts. The
+    # `ncpu=` line necessarily still differs, because it reports the seam's own
+    # value and test_fake_ncpu_inside_plan_mode_is_still_honoured asserts that.
+    def _without_ncpu(text):
+        return [line for line in text.splitlines() if not line.startswith("ncpu=")]
+
+    assert _without_ncpu(small.stdout) == _without_ncpu(large.stdout)
+
+
+def test_plan_budget_still_reflects_a_combined_knob():
+    kv = _kv(_plan({"CCTALLY_TEST_JOBS": "4"}, fake_ncpu="16").stdout)
+    assert kv["budget"] == "4/4/4"
+
+
+# ------------------------------------------------- plan mode and subset runs
+
+
+def test_plan_mode_reports_the_subset_selection(tmp_path):
+    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    p = _plan({}, runner=runner, args=("--harness", "source-aware"))
+    assert p.returncode == 0, p.stdout + p.stderr
+    kv = _kv(p.stdout)
+    assert kv["mode"] == "subset"
+    assert kv["pytest_disposition"] == "skipped"
+    # `harnesses=` is the single carrier of the selection. A second key
+    # printing the same variable under a different name used to sit beside it,
+    # inviting a reader to equate it with the record's manifest-ordered
+    # `coverage.selectedHarnesses`, which it is not.
+    assert kv["harnesses"] == "source-aware"
+    assert "selected" not in kv, kv
+
+
+def test_plan_mode_reports_a_full_run_as_full(tmp_path):
+    subset = _kv(
+        _plan(
+            {},
+            runner=_tree(tmp_path, private=False, test_remote_mode=None),
+            args=("--harness", "source-aware"),
+        ).stdout
+    )
+    full = _kv(_plan({}).stdout)
+    assert full["mode"] == "full"
+    assert full["pytest_disposition"] == "full"
+    # The real content of "full": the plan names the whole discovered estate,
+    # ordered so `reconcile` stays the last row, and it is strictly wider than
+    # a subset plan for the same key.
+    names = full["harnesses"].split()
+    assert len(names) > len(subset["harnesses"].split())
+    assert names[-1] == "reconcile", names
+
+
+def test_plan_mode_with_a_subset_stays_side_effect_free(tmp_path):
+    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    evidence = tmp_path / "ev"
+    p = _plan(
+        {"CCTALLY_TEST_EVIDENCE_ROOT": str(evidence)},
+        runner=runner,
+        args=("--harness", "source-aware"),
+    )
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert not evidence.exists(), "plan mode must remain side-effect free"
+
+
+def test_plan_mode_still_rejects_an_unknown_harness(tmp_path):
+    """Selection is validated even in plan mode: a plan for a set that cannot
+    be run is not a plan."""
+    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    p = _plan({}, runner=runner, args=("--harness", "no-such-harness"))
+    assert p.returncode == 2, p.stdout + p.stderr
+    assert "no-such-harness" in p.stderr
+
+
+def test_plan_mode_with_a_subset_publishes_no_outcome_record(tmp_path):
+    """A plan is never an authoritative outcome, and a subset plan is not one
+    either — the two modes stay mutually exclusive rather than precedence
+    ordered."""
+    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    outcome = tmp_path / "outcome.json"
+    p = _plan(
+        {"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)},
+        runner=runner,
+        args=("--harness", "source-aware"),
+    )
+    assert p.returncode == 2, p.stdout + p.stderr
+    assert not outcome.exists()

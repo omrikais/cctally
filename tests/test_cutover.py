@@ -583,8 +583,42 @@ def test_reader_output_byte_identical_pre_post_cutover_broadened(
 
 
 # ==========================================================================
-# #496 S5 — exact-equivalent bootstrap reuse (the pure predicate)
+# Bootstrap retry naming and #496 S5 exact-equivalent reuse predicates
 # ==========================================================================
+
+def test_cutover_segment_name_advances_past_every_published_bootstrap(ns):
+    jr = _jr()
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    current = "bootstrap-20260101T000000_000000.jsonl"
+    newer = "bootstrap-20260102T030405_000006.jsonl"
+
+    assert jr._cutover_segment_name(now) == current
+    assert jr._cutover_segment_name(
+        now, existing=["observations-2026-01.jsonl"]
+    ) == current
+    assert jr._cutover_segment_name(
+        now, existing=[current]
+    ) == "bootstrap-20260101T000000_000001.jsonl"
+    assert jr._cutover_segment_name(
+        now, existing=[current, newer]
+    ) == "bootstrap-20260102T030405_000007.jsonl"
+
+
+@pytest.mark.parametrize(
+    "newest",
+    [
+        "bootstrap-not-a-timestamp.jsonl",
+        "bootstrap-99991231T235959_999999.jsonl",
+    ],
+)
+def test_cutover_segment_name_fails_closed_when_newest_cannot_advance(
+    ns, newest
+):
+    jr = _jr()
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    with pytest.raises(jr.JournalError, match="cannot mint a cutover bootstrap"):
+        jr._cutover_segment_name(now, existing=[newest])
+
 
 def test_reusable_bootstrap_name_returns_none_without_an_exact_match():
     jl = _lib_journal()
@@ -899,6 +933,93 @@ def test_a_genuinely_differing_retry_writes_a_new_segment(ns, monkeypatch):
     assert first[0] in after
 
 
+def test_backward_clock_retry_stamps_past_the_crash_orphan(
+    ns, monkeypatch, tmp_path
+):
+    """A fresh retry segment must cover every published bootstrap (#509).
+
+    Attempt one publishes under T2 and crashes before the cursor commit.  An
+    old-binary write then changes the retry export while the wall clock steps
+    back to T1.  The retry therefore cannot reuse the orphan and must mint its
+    fresh segment *after* T2 in canonical order.  That makes the next ingest a
+    no-op over the bootstrap prefix and preserves byte-zero rebuild parity.
+    """
+    _build_legacy_install(ns)
+    core, jr = _core(), _jr()
+    t1 = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    t2 = dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc)
+    t2_name = jr._cutover_segment_name(t2)
+    real_write_cursor = jr._write_cursor
+
+    crashed = sqlite3.connect(core.DB_PATH)
+    crashed.row_factory = sqlite3.Row
+    monkeypatch.setattr(
+        jr,
+        "_write_cursor",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            RuntimeError("crash after bootstrap rename")
+        ),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="crash after bootstrap rename"):
+            jr.run_cutover(crashed, now_utc=t2)
+    finally:
+        crashed.close()
+    assert jr.list_segments() == [t2_name]
+    _legacy_still_functional(core)
+
+    # A reachable differing export: the legacy binary appended one more usage
+    # snapshot before the new binary retried the cutover.
+    legacy = sqlite3.connect(core.DB_PATH)
+    try:
+        legacy.execute(
+            "INSERT INTO weekly_usage_snapshots (captured_at_utc, "
+            "week_start_date, week_end_date, week_start_at, week_end_at, "
+            "weekly_percent, page_url, source, payload_json, "
+            "five_hour_percent, five_hour_resets_at, five_hour_window_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("2026-01-05T09:00:00Z", "2026-01-01", "2026-01-08", _WSA, _WEA,
+             70.0, None, "statusline", "{}", 30.0,
+             "2026-01-05T14:00:00Z", 333),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    monkeypatch.setattr(jr, "_write_cursor", real_write_cursor)
+    retry = sqlite3.connect(core.DB_PATH)
+    retry.row_factory = sqlite3.Row
+    try:
+        retry_name = jr.run_cutover(retry, now_utc=t1)
+        segments = jr.list_segments()
+        assert segments == [t2_name, retry_name]
+        cursor = retry.execute(
+            "SELECT segment, offset FROM journal_cursor WHERE id = 1"
+        ).fetchone()
+        assert tuple(cursor) == (
+            retry_name,
+            (core.JOURNAL_DIR / retry_name).stat().st_size,
+        )
+
+        ingest = jr.run_stats_ingest(mode="authoritative", conn=retry)
+        assert ingest.ran and ingest.consumed == 0, ingest
+        live_dump = _canonical_dump(retry)
+    finally:
+        retry.close()
+
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"),
+        target_path=str(tmp_path / "backward-clock-rebuild.db"),
+    )
+    rebuilt = core.open_db(
+        _target_path=str(tmp_path / "backward-clock-rebuild.db")
+    )
+    try:
+        assert _canonical_dump(rebuilt) == live_dump
+    finally:
+        rebuilt.close()
+
+
 def test_a_size_matching_but_byte_differing_segment_is_never_reused(ns):
     core, jr = _core(), _jr()
     core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -1058,19 +1179,10 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
     # bytes in the older bootstrap still make the journal a valid rebuild source
     # even though journal_high_water() ends at offset zero.
     #
-    # The name is the CURRENT UTC month rather than a synthetic far-future one.
-    # Since #511 both appenders revalidate their target under the leaf lock, so
-    # a production writer cannot create a future-dated segment at all — and a
-    # far-future empty segment would make every later append in this test refuse
-    # as non-canonically-last, which is the refusal working correctly against a
-    # premise that no longer describes a reachable state.
-    empty_latest = core.JOURNAL_DIR / _lib_journal().segment_name(
-        dt.datetime.now(dt.timezone.utc))
-    # The premise, stated rather than assumed: this reads the real clock, so it
-    # is only an EMPTY latest segment while the cutover fixture has not itself
-    # written an observation segment for the current month. If it ever does,
-    # `touch()` would leave that content in place and the case under test would
-    # silently become a different one.
+    # Reproduce #512's externally restored clock-anomaly state exactly. Before
+    # bounded empty-tail recovery, this synthetic far-future segment made the
+    # cutover-op append refuse permanently under #511's physical-order guard.
+    empty_latest = core.JOURNAL_DIR / "observations-9999-12.jsonl"
     assert not empty_latest.exists()
     empty_latest.touch()
     assert _jr().journal_high_water() == (empty_latest.name, 0)
@@ -1089,6 +1201,7 @@ def test_epoch_mismatch_with_journal_rebuilds(ns):
         assert _canonical_dump(healed) == before, "rebuild lost data"
     finally:
         healed.close()
+    assert not empty_latest.exists(), "empty future segment was not recovered"
     # #496 S3: the version-ahead index is READABLE, so it is republished
     # transactionally into the same file rather than preserved and replaced.
     # Preservation is a consequence of destroying a file, and nothing is

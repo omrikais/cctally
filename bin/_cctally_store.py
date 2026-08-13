@@ -748,7 +748,7 @@ def stats_open_time_guard(
             except (BlockingIOError, OSError):
                 if time.monotonic() >= deadline:
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 time.sleep(0.02)
         _cctally_core.note_stats_maintenance_acquired()
@@ -827,6 +827,18 @@ _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG = (
     "stats.db maintenance is in progress; retry after the maintenance command "
     "exits"
 )
+
+
+def _stats_open_maintenance_timeout_message() -> str:
+    """Name a confirmed detached rebuild when it owns the maintenance wait."""
+    request = _read_stats_heal_request()
+    if (
+        request
+        and request.get("forensicsDisposition") == "confirmed"
+        and _stats_heal_worker_active()
+    ):
+        return str(_cctally_db.StatsHealDeferred("pending"))
+    return _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
 
 
 def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
@@ -953,10 +965,10 @@ def _pending_stats_publication_never_replaced(db_path) -> bool:
     reads that as "replaced". The proxy is used only across processes, where
     that cleanup cannot reach, so the weaker property is the one it needs.
 
-    A marker carrying no `scratchPath` cannot prove it published, so it is
-    treated as never-replaced. No released binary has ever written one — the
-    marker and this field ship together — so the branch exists only to keep an
-    unreadable marker from wedging every open.
+    A marker carrying no `scratchPath` proves neither outcome and therefore
+    still owes a verdict. No released binary has ever written one — the marker
+    and this field ship together — but failing closed keeps that malformed
+    state from silently accepting unvalidated live bytes.
 
     **In-place publication** answers with the publication's own stamp, because
     it attaches the scratch read-only and the scratch survives commit and
@@ -973,16 +985,9 @@ def _pending_stats_publication_never_replaced(db_path) -> bool:
         return True
     if str(state.get("status") or "") != "pending":
         return False
-    if str(state.get("mechanism") or "replace") == "in_place":
-        import _cctally_journal
+    import _cctally_journal
 
-        return _cctally_journal.in_place_publication_proven_predecessor(
-            db_path, state
-        )
-    scratch = state.get("scratchPath")
-    if not isinstance(scratch, str) or not scratch:
-        return True
-    return pathlib.Path(scratch).exists()
+    return _cctally_journal._pending_publication_owes_nothing(db_path, state)
 
 
 def _stats_publication_failed_error(
@@ -1411,7 +1416,7 @@ def stats_open_guarded(
                 lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
             ):
                 raise _cctally_db.StatsDbMaintenanceError(
-                    _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                    _stats_open_maintenance_timeout_message()
                 )
             if marker.exists():
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -1425,7 +1430,7 @@ def stats_open_guarded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 try:
                     if marker.exists():
@@ -1450,7 +1455,7 @@ def stats_open_guarded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 # Recovery calls `rebuild_stats_index`, whose in-place publisher
                 # reopens the live destination through `stats_open_guarded`.
@@ -1496,7 +1501,7 @@ def stats_open_guarded(
                     lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
                 ):
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 if marker.exists() or pending.exists():
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -1516,7 +1521,7 @@ def stats_open_guarded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 try:
                     _resolve_stats_publication_marker(db_path)
@@ -1526,7 +1531,7 @@ def stats_open_guarded(
                     lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
                 ):
                     raise _cctally_db.StatsDbMaintenanceError(
-                        _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
+                        _stats_open_maintenance_timeout_message()
                     )
                 if marker.exists() or pending.exists():
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -2538,7 +2543,7 @@ def cmd_stats_corruption_heal_internal(args) -> int:
         heal_id = str(request.get("healId") or "")
         try:
             outcome = _run_stats_corruption_heal(request)
-        except Exception as exc:
+        except (_cctally_db.StatsRebuildDeferred, Exception) as exc:
             # Retryable: the marker stays so a later detection is admitted
             # once its retry window expires.
             _record_stats_heal_outcome(heal_id, "failed", error=exc)

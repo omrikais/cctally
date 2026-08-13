@@ -42,7 +42,14 @@ set -uo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FIXTURES_DIR="$REPO_ROOT/tests/fixtures/share"
+# Generated fixture inputs are staged out of tree (#529 S3). The committed
+# tree is the read-only template; nothing under it is written during a run.
+FIXTURE_STAGE=$(mktemp -d -t cctally-share-fixstage.XXXXXX)
+FIXTURES_DIR="$FIXTURE_STAGE/share"
+# Goldens address the COMMITTED root, never the staging copy above: this
+# harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched.
+GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/share"
 BIN="$REPO_ROOT/bin/cctally"
 
 # Golden comparison chokepoint (#106/#107) + the missing-golden decision
@@ -58,13 +65,17 @@ export TZ=Etc/UTC
 
 # Single scratch root for the entire run. One trap, one cleanup point.
 SCRATCH_ROOT="$(mktemp -d -t cctally-share-fixtures-XXXXXX)"
-trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 export GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 
 # Always rebuild fixtures on harness start so a manual edit to
 # `_fixture_builders.py` is reflected on the next test run without an
 # explicit regen step. Cheap (~12 scenarios × 2 SQLite files each).
-python3 "$REPO_ROOT/bin/build-share-fixtures.py" >/dev/null
+stage_fixtures_out_of_tree share "$FIXTURES_DIR" || {
+    echo "FAIL: staging share fixtures failed (exit $?)" >&2
+    echo "    Every leg below would iterate an empty fixture set and report green." >&2
+    exit 1
+}
 
 pass_count=0
 fail_count=0
@@ -129,7 +140,7 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
     out_file="$scratch/output.$fmt"
     stderr_log="$scratch/stderr.log"
 
-    # shellcheck disable=SC2086  # $extra is intentionally word-split.
+    # $extra is intentionally word-split into the requested share flags.
     if ! HOME="$fake_home" \
             CCTALLY_TEST_CHANGELOG_PATH="$changelog_path" \
             python3 "$BIN" "$cmd" --format "$fmt" --theme "$theme" \
@@ -141,7 +152,7 @@ for scenario_dir in "$FIXTURES_DIR"/*/; do
         continue
     fi
 
-    golden="$scenario_dir/output.$fmt.golden"
+    golden="$GOLDEN_ROOT/$scenario/output.$fmt.golden"
     name="$scenario"
     if _golden_require "output.$fmt" "$golden" "$out_file"; then
         echo "PASS $scenario"

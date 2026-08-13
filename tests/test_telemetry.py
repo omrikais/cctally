@@ -202,6 +202,13 @@ def _no_real_background(cc, monkeypatch):
     """Neutralise the update-check side of ``_post_command_update_hooks`` so
     a call exercises only the telemetry gate — no detached process is spawned
     and the update-due branch is inert. Returns the telemetry-spawn recorder."""
+    # `_post_command_update_hooks` returns at its TOP when
+    # CCTALLY_DISABLE_UPDATE_CHECK is truthy, so the telemetry gate below it is
+    # never reached. Clear it per test rather than depending on the process
+    # environment happening not to carry it: the root conftest pins it to "1"
+    # for every worker (#529 S4), and before that pin these tests already
+    # passed vacuously for any maintainer who exported it.
+    monkeypatch.delenv("CCTALLY_DISABLE_UPDATE_CHECK", raising=False)
     calls = []
     monkeypatch.setattr(cc, "_spawn_background_telemetry_beat", lambda: calls.append(1))
     monkeypatch.setattr(cc, "_spawn_background_update_check", lambda: None)

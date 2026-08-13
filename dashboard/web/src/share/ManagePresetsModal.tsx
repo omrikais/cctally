@@ -34,6 +34,8 @@ import { sharePanelLabel } from './panelLabels';
 import { SHARE_PRESETS_TRIGGER_ID } from './PresetDropdown';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ConfirmAction, useConfirmHost, type ConfirmHost } from './ConfirmAction';
+import { fmt } from '../lib/fmt';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 
 interface Props {
   open: boolean;
@@ -97,6 +99,11 @@ export function ManagePresetsModal({ open, onClose, shareIsTopmost = true }: Pro
   // ONE confirmation slot for the whole table — see ConfirmAction.tsx for
   // why this cannot be per-row state.
   const confirm = useConfirmHost();
+  const display = useDisplayTz();
+  const fmtCtx = {
+    tz: display.resolvedTz,
+    offsetLabel: display.offsetLabel,
+  };
 
   // #503 S4 §3.1 — was scope:'modal', which fired only because ShareModal
   // gates itself out with `when: () => !manageOpen`. At overlay/208 the
@@ -280,45 +287,49 @@ export function ManagePresetsModal({ open, onClose, shareIsTopmost = true }: Pro
           onClose={onClose}
           closeClassName="share-manage-close"
         />
-        {error ? (
-          <div className="share-manage-error" role="alert">{error}</div>
-        ) : null}
-        {rows.length === 0 && !error ? (
-          <p className="share-manage-empty">No saved presets yet.</p>
-        ) : null}
-        {rows.length > 0 ? (
-          <table className="share-manage-table">
-            <thead>
-              <tr>
-                <th>Panel</th>
-                <th id={MANAGE_PRESETS_HEADING_ID} tabIndex={-1}>Name</th>
-                <th>Saved at</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <ManagePresetRow
-                  key={`${row.panel}/${row.name}`}
-                  row={row}
-                  busy={busy}
-                  confirm={confirm}
-                  onDelete={() => void handleDelete(row)}
-                  onRename={(next, overwrite) => handleRename(row, next, overwrite)}
-                />
-              ))}
-            </tbody>
-          </table>
-        ) : null}
+        <div className="share-manage-content">
+          {error ? (
+            <div className="share-manage-error" role="alert">{error}</div>
+          ) : null}
+          {rows.length === 0 && !error ? (
+            <p className="share-manage-empty">No saved presets yet.</p>
+          ) : null}
+          {rows.length > 0 ? (
+            <table className="share-manage-table">
+              <thead>
+                <tr>
+                  <th>Panel</th>
+                  <th id={MANAGE_PRESETS_HEADING_ID} tabIndex={-1}>Name</th>
+                  <th>Saved at</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <ManagePresetRow
+                    key={`${row.panel}/${row.name}`}
+                    row={row}
+                    busy={busy}
+                    confirm={confirm}
+                    savedAtLabel={fmt.datetimeShort(row.record.saved_at, fmtCtx)}
+                    onDelete={() => void handleDelete(row)}
+                    onRename={(next, overwrite) => handleRename(row, next, overwrite)}
+                  />
+                ))}
+              </tbody>
+            </table>
+          ) : null}
+        </div>
       </div>
     </div>
   );
 }
 
-function ManagePresetRow({ row, busy, confirm, onDelete, onRename }: {
+function ManagePresetRow({ row, busy, confirm, savedAtLabel, onDelete, onRename }: {
   row: Row;
   busy: boolean;
   confirm: ConfirmHost;
+  savedAtLabel: string;
   onDelete: () => void;
   onRename: (next: string, overwrite?: boolean) =>
     Promise<'ok' | 'conflict' | 'error'>;
@@ -331,6 +342,8 @@ function ManagePresetRow({ row, busy, confirm, onDelete, onRename }: {
   const rowKey = `${row.panel}/${row.name}`;
   const deleteKey = `delete:${rowKey}`;
   const renameKey = `rename:${rowKey}`;
+  const deleting = confirm.isArmed(deleteKey);
+  const replacing = confirm.isArmed(renameKey);
 
   const commitRename = () => {
     const trimmed = draft.trim();
@@ -378,29 +391,38 @@ function ManagePresetRow({ row, busy, confirm, onDelete, onRename }: {
           <span>{row.name}</span>
         )}
       </td>
-      <td>{row.record.saved_at}</td>
+      <td><time dateTime={row.record.saved_at}>{savedAtLabel}</time></td>
       <td className="share-manage-actions">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => {
-            if (editing) {
-              setDraft(row.name);
-              setEditing(false);
-            } else {
-              setEditing(true);
-            }
-          }}
-        >
-          {editing ? 'Cancel' : 'Rename'}
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => confirm.arm(deleteKey)}
-        >
-          Delete
-        </button>
+        {!deleting && !replacing ? editing ? (
+          <>
+            <button type="button" disabled={busy} onClick={commitRename}>
+              Save
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setDraft(row.name);
+                setEditing(false);
+              }}
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
+          <>
+            <button type="button" disabled={busy} onClick={() => setEditing(true)}>
+              Rename
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => confirm.arm(deleteKey)}
+            >
+              Delete
+            </button>
+          </>
+        ) : null}
         <ConfirmAction
           id={deleteKey}
           host={confirm}

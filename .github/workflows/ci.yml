@@ -16,6 +16,43 @@ on:
       - '**/*.md'
 
 jobs:
+  # #529 S7 (E1). A release stamp is a mechanical two-or-three-file version
+  # bump over a tree release Gate 0 has already certified with an
+  # authoritative receipt, and it used to occupy the single self-hosted
+  # runner for ~17 minutes across three sequential jobs. `paths-ignore`
+  # cannot express the exclusion: 76 of the last 200 commits touching
+  # package.json are NOT stamps — they add published modules to the npm
+  # `files` list, which changes the shipped artifact.
+  #
+  # This job DEFAULTS TO RUNNING THE FULL PIPELINE. It is hosted, so a stamp
+  # costs the maintainer's runner nothing at all, and every dependent job's
+  # `if:` is written so a failure here still admits the job (see below) —
+  # `needs:` alone would skip dependents on failure, which is the exact
+  # inversion of this gate's purpose.
+  release-stamp-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Read-only, matching test-pr and doc-lint.yml. This job reads history and
+    # writes one output; it needs no token scope beyond the checkout.
+    permissions:
+      contents: read
+    outputs:
+      skipHeavy: ${{ steps.classify.outputs.skipHeavy }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The predicate proves the pushed range is one commit by comparing
+          # HEAD^ against the event's `before`, so the parent must be present.
+          fetch-depth: 2
+          persist-credentials: false
+      - id: classify
+        run: |
+          python3 .github/scripts/classify_release_stamp.py \
+            --repo . \
+            --before "${{ github.event.before }}" \
+            --after "${{ github.event.after }}" \
+            --event-name "${{ github.event_name }}"
+
   # test-linux (hosted ubuntu) was disabled to save GH Actions minutes.
   # The self-hosted macOS runner covers push-to-main plus trusted private
   # same-repository PRs; public-mirror/fork PRs use the hosted `test-pr`
@@ -27,7 +64,16 @@ jobs:
     # they use this authority instead of the two-worker hosted lane that took
     # ~30 minutes for the same suite. The exact head-repository equality is the
     # safety boundary; public-mirror/fork PRs stay on `test-pr` below.
+    #
+    # The two `release-stamp-gate` clauses are an ADDITIONAL conjunct (#529
+    # S7, E1); the repository and head-repository equalities above are
+    # untouched, so a broken, widened or deleted classifier still cannot put
+    # fork code on the maintainer's machine.
+    needs: [release-stamp-gate]
     if: >-
+      !cancelled() &&
+      (needs.release-stamp-gate.result != 'success' ||
+       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
       github.repository == 'omrikais/cctally-dev' &&
       (github.event_name == 'push' ||
        (github.event_name == 'pull_request' &&
@@ -62,13 +108,24 @@ jobs:
         working-directory: dashboard/web
         run: npm ci
 
+      # FTS5 is the one hard capability no step above installs, because it is a
+      # compile-time SQLite option rather than a package (#529 S6, M2). Asked
+      # here, of the same brew python@3.13 the suite's venv is built from, so a
+      # runner whose SQLite lacks it refuses BEFORE the suite starts instead of
+      # after the aggregator's admission probe. One shared assertion:
+      # bin/_lib-test-contract.sh calls the same helper in probe mode.
+      - name: Assert FTS5 before the suite
+        env:
+          PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        run: bash bin/_lib-fts5-probe.sh require python3
+
       - name: Run cctally test suite
         env:
           # This lane is the authoritative gate for the private tree, so a
           # missing hard capability is a refusal to start rather than an
           # `incomplete` classification the run continues past (#529 S1). All
-          # five are provisioned below or by the steps above: pytest,
-          # pytest-timeout and rich by the venv pip install; node/npm from
+          # seven are provisioned below or by the steps above: pytest,
+          # pytest-timeout, PyYAML, rich and ShellCheck by the venv pip install; node/npm from
           # /opt/homebrew/bin on the pinned PATH (bin/cctally-frontend-test and
           # the npm-shim harnesses already hard-fail without them); fts5 from
           # brew python@3.13's SQLite. agentmem is asserted here too, because
@@ -107,6 +164,16 @@ jobs:
           # PYTEST to 4 as a side effect. State it explicitly (runner is a
           # 10-core M1 Max: 8 performance + 2 efficiency).
           CCTALLY_PYTEST_JOBS: "10"
+          # #529 S2. Setting the root is what turns retained evidence AND
+          # console sanitization on; the upload step below is what makes the
+          # sanitized extract survive the job. The two go together on purpose:
+          # a run that sanitizes its console while retaining nothing destroys
+          # the only copy of what it redacted, because $RUNNER_TEMP is deleted
+          # when the job ends.
+          CCTALLY_TEST_EVIDENCE_ROOT: ${{ runner.temp }}/cctally-test-evidence
+          # GITHUB_RUN_ID plus the attempt and job name do not distinguish a
+          # matrix leg, so every lane states its own identity explicitly.
+          CCTALLY_TEST_RUN_ID: macos-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -e
           python3 --version
@@ -121,20 +188,77 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           python3 bin/cctally-agentmem-dependency provision
           python3 bin/cctally-agentmem-dependency check
-          # pytest-xdist is REQUIRED for parallelism, not optional garnish:
-          # bin/cctally-test-all gates `-n "$PYTEST"` on `import xdist` and
-          # silently falls back to SERIAL pytest when it is absent. Omitting it
-          # here (the `test-pr` lane below always had it) is what made this
-          # lane's pytest phase run single-process for 914s. Keep in sync with
-          # tests/requirements-dev.txt.
-          python3 -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
+          # tests/requirements-dev.txt IS the toolchain, for this lane and for
+          # bin/cctally-test-remote alike (#529 S6, F20). This lane used to
+          # install an unpinned list here while the wrapper installed twelve
+          # exact pins, so a suite result could depend on which gate ran it.
+          # --no-deps is what makes the pin a pin, and `pip check` is the
+          # offline closure validator that --no-deps otherwise leaves unrun.
+          # tests/test_toolchain_parity.py enforces both, structurally, across
+          # every lane that sets CCTALLY_AUTHORITATIVE_RUN.
+          python3 -m pip install --no-deps -r tests/requirements-dev.txt
+          python3 -m pip check
           bin/cctally-test-all
+
+      # Failure-only, and BOUNDED: only the two export files, never logs/.
+      # `export/` is a sibling of `logs/` and never a parent, so this path
+      # cannot capture a raw log even by accident. The independent validator
+      # runs again here and REFUSES the artifact rather than transforming it a
+      # second time — a single grammar used twice would give a classifier bug
+      # two chances at the same text. It is the PUBLIC kernel that runs, because
+      # these workflows are mirrored and the public tree carries no private
+      # module.
+      - name: Validate the sanitized failure extract
+        if: failure() || cancelled()
+        env:
+          CCTALLY_EXTRACT: ${{ runner.temp }}/cctally-test-evidence/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+        run: |
+          python3 - "$CCTALLY_EXTRACT" <<'VALIDATE_PY'
+          import importlib.util, pathlib, sys
+
+          path = pathlib.Path(sys.argv[1])
+          if not path.is_file() or path.stat().st_size == 0:
+              print("::warning::no sanitized failure extract was produced for this run")
+              raise SystemExit(0)
+          spec = importlib.util.spec_from_file_location(
+              "_lib_test_evidence", "bin/_lib_test_evidence.py")
+          kernel = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(kernel)
+          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+          violations = kernel.validate_export(lines)
+          if violations:
+              for violation in violations[:5]:
+                  print("::error::failure-context.txt line %s: %s"
+                        % (violation["index"], violation["reason"]))
+              # Refuse by REMOVING it: the upload step below is set to ignore a
+              # missing file, so nothing unvalidated can reach an artifact. The
+              # complete unsanitized logs stay on the runner either way.
+              path.unlink()
+              print("::error::refusing to upload the failure extract; "
+                    "the complete unsanitized logs stay on the runner")
+          VALIDATE_PY
+
+      - name: Upload the sanitized failure extract
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-context-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/cctally-test-evidence/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+            ${{ runner.temp }}/cctally-test-evidence/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
 
   dashboard-build-stability:
     # Same self-hosted-on-public-PR exposure as test-macos above. Push-only
     # gating keeps fork PRs off the maintainer's machine; the byte-stable
     # rebuild check still runs on every push to main.
-    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    needs: [release-stamp-gate]
+    if: >-
+      !cancelled() &&
+      (needs.release-stamp-gate.result != 'success' ||
+       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
+      github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
     timeout-minutes: 20  # npm ci + vite build; headroom over the observed few-min run (#279 S7 W4)
     steps:
@@ -154,14 +278,11 @@ jobs:
         working-directory: dashboard/web
         run: npm ci
 
-      # Full frontend unit-test estate (#281 S2 / #280 R2 finding 6):
-      # before this step only the single-file share smoke ran in CI (via
-      # cctally-test-all's share-v2 harness). Runs before the build so a
-      # test failure is attributed distinctly from a build/byte failure.
-      - name: Run frontend unit tests (full vitest estate)
-        working-directory: dashboard/web
-        run: npx vitest run
-
+      # #529 S7 (E2). This job used to run the full vitest estate as its own
+      # step. It no longer does: the estate has exactly one declared execution
+      # per push, inside the bundle, and tests/test_frontend_estate_topology.py
+      # asserts that across the whole workflow tree rather than arguing it per
+      # job — which is the reasoning that let the duplication survive.
       - name: Build dashboard
         working-directory: dashboard/web
         run: npm run build
@@ -179,7 +300,12 @@ jobs:
     # bundle; its byte-stability against source is dashboard-build-stability's
     # job on the same push, so this lane deliberately does NOT rebuild (the PR
     # lane, which has no build-stability check, builds first instead).
-    if: github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
+    needs: [release-stamp-gate]
+    if: >-
+      !cancelled() &&
+      (needs.release-stamp-gate.result != 'success' ||
+       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
+      github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
     runs-on: [self-hosted, macOS, cctally]
     timeout-minutes: 30  # generous headroom over the ~2-5 min suite so a hung test can't wedge the job
     steps:
@@ -251,7 +377,7 @@ jobs:
       cancel-in-progress: true
     env:
       # A missing hard capability is a refusal to start on this lane too
-      # (#529 S1). pytest, pytest-timeout and rich come from the pip install
+      # (#529 S1). pytest, pytest-timeout, PyYAML, rich and ShellCheck come from the pip install
       # step, node/npm from setup-node plus `npm ci`, and fts5 from Ubuntu's
       # libsqlite3, which Debian builds with --enable-fts5. `agentmem` is not
       # asserted here: this lane declares hosted-private-unavailable below, and
@@ -269,6 +395,7 @@ jobs:
       CCTALLY_AGENTMEM_TEST_POLICY: "hosted-private-unavailable"
       LC_ALL: "C.UTF-8"                                 # deterministic encoding/collation
       TZ: "Etc/UTC"                                     # repo gotcha: Etc/UTC, not UTC
+      CCTALLY_TEST_RUN_ID: pr-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -304,8 +431,23 @@ jobs:
           fi
           sqlite3 --version
           sqlite3 :memory: '.recover' >/dev/null
+      # tests/requirements-dev.txt IS the toolchain, the same file and the same
+      # install bin/cctally-test-remote and the two other authoritative lanes
+      # use (#529 S6, F20). --no-deps makes the pin a pin; `pip check` is the
+      # closure validator --no-deps otherwise leaves unrun. Enforced
+      # structurally by tests/test_toolchain_parity.py.
       - name: Install Python test deps
-        run: python -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
+        run: |
+          python -m pip install --no-deps -r tests/requirements-dev.txt
+          python -m pip check
+
+      # FTS5 comes from Ubuntu's libsqlite3, which Debian builds with
+      # --enable-fts5 — but nothing in this repository makes that true, so it is
+      # asked rather than assumed (#529 S6, M2). The refusal lands before the
+      # suite starts. One shared assertion, in probe mode from the contract
+      # kernel and in provisioning mode here.
+      - name: Assert FTS5 before the suite
+        run: bash bin/_lib-fts5-probe.sh require python
       # Every lane that runs cctally-test-all installs dashboard deps, this one
       # included: vitest needs them, and both the share-v2 smoke and
       # bin/cctally-frontend-test inside cctally-test-all then run against a real
@@ -325,10 +467,71 @@ jobs:
         # bundle, so a second `npx vitest run` on this lane would execute the
         # whole estate twice in the same job. (A file count used to be quoted
         # here; it was stale within weeks, so it is deliberately gone — the point
-        # is the duplication, not its size.) The dashboard-build-stability job keeps its
-        # own estate step: that job does NOT run the bundle, so it is not a
-        # duplicate and removing it would reduce coverage.
+        # is the duplication, not its size.)
+        #
+        # #529 S7 (E2). The dashboard-build-stability job used to run the
+        # estate again as its own step. It no longer does: the estate has
+        # exactly one declared execution per push, inside the bundle, and
+        # tests/test_frontend_estate_topology.py asserts that rather than
+        # arguing it per job — which is the reasoning that let the
+        # duplication survive.
+        #
+        # #529 S2. Setting the root turns retained evidence AND console
+        # sanitization on. Keep it step-scoped because the runner context is
+        # unavailable in job-level env; the failure-only upload below preserves
+        # the sanitized extract after $RUNNER_TEMP is deleted.
+        env:
+          CCTALLY_TEST_EVIDENCE_ROOT: ${{ runner.temp }}/cctally-test-evidence
         run: timeout --kill-after=30s 30m bin/cctally-test-all
+
+      # Failure-only, and BOUNDED: only the two export files, never logs/.
+      # `export/` is a sibling of `logs/` and never a parent, so this path
+      # cannot capture a raw log even by accident. The independent validator
+      # runs again here and REFUSES the artifact rather than transforming it a
+      # second time — a single grammar used twice would give a classifier bug
+      # two chances at the same text. It is the PUBLIC kernel that runs, because
+      # these workflows are mirrored and the public tree carries no private
+      # module.
+      - name: Validate the sanitized failure extract
+        if: failure() || cancelled()
+        env:
+          CCTALLY_EXTRACT: ${{ runner.temp }}/cctally-test-evidence/local/pr-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+        run: |
+          python3 - "$CCTALLY_EXTRACT" <<'VALIDATE_PY'
+          import importlib.util, pathlib, sys
+
+          path = pathlib.Path(sys.argv[1])
+          if not path.is_file() or path.stat().st_size == 0:
+              print("::warning::no sanitized failure extract was produced for this run")
+              raise SystemExit(0)
+          spec = importlib.util.spec_from_file_location(
+              "_lib_test_evidence", "bin/_lib_test_evidence.py")
+          kernel = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(kernel)
+          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+          violations = kernel.validate_export(lines)
+          if violations:
+              for violation in violations[:5]:
+                  print("::error::failure-context.txt line %s: %s"
+                        % (violation["index"], violation["reason"]))
+              # Refuse by REMOVING it: the upload step below is set to ignore a
+              # missing file, so nothing unvalidated can reach an artifact. The
+              # complete unsanitized logs stay on the runner either way.
+              path.unlink()
+              print("::error::refusing to upload the failure extract; "
+                    "the complete unsanitized logs stay on the runner")
+          VALIDATE_PY
+
+      - name: Upload the sanitized failure extract
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-context-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/cctally-test-evidence/local/pr-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+            ${{ runner.temp }}/cctally-test-evidence/local/pr-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
 
       # Reader real-browser smoke net (#281 S3) on the PR lane. The self-hosted
       # e2e-reader job above is push-only for fork-PR safety, so external PRs pick

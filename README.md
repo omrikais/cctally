@@ -160,7 +160,8 @@ Everything runs locally against your own `~/.claude` and `~/.codex` data; sessio
 ## Documentation
 
 - [Installation](docs/installation.md): symlinks, status-line wiring, Python version.
-- [Configuration](docs/configuration.md): config.json shape and week-start rules.
+- [Configuration](docs/commands/config.md): every setting `cctally config` accepts, its default, and whether the dashboard can change it.
+- [The config.json file](docs/configuration.md): file shape, reserved collector keys, week-start rules.
 - [Architecture](docs/architecture.md): data flow, caches, week boundaries.
 - [Telemetry](docs/telemetry.md): the anonymous install-count beat, in full.
 - [Command reference](docs/commands/): one page per subcommand.

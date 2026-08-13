@@ -35,6 +35,7 @@ import os
 import pathlib
 import signal
 import sqlite3
+import stat
 import sys
 import time
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -326,6 +327,134 @@ def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _observation_segment_month(name: str) -> tuple[int, int] | None:
+    """Return a strict ``(year, month)`` for one monthly observation name."""
+    prefix = _lib_journal.SEGMENT_PREFIX
+    suffix = ".jsonl"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    stamp = name[len(prefix):-len(suffix)]
+    if len(stamp) != 7 or stamp[4] != "-":
+        return None
+    year_text, month_text = stamp.split("-", 1)
+    ascii_digits = frozenset("0123456789")
+    if (
+        any(char not in ascii_digits for char in year_text)
+        or any(char not in ascii_digits for char in month_text)
+    ):
+        return None
+    year = int(year_text)
+    month = int(month_text)
+    if year < 1 or not 1 <= month <= 12:
+        return None
+    return (year, month)
+
+
+def _future_segment_refusal(
+    journal_dir, seg_name: str, future_name: str, reason: str
+) -> JournalAppendTargetStale:
+    return JournalAppendTargetStale(
+        f"append target {seg_name} is blocked by later segment {future_name} "
+        f"in {journal_dir}: {reason}; automatic recovery is limited to empty "
+        "regular files. Preserve the future segment and either wait for its "
+        "UTC month or merge its records forward, verify `cctally db rebuild "
+        "--db stats`, and only then remove it"
+    )
+
+
+def _list_append_target_candidates(journal_dir, seg_name: str) -> list[str]:
+    """Canonical-looking entries, including types recovery must reject.
+
+    ``list_segments`` intentionally exposes readable regular segment files to
+    journal consumers. Append validation has a stricter responsibility: a
+    directory, symlink, or uninspectable path with a canonical-looking future
+    name must fail closed instead of disappearing from the recovery decision.
+    """
+    try:
+        names = [
+            entry.name
+            for entry in journal_dir.iterdir()
+            if entry.name.endswith(".jsonl")
+            and (
+                entry.name.startswith(_lib_journal.BOOTSTRAP_PREFIX)
+                or entry.name.startswith(_lib_journal.SEGMENT_PREFIX)
+            )
+        ]
+    except OSError as exc:
+        raise JournalAppendTargetStale(
+            f"append target {seg_name} cannot inspect journal entries in "
+            f"{journal_dir} ({exc}); automatic recovery is limited to "
+            "inspectable empty regular files"
+        ) from exc
+    return sorted(names, key=_lib_journal.segment_sort_key)
+
+
+def _remove_empty_future_segments(
+    journal_dir, seg_name: str, segments: list[str]
+) -> list[str]:
+    """Remove a restored empty future tail while holding ``journal.lock``.
+
+    The caller has already established that ``seg_name`` is stale. Every later
+    segment is inspected before any unlink, so a mixed empty/data-bearing tail
+    remains untouched. All supported writers take the same leaf lock; this is
+    therefore a complete concurrency boundary for journal mutations.
+    """
+    target_month = _observation_segment_month(seg_name)
+    if target_month is None:
+        return segments
+    target_key = _lib_journal.segment_sort_key(seg_name)
+    later = [
+        name
+        for name in segments
+        if _lib_journal.segment_sort_key(name) > target_key
+    ]
+    if not later:
+        return segments
+
+    removable: list[pathlib.Path] = []
+    for name in later:
+        month = _observation_segment_month(name)
+        path = journal_dir / name
+        if month is None or month <= target_month:
+            raise _future_segment_refusal(
+                journal_dir, seg_name, name, "the segment name is not a later UTC month"
+            )
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise _future_segment_refusal(
+                journal_dir, seg_name, name, f"the segment cannot be inspected ({exc})"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0:
+            detail = (
+                f"the segment retains {metadata.st_size} bytes"
+                if stat.S_ISREG(metadata.st_mode)
+                else "the path is not a regular file"
+            )
+            raise _future_segment_refusal(
+                journal_dir, seg_name, name, detail
+            )
+        removable.append(path)
+
+    removed = False
+    try:
+        for path in removable:
+            try:
+                path.unlink()
+                removed = True
+            except OSError as exc:
+                raise _future_segment_refusal(
+                    journal_dir,
+                    seg_name,
+                    path.name,
+                    f"the empty segment cannot be removed ({exc})",
+                ) from exc
+    finally:
+        if removed:
+            _fsync_dir(journal_dir)
+    return _list_append_target_candidates(journal_dir, seg_name)
+
+
 def _validate_append_target(journal_dir, seg_name: str) -> None:
     """Refuse an append whose target is not the canonically-last segment.
 
@@ -343,11 +472,24 @@ def _validate_append_target(journal_dir, seg_name: str) -> None:
     a writer retry against a freshly resolved target, where silently
     redirecting a planned correction group would move it out from under a
     caller that had already reasoned about its placement (#496 S5b §2.4).
+
+    A restored future tail is the one non-transient case (#512). Empty regular
+    future segments carry no durable truth, so they are removed and the target
+    is revalidated. Any data-bearing, malformed, or non-regular later segment
+    still fails closed with the manual recovery boundary in the error.
     """
-    segments = list_segments()
+    segments = _list_append_target_candidates(journal_dir, seg_name)
     if not segments:
         return
     if seg_name == segments[-1]:
+        return
+    if seg_name not in segments:
+        provisional = sorted(
+            [*segments, seg_name], key=_lib_journal.segment_sort_key)
+        if provisional[-1] == seg_name:
+            return
+    segments = _remove_empty_future_segments(journal_dir, seg_name, segments)
+    if not segments or seg_name == segments[-1]:
         return
     if seg_name not in segments:
         provisional = sorted(
@@ -819,7 +961,7 @@ def plan_segment_elision(segments, high_water):
         summaries=summaries, covered=covered, verdict=reason)
 
 
-def _refill_elided_quota_raw(quota_raw, gaps):
+def _refill_elided_quota_raw(quota_raw, gaps, *, failures=None):
     """``(stream, complete)`` — ``quota_raw`` with the elided observations back.
 
     Reached only when the pass elided and the cache leg's own coverage verdict
@@ -840,7 +982,10 @@ def _refill_elided_quota_raw(quota_raw, gaps):
 
     ``complete`` is False when any elided segment could not be re-read IN FULL.
     The caller must then drop its covered boundary: the observations this stream
-    is missing are exactly the ones a minted certificate would claim.
+    is missing are exactly the ones a minted certificate would claim. When a
+    ``failures`` list is supplied, every caught exception appends its segment
+    name and exception class so the rebuild record distinguishes transient I/O
+    failures from implementation defects.
 
     **A short read is detected by counting, not by catching.**
     `_iter_segment_lines` reads until its own `read()` returns nothing, so a
@@ -851,6 +996,8 @@ def _refill_elided_quota_raw(quota_raw, gaps):
     """
     by_index: dict = {}
     complete = True
+    if failures is None:
+        failures = []
     for name, index, extent, expected_lines in gaps:
         recovered = []
         seen = 0
@@ -861,7 +1008,7 @@ def _refill_elided_quota_raw(quota_raw, gaps):
                 record = _lib_journal.decode_line(raw)
                 if record is not None and _is_codex_quota_obs(record):
                     recovered.append(raw)
-        except Exception:
+        except Exception as exc:
             # A vanished segment self-heals, because the pinned vector no longer
             # matches the journal and the certificate is invalid the moment it
             # is read. A transient read error on an UNCHANGED file does not: the
@@ -874,6 +1021,10 @@ def _refill_elided_quota_raw(quota_raw, gaps):
             # call site nor its caller catches anything, so one that escaped
             # would abort the whole rebuild over a re-derivable optimization.
             complete = False
+            failures.append({
+                "segment": str(name),
+                "error": type(exc).__name__,
+            })
             continue
         if seen != int(expected_lines):
             complete = False
@@ -4635,6 +4786,7 @@ def _validate_excluded_derived_fks(conn, spec, row) -> None:
 def _full_effective_selection(hw, accumulators=None):
     records = []
     evidence = []
+    coordinates = {}
     prior_high_water = None
     if hw is not None:
         for segment, offset, raw in _read_range(None, hw):
@@ -4645,16 +4797,25 @@ def _full_effective_selection(hw, accumulators=None):
                     prior_high_water,
                     evidence,
                 )
+                # Only correction records can establish a completed-to-tainted
+                # transition. Keep their exact sequence coordinates without
+                # adding one tuple for every observation in a full fallback.
+                if record.get("t") in {"correction", "correction_batch"}:
+                    coordinates[len(records)] = (
+                        segment, offset + len(raw) + 1)
                 records.append(record)
             prior_high_water = (segment, offset + len(raw) + 1)
     cutover_claude = resolve_cutover_claude_account()
     for record in records:
         _normalize_legacy_account_stamp(record, cutover_claude)
-    return _lib_journal.resolve_effective_events(
+    selected = _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=evidence,
         accumulators=accumulators,
     )
+    if accumulators is not None:
+        accumulators["coordinates"] = coordinates
+    return selected
 
 
 def _selector_generation_matches(conn, state) -> bool:
@@ -4765,15 +4926,12 @@ def _coordinate_covers(covered, target) -> bool:
 #: — is decided BEFORE the gap read and the next successful tick writes the
 #: realigned prefix. One refusal is not the shape this cap exists for.
 #:
-#: The shape it exists for is a refusal that repeats. `merge_delta`'s
-#: durably-completed-batch shape refusal falls back to
-#: `_full_effective_selection`, whose loop acts only on entries whose `batch_id`
-#: is not `None` — and after a taint the winner reverts to the base journal
-#: event, whose `batch_id` IS `None`. That is issue #510, so no
-#: `CorrectionRebuildRequired` is raised and no rebuild follows to realign the
-#: durable prefix. Every later tick would then re-read and re-decode a
-#: monotonically growing range, which is the whole-prefix read spec §3.3 exists
-#: to prevent under another name.
+#: The shape it exists for is any refusal that repeats. A completed-to-tainted
+#: batch now signals from both the incremental and full-selection paths (#510),
+#: but other conservative full-selection fallbacks can still leave durable
+#: selector coverage behind the applied cursor. Every later tick would then
+#: re-read and re-decode a monotonically growing range, which is the whole-prefix
+#: read spec §3.3 exists to prevent under another name.
 #:
 #: Past the cap the tick degrades to full selection like every other degraded
 #: case, and `_observe_selector_desynchronization` reports the gap and this cap
@@ -5059,6 +5217,42 @@ def _raise_taint_transition(transition, coordinates) -> None:
     )
 
 
+def _full_taint_transition(conn, selection, accumulators):
+    """Find a stored corrected batch withdrawn by a full selection (#510)."""
+    stored_batches = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT batch_id FROM journal_effective_events "
+            "WHERE batch_id IS NOT NULL"
+        )
+    }
+    stale_batches = stored_batches - set(selection.completed_batches)
+    if not stale_batches:
+        return None
+
+    fold = accumulators["fold"]
+    transitions = []
+    for batch_id, _kind, fingerprint in fold.violations:
+        if batch_id not in stale_batches:
+            continue
+        causal = fold.violation_available_after.get(fingerprint)
+        if causal is not None:
+            transitions.append(
+                _lib_selector_state.TaintTransition(
+                    batch_id=batch_id,
+                    causal_sequence=causal,
+                )
+            )
+    if not transitions:
+        raise JournalError(
+            "a previously completed correction batch is no longer effective "
+            "but its causal taint record could not be resolved"
+        )
+    return min(
+        transitions,
+        key=lambda item: (item.causal_sequence, item.batch_id),
+    )
+
+
 def _correction_commit_high_water(batch_id, hw=None):
     """Return the exact end offset of one completed-batch commit marker.
 
@@ -5289,6 +5483,9 @@ def _preflight_live_events(
             recovery_eligible=True,
             kind=CORRECTION_KIND_NEWLY_COMPLETED,
         )
+    transition = _full_taint_transition(conn, full, accumulators)
+    if transition is not None:
+        _raise_taint_transition(transition, accumulators["coordinates"])
     return to_apply
 
 
@@ -6833,6 +7030,10 @@ def _pending_publication_owes_nothing(destination, state) -> bool:
 
     A marker written before the mechanism field existed reads as `replace`,
     which is what those binaries did.
+
+    A replace marker with no usable scratch path proves neither outcome. It
+    therefore owes a verdict: fail closed instead of discarding the marker as
+    though the predecessor were proven.
     """
     if str(state.get("mechanism") or "replace") == "in_place":
         return in_place_publication_proven_predecessor(destination, state)
@@ -8406,7 +8607,9 @@ def _rebuild_quota_cache_leg_raw(
         # built. Elision then costs one read in the racy case rather than an
         # unmaterialized observation under a certificate claiming coverage.
         before = len(quota_raw)
-        quota_raw, refilled = _refill_elided_quota_raw(quota_raw, elision_gaps)
+        refill_failures: list = []
+        quota_raw, refilled = _refill_elided_quota_raw(
+            quota_raw, elision_gaps, failures=refill_failures)
         if not refilled:
             # A segment this pass elided could not be re-read, so its
             # observations are absent from the stream about to be replayed.
@@ -8421,6 +8624,7 @@ def _rebuild_quota_cache_leg_raw(
                 "segments": len(elision_gaps),
                 "observations": len(quota_raw) - before,
                 "complete": refilled,
+                "failures": refill_failures,
             }
     return _run_bounded_recovery(
         quota_raw, file_accounts, cutover_claude, counters,
@@ -9785,9 +9989,55 @@ def _export_quota_obs() -> list:
     return out
 
 
-def _cutover_segment_name(now_utc: dt.datetime) -> str:
-    ts = now_utc.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-    return f"{_lib_journal.BOOTSTRAP_PREFIX}{ts}.jsonl"
+def _cutover_segment_name(
+    now_utc: dt.datetime, *, existing: "list[str] | tuple[str, ...]" = ()
+) -> str:
+    """Mint a bootstrap name that sorts after every published bootstrap.
+
+    Wall time supplies the ordinary name. A crash orphan can be later than a
+    retry after a backward clock step, so a non-newest candidate is re-minted
+    one microsecond after the canonically newest published bootstrap (#509).
+    Fail closed when that name is not parseable or cannot be advanced: writing
+    behind it would leave the segment outside the cursor, while reusing its name
+    would overwrite append-only journal truth.
+    """
+    def _name(value: dt.datetime) -> str:
+        ts = value.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+        return f"{_lib_journal.BOOTSTRAP_PREFIX}{ts}.jsonl"
+
+    candidate = _name(now_utc)
+    bootstraps = [
+        name for name in existing
+        if name.startswith(_lib_journal.BOOTSTRAP_PREFIX)
+    ]
+    if not bootstraps:
+        return candidate
+    newest = max(bootstraps, key=_lib_journal.segment_sort_key)
+    if (_lib_journal.segment_sort_key(candidate)
+            > _lib_journal.segment_sort_key(newest)):
+        return candidate
+
+    prefix = _lib_journal.BOOTSTRAP_PREFIX
+    suffix = ".jsonl"
+    try:
+        if not newest.endswith(suffix):
+            raise ValueError("missing .jsonl suffix")
+        newest_at = dt.datetime.strptime(
+            newest[len(prefix):-len(suffix)], "%Y%m%dT%H%M%S_%f"
+        ).replace(tzinfo=dt.timezone.utc)
+        reminted = _name(newest_at + dt.timedelta(microseconds=1))
+    except (OverflowError, ValueError) as exc:
+        raise JournalError(
+            "cannot mint a cutover bootstrap after the canonically newest "
+            f"published segment {newest!r}"
+        ) from exc
+    if (_lib_journal.segment_sort_key(reminted)
+            <= _lib_journal.segment_sort_key(newest)):
+        raise JournalError(
+            "cutover bootstrap remint did not advance canonical order past "
+            f"{newest!r}"
+        )
+    return reminted
 
 
 def _encode_bootstrap_lines(lines: list) -> bytes:
@@ -9920,7 +10170,8 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
     rows byte for byte, so it reuses that orphan rather than publishing a twin
     (#496 S5 §3) — the retry is now idempotent on disk, not only on fold. When
     the retry's export genuinely differs, no digest matches and a new segment is
-    written exactly as before."""
+    minted after every published bootstrap, including after a backward clock
+    step (#509)."""
     if now_utc is None:
         now_utc = dt.datetime.now(dt.timezone.utc)
     epoch = _cctally_core.STATS_INDEX_EPOCH
@@ -9946,7 +10197,8 @@ def run_cutover(conn, *, now_utc: dt.datetime | None = None) -> "str | None":
         reuse = _reusable_bootstrap(
             hashlib.sha256(blob).hexdigest(), len(blob))
         if reuse is None:
-            seg_name = _cutover_segment_name(now_utc)
+            seg_name = _cutover_segment_name(
+                now_utc, existing=list_segments())
             seg_size = _write_bootstrap_segment(seg_name, blob)
         else:
             seg_name, seg_size = reuse

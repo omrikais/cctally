@@ -284,6 +284,32 @@ def _share_period_label(
     )
 
 
+def _share_resolve_period_start(
+    period_start: dt.datetime,
+    *,
+    since_explicit: bool,
+    displayed_dates: "list[dt.date]",
+    display_tz: str,
+) -> dt.datetime:
+    """Keep a requested start, otherwise start at the first displayed day.
+
+    ``_parse_cli_date_range`` uses 2020-01-01 as the query sentinel when
+    ``--since`` is absent. That remains the correct read bound, but it is not
+    a period the user selected. Share artifacts therefore replace only that
+    defaulted presentation bound with the first civil day they actually
+    render. Empty artifacts retain the query bound because there is no
+    content-derived boundary to state (#527).
+    """
+    if since_explicit or not displayed_dates:
+        return period_start
+    first = min(displayed_dates)
+    zone = _resolve_tz(
+        display_tz,
+        fallback=period_start.tzinfo or dt.timezone.utc,
+    )
+    return dt.datetime(first.year, first.month, first.day, tzinfo=zone)
+
+
 def _share_display_zone(tz: "ZoneInfo | None"):
     """The concrete zone `_share_display_tz_label` names, as a tzinfo.
 
@@ -484,6 +510,7 @@ def _build_daily_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
+    since_explicit: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally daily`.
 
@@ -504,11 +531,12 @@ def _build_daily_snapshot(
     - `top_model` is the first entry of `model_breakdowns` (sorted by cost
       desc per upstream ccusage parity); empty → "—".
 
-    `period_start` / `period_end` / `display_tz` are passed by the
-    caller (they reflect the CLI's `--since` / `--until` window which
-    may extend past the data window). `theme` and `reveal_projects`
-    flow into the subtitle directly so the builder owns the canonical
-    subtitle shape — no post-build re-stamp at the gate site.
+    `period_start` / `period_end` / `display_tz` are passed by the caller.
+    An explicit range may extend past the data window; when `--since` was
+    omitted, `since_explicit=False` replaces only the share artifact's
+    sentinel start with the first displayed day (#527). `theme` and
+    `reveal_projects` flow into the subtitle directly so the builder owns the
+    canonical subtitle shape — no post-build re-stamp at the gate site.
     """
     _lib_share = _share_load_lib()
     columns = (
@@ -528,13 +556,16 @@ def _build_daily_snapshot(
 
     snap_rows: list = []
     chart_pts: list = []
+    displayed_period_dates: list[dt.date] = []
     for i, r in enumerate(rows):
         # `BucketUsage.bucket` is typed `str` (YYYY-MM-DD); guard against
         # empty / unparseable but skip the dead `dt.date` branch.
         bucket = getattr(r, "bucket", None)
         if isinstance(bucket, str) and bucket:
             try:
-                date_str = dt.date.fromisoformat(bucket).isoformat()
+                parsed_date = dt.date.fromisoformat(bucket)
+                date_str = parsed_date.isoformat()
+                displayed_period_dates.append(parsed_date)
             except ValueError:
                 date_str = bucket
         else:
@@ -563,6 +594,12 @@ def _build_daily_snapshot(
         _lib_share.Totalled(label="Sum", value=f"${total_cost:,.2f}"),
         _lib_share.Totalled(label="Days", value=str(len(chart_pts))),
         _lib_share.Totalled(label="Avg / day", value=f"${avg_cost:,.2f}"),
+    )
+    period_start = _share_resolve_period_start(
+        period_start,
+        since_explicit=since_explicit,
+        displayed_dates=displayed_period_dates,
+        display_tz=display_tz,
     )
     if rows:
         title = (
@@ -595,6 +632,7 @@ def _build_monthly_snapshot(
     period_end: dt.datetime,
     display_tz: str,
     version: str,
+    since_explicit: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally monthly`.
 
@@ -613,11 +651,12 @@ def _build_monthly_snapshot(
     - `Δ vs prior` is computed on `cost_usd` between consecutive ASC-sorted
       months, matching the plan's intent.
 
-    `period_start` / `period_end` / `display_tz` are passed by the
-    caller (the CLI's `--since` / `--until` window may extend past
-    the data window). `theme` / `reveal_projects` flow into the
-    subtitle directly so the builder owns the canonical subtitle
-    shape — no post-build re-stamp at the gate site.
+    `period_start` / `period_end` / `display_tz` are passed by the caller.
+    An explicit range may extend past the data window; when `--since` was
+    omitted, `since_explicit=False` replaces only the share artifact's
+    sentinel start with the first displayed month (#527). `theme` /
+    `reveal_projects` flow into the subtitle directly so the builder owns the
+    canonical subtitle shape — no post-build re-stamp at the gate site.
     """
     # Caller MUST pass rows in chronological order so the BarChart bars
     # line up left-to-right with time. view.aggregated is newest-first.
@@ -632,12 +671,20 @@ def _build_monthly_snapshot(
     )
     snap_rows: list = []
     chart_pts: list = []
+    displayed_period_dates: list[dt.date] = []
     prev_cost: float | None = None
     for i, r in enumerate(rows):
         # `BucketUsage.bucket` is typed `str` ("YYYY-MM"); guard against
         # empty / unparseable but skip the dead `dt.date` branch.
         bucket = getattr(r, "bucket", None)
         month_str = bucket if isinstance(bucket, str) and bucket else "—"
+        if isinstance(bucket, str):
+            try:
+                displayed_period_dates.append(
+                    dt.date.fromisoformat(f"{bucket}-01")
+                )
+            except ValueError:
+                pass
         cost_usd = float(getattr(r, "cost_usd", 0.0) or 0.0)
         total_tokens = int(getattr(r, "total_tokens", 0) or 0)
         if prev_cost is not None and prev_cost > 0:
@@ -667,6 +714,12 @@ def _build_monthly_snapshot(
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Months", value=str(len(chart_pts))),
         _lib_share.Totalled(label="Avg / month", value=f"${avg_cost:,.2f}"),
+    )
+    period_start = _share_resolve_period_start(
+        period_start,
+        since_explicit=since_explicit,
+        displayed_dates=displayed_period_dates,
+        display_tz=display_tz,
     )
     if rows:
         title = (
@@ -703,6 +756,7 @@ def _build_weekly_snapshot(
     display_tz: str,
     version: str,
     breakdown_model: bool,
+    since_explicit: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally weekly`.
 
@@ -780,6 +834,7 @@ def _build_weekly_snapshot(
 
     snap_rows: list = []
     chart_pts: list = []
+    displayed_period_dates: list[dt.date] = []
     stacks: dict[str, list] = {}
     for i, r in enumerate(rows):
         # `BucketUsage.bucket` is typed `str` ("YYYY-MM-DD"); guard against
@@ -787,7 +842,9 @@ def _build_weekly_snapshot(
         bucket = getattr(r, "bucket", None)
         if isinstance(bucket, str) and bucket:
             try:
-                week_label = dt.date.fromisoformat(bucket).isoformat()
+                parsed_date = dt.date.fromisoformat(bucket)
+                week_label = parsed_date.isoformat()
+                displayed_period_dates.append(parsed_date)
             except ValueError:
                 week_label = bucket
         else:
@@ -851,6 +908,12 @@ def _build_weekly_snapshot(
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Avg %/wk", value=f"{avg_pct:.1f}%"),
         _lib_share.Totalled(label="Peak %", value=f"{peak_pct:.1f}%"),
+    )
+    period_start = _share_resolve_period_start(
+        period_start,
+        since_explicit=since_explicit,
+        displayed_dates=displayed_period_dates,
+        display_tz=display_tz,
     )
     title = (
         f"Weekly usage — last {len(rows)} weeks"
@@ -1438,6 +1501,7 @@ def _build_session_snapshot(
     version: str,
     top_n: int | None,
     tz: "ZoneInfo | None",
+    since_explicit: bool,
 ) -> "ShareSnapshot":
     """Build a ShareSnapshot for `cctally session`.
 
@@ -1528,6 +1592,7 @@ def _build_session_snapshot(
     augmented = _session_disambiguate_labels(sorted_sessions)
     snap_rows: list = []
     chart_pts: list = []
+    displayed_period_dates: list[dt.date] = []
     for idx, s in enumerate(sorted_sessions):
         bare_label = (
             os.path.basename(s.project_path or "")
@@ -1544,6 +1609,9 @@ def _build_session_snapshot(
         # period_label already carries the active tz.
         last_str = format_display_dt(
             s.last_activity, tz, fmt="%Y-%m-%d %H:%M", suffix=False,
+        )
+        displayed_period_dates.append(
+            s.last_activity.astimezone(_share_display_zone(tz)).date()
         )
         models_text = ", ".join(s.models) if s.models else "—"
         snap_rows.append(_lib_share.Row(cells={
@@ -1575,6 +1643,12 @@ def _build_session_snapshot(
     totals = (
         _lib_share.Totalled(label="Sum", value=f"${sum_cost:,.2f}"),
         _lib_share.Totalled(label="Sessions", value=str(len(chart_pts))),
+    )
+    period_start = _share_resolve_period_start(
+        period_start,
+        since_explicit=since_explicit,
+        displayed_dates=displayed_period_dates,
+        display_tz=display_tz,
     )
     if sorted_sessions:
         if truncated:

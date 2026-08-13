@@ -690,6 +690,34 @@ def build_refill_layout(journal_dir, layout: str, *, per_segment: int = 2) -> di
     }
 
 
+def build_mixed_elidable_refill(journal_dir) -> dict:
+    """One elidable segment with quota observations around a Claude obs.
+
+    `quota_only` means the segment has no retained record types; it does not
+    mean every decoded line is a Codex quota observation. The line-count check
+    therefore has to compare every line read with the summary's count, while
+    returning only the two Codex observations to the quota replay stream.
+    """
+    journal_dir = pathlib.Path(journal_dir)
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    name = REFILL_LAYOUT_SEGMENTS[0]
+    records = [
+        codex_quota_obs(line_offset=0, used_percent=10.0),
+        _claude_obs(ELISION_AT, 11.0),
+        codex_quota_obs(line_offset=2, used_percent=12.0),
+    ]
+    path = journal_dir / name
+    path.write_bytes(b"".join(jl.encode_line(record) for record in records))
+    expected = [
+        jl.encode_line(records[0])[:-1],
+        jl.encode_line(records[2])[:-1],
+    ]
+    return {
+        "gaps": [(name, 0, path.stat().st_size, len(records))],
+        "expected": expected,
+    }
+
+
 #: `build_interleaved_elision_scenario`'s segments. Its own year again, and its
 #: own event id, per the §7.1 fixture caution the module docstring states.
 SEG_X1 = "observations-2025-09.jsonl"

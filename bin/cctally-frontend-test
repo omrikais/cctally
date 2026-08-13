@@ -63,8 +63,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The harness helper path is rooted through REPO_ROOT at runtime.
 # shellcheck source=/dev/null
 . "$REPO_ROOT/bin/_lib-harness-env.sh"
+# The golden helper path is rooted through REPO_ROOT at runtime.
 # shellcheck source=/dev/null
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 

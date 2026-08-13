@@ -30,6 +30,7 @@
 set -uo pipefail
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+# The golden helper path is computed from BASH_SOURCE at runtime.
 # shellcheck source=/dev/null
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-golden-diff.sh"
 

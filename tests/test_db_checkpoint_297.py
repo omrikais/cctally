@@ -32,6 +32,29 @@ def _load(n):
     return importlib.import_module(n)
 
 
+@pytest.fixture(autouse=True)
+def _pin_the_cache_locks(tmp_path, monkeypatch):
+    """Pin the two flocks ``cmd_db_checkpoint`` takes besides the database.
+
+    Every test here pins ``CACHE_DB_PATH``, and none of that pins the locks:
+    ``acquire_ordered_flocks`` opens ``CACHE_LOCK_MAINTENANCE_PATH`` and
+    ``CACHE_LOCK_PATH``, which two of the ten tests set and the other eight left
+    resolving to the maintainer's real ``~/.local/share/cctally`` (#529 S4).
+
+    A narrow pin rather than ``isolated_paths``, because these two constants are
+    the whole surface this module reaches beyond the database it already pins,
+    and re-deriving all of them from a fake HOME points the locks at a
+    ``.local/share/cctally`` directory nothing creates, which turns the
+    ``O_CREAT`` open into ENOENT.
+    """
+    core = _load("_cctally_core")
+    monkeypatch.setattr(
+        core, "CACHE_LOCK_MAINTENANCE_PATH", tmp_path / "cache.db.maintenance.lock"
+    )
+    monkeypatch.setattr(core, "CACHE_LOCK_PATH", tmp_path / "cache.db.lock")
+    yield
+
+
 def _args(**kw):
     ns = argparse.Namespace(db="cache", json=False, busy_timeout_ms=15000)
     for k, v in kw.items():

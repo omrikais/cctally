@@ -62,7 +62,8 @@ FAKE_HOME="$SCRATCH_DIR/$SCENARIO"
 # (rebuilt copy carries the same values).
 AS_OF=""
 COLUMNS_OVERRIDE=""
-# shellcheck disable=SC1091
+# ShellCheck: the selected fixture input is generated per scenario.
+# shellcheck disable=SC1090
 . "$FIXTURES_DIR/$SCENARIO/input.env"
 if [ -z "${AS_OF:-}" ]; then
     echo "FAIL: input.env missing AS_OF" >&2

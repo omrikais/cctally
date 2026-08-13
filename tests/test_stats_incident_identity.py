@@ -583,7 +583,7 @@ def _seed_cli(env: dict) -> pathlib.Path:
             "--five-hour-percent", "11",
             "--five-hour-resets-at", str(now + 3600),
         ],
-        env=env, capture_output=True, text=True, timeout=180,
+        env=env, capture_output=True, text=True, timeout=110,
     )
     assert result.returncode == 0, result.stderr
     db = pathlib.Path(env["CCTALLY_DATA_DIR"]) / "stats.db"
@@ -603,7 +603,7 @@ def test_db_rebuild_cli_manifest_records_the_db_rebuild_trigger(tmp_path):
 
     result = subprocess.run(
         [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
-        env=env, capture_output=True, text=True, timeout=300,
+        env=env, capture_output=True, text=True, timeout=110,
     )
     assert result.returncode == 0, result.stderr
 

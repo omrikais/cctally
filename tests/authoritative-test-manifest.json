@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "seededAt": "2026-08-08",
-  "minHarnessRows": 56,
+  "minHarnessRows": 58,
   "harnesses": [
     {
       "name": "5h-canonical",
@@ -215,6 +215,12 @@
       "countPolicy": "fixed"
     },
     {
+      "name": "preflight",
+      "visibility": "public",
+      "minCases": 16,
+      "countPolicy": "fixed"
+    },
+    {
       "name": "pricing-check",
       "visibility": "public",
       "minCases": 10,
@@ -224,6 +230,12 @@
       "name": "project",
       "visibility": "public",
       "minCases": 36,
+      "countPolicy": "fixed"
+    },
+    {
+      "name": "reap",
+      "visibility": "private",
+      "minCases": 54,
       "countPolicy": "fixed"
     },
     {
@@ -299,6 +311,12 @@
       "countPolicy": "fixed"
     },
     {
+      "name": "shellcheck",
+      "visibility": "public",
+      "minCases": 14,
+      "countPolicy": "fixed"
+    },
+    {
       "name": "source-aware",
       "visibility": "public",
       "minCases": 190,
@@ -319,7 +337,7 @@
     {
       "name": "test-remote",
       "visibility": "private",
-      "minCases": 391,
+      "minCases": 693,
       "countPolicy": "fixed"
     },
     {
@@ -389,5 +407,5 @@
     "CCTALLY_PRICING_CHECK_REGENERATE",
     "CCTALLY_UPDATE_TEST_REGEN"
   ],
-  "seededFrom": "Two-axis observation (macOS and Linux, floors are the minimum of the two) for the 50 public rows: macOS = TZ=Etc/UTC bin/cctally-test-remote --watch bin/cctally-test-all on omri-lan-cmd at feat/529-s1-green-means-green d2c0cc21f; Linux = omrikais/cctally ci-linux-matrix.yml run 31248367622 (v1.94.2), identical across python 3.11/3.12/3.13. Exactly one row differs between the two operating systems: alerts (139 Darwin, 125 Linux), which is why it is the only countPolicy=variable row. ONE-AXIS observation (macOS only) for the 6 private rows -- mirror-public, mirror-snapshot, release, release-harness-isolation, share-v2, test-remote: the public mirror ships none of them, so that Linux run could not observe them and their floors rest on the macOS count alone. They are declared fixed on evidence rather than assumption -- none of the six contains a uname -s or Darwin gate, so no operating-system axis exists for them to vary on -- but a private Linux lane has not yet confirmed it."
+  "seededFrom": "Two-axis observation (macOS and Linux, floors are the minimum of the two) for the original 50 public rows: macOS = TZ=Etc/UTC bin/cctally-test-remote --watch bin/cctally-test-all on a LAN runner at feat/529-s1-green-means-green d2c0cc21f; Linux = omrikais/cctally ci-linux-matrix.yml run 31248367622 (v1.94.2), identical across python 3.11/3.12/3.13. Exactly one original row differs between the two operating systems: alerts (139 Darwin, 125 Linux), which is why it is the only countPolicy=variable row. The shellcheck row was separately seeded from its 14 explicit clean-tree, mutation, target-drift, directive-audit, and version-contract cases; those generated cases are platform-independent and its public Linux execution is an issue #546 acceptance gate. ONE-AXIS observation (macOS only) for the 7 private rows -- mirror-public, mirror-snapshot, reap, release, release-harness-isolation, share-v2, test-remote: the public mirror ships none of them, so that Linux run could not observe them and their floors rest on the macOS count alone. They are declared fixed on evidence rather than assumption -- none of the seven contains a uname -s or Darwin gate, so no operating-system axis exists for them to vary on -- but a private Linux lane has not yet confirmed it."
 }

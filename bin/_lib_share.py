@@ -17,7 +17,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -122,12 +122,19 @@ class PeriodSpec:
     `display_tz`. True means they are ALREADY civil calendar labels — a
     `daily` bucket named `2026-05-04`, lifted to a UTC-midnight sentinel —
     and converting one shifts it by a day in every zone west of UTC.
+
+    `stated_*_date` are effective-rendering overrides, not builder inputs.
+    They let the provenance strip retain the civil dates found in rendered
+    text when an absolute frontmatter bound must extend across a timezone
+    boundary to contain a displayed UTC instant (#528).
     """
     start: datetime
     end: datetime
     display_tz: str
     label: str
     civil_bucket: bool = False
+    stated_start_date: str | None = None
+    stated_end_date: str | None = None
 
 
 def period_civil_dates(period: PeriodSpec) -> tuple[str, str]:
@@ -138,7 +145,8 @@ def period_civil_dates(period: PeriodSpec) -> tuple[str, str]:
     builder sets a SEMANTIC label (`This week`, `Last 8 weeks`, `Recent
     sessions`), and none of them names a date.
 
-    A `civil_bucket` period is returned verbatim, because its boundaries
+    Effective-rendering overrides win when present.  A `civil_bucket` period
+    is otherwise returned verbatim, because its boundaries
     are already calendar labels; anything else is converted into the
     labelled zone, because its boundaries are instants.
 
@@ -148,13 +156,20 @@ def period_civil_dates(period: PeriodSpec) -> tuple[str, str]:
     date rather than an outage.
     """
     if period.civil_bucket:
-        return period.start.date().isoformat(), period.end.date().isoformat()
+        derived = (period.start.date().isoformat(),
+                   period.end.date().isoformat())
+        return (period.stated_start_date or derived[0],
+                period.stated_end_date or derived[1])
     try:
         zone = ZoneInfo(period.display_tz)
     except (ZoneInfoNotFoundError, ValueError, OSError):
-        return period.start.date().isoformat(), period.end.date().isoformat()
-    return (period.start.astimezone(zone).date().isoformat(),
-            period.end.astimezone(zone).date().isoformat())
+        derived = (period.start.date().isoformat(),
+                   period.end.date().isoformat())
+    else:
+        derived = (period.start.astimezone(zone).date().isoformat(),
+                   period.end.astimezone(zone).date().isoformat())
+    return (period.stated_start_date or derived[0],
+            period.stated_end_date or derived[1])
 
 
 # --- Chart primitives ---
@@ -510,6 +525,13 @@ _HBAR_LABEL_PAD = 4.0        # gap between a gutter label and its bar
 _HBAR_VALUE_PAD = 4.0        # gap between a bar's end and its value label
 _HBAR_LABEL_FONT = 11.0
 _HBAR_VALUE_FONT = 10.0
+_HBAR_VERTICAL_PADDING = 12.0
+_HBAR_COMFORTABLE_ROW_PITCH = 14.0
+
+_STACKED_LEGEND_TOP_PAD = 4.0
+_STACKED_LEGEND_ROW_H = 12.0
+_STACKED_LEGEND_BOTTOM_PAD = 4.0
+_STACKED_PLOT_MIN_H = 80.0
 
 # Distance from the plot's left edge back to the end-anchored y-axis
 # label. With no reservation for the label's own width, `projected %`
@@ -574,6 +596,17 @@ def _hbar_right_reserve(points) -> float:
     widest = max(_svg_text_width(_hbar_value_text(p), _HBAR_VALUE_FONT)
                  for p in points)
     return _HBAR_VALUE_PAD + widest + _HBAR_RIGHT_PAD
+
+
+def _stacked_legend_height(series_count: int) -> float:
+    """Height reserved above stacked bars for their model key."""
+    if series_count <= 0:
+        return 0.0
+    return (
+        _STACKED_LEGEND_TOP_PAD
+        + series_count * _STACKED_LEGEND_ROW_H
+        + _STACKED_LEGEND_BOTTOM_PAD
+    )
 
 
 def chart_required_width(chart: "ChartSpec | None", *,
@@ -808,16 +841,21 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
     if not pts:
         return _render_chart_no_data(palette, x=x, y=y, width=width, height=height)
 
-    n = len(pts)
-    bar_gap = 4.0
-    total_gap = bar_gap * (n - 1) if n > 1 else 0.0
-    bar_w = max(2.0, (iw - total_gap) / n)
-
     has_stacks = bool(chart.stacks)
     # Sorted keys give deterministic stack ordering; matches the
     # `sorted(all_model_keys)` ordering builders use for table columns,
     # so legend swatch -> table column line up by position.
     series_keys = sorted(chart.stacks.keys()) if has_stacks else []
+    legend_iy = iy
+    if has_stacks:
+        legend_h = _stacked_legend_height(len(series_keys))
+        iy += legend_h
+        ih -= legend_h
+
+    n = len(pts)
+    bar_gap = 4.0
+    total_gap = bar_gap * (n - 1) if n > 1 else 0.0
+    bar_w = max(2.0, (iw - total_gap) / n)
 
     if has_stacks:
         per_bar_totals: list[float] = []
@@ -877,18 +915,19 @@ def _render_bar_chart_svg(chart: BarChart, *, palette: dict,
                                      font_size=10, fill=palette["muted"],
                                      anchor="middle"))
 
-    # Legend (top-right of inner box, only when stacks are present).
-    # SVG is the only artifact where the table doesn't double as a key, so
-    # the legend matters most for `--format svg` output. Placed inside the
-    # inner box so total chart dimensions stay byte-stable.
+    # Legend (top-right of a band reserved above the plot when stacks are
+    # present). SVG is the only artifact where the table does not double as a
+    # key, so the legend must remain legible even when a bar reaches y_max.
     if has_stacks:
         legend_swatch_w = 8.0
         legend_swatch_h = 8.0
-        legend_row_h = 12.0
         legend_col_w = 160.0
         legend_left = ix + iw - legend_col_w
         for k_idx, k in enumerate(series_keys):
-            row_y = iy + 4 + k_idx * legend_row_h
+            row_y = (
+                legend_iy + _STACKED_LEGEND_TOP_PAD
+                + k_idx * _STACKED_LEGEND_ROW_H
+            )
             color = series_palette[k_idx % len(series_palette)]
             elements.append(svg_rect(
                 legend_left, row_y, legend_swatch_w, legend_swatch_h,
@@ -2271,6 +2310,10 @@ _DISPLAYED_DATE_RE = re.compile(
     r"^(\d{4}-\d{2})(-\d{2})?"
     r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$")
 
+_DISPLAYED_INSTANT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"
+    r"(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$")
+
 
 def _displayed_date_token(text: str) -> "str | None":
     """`YYYY-MM` or `YYYY-MM-DD` when `text` is entirely a date."""
@@ -2278,6 +2321,22 @@ def _displayed_date_token(text: str) -> "str | None":
     if match is None:
         return None
     return match.group(1) + (match.group(2) or "")
+
+
+def _displayed_instant(text: str) -> "datetime | None":
+    """An aware datetime when the whole rendered value is an ISO instant."""
+    raw = text.strip()
+    if _DISPLAYED_INSTANT_RE.match(raw) is None:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value
 
 
 def _chart_points(chart) -> list:
@@ -2311,8 +2370,24 @@ def _chart_points(chart) -> list:
     return points
 
 
+def _displayed_temporal_texts(snap: ShareSnapshot, *, shows_chart: bool,
+                              shows_table: bool) -> list[str]:
+    """Rendered table/chart strings that can carry dates or instants."""
+    values: list[str] = []
+    if shows_table and _has_table(snap):
+        values.extend(column.label or "" for column in snap.columns)
+        for row in snap.rows:
+            for column in snap.columns:
+                cell = row.cells.get(column.key)
+                if cell is not None:
+                    values.append(_render_cell_text(cell))
+    if shows_chart:
+        values.extend(point.x_label or "" for point in _chart_points(snap.chart))
+    return values
+
+
 def displayed_dates(snap: ShareSnapshot, *, shows_chart: bool,
-                    shows_table: bool) -> list:
+                    shows_table: bool) -> list[str]:
     """Every date this rendering DISPLAYS, as a `YYYY-MM[-DD]` token.
 
     Read from the text the renderers themselves print — `_render_cell_text`
@@ -2325,26 +2400,17 @@ def displayed_dates(snap: ShareSnapshot, *, shows_chart: bool,
     Only cells reachable through `snap.columns` are visited, because only
     those are rendered.
     """
-    tokens: list[str] = []
-    if shows_table and _has_table(snap):
-        for column in snap.columns:
-            token = _displayed_date_token(column.label or "")
-            if token:
-                tokens.append(token)
-        for row in snap.rows:
-            for column in snap.columns:
-                cell = row.cells.get(column.key)
-                if cell is None:
-                    continue
-                token = _displayed_date_token(_render_cell_text(cell))
-                if token:
-                    tokens.append(token)
-    if shows_chart:
-        for point in _chart_points(snap.chart):
-            token = _displayed_date_token(point.x_label or "")
-            if token:
-                tokens.append(token)
-    return tokens
+    return [token for text in _displayed_temporal_texts(
+                snap, shows_chart=shows_chart, shows_table=shows_table)
+            if (token := _displayed_date_token(text)) is not None]
+
+
+def displayed_instants(snap: ShareSnapshot, *, shows_chart: bool,
+                       shows_table: bool) -> list[datetime]:
+    """Every absolute ISO instant this rendering displays verbatim."""
+    return [instant for text in _displayed_temporal_texts(
+                snap, shows_chart=shows_chart, shows_table=shows_table)
+            if (instant := _displayed_instant(text)) is not None]
 
 
 def _period_boundary_at(period: PeriodSpec, iso_date: str, *,
@@ -2429,22 +2495,40 @@ def effective_period(snap: ShareSnapshot, *, shows_chart: bool,
     period = snap.period
     tokens = displayed_dates(snap, shows_chart=shows_chart,
                              shows_table=shows_table)
-    if not tokens:
+    instants = (displayed_instants(snap, shows_chart=shows_chart,
+                                   shows_table=shows_table)
+                if not period.civil_bucket else [])
+    if not tokens and not instants:
         return period
     start_civil, end_civil = period_civil_dates(period)
     # Compared at the token's OWN precision, so a `2026-05` month bucket
     # is covered by any period whose bounds fall in that month.
     below = [t for t in tokens if t < start_civil[:len(t)]]
     above = [t for t in tokens if t > end_civil[:len(t)]]
-    if not below and not above:
-        return period
+    stated_start = (_whole_date(min(below), side="start")
+                    if below else start_civil)
+    stated_end = (_whole_date(max(above), side="end")
+                  if above else end_civil)
     start = (_period_boundary_at(period, _whole_date(min(below), side="start"),
                                  side="start")
              if below else period.start)
     end = (_period_boundary_at(period, _whole_date(max(above), side="end"),
                                side="end")
            if above else period.end)
-    return dataclasses.replace(period, start=start, end=end)
+    if instants:
+        start = min(start, min(instants))
+        end = max(end, max(instants))
+        # Frontmatter is intentionally second-precision.  Its formatter
+        # floors microseconds, which is safe for a start but would move an
+        # end before a displayed fractional-second instant.  Ceiling the
+        # effective end to the next representable serialized second.
+        if end.microsecond:
+            end = end.replace(microsecond=0) + timedelta(seconds=1)
+    if start == period.start and end == period.end:
+        return period
+    return dataclasses.replace(
+        period, start=start, end=end,
+        stated_start_date=stated_start, stated_end_date=stated_end)
 
 
 def _md_effective_period(snap: ShareSnapshot) -> PeriodSpec:
@@ -2675,8 +2759,44 @@ _SVG_SECTION_GAP = 20.0
 # 48px band) and footer (10pt at a +18 baseline inside a 30px band).
 _SVG_COMPOSITE_HEADER_H = 48.0
 _SVG_COMPOSITE_TITLE_BASELINE = 30.0
+_SVG_COMPOSITE_ALIAS_SCOPE_EXTRA_H = 20.0
+_SVG_COMPOSITE_ALIAS_SCOPE_BASELINE = 52.0
 _SVG_COMPOSITE_FOOTER_H = 30.0
 _SVG_COMPOSITE_FOOTER_BASELINE = 18.0
+
+_COMPOSITE_ALIAS_SCOPE_TEXT = "Project aliases are shared across sections."
+
+
+def chart_required_height(chart: "ChartSpec | None", *,
+                          nominal_height: float) -> float:
+    """Return the chart slot height needed for non-crowded chart content.
+
+    The fixed 220px slot remains byte-stable for the historical hbar estate,
+    including the CLI's 15-row cap. Detail templates may intentionally carry
+    more rows, so once the nominal slot's rounded comfortable capacity is
+    exceeded the canvas grows instead of compressing 11pt labels together.
+    Stacked bars likewise keep a minimum plot below their reserved legend band.
+    """
+    if isinstance(chart, HorizontalBarChart):
+        rows = len(_hbar_visible_points(chart))
+        nominal_capacity = math.ceil(
+            max(0.0, nominal_height - _HBAR_VERTICAL_PADDING)
+            / _HBAR_COMFORTABLE_ROW_PITCH
+        )
+        if rows > nominal_capacity:
+            return max(
+                nominal_height,
+                _HBAR_VERTICAL_PADDING
+                + rows * _HBAR_COMFORTABLE_ROW_PITCH,
+            )
+    if isinstance(chart, BarChart) and chart.stacks:
+        return max(
+            nominal_height,
+            _PADDING_TOP + _PADDING_BOTTOM
+            + _stacked_legend_height(len(chart.stacks))
+            + _STACKED_PLOT_MIN_H,
+        )
+    return nominal_height
 
 # --- SVG table geometry (issue #38) ---
 _SVG_TABLE_FONT = 11
@@ -3118,7 +3238,10 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
                            is rendered separately as a sibling element).
     """
     has_table = include_table and _has_table(snap)
-    chart_h = _SVG_CHART_H if snap.chart is not None else 0
+    chart_h = (
+        chart_required_height(snap.chart, nominal_height=_SVG_CHART_H)
+        if snap.chart is not None else 0
+    )
     header_h = _svg_header_height(snap, include_chrome=include_chrome,
                                   shows_table=has_table)
 
@@ -3198,17 +3321,17 @@ def _render_svg(snap: ShareSnapshot, *, palette: dict,
         if isinstance(snap.chart, LineChart):
             pieces.append(_render_line_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=chart_h,
             ))
         elif isinstance(snap.chart, BarChart):
             pieces.append(_render_bar_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=chart_h,
             ))
         elif isinstance(snap.chart, HorizontalBarChart):
             pieces.append(_render_hbar_chart_svg(
                 snap.chart, palette=palette,
-                x=_SVG_PADDING, y=chart_y, width=content_w, height=_SVG_CHART_H,
+                x=_SVG_PADDING, y=chart_y, width=content_w, height=chart_h,
             ))
 
     if has_table:
@@ -3937,9 +4060,15 @@ def _stitch_html(sections: tuple[ComposedSection, ...], *,
     # resolved to the user agent's default black and rendered invisible on
     # the dark palette's #0b0f17 background. Every other element in both
     # the stitcher and the fragment carries an explicit inline colour.
+    alias_scope = (
+        f'<p class="composite-alias-scope" '
+        f'style="color:{palette["muted"]};font-size:12px;margin:0 0 18px">'
+        f'{_COMPOSITE_ALIAS_SCOPE_TEXT}</p>'
+        if not opts.reveal_projects else ""
+    )
     header = (
         f'<header><h1 style="color:{palette["fg"]}">'
-        f'{_xml_escape(opts.title)}</h1></header>'
+        f'{_xml_escape(opts.title)}</h1>{alias_scope}</header>'
     )
     blocks = []
     for sec in sections:
@@ -4019,6 +4148,8 @@ def _stitch_md(sections: tuple[ComposedSection, ...], *,
     # otherwise inline HTML or MD specials in a user-entered title
     # would survive into the export unescaped.
     parts.append(f"# {_md_escape(opts.title)}\n\n")
+    if not opts.reveal_projects:
+        parts.append(f"_{_COMPOSITE_ALIAS_SCOPE_TEXT}_\n\n")
     last_idx = len(sections) - 1
     for idx, sec in enumerate(sections):
         # The section heading is the FRAGMENT's own heading, rendered at
@@ -4057,6 +4188,7 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
                                        palette=palette, branding=False)
         inners.append((inner, w, h))
     footer_text = _attribution_text(sections[0].snap.version)
+    alias_scope = None if opts.reveal_projects else _COMPOSITE_ALIAS_SCOPE_TEXT
     # The composite title and footer CONTRIBUTE to the width (#503 S2
     # review F8). It used to be the section maximum alone, so an 18pt
     # title longer than the widest section ran off the viewBox — the
@@ -4064,12 +4196,17 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
     total_w = max(
         max(w for _, w, _ in inners),
         _SVG_PADDING * 2 + _svg_text_width(opts.title, 18.0),
+        0.0 if alias_scope is None
+        else _SVG_PADDING * 2 + _svg_text_width(alias_scope, 11.0),
         0.0 if opts.no_branding
         else _SVG_PADDING * 2 + _svg_text_width(footer_text, 10.0),
     )
     stack_h = (sum(h for _, _, h in inners)
                + _SVG_SECTION_GAP * (len(inners) - 1))
-    header_h = _SVG_COMPOSITE_HEADER_H
+    header_h = (
+        _SVG_COMPOSITE_HEADER_H
+        + (_SVG_COMPOSITE_ALIAS_SCOPE_EXTRA_H if alias_scope else 0.0)
+    )
     footer_h = 0.0 if opts.no_branding else _SVG_COMPOSITE_FOOTER_H
     total_h = header_h + stack_h + footer_h
 
@@ -4078,6 +4215,12 @@ def _stitch_svg(sections: tuple[ComposedSection, ...], *,
         svg_group([
             svg_text(_SVG_PADDING, _SVG_COMPOSITE_TITLE_BASELINE, opts.title,
                      font_size=18, fill=palette["fg"], weight="bold"),
+            *([] if alias_scope is None else [
+                svg_text(
+                    _SVG_PADDING, _SVG_COMPOSITE_ALIAS_SCOPE_BASELINE,
+                    alias_scope, font_size=11, fill=palette["muted"],
+                ),
+            ]),
         ]),
     ]
     y = header_h

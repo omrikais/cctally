@@ -434,7 +434,6 @@ LOCKBODY
         disable_update_hooks=0
     fi
 
-    # shellcheck disable=SC2086
     set +u
     if [ "$TTY_SIM" = "1" ]; then
         # Banner predicate gates on sys.stderr.isatty(). Allocate a PTY
@@ -594,7 +593,7 @@ LOCKBODY
     if [ -d "$fix/post/.local/share/cctally" ]; then
         for golden in "$fix"/post/.local/share/cctally/*; do
             [ -f "$golden" ] || continue
-            local rel base actual
+            local base actual
             base=$(basename "$golden")
             actual="$scratch/.local/share/cctally/$base"
             if [ ! -f "$actual" ]; then

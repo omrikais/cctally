@@ -60,7 +60,7 @@ anomaly verdict. Per-model rows remain visible for both providers.
 | `--project PROJECT` | Filter to a specific project. |
 | `--tz TZ` | Display timezone for this call (`local`, `utc`, or IANA, e.g. `America/New_York`). Overrides config `display.tz`. See [Display timezone](config.md#how-displaytz-interacts-with-subcommands) for the full contract (parsing scope, JSON UTC invariant). |
 | `--json` | Machine-readable JSON. Claude row anomaly objects include `triggered`, `reasons`, and `unevaluated`; the additive `unevaluated` key keeps `schemaVersion: 1`. |
-| `--anomaly-threshold-pp PP` | Claude Cache% drop threshold for the `cache_drop` trigger. Default `15`. |
+| `--anomaly-threshold-pp PP` | Claude Cache% drop threshold for the `cache_drop` trigger. Default `15`. This flag does **not** read `config.json` — see [Anomaly threshold sources](#anomaly-threshold-sources). |
 | `--anomaly-window-days N` | Claude trailing baseline window in days. Default `14`. |
 | `--no-anomaly` | Disable Claude `cache_drop` and `net_negative` triggers. |
 | `--sort` | Override the source-native sort order. `reuse` is Codex-only; `net`, `cache`, and `anomaly` are Claude-only. |
@@ -81,6 +81,23 @@ cctally cache-report --source all --by-session --json
 ```
 
 ## Gotchas
+
+### Anomaly threshold sources
+
+There are two thresholds with the same meaning and no connection between
+them, and this is deliberate rather than an oversight.
+
+- **This command** uses `--anomaly-threshold-pp`, whose default is `15`.
+  `cctally cache-report` never reads `config.json`, so a stored value has no
+  effect here. Pass the flag to change it for one invocation.
+- **The dashboard and the TUI** read
+  `config.json`'s `cache_report.anomaly_threshold_pp`, which the dashboard's
+  cache-report settings write through `POST /api/settings`.
+
+So a threshold you set in the dashboard changes what the dashboard and the
+TUI flag, and changes nothing about what this command prints. The stored key
+is also not a `cctally config set` key: it is absent from the
+[allowed-keys table](config.md#allowed-keys) for that reason.
 
 - **Effectively-zero Net $ is not anomalous.** The `net_negative` trigger uses
   the repository-wide `1e-9` USD tolerance, so a correctly rounded floating

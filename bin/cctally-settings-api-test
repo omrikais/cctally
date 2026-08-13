@@ -35,6 +35,22 @@
 #  16. Malformed stored alerts block (e.g. config.json hand-edit left
 #      "alerts": "bad") -> POST /api/settings returns 400 with
 #      "alerts must be an object" and does NOT partial-write.
+#  18. (#513 S1) HTTP framing / dispatch branches that had no coverage:
+#      over-cap body, zero-length body, non-object payload, {} with no
+#      known block, and {"display":{}}. Each asserts its `field`.
+#  19. (#513 S1) Echo redaction canary: a seeded command_template holding
+#      a distinctive secret must not appear anywhere in the response.
+#  20. (#513 S1) Unknown leaves are rejected and name themselves, where
+#      four of them previously answered 200 and discarded the value.
+#  21. (#513 S1) budget.codex.alerts_enabled rejects a string exactly as
+#      its Claude sibling does -- with a Codex budget PRE-SEEDED, or the
+#      fail-closed guard would answer first and the case would prove
+#      nothing.
+#  22. (#513 S1) ignored_fields: exact sorted array for a multi-leaf
+#      request, present for budget.period alone, absent on an ordinary
+#      write.
+#  23. (#513 S1) Every named-but-empty block shape, pinned to what the
+#      pre-change endpoint answered.
 
 set -uo pipefail
 
@@ -634,6 +650,281 @@ assert_contains  "400 malformed stored alerts msg"  'alerts must be an object' "
 # No partial write: config.json must remain exactly as it was.
 after16=$(cat "$HOME_DIR/.local/share/cctally/config.json")
 assert_eq        "400 malformed stored alerts no partial write" "$before16" "$after16"
+stop_server
+
+# === #513 S1 ================================================================
+# Helpers used only by the cases below.
+
+# Write a config.json under the running case's HOME.
+seed_config () {
+    mkdir -p "$HOME_DIR/.local/share/cctally"
+    printf '%s\n' "$1" > "$HOME_DIR/.local/share/cctally/config.json"
+}
+
+read_config () {
+    cat "$HOME_DIR/.local/share/cctally/config.json"
+}
+
+# Print one JSON value from a response body, resolved by dotted path with
+# `-` for "key absent". Keeps the assertions below reading as data rather
+# than as substring luck.
+json_path () {
+    printf '%s' "$1" | JPATH="$2" python3 -c '
+import json, os, sys
+node = json.load(sys.stdin)
+for part in os.environ["JPATH"].split("."):
+    if not isinstance(node, dict) or part not in node:
+        print("-")
+        sys.exit(0)
+    node = node[part]
+print(json.dumps(node, sort_keys=True))
+'
+}
+
+# A stored Codex budget. Every case that touches budget.codex needs one:
+# without it the fail-closed guard answers 400 before execution reaches the
+# merge, and an assertion written on top of that proves nothing.
+CODEX_SEED='{"budget": {"weekly_usd": 100, "codex": {"amount_usd": 50, "period": "calendar-month"}}}'
+
+# --- Case 18: HTTP framing and dispatch branches ----------------------------
+# These five branches shipped without coverage. The status and message halves
+# already behaved correctly before #513 S1 and are proved non-vacuous by
+# mutation (delete the branch, watch the case fail, restore); the `field`
+# assertions are the new part.
+start_server || exit 1
+
+# 18a: body over the 4096-byte cap.
+big=$(python3 -c 'import json; print(json.dumps({"display": {"tz": "x" * 5000}}))')
+raw=$(post_settings "http://127.0.0.1:$PORT" "$big")
+split_post_response "$raw"
+assert_eq       "400 over-cap body code"   "400" "$code"
+assert_contains "400 over-cap body msg"    "body required (<=4 KB)" "$body"
+assert_eq       "400 over-cap body field"  '"$"' "$(json_path "$body" field)"
+
+# 18b: zero-length body.
+raw=$(curl -s -X POST "$base/api/settings" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    --data-binary '')
+split_post_response "$raw"
+assert_eq       "400 zero-length body code"  "400" "$code"
+assert_contains "400 zero-length body msg"   "body required (<=4 KB)" "$body"
+assert_eq       "400 zero-length body field" '"$"' "$(json_path "$body" field)"
+
+# 18c: a well-formed JSON payload that is not an object.
+raw=$(curl -s -X POST "$base/api/settings" \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -w '\n@HTTP@\n%{http_code}\n' \
+    --data-binary '[]')
+split_post_response "$raw"
+assert_eq       "400 non-object payload code"  "400" "$code"
+assert_contains "400 non-object payload msg"   "expected JSON object" "$body"
+assert_eq       "400 non-object payload field" '"$"' "$(json_path "$body" field)"
+
+# 18d: an object naming no known block.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{}')
+split_post_response "$raw"
+assert_eq       "400 no known block code"  "400" "$code"
+assert_contains "400 no known block msg" \
+    "body must contain at least one of: display, alerts, update, cache_report, budget, dashboard" \
+    "$body"
+assert_eq       "400 no known block field" '"$"' "$(json_path "$body" field)"
+
+# 18e: display is the one block that declares a required leaf.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{}}')
+split_post_response "$raw"
+assert_eq       "400 empty display code"  "400" "$code"
+assert_contains "400 empty display msg"   "missing display.tz" "$body"
+assert_eq       "400 empty display field" '"display.tz"' "$(json_path "$body" field)"
+stop_server
+
+# --- Case 19: echo redaction canary -----------------------------------------
+# alerts.command_template routinely holds secrets (webhook URLs, bearer
+# tokens) and the settings echo goes back to the browser, so the handler
+# replaces it with the boolean `command_configured`. A non-null canary is
+# what makes this observable: assert the secret is absent from the WHOLE
+# raw body, not merely that one key is missing.
+start_server || exit 1
+seed_config '{"alerts": {"notifier": "command", "command_template": ["echo", "SECRETXYZ"]}}'
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"alerts":{"notifier":"command"}}')
+split_post_response "$raw"
+assert_eq "200 redaction canary code" "200" "$code"
+assert_eq "200 redaction canary command_configured" \
+    "true" "$(json_path "$body" alerts.command_configured)"
+assert_eq "200 redaction canary no raw template" \
+    "-" "$(json_path "$body" alerts.command_template)"
+if printf '%s' "$body" | grep -qF 'SECRETXYZ'; then
+    echo "FAIL 200 redaction canary: the secret reached the response body"
+    printf '  body: %s\n' "$body"
+    fail_count=$((fail_count + 1))
+else
+    echo "PASS 200 redaction canary: secret absent from the whole body"
+    pass_count=$((pass_count + 1))
+fi
+# The persisted template is untouched -- redaction is an echo concern.
+assert_contains "200 redaction canary template still stored" \
+    'SECRETXYZ' "$(read_config)"
+stop_server
+
+# --- Case 20: unknown leaves are rejected and name themselves ---------------
+# alerts.quota, budget.projects, budget.accounts and budget.codex.accounts
+# are real ALLOWED_CONFIG_KEYS entries that this endpoint does not write.
+# Each previously answered 200 and dropped the value.
+start_server || exit 1
+seed_config "$CODEX_SEED"
+for pair in \
+    'alerts.quota|{"alerts":{"quota":{"enabled":true}}}' \
+    'budget.projects|{"budget":{"projects":{"/tmp/x":5}}}' \
+    'budget.accounts|{"budget":{"accounts":{"k":5}}}' \
+    'budget.codex.accounts|{"budget":{"codex":{"accounts":{"k":5}}}}' \
+    'alerts.bogus|{"alerts":{"bogus":1}}' \
+    'display.bogus|{"display":{"tz":"utc","bogus":1}}'
+do
+    leaf="${pair%%|*}"
+    payload="${pair#*|}"
+    raw=$(post_settings "http://127.0.0.1:$PORT" "$payload")
+    split_post_response "$raw"
+    assert_eq "400 unknown leaf $leaf code"  "400" "$code"
+    assert_eq "400 unknown leaf $leaf field" "\"$leaf\"" "$(json_path "$body" field)"
+done
+# The purpose-written rejections keep their sentence and gain the pointer.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"alerts":{"command_template":["x"]}}')
+split_post_response "$raw"
+assert_eq       "400 command_template code"  "400" "$code"
+assert_contains "400 command_template msg" \
+    "alerts.command_template is CLI/config-only (not settable via the dashboard)" "$body"
+assert_eq       "400 command_template field" \
+    '"alerts.command_template"' "$(json_path "$body" field)"
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"dashboard":{"bind":"lan"}}')
+split_post_response "$raw"
+assert_eq       "400 dashboard.bind code"  "400" "$code"
+assert_contains "400 dashboard.bind msg"   "bind-time / privacy-gate setting" "$body"
+assert_eq       "400 dashboard.bind field" '"dashboard.bind"' "$(json_path "$body" field)"
+# An unknown leaf under budget.codex reports itself, not the prerequisite.
+seed_config '{}'
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"codex":{"bogus":1}}}')
+split_post_response "$raw"
+assert_eq "400 unknown codex leaf beats fail-closed field" \
+    '"budget.codex.bogus"' "$(json_path "$body" field)"
+# ...while a request whose leaves are all known still hits the fail-closed 400.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"codex":{"alerts_enabled":true}}}')
+split_post_response "$raw"
+assert_eq       "400 fail-closed codex code"  "400" "$code"
+assert_contains "400 fail-closed codex msg"   "no Codex budget configured" "$body"
+assert_eq       "400 fail-closed codex field" '"budget.codex"' "$(json_path "$body" field)"
+stop_server
+
+# --- Case 21: one boolean rule across the budget tree -----------------------
+# The Codex merge used to coerce with bool(), so "yes" persisted as true
+# while the Claude sibling answered 400 for the same input.
+start_server || exit 1
+seed_config "$CODEX_SEED"
+before21=$(read_config)
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"codex":{"alerts_enabled":"yes"}}}')
+split_post_response "$raw"
+assert_eq "400 codex alerts_enabled string code"  "400" "$code"
+assert_eq "400 codex alerts_enabled string field" \
+    '"budget.codex.alerts_enabled"' "$(json_path "$body" field)"
+assert_eq "400 codex alerts_enabled string no write" "$before21" "$(read_config)"
+# The Claude sibling answers identically.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"alerts_enabled":"yes"}}')
+split_post_response "$raw"
+assert_eq "400 claude alerts_enabled string code"  "400" "$code"
+assert_eq "400 claude alerts_enabled string field" \
+    '"budget.alerts_enabled"' "$(json_path "$body" field)"
+# A real boolean still round-trips.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"codex":{"alerts_enabled":true}}}')
+split_post_response "$raw"
+assert_eq "200 codex alerts_enabled bool code" "200" "$code"
+assert_contains "200 codex alerts_enabled bool persisted" \
+    '"alerts_enabled": true' "$(read_config)"
+stop_server
+
+# --- Case 22: ignored_fields ------------------------------------------------
+start_server || exit 1
+seed_config "$CODEX_SEED"
+raw=$(post_settings "http://127.0.0.1:$PORT" \
+    '{"budget":{"period":"calendar-week","codex":{"period":"calendar-week","amount_usd":999,"alert_thresholds":[10]}}}')
+split_post_response "$raw"
+assert_eq "200 ignored_fields multi-leaf code" "200" "$code"
+assert_eq "200 ignored_fields multi-leaf exact sorted array" \
+    '["budget.codex.alert_thresholds", "budget.codex.amount_usd", "budget.codex.period", "budget.period"]' \
+    "$(json_path "$body" ignored_fields)"
+# Every corresponding persisted value is untouched.
+persisted22=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+codex = d.get("budget", {}).get("codex", {})
+print(json.dumps({
+    "amount_usd": codex.get("amount_usd"),
+    "period": codex.get("period"),
+    "codex_thresholds": codex.get("alert_thresholds"),
+    "budget_period": d.get("budget", {}).get("period"),
+}, sort_keys=True))
+' "$HOME_DIR/.local/share/cctally/config.json")
+assert_eq "200 ignored_fields multi-leaf persisted nothing" \
+    '{"amount_usd": 50, "budget_period": null, "codex_thresholds": null, "period": "calendar-month"}' \
+    "$persisted22"
+
+# budget.period alone: still 200, still not persisted, now disclosed. The
+# forward-only reconcile it triggers (#143) is pinned in
+# tests/test_project_budget_dashboard.py, which observes the journal.
+seed_config '{"budget": {"weekly_usd": 100}}'
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"budget":{"period":"calendar-month"}}')
+split_post_response "$raw"
+assert_eq "200 budget.period code"           "200" "$code"
+assert_eq "200 budget.period ignored_fields" '["budget.period"]' \
+    "$(json_path "$body" ignored_fields)"
+assert_eq "200 budget.period not persisted"  "-" \
+    "$(json_path "$(read_config)" budget.period)"
+
+# An ordinary write carries no ignored_fields key at all -- that absence is
+# what keeps the field additive for existing clients.
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"display":{"tz":"utc"}}')
+split_post_response "$raw"
+assert_eq "200 ordinary write code"                 "200" "$code"
+assert_eq "200 ordinary write has no ignored_fields" "-" \
+    "$(json_path "$body" ignored_fields)"
+stop_server
+
+# --- Case 23: named-but-empty blocks ----------------------------------------
+# Recorded against the pre-change endpoint: each answers 200 WITH its cooked
+# echo. The echo is driven by block presence, so "no-op" means "writes no
+# leaf", not "returns nothing". {"cache_report":{}} in particular is what a
+# combined save sends when the user never opened that tab.
+start_server || exit 1
+for pair in \
+    'alerts|alerts.notifier|"auto"' \
+    'budget|budget.period|"subscription-week"' \
+    'dashboard|dashboard.live_tail|true' \
+    'update|update.check.ttl_hours|24' \
+    'cache_report|cache_report.anomaly_threshold_pp|15'
+do
+    block="${pair%%|*}"
+    rest="${pair#*|}"
+    path="${rest%%|*}"
+    want="${rest#*|}"
+    raw=$(post_settings "http://127.0.0.1:$PORT" "{\"$block\":{}}")
+    split_post_response "$raw"
+    assert_eq "200 empty $block block code"  "200" "$code"
+    assert_eq "200 empty $block block echo"  "$want" "$(json_path "$body" "$path")"
+    assert_eq "200 empty $block block has no ignored_fields" "-" \
+        "$(json_path "$body" ignored_fields)"
+done
+stop_server
+
+# An empty cache_report block must not clobber a persisted threshold.
+start_server || exit 1
+seed_config '{"cache_report": {"anomaly_threshold_pp": 42}}'
+raw=$(post_settings "http://127.0.0.1:$PORT" '{"cache_report":{}}')
+split_post_response "$raw"
+assert_eq "200 empty cache_report keeps persisted echo" "42" \
+    "$(json_path "$body" cache_report.anomaly_threshold_pp)"
+assert_eq "200 empty cache_report keeps persisted config" "42" \
+    "$(json_path "$(read_config)" cache_report.anomaly_threshold_pp)"
 stop_server
 
 echo

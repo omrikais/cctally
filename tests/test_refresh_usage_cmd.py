@@ -9,9 +9,24 @@ import pytest
 
 from conftest import load_script
 
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). The write detector caught this module creating the maintainer's
+# real ~/.local/share/cctally: its tests call load_script() themselves, and
+# load_script() re-derives every path constant from HOME on each call, so a
+# redirect_paths() patch would be clobbered by the next one.
+pytestmark = pytest.mark.usefixtures("isolated_home")
 
-@pytest.fixture(scope="module")
-def ns():
+
+@pytest.fixture
+def ns(isolated_home):
+    """Function-scoped and dependent on ``isolated_home`` (#529 S4).
+
+    It was module-scoped, so the script loaded ONCE before any function
+    fixture ran and derived every path constant under the real HOME. The
+    write detector caught the result: this module created the maintainer's
+    real ~/.local/share/cctally. Requesting ``isolated_home`` is what orders
+    the HOME pin BEFORE the load, which no module-scoped fixture can do.
+    """
     return load_script()
 
 

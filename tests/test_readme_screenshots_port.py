@@ -92,23 +92,60 @@ def default_port_occupied():
             srv.shutdown()
 
 
-def free_port() -> int:
-    """An ephemeral port that was free a moment ago."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 @contextlib.contextmanager
-def holding(port: int):
-    """Hold `port` with a real HTTP responder."""
-    srv = _QuietThreadingHTTPServer(("127.0.0.1", port), _Ok200Handler)
+def holding():
+    """Occupy an ephemeral port and yield the one actually bound.
+
+    The responder binds port 0 and reports what the kernel gave it, so the port
+    is never free between choosing it and holding it. Choosing a port first and
+    binding it afterwards leaves a window in which
+    another process on the machine can take it, and the test then fails saying
+    the code under test did not refuse a busy port when in truth the port was
+    not busy. `SO_REUSEADDR` is deliberately not set: it would let the child
+    bind alongside this responder and turn the whole case vacuous.
+    """
+    srv = _QuietThreadingHTTPServer(("127.0.0.1", 0), _Ok200Handler)
     with srv:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            yield
+            yield srv.server_address[1]
         finally:
             srv.shutdown()
+
+
+def _is_a_bind_collision(result, port: int) -> bool:
+    """Whether RESULT is the script refusing PORT because somebody took it."""
+    return (
+        result.returncode == 1
+        and str(port) in (result.stderr or "")
+        and "already in use" in (result.stderr or "")
+    )
+
+
+def with_a_pinned_port(attempt, *, attempts: int = 5):
+    """Run ATTEMPT(port) on a freshly reserved port; retry a real collision.
+
+    A test that asserts the code bound one specific number has to name that
+    number before the code runs, and the only way to learn a free one is to bind
+    it and let go. The window between letting go and the child binding cannot be
+    removed, so it is DETECTED: a collision is identified positively from the
+    script's own refusal, and every observation from that attempt is discarded
+    rather than asserted on. Retrying without discarding would assert on a run
+    that never got the port it was given.
+    """
+    last = None
+    for _ in range(attempts):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        result = attempt(port)
+        if not _is_a_bind_collision(result, port):
+            return port, result
+        last = result
+    pytest.skip(
+        "every attempt lost its reserved port to another process on this "
+        "machine; last refusal: %r" % ((last.stderr or "")[-400:],)
+    )
 
 
 def run_selftest(mode: str, env_extra: dict | None = None, timeout: float = 60):
@@ -132,8 +169,7 @@ def test_busy_default_port_auto_selects():
 
 # --- Case B: an explicit pin on a busy port still refuses ------------------
 def test_explicit_busy_port_refuses():
-    p = free_port()
-    with holding(p):
+    with holding() as p:
         r = run_selftest("port", {"DASHBOARD_PORT": str(p)})
     assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert str(p) in r.stderr and "already in use" in r.stderr, r.stderr
@@ -141,8 +177,9 @@ def test_explicit_busy_port_refuses():
 
 # --- Case C: an explicit pin on a free port wins exactly -------------------
 def test_explicit_free_port_is_pinned():
-    p = free_port()
-    r = run_selftest("port", {"DASHBOARD_PORT": str(p)})
+    p, r = with_a_pinned_port(
+        lambda port: run_selftest("port", {"DASHBOARD_PORT": str(port)})
+    )
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert f"port={p}" in r.stdout.splitlines(), r.stdout
 
@@ -268,8 +305,9 @@ def test_auto_port_parses_bound_port(stub, tmp_path):
 
 # --- Case D2: an explicit pin must reach the LAUNCH, not just the log line -
 def test_explicit_port_reaches_the_dashboard(stub, tmp_path):
-    p = free_port()
-    r = run_dashboard_selftest(stub, tmp_path, dashboard_port=p)
+    p, r = with_a_pinned_port(
+        lambda port: run_dashboard_selftest(stub, tmp_path, dashboard_port=port)
+    )
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     rec = _record(tmp_path)
     assert rec["requested"] == str(p), rec
@@ -353,7 +391,7 @@ def test_real_dashboard_banner_is_parseable(tmp_path):
             "CODEX_HOME": str(codex),
             "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
         },
-        timeout=180,
+        timeout=110,
     )
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     urls = [ln for ln in r.stdout.splitlines() if ln.startswith("url=")]

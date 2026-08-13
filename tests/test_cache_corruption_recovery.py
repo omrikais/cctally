@@ -854,6 +854,29 @@ def test_cache_repair_marker_rejects_reused_pid_identity(
     assert not marker.exists()
 
 
+def test_cache_repair_owner_fallback_identity_is_caller_timezone_independent(
+    tmp_path, monkeypatch,
+):
+    """macOS has no /proc, so its live-owner decision always uses this fallback."""
+    _ns, _core, _store = _load(tmp_path, monkeypatch)
+    db_mod = sys.modules["_cctally_db"]
+    real_read_text = pathlib.Path.read_text
+
+    def without_proc(self, *args, **kwargs):
+        if str(self).startswith("/proc/") and self.name == "stat":
+            raise OSError("force the macOS ps fallback")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", without_proc)
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    tokyo = db_mod._process_start_identity(os.getpid())
+    monkeypatch.setenv("TZ", "America/New_York")
+    new_york = db_mod._process_start_identity(os.getpid())
+
+    assert tokyo, "the fallback must identify this live pytest process"
+    assert tokyo == new_york
+
+
 def _write_recovery_sources(
     claude_dir: pathlib.Path, codex_home: pathlib.Path,
 ) -> None:

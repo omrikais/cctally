@@ -139,6 +139,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
             snap = c._build_daily_snapshot(
                 view, period_start=range_start, period_end=range_end,
                 display_tz=display_tz_str, version=c._share_resolve_version(),
+                since_explicit=getattr(args, "since", None) is not None,
             )
             if args.order == "desc":
                 snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -153,14 +154,13 @@ def cmd_daily(args: argparse.Namespace) -> int:
             )
             json_groups: list = []
             table_groups: list = []
-            # `_project_disambiguate_labels` only suffixes the immediate
-            # parent-dir basename, so two distinct git-roots like
-            # `/a/x/app` + `/b/x/app` both resolve to `app (x)`. Guarantee
-            # per-group JSON-key uniqueness with a counter suffix on any
-            # residual collision — otherwise `_bucket_by_project_to_json`'s
-            # `projects[label] = ...` silently overwrites the earlier group
-            # (data loss in --json). The table_label derives from the now-
-            # unique json_label, so section headers stay distinct too.
+            # The shared disambiguation kernel progressively qualifies paths
+            # and is total for indistinguishable inputs. Keep a defensive
+            # per-group counter anyway: JSON object keys must never rely on a
+            # label formatter remaining injective, or `projects[label] = ...`
+            # would silently overwrite an earlier group. The table label
+            # derives from the now-unique json_label, so section headers stay
+            # distinct too.
             # `json_label`s are unique by construction (the `(#N)` counter
             # above). Table labels, however, can re-collide: `_alias_for`
             # matches on `display_key` first, so a basename alias like
@@ -248,6 +248,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
+            since_explicit=getattr(args, "since", None) is not None,
         )
         if args.order == "desc":
             snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -322,6 +323,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
             period_end=range_end,
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
+            since_explicit=getattr(args, "since", None) is not None,
         )
         if args.order == "desc":
             snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -456,6 +458,7 @@ def cmd_weekly(args: argparse.Namespace) -> int:
             display_tz=display_tz_str,
             version=c._share_resolve_version(),
             breakdown_model=bool(getattr(args, "breakdown", False)),
+            since_explicit=getattr(args, "since", None) is not None,
         )
         if args.order == "desc":
             snap = dataclasses.replace(snap, rows=tuple(reversed(snap.rows)))
@@ -613,6 +616,7 @@ def cmd_session(args: argparse.Namespace) -> int:
             version=c._share_resolve_version(),
             top_n=top_n,
             tz=tz,
+            since_explicit=getattr(args, "since", None) is not None,
         )
         c._share_render_and_emit(snap, args)
         return 0

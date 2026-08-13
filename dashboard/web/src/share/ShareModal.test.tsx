@@ -486,7 +486,7 @@ describe('#503 S1 B1 — the neutral no-project-names state', () => {
 // wording left 37px of preview against 91px with the line hidden, i.e. the line
 // took 42% of the budget on the state the user sees first. One line in every
 // state left 58px. #503 S4 §4.2 has since raised the cap to
-// `min(45dvh, 320px)`, which widens the budget but does not retire this rule —
+// `min(50dvh, 380px)`, which widens the budget but does not retire this rule —
 // a wrapped line still costs the preview whatever it takes.
 //
 // JSDOM cannot measure the wrap — that is the real-browser gate's job. What

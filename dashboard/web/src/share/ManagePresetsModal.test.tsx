@@ -4,7 +4,7 @@
 //   - Delete button fires DELETE then removes the row.
 //   - Rename uses save-then-delete; success updates the row name.
 //   - Empty-state copy renders when no presets exist.
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ManagePresetsModal } from './ManagePresetsModal';
 import { _resetForTests } from '../store/store';
@@ -106,6 +106,114 @@ describe('<ManagePresetsModal>', () => {
     await screen.findByText('morning');
     expect(screen.getByText('morning')).toBeInTheDocument();
     expect(screen.getByText('team-monday')).toBeInTheDocument();
+  });
+
+  it('formats Saved at through the dashboard datetime chokepoint', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        presets: {
+          weekly: {
+            'team-monday': {
+              template_id: 'weekly-recap',
+              options: defaults(),
+              saved_at: '2026-05-11T09:00:00Z',
+            },
+          },
+        },
+      }), { status: 200 }),
+    );
+    render(<ManagePresetsModal open={true} onClose={() => {}} />);
+    const rendered = await screen.findByText('May 11 09:00 UTC');
+    expect(rendered.tagName).toBe('TIME');
+    expect(rendered).toHaveAttribute('dateTime', '2026-05-11T09:00:00Z');
+    expect(screen.queryByText('2026-05-11T09:00:00Z')).not.toBeInTheDocument();
+  });
+
+  it('keeps the header outside the internally scrolling preset body', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        presets: {
+          weekly: {
+            alpha: {
+              template_id: 'weekly-recap', options: defaults(),
+              saved_at: '2026-05-11T09:00:00Z',
+            },
+          },
+        },
+      }), { status: 200 }),
+    );
+    render(<ManagePresetsModal open={true} onClose={() => {}} />);
+    await screen.findByText('alpha');
+    const dialog = screen.getByRole('dialog');
+    const body = dialog.querySelector('.share-manage-content');
+    expect(body).not.toBeNull();
+    expect(body?.querySelector('.share-manage-table')).not.toBeNull();
+    expect(dialog.querySelector('.share-manage-header')?.parentElement).toBe(dialog);
+    expect(body?.querySelector('.share-manage-header')).toBeNull();
+  });
+
+  it('offers explicit Save and Cancel controls while renaming', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(((
+      _url: string, init?: RequestInit,
+    ) => {
+      if ((init?.method ?? 'GET') === 'GET') {
+        return Promise.resolve(new Response(JSON.stringify({
+          presets: {
+            weekly: {
+              alpha: {
+                template_id: 'weekly-recap', options: defaults(),
+                saved_at: '2026-05-11T09:00:00Z',
+              },
+            },
+          },
+        }), { status: 200 }));
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        panel: 'weekly', name: 'beta', template_id: 'weekly-recap',
+        options: defaults(), saved_at: '2026-05-11T09:00:00Z',
+      }), { status: 200 }));
+    }) as typeof fetch);
+    render(<ManagePresetsModal open={true} onClose={() => {}} />);
+    await screen.findByText('alpha');
+    fireEvent.click(screen.getByRole('button', { name: /^rename$/i }));
+    const row = screen.getByDisplayValue('alpha').closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByRole('button', { name: /^save$/i }))
+      .toBeInTheDocument();
+    expect(within(row as HTMLElement).getByRole('button', { name: /^cancel$/i }))
+      .toBeInTheDocument();
+    expect(within(row as HTMLElement).queryByRole('button', { name: /^delete$/i }))
+      .not.toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue('alpha'), { target: { value: 'beta' } });
+    fireEvent.click(within(row as HTMLElement).getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(screen.getByText('beta')).toBeInTheDocument());
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('replaces the row actions with the armed delete confirmation', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({
+        presets: {
+          weekly: {
+            alpha: {
+              template_id: 'weekly-recap', options: defaults(),
+              saved_at: '2026-05-11T09:00:00Z',
+            },
+          },
+        },
+      }), { status: 200 }),
+    );
+    render(<ManagePresetsModal open={true} onClose={() => {}} />);
+    await screen.findByText('alpha');
+    const row = screen.getByText('alpha').closest('tr');
+    fireEvent.click(within(row as HTMLElement).getByRole('button', { name: /^delete$/i }));
+    await screen.findByText('Delete "alpha"?');
+    expect(within(row as HTMLElement).queryByRole('button', { name: /^rename$/i }))
+      .not.toBeInTheDocument();
+    expect(within(row as HTMLElement).getAllByRole('button', { name: /^delete$/i }))
+      .toHaveLength(1);
+    expect(within(row as HTMLElement).getAllByRole('button', { name: /^cancel$/i }))
+      .toHaveLength(1);
   });
 
   it('Delete button fires DELETE and removes the row', async () => {
@@ -444,7 +552,7 @@ describe('<ManagePresetsModal>', () => {
     });
     // The row shows what the SERVER stored, not the stale local record:
     // `saved_at` is unchanged by a rename because the recipe did not change.
-    expect(screen.getByText('2026-05-11T09:00:00Z')).toBeInTheDocument();
+    expect(screen.getByText('May 11 09:00 UTC')).toBeInTheDocument();
   });
 
   it('close button fires onClose', async () => {

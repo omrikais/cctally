@@ -1,18 +1,78 @@
-# Optional dev dependencies for running the test suite. The runtime CLI
-# itself remains stdlib-only (see CLAUDE.md "Stdlib-only ethos"); these
-# are test-time only.
+# The canonical test-toolchain closure. The runtime CLI itself remains
+# stdlib-only (see CLAUDE.md); everything here is test-time only.
 #
-# Install: pip install -r tests/requirements-dev.txt
-# Or with uv: uv pip install -r tests/requirements-dev.txt
+# THIS FILE IS THE ONE SOURCE EVERY AUTHORITATIVE GATE INSTALLS (#529 S6, F20).
+# bin/cctally-test-remote installs it when it provisions a runner, and each of
+# the three CI jobs that set CCTALLY_AUTHORITATIVE_RUN=1 installs it too. Before
+# this file became the source, the wrapper carried its own pin literal while all
+# three CI lanes ran an unpinned `pip install --upgrade pip pytest pytest-xdist
+# pytest-timeout PyYAML rich shellcheck-py==0.11.0.1`, so which toolchain a
+# suite ran under depended on which gate ran it.
 #
-# pytest-xdist enables `pytest -n <N>` for parallel test execution.
-# bin/cctally-test-all detects it at runtime and passes -n "$JOBS"
-# when available; absence falls back to serial pytest with no error.
-pytest-xdist
-# pytest-timeout caps each test's wall-clock so a hung test can't wedge the
-# whole suite (or a CI job for GitHub's default 6h). bin/cctally-test-all
-# detects it at runtime and passes --timeout=${CCTALLY_PYTEST_TIMEOUT:-120}
-# --timeout-method=thread when available; absence falls back to no timeout with
-# no error (optional-by-detection, mirroring pytest-xdist). Keeping it optional
-# preserves the stdlib-only ethos for local runs.
-pytest-timeout
+# INSTALL IT EXACTLY THIS WAY, EVERYWHERE:
+#
+#     python3 -m pip install --no-deps -r tests/requirements-dev.txt
+#     python3 -m pip check
+#
+# Install it into a VIRTUALENV, never into your system or user Python. This set
+# pins `pip` itself, so a --no-deps install outside a virtualenv replaces the pip
+# you already have. Contributors: `python3 -m venv .venv && . .venv/bin/activate`
+# first. Both gates already do this — the wrapper builds `.venv` on the runner
+# and every CI lane runs on a throwaway machine.
+#
+# --no-deps is what makes the pin a pin: without it pip resolves any gap freely
+# and reintroduces the cross-host drift these versions closed. The listed set IS
+# the complete closure on Python 3.11 and newer; on 3.10 or older pytest also
+# needs exceptiongroup + tomli and rich also needs typing_extensions, none of
+# which are listed, so an older interpreter fails loudly here rather than
+# silently installing a different stack.
+#
+# `pip check` is the offline closure validator and is NOT optional. --no-deps
+# means nothing verifies that the list closes, and an import smoke check only
+# covers what it imports: this set minus markdown-it-py + mdurl still passes
+# `import pytest, xdist, pytest_timeout, yaml, rich`, because rich imports
+# markdown-it lazily. `pip check` is what makes the closure claim true.
+#
+# Parity is enforced from both sides of the public-mirror boundary, because
+# neither test can reach the other's file: tests/test_toolchain_parity.py (public)
+# checks this file and the three workflow lanes, and bin/cctally-test-remote-test
+# (private) checks the wrapper.
+#
+# Four entries below are not imported by the product and are here because a gate
+# detects or executes them at runtime:
+#   pytest-xdist   -- bin/cctally-test-all gates `-n "$PYTEST"` on `import xdist`
+#                     and silently falls back to SERIAL pytest without it.
+#   pytest-timeout -- bin/cctally-test-all gates `--timeout` on its presence, so
+#                     a hung test cannot wedge the suite (or a CI job for
+#                     GitHub's default 6h).
+# Those two stay optional-by-detection for an ad-hoc local run; a gate installs
+# them. The next two are NOT optional — each backs a fail-closed gate:
+#   PyYAML         -- the real Actions YAML parser behind the workflow contract
+#                     gate (tests/test_test_all_observability.py). Without it,
+#                     malformed workflow YAML would fail at collection rather
+#                     than pass as an unvalidated skip.
+#   shellcheck-py  -- supplies the audited ShellCheck executable that
+#                     bin/cctally-shellcheck runs. This distribution version is
+#                     deliberately exact and carries a packaging revision AFTER
+#                     the upstream engine version, which is why the pin reads
+#                     0.11.0.1 while the gate requires the executable to report
+#                     0.11.0.
+#
+# The remaining entries are the transitive closure of the ones above: Pygments +
+# markdown-it-py + mdurl are rich's, execnet is pytest-xdist's, and iniconfig +
+# packaging + pluggy are pytest's. PyYAML and shellcheck-py declare no
+# dependencies at all, so they close on themselves.
+pip==26.2
+pytest==9.1.1
+pytest-xdist==3.8.0
+pytest-timeout==2.4.0
+PyYAML==6.0.3
+rich==15.0.0
+shellcheck-py==0.11.0.1
+Pygments==2.20.0
+execnet==2.1.2
+iniconfig==2.3.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+packaging==26.2
+pluggy==1.6.0

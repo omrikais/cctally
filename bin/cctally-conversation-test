@@ -41,7 +41,15 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
-FIX_DIR="$REPO_ROOT/tests/fixtures/conversation"
+# Generated fixture inputs are staged out of tree (#529 S3). The committed
+# tree is the read-only template; nothing under it is written during a run.
+FIXTURE_STAGE=$(mktemp -d -t cctally-conversation-fixstage.XXXXXX)
+FIX_DIR="$FIXTURE_STAGE/conversation"
+FIXTURES_ROOT="$FIX_DIR"
+# Goldens address the COMMITTED root, never the staging copy above: this
+# harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched.
+GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/conversation"
 
 # Robust golden comparison (#106/#107): ONE `diff` over real files drives both
 # the verdict and the displayed bytes — no `<(process substitution)`.
@@ -67,12 +75,12 @@ cleanup () {
     for p in "${BG_PIDS[@]:-}"; do
         [ -n "$p" ] && kill_server_bounded "$p"
     done
-    rm -rf "$SCRATCH_ROOT"
+    rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"
 }
 trap cleanup EXIT INT TERM
 
 echo ">> rebuilding fixtures"
-"$REPO_ROOT/bin/build-conversation-fixtures.py" >/dev/null || {
+stage_fixtures_out_of_tree conversation "$FIXTURES_ROOT" || {
     echo "FAIL: build-conversation-fixtures.py crashed (exit $?)" >&2
     exit 1
 }
@@ -119,7 +127,7 @@ fail () {
 #   run). Marks `ok=0` on any failure. Uses the golden-diff chokepoint.
 fetch_and_diff () {
     local label="$1" golden_base="$2" url="$3"; shift 3
-    local golden="$dir/$golden_base"
+    local golden="$GOLDEN_ROOT/$name/$golden_base"
     local raw actual
     raw=$(curl -s --max-time 5 "$@" "$url")
     if [ -z "$raw" ]; then
@@ -891,13 +899,11 @@ print("ok")
 }
 
 # Single scenario, sequential.
-for scenario in all-history; do
-    if run_scenario "$scenario"; then
-        pass_count=$((pass_count + 1))
-    else
-        fail_count=$((fail_count + 1))
-    fi
-done
+if run_scenario all-history; then
+    pass_count=$((pass_count + 1))
+else
+    fail_count=$((fail_count + 1))
+fi
 
 echo
 echo "passed: $pass_count   failed: $fail_count"

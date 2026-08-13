@@ -9,6 +9,21 @@
 # Exit band: 0 pass | 1 product | 2 usage | 3 infrastructure or incomplete.
 # Never 75 — that is the wrapper's "still running", not an outcome.
 
+# The FTS5 assertion, shared with provisioning so one statement answers the
+# question in both places (#529 S6, exception X2). Resolved from THIS file's own
+# directory, like every other sibling this library needs, and refused loudly
+# when absent: a contract that silently lost its capability probe would admit a
+# runner it never asked about.
+if [ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-fts5-probe.sh" ]; then
+    # The probe path is computed from BASH_SOURCE at runtime, so ShellCheck
+    # cannot resolve it statically; the readability test above is the guard.
+    # shellcheck source=/dev/null
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-fts5-probe.sh"
+else
+    echo "cctally test contract: bin/_lib-fts5-probe.sh is missing or unreadable; refusing to run without the FTS5 assertion" >&2
+    exit 3
+fi
+
 # The reason-code vocabulary (spec §5). Codes are bare string literals at each
 # emission site, so nothing in the shell can catch a typo; this list is the
 # authoritative registry and tests/test_authoritative_test_contract.py asserts
@@ -18,9 +33,14 @@
 # Adding a code is additive and does not bump schemaVersion.
 _CONTRACT_REASON_CODES='
 admission-scratch-failed
+agentmem-unavailable-local
 aggregator-usage-error
+binary-log
 capability-missing
 case-floor-unmet
+deliberate-subset
+evidence-init-failed
+evidence-kernel-missing
 exit-summary-mismatch
 harness-failed
 harness-killed
@@ -79,6 +99,8 @@ contract_note() {
 contract_fail() {  # contract_fail <class> <code> [subject] [phase]
     local class=$1 code=$2 subject=${3:-} phase=${4:-admission}
     CONTRACT_REASONS="${CONTRACT_REASONS}${code}"$'\t'"${phase}"$'\t'"${subject}"$'\n'
+    # ShellCheck: this sourced-library result is consumed by cctally-test-all.
+    # shellcheck disable=SC2034
     CONTRACT_LAST_CODE=$code
     if [ "$(_contract_rank "$class")" -gt "$(_contract_rank "$CONTRACT_CLASS")" ]; then
         CONTRACT_CLASS=$class
@@ -386,6 +408,28 @@ EOF
 CONTRACT_CAPABILITIES=""   # name<TAB>true|false, one per line
 CONTRACT_PASSED=0
 CONTRACT_FAILED=0
+# pytest's own passed-ITEM count, summed across the bulk leg and the serial
+# benchmark leg. Kept separate from CONTRACT_PASSED, which counts shell harness
+# CASES: the two are different units and only their sum is the metric's
+# denominator (#529 S5 §4.6).
+CONTRACT_PYTEST_PASSED=0
+# 1 once ANY leg reported a count that could not be read. The metric is then
+# published as null rather than computed from a denominator missing pytest's
+# half — a lost count does not zero that denominator, it halves it, and a
+# halved denominator roughly doubles the recorded cost per thousand cases.
+CONTRACT_PYTEST_UNPARSED=0
+
+# The run's wall-clock seconds, sampled ONCE. The outcome record and the
+# retained run manifest both publish a metric whose numerator is this number
+# and they are written at different instants — the record at the verdict, the
+# manifest afterwards from the aggregator's EXIT trap — so sampling $SECONDS
+# independently in each let one run publish two different
+# secondsPerThousandCases values for itself.
+CONTRACT_WALL_SECONDS=""
+
+contract_freeze_wall_seconds() {
+    [ -n "$CONTRACT_WALL_SECONDS" ] || CONTRACT_WALL_SECONDS=$SECONDS
+}
 
 CONTRACT_USAGE=0           # 1 once contract_usage_abort has been called
 
@@ -416,6 +460,9 @@ contract_print_diagnostics() {
 # one spool, so a stdout/stderr split cannot carry it.
 contract_emit_outcome() {  # <exit_code>
     local dest=${CCTALLY_TEST_ALL_OUTCOME_FILE:-} rc=$1 tmp
+    # Before the early return, so the retained manifest reads the same frozen
+    # number whether or not a record was asked for.
+    contract_freeze_wall_seconds
     [ -n "$dest" ] || return 0
     # A plan is never an authoritative outcome. bin/cctally-test-all already
     # refuses the two modes together, but the worker-budget check runs before
@@ -425,6 +472,15 @@ contract_emit_outcome() {  # <exit_code>
     CONTRACT_R="$CONTRACT_REASONS" CONTRACT_C="$CONTRACT_CLASS" \
     CONTRACT_CAPS="$CONTRACT_CAPABILITIES" CONTRACT_RC="$rc" \
     CONTRACT_P="$CONTRACT_PASSED" CONTRACT_F="$CONTRACT_FAILED" \
+    CONTRACT_PYP="$CONTRACT_PYTEST_PASSED" \
+    CONTRACT_PYP_UNPARSED="$CONTRACT_PYTEST_UNPARSED" \
+    CONTRACT_WALL="$CONTRACT_WALL_SECONDS" CONTRACT_OUTER="${OUTER:-0}" \
+    CONTRACT_INNER="${INNER:-0}" CONTRACT_PYTEST_JOBS="${PYTEST:-0}" \
+    CONTRACT_COV_RESOLVED="${COVERAGE_RESOLVED:-0}" \
+    CONTRACT_COV_MODE="${COVERAGE_MODE:-full}" \
+    CONTRACT_COV_SELECTED="${COVERAGE_SELECTED:-}" \
+    CONTRACT_COV_OMITTED="${COVERAGE_OMITTED:-}" \
+    CONTRACT_COV_PYTEST="${COVERAGE_PYTEST:-full}" \
     python3 -c '
 import json, os
 
@@ -445,24 +501,73 @@ for line in os.environ.get("CONTRACT_CAPS", "").split("\n"):
     caps[name] = value == "true"
 
 cls = os.environ.get("CONTRACT_C", "none")
-print(json.dumps({
+
+
+def _int(name):
+    try:
+        return int(os.environ.get(name, "0") or 0)
+    except ValueError:
+        return 0
+
+
+# Wall-seconds per thousand passed cases. The denominator sums shell harness
+# CASES and pytest ITEMS, which is why it is not called assertions. A zero
+# denominator records null rather than dividing: 0.0 would be a claim about
+# cost, and a run that passed nothing supports no such claim.
+#
+# A pytest count that could not be READ is a third answer, distinct from both.
+# The sum of a known number and an unknown one is unknown, so both the count
+# and the sum are published as null and the metric with them — reporting the
+# shell half alone would halve the denominator and roughly double the cost this
+# run appears to have had.
+shell_passed = _int("CONTRACT_P")
+unparsed = os.environ.get("CONTRACT_PYP_UNPARSED") == "1"
+pytest_passed = None if unparsed else _int("CONTRACT_PYP")
+passed_cases = None if unparsed else shell_passed + pytest_passed
+wall_seconds = _int("CONTRACT_WALL")
+metric = None if not passed_cases else round(wall_seconds / passed_cases * 1000, 1)
+
+doc = {
     "schemaVersion": 1,
     "outcome": "pass" if cls == "none" else "fail",
     "failureClass": cls,
     "exitCode": int(os.environ.get("CONTRACT_RC", "3")),
     "reasons": reasons,
     "capabilities": caps,
-    "totals": {
-        "passed": int(os.environ.get("CONTRACT_P", "0") or 0),
-        "failed": int(os.environ.get("CONTRACT_F", "0") or 0),
+    "pytestPassed": pytest_passed,
+    "passedCases": passed_cases,
+    "wallSeconds": wall_seconds,
+    "secondsPerThousandCases": metric,
+    "budget": {
+        "outer": _int("CONTRACT_OUTER"),
+        "inner": _int("CONTRACT_INNER"),
+        "pytest": _int("CONTRACT_PYTEST_JOBS"),
     },
-}, sort_keys=True))
+    "totals": {
+        "passed": shell_passed,
+        "failed": _int("CONTRACT_F"),
+    },
+}
+
+# Additive at schemaVersion 1, and published only from the point a selection
+# was resolved. A usage refusal that never parsed one carries no `coverage`
+# object at all, rather than an object describing a selection it does not have.
+if os.environ.get("CONTRACT_COV_RESOLVED") == "1":
+    doc["coverage"] = {
+        "mode": os.environ.get("CONTRACT_COV_MODE", "full"),
+        "selectedHarnesses": os.environ.get("CONTRACT_COV_SELECTED", "").split(),
+        "omittedHarnesses": os.environ.get("CONTRACT_COV_OMITTED", "").split(),
+        "pytest": os.environ.get("CONTRACT_COV_PYTEST", "full"),
+    }
+
+print(json.dumps(doc, sort_keys=True))
 ' > "$tmp" && mv -f "$tmp" "$dest"
 }
 
 # Terminal path: print every diagnostic, write the record, exit the mapped code.
 contract_finish() {
     local rc
+    contract_freeze_wall_seconds
     rc=$(contract_exit_code)
     contract_print_diagnostics
     contract_emit_outcome "$rc"
@@ -496,6 +601,49 @@ contract_usage_abort() {  # <message> [subject]
 # and needs no anti-tamper guard.
 contract_is_authoritative() { [ "${CCTALLY_AUTHORITATIVE_RUN:-}" = "1" ]; }
 
+# --- externally supplied incomplete reason (#529 S6, exception X1) -----------
+#
+# The classification schema is consumed by both the aggregator and the wrapper
+# rather than duplicated in each, so a caller that KNOWS it degraded the run
+# says so in this vocabulary instead of inventing a second taxonomy. Today
+# exactly one caller does: bin/cctally-test-remote's CCTALLY_TEST_LOCAL=1 branch,
+# when the machine genuinely has no `agentmem` and the run therefore cannot
+# execute the gated tests the remote path executes.
+#
+# The allowlist is STRICT, and the empty value is rejected explicitly rather
+# than falling through as "nothing set". An unguarded empty read is the selector
+# failure class this repository has already paid for twice — an empty `--harness`
+# value selected nobody and reported the same incompleteness an all-passing
+# subset reports, and an empty pattern elsewhere matched everything. The kernel
+# now reads a reason CODE from the environment, so both mistakes are refused at
+# admission rather than recorded as a degradation nobody chose.
+# The accepted set is the CASE ARMS below, not this string. This exists only so
+# the refusal can list what it would have accepted. Emitting the reason through
+# a variable would satisfy the allowlist while defeating the registry guard,
+# which asserts that every declared code appears as a bare literal at some
+# emission site — a variable is exactly the shape that lets a typo through.
+_CONTRACT_EXTERNAL_REASONS='agentmem-unavailable-local'
+
+contract_admit_external_reason() {
+    local reason
+    # Unset is the ordinary case and says nothing. `+set` distinguishes it from
+    # a variable that is set to the empty string, which is the case below.
+    [ -n "${CCTALLY_TEST_EXTERNAL_INCOMPLETE+set}" ] || return 0
+    reason=$CCTALLY_TEST_EXTERNAL_INCOMPLETE
+    case "$reason" in
+        agentmem-unavailable-local)
+            # Recorded, NOT fatal. The run continues and completes; what changes
+            # is that it can never be green, exactly as a deliberate subset can
+            # never be green.
+            contract_fail incomplete agentmem-unavailable-local "" admission ;;
+        '')
+            contract_usage_abort "CCTALLY_TEST_EXTERNAL_INCOMPLETE is set to the empty value; an empty reason names no degradation and must not read as one" CCTALLY_TEST_EXTERNAL_INCOMPLETE ;;
+        *)
+            contract_usage_abort "CCTALLY_TEST_EXTERNAL_INCOMPLETE='$reason' is not an accepted external incomplete reason (accepted: $_CONTRACT_EXTERNAL_REASONS)" CCTALLY_TEST_EXTERNAL_INCOMPLETE ;;
+    esac
+    return 0
+}
+
 _contract_probe() {  # <probe-spec>
     local spec=$1 mod
     case "$spec" in
@@ -507,7 +655,15 @@ _contract_probe() {  # <probe-spec>
             # stay. What changes is only that an authoritative run refuses to
             # start on a runner lacking it, so genuinely skipped coverage
             # surfaces instead of reading as a pass.
-            python3 -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE _p USING fts5(x)')" >/dev/null 2>&1 ;;
+            #
+            # The statement itself lives in bin/_lib-fts5-probe.sh, which
+            # provisioning also calls so the refusal can land before the suite
+            # rather than after the round trip (#529 S6, exception X2). PROBE
+            # mode is deliberate: the decision below — authoritative refusal
+            # versus non-authoritative `incomplete` that continues — stays with
+            # this caller, and a helper that printed a refusal diagnostic would
+            # be false on the second path.
+            fts5_probe python3 ;;
         python-import:*)
             mod=${spec#python-import:}
             python3 -c "import $mod" >/dev/null 2>&1 ;;
@@ -647,8 +803,24 @@ contract_classify_harness() {  # <name> <logfile> <exitfile> <min_cases>
     fi
     p=$(printf '%s\n' "$line" | sed -E "s/$_CONTRACT_SUMMARY_RE/\1/")
     f=$(printf '%s\n' "$line" | sed -E "s/$_CONTRACT_SUMMARY_RE/\2/")
+    case "$p" in
+        ''|*[!0-9]*)
+            contract_fail infrastructure binary-log "$name" harness
+            return 0 ;;
+    esac
+    case "$f" in
+        ''|*[!0-9]*)
+            contract_fail infrastructure binary-log "$name" harness
+            return 0 ;;
+    esac
+    # ShellCheck: these sourced-library results are consumed by cctally-test-all.
+    # shellcheck disable=SC2034
     CONTRACT_LAST_PASSED=$p
+    # ShellCheck: these sourced-library results are consumed by cctally-test-all.
+    # shellcheck disable=SC2034
     CONTRACT_LAST_FAILED=$f
+    # ShellCheck: these sourced-library results are consumed by cctally-test-all.
+    # shellcheck disable=SC2034
     CONTRACT_LAST_SUMMARY_OK=1
     CONTRACT_PASSED=$((CONTRACT_PASSED + p))
     CONTRACT_FAILED=$((CONTRACT_FAILED + f))
@@ -674,8 +846,26 @@ contract_classify_harness() {  # <name> <logfile> <exitfile> <min_cases>
 # The pytest phase's exit code is read for MEANING, not as a boolean. The
 # separate wall-clock benchmark leg is classified by the same rule, so
 # isolating it did not put it outside the verdict.
-contract_classify_pytest() {  # <rc> [subject]
-    local rc=$1 subject=${2:-pytest}
+#
+# The third argument is the leg's passed-ITEM count and is purely additive: it
+# is accumulated before the exit-code cases and changes none of them, so a
+# count that could not be read degrades the METRIC and never the verdict. It is
+# accumulated for EVERY leg including a passing one, which is why the caller
+# invokes this unconditionally rather than only on a non-zero status.
+#
+# `${3-0}`, not `${3:-0}`: an EMPTY third argument is the caller saying it read
+# no count at all, and collapsing that to 0 is exactly the confusion this
+# sentinel exists to prevent. An omitted argument still means 0, because a
+# caller that passes none never tried to measure.
+contract_classify_pytest() {  # <rc> [subject] [passed_items]
+    local rc=$1 subject=${2:-pytest} passed=${3-0}
+    case "$passed" in
+        ''|*[!0-9]*)
+            CONTRACT_PYTEST_UNPARSED=1
+            contract_note "pytest: the $subject leg's passed-item count could not be read from its log, so this run's passed-case total and normalized metric are recorded as null; the verdict is unaffected"
+            passed=0 ;;
+    esac
+    CONTRACT_PYTEST_PASSED=$((CONTRACT_PYTEST_PASSED + passed))
     case "$rc" in
         0)     return 0 ;;
         1)     contract_fail product pytest-failed "$subject" pytest ;;
@@ -711,6 +901,10 @@ print(json.dumps({
     "totals": {"passed": 0, "failed": 0},
 }, sort_keys=True))
 '
+    # ShellCheck: the remote wrapper reads this sourced-library state.
+    # shellcheck disable=SC2034
+    # ShellCheck: the remote wrapper reads this sourced-library state.
+    # shellcheck disable=SC2034
     CONTRACT_CARRIER_EMITTED=1
     return 3
 }
@@ -778,6 +972,8 @@ print(json.dumps(doc, sort_keys=True))
 sys.exit(observed if 0 <= observed <= 255 else 3)
 '
     rc=$?
+    # ShellCheck: the remote wrapper reads this sourced-library state.
+    # shellcheck disable=SC2034
     CONTRACT_CARRIER_EMITTED=1
     return $rc
 }

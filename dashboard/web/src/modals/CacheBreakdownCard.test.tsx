@@ -9,7 +9,7 @@ import { CacheBreakdownCard } from './CacheBreakdownCard';
 
 describe('<CacheBreakdownCard /> project basenames (#251 CR-4)', () => {
   it('shows the basename of a full project path with the full path in title', () => {
-    const path = '/Volumes/TRANSCEND/repos/cctally-dev';
+    const path = '/Volumes/Scratch/repos/cctally-dev';
     const { container } = render(
       <CacheBreakdownCard
         kind="projects"
@@ -23,7 +23,7 @@ describe('<CacheBreakdownCard /> project basenames (#251 CR-4)', () => {
 
   it('shows the basename of a deep worktree path (keeps the checkout name)', () => {
     const path =
-      '/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/feature/view-model-unification';
+      '/Volumes/Scratch/repos/cctally-dev/.worktrees/feature/view-model-unification';
     const { container } = render(
       <CacheBreakdownCard
         kind="projects"

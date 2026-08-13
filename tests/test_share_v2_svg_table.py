@@ -58,7 +58,7 @@ def test_wrap_text_that_fits_returns_unwrapped():
 def test_wrap_breaks_on_slash_for_paths():
     # Path with multiple `/` candidates — should break on rightmost
     # `/` that fits in content_w.
-    text = "/Volumes/TRANSCEND/repos/cctally-dev"
+    text = "/Volumes/Scratch/repos/cctally-dev"
     lines = _LS._wrap_for_width(text, 80, 11)  # narrow column
     assert all(_LS._svg_text_width(l, 11) <= 80 for l in lines), lines
     # Slash should anchor at end of a line (not start of next).

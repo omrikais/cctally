@@ -353,6 +353,17 @@ def test_cache_report_qa_fixture_reaches_amber_and_mixed_signs(
     assert signs == {"negative", "positive"}
 
 
+#: One budget for the whole responsive-startup test, comfortably under the
+#: 120-second per-test ceiling `bin/cctally-test-all` applies to the pytest
+#: phase. Every wait in the test draws from it rather than declaring its own.
+_WHOLE_TEST_BUDGET_S = 100.0
+
+
+def _remaining(deadline: float) -> float:
+    """Seconds left of the shared budget, never zero or negative."""
+    return max(1.0, deadline - time.monotonic())
+
+
 def _read_url_port(proc, deadline_s):
     """Block on the subprocess stdout until the 'serving …:PORT' line (printed
     right after the socket bind), returning (port, elapsed_since_start)."""
@@ -421,15 +432,23 @@ def test_bind_before_build_timing(tmp_path):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     try:
-        # Generous deadlines: under an 8-way parallel test-all the heavy
-        # background build is CPU-starved and its wall time balloons, so a tight
-        # deadline would false-fail. The assertion below is RELATIVE (bind
+        # ONE budget for the whole test, shared by every phase below rather than
+        # given to each of them separately. Four independent 90-second deadlines
+        # summed to 280 seconds, which `bin/cctally-test-all` cannot grant: it
+        # runs the pytest phase under `--timeout=120`, so a phase that reached
+        # its own deadline would already have been killed. Each wait now takes
+        # what remains of the shared budget, so the test bounds itself once and
+        # the number means something. The assertion below is RELATIVE (bind
         # precedes full data), so it stays valid regardless of absolute wall
-        # time; the deadlines only bound a genuine hang.
-        port, time_to_accept = _read_url_port(proc, deadline_s=90.0)
+        # time; this budget only bounds a genuine hang.
+        overall_deadline = time.monotonic() + _WHOLE_TEST_BUDGET_S
+        port, time_to_accept = _read_url_port(
+            proc, deadline_s=_remaining(overall_deadline))
         # time-to-URL ≈ time-to-bind ≈ time-to-accept (the serving line prints
         # right after TCPServer.__init__ bound + listened).
-        with socket.create_connection(("127.0.0.1", port), timeout=5.0):
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=min(5.0, _remaining(overall_deadline))
+        ):
             pass
         # Full data arrives later over SSE: read /api/events until a
         # hydrating=false frame with non-empty sessions lands.
@@ -437,9 +456,10 @@ def test_bind_before_build_timing(tmp_path):
         import urllib.request
         time_to_full = None
         req = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/events", timeout=90
+            f"http://127.0.0.1:{port}/api/events",
+            timeout=_remaining(overall_deadline),
         )
-        end = time.monotonic() + 90.0
+        end = overall_deadline
         data_lines: list[str] = []
         while time.monotonic() < end and time_to_full is None:
             raw = req.readline()

@@ -28,6 +28,8 @@ Sibling dependencies (loaded at module-load time via ``_load_lib``):
     used across every breakdown-aware table).
   * ``_lib_display_tz`` — ``_resolve_tz`` (IANA tz resolution for the
     Codex session-table date columns).
+  * ``_lib_share`` — ``disambiguate_basenames`` (the single project-label
+    collision algorithm shared with artifact preparation).
 
 ``bin/cctally`` back-references via module-level callable shims
 (spec §5.5; same precedent as ``bin/_cctally_record.py``'s 34 shims):
@@ -98,6 +100,7 @@ _lib_pricing = _load_lib("_lib_pricing")
 _short_model_name = _lib_pricing._short_model_name
 
 _lib_display_tz = _load_lib("_lib_display_tz")
+_lib_share = _load_lib("_lib_share")
 _resolve_tz = _lib_display_tz._resolve_tz
 
 # JSON wire-format kernel — the additive camelCase schemaVersion stamp
@@ -2722,11 +2725,11 @@ def _project_disambiguate_labels(rows: list[dict]) -> dict[int, str]:
     """Return ``{row_index: disambiguated_label}`` for project rows whose
     bare ``display_key`` collides with another row's basename.
 
-    When two projects share a basename (e.g., two ``app`` directories under
-    different parents), suffix the colliding rows with the parent-directory
-    segment ("(work)" / "(personal)") so they remain visually and
-    semantically distinct. Prefer ``key.git_root`` as the disambiguation
-    source when present; fall back to ``key.bucket_path`` for no-git rows.
+    ``_lib_share.disambiguate_basenames`` owns the collision algorithm. This
+    adapter identifies the colliding project identities in the row-shaped
+    renderer input, deduplicates repeated rows for one canonical bucket, and
+    fans the kernel labels back out. Prefer ``key.git_root`` as the kernel
+    path when present; fall back to ``key.bucket_path`` for no-git rows.
 
     Used by:
       - ``_render_project_table`` (terminal table render).
@@ -2737,20 +2740,45 @@ def _project_disambiguate_labels(rows: list[dict]) -> dict[int, str]:
     Rows that do not collide are absent from the returned dict; callers
     fall back to ``key.display_key`` for those.
     """
-    display_counts: dict[str, int] = {}
-    for r in rows:
-        dk = r["key"].display_key
-        display_counts[dk] = display_counts.get(dk, 0) + 1
-    augmented: dict[int, str] = {}
-    for idx, r in enumerate(rows):
-        if display_counts[r["key"].display_key] > 1:
-            source_path = r["key"].git_root or r["key"].bucket_path
-            if source_path:
-                parent = (
-                    os.path.basename(os.path.dirname(source_path)) or "/"
-                )
-                augmented[idx] = f"{r['key'].display_key} ({parent})"
-    return augmented
+    identity_to_unique: dict[str, int] = {}
+    unique_projects: list[tuple[str, str]] = []
+    row_unique_indices: list[int] = []
+    display_groups: dict[str, list[int]] = {}
+
+    for row in rows:
+        key = row["key"]
+        identity = key.bucket_path
+        unique_idx = identity_to_unique.get(identity)
+        if unique_idx is None:
+            unique_idx = len(unique_projects)
+            identity_to_unique[identity] = unique_idx
+            source_path = key.git_root or key.bucket_path
+            unique_projects.append((key.display_key, source_path))
+            display_groups.setdefault(key.display_key, []).append(unique_idx)
+        row_unique_indices.append(unique_idx)
+
+    colliding_unique = {
+        unique_idx
+        for unique_indices in display_groups.values()
+        if len(unique_indices) > 1
+        for unique_idx in unique_indices
+    }
+    if not colliding_unique:
+        return {}
+
+    ordered_unique = sorted(colliding_unique)
+    kernel_labels = _lib_share.disambiguate_basenames(
+        [unique_projects[unique_idx][1] for unique_idx in ordered_unique]
+    )
+    labels_by_unique = {
+        unique_idx: kernel_labels[kernel_idx]
+        for kernel_idx, unique_idx in enumerate(ordered_unique)
+    }
+    return {
+        row_idx: labels_by_unique[unique_idx]
+        for row_idx, unique_idx in enumerate(row_unique_indices)
+        if unique_idx in labels_by_unique
+    }
 
 
 def _render_project_table(
@@ -3214,4 +3242,3 @@ def _render_five_hour_blocks_table(
     print(_boxed_table(headers, rows, aligns, compact=args.compact))
     glyph = " · ⚡ = block crossed weekly reset" if has_crossed else ""
     print(f"\n{len(block_dicts)} blocks · cost: ${total_cost:.2f}{glyph}")
-

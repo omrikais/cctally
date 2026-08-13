@@ -52,7 +52,6 @@ for combo in "${COMBOS[@]}"; do
     mod="$FIX/snapshot_${state}.py"
     want="$GOLDEN/${state}_${variant}_${size}.txt"
     got="$TMP/${state}_${variant}_${size}.txt"
-    # shellcheck disable=SC2086
     NO_COLOR=1 TZ=Etc/UTC "$BIN" tui --render-once \
         --snapshot-module "$mod" \
         --variant "$variant" \

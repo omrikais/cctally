@@ -302,6 +302,11 @@ describe('alerts store (T8)', () => {
       codex_budget_configured: false,
       codex_budget_alerts_enabled: false,
       codex_projected_enabled: false,
+      // #513 S2 §5.1: the mirrored Claude weekly budget amount. `null` is the
+      // canonical "no budget configured" value, and the pre-tick default must
+      // agree with what `normalizeAlertsSettings` produces for an envelope
+      // whose block omits the leaf.
+      weekly_usd: null,
     });
   });
 
@@ -324,7 +329,9 @@ describe('alerts store (T8)', () => {
       alertsSettings: incoming,
       isFirstTick: true,
     });
-    expect(getState().alertsConfig).toEqual(incoming);
+    // #513 S2 §5.1: the reducer normalizes rather than assigning the wire
+    // block verbatim, so an envelope without the amount leaf reads `null`.
+    expect(getState().alertsConfig).toEqual({ ...incoming, weekly_usd: null });
 
     // And on subsequent (non-cold-start) ticks too — server-side
     // cross-tab updates must propagate without waiting for a reload.
@@ -341,7 +348,7 @@ describe('alerts store (T8)', () => {
       alertsSettings: next,
       isFirstTick: false,
     });
-    expect(getState().alertsConfig).toEqual(next);
+    expect(getState().alertsConfig).toEqual({ ...next, weekly_usd: null });
   });
 
   it('alertsCollapsed default false', () => {

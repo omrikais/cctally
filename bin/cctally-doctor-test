@@ -30,7 +30,14 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CCTALLY="$REPO_ROOT/bin/cctally"
-FIXTURES="$REPO_ROOT/tests/fixtures/doctor"
+# Generated fixture inputs are staged out of tree (#529 S3). The committed
+# tree is the read-only template; nothing under it is written during a run.
+FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)
+FIXTURES="$FIXTURE_STAGE/doctor"
+# Goldens address the COMMITTED root, never the staging copy above: this
+# harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched.
+GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/doctor"
 AS_OF="2026-05-13T14:22:31+00:00"
 REGENERATE="${CCTALLY_DOCTOR_REGENERATE:-}"
 
@@ -48,7 +55,7 @@ fail_count=0
 # Per-run scratch root for ALL scenarios. Each scenario gets its own
 # subdir under here so concurrent harnesses don't collide.
 SCRATCH_ROOT=$(mktemp -d -t cctally-doctor-fixtures-XXXXXX)
-trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 
 # Clean python-only bin for the scrubbed PATH (issue #114).
 # _setup_compute_symlink_state is now shutil.which-aware, so the scrubbed
@@ -120,7 +127,7 @@ compute_fake_codex_home () {
 # Refresh setup.sh + .gitignore from the builder so harness output
 # reflects current scaffold (parallels build-forecast-fixtures.py
 # invocation in cctally-forecast-test).
-"$REPO_ROOT/bin/build-doctor-fixtures.py" >/dev/null || {
+stage_fixtures_out_of_tree doctor "$FIXTURES" || {
     echo "FAIL: build-doctor-fixtures.py crashed (exit $?)" >&2
     exit 1
 }
@@ -140,7 +147,7 @@ run_mode () {
     # name, mode-label, flags, golden-suffix
     local name="$1" label="$2" flags="$3" suffix="$4"
     local dir="$FIXTURES/$name"
-    local golden="$dir/expected.$suffix"
+    local golden="$GOLDEN_ROOT/$name/expected.$suffix"
     # Fresh scratch per mode: the post-command update hook
     # (`_post_command_update_hooks`) calls load_config (auto-creates
     # config.json) and may fire-and-forget `_update-check` which writes
@@ -175,7 +182,6 @@ run_mode () {
     # mode's golden. Discard stderr; doctor's user-facing output is
     # 100% on stdout per spec.
     local raw
-    # shellcheck disable=SC2086
     raw=$(HOME="$scratch" TZ=Etc/UTC \
           PATH="$fake_path" \
           CODEX_HOME="$fake_codex_home" \
@@ -237,7 +243,7 @@ run_exit_code () {
     # Per-scenario shaping (issue #119) via optional input.env knobs.
     local fake_path; fake_path=$(compute_fake_path "$scratch" "$dir")
     local fake_codex_home; fake_codex_home=$(compute_fake_codex_home "$scratch" "$dir")
-    local exit_file="$dir/expected.exit"
+    local exit_file="$GOLDEN_ROOT/$name/expected.exit"
     local actual_exit
 
     HOME="$scratch" TZ=Etc/UTC PATH="$fake_path" CODEX_HOME="$fake_codex_home" \

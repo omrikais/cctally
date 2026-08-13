@@ -35,7 +35,9 @@ wall-clock ceiling at fixture scale cannot fail.
 """
 from __future__ import annotations
 
+import argparse
 import importlib
+import json
 import pathlib
 import sys
 
@@ -507,13 +509,51 @@ def test_the_result_byte_matches_a_never_eliding_oracle(
     _rebuild(jr, target_path=str(eliding))
     assert jr.read_segment_summaries(), "the sidecar vanished"
 
-    jr.segment_summary_sidecar_path().unlink()
+    # #532 instrument. The issue proposes that this unlink reaches a journal
+    # sidecar SHARED with another xdist worker. Assert the precondition at the
+    # moment of the unlink rather than the outcome afterwards: this runs on
+    # every execution of the test, so a green run is evidence that the path was
+    # private, which "it did not fail" on its own would not be.
+    #
+    # It also discriminates the leading alternative hypothesis. If process-global
+    # module state had leaked from an earlier test on this worker, the sidecar
+    # would resolve under THAT test's tmp_path, and this assertion is what
+    # notices. Nothing else in the file would.
+    #
+    # WHAT IT DOES NOT OBSERVE. This is an assertion about the resolved PATH, so
+    # a green run supports "does not reproduce" only for the family of causes
+    # that would move that path: a shared journal root, or leaked path state from
+    # an earlier test. It says nothing about a cause internal to `_rebuild` --
+    # nondeterministic segment ordering, say -- which would produce the same
+    # intermittent byte mismatch with a perfectly private sidecar. #532 stays
+    # open partly for that reason.
+    sidecar = jr.segment_summary_sidecar_path()
+    assert tmp_path in sidecar.parents, (
+        f"#532: the sidecar about to be unlinked ({sidecar}) is not inside this "
+        f"test's own tmp_path ({tmp_path}), so another worker could reach it"
+    )
+    sidecar.unlink()
     oracle = tmp_path / "oracle.sqlite"
     result = _rebuild(jr, target_path=str(oracle))
     assert result.traversal["elision"]["elidedSegments"] == 0, (
         "the oracle elided, so it is not an oracle"
     )
     assert _dump(eliding) == _dump(oracle)
+
+
+def test_the_elision_fixture_pins_the_journal_directory(elision_fixture, tmp_path):
+    """#532 proposed giving this file's tests their own journal root. They
+    already have one, and this records that so the refuted cause cannot be
+    re-proposed.
+
+    `elision_fixture` calls `load_script()` and then
+    `redirect_paths(ns, monkeypatch, tmp_path)`, which pins `JOURNAL_DIR` to the
+    per-test directory. Separate xdist workers are separate processes with
+    separate `tmp_path` values and cannot reach each other's journal, so "the
+    test manipulates shared on-disk journal state" is not what happens.
+    """
+    core = importlib.import_module("_cctally_core")
+    assert tmp_path in pathlib.Path(core.JOURNAL_DIR).parents
 
 
 def test_the_original_journal_bytes_are_unchanged(elision_fixture):
@@ -867,6 +907,7 @@ def test_a_refill_after_a_mid_pass_invalidation_replays_in_journal_order(
     assert coverage["status"] == "recovered"
     assert coverage["elisionRefill"]["observations"] == len(journal_order)
     assert coverage["elisionRefill"]["complete"] is True
+    assert coverage["elisionRefill"]["failures"] == []
     assert replayed == journal_order
     assert _stored_line_offsets(ns) == sorted(journal_order), (
         "an elided observation was never materialized, under a certificate the "
@@ -892,7 +933,7 @@ def _stored_certificate(jr, core):
 
 
 def test_a_refill_read_failure_establishes_no_coverage(
-    elision_fixture, monkeypatch,
+    elision_fixture, monkeypatch, capsys,
 ):
     """A refill that cannot re-read an elided segment must mint nothing.
 
@@ -914,7 +955,10 @@ def test_a_refill_read_failure_establishes_no_coverage(
     core = importlib.import_module("_cctally_core")
     coverage_kernel = importlib.import_module("_lib_cache_coverage")
     ns = elision_fixture["ns"]
-    target = elision_fixture["elidable"][0]
+    targets = {
+        elision_fixture["elidable"][0]: OSError,
+        elision_fixture["elidable"][1]: TypeError,
+    }
     _prime(jr)
     before = _stored_certificate(jr, core)
     assert before is not None, (
@@ -926,18 +970,26 @@ def test_a_refill_read_failure_establishes_no_coverage(
     real_lines = jr._iter_segment_lines
 
     def failing(seg_path, lo, hi, **kwargs):
-        if pathlib.Path(seg_path).name == target:
-            raise OSError("injected refill read failure")
+        name = pathlib.Path(seg_path).name
+        if name in targets:
+            raise targets[name]("injected refill read failure")
         return real_lines(seg_path, lo, hi, **kwargs)
 
     monkeypatch.setattr(jr, "_iter_segment_lines", failing)
-    result = _rebuild(jr)
+    capsys.readouterr()
+    assert ns["cmd_db_rebuild"](
+        argparse.Namespace(db="stats", json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
 
-    assert result.traversal["elision"]["elidedSegments"] == 2, (
+    assert payload["segmentElision"]["elidedSegments"] == 2, (
         "nothing was elided, so no refill was attempted"
     )
-    coverage = result.quota_cache_coverage
+    coverage = payload["quotaCacheCoverage"]
     assert coverage["elisionRefill"]["complete"] is False
+    assert coverage["elisionRefill"]["failures"] == [
+        {"segment": name, "error": error.__name__}
+        for name, error in targets.items()
+    ]
     assert coverage["complete"] is False
     assert coverage["coveredHighWater"] is None
     assert coverage["remainder"]["reason"] == "noCoverageEstablished"
@@ -1089,6 +1141,31 @@ def test_a_short_read_during_the_refill_reports_incomplete(
     )
 
 
+def test_a_mixed_elidable_segment_counts_every_line_not_only_quota_lines(
+    tmp_path, monkeypatch,
+):
+    """A Claude observation is non-retained but not a quota replay record.
+
+    Comparing the number of recovered quota observations with the summary's
+    decoded-line count reports a false short read for this valid segment. The
+    refill must count all three lines while returning only the two quota ones.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = importlib.import_module("_cctally_core")
+    jr = _journal()
+    shape = F.build_mixed_elidable_refill(core.JOURNAL_DIR)
+
+    assert shape["gaps"][0][3] == 3, (
+        "the segment does not contain the non-quota line that distinguishes "
+        "decoded-line count from recovered-observation count"
+    )
+    out, complete = jr._refill_elided_quota_raw([], shape["gaps"])
+
+    assert (complete, len(out)) == (True, 2)
+    assert out == shape["expected"]
+
+
 def test_a_non_oserror_during_the_refill_falls_back_instead_of_raising(
     tmp_path, monkeypatch,
 ):
@@ -1198,11 +1275,11 @@ def test_a_refill_splices_around_a_read_segment_and_stays_outside_the_flocks(
     real_refill = jr._refill_elided_quota_raw
     captured_gaps: list = []
 
-    def refilling(quota_raw, gaps):
+    def refilling(quota_raw, gaps, **kwargs):
         captured_gaps.extend(gaps)
         inside_refill["now"] = True
         try:
-            return real_refill(quota_raw, gaps)
+            return real_refill(quota_raw, gaps, **kwargs)
         finally:
             inside_refill["now"] = False
 
@@ -1229,6 +1306,7 @@ def test_a_refill_splices_around_a_read_segment_and_stays_outside_the_flocks(
         "the two elided segments hold four observations between them"
     )
     assert coverage["elisionRefill"]["complete"] is True
+    assert coverage["elisionRefill"]["failures"] == []
     assert replayed == journal_order
     assert _stored_line_offsets(ns) == sorted(journal_order)
 

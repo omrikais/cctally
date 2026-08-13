@@ -498,7 +498,7 @@ def build_codex_task_b(out: pathlib.Path) -> dict:
         {
             "payload": {
                 "call_id": "exec-long",
-                "input": "const r = await tools.exec_command({\n  cmd: \"seq 1 25\",\n  workdir: \"/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy\"\n});\ntext(r.output);",
+                "input": "const r = await tools.exec_command({\n  cmd: \"seq 1 25\",\n  workdir: \"/synthetic/root-b/duplicated-conversation-copy\"\n});\ntext(r.output);",
                 "name": "exec",
                 "status": "completed",
                 "type": "custom_tool_call",

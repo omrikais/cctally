@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Fail-closed ShellCheck gate over the explicit cctally shell estate (#546)."""
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_DEFECT = 3
+EXPECTED_VERSION = "0.11.0"
+MANIFEST = pathlib.Path("tests/shellcheck-targets.txt")
+_DIRECTIVE = re.compile(r"^\s*# shellcheck (disable|source)=([^\s]+)\s*$")
+_ALLOWED_WARNING_SUPPRESSIONS = {"SC1090", "SC1091", "SC1094", "SC2034"}
+
+
+class Defect(Exception):
+    pass
+
+
+def _shebang(path: pathlib.Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            first = handle.readline(512)
+    except OSError:
+        return ""
+    return first.decode("utf-8", "replace").strip() if first.startswith(b"#!") else ""
+
+
+def _shell_dialect(path: pathlib.Path) -> str:
+    shebang = _shebang(path)
+    if path.suffix != ".sh" and not any(
+        os.path.basename(token) in {"bash", "sh", "dash", "ksh", "zsh"}
+        for token in shebang.replace("#!", "").split()
+    ):
+        return ""
+    for token in reversed(shebang.replace("#!", "").split()):
+        if os.path.basename(token) in {"sh", "dash"}:
+            return "sh"
+        if os.path.basename(token) in {"bash", "ksh", "zsh"}:
+            return "bash"
+    return "bash"
+
+
+def _load_manifest(root: pathlib.Path, surface: str) -> list[pathlib.Path]:
+    path = root / MANIFEST
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise Defect(f"{MANIFEST} could not be read: {exc}") from exc
+    rows: list[tuple[str, pathlib.Path]] = []
+    seen: set[pathlib.Path] = set()
+    for line_no, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if len(fields) != 2:
+            raise Defect(f"{MANIFEST}:{line_no}: expected '<scope> <path>'")
+        scope, rel_text = fields
+        if scope not in {"public", "private"}:
+            raise Defect(
+                f"{MANIFEST}:{line_no}: scope must be public or private, got {scope!r}"
+            )
+        rel = pathlib.Path(rel_text)
+        if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts[0] != "bin":
+            raise Defect(f"{MANIFEST}:{line_no}: target must be a repo-relative bin/ path")
+        if rel in seen:
+            raise Defect(f"{MANIFEST}:{line_no}: duplicate target {rel.as_posix()}")
+        seen.add(rel)
+        rows.append((scope, rel))
+    if not rows:
+        raise Defect(f"{MANIFEST} declares no targets")
+    selected = [rel for scope, rel in rows if surface == "private" or scope == "public"]
+    if not selected:
+        raise Defect(f"{MANIFEST} declares no {surface} targets")
+    return selected
+
+
+def _discover(root: pathlib.Path) -> set[pathlib.Path]:
+    bin_dir = root / "bin"
+    if not bin_dir.is_dir():
+        raise Defect("repository has no bin/ directory, so shell targets cannot be discovered")
+    return {
+        path.relative_to(root)
+        for path in bin_dir.rglob("*")
+        if path.is_file() and _shell_dialect(path)
+    }
+
+
+def _version(shellcheck: str) -> str:
+    try:
+        proc = subprocess.run(
+            [shellcheck, "--version"], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        raise Defect(f"could not run ShellCheck at {shellcheck}: {exc}") from exc
+    match = re.search(r"^version:\s*(\S+)\s*$", proc.stdout, re.MULTILINE)
+    if proc.returncode != 0 or not match:
+        raise Defect(f"could not read ShellCheck version from {shellcheck}")
+    version = match.group(1)
+    if version != EXPECTED_VERSION:
+        raise Defect(
+            f"ShellCheck version {version} is not the pinned {EXPECTED_VERSION}"
+        )
+    return version
+
+
+def _audit_directives(root: pathlib.Path, targets: list[pathlib.Path]) -> None:
+    target_set = set(targets)
+    for rel in targets:
+        try:
+            lines = (root / rel).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise Defect(f"{rel} could not be read for directive audit: {exc}") from exc
+        for index, line in enumerate(lines):
+            if not line.lstrip().startswith("# shellcheck "):
+                continue
+            if line.strip() in {"# shellcheck shell=bash", "# shellcheck shell=sh"}:
+                continue
+            match = _DIRECTIVE.match(line)
+            if not match:
+                raise Defect(f"{rel}:{index + 1}: malformed ShellCheck directive")
+            previous = lines[index - 1].strip() if index else ""
+            following = lines[index + 1] if index + 1 < len(lines) else ""
+            is_source_command = bool(
+                re.search(r"(^|\s)source\s+", following)
+                or re.search(r"(^|\s)\.\s+", following)
+            )
+            codes = set(match.group(2).split(",")) if match.group(1) == "disable" else set()
+            source_only_suppression = bool(codes) and codes <= {"SC1090", "SC1091"}
+            needs_reason = (
+                (match.group(1) == "disable" and not source_only_suppression)
+                or match.group(2) == "/dev/null"
+            )
+            if needs_reason and not previous.startswith("# "):
+                raise Defect(
+                    f"{rel}:{index + 1}: directive must be preceded by a ShellCheck justification"
+                )
+            if source_only_suppression:
+                if not is_source_command:
+                    raise Defect(
+                        f"{rel}:{index + 1}: SC1090/SC1091 suppression must apply only to the next source command"
+                    )
+            if match.group(1) == "source":
+                source_value = match.group(2)
+                if source_value != "/dev/null":
+                    source_rel = pathlib.Path(source_value)
+                    if (
+                        source_rel.is_absolute()
+                        or ".." in source_rel.parts
+                        or not source_rel.parts
+                        or source_rel.parts[0] != "bin"
+                        or source_rel not in target_set
+                        or not (root / source_rel).is_file()
+                    ):
+                        raise Defect(
+                            f"{rel}:{index + 1}: source target must be an existing "
+                            "repo-local bin/ path in the selected target surface"
+                        )
+                if not is_source_command:
+                    raise Defect(
+                        f"{rel}:{index + 1}: source directive must apply only to the next source command"
+                    )
+            if match.group(1) == "disable":
+                for code in codes:
+                    if code not in _ALLOWED_WARNING_SUPPRESSIONS:
+                        raise Defect(
+                            f"{rel}:{index + 1}: {code} is not allowed at the warning threshold; "
+                            "remove the obsolete suppression or fix the warning"
+                        )
+
+
+def run(root: pathlib.Path, surface: str, shellcheck: str) -> tuple[int, str]:
+    version = _version(shellcheck)
+    targets = _load_manifest(root, surface)
+    expected = set(targets)
+    discovered = _discover(root)
+    missing = sorted(expected - discovered)
+    unexpected = sorted(discovered - expected)
+    if missing or unexpected:
+        details = []
+        details.extend(f"declared target is absent or not shell: {path}" for path in missing)
+        details.extend(f"undeclared shell target: {path}" for path in unexpected)
+        raise Defect("target manifest drift:\n  " + "\n  ".join(details))
+
+    _audit_directives(root, targets)
+
+    diagnostics: list[str] = []
+    for rel in targets:
+        dialect = _shell_dialect(root / rel)
+        proc = subprocess.run(
+            [
+                shellcheck,
+                "--severity=warning",
+                "--external-sources",
+                "--source-path=SCRIPTDIR",
+                "--format=gcc",
+                f"--shell={dialect}",
+                rel.as_posix(),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode:
+            detail = (proc.stdout + proc.stderr).strip()
+            diagnostics.append(detail or f"{rel}: ShellCheck exited {proc.returncode}")
+    if diagnostics:
+        raise Defect("ShellCheck diagnostics:\n" + "\n".join(diagnostics))
+    return EXIT_OK, f"clean ({len(targets)} targets, ShellCheck {version}, {surface})"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="cctally-shellcheck")
+    parser.add_argument("--repo-root", metavar="DIR")
+    parser.add_argument("--surface", choices=("auto", "private", "public"), default="auto")
+    parser.add_argument("--shellcheck", metavar="PATH")
+    args = parser.parse_args(argv)
+    root = pathlib.Path(args.repo_root).resolve() if args.repo_root else pathlib.Path(__file__).resolve().parents[1]
+    if not root.is_dir():
+        parser.error(f"repository root is not a directory: {root}")
+    surface = args.surface
+    if surface == "auto":
+        surface = "private" if (root / ".mirror-allowlist").is_file() else "public"
+    shellcheck = args.shellcheck or shutil.which("shellcheck")
+    if not shellcheck:
+        sys.stderr.write("shellcheck: pinned ShellCheck executable is absent from PATH\n")
+        return EXIT_DEFECT
+    try:
+        code, message = run(root, surface, shellcheck)
+    except Defect as exc:
+        sys.stderr.write(f"shellcheck: {exc}\n")
+        return EXIT_DEFECT
+    sys.stdout.write(f"shellcheck: {message}\n")
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

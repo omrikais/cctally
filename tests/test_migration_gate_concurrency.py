@@ -42,6 +42,13 @@ import sys
 
 import pytest
 
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). This module loads bin/cctally (or a sibling) through
+# SourceFileLoader or at import, and neither re-derives the path constants,
+# so pinning HOME alone would leave whatever the previous test on this xdist
+# worker left behind -- which is why it was green alone and red under -n 4.
+pytestmark = pytest.mark.usefixtures("isolated_paths")
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _BIN_DIR = _ROOT / "bin"
 if str(_BIN_DIR) not in sys.path:

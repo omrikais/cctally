@@ -39,7 +39,8 @@
     "weekly_thresholds": [
       90,
       95
-    ]
+    ],
+    "weekly_usd": 50.0
   },
   "blocks": {
     "rows": [
@@ -2684,7 +2685,8 @@
                 "weekly_thresholds": [
                   90,
                   95
-                ]
+                ],
+                "weekly_usd": 50.0
               }
             },
             "hero": {
@@ -6213,7 +6215,8 @@
             "weekly_thresholds": [
               90,
               95
-            ]
+            ],
+            "weekly_usd": 50.0
           }
         },
         "hero": {

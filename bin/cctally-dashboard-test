@@ -47,7 +47,15 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
-FIX_DIR="$REPO_ROOT/tests/fixtures/dashboard"
+# Generated fixture inputs are staged out of tree (#529 S3). The committed
+# tree is the read-only template; nothing under it is written during a run.
+FIXTURE_STAGE=$(mktemp -d -t cctally-dashboard-fixstage.XXXXXX)
+FIX_DIR="$FIXTURE_STAGE/dashboard"
+FIXTURES_ROOT="$FIX_DIR"
+# Goldens address the COMMITTED root, never the staging copy above: this
+# harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched.
+GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/dashboard"
 
 # Robust golden comparison (issue #106/#107): ONE `diff` over real files
 # drives both the verdict and the displayed bytes — no `<(process
@@ -89,12 +97,12 @@ cleanup () {
     for p in "${BG_PIDS[@]:-}"; do
         [ -n "$p" ] && kill_server_bounded "$p"
     done
-    rm -rf "$SCRATCH_ROOT"
+    rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"
 }
 trap cleanup EXIT INT TERM
 
 echo ">> rebuilding fixtures"
-"$REPO_ROOT/bin/build-dashboard-fixtures.py" >/dev/null || {
+stage_fixtures_out_of_tree dashboard "$FIXTURES_ROOT" || {
     echo "FAIL: build-dashboard-fixtures.py crashed (exit $?)" >&2
     exit 1
 }
@@ -188,7 +196,7 @@ print(json.dumps(env, indent=2, sort_keys=True))
 _run_scenario_inner () {
     local name="$1"
     local dir="$FIX_DIR/$name"
-    local golden="$dir/golden-data.json"
+    local golden="$GOLDEN_ROOT/$name/golden-data.json"
     local log="$dir/.harness.log"
 
     if [ ! -f "$dir/input.env" ]; then
@@ -234,7 +242,6 @@ _run_scenario_inner () {
     # Golden-diff helpers materialize temp compare files here; cleaned with
     # $SCRATCH_ROOT on harness exit.
     local GOLDEN_DIFF_TMPDIR="$scratch_home"
-    # shellcheck disable=SC2086
     CCTALLY_AS_OF="$as_of" HOME="$scratch_home" TZ=Etc/UTC \
         "$BIN" dashboard --port 0 --no-browser --no-sync \
         --sync-interval 9999 --host 127.0.0.1 $extra_flags >"$log" 2>&1 &
@@ -351,6 +358,42 @@ _run_scenario_inner () {
             # the prior effectively-unlimited full-diff behavior (largest
             # golden is ~2.5k lines) while still surfacing the whole divergence.
             _golden_diff_str "/api/data" "$golden" "$actual" 5000 || ok=0
+        fi
+    fi
+
+    # Claude weekly budget AMOUNT mirror (#513 S2 §5.1). Asserted for EVERY
+    # scenario, explicitly and by value, in addition to the golden diff above.
+    # The golden diff alone is not enough: a future rebaseline that regenerates
+    # goldens from a build which dropped the leaf would erase the field from
+    # both sides at once and stay green. This check names the expected value
+    # per scenario, so the field cannot go missing and cannot silently change.
+    if [ -n "${raw:-}" ]; then
+        local weekly_usd_check
+        weekly_usd_check=$(printf '%s' "$raw" | CCTALLY_SCENARIO="$name" python3 -c '
+import json, os, sys
+# The two scenarios whose fixture config.json carries a `budget` block
+# (bin/build-dashboard-fixtures.py seeds weekly_usd=50.0 for both). Every
+# other scenario writes no budget block, so the validated getter yields None
+# and the mirror must be an explicit null rather than an absent key.
+EXPECTED = {"ok": 50.0, "projected-alerts": 50.0, "cache-report-qa": 50.0}
+scenario = os.environ["CCTALLY_SCENARIO"]
+d = json.load(sys.stdin)
+s = d.get("alerts_settings")
+if not isinstance(s, dict):
+    sys.exit("alerts_settings block missing or not an object")
+if "weekly_usd" not in s:
+    sys.exit("alerts_settings.weekly_usd key absent (the mirror was dropped)")
+got = s["weekly_usd"]
+want = EXPECTED.get(scenario)
+if got != want:
+    sys.exit("alerts_settings.weekly_usd == %r, expected %r" % (got, want))
+if got is not None and not (isinstance(got, float) and got > 0):
+    sys.exit("alerts_settings.weekly_usd must be a positive float or null: %r" % (got,))
+print("ok")
+' 2>&1)
+        if [ "$weekly_usd_check" != "ok" ]; then
+            echo "FAIL $name: weekly-budget mirror assertion: $weekly_usd_check"
+            ok=0
         fi
     fi
 
@@ -700,7 +743,7 @@ print("ok")
     # normalize, diff against golden-session.json (or write on first
     # run). Skipped for no-data since there's no session to seed.
     if [ -n "$fixed_sid" ]; then
-        local session_golden="$dir/golden-session.json"
+        local session_golden="$GOLDEN_ROOT/$name/golden-session.json"
         local sess_raw sess_actual
         sess_raw=$(curl -s --max-time 5 "$base/api/session/$fixed_sid")
         if [ -z "$sess_raw" ]; then
@@ -875,7 +918,7 @@ export -f _run_scenario_inner run_scenario normalize_json normalize_session_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
 export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
-export FIX_DIR BIN SCRATCH_ROOT
+export FIX_DIR GOLDEN_ROOT BIN SCRATCH_ROOT
 
 printf '%s\n' "${fixture_scenarios[@]}" \
     | xargs -n1 -P "$JOBS" -I{} \
@@ -1097,7 +1140,7 @@ assert_not_contains "banner LAN auth opt-out: no access token" \
 # fields would only trip the harness if the byte-stable diff catches it,
 # which a careless re-baseline could mask. This loop fails the harness
 # even if the goldens were updated to drop the field.
-for golden in "$FIX_DIR"/*/golden-data.json; do
+for golden in "$GOLDEN_ROOT"/*/golden-data.json; do
     name=$(basename "$(dirname "$golden")")
     for field in tz resolved_tz offset_label offset_seconds; do
         if ! jq -e ".display | has(\"$field\")" "$golden" >/dev/null 2>&1; then

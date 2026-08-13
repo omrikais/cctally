@@ -28,18 +28,37 @@ from types import SimpleNamespace
 
 import pytest
 
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). The write detector caught this module creating the maintainer's
+# real ~/.local/share/cctally: its tests call load_script() themselves, and
+# load_script() re-derives every path constant from HOME on each call, so a
+# redirect_paths() patch would be clobbered by the next one.
+pytestmark = pytest.mark.usefixtures("isolated_home")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CCTALLY = REPO_ROOT / "bin" / "cctally"
 
 
-@pytest.fixture(scope="module")
-def cctally_mod():
-    """Load ``bin/cctally`` as a Python module."""
+@pytest.fixture
+def cctally_mod(isolated_home):
+    """Load ``bin/cctally`` as a Python module.
+
+    Function-scoped and dependent on ``isolated_home`` (#529 S4). It was
+    module-scoped, so it ran once before any function fixture and left every
+    path constant derived under the real HOME; the write detector caught this
+    module creating the maintainer's real ~/.local/share/cctally. This loader
+    uses SourceFileLoader rather than ``load_script()``, so it does not
+    re-derive on its own -- hence the explicit ``_init_paths_from_env()``,
+    which is safe here because it runs before any test applies a patch.
+    """
     loader = SourceFileLoader("cctally", str(CCTALLY))
     spec = importlib.util.spec_from_loader("cctally", loader)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cctally"] = mod
     loader.exec_module(mod)
+    import _cctally_core
+
+    _cctally_core._init_paths_from_env()
     return mod
 
 

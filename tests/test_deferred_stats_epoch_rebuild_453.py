@@ -337,8 +337,15 @@ def test_dashboard_cold_bind_hydrates_when_the_heal_defers(
     assert "corruption rebuild is running" in snapshot.last_sync_error
 
 
+@pytest.mark.parametrize(
+    ("factory", "want_corruption"),
+    (
+        ("StatsEpochRebuildDeferred", False),
+        ("StatsHealDeferred", True),
+    ),
+)
 def test_tui_snapshot_degrades_typed_when_the_post_query_heal_defers(
-    runtime, monkeypatch,
+    runtime, monkeypatch, factory, want_corruption,
 ):
     """The TUI calls the heal BEFORE entering its retry catch, and must not
     spin: after deferral the index is still corrupt."""
@@ -358,7 +365,7 @@ def test_tui_snapshot_degrades_typed_when_the_post_query_heal_defers(
     monkeypatch.setattr(
         tui,
         "_tui_heal_post_query_stats",
-        lambda _cause: (_ for _ in ()).throw(db.StatsHealDeferred("pending")),
+        lambda _cause: (_ for _ in ()).throw(getattr(db, factory)("pending")),
     )
 
     snapshot = tui._tui_build_snapshot(
@@ -368,7 +375,7 @@ def test_tui_snapshot_degrades_typed_when_the_post_query_heal_defers(
 
     assert builds == 1, "the retry must not spin against a still-corrupt index"
     assert snapshot.sync_failures[0].database == "stats"
-    assert snapshot.sync_failures[0].corruption is True
+    assert snapshot.sync_failures[0].corruption is want_corruption
 
 
 def test_worker_closes_resolver_connection_and_clears_marker_on_success(

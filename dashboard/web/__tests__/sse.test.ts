@@ -264,7 +264,62 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     });
     startSSE();
     await Promise.resolve(); await Promise.resolve();
-    expect(getState().alertsConfig).toEqual(envelopeSettings);
+    // #513 S2 §5.1: the seam feeds the store's normalizer, which turns the
+    // absent `weekly_usd` leaf into the canonical null.
+    expect(getState().alertsConfig).toEqual({ ...envelopeSettings, weekly_usd: null });
+  });
+
+  it('normalizes a missing weekly_usd to null when the block IS present (#513 S2 §5.1)', async () => {
+    // The compatibility hazard: the seam passes a present `alerts_settings`
+    // block through wholesale and defaults only when the WHOLE block is
+    // absent, so a server predating the mirror yields `undefined` unless the
+    // store normalizes. `undefined` and `null` are distinguishable here.
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      json: () =>
+        Promise.resolve({
+          ...snap('2026-04-24T10:00:00Z'),
+          alerts: [],
+          alerts_settings: {
+            enabled: false,
+            weekly_thresholds: [90, 95],
+            five_hour_thresholds: [90, 95],
+            budget_thresholds: [],
+          },
+        }),
+    });
+    startSSE();
+    await Promise.resolve(); await Promise.resolve();
+    expect(getState().alertsConfig.weekly_usd).toBeNull();
+    expect('weekly_usd' in getState().alertsConfig).toBe(true);
+  });
+
+  it('carries a mirrored weekly_usd amount through the seam (#513 S2 §5.1)', async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      json: () =>
+        Promise.resolve({
+          ...snap('2026-04-24T10:00:00Z'),
+          alerts: [],
+          alerts_settings: {
+            enabled: false,
+            weekly_thresholds: [90, 95],
+            five_hour_thresholds: [90, 95],
+            budget_thresholds: [],
+            weekly_usd: 250,
+          },
+        }),
+    });
+    startSSE();
+    await Promise.resolve(); await Promise.resolve();
+    expect(getState().alertsConfig.weekly_usd).toBe(250);
+  });
+
+  it('falls back to a null amount when the whole block is absent (#513 S2 §5.1)', async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      json: () => Promise.resolve({ ...snap('2026-04-24T10:00:00Z'), alerts: [] }),
+    });
+    startSSE();
+    await Promise.resolve(); await Promise.resolve();
+    expect(getState().alertsConfig.weekly_usd).toBeNull();
   });
 
   it('out-of-order bootstrap is dropped — alerts/alertsConfig/seenAlertIds untouched', async () => {
@@ -304,7 +359,7 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     }, [newerAlert]));
     // #294 S5 — sse now feeds the source pipeline; the observable invariants are
     // alertsConfig + seenAlertIds (state.alerts is no longer sse-populated).
-    expect(getState().alertsConfig).toEqual(freshSettings);
+    expect(getState().alertsConfig).toEqual({ ...freshSettings, weekly_usd: null });
     const seenBefore = new Set(getState().seenAlertIds);
     expect(seenBefore.has(newerAlert.id)).toBe(true);
 
@@ -328,7 +383,7 @@ describe('startSSE — INGEST_SNAPSHOT_ALERTS wiring (T15)', () => {
     // updateSnapshot rejected the older envelope; ingestAlerts MUST NOT have
     // run, so alertsConfig / seenAlertIds are exactly as they were after the
     // post-bootstrap update (the stale alert never got seeded).
-    expect(getState().alertsConfig).toEqual(freshSettings);
+    expect(getState().alertsConfig).toEqual({ ...freshSettings, weekly_usd: null });
     expect(getState().seenAlertIds.has(staleAlert.id)).toBe(false);
   });
 });

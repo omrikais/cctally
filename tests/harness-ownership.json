@@ -1,0 +1,338 @@
+{
+  "schemaVersion": 1,
+  "description": "Declared harness ownership (#529 S5 section 4.5). fixturePaths is re-derived and VERIFIED by bin/cctally-test-owners --verify; sourcePaths is hand-maintained, ADVISORY, and never narrows the safe set.",
+  "harnesses": {
+    "5h-canonical": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "account": {
+      "fixturePaths": [
+        "bin/build-account-fixtures.py",
+        "tests/fixtures/account"
+      ],
+      "sourcePaths": []
+    },
+    "alerts": {
+      "fixturePaths": [
+        "bin/build-alerts-fixtures.py",
+        "tests/fixtures/alerts"
+      ],
+      "sourcePaths": []
+    },
+    "alerts-dispatch": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "bench": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "blocks": {
+      "fixturePaths": [
+        "bin/build-blocks-fixtures.py",
+        "tests/fixtures/blocks"
+      ],
+      "sourcePaths": []
+    },
+    "budget": {
+      "fixturePaths": [
+        "bin/build-budget-fixtures.py",
+        "tests/fixtures/budget"
+      ],
+      "sourcePaths": []
+    },
+    "cache-report": {
+      "fixturePaths": [
+        "bin/build-cache-report-fixtures.py",
+        "tests/fixtures/cache-report"
+      ],
+      "sourcePaths": []
+    },
+    "chokepoint": {
+      "fixturePaths": [
+        "tests/fixtures/chokepoint"
+      ],
+      "sourcePaths": []
+    },
+    "codex-daily": {
+      "fixturePaths": [
+        "bin/build-codex-fixtures.py",
+        "tests/fixtures/codex-daily"
+      ],
+      "sourcePaths": []
+    },
+    "codex-monthly": {
+      "fixturePaths": [
+        "bin/build-codex-fixtures.py",
+        "tests/fixtures/codex-monthly"
+      ],
+      "sourcePaths": []
+    },
+    "codex-quota": {
+      "fixturePaths": [
+        "bin/build-codex-quota-fixtures.py",
+        "tests/fixtures/codex-quota"
+      ],
+      "sourcePaths": []
+    },
+    "codex-session": {
+      "fixturePaths": [
+        "bin/build-codex-fixtures.py",
+        "tests/fixtures/codex-session"
+      ],
+      "sourcePaths": []
+    },
+    "codex-weekly": {
+      "fixturePaths": [
+        "bin/build-codex-fixtures.py",
+        "tests/fixtures/codex-weekly"
+      ],
+      "sourcePaths": []
+    },
+    "config": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "conversation": {
+      "fixturePaths": [
+        "bin/build-conversation-fixtures.py",
+        "tests/fixtures/conversation"
+      ],
+      "sourcePaths": []
+    },
+    "daily": {
+      "fixturePaths": [
+        "bin/build-daily-fixtures.py",
+        "tests/fixtures/daily"
+      ],
+      "sourcePaths": []
+    },
+    "daily-instances": {
+      "fixturePaths": [
+        "bin/build-daily-instances-fixtures.py",
+        "tests/fixtures/daily-instances"
+      ],
+      "sourcePaths": []
+    },
+    "dashboard": {
+      "fixturePaths": [
+        "bin/build-dashboard-fixtures.py",
+        "tests/fixtures/dashboard"
+      ],
+      "sourcePaths": []
+    },
+    "diff": {
+      "fixturePaths": [
+        "bin/build-diff-fixtures.py",
+        "tests/fixtures/diff"
+      ],
+      "sourcePaths": []
+    },
+    "doc-lint": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "doctor": {
+      "fixturePaths": [
+        "bin/build-doctor-fixtures.py",
+        "tests/fixtures/doctor"
+      ],
+      "sourcePaths": []
+    },
+    "five-hour-blocks": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "fixture-cache": {
+      "fixturePaths": [
+        "bin/build-weekly-fixtures.py"
+      ],
+      "sourcePaths": []
+    },
+    "forecast": {
+      "fixturePaths": [
+        "bin/build-forecast-fixtures.py",
+        "tests/fixtures/forecast"
+      ],
+      "sourcePaths": []
+    },
+    "frontend": {
+      "fixturePaths": [
+        "bin/build-codex-reader-fixtures.py",
+        "tests/fixtures/codex-reader"
+      ],
+      "sourcePaths": []
+    },
+    "hook-tick": {
+      "fixturePaths": [
+        "tests/fixtures/hook-tick"
+      ],
+      "sourcePaths": []
+    },
+    "kill-server": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "migrations": {
+      "fixturePaths": [
+        "tests/fixtures/migrations"
+      ],
+      "sourcePaths": []
+    },
+    "monthly": {
+      "fixturePaths": [
+        "bin/build-monthly-fixtures.py",
+        "tests/fixtures/monthly"
+      ],
+      "sourcePaths": []
+    },
+    "npm-postinstall": {
+      "fixturePaths": [
+        "tests/fixtures/npm-postinstall"
+      ],
+      "sourcePaths": []
+    },
+    "npm-shim": {
+      "fixturePaths": [
+        "tests/fixtures/npm-shim"
+      ],
+      "sourcePaths": []
+    },
+    "percent-milestone-idempotency": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "preflight": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "pricing-check": {
+      "fixturePaths": [
+        "bin/build-pricing-check-fixtures.py",
+        "tests/fixtures/pricing-check"
+      ],
+      "sourcePaths": []
+    },
+    "project": {
+      "fixturePaths": [
+        "bin/build-project-fixtures.py",
+        "tests/fixtures/project"
+      ],
+      "sourcePaths": []
+    },
+    "reconcile": {
+      "fixturePaths": [
+        "bin/build-budget-fixtures.py",
+        "bin/build-cache-report-fixtures.py",
+        "bin/build-codex-fixtures.py",
+        "bin/build-daily-instances-fixtures.py",
+        "bin/build-dedup-fixtures.py",
+        "bin/build-diff-fixtures.py",
+        "bin/build-forecast-fixtures.py",
+        "bin/build-mode-fixtures.py",
+        "bin/build-session-fixtures.py",
+        "bin/build-speed-fixtures.py",
+        "bin/build-weekly-fixtures.py",
+        "tests/fixtures/projects"
+      ],
+      "sourcePaths": []
+    },
+    "record-credit": {
+      "fixturePaths": [
+        "tests/fixtures/record-credit"
+      ],
+      "sourcePaths": []
+    },
+    "record-usage-selfheal": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "rederive": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "report": {
+      "fixturePaths": [
+        "bin/build-report-fixtures.py",
+        "tests/fixtures/report"
+      ],
+      "sourcePaths": []
+    },
+    "session": {
+      "fixturePaths": [
+        "bin/build-session-fixtures.py",
+        "tests/fixtures/session"
+      ],
+      "sourcePaths": []
+    },
+    "settings-api": {
+      "fixturePaths": [],
+      "sourcePaths": []
+    },
+    "setup": {
+      "fixturePaths": [
+        "tests/fixtures/setup"
+      ],
+      "sourcePaths": []
+    },
+    "share": {
+      "fixturePaths": [
+        "bin/build-share-fixtures.py",
+        "tests/fixtures/share"
+      ],
+      "sourcePaths": []
+    },
+    "shellcheck": {
+      "fixturePaths": [],
+      "sourcePaths": [
+        ".github/workflows/ci-linux-matrix.yml",
+        ".github/workflows/ci.yml",
+        "bin",
+        "tests/requirements-dev.txt",
+        "tests/shellcheck-targets.txt"
+      ]
+    },
+    "source-aware": {
+      "fixturePaths": [
+        "bin/build-source-aware-fixtures.py",
+        "tests/fixtures/source-aware"
+      ],
+      "sourcePaths": []
+    },
+    "statusline": {
+      "fixturePaths": [
+        "bin/build-statusline-fixtures.py",
+        "tests/fixtures/statusline"
+      ],
+      "sourcePaths": []
+    },
+    "subgroup": {
+      "fixturePaths": [
+        "bin/build-blocks-fixtures.py",
+        "bin/build-codex-fixtures.py",
+        "tests/fixtures/statusline"
+      ],
+      "sourcePaths": []
+    },
+    "tui": {
+      "fixturePaths": [
+        "tests/fixtures/tui"
+      ],
+      "sourcePaths": []
+    },
+    "update": {
+      "fixturePaths": [
+        "tests/fixtures/update"
+      ],
+      "sourcePaths": []
+    },
+    "weekly": {
+      "fixturePaths": [
+        "bin/build-weekly-fixtures.py",
+        "tests/fixtures/weekly"
+      ],
+      "sourcePaths": []
+    }
+  }
+}

@@ -1,13 +1,13 @@
 ---
-title: Monthly usage — 2020-01 → 2026-05
+title: Monthly usage — 2026-05 → 2026-05
 generated_at: 2026-05-09T12:00:00Z
-period: 2020-01-01T00:00:00Z..2026-05-09T12:00:00Z
+period: 2026-05-01T00:00:00Z..2026-05-09T12:00:00Z
 panel: monthly
 anonymized: true
 cctally_version: 9.9.9
 ---
-# Monthly usage — 2020-01 → 2026-05
-_2020-01-01 → 2026-05-09 (Etc/UTC)_
+# Monthly usage — 2026-05 → 2026-05
+_2026-05-01 → 2026-05-09 (Etc/UTC)_
 _2026-05-09T12:00:00Z_
 
 | Month | $ Cost | Tokens | Δ vs prior |

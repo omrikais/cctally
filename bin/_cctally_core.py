@@ -227,6 +227,16 @@ def _init_paths_from_env() -> None:
     CLAUDE_PROJECTS_DIR = home / ".claude" / "projects"
 
 
+# The statusline OAuth cache is HOST-GLOBAL and shared with the real Claude
+# Code statusline, so /tmp stays the production location -- relocating it would
+# change behaviour for real users. It lives here, as a module constant rather
+# than inside _init_paths_from_env(), because it is deliberately NOT derived
+# from APP_DIR or HOME; putting it here is what lets redirect_paths pin it and
+# lets _bust_statusline_cache resolve it at CALL time instead of binding it as
+# a default argument at import (#529 S4, spec section 5.4).
+STATUSLINE_OAUTH_CACHE_PATH = "/tmp/claude-statusline-usage-cache.json"
+
+
 def _truthy_env(name: str) -> bool:
     """A ``1``/``true``/``yes``/any-other-non-empty env value is truthy;
     unset, empty, ``0``, ``false``, ``no`` are falsey (case-insensitive,
@@ -882,7 +892,20 @@ def note_stats_maintenance_released() -> None:
 
 
 class _AlertsConfigError(ValueError):
-    """Raised by _get_alerts_config on invalid alerts block."""
+    """Raised by _get_alerts_config on invalid alerts block.
+
+    ``field`` carries the offending dotted config path (e.g.
+    ``"alerts.notifier"``) so ``POST /api/settings`` can answer
+    ``{error, field}`` on every rejection. It is set explicitly at each
+    raise site and never inferred from the message text, because inferring
+    it would let a reworded message silently move a machine-readable
+    pointer. Keyword-only with a ``None`` default, so every existing CLI
+    caller keeps working unchanged.
+    """
+
+    def __init__(self, message: str, *, field: "str | None" = None) -> None:
+        super().__init__(message)
+        self.field = field
 
 
 _ALERTS_CONFIG_VALID_KEYS = {
@@ -907,11 +930,15 @@ def _validate_threshold_list(name: str, value: object) -> "list[int]":
     Error messages mention `alerts.<name>` so users can locate the
     offending key in their config.json.
     """
+    field = f"alerts.{name}"
     if not isinstance(value, list):
-        raise _AlertsConfigError(f"alerts.{name} must be a list of integers")
+        raise _AlertsConfigError(
+            f"alerts.{name} must be a list of integers", field=field
+        )
     if len(value) == 0:
         raise _AlertsConfigError(
-            f"alerts.{name} must not be empty (disable alerts via alerts.enabled=false)"
+            f"alerts.{name} must not be empty (disable alerts via alerts.enabled=false)",
+            field=field,
         )
     out: "list[int]" = []
     prev = -1
@@ -919,19 +946,23 @@ def _validate_threshold_list(name: str, value: object) -> "list[int]":
     for item in value:
         if not isinstance(item, int) or isinstance(item, bool):
             raise _AlertsConfigError(
-                f"alerts.{name} items must be integers, got {type(item).__name__}: {item!r}"
+                f"alerts.{name} items must be integers, got {type(item).__name__}: {item!r}",
+                field=field,
             )
         if item < 1 or item > 100:
             raise _AlertsConfigError(
-                f"alerts.{name} items must be in [1, 100], got {item}"
+                f"alerts.{name} items must be in [1, 100], got {item}",
+                field=field,
             )
         if item in seen:
             raise _AlertsConfigError(
-                f"alerts.{name} contains duplicate value {item}"
+                f"alerts.{name} contains duplicate value {item}",
+                field=field,
             )
         if item <= prev:
             raise _AlertsConfigError(
-                f"alerts.{name} must be strictly increasing, got {prev} then {item}"
+                f"alerts.{name} must be strictly increasing, got {prev} then {item}",
+                field=field,
             )
         seen.add(item)
         prev = item
@@ -949,7 +980,7 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     """
     block = (cfg or {}).get("alerts", {}) or {}
     if not isinstance(block, dict):
-        raise _AlertsConfigError("alerts must be an object")
+        raise _AlertsConfigError("alerts must be an object", field="alerts")
     # warn-and-ignore unknown keys (forward compat; matches display.tz posture)
     for k in block.keys():
         if k not in _ALERTS_CONFIG_VALID_KEYS:
@@ -960,7 +991,8 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     enabled = block.get("enabled", False)
     if not isinstance(enabled, bool):
         raise _AlertsConfigError(
-            f"alerts.enabled must be a JSON boolean, got {type(enabled).__name__}: {enabled!r}"
+            f"alerts.enabled must be a JSON boolean, got {type(enabled).__name__}: {enabled!r}",
+            field="alerts.enabled",
         )
     weekly = _validate_threshold_list(
         "weekly_thresholds", block.get("weekly_thresholds", [90, 95])
@@ -975,7 +1007,8 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     if not isinstance(projected_enabled, bool):
         raise _AlertsConfigError(
             f"alerts.projected_enabled must be a JSON boolean, got "
-            f"{type(projected_enabled).__name__}: {projected_enabled!r}"
+            f"{type(projected_enabled).__name__}: {projected_enabled!r}",
+            field="alerts.projected_enabled",
         )
     # Dispatch-global keys (Phase B). `notifier` selects the backend;
     # `command_template` is an argv list for the `command` backend (and may be
@@ -985,31 +1018,39 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
     if notifier not in _ALERTS_VALID_NOTIFIERS:
         raise _AlertsConfigError(
             f"alerts.notifier must be one of {list(_ALERTS_VALID_NOTIFIERS)}, "
-            f"got {notifier!r}"
+            f"got {notifier!r}",
+            field="alerts.notifier",
         )
     command_template = block.get("command_template", None)
     if command_template is not None:
         if not isinstance(command_template, list) or not command_template:
             raise _AlertsConfigError(
-                "alerts.command_template must be null or a non-empty list of strings"
+                "alerts.command_template must be null or a non-empty list of strings",
+                field="alerts.command_template",
             )
         for el in command_template:
             if not isinstance(el, str):
                 raise _AlertsConfigError(
                     f"alerts.command_template elements must be strings, "
-                    f"got {type(el).__name__}: {el!r}"
+                    f"got {type(el).__name__}: {el!r}",
+                    field="alerts.command_template",
                 )
             if "\x00" in el:
                 raise _AlertsConfigError(
-                    "alerts.command_template elements must not contain a NUL byte"
+                    "alerts.command_template elements must not contain a NUL byte",
+                    field="alerts.command_template",
                 )
         if not command_template[0].strip():
             raise _AlertsConfigError(
-                "alerts.command_template[0] (the program) must not be empty/whitespace"
+                "alerts.command_template[0] (the program) must not be empty/whitespace",
+                field="alerts.command_template",
             )
     if notifier == "command" and command_template is None:
+        # Cross-field: point at the leaf the caller just set, not at the
+        # absent one, so a dashboard save highlights the field it sent.
         raise _AlertsConfigError(
-            "alerts.notifier='command' requires alerts.command_template to be set"
+            "alerts.notifier='command' requires alerts.command_template to be set",
+            field="alerts.notifier",
         )
     return {
         "enabled": enabled,
@@ -1025,7 +1066,16 @@ def _get_alerts_config(cfg: "dict | None") -> dict:
 
 
 class _BudgetConfigError(ValueError):
-    """Raised by _get_budget_config on an invalid budget block."""
+    """Raised by _get_budget_config on an invalid budget block.
+
+    ``field`` follows the same contract as ``_AlertsConfigError.field``:
+    the offending dotted path (e.g. ``"budget.codex.alerts_enabled"``),
+    set explicitly at the raise site, keyword-only, defaulting to ``None``.
+    """
+
+    def __init__(self, message: str, *, field: "str | None" = None) -> None:
+        super().__init__(message)
+        self.field = field
 
 
 def _validate_positive_budget_amount(v: object, label: str) -> float:
@@ -1039,9 +1089,11 @@ def _validate_positive_budget_amount(v: object, label: str) -> float:
     only validates a value the caller has already decided must be a number.
     """
     if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise _BudgetConfigError(f"{label} must be a number")
+        raise _BudgetConfigError(f"{label} must be a number", field=label)
     if not math.isfinite(float(v)) or float(v) <= 0:
-        raise _BudgetConfigError(f"{label} must be a finite number > 0")
+        raise _BudgetConfigError(
+            f"{label} must be a finite number > 0", field=label
+        )
     return float(v)
 
 
@@ -1088,23 +1140,26 @@ def _validate_account_budget_map(v: object, label: str) -> "dict[str, float]":
     each value a non-bool finite number > 0. Returns a cleaned copy."""
     if not isinstance(v, dict):
         raise _BudgetConfigError(
-            f"{label} must be an object, got {type(v).__name__}"
+            f"{label} must be an object, got {type(v).__name__}", field=label
         )
     cleaned: "dict[str, float]" = {}
     for acc_key, acc_val in v.items():
         if not isinstance(acc_key, str) or not acc_key:
             raise _BudgetConfigError(
-                f"{label} keys must be non-empty strings (account keys)"
+                f"{label} keys must be non-empty strings (account keys)",
+                field=label,
             )
         if isinstance(acc_val, bool) or not isinstance(acc_val, (int, float)):
             raise _BudgetConfigError(
                 f"{label} values must be numbers, "
-                f"got {type(acc_val).__name__} for key {acc_key!r}"
+                f"got {type(acc_val).__name__} for key {acc_key!r}",
+                field=label,
             )
         if not math.isfinite(float(acc_val)) or float(acc_val) <= 0:
             raise _BudgetConfigError(
                 f"{label} values must be finite numbers > 0, "
-                f"got {acc_val!r} for key {acc_key!r}"
+                f"got {acc_val!r} for key {acc_key!r}",
+                field=label,
             )
         cleaned[acc_key] = float(acc_val)
     return cleaned
@@ -1125,7 +1180,8 @@ def _get_budget_config(cfg: dict) -> dict:
         return out
     if not isinstance(block, dict):
         raise _BudgetConfigError(
-            f"budget must be an object, got {type(block).__name__}"
+            f"budget must be an object, got {type(block).__name__}",
+            field="budget",
         )
     # warn-and-ignore unknown keys (forward compat; matches _get_alerts_config)
     for k in block.keys():
@@ -1140,16 +1196,25 @@ def _get_budget_config(cfg: dict) -> dict:
         if v is None:
             out["weekly_usd"] = None
         elif isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise _BudgetConfigError("budget.weekly_usd must be a number or null")
+            raise _BudgetConfigError(
+                "budget.weekly_usd must be a number or null",
+                field="budget.weekly_usd",
+            )
         elif not math.isfinite(float(v)) or float(v) <= 0:
-            raise _BudgetConfigError("budget.weekly_usd must be a finite number > 0")
+            raise _BudgetConfigError(
+                "budget.weekly_usd must be a finite number > 0",
+                field="budget.weekly_usd",
+            )
         else:
             out["weekly_usd"] = float(v)
 
     if "alerts_enabled" in block:
         v = block["alerts_enabled"]
         if not isinstance(v, bool):
-            raise _BudgetConfigError("budget.alerts_enabled must be a boolean")
+            raise _BudgetConfigError(
+                "budget.alerts_enabled must be a boolean",
+                field="budget.alerts_enabled",
+            )
         out["alerts_enabled"] = v
 
     if "alert_thresholds" in block:
@@ -1162,39 +1227,47 @@ def _get_budget_config(cfg: dict) -> dict:
         if not isinstance(v, str) or v not in BUDGET_PERIODS:
             raise _BudgetConfigError(
                 "budget.period must be one of "
-                f"{', '.join(BUDGET_PERIODS)}, got {v!r}"
+                f"{', '.join(BUDGET_PERIODS)}, got {v!r}",
+                field="budget.period",
             )
         out["period"] = v
 
     if "projected_enabled" in block:
         v = block["projected_enabled"]
         if not isinstance(v, bool):
-            raise _BudgetConfigError("budget.projected_enabled must be a boolean")
+            raise _BudgetConfigError(
+                "budget.projected_enabled must be a boolean",
+                field="budget.projected_enabled",
+            )
         out["projected_enabled"] = v
 
     if "projects" in block:
         v = block["projects"]
         if not isinstance(v, dict):
             raise _BudgetConfigError(
-                f"budget.projects must be an object, got {type(v).__name__}"
+                f"budget.projects must be an object, got {type(v).__name__}",
+                field="budget.projects",
             )
         cleaned: "dict[str, float]" = {}
         for proj_key, proj_val in v.items():
             if not isinstance(proj_key, str):
                 raise _BudgetConfigError(
-                    "budget.projects keys must be strings (canonical git-root paths)"
+                    "budget.projects keys must be strings (canonical git-root paths)",
+                    field="budget.projects",
                 )
             # Reuse the weekly_usd numeric rule per value: a non-bool finite
             # number > 0 (bool is an int subclass, so reject it explicitly).
             if isinstance(proj_val, bool) or not isinstance(proj_val, (int, float)):
                 raise _BudgetConfigError(
                     f"budget.projects values must be numbers, "
-                    f"got {type(proj_val).__name__} for key {proj_key!r}"
+                    f"got {type(proj_val).__name__} for key {proj_key!r}",
+                    field="budget.projects",
                 )
             if not math.isfinite(float(proj_val)) or float(proj_val) <= 0:
                 raise _BudgetConfigError(
                     f"budget.projects values must be finite numbers > 0, "
-                    f"got {proj_val!r} for key {proj_key!r}"
+                    f"got {proj_val!r} for key {proj_key!r}",
+                    field="budget.projects",
                 )
             cleaned[proj_key] = float(proj_val)
         out["projects"] = cleaned
@@ -1203,7 +1276,8 @@ def _get_budget_config(cfg: dict) -> dict:
         v = block["project_alerts_enabled"]
         if not isinstance(v, bool):
             raise _BudgetConfigError(
-                "budget.project_alerts_enabled must be a boolean"
+                "budget.project_alerts_enabled must be a boolean",
+                field="budget.project_alerts_enabled",
             )
         out["project_alerts_enabled"] = v
 
@@ -1227,13 +1301,17 @@ def _validate_budget_thresholds(v: object, label: str) -> "list[int]":
     an empty list is allowed (alerts silenced).
     """
     if not isinstance(v, list):
-        raise _BudgetConfigError(f"{label} must be a list of ints")
+        raise _BudgetConfigError(f"{label} must be a list of ints", field=label)
     cleaned: "list[int]" = []
     for t in v:
         if isinstance(t, bool) or not isinstance(t, int):
-            raise _BudgetConfigError(f"{label} entries must be integers")
+            raise _BudgetConfigError(
+                f"{label} entries must be integers", field=label
+            )
         if t < 1 or t > 100:
-            raise _BudgetConfigError(f"{label} entries must be in [1, 100]")
+            raise _BudgetConfigError(
+                f"{label} entries must be in [1, 100]", field=label
+            )
         cleaned.append(t)
     return sorted(set(cleaned))  # empty list allowed (silenced)
 
@@ -1252,7 +1330,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
         return None
     if not isinstance(v, dict):
         raise _BudgetConfigError(
-            f"budget.codex must be an object or null, got {type(v).__name__}"
+            f"budget.codex must be an object or null, got {type(v).__name__}",
+            field="budget.codex",
         )
     # warn-and-ignore unknown sub-keys (forward compat, like the parent block)
     for k in v.keys():
@@ -1283,7 +1362,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
     elif not _has_codex_accounts:
         raise _BudgetConfigError(
             "budget.codex.amount_usd is required (or set a per-account "
-            "budget.codex.accounts map)"
+            "budget.codex.accounts map)",
+            field="budget.codex.amount_usd",
         )
 
     if "period" in v:
@@ -1292,7 +1372,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
             raise _BudgetConfigError(
                 "budget.codex.period must be one of "
                 f"{', '.join(CODEX_BUDGET_PERIODS)} (NOT subscription-week), "
-                f"got {p!r}"
+                f"got {p!r}",
+                field="budget.codex.period",
             )
         out["period"] = p
 
@@ -1300,7 +1381,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
         ae = v["alerts_enabled"]
         if not isinstance(ae, bool):
             raise _BudgetConfigError(
-                "budget.codex.alerts_enabled must be a boolean"
+                "budget.codex.alerts_enabled must be a boolean",
+                field="budget.codex.alerts_enabled",
             )
         out["alerts_enabled"] = ae
 
@@ -1313,7 +1395,8 @@ def _validate_codex_budget_block(v: object) -> "dict | None":
         pe = v["projected_enabled"]
         if not isinstance(pe, bool):
             raise _BudgetConfigError(
-                "budget.codex.projected_enabled must be a boolean"
+                "budget.codex.projected_enabled must be a boolean",
+                field="budget.codex.projected_enabled",
             )
         out["projected_enabled"] = pe
 

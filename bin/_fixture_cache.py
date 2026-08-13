@@ -15,16 +15,21 @@ from __future__ import annotations
 import argparse, ast, hashlib, os, shutil, sqlite3, subprocess, sys, tempfile
 from pathlib import Path
 
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 BIN_DIR = Path(__file__).resolve().parent
 _TRANSIENT = (".db-wal", ".db-shm", ".db-journal",
               ".sqlite-wal", ".sqlite-shm", ".sqlite-journal")
-# Curated allowlist — the ONLY env vars passed to a builder subprocess, so an
-# ambient var can never change fixture bytes without changing the key. Expand
-# only if a wired builder errors under the sanitized env (never add a byte-
-# affecting var like CCTALLY_MIGRATION_TEST_MODE).
-_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "TMP", "TEMP", "TZ",
-             "LANG", "LC_ALL", "LC_CTYPE", "CCTALLY_DISABLE_DEV_AUTODETECT")
+# Every variable forwarded to a builder subprocess, classified by whether it
+# can change fixture BYTES. Semantic variables enter the cache key; operational
+# ones are forwarded so a builder can run at all and must not change a single
+# output byte — a contract tests/test_fixture_cache.py enforces by differential
+# rather than by assertion. The forward set IS this map's keys, so a variable
+# cannot be forwarded without being classified.
+_ENV_SEMANTIC = ("CCTALLY_DISABLE_DEV_AUTODETECT", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+_ENV_OPERATIONAL = ("HOME", "PATH", "TEMP", "TMP", "TMPDIR")
+_ENV_POLICY = {n: "semantic" for n in _ENV_SEMANTIC}
+_ENV_POLICY.update({n: "operational" for n in _ENV_OPERATIONAL})
+_ENV_KEEP = tuple(sorted(_ENV_POLICY))
 
 
 def _emit(marker: str, label: str) -> None:
@@ -84,7 +89,7 @@ def _h(h, data: bytes) -> None:
 
 
 def compute_key(builder_path, *, sqlite_version, compile_options,
-                fts5_available, python_id) -> str:
+                fts5_available, python_id, env) -> str:
     d = hashlib.sha256()
     _h(d, str(CACHE_FORMAT_VERSION).encode())
     for src in transitive_bin_sources(builder_path):
@@ -93,6 +98,14 @@ def compute_key(builder_path, *, sqlite_version, compile_options,
     for opt in compile_options: _h(d, opt.encode())
     _h(d, b"fts5:1" if fts5_available else b"fts5:0")
     _h(d, python_id.encode())
+    # The distinct set/unset markers are what keep an unset variable and one
+    # set to "" from hashing alike; `_h`'s framing only separates fields.
+    for name in sorted(_ENV_SEMANTIC):
+        _h(d, name.encode())
+        if name in env:
+            _h(d, b"set"); _h(d, env[name].encode())
+        else:
+            _h(d, b"unset")
     return d.hexdigest()
 
 
@@ -124,10 +137,12 @@ def _sanitized_env() -> dict:
     return {k: os.environ[k] for k in _ENV_KEEP if k in os.environ}
 
 
-def _run_builder(builder: Path, out: Path) -> int:
+def _run_builder(builder: Path, out: Path, env: dict) -> int:
+    # `env` is passed in, never re-derived here, so the mapping the key hashes
+    # and the mapping the builder receives cannot diverge within one run().
     out.mkdir(parents=True, exist_ok=True)
     return subprocess.run([sys.executable, str(builder), "--out", str(out)],
-                          env=_sanitized_env(), stdout=subprocess.DEVNULL).returncode
+                          env=env, stdout=subprocess.DEVNULL).returncode
 
 
 def _copy_tree_into(src: Path, dest: Path) -> None:
@@ -207,10 +222,10 @@ def _tree_diff(a: Path, b: Path) -> "list[str]":
     return diffs
 
 
-def _verify_clean_hit(builder: Path, out: Path, label: str) -> int:
+def _verify_clean_hit(builder: Path, out: Path, label: str, env: dict) -> int:
     with tempfile.TemporaryDirectory(prefix=f"fcverify-{label}-") as td:
         fresh = Path(td) / "fresh"
-        rc = _run_builder(builder, fresh)
+        rc = _run_builder(builder, fresh, env)
         if rc != 0:
             sys.stderr.write(f"fixture-cache: VERIFY build failed {label}\n"); return rc
         diffs = _tree_diff(out, fresh)
@@ -227,16 +242,20 @@ def run(builder: Path, out: Path) -> int:
     builder = Path(builder); out = Path(out)
     label = label_for(builder)
     verify = os.environ.get("CCTALLY_FIXTURE_CACHE_VERIFY") == "1"
+    # Snapshot the forwarded environment ONCE, before any branch, so the key
+    # can never describe an environment the builder did not receive.
+    builder_env = _sanitized_env()
     if os.environ.get("CCTALLY_FIXTURE_CACHE") == "0":
-        _emit("BYPASS", label); return _run_builder(builder, out)
+        _emit("BYPASS", label); return _run_builder(builder, out, builder_env)
     try:
         sv, opts, fts5 = sqlite_fingerprint()
         key = compute_key(builder, sqlite_version=sv, compile_options=opts,
-                          fts5_available=fts5, python_id=python_identity())
+                          fts5_available=fts5, python_id=python_identity(),
+                          env=builder_env)
         entry = cache_root() / f"{label}__{key}"
         lock = cache_root() / f"{label}__{key}.lock"
     except Exception:
-        _emit("MISS", label); return _run_builder(builder, out)
+        _emit("MISS", label); return _run_builder(builder, out, builder_env)
     if entry.is_dir():
         corrupt = False
         try:
@@ -247,7 +266,7 @@ def run(builder: Path, out: Path) -> int:
             # entry. A missing/corrupt MANIFEST raises → caught below → corrupt.
             if _restore(entry, out):
                 _emit("HIT", label)
-                return _verify_clean_hit(builder, out, label) if verify else 0
+                return _verify_clean_hit(builder, out, label, builder_env) if verify else 0
             corrupt = True
         except Exception:
             corrupt = True
@@ -257,7 +276,7 @@ def run(builder: Path, out: Path) -> int:
                 sys.stderr.write(f"fixture-cache: AUDIT FAILURE (corrupt entry) {label}\n")
                 return 3
             shutil.rmtree(entry, ignore_errors=True); _clear_dir(out)
-    rc = _run_builder(builder, out)
+    rc = _run_builder(builder, out, builder_env)
     if rc != 0: _emit("MISS", label); return rc
     _try_store(out, entry, lock); _emit("MISS", label); return 0
 

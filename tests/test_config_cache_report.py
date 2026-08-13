@@ -206,7 +206,15 @@ def test_http_cache_report_valid_round_trip(monkeypatch, tmp_path):
 
 
 def test_http_cache_report_invalid_threshold_returns_400(monkeypatch, tmp_path):
-    """Out-of-range threshold → 400 with field='anomaly_threshold_pp'."""
+    """Out-of-range threshold → 400 with field='cache_report.anomaly_threshold_pp'.
+
+    The pure validator still raises with the bare leaf name (the
+    ``test_validate_rejects_*`` cases above pin that); the HTTP contract is
+    dotted end to end since #513 S1, so the handler qualifies it. A mixed
+    convention would be worse than either: an unknown leaf under this block
+    is reported by the classification pass with a dotted path, so a bare
+    pointer here would make one block answer in two shapes.
+    """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     _wire_handlers(ns)
@@ -218,7 +226,7 @@ def test_http_cache_report_invalid_threshold_returns_400(monkeypatch, tmp_path):
         )
         assert status == 400, body
         assert body is not None
-        assert body.get("field") == "anomaly_threshold_pp"
+        assert body.get("field") == "cache_report.anomaly_threshold_pp"
     finally:
         srv.shutdown()
 

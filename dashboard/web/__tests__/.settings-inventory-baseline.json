@@ -1,0 +1,1485 @@
+{
+  "total": 94,
+  "perFile": {
+    "src/components/SettingsOverlay.test.tsx": 56,
+    "src/components/SettingsOverlay.lanAuth.test.tsx": 3,
+    "src/components/SettingsOverlay.source.test.tsx": 7,
+    "__tests__/SettingsOverlay.test.tsx": 20,
+    "__tests__/SettingsOverlay-layout.test.tsx": 2,
+    "__tests__/SettingsOverlay-tableSort.test.tsx": 6
+  },
+  "cases": [
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> test-alert axis picker > POSTs the SELECTED axis (budget) with threshold 90",
+      "paramExpansionCount": 1,
+      "callbackHash": "e2595e35a70b9b37",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> test-alert axis picker > reveals a metric sub-select for projected and POSTs the chosen metric",
+      "paramExpansionCount": 1,
+      "callbackHash": "4580b3350a2363ba",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> test-alert axis picker > omits metric from the body for non-projected axes",
+      "paramExpansionCount": 1,
+      "callbackHash": "fdebdd934c11d0e1",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> restore view preferences button (#207 D9 → #252) > Restore view preferences mutates the sort field and posts nothing until Save",
+      "paramExpansionCount": 1,
+      "callbackHash": "f97b2a268727dfb0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> test-alert inline confirmation (#207 D4) > shows an inline confirmation when the test alert is queued",
+      "paramExpansionCount": 1,
+      "callbackHash": "d42af9e75c9035e5",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> test-alert inline confirmation (#207 D4) > shows the error, not the confirmation, on a non-queued dispatch",
+      "paramExpansionCount": 1,
+      "callbackHash": "c69953ad5c033ad6",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> notifier dropdown > disables the \"Custom command\" option when command_configured is false",
+      "paramExpansionCount": 1,
+      "callbackHash": "81a289481f4f2a1b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> notifier dropdown > enables the \"Custom command\" option when command_configured is true",
+      "paramExpansionCount": 1,
+      "callbackHash": "b9114336f8aba362",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> notifier dropdown > POSTs alerts.notifier when the notifier select changes",
+      "paramExpansionCount": 1,
+      "callbackHash": "2d52c708022b8a1b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> notifier dropdown > does NOT POST alerts.notifier when the notifier is unchanged",
+      "paramExpansionCount": 1,
+      "callbackHash": "a41d96420868f38d",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> per-project budget alerts toggle > renders the toggle seeded from project_alerts_enabled",
+      "paramExpansionCount": 1,
+      "callbackHash": "10dd50f6cfbae6dd",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> per-project budget alerts toggle > POSTs budget.project_alerts_enabled when toggled on",
+      "paramExpansionCount": 1,
+      "callbackHash": "2e988b4377a247c6",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> per-project budget alerts toggle > does NOT POST when the per-project toggle is unchanged",
+      "paramExpansionCount": 1,
+      "callbackHash": "b50967e33e17bdaf",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > renders both toggles disabled + a CLI hint when no Codex budget is configured",
+      "paramExpansionCount": 1,
+      "callbackHash": "c2a34e1ce55b472b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > enables + seeds both toggles when a Codex budget is configured",
+      "paramExpansionCount": 1,
+      "callbackHash": "e55ffbc2334eb32c",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > POSTs budget.codex.alerts_enabled (nested, no other codex keys) when toggled on",
+      "paramExpansionCount": 1,
+      "callbackHash": "7c507e1ff3d5552f",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > POSTs budget.codex.projected_enabled when the projected toggle flips on",
+      "paramExpansionCount": 1,
+      "callbackHash": "e917fbf202d5c35b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > does NOT POST when neither Codex toggle is dirty",
+      "paramExpansionCount": 1,
+      "callbackHash": "f98188fed9e73a0f",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Codex budget toggles > POSTs BOTH a flat Claude leaf and budget.codex when co-dirty in one Save",
+      "paramExpansionCount": 1,
+      "callbackHash": "9fc1a46ed35bb16b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > defaults the checkbox checked (markers ON) before any tick",
+      "paramExpansionCount": 1,
+      "callbackHash": "dc99c69f07cbafbc",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > seeds the checkbox from dashboard_prefs (OFF when the server reports false)",
+      "paramExpansionCount": 1,
+      "callbackHash": "5a2e4748f7872ac9",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > POSTs dashboard.cache_failure_markers=false in the combined Save body when toggled off",
+      "paramExpansionCount": 1,
+      "callbackHash": "92f5daade9829127",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > POSTs cache_failure_markers=true when re-enabled from an OFF server state",
+      "paramExpansionCount": 1,
+      "callbackHash": "a5b4862a50059c1b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > does NOT POST when the markers toggle is unchanged",
+      "paramExpansionCount": 1,
+      "callbackHash": "275f7214d7e0c6f5",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> cache-failure markers toggle > re-seeds the checkbox when a fresh dashboard_prefs tick arrives while open",
+      "paramExpansionCount": 1,
+      "callbackHash": "1310779777a72b76",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > defaults the checkbox checked (live-tail ON) before any tick",
+      "paramExpansionCount": 1,
+      "callbackHash": "03ee4e5ee95ad923",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > seeds the checkbox from dashboard_prefs (OFF when the server reports false)",
+      "paramExpansionCount": 1,
+      "callbackHash": "baa5c98140f81734",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > POSTs dashboard.live_tail=false in the combined Save body when toggled off",
+      "paramExpansionCount": 1,
+      "callbackHash": "ab9dcf5fe4cdc63b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > POSTs live_tail=true when re-enabled from an OFF server state",
+      "paramExpansionCount": 1,
+      "callbackHash": "37df526658e78ad6",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > does NOT POST when the live-tail toggle is unchanged",
+      "paramExpansionCount": 1,
+      "callbackHash": "038f887293c4d926",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > carries both leaves in one dashboard block when both toggles are dirty",
+      "paramExpansionCount": 1,
+      "callbackHash": "2ff947846422a70a",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> live-tail toggle > re-seeds the checkbox when a fresh dashboard_prefs tick arrives while open",
+      "paramExpansionCount": 1,
+      "callbackHash": "2417a369c0320a7c",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> swallows `0` while open (#156) > `0` does not reach the global 10th-panel opener while Settings is open",
+      "paramExpansionCount": 1,
+      "callbackHash": "c693fbfaacb47c70",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dirty-state feedback (SET-1) > Save reads plain \"Save\" and is disabled when nothing is dirty",
+      "paramExpansionCount": 1,
+      "callbackHash": "a267d05eabeaa1d2",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dirty-state feedback (SET-1) > badges the change count and enables Save as fields dirty",
+      "paramExpansionCount": 1,
+      "callbackHash": "b7aaf22178f39eda",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dirty-state feedback (SET-1) > does NOT clear the sessions column sort when only a server field is saved",
+      "paramExpansionCount": 1,
+      "callbackHash": "7be2c7bb8d4812d4",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> alerts source-scoped grouping (Task 8) > renders distinct Notifications / Claude / Codex groups",
+      "paramExpansionCount": 1,
+      "callbackHash": "15792a11e6e90396",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> alerts source-scoped grouping (Task 8) > flipping the threshold master does not disable the budget/Codex toggles",
+      "paramExpansionCount": 1,
+      "callbackHash": "de1bc0ed7bf9f55b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2/SET-6) > staging Card order does NOT dispatch until Save, and does not drop a pending notifier edit",
+      "paramExpansionCount": 1,
+      "callbackHash": "5eb3511b3fb0921c",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2/SET-6) > staging Table column sorting is deferred, then clears all overrides on Save",
+      "paramExpansionCount": 1,
+      "callbackHash": "29b05eae1fefd8d7",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2/SET-6) > a History table-sort override enables the Table-sort reset and Save clears it (S8 #254)",
+      "paramExpansionCount": 1,
+      "callbackHash": "065bc9f7bcebdf2f",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2/SET-6) > Restore view preferences resets the sort field only (narrowed), deferred",
+      "paramExpansionCount": 1,
+      "callbackHash": "88b3b5c61765f901",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> per-fieldset changed markers (SET-1) > marks the Notifications fieldset changed after a notifier edit, not Sort default",
+      "paramExpansionCount": 1,
+      "callbackHash": "e14a3d7761d24af0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dismiss guard > Esc while dirty shows a confirm and keeps the overlay open; Keep editing dismisses it",
+      "paramExpansionCount": 1,
+      "callbackHash": "803103ca5d0fb7d0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dismiss guard > Esc while dirty then Discard closes the overlay",
+      "paramExpansionCount": 1,
+      "callbackHash": "6213c0f19e6ee637",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dismiss guard > Esc while clean closes immediately with no confirm",
+      "paramExpansionCount": 1,
+      "callbackHash": "6c0f05f7d074d10f",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> dismiss guard > the × button while dirty closes directly, no confirm",
+      "paramExpansionCount": 1,
+      "callbackHash": "1a9dc4c8e569732c",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> discards uncommitted edits on reopen (review P2) > re-seeds the live-tail toggle from the server after Cancel + reopen",
+      "paramExpansionCount": 1,
+      "callbackHash": "148a5af7a5361301",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> discards uncommitted edits on reopen (review P2) > marks the modal body inert while the discard confirm is open",
+      "paramExpansionCount": 1,
+      "callbackHash": "132bbb5bf4a522a1",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Card-order restore gating (review P3) > disables the Card order toggle at the default panel order, enables it after a reorder",
+      "paramExpansionCount": 1,
+      "callbackHash": "b600e3161beffac0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> re-seed conflict guard (#258) > keeps a pending notifier edit when a concurrent same-field tick arrives",
+      "paramExpansionCount": 1,
+      "callbackHash": "99ad3dcb6dc6af16",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> re-seed conflict guard (#258) > keeps a pending boolean edit when an UNRELATED field ticks (on-open clobber site)",
+      "paramExpansionCount": 1,
+      "callbackHash": "d5fdc9fde2db9cf8",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> re-seed conflict guard (#258) > adopts a concurrent write to a DIFFERENT field while holding a pending edit",
+      "paramExpansionCount": 1,
+      "callbackHash": "e60f23f184ce64ac",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> re-seed conflict guard (#258) > re-adopts after the user manually rejoins the new server value (ref updates in keep branch)",
+      "paramExpansionCount": 1,
+      "callbackHash": "083721df6ffe9444",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> update channel toggle > seeds the toggle from the envelope configured_channel",
+      "paramExpansionCount": 1,
+      "callbackHash": "6e4364811a532123",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> update channel toggle > POSTs update.channel when the toggle flips to beta",
+      "paramExpansionCount": 1,
+      "callbackHash": "de01930ad12eb859",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "2fbf6b93f7f49810"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "fc6c39a14747a3b6"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.lanAuth.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> LAN authentication > defaults the restart-only access-token toggle on",
+      "paramExpansionCount": 1,
+      "callbackHash": "5c61a5719a253a88",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "19934901c9309013"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.lanAuth.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> LAN authentication > persists the opt-out, stays open, and reports the required restart",
+      "paramExpansionCount": 1,
+      "callbackHash": "0b7fc9100634f3ed",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "19934901c9309013"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.lanAuth.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> LAN authentication > seeds an explicit server opt-out as unchecked",
+      "paramExpansionCount": 1,
+      "callbackHash": "6b35718d4102cff7",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "19934901c9309013"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > renders Notifications / Claude alerts / Codex alerts groups",
+      "paramExpansionCount": 1,
+      "callbackHash": "3956442db7def7d0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > the global group carries the notifier select with command gating disabled",
+      "paramExpansionCount": 1,
+      "callbackHash": "46c322298bd54432",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > enables the command option when a command template is configured",
+      "paramExpansionCount": 1,
+      "callbackHash": "38e27b48d74fd6dd",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > the Claude group has a labeled Claude-budget subgroup with both budget toggles",
+      "paramExpansionCount": 1,
+      "callbackHash": "7cdb7fff013e32b4",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > the Codex group states quota rules are not configurable here (CLI pointer)",
+      "paramExpansionCount": 1,
+      "callbackHash": "5a12e6bc5bf6bae1",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > POST /api/settings body keys are byte-identical after regrouping",
+      "paramExpansionCount": 1,
+      "callbackHash": "8a76c04209e2cf5b",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "src/components/SettingsOverlay.source.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> three source-scoped alert groups > reconcile() does not clobber a dirty edit on an unrelated SSE tick",
+      "paramExpansionCount": 1,
+      "callbackHash": "1e74c3b2e50d366c",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "7b0f3dfe179a78a3"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "b716401c337758c0"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > opens on \"s\" and Save persists prefs",
+      "paramExpansionCount": 1,
+      "callbackHash": "e0101b418d1cc479",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > Restore view preferences is deferred — mutates the working copy, persists on Save",
+      "paramExpansionCount": 1,
+      "callbackHash": "3949935025a21058",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > reopen after Cancel shows current prefs, not stale local values",
+      "paramExpansionCount": 1,
+      "callbackHash": "93a5ab8ccb698855",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > `s` is a no-op while a modal is open (no stacked overlay)",
+      "paramExpansionCount": 1,
+      "callbackHash": "e9c1476c2658a866",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > Escape closes the overlay",
+      "paramExpansionCount": 1,
+      "callbackHash": "0ffe2eda6691af55",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > renders alerts fieldset with toggle bound to alertsConfig.enabled (default false → unchecked)",
+      "paramExpansionCount": 1,
+      "callbackHash": "bb3f024d1beb1554",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > clicking toggle dirties Save, then Save POSTs /api/settings with {alerts: {enabled: true}}",
+      "paramExpansionCount": 1,
+      "callbackHash": "154a2b1d35ab2687",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > test alert button POSTs /api/alerts/test and dispatches SHOW_ALERT_TOAST on queued",
+      "paramExpansionCount": 1,
+      "callbackHash": "ada4aad2e007c527",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > test alert button surfaces toast AND error when dispatch returns spawn_error",
+      "paramExpansionCount": 1,
+      "callbackHash": "aa1dda1cbf27d33a",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > renders read-only threshold summary line from alertsConfig (spec §8.1)",
+      "paramExpansionCount": 1,
+      "callbackHash": "97c60843bb4ea4ba",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > test alert button stays enabled when alertsConfig.enabled toggles to false",
+      "paramExpansionCount": 1,
+      "callbackHash": "2cc6b89ac3b6971a",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > projected toggles render unchecked by default (issue #121)",
+      "paramExpansionCount": 1,
+      "callbackHash": "1216f68ad5a10781",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > projected-weekly toggle POSTs {alerts: {projected_enabled: true}} (issue #121)",
+      "paramExpansionCount": 1,
+      "callbackHash": "92138add3e5270d6",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > projected-budget toggle POSTs {budget: {projected_enabled: true}} in its own block (issue #121)",
+      "paramExpansionCount": 1,
+      "callbackHash": "a7bf8281ec003653",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > master alerts + projected-weekly both dirty → one alerts block with both keys (issue #121)",
+      "paramExpansionCount": 1,
+      "callbackHash": "1caf464527305ba0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > projected test axis option appears in the Send-test-alert axis select (issue #121)",
+      "paramExpansionCount": 1,
+      "callbackHash": "0e8f47088a0504e0",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > alerts fieldset (T9) > combined save: tz dirty + alerts dirty → single POST with both blocks",
+      "paramExpansionCount": 1,
+      "callbackHash": "0331c25898a2215f",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "c4c862e22f128cff"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > swallows \"5\" while open so it does not stack the daily modal",
+      "paramExpansionCount": 3,
+      "callbackHash": "9f0e3fea12604717",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > swallows \"6\" while open so it does not stack the daily modal",
+      "paramExpansionCount": 3,
+      "callbackHash": "9f0e3fea12604717",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> > swallows \"8\" while open so it does not stack the daily modal",
+      "paramExpansionCount": 3,
+      "callbackHash": "9f0e3fea12604717",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-layout.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Card order reset (deferred) > shows a \"Card order\" button in the Restore defaults fieldset",
+      "paramExpansionCount": 1,
+      "callbackHash": "2cba91322c490baf",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-layout.test.tsx",
+      "qualifiedName": "<SettingsOverlay /> Card order reset (deferred) > staging \"Card order\" is deferred, then Save restores DEFAULT_PANEL_ORDER and leaves other prefs",
+      "paramExpansionCount": 1,
+      "callbackHash": "a183f83b8b8162e1",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > renders a \"Table column sorting\" button when overlay is open",
+      "paramExpansionCount": 1,
+      "callbackHash": "70ccf2d78e32255e",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > button is disabled when no override exists and nothing is staged",
+      "paramExpansionCount": 1,
+      "callbackHash": "efe40faef178eadd",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > button is enabled when at least one override exists (any of the three)",
+      "paramExpansionCount": 1,
+      "callbackHash": "5a1529153aff21d4",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > clicking stages the reset (deferred) — overlay stays open, overrides untouched until Save",
+      "paramExpansionCount": 1,
+      "callbackHash": "21f929a3caba4319",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > Save applies the staged reset: CLEAR_TABLE_SORTS clears all three overrides",
+      "paramExpansionCount": 1,
+      "callbackHash": "0931b2c60a84d713",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    },
+    {
+      "file": "__tests__/SettingsOverlay-tableSort.test.tsx",
+      "qualifiedName": "SettingsOverlay — Table column sorting reset (deferred) > Save does NOT clear column sorts when nothing is staged and the sort default is unchanged",
+      "paramExpansionCount": 1,
+      "callbackHash": "5d705ac77d227dbf",
+      "hooks": [
+        {
+          "kind": "beforeEach",
+          "hash": "561d07bf3dd5d9fe"
+        },
+        {
+          "kind": "afterEach",
+          "hash": "3b44789bd5246913"
+        }
+      ]
+    }
+  ]
+}

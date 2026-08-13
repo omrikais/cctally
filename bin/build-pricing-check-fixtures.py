@@ -177,4 +177,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    _parser = argparse.ArgumentParser(description=__doc__)
+    _parser.add_argument(
+        "--out", type=pathlib.Path, default=None,
+        help="Override the output directory (defaults to tests/fixtures/pricing-check/). Harnesses build into a per-run scratch dir so the committed fixtures stay byte-stable and a test run leaves the tracked tree unchanged.",
+    )
+    _args = _parser.parse_args()
+    if _args.out is not None:
+        ROOT = _args.out
     main()

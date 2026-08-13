@@ -42,7 +42,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$REPO_ROOT/bin/_lib-harness-env.sh"
 # git grep pathspecs below are repo-relative — root the process here so
 # the harness behaves identically from any invocation cwd.
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 pass_count=0
 fail_count=0

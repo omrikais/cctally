@@ -59,9 +59,7 @@ compare_forms() {
     local name="$label"  # _golden_diff_two_str uses $name in FAIL lines
     local o1 o2 e1 e2 r1 r2
     # word-split arglines intentionally (flags); disable SC2086 locally
-    # shellcheck disable=SC2086
     o1=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" $flat 2>"$SCRATCH/e1"); r1=$?
-    # shellcheck disable=SC2086
     o2=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 "$BIN" $sub 2>"$SCRATCH/e2"); r2=$?
     e1=$(cat "$SCRATCH/e1"); e2=$(cat "$SCRATCH/e2")
     local ok=1
@@ -80,9 +78,7 @@ compare_forms_stdin() {
     local label="$1" home="$2" flat="$3" sub="$4" input="$5"
     local name="$label"
     local o1 o2 e1 e2 r1 r2
-    # shellcheck disable=SC2086
     o1=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="2026-05-28T12:00:00Z" "$BIN" $flat < "$input" 2>"$SCRATCH/e1"); r1=$?
-    # shellcheck disable=SC2086
     o2=$(HOME="$home" CCTALLY_DATA_DIR="$home/.local/share/cctally" TZ=Etc/UTC NO_COLOR=1 CCTALLY_AS_OF="2026-05-28T12:00:00Z" "$BIN" $sub < "$input" 2>"$SCRATCH/e2"); r2=$?
     e1=$(cat "$SCRATCH/e1"); e2=$(cat "$SCRATCH/e2")
     local ok=1
@@ -139,7 +135,6 @@ compare_forms "codex-daily-speed-fast" "$CODEX_HOME" "codex-daily --speed fast" 
 # --- help surfaces ---
 check_help() {  # check_help <label> <argline> <grep-extended-regex>
     local label="$1" argline="$2" pat="$3"
-    # shellcheck disable=SC2086
     if HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" $argline 2>&1 | grep -qE "$pat"; then
         pass=$((pass+1)); else echo "FAIL[$label] help missing /$pat/"; fail=$((fail+1)); fi
 }
@@ -150,7 +145,6 @@ check_help() {  # check_help <label> <argline> <grep-extended-regex>
 check_help_lists() {
     local label="$1" argline="$2"; shift 2
     local out leaf missing=""
-    # shellcheck disable=SC2086
     out=$(HOME="$SCRATCH" CCTALLY_DATA_DIR="$SCRATCH/.local/share/cctally" "$BIN" $argline 2>&1)
     for leaf in "$@"; do
         printf '%s\n' "$out" | grep -qw "$leaf" || missing="$missing $leaf"

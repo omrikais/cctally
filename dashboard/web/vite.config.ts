@@ -124,7 +124,17 @@ export default defineConfig({
     // COLLECT those Playwright specs and fail (no vitest globals there). Preserve
     // the defaults and add `e2e/**` on top — a bare `['e2e/**']` would drop
     // node_modules/dist from the ignore set and slow every run.
-    exclude: [...configDefaults.exclude, 'e2e/**'],
+    // #513 S2 §6.3 — the three superseded SettingsOverlay suites were deleted
+    // once their replacements had proven themselves. The exclusion is the file
+    // GLOB, never the whole `__tests__` directory: `setup.ts` loads from there
+    // via `setupFiles` and a dozen live suites still live there.
+    // `src/components/settings/legacySuiteGuard.test.ts` fails if one comes
+    // back, so an excluded-but-present file is loud rather than invisible.
+    exclude: [
+      ...configDefaults.exclude,
+      'e2e/**',
+      '__tests__/SettingsOverlay*.test.tsx',
+    ],
     // Auto-undo `vi.stubGlobal(...)` between tests. Without this, a stub like
     // `stubMobileMedia`'s `matchMedia` (vi.stubGlobal, which restoreAllMocks
     // does NOT undo) leaks into every later test in the file, so `useIsMobile()`

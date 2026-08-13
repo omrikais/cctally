@@ -320,6 +320,10 @@ STATUSLINE_SELECTED_PATH = _cctally_core.STATUSLINE_SELECTED_PATH
 STATUSLINE_TRANSPORT_MARKER_PATH = _cctally_core.STATUSLINE_TRANSPORT_MARKER_PATH
 STATUSLINE_AUTHORITATIVE_7D_PATH = _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH
 STATUSLINE_AUTHORITATIVE_5H_PATH = _cctally_core.STATUSLINE_AUTHORITATIVE_5H_PATH
+# Host-global, NOT APP_DIR-derived (#529 S4). Readers resolve it through
+# _cctally_core at call time; this re-export exists for introspection parity
+# with the other statusline constants.
+STATUSLINE_OAUTH_CACHE_PATH = _cctally_core.STATUSLINE_OAUTH_CACHE_PATH
 OAUTH_BACKOFF_MARKER_PATH = _cctally_core.OAUTH_BACKOFF_MARKER_PATH
 STATUSLINE_CANDIDATE_TTL_SECONDS = _cctally_core.STATUSLINE_CANDIDATE_TTL_SECONDS
 STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS = _cctally_core.STATUSLINE_CANDIDATE_FUTURE_SKEW_SECONDS
@@ -1830,7 +1834,7 @@ def _decode_escaped_cwd(dir_name: str) -> str:
     Claude stores JSONL files under ~/.claude/projects/<escaped-cwd>/<uuid>.jsonl
     where `<escaped-cwd>` replaces path separators with '-' and adds a leading
     '-'. This function reverses that transform:
-        "-Volumes-TRANSCEND-repos-foo" -> "/Volumes/TRANSCEND/repos/foo"
+        "-Volumes-Scratch-repos-foo" -> "/Volumes/Scratch/repos/foo"
 
     Lossy: original path dashes become slashes. Preferred alternative at the
     caller site is to pull `cwd` from the JSONL itself when present.

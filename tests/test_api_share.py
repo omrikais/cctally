@@ -750,6 +750,40 @@ def test_presets_save_with_explicit_false_overwrite_also_conflicts(
     assert body["code"] == "preset_name_conflict"
 
 
+@pytest.mark.parametrize("path", (
+    "/api/share/presets",
+    "/api/share/presets/rename",
+))
+def test_preset_mutations_reject_non_boolean_overwrite(
+    dashboard_server, path,
+):
+    """A truthy JSON string must not bypass either conflict gate."""
+    port, _ = dashboard_server
+    _seed_preset(port, "team-monday", source="codex", theme="dark")
+    _seed_preset(port, "deep-dive", source="claude", theme="light")
+    payload = (
+        {
+            "panel": "weekly", "name": "team-monday",
+            "template_id": "weekly-recap", "source": "claude",
+            "options": {"theme": "light", "format": "html"},
+            "overwrite": "false",
+        }
+        if path.endswith("presets") else
+        {
+            "panel": "weekly", "from_name": "team-monday",
+            "to_name": "deep-dive", "overwrite": "false",
+        }
+    )
+
+    status, body = _presets_post(port, payload, path=path)
+
+    assert status == 400, body
+    assert body["field"] == "overwrite"
+    presets = _presets_get(port)["weekly"]
+    assert presets["team-monday"]["source"] == "codex"
+    assert presets["deep-dive"]["source"] == "claude"
+
+
 def test_presets_post_csrf_gate(dashboard_server):
     """POST without matching Origin returns 403."""
     port, _ = dashboard_server
@@ -1468,6 +1502,45 @@ def test_render_anonymizes_when_reveal_projects_is_absent(dashboard_server):
                  "project_allowlist": None},
     )["body"]
     assert "anonymized: true" in body
+
+
+@pytest.mark.parametrize("path,payload,field", (
+    (
+        "/api/share/render",
+        {
+            "panel": "weekly", "template_id": "weekly-recap",
+            "options": {
+                "format": "md", "theme": "light",
+                "reveal_projects": "false",
+            },
+        },
+        "options.reveal_projects",
+    ),
+    (
+        "/api/share/compose",
+        {
+            "title": "Composite", "theme": "light", "format": "md",
+            "reveal_projects": "false",
+            "sections": [_section_recipe("weekly", "weekly-recap")],
+        },
+        "reveal_projects",
+    ),
+))
+def test_share_endpoints_reject_non_boolean_reveal_projects(
+    dashboard_server, path, payload, field,
+):
+    """The string ``false`` must never become a truthy privacy opt-out."""
+    port, _ = dashboard_server
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={**_csrf_headers(port), "Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=10)
+    assert exc.value.code == 400
+    body = json.loads(exc.value.read())
+    assert body["field"] == field
 
 
 def test_render_projects_panel_claims_anonymized_when_the_field_is_absent(

@@ -259,8 +259,10 @@ def reusable_bootstrap_name(candidate_digest, candidate_size, existing):
 
     Reusing an older match instead would stamp the cursor behind a bootstrap the
     cursor does not cover, and the next ingest would fold that stale bootstrap's
-    records into stats.db. Writing a fresh segment is the pre-reuse behaviour and
-    restores the pre-reuse invariant, because a minted name always sorts last.
+    records into stats.db. Writing a fresh segment invokes the caller's
+    monotonic name selector, which compares wall time with the published
+    bootstrap set and mints after the canonically newest segment when the clock
+    moved backwards (#509).
 
     Returns None when the newest bootstrap does not match, which covers the
     ordinary first-cutover path, the genuinely-differing-export path, and the

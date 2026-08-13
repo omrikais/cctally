@@ -17,6 +17,9 @@ const CONFIG: AlertsConfig = {
   weekly_thresholds: [90, 95],
   five_hour_thresholds: [90, 95],
   budget_thresholds: [90, 95],
+  // #513 S2 §5.1 — the mirrored Claude weekly budget amount; null here
+  // because these fixtures describe alert rendering, not the budget state.
+  weekly_usd: null,
 };
 
 function ingest(alerts: AlertEntry[]) {

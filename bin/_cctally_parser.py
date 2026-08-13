@@ -2015,7 +2015,9 @@ def _build_cache_report_parser(subparsers, name, *, help_text, xref=None, fixed_
         default=15,
         dest="anomaly_threshold_pp",
         help="Claude cache %% drop threshold (percentage points) vs. a trailing "
-             "median. Default: 15.",
+             "median. Default: 15. This flag does NOT read config.json:"
+             " cache_report.anomaly_threshold_pp, which the dashboard writes"
+             " and the dashboard and TUI read.",
     )
     pc.add_argument(
         "--anomaly-window-days",
@@ -2464,10 +2466,14 @@ def _build_config_parser(subparsers, name, *, help_text, xref=None):
         name,
         help=help_text,
         formatter_class=CLIHelpFormatter,
+        # The key count is interpolated from the runtime tuple, never
+        # written as a literal: a frozen number is exactly the drift #513
+        # exists to remove, and the next key added would make this text
+        # wrong with no check to catch it.
         description=textwrap.dedent("""\
                     Manage cctally user preferences in ~/.local/share/cctally/config.json.
 
-                    Currently supported keys:
+                    Commonly set keys:
                       display.tz       Display timezone. Values: 'local' (default; host
                                        zone via the OS locale), 'utc', or any IANA name
                                        like 'America/New_York'. Per-call --tz flag on
@@ -2478,13 +2484,18 @@ def _build_config_parser(subparsers, name, *, help_text, xref=None):
                                        loopback-only), 'lan' (binds 0.0.0.0 —
                                        LAN-accessible), or any literal IP / hostname.
 
+                    Those three are a sample, not the set. {count} keys are settable in
+                    total; run `cctally config get` to list every one with its current
+                    value, or see docs/commands/config.md for values, defaults, and
+                    which keys the dashboard can write.
+
                     Examples:
                       cctally config get
                       cctally config get display.tz
                       cctally config set display.tz America/New_York
                       cctally config set dashboard.bind lan
                       cctally config unset dashboard.bind
-                """),
+                """).format(count=len(c.ALLOWED_CONFIG_KEYS)),
     )
     cfg_sub = cfg_p.add_subparsers(dest="action", required=True)
     cfg_get = cfg_sub.add_parser("get", help="Print current value(s)")

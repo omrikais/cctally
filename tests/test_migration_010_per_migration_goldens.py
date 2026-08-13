@@ -32,6 +32,17 @@ from pathlib import Path
 
 import pytest
 
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). The write detector caught this module creating the maintainer's
+# real ~/.local/share/cctally, through the handler's own
+# `_eagerly_apply_cache_migrations`, which does `APP_DIR.mkdir(...)` before the
+# gate check. That helper is reached by stats migrations 008, 009 AND 010, so
+# the two modules migrated earlier were two thirds of one class rather than a
+# pair. The violation is masked whenever an earlier module on the same process
+# has already rebound the constants, which is the ordering dependence
+# `bin/cctally-isolation-sweep` exists to observe.
+pytestmark = pytest.mark.usefixtures("isolated_home")
+
 # W1 registry-completeness guard (#279 S7): declares this module exercises
 # the handler's second-invocation idempotency (test names vary across modules).
 IDEMPOTENCY_COVERED = True
@@ -49,8 +60,23 @@ POST_DB = FIXTURE_DIR / "post.sqlite"
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
 
 
-@pytest.fixture(scope="module")
-def db_module():
+@pytest.fixture
+def db_module(isolated_home):
+    """Load bin/_cctally_db.py via SourceFileLoader.
+
+    Function-scoped and dependent on ``isolated_home`` (#529 S4). Module scope
+    ran it once before any function fixture, so every path constant stayed
+    derived from whatever HOME was current then -- the real one when this module
+    ran first in its process.
+
+    A ``SourceFileLoader`` load does not re-derive the path constants on its own,
+    which is why the explicit ``_init_paths_from_env()`` is here. That call runs
+    AFTER the autouse ``_guard_real_prod_migration_log`` has monkeypatched
+    ``MIGRATION_ERROR_LOG_PATH`` and ``LOG_DIR``, and it rebinds both, so it
+    discards those two patches for this test's duration. It is safe only because
+    ``isolated_home`` has already pinned HOME: every value it re-derives lands
+    under the same per-test directory the discarded patches named.
+    """
     if str(BIN_DIR) not in sys.path:
         sys.path.insert(0, str(BIN_DIR))
     for _name in [
@@ -64,6 +90,9 @@ def db_module():
     mod = ilu.module_from_spec(spec)
     sys.modules["_cctally_db"] = mod
     spec.loader.exec_module(mod)
+    import _cctally_core
+
+    _cctally_core._init_paths_from_env()
     return mod
 
 

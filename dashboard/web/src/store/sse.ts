@@ -150,6 +150,9 @@ const FALLBACK_ALERTS_SETTINGS = {
   // won't carry these; default to "no thresholds / disabled".
   budget_thresholds: [] as number[],
   budget_enabled: false,
+  // The Claude weekly budget amount (#513 S2 §5.1) — a server without the
+  // mirror carries no amount, and "no budget configured" is exactly `null`.
+  weekly_usd: null as number | null,
   // Projected axis (issue #121) — a stale Python without the projected leg
   // won't carry these; default to "disabled".
   projected_weekly_enabled: false,

@@ -51,13 +51,15 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # `wait "$STUB_PID"` (inside the helper under test) is valid — spawning via
 # `$(...)` would make it a command-substitution-subshell child instead.
 spawn_ignore_term () {
+    STUB_READY_FILE="$SCRATCH/ready.$$.$RANDOM"
+    : > "$STUB_READY_FILE"
     python3 -c '
 import signal, sys, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 sys.stdout.write("READY\n"); sys.stdout.flush()
 while True:
     time.sleep(0.2)
-' >/dev/null 2>&1 &
+' >"$STUB_READY_FILE" 2>/dev/null &
     STUB_PID=$!
 }
 
@@ -65,22 +67,35 @@ while True:
 # immediately at the kernel level — no Python-level handler, so no
 # lost-wakeup window.
 spawn_cooperative () {
+    STUB_READY_FILE="$SCRATCH/ready.$$.$RANDOM"
+    : > "$STUB_READY_FILE"
     python3 -c '
 import sys, time
 sys.stdout.write("READY\n"); sys.stdout.flush()
 while True:
     time.sleep(0.2)
-' >/dev/null 2>&1 &
+' >"$STUB_READY_FILE" 2>/dev/null &
     STUB_PID=$!
 }
 
-wait_ready () {  # wait until the stub has printed READY (armed its handler)
+# Wait until the stub has actually printed READY, which is the moment its
+# SIGTERM disposition is installed. The previous version polled `kill -0` and
+# returned early when that FAILED — that is, when the stub had died — so for a
+# healthy stub it never returned early and burned its whole 5-second budget at
+# each of its two call sites. The stub's stdout is now a file, so readiness is
+# an observable state rather than an elapsed time.
+wait_ready () {  # $1 = stub pid
     local pid="$1" t=0
-    while [ $t -lt 100 ]; do
-        kill -0 "$pid" 2>/dev/null || return 0
+    while [ $t -lt 200 ]; do
+        if [ -s "${STUB_READY_FILE:-/dev/null}" ] \
+           && grep -q READY "$STUB_READY_FILE" 2>/dev/null; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || return 1   # it died before announcing
         sleep 0.05
         t=$((t + 1))
     done
+    return 1
 }
 
 now_ms () { python3 -c 'import time; print(int(time.time()*1000))'; }
@@ -93,7 +108,10 @@ test_wedged_server_escalates () {
     local grace=2 ceiling=8
     local errlog="$SCRATCH/warn1.txt"
     local pid; spawn_ignore_term; pid=$STUB_PID
-    sleep 0.3  # let SIG_IGN install
+    # READY is printed AFTER signal.signal(SIGTERM, SIG_IGN) returns, so the
+    # line is the observable form of "the handler is installed". The fixed
+    # `sleep 0.3` it replaces was a guess at how long that takes.
+    wait_ready "$pid" || { fail "wedged: stub never announced READY"; return 1; }
 
     # Hard-ceiling watchdog: if the helper hasn't returned by $ceiling, force
     # the stub dead (so even an unbounded `wait` unblocks) and mark a timeout.
@@ -141,7 +159,7 @@ test_cooperative_server_is_fast_and_quiet () {
     local grace=5
     local errlog="$SCRATCH/warn2.txt"
     local pid; spawn_cooperative; pid=$STUB_PID
-    wait_ready "$pid"
+    wait_ready "$pid" || { fail "cooperative: stub never announced READY"; return 1; }
 
     local t0 t1
     t0=$(now_ms)
@@ -176,7 +194,7 @@ test_empty_and_dead_pid_noop () {
     if [ $? -eq 0 ]; then pass "empty pid: no-op returns 0"; else fail "empty pid: non-zero return"; fi
 
     local pid; spawn_cooperative; pid=$STUB_PID
-    wait_ready "$pid"
+    wait_ready "$pid" || { fail "dead pid: stub never announced READY"; return 1; }
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true   # reap so it's truly gone
     local t0 t1

@@ -12,13 +12,34 @@ import types
 
 import pytest
 
-# Dev-instance isolation (2026-05-26): force dev-checkout auto-detect OFF
-# for the whole pytest process. Set at conftest import — earlier than any
-# fixture — so the import-time _init_paths_from_env() in _cctally_core and
-# every load_script() reload resolve the prod data-dir layout under the
-# per-test fake HOME, not the cctally-dev layout. setdefault so an explicit
-# env value (a test that WANTS to exercise auto-detect) still wins.
-os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+# Dev-instance isolation and preamble parity (2026-05-26; widened #529 S4).
+# The shell half of the estate neutralizes six variables in
+# bin/_lib-harness-env.sh; this is the pytest half of the same contract.
+#
+# ASSIGN, never setdefault: setdefault lets an inherited runner value WIN,
+# which is an inheritance hole rather than a pin, and it is exactly the class
+# this contract exists to close. Set at conftest import because collection and
+# module-level imports run before any fixture, and _cctally_core computes its
+# path constants inside _init_paths_from_env() at import from these values --
+# no fixture is early enough, and rewriting os.environ afterwards does not
+# rebuild constants already derived. A test that wants a different value still
+# uses monkeypatch.setenv, which mutates os.environ after this point and is
+# reverted at teardown.
+#
+# A test MODULE must never set a determinism pin on os.environ, because
+# pytest-xdist runs many modules per worker and the pin stays live for every
+# sibling module that worker runs afterwards. This root conftest is the stated
+# exception: it is imported once per worker before any test module is
+# collected and applies uniformly, so it has no victim and no ordering
+# dependence.
+for _name, _value in (
+    ("CCTALLY_DISABLE_DEV_AUTODETECT", "1"),
+    ("CCTALLY_DISABLE_UPDATE_CHECK", "1"),
+    ("CCTALLY_DISABLE_RETENTION_SWEEP", "1"),
+):
+    os.environ[_name] = _value
+for _name in ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY"):
+    os.environ.pop(_name, None)
 
 
 _AGENTMEM_TEST_POLICIES = {
@@ -67,15 +88,21 @@ def _script_path() -> pathlib.Path:
 
 
 # Compile bin/cctally once per pytest session and reuse the code object
-# across every load_script() call. Profiling: compile() is ~146ms,
-# exec() ~16ms; the 26K-line script is reparsed 335+ times in a full
-# pytest run, so caching the code object cuts ~50s off suite wallclock.
-# Each test still gets a fresh namespace via exec(), preserving isolation.
-# Under pytest-xdist (`pytest -n <N>`) each worker is a fresh Python
-# process, so this cache is per-worker — the compile cost is paid N
-# times instead of once. That's a small constant-cost regression
-# (~146ms × N) which is well within the parallel speedup; see
-# tests/requirements-dev.txt for the optional xdist dep.
+# across every load_script() call. Each test still gets a fresh namespace via
+# exec(), preserving isolation. Under pytest-xdist (`pytest -n <N>`) each
+# worker is a fresh Python process, so this cache is per-worker and the
+# compile cost is paid N times instead of once; see tests/requirements-dev.txt
+# for the optional xdist dep.
+#
+# THE FIGURES THIS COMMENT USED TO CITE ARE STALE AND ARE CORRECTED HERE
+# (#529 S4). It described a "26K-line script" whose compile() cost ~146 ms and
+# whose exec() cost ~16 ms, and claimed the cache cut ~50 s off the suite.
+# Measured on the runner today: bin/cctally is 3,602 lines and 186 KB,
+# compile() takes 5.4 ms, and a warm exec() into a fresh namespace takes
+# 0.2 ms. Nothing comes from a bytecode cache either — sys.dont_write_bytecode
+# is True under pytest here and bin/__pycache__ does not exist — so a
+# SourceFileLoader load of the same file costs 5.7 ms, which is compile plus
+# exec and not a cache read.
 _SCRIPT_PATH = _script_path()
 _SCRIPT_CODE = compile(_SCRIPT_PATH.read_text(), str(_SCRIPT_PATH), "exec")
 
@@ -98,6 +125,198 @@ if _BIN_DIR not in sys.path:
 _REAL_PROD_MIGRATION_LOG = (
     pathlib.Path.home() / ".local" / "share" / "cctally" / "logs" / "migration-errors.log"
 )
+
+
+# --- the fail-closed production-write detector (#529 S4) -------------------
+#
+# Installed at conftest import, before any test module is collected, because a
+# module-level write in a test file would otherwise run unguarded. The audit
+# hook cannot be removed once installed, so `install()` is idempotent and later
+# calls only rebind the policy it reads.
+import _lib_test_isolation as _iso  # noqa: E402  -- bin/ joins sys.path above
+
+_iso.install()
+_iso.install_popen_interceptor()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolation_scratch_root(tmp_path_factory):
+    """Register the pytest temp base ONCE, not one root per test.
+
+    The interceptor asks whether a child's environment-resolved APP_DIR sits
+    beneath a scratch root before deciding to protect it, and that question is
+    asked on every launch. Registering per test would grow the list without
+    bound and make the answer cost O(tests).
+    """
+    _iso.register_scratch_root(tmp_path_factory.getbasetemp())
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolation_detector(request):
+    """Attribute writes to the running test, and fail it from the ledger.
+
+    Defined FIRST among the autouse fixtures in this file so it sets up first
+    and tears down last: a violation caused by another fixture's teardown still
+    has to be attributed and reported.
+
+    Failing from the ledger rather than from the raised exception is the whole
+    point. A test that catches `ProductionWriteBlocked` and returns normally is
+    still failed here, because the hook recorded the violation before it raised.
+    """
+    node_id = request.node.nodeid
+    _iso.set_node_id_getter(lambda: node_id)
+    try:
+        yield
+    finally:
+        problems = _iso.collect_test_violations(node_id)
+    if problems:
+        pytest.fail(
+            "isolation contract violated by this test (#529 S4):\n  "
+            + "\n  ".join(problems),
+            pytrace=False,
+        )
+
+
+# --- the agentmem degradation announcement (#529 S6, M4) -------------------
+#
+# When `agentmem` is absent the run still completes, but it runs a WEAKER
+# contract than the remote path does, and D2 requires it to say so: which
+# contract ran, and how many tests that cost.
+#
+# The count is over items carrying the ONE shared gate object, compared by
+# IDENTITY. No custom marker is registered, and none may be — pytest.ini records
+# that settled decision, and the pre-plan review's marker proposal was rejected
+# on that ground.
+#
+# Aggregation reuses S4's worker-private-ledger plus controller-aggregation
+# pattern rather than inventing a second transport: each worker writes its own
+# count into its own file under the same per-session directory the isolation
+# ledger uses, and the controller — the only process whose exit status the run
+# honours — sums them and emits ONE line.
+from _agentmem_gate import AGENTMEM_PRESENT, requires_agentmem  # noqa: E402
+
+_AGENTMEM_SKIP_FILE = "agentmem-skips"
+
+
+def _agentmem_count_path():
+    return _iso.state_dir() / _AGENTMEM_SKIP_FILE
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """Record, per worker, how many collected items this gate would skip."""
+    if AGENTMEM_PRESENT:
+        return
+    count = 0
+    for item in items:
+        for mark in item.iter_markers(name="skipif"):
+            # Identity, not equality: the point of the single shared object is
+            # that "carries THIS gate" is a fact rather than a resemblance.
+            if mark is requires_agentmem.mark:
+                count += 1
+                break
+    path = _agentmem_count_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(count), encoding="utf-8")
+    except OSError:
+        # Instrumentation must never take down the run it is instrumenting.
+        # A missing file reads as zero, and the controller says so explicitly.
+        pass
+
+
+def _aggregate_agentmem_skips() -> int:
+    """The run's count, which is the MAXIMUM across workers rather than the sum.
+
+    Under `pytest -n N` every worker collects the WHOLE estate and only runs its
+    share, so each worker's hook sees the same item list and records the same
+    number. Summing them would announce N times the real figure — a number that
+    is not merely imprecise but false, and false in a way that grows with the
+    worker count. The maximum is the count of one complete collection, which is
+    what "how many tests this run could not execute" means.
+    """
+    counts = [0]
+    base = _iso.session_dir()
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        children = []
+    seen = set()
+    for child in children:
+        path = child / _AGENTMEM_SKIP_FILE
+        if not path.is_file():
+            continue
+        seen.add(str(path))
+        try:
+            counts.append(int(path.read_text(encoding="utf-8").strip() or 0))
+        except (OSError, ValueError):
+            continue
+    own = _agentmem_count_path()
+    if own.is_file() and str(own) not in seen:
+        try:
+            counts.append(int(own.read_text(encoding="utf-8").strip() or 0))
+        except (OSError, ValueError):
+            pass
+    return max(counts)
+
+
+def _announce_agentmem_contract(session) -> None:
+    """One line, from the controller, naming the contract and the cost."""
+    policy = os.environ.get("CCTALLY_AGENTMEM_TEST_POLICY", "optional-local")
+    if AGENTMEM_PRESENT:
+        message = (
+            f"agentmem contract: {policy} — agentmem is present, so the "
+            f"agentmem-gated tests ran"
+        )
+    else:
+        skipped = _aggregate_agentmem_skips()
+        message = (
+            f"agentmem contract: {policy} — agentmem is ABSENT, so "
+            f"{skipped} agentmem-gated test(s) did not run; this run verified "
+            f"less than a run with agentmem present"
+        )
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(message)
+    else:  # pragma: no cover - only when the terminal plugin is disabled
+        print(message, file=sys.stderr)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Late arrivals fail the SESSION, because their test's report is final.
+
+    A child that writes after its launching test has already been reported
+    cannot fail that test. E4 promises that no test PASSES when a covered write
+    happens, not that the causing test is always the one that turns red, and
+    this is the half of the criterion that difference exists for.
+
+    THE CONTROLLER IS THE ONLY PROCESS WHOSE EXIT STATUS THE RUN HONOURS. Under
+    ``pytest -n`` -- which is the configuration the authoritative gate runs, see
+    ``bin/cctally-test-all`` phase 3 -- a worker's ``session.exitstatus`` never
+    reaches the controller's exit code, measured as ``-n 2`` exiting 0 while
+    this hook fired in gw0 and gw1. A worker therefore records what it found and
+    returns; the controller reads every worker's ledger and decides the run.
+    """
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        _iso.flush_late_handshake_problems()
+        return
+    # Controller-only, for the same reason the isolation aggregation is: under
+    # `pytest -n` every worker reaches this hook, and announcing from each of
+    # them would print the line once per worker instead of once per run.
+    _announce_agentmem_contract(session)
+    problems = _iso.collect_session_violations()
+    if not problems:
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    message = (
+        "isolation contract violated after the reporting test finished "
+        "(#529 S4):\n  " + "\n  ".join(problems)
+    )
+    if reporter is not None:
+        reporter.write_line(message, red=True)
+    else:  # pragma: no cover - only when the terminal plugin is disabled
+        print(message, file=sys.stderr)
+    session.exitstatus = 1
 
 
 def _migration_log_identity():
@@ -142,6 +361,24 @@ def _guard_real_prod_migration_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         _cctally_core, "MIGRATION_ERROR_LOG_PATH", tmp_path / "migration-errors.log"
     )
+    # LOG_DIR too (#529 S4). `_log_migration_error` does
+    # `_cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)` BEFORE it opens
+    # the log path, so pinning only the file left the DIRECTORY unpinned: every
+    # test that reached this path created the real ~/.local/share/cctally/logs,
+    # and by extension ~/.local/share/cctally. The prevention half of this
+    # fixture was therefore incomplete in exactly the way its detection half was
+    # never able to see — the identity check watches the log FILE, and creating
+    # its parent directory does not change that file.
+    #
+    # THIS PIN IS WIDER THAN THIS FIXTURE'S NAME. LOG_DIR is not only the
+    # migration log's parent: `HOOK_TICK_LOG_DIR` and the update log resolve
+    # beside it, and this fixture is autouse, so from here on LOG_DIR is
+    # decoupled from APP_DIR for EVERY test rather than only for the ones that
+    # touch a migration. Nothing depends on the two agreeing today. What a
+    # future reader must not do is write a negative assertion over LOG_DIR in a
+    # module that redirects only APP_DIR and read a pass as evidence: it would
+    # pass because of this line, not because of the code under test.
+    monkeypatch.setattr(_cctally_core, "LOG_DIR", tmp_path / "logs")
     before = _migration_log_identity()
     yield
     after = _migration_log_identity()
@@ -503,6 +740,11 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "STATUSLINE_TRANSPORT_MARKER_PATH": share / "statusline-transport.last",
         "STATUSLINE_AUTHORITATIVE_7D_PATH": share / "statusline-authoritative-7d.json",
         "STATUSLINE_AUTHORITATIVE_5H_PATH": share / "statusline-authoritative-5h.json",
+        # Host-global statusline cache (#529 S4). NOT under share/ — production
+        # keeps it in /tmp because the real Claude Code statusline shares it, so
+        # the fixture analogue is a per-test tmp file rather than an APP_DIR
+        # child. A str, matching the production constant's type.
+        "STATUSLINE_OAUTH_CACHE_PATH": str(tmp_path / "statusline-usage-cache.json"),
         "OAUTH_BACKOFF_MARKER_PATH": share / "oauth-backoff.until",
         "OAUTH_BACKOFF_COUNT_PATH": share / "oauth-backoff.count",
         "UPDATE_STATE_PATH": share / "update-state.json",
@@ -541,6 +783,70 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     # the kernel patches above propagate directly — no extra block here.
 
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    """Resolve every HOME-derived path constant under a per-test directory.
+
+    Opt a whole module in with, at module scope::
+
+        pytestmark = pytest.mark.usefixtures("isolated_home")
+
+    This is the narrow pin for the module whose tests call ``load_script()``
+    themselves and never take ``tmp_path``. ``redirect_paths`` cannot serve
+    them: it patches ``_cctally_core`` attributes, and the very next
+    ``load_script()`` re-runs ``_init_paths_from_env()`` and rebinds every one
+    of them from the current ``HOME`` — the ordering trap ``load_script``'s own
+    docstring describes. Pinning ``HOME`` instead survives an arbitrary number
+    of later ``load_script()`` calls, because each of them re-derives from it.
+
+    Introduced by #529 S4, when the write detector caught 19 modules whose
+    ``load_config()`` reached ``ensure_dirs()`` and created the maintainer's
+    REAL ``~/.local/share/cctally``. Use ``redirect_paths`` instead wherever a
+    test already receives ``tmp_path`` and wants the full explicit surface.
+
+    It deliberately does NOT call ``_init_paths_from_env()`` itself. Doing so
+    rebinds all 23 constants, which silently destroys a patch an earlier
+    fixture already applied — ``TestSelfHealCurrentVersion``'s class-scoped
+    autouse fixture pins ``CHANGELOG_PATH`` away from the dev tree, and
+    re-deriving put it back, so the issue #42 dev-clone guard short-circuited
+    and the test read a stale version. Pinning only the environment leaves
+    every existing patch intact and lets the next ``load_script()`` do the
+    re-derivation, which is what it already does at its top.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    yield
+
+
+@pytest.fixture
+def isolated_paths(isolated_home):
+    """``isolated_home`` plus an immediate re-derivation of the constants.
+
+    Opt in the same way::
+
+        pytestmark = pytest.mark.usefixtures("isolated_paths")
+
+    Use this, and not ``isolated_home``, for a module that loads ``bin/cctally``
+    or a sibling through ``SourceFileLoader`` or at module import. Those paths
+    never call ``_init_paths_from_env()``, so pinning ``HOME`` alone changes
+    nothing: the constants keep whatever values the previous test on this xdist
+    worker left behind. That is why the modules needing this were green when run
+    alone and red under ``-n 4`` — the difference was which module happened to
+    run first on the worker, which is the machine dependence #529 S4 exists to
+    remove.
+
+    It re-derives eagerly, which REBINDS all 23 constants and would destroy a
+    patch applied earlier in the same test. That is safe only because it runs
+    before the test body and before any fixture that patches a path constant;
+    where that ordering does not hold, use ``isolated_home`` and let the
+    module's own ``load_script()`` do the re-derivation.
+    """
+    import _cctally_core
+
+    _cctally_core._init_paths_from_env()
+    yield
 
 
 def load_isolated_cctally_module(tmp_path, monkeypatch):

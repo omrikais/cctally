@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Contract harness for the fail-closed ShellCheck gate (#546).
+#
+# Every case runs the real pinned ShellCheck binary. The synthetic trees prove
+# the version, manifest, surface, target-drift, and warning contracts; the final
+# real-tree leg proves the checked-out shell estate itself is clean.
+
+set -uo pipefail
+
+# Universal harness isolation: keep dev-checkout path detection and detached
+# post-command workers out of synthetic HOME fixtures.
+# shellcheck source=bin/_lib-harness-env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+GATE="$REPO_ROOT/bin/cctally-shellcheck"
+SHELLCHECK_BIN=${SHELLCHECK_BIN:-$(command -v shellcheck 2>/dev/null || true)}
+
+pass_count=0
+fail_count=0
+SCRATCH_DIR=$(mktemp -d -t cctally-shellcheck-XXXXXX)
+
+cleanup_on_exit () {
+    local rc=$?
+    if [ "$fail_count" -eq 0 ] && [ "$rc" -eq 0 ]; then
+        rm -rf "$SCRATCH_DIR"
+    else
+        printf 'Scratch dir preserved for debugging: %s\n' "$SCRATCH_DIR" >&2
+    fi
+}
+trap cleanup_on_exit EXIT
+
+report () {
+    local case_name="$1" status="$2" detail="${3-}"
+    if [ "$status" = PASS ]; then
+        pass_count=$((pass_count + 1))
+        printf 'PASS: %s\n' "$case_name"
+    else
+        fail_count=$((fail_count + 1))
+        printf 'FAIL: %s%s\n' "$case_name" "${detail:+ — $detail}" >&2
+    fi
+}
+
+new_tree () {
+    local name="$1" surface="$2" root
+    root="$SCRATCH_DIR/$name"
+    mkdir -p "$root/bin" "$root/tests"
+    if [ "$surface" = private ]; then
+        printf '%s\n' 'bin/**' 'tests/**' > "$root/.mirror-allowlist"
+    fi
+    printf '%s\n' "$root"
+}
+
+write_clean () {
+    local path="$1"
+    printf '%s\n%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "ok"' > "$path"
+    chmod +x "$path"
+}
+
+expect_rc () {
+    local name="$1" want_rc="$2" root="$3" surface="$4" want_text="${5-}"
+    local log="$SCRATCH_DIR/$name.log" rc
+    "$GATE" --repo-root "$root" --surface "$surface" \
+        --shellcheck "$SHELLCHECK_BIN" > "$log" 2>&1
+    rc=$?
+    if [ "$rc" -ne "$want_rc" ]; then
+        report "$name" FAIL "expected exit $want_rc, got $rc (see $log)"
+    elif [ -n "$want_text" ] && ! grep -Fq "$want_text" "$log"; then
+        report "$name" FAIL "exit matched, but diagnostic omitted '$want_text' (see $log)"
+    else
+        report "$name" PASS
+    fi
+}
+
+if [ ! -x "$GATE" ]; then
+    report bootstrap FAIL "$GATE is absent or not executable"
+elif [ -z "$SHELLCHECK_BIN" ]; then
+    report bootstrap FAIL "the pinned shellcheck executable is absent from PATH"
+else
+    d=$(new_tree clean-private private)
+    write_clean "$d/bin/public.sh"
+    write_clean "$d/bin/private.sh"
+    printf '%s\n' 'public bin/public.sh' 'private bin/private.sh' \
+        > "$d/tests/shellcheck-targets.txt"
+    expect_rc clean-private 0 "$d" private
+
+    d=$(new_tree clean-public public)
+    write_clean "$d/bin/public.sh"
+    printf '%s\n' 'public bin/public.sh' 'private bin/private.sh' \
+        > "$d/tests/shellcheck-targets.txt"
+    expect_rc clean-public 0 "$d" public
+
+    d=$(new_tree warning private)
+    printf '%s\n%s\n' '#!/usr/bin/env bash' 'cd "$1"' > "$d/bin/warning.sh"
+    chmod +x "$d/bin/warning.sh"
+    printf '%s\n' 'public bin/warning.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc warning 3 "$d" private 'SC2164'
+
+    d=$(new_tree empty-manifest private)
+    : > "$d/tests/shellcheck-targets.txt"
+    expect_rc empty-manifest 3 "$d" private 'declares no targets'
+
+    d=$(new_tree narrowed-manifest private)
+    write_clean "$d/bin/declared.sh"
+    write_clean "$d/bin/forgotten.sh"
+    printf '%s\n' 'public bin/declared.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc narrowed-manifest 3 "$d" private 'undeclared shell target'
+
+    d=$(new_tree missing-target private)
+    printf '%s\n' 'public bin/missing.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc missing-target 3 "$d" private 'declared target is absent'
+
+    d=$(new_tree duplicate-target private)
+    write_clean "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' 'public bin/clean.sh' \
+        > "$d/tests/shellcheck-targets.txt"
+    expect_rc duplicate-target 3 "$d" private 'duplicate target'
+
+    d=$(new_tree malformed-scope private)
+    write_clean "$d/bin/clean.sh"
+    printf '%s\n' 'shared bin/clean.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc malformed-scope 3 "$d" private 'scope must be public or private'
+
+    d=$(new_tree unjustified-directive private)
+    printf '%s\n' '#!/usr/bin/env bash' '# shellcheck disable=SC2034' 'fixture_value=1' \
+        > "$d/bin/clean.sh"
+    chmod +x "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc unjustified-directive 3 "$d" private 'must be preceded by a ShellCheck justification'
+
+    d=$(new_tree obsolete-directive private)
+    printf '%s\n' '#!/usr/bin/env bash' \
+        '# ShellCheck: deliberate word splitting for this fixture.' \
+        '# shellcheck disable=SC2086' 'printf "%s\\n" $*' > "$d/bin/clean.sh"
+    chmod +x "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' > "$d/tests/shellcheck-targets.txt"
+    expect_rc obsolete-directive 3 "$d" private 'not allowed at the warning threshold'
+
+    d=$(new_tree nonlocal-source private)
+    write_clean "$d/bin/helper.sh"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        '# shellcheck source=bin/../../tmp/helper.sh' '. "$1/bin/helper.sh"' \
+        > "$d/bin/clean.sh"
+    chmod +x "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' 'public bin/helper.sh' \
+        > "$d/tests/shellcheck-targets.txt"
+    expect_rc nonlocal-source 3 "$d" private 'source target must be an existing repo-local bin/ path'
+
+    d=$(new_tree detached-source private)
+    write_clean "$d/bin/helper.sh"
+    printf '%s\n' '#!/usr/bin/env bash' '# shellcheck source=bin/helper.sh' \
+        'printf "%s\\n" "gap"' '. "$1/bin/helper.sh"' > "$d/bin/clean.sh"
+    chmod +x "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' 'public bin/helper.sh' \
+        > "$d/tests/shellcheck-targets.txt"
+    expect_rc detached-source 3 "$d" private 'source directive must apply only to the next source command'
+
+    d=$(new_tree wrong-version private)
+    write_clean "$d/bin/clean.sh"
+    printf '%s\n' 'public bin/clean.sh' > "$d/tests/shellcheck-targets.txt"
+    saved_shellcheck="$SHELLCHECK_BIN"
+    SHELLCHECK_BIN=/usr/bin/true
+    expect_rc wrong-version 3 "$d" private 'could not read ShellCheck version'
+    SHELLCHECK_BIN="$saved_shellcheck"
+
+    expect_rc real-tree 0 "$REPO_ROOT" private
+fi
+
+printf '%s\n' '----'
+printf 'passed: %d   failed: %d\n' "$pass_count" "$fail_count"
+[ "$fail_count" -eq 0 ]

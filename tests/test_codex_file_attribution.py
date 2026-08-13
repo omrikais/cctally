@@ -339,7 +339,7 @@ def _cache_sync(env, *extra):
     return subprocess.run(
         [sys.executable, str(CCTALLY_BIN), "cache-sync", "--source", "codex",
          *extra],
-        env=env, capture_output=True, text=True, timeout=180,
+        env=env, capture_output=True, text=True, timeout=110,
     )
 
 

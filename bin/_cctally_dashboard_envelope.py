@@ -1404,6 +1404,17 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         "five_hour_thresholds": list(_alerts_cfg["five_hour_thresholds"]),
         "budget_thresholds":    list(_budget_cfg["alert_thresholds"]),
         "budget_enabled":       _budget_alerts_active(_budget_cfg),
+        # Claude weekly budget AMOUNT mirror (#513 S2 §5.1). `budget_enabled`
+        # above collapses "no budget set" and "budget set, alerts off" into one
+        # false, so Settings could not state which of the two a user is in, nor
+        # name the remedy. The amount itself distinguishes them. It is read
+        # from the same validated `_budget_cfg` the neighbouring keys use, and
+        # the `_BudgetConfigError` fallback dict already carries
+        # `"weekly_usd": None`, so the null path needs no separate default.
+        # Reading it back through an empty `POST {"budget": {}}` is NOT an
+        # option: that request reaches `save_config` and triggers the
+        # synchronous rebuild, so this mirror is the only read path.
+        "weekly_usd":           _budget_cfg.get("weekly_usd"),
         # Projected-pace opt-in mirrors (#121). Two flags, one per parent
         # axis — the frontend SettingsOverlay seeds two toggles. Sourced
         # from the validated getters' ``projected_enabled`` (default False).

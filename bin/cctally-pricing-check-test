@@ -37,7 +37,14 @@ set -uo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CCTALLY="$REPO_ROOT/bin/cctally"
-FIXTURES="$REPO_ROOT/tests/fixtures/pricing-check"
+# Generated fixture inputs are staged out of tree (#529 S3). The committed
+# tree is the read-only template; nothing under it is written during a run.
+FIXTURE_STAGE=$(mktemp -d -t cctally-pricing-check-fixstage.XXXXXX)
+FIXTURES="$FIXTURE_STAGE/pricing-check"
+# Goldens address the COMMITTED root, never the staging copy above: this
+# harness's EXIT trap removes that copy, so a regenerate run writing there
+# would leave the committed goldens untouched.
+GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/pricing-check"
 REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 
 pass_count=0
@@ -48,7 +55,7 @@ fail_count=0
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
 SCRATCH_ROOT=$(mktemp -d -t cctally-pricing-check-XXXXXX)
-trap 'rm -rf "$SCRATCH_ROOT"' EXIT
+trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 
 # python3-only clean bin so the CLI runs without leaking a real cctally onto
 # PATH (mirrors the doctor harness rationale).
@@ -58,7 +65,7 @@ ln -sf "$(command -v python3)" "$PY_CLEAN_BIN/python3"
 CLEAN_PATH="$PY_CLEAN_BIN:/usr/bin:/bin"
 
 # Rebuild fixtures so harness output reflects the current builder.
-"$REPO_ROOT/bin/build-pricing-check-fixtures.py" >/dev/null || {
+stage_fixtures_out_of_tree pricing-check "$FIXTURES" || {
     echo "FAIL: build-pricing-check-fixtures.py crashed (exit $?)" >&2
     exit 1
 }
@@ -70,7 +77,7 @@ CLEAN_PATH="$PY_CLEAN_BIN:/usr/bin:/bin"
 run_scenario () {
     local name="$1" expected_rc="$2"
     local dir="$FIXTURES/$name"
-    local golden="$dir/expected.json"
+    local golden="$GOLDEN_ROOT/$name/expected.json"
     local scratch="$SCRATCH_ROOT/$name"
     mkdir -p "$scratch/.local/share/cctally"
 
@@ -128,10 +135,10 @@ run_scenario () {
 
     # Exit-code assertion (the load-bearing precedence contract).
     if [ -n "$REGENERATE" ]; then
-        echo "$rc" > "$dir/expected.exit"
+        echo "$rc" > "$GOLDEN_ROOT/$name/expected.exit"
     else
         local want_exit
-        want_exit=$(cat "$dir/expected.exit" 2>/dev/null || echo "$expected_rc")
+        want_exit=$(cat "$GOLDEN_ROOT/$name/expected.exit" 2>/dev/null || echo "$expected_rc")
         if [ "$rc" != "$want_exit" ]; then
             echo "FAIL $name/exit  expected=$want_exit  actual=$rc"
             printf '%s\n' "$raw" | head -40 | sed 's/^/    /'

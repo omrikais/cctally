@@ -96,6 +96,7 @@ for dir in "${scenario_dirs[@]}"; do
     REMOVE_SCRIPT=0
     CCTALLY_PYTHON=""
     if [ -f "$dir/env.sh" ]; then
+        # ShellCheck: each scenario optionally supplies a generated environment.
         # shellcheck disable=SC1090
         . "$dir/env.sh"
     fi
@@ -115,8 +116,7 @@ EOF
 
     args=()
     if [ -f "$dir/args.txt" ]; then
-        # shellcheck disable=SC2207
-        args=( $(cat "$dir/args.txt") )
+        read -r -a args < "$dir/args.txt"
     fi
 
     stdout_file="$work/_stdout.txt"

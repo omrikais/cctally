@@ -4304,10 +4304,18 @@ def _tui_empty_snapshot(now_utc: dt.datetime) -> DataSnapshot:
     )
 
 
+def _stats_open_failure_is_corruption(exc: BaseException) -> bool:
+    """Keep epoch deferral distinct from heal deferral and read failures."""
+    c = _cctally()
+    if isinstance(exc, c.StatsRebuildDeferred):
+        return isinstance(exc, c.StatsHealDeferred)
+    return True
+
+
 def _tui_stats_retry_degraded_snapshot(
     *,
     now_utc: dt.datetime,
-    exc: Exception,
+    exc: BaseException,
     precompute_envelope: bool,
     runtime_bind: "str | None",
 ) -> DataSnapshot:
@@ -4333,7 +4341,7 @@ def _tui_stats_retry_degraded_snapshot(
             SyncFailureAttribution(
                 leg="stats-open",
                 database="stats",
-                corruption=True,
+                corruption=_stats_open_failure_is_corruption(exc),
             ),
         ),
         doctor_payload=doctor_payload,
@@ -6724,9 +6732,7 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     SyncFailureAttribution(
                         leg="stats-open",
                         database="stats",
-                        corruption=isinstance(
-                            exc, _cctally().StatsHealDeferred
-                        ),
+                        corruption=_stats_open_failure_is_corruption(exc),
                     ),
                 ),
                 generated_at=dt.datetime.now(dt.timezone.utc),

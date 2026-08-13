@@ -1,86 +1,42 @@
-"""Forward-looking drift guard for a potential pytest/shell-pool overlap (#296).
+"""No harness rebuilds a committed fixture tree in place (#529 S3, Task 17).
 
-#296 investigated overlapping the post-pool `pytest` phase with the shell
-harness pool in `bin/cctally-test-all`. The overlap was proven SAFE and
-regression-free but NOT enabled — empirically it does not pay off, because the
-shell pool is CPU-saturated (bulk pytest competing with it inflates the pool's
-critical path by ~as much as it saves; best case was ~4% on a 16-core box, far
-short of the target). See the "Empirical result & decision" section of
-docs/superpowers/specs/2026-07-13-296-pytest-shell-overlap-design.md.
+This file used to record the opposite. It listed the six harnesses that DID
+rebuild `tests/fixtures/<cmd>` in place and, for each, the pytest files that
+read those directories and would have raced the rebuild under the
+pytest/shell-pool overlap #296 investigated. That list was an inventory of a
+hazard, kept because the hazard was real.
 
-This test survives as cheap insurance: it encodes the audit that made the
-overlap safe, so that IF the overlap is ever revisited, the deselect set it
-would need is already known and drift is caught. It has no runtime dependency
-on the runner — it is pure static analysis of the harnesses and tests.
+Task 17 removed the hazard: all six harnesses now stage the committed tree into
+scratch and build their generated inputs there, so a test run writes nothing
+under `tests/fixtures/`. The assertion inverts with it. Two things are checked,
+and the second is what keeps the first from being satisfied by a harness that
+simply stopped building anything:
 
-The invariant: every pytest file that reads an in-place-rebuilt
-tests/fixtures/<cmd> dir must be in KNOWN_SAFE_DESELECT (the set an overlap
-would have to run serially after the pool). If a new such reader appears, this
-fails — reminding whoever adds it that it would race an in-place fixture
-rebuild under overlap, and must be added to the deselect set (see the spec).
+  1. No harness in this tree invokes a fixture builder without redirecting its
+     output. The derivation is the same parser as before, so a regression to an
+     in-place invocation is caught exactly as a new one used to be.
+  2. Each of the six former holdouts still stages its own fixture tree out of
+     tree, named explicitly.
 
-Two independent checks:
-  1. Auto-derive the in-place-rebuilt dir set from the harnesses and assert it
-     equals the hardcoded EXPECTED set filtered to harnesses present in THIS
-     tree (a brittle-parser miss fails loudly here; the tree filter keeps it
-     correct on the public mirror, where some harnesses are private/absent).
-  2. Assert every pytest reader of any dir in that set is in KNOWN_SAFE_DESELECT.
+The reader and deselect assertions are deleted rather than left. With no
+in-place directory left to read, `_pytest_readers_of` returns nothing, and an
+assertion over nothing passes without checking anything — which is worse than
+no assertion, because it reads like coverage.
 """
 import pathlib
 import re
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
-# The audit's durable output (#296 spec audit table). Update — and re-audit
-# the readers — only when a harness starts/stops rebuilding a fixtures/<x> in
-# place. build-codex-fixtures.py is the one builder whose roots are NOT
-# fixtures/<name>; its suite calls are all --out-redirected, so it never lands
-# here (mapping handled below for correctness).
-EXPECTED_INPLACE_DIRS = {
-    "dashboard", "doctor", "pricing-check", "conversation", "share", "share-v2",
+# The six that used to rebuild in place. Each maps 1:1 to bin/cctally-<name>-test
+# and to tests/fixtures/<name>.
+FORMER_INPLACE_HOLDOUTS = {
+    "conversation", "dashboard", "doctor", "pricing-check", "share", "share-v2",
 }
-# The pytest files an overlap would have to deselect (run serially after the
-# pool).
-KNOWN_SAFE_DESELECT = {
-    # The three #503 S1 share guards below are mirror-private, so a public
-    # clone does not carry them. Naming them here is safe anyway, and is
-    # waived for tests/test_public_test_dep_closure.py Scope A2 on that basis:
-    # mirror-private-ok — this list is only ever read as a superset of the
-    # readers `_pytest_readers_of` DISCOVERS by globbing, so an entry whose
-    # file is absent is never matched and never asserted about.
-    "tests/test_dashboard_responsive_startup.py",
-    # #503 S1: the share privacy detector's negative corpus reads every
-    # committed golden under both share fixture roots, which
-    # bin/cctally-share-test and bin/cctally-share-v2-test rebuild in place.
-    # (Spelling the two directory names out here would make this file itself
-    # match the reader scan below.)
-    "tests/test_share_privacy_detector.py",
-    # #503 S1 B1/B3: reads the panel fixtures and the harness's `--plan` case
-    # list under the share-v2 root, which bin/cctally-share-v2-test rebuilds in
-    # place on every start.
-    "tests/test_share_golden_discipline.py",
-    # #503 S1 B4: the registry/fixture/golden bijection enumerates both share
-    # fixture roots, and both harnesses rebuild theirs in place.
-    "tests/test_share_registry_completeness.py",
-    # #503 S2: the boundary-kind classification, the chart bounding-box
-    # sweep and the empty-table cases build every registered template from
-    # the share-v2 panel fixtures, which bin/cctally-share-v2-test rebuilds
-    # in place on every start. Unlike the four entries above, these two
-    # files are PUBLIC — their share-v2 reads carry a module-level
-    # `.is_dir()` skip gate so a public clone skips them rather than
-    # failing, which is a separate concern from the overlap race this list
-    # records.
-    "tests/test_lib_share.py",
-    "tests/test_lib_share_v2.py",
-    # #496 S6 §7.6: the tripwire that asserts each of the four new doctor
-    # scenarios still reaches the WARN or FAIL branch it exists to cover reads
-    # their committed `expected.txt` and `expected.exit`, under a root
-    # bin/cctally-doctor-test rebuilds in place. The tripwire exists because a
-    # gather defect once degraded all four to "retention scan unavailable" —
-    # which reads exactly like a healthy install — with the harness still green
-    # because the goldens had been regenerated from the broken output.
-    "tests/test_doctor_journal_legs.py",
-}
+
+# The helper each of them now calls, from bin/_lib-harness-env.sh.
+STAGING_HELPER = "stage_fixtures_out_of_tree"
+
 # builder stem -> output roots when NOT tests/fixtures/<stem>.
 BUILDER_ROOT_EXCEPTIONS = {
     "codex": ["codex-daily", "codex-monthly", "codex-weekly", "codex-session"],
@@ -112,78 +68,174 @@ _CMD = re.compile(
 )
 
 
-def _derive_inplace_dirs():
+def _inplace_dirs_in(text):
+    """The fixture dirs one harness's TEXT rebuilds in place.
+
+    Split out from the tree walk so the parser can be exercised against
+    scaffolds: an assertion that a derived set is empty is otherwise satisfied
+    by a derivation that finds nothing under any circumstances.
+    """
     dirs = set()
-    for harness in sorted((REPO / "bin").glob("cctally-*-test")):
-        for line in _logical_lines(harness.read_text()):
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                continue
-            m = _CMD.match(line)
-            if not m:
-                continue
-            stem = m.group(1)
-            if any(mark in line for mark in OUTDIR_MARKERS):
-                continue  # redirected to scratch -> not in-place
-            dirs.update(BUILDER_ROOT_EXCEPTIONS.get(stem, [stem]))
+    for line in _logical_lines(text):
+        if line.lstrip().startswith("#"):
+            continue
+        m = _CMD.match(line)
+        if not m:
+            continue
+        if any(mark in line for mark in OUTDIR_MARKERS):
+            continue  # redirected to scratch -> not in-place
+        dirs.update(BUILDER_ROOT_EXCEPTIONS.get(m.group(1), [m.group(1)]))
     return dirs
 
 
-def _expected_dirs_present():
-    """EXPECTED filtered to harnesses actually present in this tree.
+def _derive_inplace_dirs():
+    dirs = set()
+    for harness in sorted((REPO / "bin").glob("cctally-*-test")):
+        dirs |= _inplace_dirs_in(harness.read_text())
+    return dirs
 
-    Every EXPECTED dir maps 1:1 to bin/cctally-<dir>-test. The public mirror
-    excludes some harnesses (bin/cctally-share-v2-test is mirror-private), so
-    their fixture dir cannot be auto-derived there; requiring exact equality
-    against the full EXPECTED would red public CI (#296). Filtering keeps the
-    check strong on every tree: a parser miss still drops a *present* dir
-    (RED), and a new in-place rebuilder still adds a dir not in EXPECTED (RED).
+
+def test_no_harness_rebuilds_a_committed_fixture_tree_in_place():
+    """The inverted assertion: the derived in-place set must be EMPTY."""
+    derived = _derive_inplace_dirs()
+    assert derived == set(), (
+        "these harnesses invoke a fixture builder without redirecting its "
+        "output, so a test run rewrites tests/fixtures/%s and leaves the tracked "
+        "tree dirty: %s. Stage the committed tree into scratch with %s and build "
+        "there." % (sorted(derived), sorted(derived), STAGING_HELPER)
+    )
+
+
+_ASSIGN = re.compile(r"^\s*(?:local\s+|export\s+)?([A-Za-z_]\w*)=(.*)$")
+_REF = re.compile(r"\$\{?([A-Za-z_]\w*)")
+
+
+def _bindings(text):
+    found = {}
+    for raw in text.splitlines():
+        if raw.strip().startswith("#"):
+            continue
+        m = _ASSIGN.match(raw)
+        if m:
+            found.setdefault(m.group(1), []).append(m.group(2))
+    return found
+
+
+def _reaches_mktemp(name, bindings, seen=None):
+    """Whether NAME's value is built on a `mktemp` result, following references."""
+    seen = seen or set()
+    if name in seen:
+        return False
+    seen.add(name)
+    for value in bindings.get(name, ()):
+        if "mktemp" in value:
+            return True
+        if any(_reaches_mktemp(ref, bindings, seen) for ref in _REF.findall(value)):
+            return True
+    return False
+
+
+def staging_destinations(text, helper=STAGING_HELPER):
+    """`{fixture name: destination expression}` for each staging call."""
+    pattern = re.compile(
+        r'^\s*%s\s+([A-Za-z0-9_-]+)\s+"?([^"\s]+)"?' % re.escape(helper)
+    )
+    found = {}
+    for raw in text.splitlines():
+        if raw.strip().startswith("#"):
+            continue
+        m = pattern.match(raw)
+        if m:
+            found[m.group(1)] = m.group(2)
+    return found
+
+
+def staged_into_the_tree(text, helper=STAGING_HELPER):
+    """Staging calls whose destination is not a `mktemp` directory.
+
+    Calling the helper is not the property; staging OUT OF TREE is.
+    `stage_fixtures_out_of_tree doctor "$REPO_ROOT/tests/fixtures/doctor"`
+    rebuilds the committed tree in place and satisfies a check that only looks
+    for the call. `bin/_lib-harness-env.sh` refuses that destination at run
+    time; this is the same rule read off the source, so a harness that would be
+    refused is reported before anybody runs it.
     """
-    return {
-        d for d in EXPECTED_INPLACE_DIRS
-        if (REPO / "bin" / ("cctally-%s-test" % d)).exists()
+    bindings = _bindings(text)
+    offenders = {}
+    for name, destination in staging_destinations(text, helper).items():
+        refs = _REF.findall(destination)
+        if not any(_reaches_mktemp(ref, bindings) for ref in refs):
+            offenders[name] = destination
+    return offenders
+
+
+def test_the_six_former_holdouts_stage_their_fixtures_out_of_tree():
+    """Emptiness alone is satisfied by a harness that stopped building at all."""
+    missing = []
+    for name in sorted(FORMER_INPLACE_HOLDOUTS):
+        harness = REPO / "bin" / ("cctally-%s-test" % name)
+        if not harness.exists():
+            continue  # mirror-private in a public clone
+        text = harness.read_text()
+        if ("%s %s " % (STAGING_HELPER, name)) not in text:
+            missing.append(name)
+    assert not missing, (
+        "these harnesses no longer stage their fixture tree out of tree: %s" % missing
+    )
+
+
+def test_every_staging_destination_is_a_temporary_directory():
+    """The other direction, which naming the helper does not establish."""
+    reported = {}
+    for harness in sorted((REPO / "bin").glob("cctally-*-test")):
+        offenders = staged_into_the_tree(harness.read_text())
+        if offenders:
+            reported[harness.name] = offenders
+    assert not reported, (
+        "these harnesses call %s with a destination that is not a mktemp "
+        "directory, so the rebuild lands wherever that path points — including, "
+        "if it is the committed root, in place: %r" % (STAGING_HELPER, reported)
+    )
+
+
+def test_the_destination_check_reports_a_committed_root():
+    """Proven against the exact call that would defeat the check above."""
+    in_tree = (
+        'REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)\n'
+        '%s doctor "$REPO_ROOT/tests/fixtures/doctor"\n' % STAGING_HELPER
+    )
+    assert staged_into_the_tree(in_tree) == {
+        "doctor": "$REPO_ROOT/tests/fixtures/doctor"
     }
 
-
-def _pytest_readers_of(dirs):
-    """tests/*.py files that reference tests/fixtures/<d> for any d in dirs."""
-    readers = {}
-    for test in sorted((REPO / "tests").glob("test_*.py")):
-        text = test.read_text()
-        for d in dirs:
-            # literal "fixtures/<d>" OR pathlib "fixtures", "<d>" / "fixtures" / "<d>"
-            pat = (
-                r'fixtures/%s\b' % re.escape(d)
-                + r'|"fixtures"\s*[,/]\s*"%s"' % re.escape(d)
-            )
-            if re.search(pat, text):
-                readers.setdefault("tests/" + test.name, set()).add(d)
-    return readers
-
-
-def test_derived_inplace_dirs_match_expected():
-    derived = _derive_inplace_dirs()
-    expected = _expected_dirs_present()
-    assert derived == expected, (
-        "auto-derived in-place-rebuilt dirs %s != expected-present %s "
-        "(new/removed in-place rebuilder — re-audit its pytest readers, or "
-        "update EXPECTED_INPLACE_DIRS)" % (sorted(derived), sorted(expected))
+    staged = (
+        'FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)\n'
+        'FIXTURES="$FIXTURE_STAGE/doctor"\n'
+        '%s doctor "$FIXTURES"\n' % STAGING_HELPER
     )
+    assert staged_into_the_tree(staged) == {}
 
 
-def test_every_inplace_reader_is_deselected():
-    readers = _pytest_readers_of(EXPECTED_INPLACE_DIRS)
-    missing = {f: sorted(ds) for f, ds in readers.items()
-               if f not in KNOWN_SAFE_DESELECT}
-    assert not missing, (
-        "pytest files read an in-place-rebuilt fixture dir but are NOT in "
-        "KNOWN_SAFE_DESELECT: %s. Under a pytest/shell-pool overlap (#296) they "
-        "would race the rebuild; add them to KNOWN_SAFE_DESELECT and, if the "
-        "overlap is (re-)enabled, to the runner's deselect list." % missing
+def test_the_inversion_can_fail():
+    """Proven against scaffolds, so the empty derivation is not vacuous.
+
+    An assertion that something is empty is exactly the assertion that passes
+    when the thing that produces it is broken, so the producer is exercised
+    directly here.
+    """
+    inplace = '"$REPO_ROOT/bin/build-dashboard-fixtures.py" >/dev/null\n'
+    assert _inplace_dirs_in(inplace) == {"dashboard"}
+
+    redirected = (
+        '"$REPO_ROOT/bin/build-dashboard-fixtures.py" --out "$SCRATCH/x"\n'
     )
+    assert _inplace_dirs_in(redirected) == set()
 
+    cached = 'build_fixtures_cached "$REPO_ROOT/bin/build-share-fixtures.py" "$D"\n'
+    assert _inplace_dirs_in(cached) == set()
 
-def test_guard_is_non_vacuous():
-    # There is at least one real reader being guarded (else the test is vacuous).
-    assert _pytest_readers_of(EXPECTED_INPLACE_DIRS), \
-        "no in-place fixture readers found — guard would be vacuous"
+    commented = '#  "$REPO_ROOT/bin/build-doctor-fixtures.py" >/dev/null\n'
+    assert _inplace_dirs_in(commented) == set()
+
+    staged = '%s doctor "$FIXTURES"\n' % STAGING_HELPER
+    assert _inplace_dirs_in(staged) == set()

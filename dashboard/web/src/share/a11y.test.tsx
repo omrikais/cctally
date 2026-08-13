@@ -157,6 +157,29 @@ describe('share-v2 a11y attributes', () => {
 });
 
 describe('share-v2 focus restoration', () => {
+  it('<ComposerModal> contains Tab while open', () => {
+    dispatch({
+      type: 'BASKET_HYDRATE',
+      items: [{
+        id: '1', panel: 'weekly', template_id: 'weekly-recap',
+        options: defaultOpts(), added_at: '2026-05-12T09:00:00Z',
+        data_digest_at_add: 'sha256:abc', kernel_version: 1,
+        label_hint: 'Weekly recap', source: 'claude' as const,
+      } satisfies BasketItem],
+    });
+    dispatch(openComposer());
+    render(<ComposerModal />);
+    const dialog = screen.getByRole('dialog');
+    const focusables = within(dialog).getAllByRole('button');
+    expect(focusables.length).toBeGreaterThan(1);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    act(() => { last.focus(); });
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(first);
+  });
+
   it('<ComposerModal> restores focus to the opener element on close', async () => {
     const opener = document.createElement('button');
     opener.id = 'composer-opener';

@@ -1883,6 +1883,27 @@ def test_a_replace_marker_keeps_its_scratch_proxy_when_a_stamp_would_disagree(
     )
 
 
+def test_replace_marker_without_scratch_owes_one_shared_fail_closed_verdict(ns):
+    """No scratch is not proof that a replace publication stayed predecessor."""
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_store as st
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+    jr._write_publication_marker(
+        db,
+        "/nonexistent/stats-rebuild-no-scratch.json",
+        started_at="2026-08-05T12:00:00Z",
+        scratch_path="",
+        mechanism="replace",
+    )
+    state = jr._read_publication_marker(db)
+
+    assert jr._pending_publication_owes_nothing(db, state) is False
+    assert st._pending_stats_publication_never_replaced(db) is False
+
+
 def test_a_crash_publishing_into_a_pre_stamp_epoch_discards_the_marker(ns):
     """#496 S3 §5, the upgrade path.
 

@@ -146,8 +146,7 @@ for fix_dir in "$FIXDIR"/*/; do
     flags_arr=()
     if [ -f "$fix_dir/flags.txt" ]; then
         flags_line=$(sed "s|{HOME}|$scratch|g" "$fix_dir/flags.txt")
-        # shellcheck disable=SC2207,SC2046,SC2086
-        flags_arr=( $flags_line )
+        read -r -a flags_arr <<< "$flags_line"
     fi
 
     # Expected stderr / rc.

@@ -41,6 +41,7 @@ build_fixtures_cached "$REPO_ROOT/bin/build-budget-fixtures.py" "$SCRATCH_DIR" |
     exit 1
 }
 
+# ShellCheck: the shared harness is resolved from the runtime repository root.
 # shellcheck disable=SC1091
 . "$REPO_ROOT/bin/_lib-fixture-harness.sh"
 
@@ -76,12 +77,12 @@ run_format_mode () {
     local label="$1" flags="$2" golden_suffix="$3"
     local fx_home="$SCRATCH_DIR/under"
     local as_of=""
+    # ShellCheck: the selected fixture input is generated per scenario.
     # shellcheck disable=SC1091
     . "$HARNESS_FIXTURES_DIR/under/input.env"
     as_of="$AS_OF"
     local golden="$HARNESS_FIXTURES_DIR/under/golden-$golden_suffix.txt"
     local raw actual
-    # shellcheck disable=SC2086
     raw=$(HOME="$fx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" \
           "$HARNESS_BIN" budget $flags 2>&1)
     # Normalize the live version token (both `cctally_version: X` and `vX`).
@@ -128,12 +129,12 @@ run_project_format_mode () {
     local fixture="$1" label="$2" flags="$3" golden_suffix="$4"
     local fx_home="$SCRATCH_DIR/$fixture"
     local as_of=""
-    # shellcheck disable=SC1091
+    # ShellCheck: the selected fixture input is generated per scenario.
+    # shellcheck disable=SC1090
     . "$HARNESS_FIXTURES_DIR/$fixture/input.env"
     as_of="$AS_OF"
     local golden="$HARNESS_FIXTURES_DIR/$fixture/golden-$golden_suffix.txt"
     local raw actual
-    # shellcheck disable=SC2086
     raw=$(HOME="$fx_home" NO_COLOR=1 TZ=Etc/UTC CCTALLY_AS_OF="$as_of" \
           "$HARNESS_BIN" budget $flags 2>&1)
     if [ -n "$LIVE_VERSION" ]; then

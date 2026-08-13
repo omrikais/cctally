@@ -20,12 +20,19 @@ export interface ModalCloseButtonProps {
   label?: string;
   /** CSS hook. Defaults to the shared "modal-close". */
   className?: string;
+  /**
+   * For a shell whose close is inoperable for a stretch — Settings suppresses
+   * dismissal while a save is in flight — so the affordance matches the
+   * behaviour instead of looking operable through a no-op.
+   */
+  disabled?: boolean;
 }
 
 export function ModalCloseButton({
   onClose,
   label = 'Close',
   className = 'modal-close',
+  disabled,
 }: ModalCloseButtonProps) {
   return (
     <button
@@ -33,6 +40,7 @@ export function ModalCloseButton({
       className={className}
       aria-label={label}
       onClick={onClose}
+      disabled={disabled}
     >
       ×
     </button>

@@ -316,6 +316,13 @@ export interface AlertsSettingsEnvelope {
   // reflects `_budget_alerts_active` (a budget set AND alerts on).
   budget_thresholds: number[];
   budget_enabled?: boolean;
+  // The Claude weekly budget AMOUNT (#513 S2 §5.1), mirrored from
+  // `_get_budget_config(...)["weekly_usd"]`. Optional AND nullable: optional
+  // because a server predating the mirror omits the key entirely, nullable
+  // because "no budget configured" is a real, expressible state. The store's
+  // `AlertsConfig` narrows this to a REQUIRED `number | null`, so no consumer
+  // has to re-derive the defaulting — see `normalizeAlertsSettings`.
+  weekly_usd?: number | null;
   // Projected axis (issue #121): the two opt-in toggles, mirrored from
   // `_get_alerts_config(...)["projected_enabled"]` (weekly leg) and
   // `_get_budget_config(...)["projected_enabled"]` (budget leg). Both

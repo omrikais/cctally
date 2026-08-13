@@ -31,6 +31,8 @@ export interface ModalHeaderProps {
   closeLabel?: string;
   /** CSS hook forwarded to the close button (defaults to "modal-close"). */
   closeClassName?: string;
+  /** Forwarded to the close button; see ModalCloseButton's `disabled`. */
+  closeDisabled?: boolean;
 }
 
 export function ModalHeader({
@@ -41,6 +43,7 @@ export function ModalHeader({
   onClose,
   closeLabel,
   closeClassName,
+  closeDisabled,
 }: ModalHeaderProps) {
   return (
     <header className={className}>
@@ -54,6 +57,7 @@ export function ModalHeader({
           onClose={onClose}
           label={closeLabel}
           className={closeClassName}
+          disabled={closeDisabled}
         />
       ) : null}
     </header>

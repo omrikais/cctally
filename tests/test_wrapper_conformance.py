@@ -53,6 +53,7 @@ def test_map_is_complete():
         if p.name.endswith("-test") or p.name in (
             "cctally-test-all", "cctally-preview", "cctally-bench",
             "cctally-mirror-public", "cctally-release", "cctally-test-remote",
+            "cctally-isolation-sweep",
         ):
             continue
         head = p.read_text(encoding="utf-8", errors="replace").splitlines()[0]

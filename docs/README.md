@@ -5,7 +5,8 @@ Reference docs for `cctally`.
 ## Start here
 
 - [Installation](installation.md) — symlinks, status-line wiring, Python version
-- [Configuration](configuration.md) — `config.json` shape and week-start rules
+- [Configuration](commands/config.md) — every setting `cctally config` accepts, its default, and whether the dashboard can change it
+- [The `config.json` file](configuration.md) — file shape, reserved `collector.*` keys, week-start rules
 - [Runtime data](runtime-data.md) — what lives in `~/.local/share/cctally/`
 - [Architecture](architecture.md) — data flow, caches, week boundaries
 

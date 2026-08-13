@@ -33,6 +33,8 @@ cctally exit codes fall into three groups.
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |
 | share surface | `2` flag-combo error · `3` output-filename collision exhaustion, or a privacy refusal (the render detected a forbidden identifier class and, per the #503 S1 decision, fails rather than redacting — nothing is written) |
 
+**Standalone tools under `bin/` follow the same taxonomy without being subcommands.** `bin/cctally-preflight` and `bin/cctally-test-owners` are development tools invoked by path, not `cctally` subcommands, so they are listed here only to record that they obey the conventions above rather than inventing their own: `0` clean, `2` invalid invocation, and `3` for any detected defect **or for an inability to complete the check**. That last clause is the load-bearing one — an inability to verify fails rather than passes, so a missing ownership file or an unreadable tree is a refusal and never a silent green. Neither emits a `--json` envelope, because nothing consumes one. Both accept `--repo-root <DIR>` to operate on a tree other than the one containing the script, and each describes its own flags under `--help`.
+
 **The privacy refusal's stderr line.** The CLI prints `cctally: refused to write a share artifact — ` followed verbatim by the exception message, so the text after the em dash is whichever message the detector raised. There are two, and both begin with their own prefix. A document-wide class detection prints `share artifact would disclose: ` and then one comma-separated `<class> (<offending value>)` pair per detected class, each matched value truncated, at most five pairs and then `and N more`:
 
 ```

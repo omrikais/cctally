@@ -967,7 +967,7 @@ def test_h1_multiwriter_baseline_stays_intact(tmp_path):
         for surface, process in reader_procs
     })
     latencies = {"writer": [], "statusline": [], "hook-tick": [], "report": []}
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 110
     while active and time.monotonic() < deadline:
         now = time.monotonic()
         for process, (surface, process_started) in list(active.items()):
@@ -1641,7 +1641,7 @@ def test_h4_two_concurrent_heals(tmp_path):
 
     procs = [_spawn_writer(env, "report") for _ in range(2)]
     for p in procs:
-        p.wait(timeout=180)
+        p.wait(timeout=110)
 
     # #496 S3: both detections DEFER, and admission admits exactly one of them.
     # The replacement itself happens in the detached worker that admission
@@ -1649,7 +1649,7 @@ def test_h4_two_concurrent_heals(tmp_path):
     # occurred. A poll rather than a fixed sleep: the property is "exactly one",
     # and reading it before the worker finishes would assert nothing.
     db = _resolved_app_dir(env) / "stats.db"
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 110
     while time.monotonic() < deadline:
         try:
             ok, _text = _integrity_ok(db)
@@ -2005,7 +2005,7 @@ def test_h4_open_time_cutover_races_storm(tmp_path):
 
     procs = [_spawn_writer(env, *_tick_args(1000 + i)) for i in range(6)]
     for p in procs:
-        p.wait(timeout=180)
+        p.wait(timeout=110)
 
     db = _resolved_app_dir(env) / "stats.db"
     ok, text = _integrity_ok(db)
@@ -2088,6 +2088,56 @@ def test_stats_open_fails_fast_while_maintenance_is_held(tmp_path):
     # failure above is attributable to the lock and not to a broken `report`.
     res = _cctally(env, "report")
     assert res.returncode == 0, res.stderr
+
+
+def test_stats_open_names_background_rebuild_while_heal_worker_holds_maintenance(
+    tmp_path,
+):
+    """A concurrent opener must name the detached background rebuild."""
+    env = _storm_env(tmp_path / "data")
+    _seed_journal(env, 3)
+    app = _resolved_app_dir(env)
+    maintenance_lock = app / "stats.db.maintenance.lock"
+    worker_lock = app / "stats-corruption-heal.worker.lock"
+    request = app / "stats-corruption-heal.pending"
+    request.write_text(json.dumps({
+        "schemaVersion": 1,
+        "healId": "concurrent-opener",
+        "forensicsDisposition": "confirmed",
+    }))
+    holder_code = (
+        "import fcntl, sys, time; "
+        "worker = open(sys.argv[1], 'a+'); "
+        "fcntl.flock(worker, fcntl.LOCK_EX); "
+        "maintenance = open(sys.argv[2], 'a+'); "
+        "fcntl.flock(maintenance, fcntl.LOCK_EX); "
+        "print('held', flush=True); time.sleep(120)"
+    )
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            holder_code,
+            str(worker_lock),
+            str(maintenance_lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        result = _cctally(env, "report", timeout=60)
+        assert result.returncode == 3, result.stderr
+        assert (
+            "stats.db corruption rebuild is running in the background; "
+            "retry shortly"
+        ) in result.stderr
+        assert "maintenance command exits" not in result.stderr
+    finally:
+        holder.send_signal(signal.SIGKILL)
+        holder.wait(timeout=30)
+        if holder.stdout is not None:
+            holder.stdout.close()
 
 
 _NESTED_HEAL_CHILD = """

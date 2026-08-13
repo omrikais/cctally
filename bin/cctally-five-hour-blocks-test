@@ -146,7 +146,8 @@ seed_session_entry () {
     # rare case where a single scenario seeds two entries from the same
     # (ts, model, in_tok, source_path) tuple.
     SEED_COUNTER=$((${SEED_COUNTER:-0} + 1))
-    local msg_id="msg_${SEED_COUNTER}_$(echo "${ts}_${model}_${in_tok}_${source_path}" | tr -dc 'A-Za-z0-9_' | head -c 32)"
+    local msg_id
+    msg_id="msg_${SEED_COUNTER}_$(echo "${ts}_${model}_${in_tok}_${source_path}" | tr -dc 'A-Za-z0-9_' | head -c 32)"
 
     sqlite3 "$cache_db" <<EOF
 INSERT INTO session_files (path, size_bytes, mtime_ns, last_byte_offset,

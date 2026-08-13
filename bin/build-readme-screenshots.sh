@@ -28,9 +28,12 @@ DOCS_IMG="$REPO_ROOT/docs/img"
 # Dev/test knobs (issue #367 — NOT part of the capability contract above):
 #   README_SCREENSHOTS_SELFTEST=port       print `port=<n>` and exit 0
 #   README_SCREENSHOTS_SELFTEST=dashboard  launch, print `url=<url>`, exit 0
+#   README_SCREENSHOTS_SELFTEST=toolchain  provision/validate, print paths, exit 0
 #   README_SCREENSHOTS_WAIT_TICKS=<n>      banner-poll ticks, 0.1s each (default 150 => ~15s)
 #   README_SCREENSHOTS_READY_TICKS=<n>     readiness-poll ticks, up to 2.1s each
 #                                          when the probe times out (default 30 => ~60s)
+# ShellCheck: the release driver greps this literal capability marker from tags.
+# shellcheck disable=SC2034
 README_SCREENSHOTS_CONTRACT=1
 CCTALLY_BIN="${CCTALLY_BIN:-$REPO_ROOT/bin/cctally}"
 export CCTALLY_BIN
@@ -189,6 +192,8 @@ case "${README_SCREENSHOTS_SELFTEST:-}" in
         echo "url=$DASHBOARD_URL"
         exit 0
         ;;
+    toolchain)
+        ;;
     "")
         ;;
     *)
@@ -197,8 +202,51 @@ case "${README_SCREENSHOTS_SELFTEST:-}" in
         ;;
 esac
 
-# 1. Verify dev tools (playwright is verified at import time inside
-#    bin/_capture_dashboard.py, with its own clean error message).
+# Resolve and validate the Python/Playwright toolchain before fixture generation
+# or capture. The owned default is a durable per-user cache and needs no manual
+# setup: a missing/torn venv or matching Chromium revision is rebuilt under a
+# lock. Packages are staged first; Chromium is installed only after the venv
+# has its durable name, and the completion marker follows final validation.
+# SCREENSHOTS_VENV_DIR relocates that owned cache for isolated acceptance.
+# SCREENSHOTS_PYTHONPATH remains a
+# validation-only operator override: it must be the derived site-packages of one
+# actual venv and is never mutated. Package/browser installation is stubbed only
+# by the hermetic `toolchain` self-test through
+# README_SCREENSHOTS_TOOLCHAIN_INSTALLER.
+ORIGINAL_HOME="$HOME"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    SCREENSHOTS_CACHE_ROOT="${XDG_CACHE_HOME:-$ORIGINAL_HOME/Library/Caches}/cctally/readme-screenshots"
+    export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ORIGINAL_HOME/Library/Caches/ms-playwright}"
+else
+    SCREENSHOTS_CACHE_ROOT="${XDG_CACHE_HOME:-$ORIGINAL_HOME/.cache}/cctally/readme-screenshots"
+    export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ORIGINAL_HOME/.cache/ms-playwright}"
+fi
+SCREENSHOTS_VENV_DIR="${SCREENSHOTS_VENV_DIR:-$SCREENSHOTS_CACHE_ROOT/venv}"
+TOOLCHAIN_ARGS=(
+    --venv "$SCREENSHOTS_VENV_DIR"
+    --browser-root "$PLAYWRIGHT_BROWSERS_PATH"
+)
+if [[ -n "${SCREENSHOTS_PYTHONPATH:-}" ]]; then
+    TOOLCHAIN_ARGS+=(--pythonpath "$SCREENSHOTS_PYTHONPATH")
+fi
+TOOLCHAIN_JSON="$(python3 "$REPO_ROOT/bin/_provision_readme_screenshot_toolchain.py" "${TOOLCHAIN_ARGS[@]}")"
+SCREENSHOTS_PYTHON="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["python"])' <<<"$TOOLCHAIN_JSON")"
+ORIGINAL_USER_SITE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["sitePackages"])' <<<"$TOOLCHAIN_JSON")"
+SCREENSHOTS_BROWSER="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["browser"])' <<<"$TOOLCHAIN_JSON")"
+SCREENSHOTS_TOOLCHAIN_STATUS="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["status"])' <<<"$TOOLCHAIN_JSON")"
+
+if [[ "${README_SCREENSHOTS_SELFTEST:-}" == "toolchain" ]]; then
+    echo "toolchain=$SCREENSHOTS_TOOLCHAIN_STATUS"
+    echo "python=$SCREENSHOTS_PYTHON"
+    echo "site-packages=$ORIGINAL_USER_SITE"
+    echo "browser=$SCREENSHOTS_BROWSER"
+    exit 0
+fi
+
+SCREENSHOTS_PYTHON_DIR=$(dirname "$SCREENSHOTS_PYTHON")
+export PATH="$SCREENSHOTS_PYTHON_DIR:$PATH"
+
+# 1. Verify dev tools.
 require freeze "brew install charmbracelet/tap/freeze"
 
 # 2. Build marketing fixture (today UTC anchored). The fixture builder
@@ -213,39 +261,6 @@ echo "[1/5] Building marketing fixture (--as-of $AS_OF)"
 mkdir -p "$SCRATCH/home"
 cp -R "$MARKETING_FIXTURE/." "$SCRATCH/home/"
 echo "[2/5] Staged marketing fixture at $SCRATCH/home"
-
-# Capture original HOME so Playwright can still find its chromium cache
-# after we redirect HOME for cctally + dashboard. Honors a user-set
-# PLAYWRIGHT_BROWSERS_PATH (e.g. custom install location) via ${VAR:-default}.
-ORIGINAL_HOME="$HOME"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ORIGINAL_HOME/Library/Caches/ms-playwright}"
-else
-    export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$ORIGINAL_HOME/.cache/ms-playwright}"
-fi
-
-# Resolve a Python site-packages tree that has BOTH `rich` (for `cctally
-# tui`) and `playwright` (for the dashboard captures). HOME redirect
-# below moves Python's user-site lookup to the empty scratch dir, so
-# anything pip-installed into ~/Library/Python/.../site-packages becomes
-# invisible to subprocesses unless we pin its path via PYTHONPATH.
-#
-# Resolution order:
-#   1. SCREENSHOTS_PYTHONPATH env (explicit override; e.g. CI venv)
-#   2. /tmp/cctally-screenshots-venv/lib/python3.14/site-packages (the
-#      maintainer-local venv that this pipeline assumes — created by
-#      `python3 -m venv /tmp/cctally-screenshots-venv && pip install
-#      rich playwright && playwright install chromium`)
-#   3. The current user-site (last resort; works only if both packages
-#      are installed there)
-SCREENSHOTS_VENV_SITE="/tmp/cctally-screenshots-venv/lib/python3.14/site-packages"
-if [[ -n "${SCREENSHOTS_PYTHONPATH:-}" ]]; then
-    ORIGINAL_USER_SITE="$SCREENSHOTS_PYTHONPATH"
-elif [[ -d "$SCREENSHOTS_VENV_SITE" ]]; then
-    ORIGINAL_USER_SITE="$SCREENSHOTS_VENV_SITE"
-else
-    ORIGINAL_USER_SITE="$(python3 -c 'import site; print(site.getusersitepackages())' 2>/dev/null || echo "")"
-fi
 
 # 4. Pin CCTALLY_AS_OF + HOME for every subsequent invocation. The
 # fixture builder shifts to Thursday 14:00 UTC of the AS_OF-containing

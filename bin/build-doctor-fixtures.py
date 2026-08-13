@@ -624,6 +624,14 @@ def main():
         "quota-fresh-stale", "quota-fresh-future",
         "lifecycle-recent-never", "lifecycle-recent-stale",
     ])
+    p.add_argument(
+        "--out", type=pathlib.Path, default=None,
+        help="Override the output directory (defaults to tests/fixtures/doctor/). "
+             "Harnesses build into a per-run scratch dir so the committed "
+             "fixtures stay byte-stable and a test run leaves the tracked tree "
+             "unchanged. Applies to the plain scaffolding mode only; the "
+             "--emit-* modes take their destination as a positional path.",
+    )
     p.add_argument("path", nargs="?")
     p.add_argument("roots", nargs="*")
     args = p.parse_args()
@@ -657,9 +665,10 @@ def main():
         return
 
     # Plain mode: scaffold every scenario directory.
-    ROOT.mkdir(parents=True, exist_ok=True)
+    root = ROOT if args.out is None else args.out
+    root.mkdir(parents=True, exist_ok=True)
     for dir_name, slug in SCENARIOS.items():
-        d = ROOT / dir_name
+        d = root / dir_name
         d.mkdir(parents=True, exist_ok=True)
         (d / "setup.sh").write_text(_common_setup_preamble() + _scenario_body(slug))
         (d / "setup.sh").chmod(0o755)
@@ -678,7 +687,7 @@ def main():
             homes_path.write_text("\n".join(homes) + "\n")
         elif homes_path.exists():
             homes_path.unlink()
-    print(f"Scaffolded {len(SCENARIOS)} scenarios under {ROOT}")
+    print(f"Scaffolded {len(SCENARIOS)} scenarios under {root}")
 
 
 

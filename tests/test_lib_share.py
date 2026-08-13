@@ -8,6 +8,15 @@ import pathlib
 import sys
 from datetime import datetime, timezone
 
+import pytest
+
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). This module loads bin/cctally (or a sibling) through
+# SourceFileLoader or at import, and neither re-derives the path constants,
+# so pinning HOME alone would leave whatever the previous test on this xdist
+# worker left behind -- which is why it was green alone and red under -n 4.
+pytestmark = pytest.mark.usefixtures("isolated_paths")
+
 # Load _lib_share by path (same pattern bin/cctally uses for its peers).
 # Reuse an already-loaded module if a peer test file (e.g.
 # `tests/test_lib_share_v2.py`) registered one — otherwise the LAST loader
@@ -1478,6 +1487,86 @@ def test_bar_chart_renders_stacks_when_present():
     assert a_idx < b_idx, "expected sorted-key ordering in legend"
 
 
+def test_stacked_bar_legend_is_reserved_outside_the_plot():
+    """The legend key must not be painted over the bars it identifies."""
+    import xml.etree.ElementTree as ET
+
+    chart = BarChart(
+        points=(
+            ChartPoint(x_label="W1", x_value=0.0, y_value=30.0),
+            ChartPoint(x_label="W2", x_value=1.0, y_value=50.0),
+        ),
+        y_label="$",
+        stacks={
+            "model-a": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=10.0),
+                ChartPoint(x_label="W2", x_value=1.0, y_value=20.0),
+            ),
+            "model-b": (
+                ChartPoint(x_label="W1", x_value=0.0, y_value=20.0),
+                ChartPoint(x_label="W2", x_value=1.0, y_value=30.0),
+            ),
+        },
+    )
+    out = _lib_share._render_bar_chart_svg(
+        chart, palette=_lib_share.PALETTE_LIGHT,
+        x=0, y=0, width=400, height=200,
+    )
+    root = ET.fromstring(f"<svg>{out}</svg>")
+    bars = [
+        node for node in root.iter("rect")
+        if float(node.attrib["width"]) > 8.0
+    ]
+    legend_labels = [
+        node for node in root.iter("text")
+        if (node.text or "") in chart.stacks
+    ]
+    assert len(bars) == 4
+    assert len(legend_labels) == 2
+    assert max(float(node.attrib["y"]) for node in legend_labels) < min(
+        float(node.attrib["y"]) for node in bars
+    )
+
+
+def test_hbar_chart_grows_to_keep_eighteen_labels_comfortably_spaced():
+    """Detail templates may draw 18+ rows; the fixed 220px slot crowded them."""
+    import dataclasses
+    import xml.etree.ElementTree as ET
+
+    chart = HorizontalBarChart(
+        points=tuple(
+            ChartPoint(
+                x_label=f"session-{index:02d}",
+                x_value=float(index),
+                y_value=float(18 - index),
+            )
+            for index in range(18)
+        ),
+        x_label="$",
+        cap=None,
+    )
+    snap = dataclasses.replace(
+        _make_minimal_snapshot(),
+        columns=(), rows=(), chart=chart, totals=(),
+    )
+    out = _lib_share._render_svg(
+        snap,
+        palette=_lib_share.PALETTE_LIGHT,
+        branding=False,
+        include_chrome=False,
+        include_table=False,
+    )
+    root = ET.fromstring(out)
+    baselines = sorted(
+        float(node.attrib["y"])
+        for node in root.iter()
+        if node.tag.rsplit("}", 1)[-1] == "text"
+        and (node.text or "").startswith("session-")
+    )
+    assert len(baselines) == 18
+    assert min(b - a for a, b in zip(baselines, baselines[1:])) >= 14.0
+
+
 def test_bar_chart_unstacked_path_unchanged_when_no_stacks():
     """BarChart with stacks=None still renders the unstacked path."""
     chart = BarChart(
@@ -1778,7 +1867,8 @@ def test_weekly_builder_renders_none_used_pct_as_em_dash():
         view,
         period_start=datetime(2026, 4, 13, tzinfo=timezone.utc),
         period_end=datetime(2026, 4, 27, tzinfo=timezone.utc),
-        display_tz="UTC", version="9.9.9",breakdown_model=False,
+        display_tz="UTC", version="9.9.9", breakdown_model=False,
+        since_explicit=True,
     )
     assert isinstance(snap.rows[0].cells["used"], _lib_share.PercentCell)
     assert isinstance(snap.rows[1].cells["used"], _lib_share.TextCell)
@@ -2311,6 +2401,7 @@ def _session_snapshot_for(paths_and_costs):
         version="9.9.9",
         top_n=None,
         tz=timezone.utc,
+        since_explicit=True,
     )
 
 
@@ -2881,33 +2972,122 @@ def _s2r_construction_sites(call_name: str) -> "list[tuple[str, str, int]]":
     return found
 
 
-def test_share_snapshot_constructor_inventory_is_fully_enumerated():
-    """F10's acceptance: an independently checked constructor inventory.
+_SHARE_SNAPSHOT_REGISTRY_SITES = frozenset(
+    ("bin/_lib_share_templates.py", fn, 0)
+    for fn in (
+        "_build_weekly_recap", "_build_current_week_recap",
+        "_build_trend_recap", "_build_daily_recap",
+        "_build_monthly_recap", "_build_blocks_recap",
+        "_build_forecast_recap", "_build_sessions_recap",
+        "_build_weekly_visual", "_build_weekly_detail",
+        "_build_current_week_visual", "_build_current_week_detail",
+        "_build_trend_visual", "_build_trend_detail",
+        "_build_daily_visual", "_build_daily_detail",
+        "_build_monthly_visual", "_build_monthly_detail",
+        "_build_blocks_visual", "_build_blocks_detail",
+        "_build_forecast_visual", "_build_forecast_detail",
+        "_build_sessions_visual", "_build_sessions_detail",
+        "_build_projects_recap", "_build_projects_visual",
+        "_build_projects_detail",
+    )
+)
 
-    The number 43 used to appear only in a prose comment. Counted here
-    from the source across all six construction modules, with the
-    per-module split spelled out so a site that MOVES between modules
-    still fails rather than netting out.
+_SHARE_SNAPSHOT_CLI_SITES = frozenset(
+    ("bin/_cctally_share.py", fn, 0)
+    for fn in (
+        "_build_report_snapshot", "_build_daily_snapshot",
+        "_build_monthly_snapshot", "_build_weekly_snapshot",
+        "_build_forecast_snapshot", "_build_project_snapshot",
+        "_build_five_hour_blocks_snapshot", "_build_session_snapshot",
+    )
+)
 
-    SCOPE: those six modules, listed in `_S2R_PERIOD_MODULES`. The class
-    this guards is therefore "these six files", not "the tree" — a
-    `ShareSnapshot` built in a seventh module is invisible to it. The
-    scope is deliberate (every shipped builder lives in one of the six),
-    but it is a scope, so a new builder module must be added here
-    (#503 S2 second review N8).
+_SHARE_SNAPSHOT_BYPASS_WAIVERS = {
+    ("bin/_cctally_forecast.py", "_build_budget_snapshot", 0):
+        "budget snapshots carry no project cell",
+    ("bin/_cctally_forecast.py", "_build_budget_no_data_snapshot", 0):
+        "budget no-data snapshots carry no project cell",
+    ("bin/_cctally_forecast.py", "_build_budget_no_budget_snapshot", 0):
+        "budget no-budget snapshots carry no project cell",
+    ("bin/_cctally_dashboard_share.py", "_build_codex_source_share_snapshot", 0):
+        "Codex source projects carry identity and kernel preparation covers them",
+    ("bin/_cctally_dashboard_share.py", "_build_codex_source_share_snapshot", 1):
+        "Codex source projects carry identity and kernel preparation covers them",
+    ("bin/_cctally_dashboard_share.py", "_build_codex_source_share_snapshot", 2):
+        "Codex source projects carry identity and kernel preparation covers them",
+    ("bin/_cctally_source_analytics.py", "build_source_share_snapshot", 0):
+        "source analytics snapshots carry no project cell",
+    ("bin/_cctally_codex.py", "_build_codex_share_snapshot", 0):
+        "Codex command snapshots carry no project cell",
+}
+
+
+def _share_snapshot_construction_sites():
+    """Find every `ShareSnapshot(...)` call in any text file under `bin/`.
+
+    The token prefilter lets the scan include extensionless Python entry points
+    without trying to parse every Bash wrapper. A matching file that is not
+    valid Python fails loudly instead of disappearing from the inventory.
     """
-    per_module: dict[str, int] = {}
-    for rel, _fn, _ordinal in _s2r_construction_sites("ShareSnapshot"):
-        per_module[rel] = per_module.get(rel, 0) + 1
-    assert per_module == {
-        "bin/_lib_share_templates.py": 27,
-        "bin/_cctally_share.py": 8,
-        "bin/_cctally_forecast.py": 3,
-        "bin/_cctally_dashboard_share.py": 3,
-        "bin/_cctally_source_analytics.py": 1,
-        "bin/_cctally_codex.py": 1,
-    }
-    assert sum(per_module.values()) == 43
+    import ast as _ast
+    import re as _re
+
+    found = []
+    for path in sorted((_REPO_ROOT / "bin").rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if not _re.search(r"\bShareSnapshot\s*\(", source):
+            continue
+        tree = _ast.parse(source, filename=str(path))
+        rel = str(path.relative_to(_REPO_ROOT))
+        stack = []
+        counts = {}
+
+        def walk(node):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                stack.append(node.name)
+            if isinstance(node, _ast.Call):
+                func = node.func
+                name = (func.attr if isinstance(func, _ast.Attribute)
+                        else getattr(func, "id", None))
+                if name == "ShareSnapshot":
+                    key = (rel, stack[-1] if stack else "<module>")
+                    ordinal = counts.get(key, 0)
+                    counts[key] = ordinal + 1
+                    found.append((*key, ordinal))
+            for child in _ast.iter_child_nodes(node):
+                walk(child)
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                stack.pop()
+
+        walk(tree)
+    return found
+
+
+def test_every_share_snapshot_constructor_is_classified_or_waived():
+    """Every constructor in `bin/` is registry, CLI, or explicitly waived."""
+    categories = (
+        _SHARE_SNAPSHOT_REGISTRY_SITES,
+        _SHARE_SNAPSHOT_CLI_SITES,
+        frozenset(_SHARE_SNAPSHOT_BYPASS_WAIVERS),
+    )
+    assert not (categories[0] & categories[1])
+    assert not (categories[0] & categories[2])
+    assert not (categories[1] & categories[2])
+    assert all(reason.strip() for reason in _SHARE_SNAPSHOT_BYPASS_WAIVERS.values())
+
+    actual = set(_share_snapshot_construction_sites())
+    classified = set().union(*categories)
+    assert actual == classified, (
+        "ShareSnapshot construction sites drifted from their structural "
+        "classification: "
+        f"unclassified={sorted(actual - classified)} "
+        f"missing={sorted(classified - actual)}"
+    )
 
 
 def test_every_period_construction_site_declares_its_boundary_kind():
@@ -3400,11 +3580,15 @@ def _s2r_facts_line(markdown: str) -> str:
         # block. Under America/New_York this named 2026-05-06, a day with
         # no row in the table below it.
         ("five-hour-blocks-md", "five-hour-blocks", "2026-05-07 → 2026-05-07"),
-        # Controls: these carry `--since`/`--until` instants that
-        # `_parse_cli_date_range` already grounds in the display zone.
-        ("daily-md", "daily", "2020-01-01 → 2026-05-09"),
-        ("weekly-md", "weekly", "2020-01-01 → 2026-05-09"),
-        ("session-md", "session", "2020-01-01 → 2026-05-09"),
+        # #527: an omitted `--since` is not a user-selected all-history
+        # bound. Share artifacts start at their first displayed bucket/row.
+        ("daily-md", "daily", "2026-05-04 → 2026-05-09"),
+        ("monthly-md", "monthly", "2026-05-01 → 2026-05-09"),
+        ("weekly-md", "weekly", "2026-04-27 → 2026-05-09"),
+        # The first 2026-05-04 entry resumes into a session whose displayed
+        # Last Activity is 2026-05-05, so the artifact's first visible day is
+        # the fifth rather than the first raw entry's day.
+        ("session-md", "session", "2026-05-05 → 2026-05-09"),
         ("project-md-anon", "project", "2026-05-04 → 2026-05-09"),
     ],
 )
@@ -3423,6 +3607,28 @@ def test_cli_artifacts_state_the_dates_their_own_rows_name(
         assert facts.startswith(expected), (scenario, tz, facts)
         zone = facts.rsplit("(", 1)[1].split(")", 1)[0]
         assert _ZoneInfo(zone).key == zone, (scenario, tz, facts)
+
+
+@_s2r_needs_share_fixtures
+@_s2_pytest.mark.parametrize(
+    "scenario,command",
+    [
+        ("daily-md", "daily"),
+        ("monthly-md", "monthly"),
+        ("weekly-md", "weekly"),
+        ("session-md", "session"),
+    ],
+)
+def test_cli_share_artifacts_preserve_an_explicit_since(
+        scenario, command, tmp_path):
+    """#527: content-derived defaults must never narrow a requested range."""
+    for tz in ("Etc/UTC", "America/New_York"):
+        facts = _s2r_facts_line(_s2r_run_cli(
+            scenario, command, tz=tz, tmp_path=tmp_path,
+            extra=("--since", "2020-01-01"),
+        ))
+        assert facts.startswith("2020-01-01 → 2026-05-09"), (
+            scenario, tz, facts)
 
 
 def _s2r_codex_entries():
@@ -5403,6 +5609,50 @@ def test_a_widened_end_bound_covers_the_instant_the_artifact_prints():
     assert _lib_share.period_civil_dates(widened) == ("2026-05-07",
                                                       "2026-05-08")
     assert widened.end >= printed, widened.end
+
+
+def test_a_widened_start_bound_covers_a_utc_instant_west_of_utc():
+    """The serialized start is absolute even when the strip is civil.
+
+    New York midnight is 04:00Z in May.  A row that prints 02:00Z on
+    the widened UTC date must not sit before the frontmatter bound, while
+    the facts strip must continue to name the date printed by the row.
+    """
+    printed = _dt2.datetime(2026, 5, 7, 2, 0, tzinfo=_dt2.timezone.utc)
+    period = _s2t_period(
+        _dt2.datetime(2026, 5, 8, 5, 0, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 5, 8, 6, 0, tzinfo=_dt2.timezone.utc),
+        display_tz="America/New_York")
+    snap = _s2t_snapshot_with_period(
+        period,
+        columns=(ColumnSpec(key="resets", label="Resets", align="left"),),
+        rows=(Row(cells={"resets": TextCell(printed.isoformat())}),))
+
+    facts = _s2r_facts_from_markdown(_s2t_render(snap, "md"))
+
+    assert facts.start_utc <= printed, facts
+    assert (facts.civil_start, facts.civil_end) == ("2026-05-07",
+                                                    "2026-05-08")
+
+
+def test_a_widened_end_bound_covers_a_utc_instant_east_of_utc():
+    """Tokyo's local end-of-day must not truncate a printed UTC row."""
+    printed = _dt2.datetime(2026, 5, 8, 18, 0, 0, 500000,
+                            tzinfo=_dt2.timezone.utc)
+    period = _s2t_period(
+        _dt2.datetime(2026, 5, 7, 0, 0, tzinfo=_dt2.timezone.utc),
+        _dt2.datetime(2026, 5, 7, 10, 0, tzinfo=_dt2.timezone.utc),
+        display_tz="Asia/Tokyo")
+    snap = _s2t_snapshot_with_period(
+        period,
+        columns=(ColumnSpec(key="resets", label="Resets", align="left"),),
+        rows=(Row(cells={"resets": TextCell(printed.isoformat())}),))
+
+    facts = _s2r_facts_from_markdown(_s2t_render(snap, "md"))
+
+    assert facts.end_utc >= printed, facts
+    assert (facts.civil_start, facts.civil_end) == ("2026-05-07",
+                                                    "2026-05-08")
 
 
 def test_a_widened_end_bound_from_a_month_bucket_covers_the_whole_month():

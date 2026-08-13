@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""Which harnesses own this change? (#529 S5 sections 4.5 and 4.6)
+
+Two modes.
+
+  --verify   Check the declared ownership files against the estate and against
+             a scraper that re-derives each harness's fixture edges from the
+             harness's own text. Exit 0 consistent, 2 invalid invocation, 3 on
+             any inconsistency or on an inability to complete the check.
+
+  (query)    Given changed paths — as arguments, on stdin one per line, or via
+             --from-diff <rev-range> — report the suggested direct owners, the
+             changed paths that could not be attributed, and a separate SAFE
+             SHELL SET this tool is willing to stand behind.
+
+Only mechanically verified evidence narrows the safe set: a changed fixture
+directory, a changed builder, or a change to a harness file itself. Every other
+path — one that matches nothing, one attributed only through the advisory
+hand-maintained source map, or any path at all while some harness is opaque —
+makes the safe set the entire shell estate. Under-selection is the dangerous
+direction and over-selection costs only time.
+
+Source edges cannot be scraped. Essentially every harness sets HARNESS_BIN to
+bin/cctally and invokes the CLI opaquely, naming none of the sibling modules it
+exercises, so `sourcePaths` is hand-maintained, unverifiable, and ADVISORY: it
+serves a human reader and never narrows anything.
+
+The private overlay tests/harness-ownership.private.json carries the rows for
+the mirror-private harnesses and is discovered by EXISTENCE. A public clone
+carries only the public half, so its absence there is normal and the tooling
+reports that it checked public rows alone. In the private checkout — the tree
+that carries .mirror-allowlist — its absence is a silent narrowing and is an
+error instead.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_DEFECT = 3
+
+SCHEMA_VERSION = 1
+_MANIFEST_REL = ("tests", "authoritative-test-manifest.json")
+_PUBLIC_REL = ("tests", "harness-ownership.json")
+_OVERLAY_REL = ("tests", "harness-ownership.private.json")
+
+_ROW_KEYS = frozenset({"fixturePaths", "sourcePaths"})
+_DOC_KEYS = frozenset({"schemaVersion", "description", "harnesses"})
+
+# ------------------------------------------------------------------ scraping
+
+# A bare word: the only argument form whose fixture name can be READ. Anything
+# else — "$VAR", "${A}b", a command substitution — is a construction this
+# scraper cannot prove, and an unprovable construction marks its harness
+# opaque rather than edge-free.
+_BARE_WORD = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+_LITERAL_FIXTURE = re.compile(r"tests/fixtures/([A-Za-z0-9_.-]+)")
+_LITERAL_BUILDER = re.compile(r"build-([A-Za-z0-9_.-]+)-fixtures\.py")
+_STAGE_CALL = re.compile(r"stage_fixtures_out_of_tree[ \t]+(\S+)")
+_FIXTURES_DIR_ASSIGN = re.compile(r"^[ \t]*HARNESS_FIXTURES_DIR=(\S+)", re.M)
+
+# The catch-all. The forms above each recognise one WAY of naming a fixture
+# directory, so a harness that names one in a fourth way declared no edges at
+# all — and silence is the direction that narrows. These two patterns match a
+# fixtures path segment that none of the recognised forms could have consumed:
+# `tests/fixtures/` whose next character cannot begin a directory name (an
+# interpolation, a substitution, a format placeholder), and a `fixtures` string
+# constant joined to a `tests` one, which is how pathlib builds the same path
+# component by component.
+_UNREADABLE_FIXTURE_PATH = re.compile(r"tests/fixtures/(?![A-Za-z0-9_.-])")
+_COMPONENT_WISE_FIXTURES = re.compile(r"""(['"])tests\1[ \t]*/[ \t]*(['"])fixtures\2""")
+
+# A comment is prose ABOUT the harness, never a path it reaches. Stripped
+# before every probe below, following the convention
+# tests/test_public_test_dep_closure.py::_shell_private_refs already uses.
+_COMMENT_LINE = re.compile(r"^[ \t]*#")
+
+Scrape = collections.namedtuple("Scrape", "edges opaque_reasons")
+
+
+def scrape_fixture_edges(text: str) -> Scrape:
+    """Fixture edges provable from one harness's text, plus why it is opaque.
+
+    Comment lines are removed first: a ``#`` line describes the harness and
+    reaches nothing, and scraping one produced four committed declarations that
+    no code supports.
+
+    Three canonical forms are recognised, and a catch-all closes the set:
+
+      1. a literal ``tests/fixtures/<name>`` path or ``build-<name>-fixtures.py``
+         reference anywhere in the text;
+      2. a ``HARNESS_FIXTURES_DIR=`` assignment, which the shared fixture
+         wrapper consumes;
+      3. a ``stage_fixtures_out_of_tree <name>`` call, which
+         ``bin/_lib-harness-env.sh`` expands into BOTH a fixture directory and
+         a builder path out of that single argument — so a per-harness literal
+         scan sees neither of them;
+      4. anything else that names a fixtures path segment — an interpolated
+         ``tests/fixtures/$CMD``, a component-wise ``/ "tests" / "fixtures" /``
+         build — is a construction this scraper cannot prove, and marks the
+         harness opaque.
+
+    Rule 4 is what makes the first three an exhaustive account rather than a
+    list of the forms someone happened to think of. ``opaque_reasons`` is
+    non-empty when some construction could not be proved. A caller must treat
+    that harness as owning an unknown set, never an empty one: absent narrows
+    the safe set and opaque widens it.
+    """
+    edges: set[str] = set()
+    opaque: list[str] = []
+
+    text = "\n".join(
+        line for line in text.splitlines() if not _COMMENT_LINE.match(line)
+    )
+
+    for match in _LITERAL_FIXTURE.finditer(text):
+        edges.add("tests/fixtures/%s" % match.group(1))
+    for match in _LITERAL_BUILDER.finditer(text):
+        edges.add("bin/build-%s-fixtures.py" % match.group(1))
+
+    for match in _STAGE_CALL.finditer(text):
+        name = match.group(1).strip("\"'")
+        if _BARE_WORD.match(name):
+            edges.add("tests/fixtures/%s" % name)
+            edges.add("bin/build-%s-fixtures.py" % name)
+        else:
+            opaque.append(
+                "stage_fixtures_out_of_tree is called with %s, whose fixture "
+                "name cannot be read from the text" % match.group(1)
+            )
+
+    for match in _FIXTURES_DIR_ASSIGN.finditer(text):
+        value = match.group(1).strip("\"'")
+        if not _LITERAL_FIXTURE.search(value):
+            opaque.append(
+                "HARNESS_FIXTURES_DIR is assigned %s, which names no readable "
+                "fixture directory" % match.group(1)
+            )
+
+    if _UNREADABLE_FIXTURE_PATH.search(text):
+        opaque.append(
+            "a tests/fixtures/ path is continued by something other than a "
+            "directory name, so the directory it reaches cannot be read from "
+            "the text"
+        )
+    if _COMPONENT_WISE_FIXTURES.search(text):
+        opaque.append(
+            "a fixtures path is built component by component from separate "
+            "string constants, which no literal scan can follow — write it as "
+            "one literal so the edge is provable"
+        )
+
+    return Scrape(edges, opaque)
+
+
+# ------------------------------------------------------------------- loading
+
+
+class Defect(Exception):
+    """An inability to complete the check. Reported, never swallowed."""
+
+
+class Usage(Defect):
+    """A mistake in the invocation rather than a defect in the tree.
+
+    A separate class, not a phrase in the message: the exit code used to be
+    selected by testing the rendered text for "outside the repository", so any
+    unrelated defect whose message happened to contain those words — a
+    repository path that carries them, for one — was reported as exit 2, and a
+    caller reading 2 as "my command was wrong" never looked at it.
+    """
+
+
+def _read_json(path: pathlib.Path) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Defect("%s could not be read: %s" % (path, exc))
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise Defect("%s is not valid JSON: %s" % (path, exc))
+    if not isinstance(doc, dict):
+        raise Defect("%s does not hold a JSON object" % path)
+    return doc
+
+
+def load_manifest(root: pathlib.Path) -> list[tuple[str, str]]:
+    """``[(name, visibility)]`` in manifest order."""
+    doc = _read_json(root.joinpath(*_MANIFEST_REL))
+    rows = doc.get("harnesses")
+    if not isinstance(rows, list) or not rows:
+        raise Defect("the manifest declares no harness rows")
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            raise Defect("the manifest carries a row with no name")
+        out.append((row["name"], str(row.get("visibility", "public"))))
+    return out
+
+
+def load_ownership(path: pathlib.Path) -> dict[str, dict]:
+    doc = _read_json(path)
+    unknown = set(doc) - _DOC_KEYS
+    if unknown:
+        raise Defect("%s carries unknown top-level keys: %s"
+                     % (path, ", ".join(sorted(unknown))))
+    if doc.get("schemaVersion") != SCHEMA_VERSION:
+        raise Defect("%s declares schemaVersion %r; this tool reads %d"
+                     % (path, doc.get("schemaVersion"), SCHEMA_VERSION))
+    rows = doc.get("harnesses")
+    if not isinstance(rows, dict):
+        raise Defect("%s carries no `harnesses` object" % path)
+    for name, row in rows.items():
+        if not isinstance(row, dict) or set(row) != _ROW_KEYS:
+            raise Defect("%s: row '%s' must declare exactly fixturePaths and "
+                         "sourcePaths, both written explicitly even when empty"
+                         % (path, name))
+        for key in sorted(_ROW_KEYS):
+            value = row[key]
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise Defect("%s: row '%s' key '%s' must be a list of strings"
+                             % (path, name, key))
+    return rows
+
+
+def repo_profile(root: pathlib.Path) -> str:
+    """``.mirror-allowlist`` excludes itself, so its presence is exactly the
+    private discriminator — the same one ``bin/cctally-test-all`` uses."""
+    return "private" if (root / ".mirror-allowlist").is_file() else "public"
+
+
+def harnesses_on_disk(root: pathlib.Path) -> dict[str, pathlib.Path]:
+    out: dict[str, pathlib.Path] = {}
+    for path in sorted((root / "bin").glob("cctally-*-test")):
+        if not path.is_file():
+            continue
+        name = path.name[len("cctally-"):-len("-test")]
+        out[name] = path
+    return out
+
+
+# ------------------------------------------------------------------- the map
+
+
+class Estate:
+    """The declared estate, the ownership rows, and the scraped edges."""
+
+    def __init__(self, root: pathlib.Path) -> None:
+        self.root = root
+        self.profile = repo_profile(root)
+        self.manifest = load_manifest(root)
+        self.visibility = dict(self.manifest)
+        self.order = [name for name, _ in self.manifest]
+        self.required = [
+            name
+            for name, visibility in self.manifest
+            if self.profile == "private" or visibility == "public"
+        ]
+        self.disk = harnesses_on_disk(root)
+
+        self.public_rows = load_ownership(root.joinpath(*_PUBLIC_REL))
+        overlay_path = root.joinpath(*_OVERLAY_REL)
+        self.overlay_present = overlay_path.is_file()
+        if self.overlay_present:
+            self.overlay_rows = load_ownership(overlay_path)
+        elif self.profile == "private":
+            raise Defect(
+                "this tree is the PRIVATE profile (.mirror-allowlist is "
+                "present) but %s is absent, so the rows for the "
+                "mirror-private harnesses cannot be checked — restore the "
+                "overlay rather than narrowing the check silently" % overlay_path
+            )
+        else:
+            self.overlay_rows = {}
+
+        self.rows: dict[str, dict] = {}
+        self.duplicated = sorted(set(self.public_rows) & set(self.overlay_rows))
+        self.rows.update(self.public_rows)
+        self.rows.update(self.overlay_rows)
+
+        self.scrapes: dict[str, Scrape] = {}
+        for name, path in self.disk.items():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise Defect("bin/cctally-%s-test could not be read: %s" % (name, exc))
+            self.scrapes[name] = scrape_fixture_edges(text)
+
+    # -- derived views ----------------------------------------------------
+
+    def opaque_names(self) -> list[str]:
+        return [n for n in self.required if self.scrapes.get(n, Scrape(set(), [])).opaque_reasons]
+
+    def declared_fixture_paths(self, name: str) -> set[str]:
+        row = self.rows.get(name)
+        return set(row["fixturePaths"]) if row else set()
+
+    def owners_of_fixture_edge(self, edge: str) -> set[str]:
+        return {n for n in self.required if edge in self.declared_fixture_paths(n)}
+
+    def advisory_owners_of(self, relpath: str) -> set[str]:
+        out = set()
+        for name in self.required:
+            row = self.rows.get(name)
+            if not row:
+                continue
+            for declared in row["sourcePaths"]:
+                if relpath == declared or relpath.startswith(declared.rstrip("/") + "/"):
+                    out.add(name)
+        return out
+
+
+# ------------------------------------------------------------------- verify
+
+
+def verify(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
+    """``(exit_code, problems, notes)``."""
+    problems: list[str] = []
+    notes: list[str] = []
+    try:
+        estate = Estate(root)
+    except Defect as exc:
+        return EXIT_DEFECT, [str(exc)], notes
+
+    notes.append("profile: %s" % estate.profile)
+    if estate.overlay_present:
+        notes.append("ownership: public rows plus the private overlay")
+    else:
+        notes.append(
+            "ownership: public rows only (the private overlay is absent, which "
+            "is the expected state on a public clone)"
+        )
+
+    # -- the estate itself: manifest against disk, both directions --------
+    declared_all = set(estate.order)
+    for name in estate.required:
+        if name not in estate.disk:
+            problems.append(
+                "manifest row '%s' has no bin/cctally-%s-test — restore the "
+                "file, or remove the row if the harness was retired" % (name, name)
+            )
+        elif not os.access(estate.disk[name], os.X_OK):
+            problems.append(
+                "bin/cctally-%s-test exists but is not executable — chmod +x it "
+                "(a lost mode bit is NOT an absent harness)" % name
+            )
+    for name in sorted(set(estate.disk) - declared_all):
+        problems.append(
+            "harness '%s' is on disk but has no manifest row — add a row to "
+            "tests/authoritative-test-manifest.json, or remove "
+            "bin/cctally-%s-test if it is accidental" % (name, name)
+        )
+
+    # -- the ownership rows against the manifest --------------------------
+    for name in estate.duplicated:
+        problems.append(
+            "ownership row '%s' appears in BOTH tests/harness-ownership.json "
+            "and the private overlay; exactly one file owns each row" % name
+        )
+    for name in sorted(set(estate.rows) - declared_all):
+        problems.append(
+            "ownership row '%s' names a harness with no manifest row" % name
+        )
+    for name in estate.required:
+        if name not in estate.rows:
+            problems.append(
+                "manifest harness '%s' has no ownership row in the file that "
+                "should carry it (%s)"
+                % (name, "the private overlay"
+                   if estate.visibility.get(name) != "public"
+                   else "tests/harness-ownership.json")
+            )
+    # A duplicated row sits in both files, so exactly one of the two placement
+    # checks below would fire on it as well — which left the duplicate check
+    # unable to change the exit code on its own, and its case passing with the
+    # check deleted. The duplicate message subsumes both, so a name already
+    # claimed above is stepped over here rather than reported twice.
+    for name in sorted(estate.public_rows):
+        if name in estate.duplicated:
+            continue
+        if estate.visibility.get(name, "public") != "public":
+            problems.append(
+                "ownership row '%s' is declared '%s' in the manifest but sits "
+                "in the PUBLIC ownership file" % (name, estate.visibility[name])
+            )
+    for name in sorted(estate.overlay_rows):
+        if name in estate.duplicated:
+            continue
+        if estate.visibility.get(name, "public") == "public":
+            problems.append(
+                "ownership row '%s' is declared public in the manifest but sits "
+                "in the private overlay" % name
+            )
+
+    # -- the declarations against the scraper, in both directions ---------
+    for name in estate.required:
+        if name not in estate.rows or name not in estate.scrapes:
+            continue
+        declared = estate.declared_fixture_paths(name)
+        discovered = estate.scrapes[name].edges
+        for edge in sorted(discovered - declared):
+            problems.append(
+                "harness '%s' reaches %s but does not declare it — add it to "
+                "fixturePaths" % (name, edge)
+            )
+        for edge in sorted(declared - discovered):
+            problems.append(
+                "harness '%s' declares %s but its text reaches no such edge — "
+                "remove the stale declaration" % (name, edge)
+            )
+        for edge in sorted(declared):
+            if not (root / edge).exists():
+                problems.append(
+                    "harness '%s' declares %s, which does not exist on disk"
+                    % (name, edge)
+                )
+        for reason in estate.scrapes[name].opaque_reasons:
+            notes.append(
+                "harness '%s' is OPAQUE: %s. Every query naming any changed "
+                "path therefore widens to the whole shell estate." % (name, reason)
+            )
+
+    return (EXIT_DEFECT if problems else EXIT_OK), problems, notes
+
+
+# -------------------------------------------------------------------- query
+
+
+def _normalise(root: pathlib.Path, raw: str) -> str:
+    """Repo-relative POSIX form, or raise Defect for a path outside the tree."""
+    candidate = pathlib.Path(raw)
+    if candidate.is_absolute():
+        resolved = os.path.realpath(str(candidate))
+    else:
+        resolved = os.path.realpath(str(root / candidate))
+    base = os.path.realpath(str(root))
+    try:
+        rel = os.path.relpath(resolved, base)
+    except ValueError:
+        raise Usage("%s is outside the repository" % raw)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        raise Usage("%s is outside the repository" % raw)
+    return pathlib.PurePath(rel).as_posix()
+
+
+def _parse_name_status(tokens: list[str]) -> list[str]:
+    """Every path in a ``--name-status -z`` token stream.
+
+    A rename or a copy counts as a change to BOTH the old and the new path, and
+    both statuses carry two path tokens where every other status carries one.
+    Reading a two-token record as one token does not merely lose that record: it
+    shifts the cursor, so every path AFTER it is read out of a status slot.
+
+    ``C`` is unreachable through the invocation below, which passes ``-M`` —
+    that selects rename-only detection and overrides ``diff.renames=copies``.
+    The parse is kept correct anyway, because the flag is the only thing
+    standing between here and a desynchronised stream.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        status = tokens[index]
+        index += 1
+        if status[:1] in ("R", "C"):
+            out.extend(tokens[index:index + 2])
+            index += 2
+        else:
+            if index < len(tokens):
+                out.append(tokens[index])
+            index += 1
+    return out
+
+
+def _from_diff(root: pathlib.Path, rev_range: str) -> list[str]:
+    """Changed paths, with a rename or a deletion counted as a change to BOTH
+    the old and the new path."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-status", "-M", "-z", rev_range],
+            capture_output=True, text=True,
+        )
+    except OSError as exc:
+        raise Defect("git could not be run: %s" % exc)
+    if proc.returncode != 0:
+        raise Defect("git diff %s failed: %s" % (rev_range, proc.stderr.strip()))
+    return _parse_name_status([t for t in proc.stdout.split("\0") if t != ""])
+
+
+def _pytest_estate(root: pathlib.Path) -> tuple[int, int]:
+    """``(files, load_script consumers)``, counted live so the statement that
+    the pytest estate cannot be narrowed can never go stale."""
+    files = sorted((root / "tests").glob("test_*.py"))
+    consumers = 0
+    for path in files:
+        try:
+            if "load_script" in path.read_text(encoding="utf-8", errors="replace"):
+                consumers += 1
+        except OSError:
+            continue
+    return len(files), consumers
+
+
+Attribution = collections.namedtuple(
+    "Attribution", "direct advisory unattributed safe widened_because"
+)
+
+
+def attribute(estate: Estate, paths: list[str]) -> Attribution:
+    direct: dict[str, set[str]] = {}
+    advisory: dict[str, set[str]] = {}
+    unattributed: list[str] = []
+    widened: list[str] = []
+
+    for rel in paths:
+        owners: set[str] = set()
+        parts = rel.split("/")
+        if len(parts) >= 3 and parts[0] == "tests" and parts[1] == "fixtures":
+            owners = estate.owners_of_fixture_edge("tests/fixtures/%s" % parts[2])
+        elif re.fullmatch(r"bin/build-[A-Za-z0-9_.-]+-fixtures\.py", rel):
+            owners = estate.owners_of_fixture_edge(rel)
+        elif rel.startswith("bin/cctally-") and rel.endswith("-test"):
+            name = rel[len("bin/cctally-"):-len("-test")]
+            if name in estate.required:
+                owners = {name}
+        if owners:
+            direct[rel] = owners
+            continue
+        hinted = estate.advisory_owners_of(rel)
+        if hinted:
+            advisory[rel] = hinted
+            widened.append(
+                "%s is attributed only through the ADVISORY source map, which "
+                "is hand-maintained and unverifiable, so it never narrows" % rel
+            )
+        else:
+            unattributed.append(rel)
+            widened.append("%s matches no verified fixture, builder or harness edge" % rel)
+
+    for name in estate.opaque_names():
+        widened.append(
+            "harness '%s' is opaque: some fixture edge could not be proved from "
+            "its text" % name
+        )
+
+    if not paths:
+        safe: list[str] = []
+    elif widened:
+        safe = list(estate.required)
+    else:
+        selected = set().union(*direct.values()) if direct else set()
+        safe = [n for n in estate.order if n in selected]
+    return Attribution(direct, advisory, unattributed, safe, widened)
+
+
+def _render(estate: Estate, result: Attribution, paths: list[str]) -> str:
+    lines: list[str] = []
+    lines.append("Suggested direct owners:")
+    if result.direct:
+        for rel in sorted(result.direct):
+            lines.append("  %s -> %s" % (rel, " ".join(sorted(result.direct[rel]))))
+    else:
+        lines.append("  (none)")
+    if result.advisory:
+        lines.append("Advisory-only attributions (these never narrow):")
+        for rel in sorted(result.advisory):
+            lines.append("  %s -> %s" % (rel, " ".join(sorted(result.advisory[rel]))))
+    lines.append("Unattributed changed paths:")
+    if result.unattributed:
+        for rel in sorted(result.unattributed):
+            lines.append("  %s" % rel)
+    else:
+        lines.append("  (none)")
+    lines.append("Safe shell set (%d of %d harnesses):"
+                 % (len(result.safe), len(estate.required)))
+    if result.safe:
+        lines.append("  " + " ".join(result.safe))
+    else:
+        lines.append("  (empty — no harness needs to run)")
+    # Gated on the safe set ACTUALLY being the estate, not on there being a
+    # reason to widen. Opacity is recorded before the empty-paths branch, so a
+    # query naming no path at all against a tree with an opaque harness carried
+    # a reason while the answer stayed empty — and the report then printed
+    # "(empty — no harness needs to run)" directly above "Widened to the whole
+    # estate because…". An operator cannot act on that pair.
+    if result.widened_because and result.safe == list(estate.required):
+        lines.append("Widened to the whole estate because:")
+        for why in result.widened_because:
+            lines.append("  %s" % why)
+    files, consumers = _pytest_estate(estate.root)
+    lines.append(
+        "The pytest estate stays FULL and cannot be narrowed: %d tests/test_*.py "
+        "files, %d of them consumers of load_script." % (files, consumers)
+    )
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------- main
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cctally-test-owners",
+        description="Report which test harnesses own a set of changed paths.",
+        epilog=(
+            "--names-only emits the safe set NUL-separated, so it can feed "
+            "repeated --harness arguments without quoting hazards. EMPTY OUTPUT "
+            "MEANS RUN NO HARNESS, never run every harness: a consumer must "
+            "test for emptiness before building a bin/cctally-test-all "
+            "invocation, because a bare invocation is a full authoritative run."
+        ),
+    )
+    parser.add_argument("paths", nargs="*",
+                        help="changed paths, repo-relative or absolute")
+    parser.add_argument("--verify", action="store_true",
+                        help="check the ownership files against the estate and the scraper")
+    parser.add_argument("--names-only", action="store_true",
+                        help="emit the safe set NUL-separated instead of a report")
+    parser.add_argument("--from-diff", metavar="REV-RANGE",
+                        help="derive the changed paths from git")
+    parser.add_argument("--repo-root", metavar="DIR",
+                        help="operate on this tree instead of the one containing this script")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_OK if exc.code == 0 else EXIT_USAGE
+
+    root = pathlib.Path(args.repo_root) if args.repo_root \
+        else pathlib.Path(__file__).resolve().parents[1]
+    if not root.is_dir():
+        sys.stderr.write("test-owners: %s is not a directory\n" % root)
+        return EXIT_USAGE
+
+    if args.verify:
+        if args.paths or args.from_diff or args.names_only:
+            sys.stderr.write(
+                "test-owners: --verify takes no paths, --from-diff or --names-only\n"
+            )
+            return EXIT_USAGE
+        code, problems, notes = verify(root)
+        for note in notes:
+            sys.stdout.write("%s\n" % note)
+        for problem in problems:
+            sys.stderr.write("test-owners: %s\n" % problem)
+        if code == EXIT_OK:
+            sys.stdout.write("ownership: consistent\n")
+        return code
+
+    try:
+        if args.from_diff:
+            if args.paths:
+                sys.stderr.write(
+                    "test-owners: --from-diff and positional paths are two ways "
+                    "to say the same thing; give one\n"
+                )
+                return EXIT_USAGE
+            raw_paths = _from_diff(root, args.from_diff)
+        elif args.paths:
+            raw_paths = list(args.paths)
+        else:
+            # Reading to EOF is right for a pipe and wrong for a terminal,
+            # where no EOF is coming: a bare interactive invocation simply sat
+            # there. A person who types the command gets the usage message.
+            if sys.stdin.isatty():
+                raise Usage(
+                    "no changed paths were given and stdin is a terminal, so "
+                    "there is nothing to read; pass paths as arguments, pipe "
+                    "them on stdin, or use --from-diff"
+                )
+            raw_paths = [line.strip() for line in sys.stdin.read().splitlines()]
+            raw_paths = [p for p in raw_paths if p]
+            if not raw_paths:
+                raise Usage(
+                    "no changed paths were given, so there is nothing to "
+                    "attribute; pass paths as arguments, on stdin, or use "
+                    "--from-diff"
+                )
+        estate = Estate(root)
+        paths = sorted({_normalise(root, raw) for raw in raw_paths})
+    except Usage as exc:
+        sys.stderr.write("test-owners: %s\n" % exc)
+        return EXIT_USAGE
+    except Defect as exc:
+        sys.stderr.write("test-owners: %s\n" % exc)
+        return EXIT_DEFECT
+
+    result = attribute(estate, paths)
+    if args.names_only:
+        if result.safe:
+            sys.stdout.write("\0".join(result.safe) + "\0")
+        else:
+            sys.stderr.write(
+                "test-owners: the safe set is empty, so no harness needs to "
+                "run; do NOT build a bin/cctally-test-all invocation from this "
+                "output, because a bare invocation is a full authoritative run\n"
+            )
+    else:
+        sys.stdout.write(_render(estate, result, paths))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

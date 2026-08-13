@@ -7,6 +7,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 # Reuse an already-loaded `_lib_share` if `tests/test_lib_share.py` (or any
 # other peer) registered one — otherwise pytest's shared sys.modules table
 # would end up holding TWO distinct module objects under the same key, and
@@ -498,6 +500,31 @@ def test_composed_document_uses_one_alias_namespace():
                            no_branding=False, reveal_projects=False))
     weekly, daily = _split_sections(body)
     assert _alias_for_cost(weekly, 5.12) == _alias_for_cost(daily, 5.12)
+
+
+@pytest.mark.parametrize("format", ("md", "html", "svg"))
+@pytest.mark.parametrize("no_branding", (False, True))
+def test_anonymized_composite_discloses_its_alias_scope(format, no_branding):
+    body = _LS.compose(
+        _sections_sharing_a_project(),
+        opts=_LS.ComposeOptions(
+            title="Combined", theme="light", format=format,
+            no_branding=no_branding, reveal_projects=False,
+        ),
+    )
+    assert "Project aliases are shared across sections." in body
+
+
+@pytest.mark.parametrize("format", ("md", "html", "svg"))
+def test_revealed_composite_does_not_claim_to_use_aliases(format):
+    body = _LS.compose(
+        _sections_sharing_a_project(),
+        opts=_LS.ComposeOptions(
+            title="Combined", theme="light", format=format,
+            no_branding=False, reveal_projects=True,
+        ),
+    )
+    assert "Project aliases are shared across sections." not in body
 
 
 def test_merged_mapping_sums_costs_across_sections():

@@ -40,6 +40,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import select
 import signal
 import socket
 import subprocess
@@ -168,6 +169,48 @@ def _process_gone(pid: int) -> bool:
     ).stdout.strip() == ""
 
 
+def _read_process_line(proc, stream, *, what, budget=_WAIT_S) -> str:
+    """Read one readiness event without an unbounded ``readline`` wait."""
+    if stream is None:
+        raise AssertionError(f"cannot wait for {what}; observed: stdout=None")
+    ready, _, _ = select.select([stream], [], [], budget)
+    if not ready:
+        raise AssertionError(
+            f"timed out after {budget:g}s waiting for {what}; observed: "
+            f"exit={proc.poll()}"
+        )
+    line = stream.readline()
+    if line == "":
+        raise AssertionError(
+            f"stdout closed while waiting for {what}; observed: exit={proc.poll()}"
+        )
+    return line.rstrip("\n")
+
+
+def test_process_readiness_wait_is_bounded_and_reports_child_state():
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with pytest.raises(AssertionError, match=r"child readiness.*exit=None"):
+            _read_process_line(
+                child,
+                child.stdout,
+                what="child readiness",
+                budget=0.01,
+            )
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+        if child.stdout is not None:
+            child.stdout.close()
+        if child.stderr is not None:
+            child.stderr.close()
+
+
 # --------------------------------------------------------------------------
 # The fixture
 # --------------------------------------------------------------------------
@@ -269,7 +312,7 @@ def e2e(tmp_path):
 # --------------------------------------------------------------------------
 
 _HOLDER = """
-import importlib.machinery, importlib.util, pathlib, sys, time
+import importlib.machinery, importlib.util, sys
 
 sys.path.insert(0, {bin!r})
 # `_spawn_detached` launches `[sys.executable, realpath(sys.argv[0]), command]`.
@@ -287,7 +330,6 @@ _loader.exec_module(_mod)
 import sqlite3
 import _cctally_core, _cctally_journal, _cctally_tui
 
-release = pathlib.Path({release!r})
 fd = _cctally_journal._acquire_maintenance_shared("authoritative", 30.0)
 assert fd is not None, "child could not take maintenance shared"
 print("SHARED-HELD", flush=True)
@@ -304,11 +346,11 @@ try:
         print("HEAL-RETURNED", flush=True)
     except BaseException as exc:
         print("RAISED %s" % type(exc).__name__, flush=True)
-    # Keep the shared hold until the parent says otherwise, so the statusline
-    # and the dashboard meet a maintenance owner they cannot displace.
-    deadline = time.monotonic() + 180
-    while not release.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
+    # Keep the shared hold until the parent releases this explicit pipe.  A
+    # timer here guesses how long the loaded parent needs and can release the
+    # lock before the phase that is meant to observe it.
+    if not sys.stdin.buffer.read(1):
+        raise RuntimeError("maintenance release pipe closed without a token")
 finally:
     _cctally_journal._release_maintenance_shared(fd)
 print("DONE", flush=True)
@@ -402,6 +444,34 @@ def _heal_log(app: pathlib.Path) -> str:
         return ""
 
 
+def _heal_success_recorded(app: pathlib.Path) -> bool:
+    """The worker's terminal event, written after it clears its request."""
+    return "result=success" in _heal_log(app)
+
+
+def test_heal_completion_requires_the_terminal_outcome_after_request_clear(
+    tmp_path,
+):
+    """Request deletion precedes the worker's terminal log write.
+
+    The request marker is ownership state, not a completion event.  A waiter
+    that accepts its disappearance can race the worker between unlinking the
+    request and appending ``result=success`` under load.
+    """
+    app = tmp_path / "data"
+    (app / "logs").mkdir(parents=True)
+    request = app / "stats-corruption-heal.pending"
+    request.write_text("pending\n")
+
+    request.unlink()
+    assert not _heal_success_recorded(app)
+
+    (app / "logs" / "stats-corruption-heal.log").write_text(
+        "at=2026-08-12T08:35:39Z result=success\n"
+    )
+    assert _heal_success_recorded(app)
+
+
 def _admitted_worker_runs(app: pathlib.Path) -> int:
     """How many detached heal workers have recorded an outcome.
 
@@ -448,7 +518,6 @@ def _worker_deleted_count(line: str):
 
 def test_the_epic_scenario_end_to_end(e2e, tmp_path):
     env, app, control, sentinel = e2e
-    release_marker = tmp_path / "release-maintenance"
     heal_request = app / "stats-corruption-heal.pending"
     stats_db = app / "stats.db"
 
@@ -468,14 +537,17 @@ def test_the_epic_scenario_end_to_end(e2e, tmp_path):
     holder = subprocess.Popen(
         [
             sys.executable, "-c",
-            _HOLDER.format(
-                bin=str(BIN), cli=str(CCTALLY), release=str(release_marker),
-            ),
+            _HOLDER.format(bin=str(BIN), cli=str(CCTALLY)),
         ],
-        env=env, stdout=subprocess.PIPE, stderr=holder_err_handle, text=True,
+        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=holder_err_handle, text=True,
     )
     try:
-        assert holder.stdout.readline().strip() == "SHARED-HELD"
+        assert _read_process_line(
+            holder,
+            holder.stdout,
+            what="the maintenance holder to report SHARED-HELD",
+        ) == "SHARED-HELD"
         _await(
             lambda: _worker_lock_held(app),
             what="the detached heal worker to claim its admission flock",
@@ -551,7 +623,14 @@ def test_the_epic_scenario_end_to_end(e2e, tmp_path):
         assert _worker_lock_held(app)
         assert heal_request.exists(), "the retry marker must still be durable"
     finally:
-        release_marker.write_text("go\n")
+        if holder.stdin is not None:
+            try:
+                holder.stdin.write("g")
+                holder.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                holder.stdin.close()
         try:
             holder.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -565,11 +644,13 @@ def test_the_epic_scenario_end_to_end(e2e, tmp_path):
     # was blocked on `stats.db.maintenance.lock` exclusive, not on an injected
     # barrier — takes it and finishes. Nothing is started here.
     _await(
-        lambda: not heal_request.exists(),
-        what="the completed worker to clear its own request marker",
+        lambda: _heal_success_recorded(app),
+        what="the completed worker to record its terminal success outcome",
         describe=lambda: _heal_log(app),
     )
-    assert "result=success" in _heal_log(app), _heal_log(app)
+    assert not heal_request.exists(), (
+        "the successful worker must clear its request marker: " + _heal_log(app)
+    )
 
     # Final validation in a FRESH process, on bytes no inherited handle reaches.
     report = _cli(env, "report", "--json")

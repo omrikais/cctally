@@ -281,7 +281,16 @@ def test_nested_codex_fixture_uses_metadata_not_agent_filename():
 
 
 def test_fixture_corpus_contains_no_maintainer_data():
-    forbidden = ("omrikaisari", "/Users/", "/Volumes/TRANSCEND", "cctally-dev",
+    # Stated as SHAPES rather than as the maintainer's real account name and
+    # volume. This file is published, and a tripwire has to hardcode the value
+    # it forbids, so spelling the real ones here disclosed exactly what the
+    # guard exists to keep unpublished. The literal values are forbidden across
+    # the whole public tree by the private guard in
+    # tests/test_test_remote_observability.py, which can hold them safely.
+    # `/home/` is deliberately absent: rollouts/secret-canary.jsonl carries the
+    # synthetic `/home/fixture-user`, which is the shape this corpus is built
+    # to exercise rather than a real home directory.
+    forbidden = ("/Users/", "/Volumes/", "cctally-dev",
                  "sk-proj-", "sk-ant-", "ghp_", "github_pat_")
     for rel, data in _tree_bytes(CORPUS).items():
         text = data.decode("utf-8")

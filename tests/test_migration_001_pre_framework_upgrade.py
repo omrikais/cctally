@@ -49,6 +49,13 @@ import sys
 
 import pytest
 
+# Every HOME-derived path constant resolves under a per-test directory
+# (#529 S4). The write detector caught this module creating the maintainer's
+# real ~/.local/share/cctally: its tests call load_script() themselves, and
+# load_script() re-derives every path constant from HOME on each call, so a
+# redirect_paths() patch would be clobbered by the next one.
+pytestmark = pytest.mark.usefixtures("isolated_home")
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"

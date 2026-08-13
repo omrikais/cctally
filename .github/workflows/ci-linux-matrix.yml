@@ -28,13 +28,33 @@ jobs:
         python-version: ['3.11', '3.12', '3.13']
     env:
       # This lane's green is meant to be believed, so a missing hard capability
-      # (pytest, fts5, pytest-timeout, rich, node/npm) is a refusal to start
+      # (pytest, fts5, pytest-timeout, PyYAML, rich, ShellCheck, node/npm) is a refusal to start
       # rather than an `incomplete` classification that lets the run continue
       # (#529 S1). Every one of those is provisioned by the steps below —
       # setup-python plus the pip install, setup-node plus `npm ci` — and FTS5
       # comes from Ubuntu's libsqlite3, which Debian builds with --enable-fts5.
       CCTALLY_AUTHORITATIVE_RUN: "1"
-      CCTALLY_TEST_JOBS: "2"                            # outer budget; derived inner cap = min(4,2)=2, release auto-capped via the runner (#292)
+      # Outer pool ONLY. The combined CCTALLY_TEST_JOBS knob set all three roles
+      # at once, so pinning the pool to 2 also collapsed the later, otherwise-solo
+      # pytest phase to 2 workers across all three matrix legs (#529 S5 §2.4).
+      # Inner still derives to min(4,2)=2 and release stays auto-capped via the
+      # runner (#292); pytest now auto-tunes to the hosted runner's core count.
+      # The fleet-constant budget that governs the two LAN runners does not bind
+      # this lane: a hosted GitHub runner is separately identified and no routing
+      # decision substitutes one hosted lane for another, so CPU discovery here
+      # costs no determinism. `test-pr` in ci.yml carries the same corrected form.
+      CCTALLY_OUTER_JOBS: "2"
+      # #529 S2. The three legs share a run id and an artifact name unless the
+      # matrix identity is part of both, so the Python version is spelled into
+      # each.
+      # Defence in depth, and inert while the line below it stands:
+      # `resolve_run_id` consults CCTALLY_TEST_MATRIX_ID only on its
+      # GITHUB_ACTIONS fallback, which the explicit CCTALLY_TEST_RUN_ID always
+      # pre-empts. It is kept so that dropping the explicit identity degrades
+      # to a still-distinct per-leg directory instead of collapsing all three
+      # legs onto one, which is the failure it was added for.
+      CCTALLY_TEST_MATRIX_ID: ${{ matrix.python-version }}
+      CCTALLY_TEST_RUN_ID: linux-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
       # Hosted Actions cannot read the separate private agentmem repository.
       # The self-hosted macOS lane owns that integration gate; this matrix
       # declares the boundary so its skips are explicit rather than accidental.
@@ -96,7 +116,78 @@ jobs:
           fi
           sqlite3 --version
           sqlite3 :memory: '.recover' >/dev/null
+      # tests/requirements-dev.txt IS the toolchain, the same file and the same
+      # install bin/cctally-test-remote and the two other authoritative lanes
+      # use (#529 S6, F20). The pin set is verified to install and close on
+      # every interpreter in this matrix — 3.11, 3.12 and 3.13. --no-deps makes
+      # the pin a pin; `pip check` is the closure validator --no-deps otherwise
+      # leaves unrun. Enforced structurally by tests/test_toolchain_parity.py.
       - name: Install Python test deps
-        run: python -m pip install --upgrade pip pytest pytest-xdist pytest-timeout rich
+        run: |
+          python -m pip install --no-deps -r tests/requirements-dev.txt
+          python -m pip check
+
+      # FTS5 comes from Ubuntu's libsqlite3, which Debian builds with
+      # --enable-fts5 — but nothing in this repository makes that true, so it is
+      # asked rather than assumed (#529 S6, M2). The refusal lands before the
+      # suite starts. One shared assertion, in probe mode from the contract
+      # kernel and in provisioning mode here.
+      - name: Assert FTS5 before the suite
+        run: bash bin/_lib-fts5-probe.sh require python
       - name: Run the suite
+        # Setting the root turns retained evidence AND console sanitization on;
+        # keep this step-scoped because the runner context is unavailable in
+        # job-level env. The upload below preserves the sanitized extract after
+        # $RUNNER_TEMP is deleted at the end of the job.
+        env:
+          CCTALLY_TEST_EVIDENCE_ROOT: ${{ runner.temp }}/cctally-test-evidence
         run: bin/cctally-test-all
+
+      # Failure-only, and BOUNDED: only the two export files, never logs/.
+      # `export/` is a sibling of `logs/` and never a parent, so this path
+      # cannot capture a raw log even by accident. The independent validator
+      # runs again here and REFUSES the artifact rather than transforming it a
+      # second time — a single grammar used twice would give a classifier bug
+      # two chances at the same text. It is the PUBLIC kernel that runs, because
+      # these workflows are mirrored and the public tree carries no private
+      # module.
+      - name: Validate the sanitized failure extract
+        if: failure() || cancelled()
+        env:
+          CCTALLY_EXTRACT: ${{ runner.temp }}/cctally-test-evidence/local/linux-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+        run: |
+          python3 - "$CCTALLY_EXTRACT" <<'VALIDATE_PY'
+          import importlib.util, pathlib, sys
+
+          path = pathlib.Path(sys.argv[1])
+          if not path.is_file() or path.stat().st_size == 0:
+              print("::warning::no sanitized failure extract was produced for this run")
+              raise SystemExit(0)
+          spec = importlib.util.spec_from_file_location(
+              "_lib_test_evidence", "bin/_lib_test_evidence.py")
+          kernel = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(kernel)
+          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+          violations = kernel.validate_export(lines)
+          if violations:
+              for violation in violations[:5]:
+                  print("::error::failure-context.txt line %s: %s"
+                        % (violation["index"], violation["reason"]))
+              # Refuse by REMOVING it: the upload step below is set to ignore a
+              # missing file, so nothing unvalidated can reach an artifact. The
+              # complete unsanitized logs stay on the runner either way.
+              path.unlink()
+              print("::error::refusing to upload the failure extract; "
+                    "the complete unsanitized logs stay on the runner")
+          VALIDATE_PY
+
+      - name: Upload the sanitized failure extract
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-context-linux-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/cctally-test-evidence/local/linux-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
+            ${{ runner.temp }}/cctally-test-evidence/local/linux-py${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json

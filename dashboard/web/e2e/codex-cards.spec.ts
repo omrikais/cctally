@@ -17,7 +17,7 @@ test('Codex shell and patch wires render as native cards without harness noise',
   await expect(terminals.first().locator('.conv-chip-name')).toHaveText('exec');
   await expect(terminals.first()).toContainText("printf 'alpha\\n'");
   await expect(terminals.first()).toContainText('/synthetic/root-a/project-red');
-  await expect(terminals.filter({ hasText: '/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy' })).toHaveCount(1);
+  await expect(terminals.filter({ hasText: '/synthetic/root-b/duplicated-conversation-copy' })).toHaveCount(1);
   await expect(terminals.first()).toContainText('alpha');
   await expect(page.locator('.conv-term-badge--err')).toHaveCount(1);
   await expect(page.locator('.conv-term').filter({ hasText: 'seq 1 25' })).not.toHaveAttribute('open', '');
@@ -64,7 +64,7 @@ test.describe('compact Codex cards', () => {
     await expect(page.locator('.conv-term').first()).toBeVisible();
     await expect(page.locator('.conv-native-patch').first()).toBeVisible();
     const terminal = page.locator('.conv-term').filter({
-      hasText: '/Volumes/TRANSCEND/repos/cctally-dev/.worktrees/duplicated-conversation-copy',
+      hasText: '/synthetic/root-b/duplicated-conversation-copy',
     });
     const workdirBox = await terminal.locator('.conv-term-workdir').boundingBox();
     const copyBox = await terminal.locator('.conv-term-copy').boundingBox();

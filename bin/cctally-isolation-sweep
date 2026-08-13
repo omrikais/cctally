@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Per-module isolation sweep (#529 S4, spec section 5.5).
+#
+# WHY THIS EXISTS, AND WHY A GREEN SUITE IS NOT ITS SUBSTITUTE. A pytest run
+# executes many test modules in one process, and the first module that pins HOME
+# and reloads bin/cctally rebinds `_cctally_core`'s path constants for every
+# module that follows it in that process. A module that reaches a path constant
+# without pinning HOME itself therefore resolves whatever the previous module
+# left behind, so its violation is invisible whenever the run happens to draw an
+# order that pins first. Three modules wrote into the maintainer's real
+# production directory while the whole estate reported green for exactly that
+# reason.
+#
+# One module per pytest process is the only arrangement in which no module can
+# be masked by another, which is what makes this the completeness check for the
+# write detector rather than a second copy of it.
+#
+# Usage:
+#   bin/cctally-isolation-sweep [MODULE ...]
+#
+# With no arguments it sweeps every tests/test_*.py. Exit 0 when no module
+# reported an isolation-contract failure, 1 when any did, 2 on a usage error.
+# A module that fails for an unrelated reason is reported separately and does
+# not decide the exit code, because this sweep's subject is isolation.
+set -uo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$REPO_ROOT" || exit 2
+
+JOBS=${CCTALLY_ISOLATION_SWEEP_JOBS:-${CCTALLY_TEST_JOBS:-4}}
+case "$JOBS" in
+    ''|*[!0-9]*) printf 'cctally-isolation-sweep: invalid job count: %s\n' "$JOBS" >&2; exit 2 ;;
+esac
+[ "$JOBS" -ge 1 ] || JOBS=1
+
+if [ "$#" -gt 0 ]; then
+    MODULES=("$@")
+    for module in "${MODULES[@]}"; do
+        if [ ! -f "$module" ]; then
+            printf 'cctally-isolation-sweep: no such module: %s\n' "$module" >&2
+            exit 2
+        fi
+    done
+else
+    MODULES=()
+    while IFS= read -r module; do
+        MODULES+=("$module")
+    done < <(find tests -maxdepth 1 -name 'test_*.py' | sort)
+fi
+
+if [ "${#MODULES[@]}" -eq 0 ]; then
+    printf 'cctally-isolation-sweep: no test modules found\n' >&2
+    exit 2
+fi
+
+# mktemp -d needs an explicit XXXXXX template: GNU coreutils silently treats a
+# template without one as a literal name.
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-isolation-sweep.XXXXXX") || exit 2
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+printf 'cctally-isolation-sweep: %d modules, %d at a time\n' "${#MODULES[@]}" "$JOBS"
+START=$(date +%s)
+
+# The worker body is passed as a string rather than exported with `export -f`,
+# because an exported bash function is encoded differently by bash 3.2 and by
+# bash 5 and would not survive a mixed pair.
+RUN_ONE='
+module=$1
+work=$2
+slug=$(printf "%s" "$module" | tr "/." "__")
+log="$work/$slug.log"
+# -p no:cacheprovider keeps 567 processes from racing on one .pytest_cache.
+python3 -m pytest -p no:cacheprovider -q "$module" >"$log" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    printf "%s\n" "$module" >>"$work/nonzero.txt"
+fi
+'
+
+printf '%s\n' "${MODULES[@]}" \
+    | xargs -P "$JOBS" -I{} sh -c "$RUN_ONE" _ {} "$WORK_DIR"
+
+ELAPSED=$(( $(date +%s) - START ))
+
+: >"$WORK_DIR/isolation.txt"
+: >"$WORK_DIR/other.txt"
+if [ -f "$WORK_DIR/nonzero.txt" ]; then
+    while IFS= read -r module; do
+        slug=$(printf '%s' "$module" | tr '/.' '__')
+        if grep -qE 'ProductionWriteBlocked|IsolationBypassBlocked|isolation contract violated|missing handshake' \
+                "$WORK_DIR/$slug.log"; then
+            printf '%s\n' "$module" >>"$WORK_DIR/isolation.txt"
+        else
+            printf '%s\n' "$module" >>"$WORK_DIR/other.txt"
+        fi
+    done <"$WORK_DIR/nonzero.txt"
+fi
+
+ISO_COUNT=$(wc -l <"$WORK_DIR/isolation.txt" | tr -d ' ')
+OTHER_COUNT=$(wc -l <"$WORK_DIR/other.txt" | tr -d ' ')
+
+printf 'cctally-isolation-sweep: %ss elapsed\n' "$ELAPSED"
+
+if [ "$OTHER_COUNT" -gt 0 ]; then
+    printf 'cctally-isolation-sweep: %d module(s) failed for a non-isolation reason:\n' "$OTHER_COUNT"
+    sed 's/^/  /' "$WORK_DIR/other.txt"
+fi
+
+if [ "$ISO_COUNT" -gt 0 ]; then
+    printf 'cctally-isolation-sweep: FAIL -- %d module(s) violate the isolation contract when run alone:\n' "$ISO_COUNT"
+    while IFS= read -r module; do
+        slug=$(printf '%s' "$module" | tr '/.' '__')
+        printf '  %s\n' "$module"
+        grep -hoE '(write|bypass|handshake) violation: [^(]*|missing handshake: [^(]*' \
+            "$WORK_DIR/$slug.log" | sort -u | sed 's/^/      /'
+    done <"$WORK_DIR/isolation.txt"
+    exit 1
+fi
+
+printf 'cctally-isolation-sweep: OK -- no module violates the isolation contract when run alone\n'
+exit 0

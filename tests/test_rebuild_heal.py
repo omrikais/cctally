@@ -1564,6 +1564,31 @@ def test_worker_fail_closed_marker_lifecycle(
         assert event["outcome"] == outcome
 
 
+def test_worker_retains_request_when_its_deferral_signal_escapes_the_rebuild(
+    ns, monkeypatch,
+):
+    """The worker's own BaseException signal family must stay retryable."""
+    import types as _types
+    import _cctally_db
+    import _cctally_store as st
+
+    request = {"healId": "deferred-worker", "probeKind": "readability"}
+    assert st.reserve_stats_corruption_heal(request) == "reserved"
+    monkeypatch.setattr(
+        st,
+        "_run_stats_corruption_heal",
+        lambda _request: (_ for _ in ()).throw(
+            _cctally_db.StatsEpochRebuildDeferred("pending")
+        ),
+    )
+
+    assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
+    assert st._read_stats_heal_request()["healId"] == "deferred-worker"
+    event = st.read_stats_heal_events()[0]
+    assert event["outcome"] == "failed"
+    assert event["error"] == "StatsEpochRebuildDeferred"
+
+
 def _corrupt_selector_with_foreign_model_page(ns, tmp_path):
     """Reproduce the observed selector -> model-page signature, not its cause.
 

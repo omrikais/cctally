@@ -169,7 +169,7 @@ function SharePrivacyStatus({
   // lines and left 37px of preview — about two lines of the artifact, on a
   // control whose documented purpose is letting the user verify what they are
   // about to share. At one line all three states left 58px. #503 S4 §4.2
-  // raised that cap to `min(45dvh, 320px)`; the one-line rule stays, because
+  // raised that cap to `min(50dvh, 380px)`; the one-line rule stays, because
   // it is what keeps the three states costing the same.
   //
   // The share modal inherits the monospace stack, so the budget is a

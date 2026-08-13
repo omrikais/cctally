@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -37,6 +38,8 @@ MARCH = dt.datetime(2026, 3, 1, 0, 0, 1, tzinfo=dt.timezone.utc)
 
 JAN_SEGMENT = "observations-2026-01.jsonl"
 FEB_SEGMENT = "observations-2026-02.jsonl"
+MAR_SEGMENT = "observations-2026-03.jsonl"
+APR_SEGMENT = "observations-2026-04.jsonl"
 
 
 @pytest.fixture
@@ -169,6 +172,7 @@ def test_an_explicit_now_utc_is_honoured_without_validation(jr):
     group_segment, _group_offset = jr.append_records(
         _correction_group(), now_utc=JANUARY)
     assert group_segment == JAN_SEGMENT
+    assert (jr._cctally_core.JOURNAL_DIR / FEB_SEGMENT).exists()
 
 
 def test_an_absent_target_that_sorts_last_is_accepted(jr, monkeypatch):
@@ -177,6 +181,158 @@ def test_an_absent_target_that_sorts_last_is_accepted(jr, monkeypatch):
     _pin_clock(jr, monkeypatch, MARCH)
     segment, _offset = jr.append_record(_obs(2.0))
     assert segment == "observations-2026-03.jsonl"
+
+
+def test_default_append_recovers_only_empty_future_segments(jr, monkeypatch):
+    """A restored empty future segment must not wedge every normal writer."""
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / MAR_SEGMENT).touch()
+    (journal_dir / APR_SEGMENT).touch()
+
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    segment, offset = jr.append_record(_obs(2.0))
+
+    assert segment == FEB_SEGMENT
+    assert offset == len(jl.encode_line(_obs(2.0)))
+    assert (journal_dir / FEB_SEGMENT).read_bytes() == jl.encode_line(_obs(2.0))
+    assert not (journal_dir / MAR_SEGMENT).exists()
+    assert not (journal_dir / APR_SEGMENT).exists()
+
+
+def test_group_append_recovers_empty_future_segments_too(jr, monkeypatch):
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / MAR_SEGMENT).touch()
+
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    segment, offset = jr.append_records(_correction_group())
+
+    expected = b"".join(jl.encode_line(record) for record in _correction_group())
+    assert segment == FEB_SEGMENT
+    assert offset == len(expected)
+    assert (journal_dir / FEB_SEGMENT).read_bytes() == expected
+    assert not (journal_dir / MAR_SEGMENT).exists()
+
+
+def test_data_bearing_future_segment_refuses_without_partial_cleanup(
+    jr, monkeypatch
+):
+    """One durable future byte makes the whole recovery decision fail closed."""
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / MAR_SEGMENT).touch()
+    future_bytes = jl.encode_line(_obs(99.0))
+    (journal_dir / APR_SEGMENT).write_bytes(future_bytes)
+
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    with pytest.raises(jr.JournalAppendTargetStale) as exc_info:
+        jr.append_record(_obs(2.0))
+
+    message = str(exc_info.value)
+    assert APR_SEGMENT in message
+    assert "automatic recovery is limited to empty regular files" in message
+    assert "merge its records forward" in message
+    assert (journal_dir / MAR_SEGMENT).exists()
+    assert (journal_dir / APR_SEGMENT).read_bytes() == future_bytes
+    assert not (journal_dir / FEB_SEGMENT).exists()
+
+
+@pytest.mark.parametrize(
+    "future_name",
+    [
+        "observations-٢٠٢٦-٠٣.jsonl",
+        "observations-²⁰²⁶-⁰³.jsonl",
+    ],
+)
+def test_non_ascii_future_segment_names_fail_closed(
+    jr, monkeypatch, future_name
+):
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    future_path = journal_dir / future_name
+    future_path.touch()
+
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    with pytest.raises(jr.JournalAppendTargetStale) as exc_info:
+        jr.append_record(_obs(2.0))
+
+    assert future_name in str(exc_info.value)
+    assert "segment name is not a later UTC month" in str(exc_info.value)
+    assert future_path.exists()
+    assert not (journal_dir / FEB_SEGMENT).exists()
+
+
+def test_non_regular_future_segment_fails_closed(jr, monkeypatch):
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    future_path = journal_dir / MAR_SEGMENT
+    future_path.mkdir()
+
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    with pytest.raises(jr.JournalAppendTargetStale) as exc_info:
+        jr.append_record(_obs(2.0))
+
+    assert "path is not a regular file" in str(exc_info.value)
+    assert future_path.is_dir()
+    assert not (journal_dir / FEB_SEGMENT).exists()
+
+
+def test_future_segment_removal_is_fsynced_before_target_creation(
+    jr, monkeypatch
+):
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    future_path = journal_dir / MAR_SEGMENT
+    future_path.touch()
+
+    def fail_fsync(path):
+        assert path == journal_dir
+        raise OSError("fsync refused")
+
+    monkeypatch.setattr(jr, "_fsync_dir", fail_fsync)
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    with pytest.raises(OSError, match="fsync refused"):
+        jr.append_record(_obs(2.0))
+
+    assert not future_path.exists()
+    assert not (journal_dir / FEB_SEGMENT).exists()
+
+
+def test_future_segment_unlink_runs_under_the_leaf_lock(jr, monkeypatch):
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    future_path = journal_dir / MAR_SEGMENT
+    future_path.touch()
+    real_unlink = pathlib.Path.unlink
+    lock_probe_results = []
+
+    def probe_lock_then_unlink(path, *args, **kwargs):
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, os, sys\n"
+                    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                    "try:\n"
+                    "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                    "except BlockingIOError:\n"
+                    "    raise SystemExit(75)\n"
+                    "raise SystemExit(0)\n"
+                ),
+                str(jr._cctally_core.JOURNAL_LOCK_PATH),
+            ],
+            check=False,
+        )
+        lock_probe_results.append(probe.returncode)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", probe_lock_then_unlink)
+    _pin_clock(jr, monkeypatch, FEBRUARY)
+    jr.append_record(_obs(2.0))
+
+    assert lock_probe_results == [75]
 
 
 def test_a_bootstrap_segment_never_blocks_an_observation_append(jr, monkeypatch):

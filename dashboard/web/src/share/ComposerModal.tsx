@@ -30,6 +30,7 @@ import { useIsMobile } from '../hooks/useIsMobile';
 import { useKeymap } from '../hooks/useKeymap';
 import { useIframeKeymapBridge } from '../hooks/useIframeKeymapBridge';
 import { useScrollLock } from '../hooks/useScrollLock';
+import { useModalFocus } from '../hooks/useModalFocus';
 import { ModalHeader } from '../modals/ModalHeader';
 import { ConfirmAction, useConfirmHost } from './ConfirmAction';
 import { svgToPng } from './exporters/png';
@@ -116,24 +117,19 @@ export function ComposerModal() {
   const isMobile = useIsMobile();
   // #503 S3 §2 — one confirmation slot for the composer.
   const confirm = useConfirmHost();
+  const cardRef = useRef<HTMLDivElement>(null);
   // M1-1: lock background page scroll while the composer is open. Declared
   // before the early `return null` below (Rules of Hooks); keyed on the
   // open value so the effect's cleanup decrements the refcount on close.
   useScrollLock(composerModal?.open ?? false);
-  // Focus restoration (spec §12.8 + M4.4): capture the element that
-  // had focus when the composer opened (BasketChip click, B keymap, or
-  // a future "Customize…" button) and restore focus to it on close.
-  // The capture happens the first time `composerModal.open` flips to
-  // true; the restore happens when it flips back to null (the slot is
-  // wiped by `closeComposer()`). If the captured element has been
-  // detached from the DOM by the time we close (panel re-render while
-  // the composer was open), fall back to `document.body.focus()` —
-  // without the fallback, focus would silently stay on whatever
-  // internal control happened to be focused inside the composer, which
-  // then itself unmounts → activeElement becomes implicit and screen
-  // readers lose the cursor.
-  const triggerElementRef = useRef<HTMLElement | null>(null);
-  const wasOpenRef = useRef(false);
+  useModalFocus(cardRef, {
+    active: composerModal?.open ?? false,
+    initialFocus: 'heading',
+  });
+  // #536: Composer now uses the same structural focus contract as the other
+  // modal surfaces. `useModalFocus` moves focus to the visible heading,
+  // contains Tab while this topmost modal is open, and restores the opener
+  // (or falls back to body when that opener was removed).
   const [title, setTitle] = useState('');
   const [theme, setTheme] = useState<ShareTheme>('light');
   const [format, setFormat] = useState<ShareFormat>('html');
@@ -199,38 +195,6 @@ export function ComposerModal() {
       setTitle(`cctally report — ${utc}`);
     }
   }, [composerModal?.open, title]);
-
-  // Focus capture + restore (spec §12.8). Mirrors <ShareModalRoot>'s
-  // pattern; kept local rather than threading a triggerId through the
-  // openComposer() action because (a) `B` keymap fires from no
-  // particular element, (b) BasketChip is the most common opener and
-  // is always the active element when clicked, (c) future "Customize…"
-  // affordances inside the share modal can rely on the same capture
-  // path with no new slice plumbing.
-  useEffect(() => {
-    if (composerModal?.open) {
-      if (!wasOpenRef.current) {
-        wasOpenRef.current = true;
-        triggerElementRef.current =
-          document.activeElement as HTMLElement | null;
-      }
-    } else if (wasOpenRef.current) {
-      wasOpenRef.current = false;
-      const el = triggerElementRef.current;
-      triggerElementRef.current = null;
-      if (el && typeof el.focus === 'function' && document.contains(el)) {
-        el.focus();
-      } else {
-        // Detached opener: blur whatever is currently focused so the
-        // screen reader doesn't keep announcing the composer's
-        // about-to-unmount internal control. Project precedent at
-        // <ShareModalRoot>.
-        const active = document.activeElement as HTMLElement | null;
-        if (active && typeof active.blur === 'function') active.blur();
-        document.body.focus();
-      }
-    }
-  }, [composerModal?.open]);
 
   // Debounced recompose. Triggers: mount, reorder, knob change,
   // per-section refresh (which mutates basket.items via remove+add).
@@ -481,6 +445,8 @@ export function ComposerModal() {
     return (
       <div
         className={`composer-modal composer-modal-empty${isMobile ? ' composer-modal-mobile' : ''}`}
+        ref={cardRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={COMPOSER_MODAL_TITLE_ID}
@@ -496,6 +462,8 @@ export function ComposerModal() {
   return (
     <div
       className={`composer-modal${isMobile ? ' composer-modal-mobile' : ''}`}
+      ref={cardRef}
+      tabIndex={-1}
       role="dialog"
       aria-modal="true"
       aria-labelledby={COMPOSER_MODAL_TITLE_ID}

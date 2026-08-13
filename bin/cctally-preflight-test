@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Harness for bin/cctally-preflight (#529 S5 section 5.2).
+#
+# The pre-flight is a local early exit: bin/cctally-test-remote runs it before
+# an authoritative full-suite round trip, and CCTALLY_SKIP_PREFLIGHT=1 skips it
+# when the pre-flight itself is what is broken. That override is only safe
+# because the same checks also run INSIDE the suite, which is this harness.
+# Without it a syntax defect in an extensionless entry point that no test loads
+# would be caught by the pre-flight alone, and skipping would remove real
+# coverage rather than remove a duplicate.
+#
+# What actually makes the skip safe is the `real-tree` case at the bottom, not
+# the mutation matrix above it. That case invokes the SAME binary with the same
+# arguments the pre-flight is invoked with, over the SAME working tree, and
+# fails on any non-zero exit. So whatever the pre-flight would have detected
+# before the round trip, the suite detects — by construction, and independently
+# of which mutations happen to be enumerated here. Read the matrix as evidence
+# that the detectors work, and `real-tree` as the reason skipping removes a
+# duplicate rather than coverage.
+#
+# The matrix covers each of the tool's three CHECKS. It does not cover every
+# branch inside them, and the difference matters when reading a green run:
+#
+#   1. compile every Python file under bin/, selected by `.py` extension OR by
+#      a Python shebang     -> cases python-extension, python-extensionless,
+#                              plus the two controls that prove the selector
+#                              does not simply compile everything.
+#                              NOT covered: the unreadable-source branch and
+#                              the null-byte branch (compile raises ValueError,
+#                              not SyntaxError).
+#   2. syntax-check every shell script, `bash -n` or `sh -n` chosen per file
+#      from its own shebang -> cases shell-bash, shell-sh.
+#      NOT covered: the `.sh` extension selector and the no-shebang default,
+#      because no synthetic tree here carries a `.sh` file at all.
+#   3. bin/cctally-test-owners --verify
+#                           -> cases missing-harness, unexpected-harness,
+#                              lost-executable-bit, removed-edge, stale-edge,
+#                              overlay-absent-public, overlay-absent-private.
+#                              NOT covered: the owners-tool-absent branch, and
+#                              the missing-bin/ branch one level up.
+#
+# No case here exercises a check the tool does not perform. The remaining three
+# cases are the green control, the usage refusal, and `real-tree`.
+#
+# Each mutation is introduced into its own scratch copy of a minimal synthetic
+# repository, so a case can only fail for the defect it introduced. There is no
+# wall-clock assertion anywhere: the tool is fast because it parses and does
+# nothing else, and #529 S3 has just removed a load-sensitive ceiling that was
+# reddening release-stamp CI runs on a contended box.
+#
+# NOTE for the ownership scraper (bin/cctally-test-owners): every fixture path
+# below is BUILT from variables rather than written as a literal, so this
+# harness declares no fixture edges of its own. A literal would be scraped as
+# an edge into a directory that exists only inside a scratch tree.
+
+set -uo pipefail
+
+# Dev-instance isolation: force the prod data-dir layout under any fake HOME.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PREFLIGHT="$REPO_ROOT/bin/cctally-preflight"
+
+pass_count=0
+fail_count=0
+
+SCRATCH_DIR=$(mktemp -d -t cctally-preflight-XXXXXX)
+
+cleanup_on_exit () {
+    local rc=$?
+    if [ "$fail_count" -eq 0 ] && [ $rc -eq 0 ]; then
+        rm -rf "$SCRATCH_DIR"
+    else
+        printf 'Scratch dir preserved for debugging: %s\n' "$SCRATCH_DIR" >&2
+    fi
+}
+trap cleanup_on_exit EXIT
+
+report () {
+    local case_name="$1"; local status="$2"; local detail="${3-}"
+    if [ "$status" = PASS ]; then
+        printf 'PASS %s\n' "$case_name"
+        pass_count=$((pass_count + 1))
+    else
+        printf 'FAIL %s%s\n' "$case_name" "${detail:+: $detail}"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# The two path segments the scraper keys on, kept as variables so this file
+# carries no literal fixture path. See the NOTE above.
+FX=fixtures
+H=alpha
+
+# A minimal repository the pre-flight accepts: one harness with one fixture
+# directory, a manifest row for it, an ownership row that agrees with what the
+# harness text reaches, and no .mirror-allowlist (so the profile is public and
+# the private overlay is not required).
+make_tree () {   # make_tree <destination root>
+    local d=$1
+    mkdir -p "$d/bin" "$d/tests/$FX/$H"
+    printf '%s\n%s\n' '#!/usr/bin/env python3' 'VALUE = 1' > "$d/bin/_lib_ok.py"
+    printf '%s\n%s\n' '#!/usr/bin/env bash' 'echo ok' > "$d/bin/cctally-ok"
+    chmod +x "$d/bin/cctally-ok"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf 'cp "$REPO_ROOT/tests/%s/%s/case" .\n' "$FX" "$H"
+        printf '%s\n' 'echo "passed: 1   failed: 0"'
+    } > "$d/bin/cctally-$H-test"
+    chmod +x "$d/bin/cctally-$H-test"
+    cat > "$d/tests/authoritative-test-manifest.json" <<EOF
+{
+  "schemaVersion": 1,
+  "seededAt": "2026-08-11",
+  "minHarnessRows": 0,
+  "harnesses": [
+    { "name": "$H", "visibility": "public", "minCases": 1, "countPolicy": "fixed" }
+  ]
+}
+EOF
+    cat > "$d/tests/harness-ownership.json" <<EOF
+{
+  "schemaVersion": 1,
+  "harnesses": {
+    "$H": { "fixturePaths": ["tests/$FX/$H"], "sourcePaths": [] }
+  }
+}
+EOF
+}
+
+# Allocate a fresh tree for one case and echo its path.
+new_tree () {   # new_tree <case name>
+    local d="$SCRATCH_DIR/$1"
+    make_tree "$d"
+    printf '%s' "$d"
+}
+
+# The optional fourth argument is what keeps the matrix a clean DIAGONAL. An
+# exit code alone cannot tell a case that fired through its own detector from
+# one that tripped a neighbour's, so every failing case also names the subject
+# it introduced and the diagnostic must mention it.
+expect_rc () {   # expect_rc <case name> <expected rc> <repo root> [substring]
+    local case_name=$1 want=$2 root=$3 want_text=${4-} got
+    "$PREFLIGHT" --repo-root "$root" > "$SCRATCH_DIR/$case_name.log" 2>&1
+    got=$?
+    if [ "$got" != "$want" ]; then
+        report "$case_name" FAIL "expected exit $want, got $got (see $SCRATCH_DIR/$case_name.log)"
+        return
+    fi
+    if [ -n "$want_text" ] && ! grep -qF "$want_text" "$SCRATCH_DIR/$case_name.log"; then
+        report "$case_name" FAIL \
+            "exit $got was right but no diagnostic named '$want_text', so the case may have tripped another detector (see $SCRATCH_DIR/$case_name.log)"
+        return
+    fi
+    report "$case_name" PASS
+}
+
+# ---- the green control -------------------------------------------------
+# Every mutation below is measured against this. A detector that fires on the
+# clean tree is not a detector.
+d=$(new_tree clean)
+expect_rc clean 0 "$d"
+
+# ---- check 1: Python compilation ---------------------------------------
+d=$(new_tree python-extension)
+printf '%s\n' 'def broken(:' > "$d/bin/_lib_broken.py"
+expect_rc python-extension 3 "$d" "_lib_broken.py"
+
+# The case that is not optional. bin/cctally is EXTENSIONLESS, so an
+# extension-keyed scan would skip the most important file in the tree, and
+# bin/codex-session-metrics shows it is a class rather than one special case.
+d=$(new_tree python-extensionless)
+printf '%s\n%s\n' '#!/usr/bin/env python3' 'def broken(:' > "$d/bin/cctally-broken-entry"
+chmod +x "$d/bin/cctally-broken-entry"
+expect_rc python-extensionless 3 "$d" "cctally-broken-entry"
+
+# Control: an extensionless file with NO shebang is not a Python file, and a
+# scanner that compiled everything would report this one. Its content is
+# deliberately invalid in every language.
+d=$(new_tree python-selector-shebangless)
+printf '%s\n' 'def broken(:' > "$d/bin/notes-not-a-script"
+expect_rc python-selector-shebangless 0 "$d"
+
+# Control: a data file is not source. Same body, different name.
+d=$(new_tree python-selector-datafile)
+printf '%s\n' 'def broken(:' > "$d/bin/payload.txt"
+expect_rc python-selector-datafile 0 "$d"
+
+# ---- check 2: shell syntax ---------------------------------------------
+d=$(new_tree shell-bash)
+printf '%s\n%s\n' '#!/usr/bin/env bash' 'if [ 1 ]; then' > "$d/bin/cctally-broken-wrapper"
+chmod +x "$d/bin/cctally-broken-wrapper"
+expect_rc shell-bash 3 "$d" "cctally-broken-wrapper"
+
+# The interpreter is chosen per file from its own shebang rather than assumed.
+d=$(new_tree shell-sh)
+printf '%s\n%s\n' '#!/bin/sh' 'case x in' > "$d/bin/cctally-broken-posix"
+chmod +x "$d/bin/cctally-broken-posix"
+expect_rc shell-sh 3 "$d" "cctally-broken-posix"
+
+# ---- check 3: harness-discovery and ownership drift --------------------
+d=$(new_tree missing-harness)
+rm -f "$d/bin/cctally-$H-test"
+expect_rc missing-harness 3 "$d" "manifest row"
+
+d=$(new_tree unexpected-harness)
+printf '%s\n%s\n' '#!/usr/bin/env bash' 'echo hi' > "$d/bin/cctally-stray-test"
+chmod +x "$d/bin/cctally-stray-test"
+expect_rc unexpected-harness 3 "$d" "stray"
+
+d=$(new_tree lost-executable-bit)
+chmod 644 "$d/bin/cctally-$H-test"
+expect_rc lost-executable-bit 3 "$d" "not executable"
+
+d=$(new_tree removed-edge)
+cat > "$d/tests/harness-ownership.json" <<EOF
+{
+  "schemaVersion": 1,
+  "harnesses": { "$H": { "fixturePaths": [], "sourcePaths": [] } }
+}
+EOF
+expect_rc removed-edge 3 "$d" "does not declare"
+
+d=$(new_tree stale-edge)
+mkdir -p "$d/tests/$FX/retired"
+cat > "$d/tests/harness-ownership.json" <<EOF
+{
+  "schemaVersion": 1,
+  "harnesses": {
+    "$H": {
+      "fixturePaths": ["tests/$FX/$H", "tests/$FX/retired"],
+      "sourcePaths": []
+    }
+  }
+}
+EOF
+expect_rc stale-edge 3 "$d" "retired"
+
+# The overlay is discovered by existence: absent is the public clone's normal
+# state, and the check runs on public rows alone there.
+d=$(new_tree overlay-absent-public)
+if [ -e "$d/tests/harness-ownership.private.json" ]; then
+    report overlay-absent-public FAIL "the synthetic tree already carries an overlay"
+else
+    expect_rc overlay-absent-public 0 "$d"
+fi
+
+# In a tree that CLAIMS to be private, the same absence is a silent narrowing.
+# .mirror-allowlist's presence is the discriminator, exactly as in
+# bin/cctally-test-all.
+d=$(new_tree overlay-absent-private)
+printf '%s\n' 'bin/cctally-*' 'tests/**' > "$d/.mirror-allowlist"
+expect_rc overlay-absent-private 3 "$d" "overlay"
+
+# ---- invocation and the real tree --------------------------------------
+"$PREFLIGHT" --nonsense > "$SCRATCH_DIR/usage.log" 2>&1
+rc=$?
+if [ "$rc" = 2 ]; then
+    report usage PASS
+else
+    report usage FAIL "expected exit 2 for an invalid invocation, got $rc"
+fi
+
+# The scan of the ACTUAL working tree. This is the leg that makes the coverage
+# genuinely duplicated: the mutations above prove the detectors work, and this
+# proves they are pointed at this repository.
+#
+# CONSTRAINT: this is the one case that reads the SHARED working tree, and
+# bin/cctally-test-all runs this harness inside a parallel pool alongside every
+# other harness. It is safe today because no harness writes into the tree it
+# reads: each builder writes to a scratch directory or stages its fixtures out
+# of tree, so the estate bin/cctally-test-owners --verify walks is quiescent for
+# the whole run. A harness that regenerated a fixture directory IN PLACE would
+# break that, and the symptom would be this leg going red intermittently and
+# only under parallelism — a defect in the other harness, reported here.
+"$PREFLIGHT" > "$SCRATCH_DIR/real-tree.log" 2>&1
+rc=$?
+if [ "$rc" = 0 ]; then
+    report real-tree PASS
+else
+    report real-tree FAIL "the working tree does not pass its own pre-flight (exit $rc; see $SCRATCH_DIR/real-tree.log)"
+fi
+
+echo "----"
+echo "passed: $pass_count   failed: $fail_count"
+[ "$fail_count" -eq 0 ]

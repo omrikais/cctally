@@ -5,11 +5,22 @@
 __pycache__/
 .worktrees/
 .superpowers/
-# Codex CLI scratch: .codex/ is partially tracked (agents/*.toml, config.toml,
-# model-profiles.lock.toml), but .codex/tmp/ is per-run temporary output. Ignore
-# only tmp/ so the tracked config survives; anchored to root (worktree copies are
-# already covered by .worktrees/).
-.codex/tmp/
+# Codex CLI runtime state: .codex/ doubles as this repo's project-level
+# CODEX_HOME, so any codex-family binary run from the repo root writes its own
+# per-install state here (state/logs/memories/queue/goals SQLite DBs + WAL/SHM
+# sidecars, installation_id, version.json, skills/.system/, tmp/ and .tmp/, and
+# potentially auth.json). Only three things are tracked, so this is default-deny
+# with those three re-included, rather than a list of the filenames Codex happens
+# to write today — a new runtime file must not be able to appear as untracked,
+# and auth.json must never become committable. A file added under .codex/ on
+# purpose later needs its own negation line here. Use `.codex/*` rather than
+# `.codex/` so git still traverses into the directory; a bare `.codex/` would
+# prevent the re-includes. Anchored to root (worktree copies are already covered
+# by .worktrees/).
+.codex/*
+!.codex/agents/
+!.codex/config.toml
+!.codex/model-profiles.lock.toml
 # Ignore everything in .claude/ EXCEPT the project-scoped skills + agents trees
 # (which are tracked so skill/agent definitions survive fresh clones / propagate
 # to CI). Use `.claude/*` rather than `.claude/` so git still traverses
@@ -68,25 +79,35 @@ tests/fixtures/weekly/*/.local/share/cctally/*.db
 /node_modules
 /package-lock.json
 
-# === Browser-MCP / manual-smoke artifacts ===
-# Playwright MCP writes a page snapshot + console log to .playwright-mcp/
-# on every browser interaction during share-v2 smoke passes (M1.20+).
-# Tool-generated; regenerated every session.
+# === Browser-MCP artifacts ===
+# Playwright MCP writes a page snapshot + console log to .playwright-mcp/ on
+# every browser interaction. This one stays ignored because the MCP server
+# writes it unconditionally rather than because a QA run chose to keep it;
+# un-ignoring it would make every browser-driven run dirty by construction.
 .playwright-mcp/
-# Ad-hoc smoke screenshots saved at the repo root during manual share-v2
-# smoke testing (M1.20 + follow-up passes). `smoke*` matches both the
-# first-pass `share-v2-smoke-N-...` and second-pass `share-v2-smoke2-N-...`
-# naming. Anchored to root so an intentional asset elsewhere (e.g.,
-# docs/) isn't accidentally dropped.
-/share-v2-smoke*.png
-baseline/
-# Ad-hoc UI/UX QA artifacts (screenshots, captured DOM, findings reports)
-# saved at the repo root during manual conversation-viewer / dashboard QA
-# passes — e.g. cctally-qa-comparison/, cctally-qa-discovery/. Tool-generated,
-# regenerated each session. Anchored to root.
-/cctally-qa-*/
+#
+# Root-level QA evidence is deliberately NOT ignored. Rules naming
+# /share-v2-smoke*.png, baseline/ and /cctally-qa-*/ used to sit here, from the
+# era when a QA pass dumped screenshots at the repo root and left them. The
+# UI-QA contract now requires every screenshot to be deleted at cleanup
+# (.agent-workflows/contracts/ui-qa.md), and the guard's before/after source
+# hash enumerates `git ls-files --cached --others --exclude-standard`
+# (.agent-workflows/lib/ui_qa_guard.py:44), which skips ignored files. An
+# ignore rule over that evidence would hide the exact cleanup failure the gate
+# exists to catch: leftovers would not move the hash, so a run that abandoned
+# them would still certify. Left visible, a missed cleanup both dirties
+# `git status` and fails the gate. Retained reports belong in
+# .agent-workflows/reports/ui-qa/, which is tracked and committed with the work
+# it certifies; nothing else a QA run produces belongs in the tree at all.
 .agentmem/local/
 
 # Screenshot-pipeline output manifest (README_SCREENSHOTS_OUT_DIR contract artifact,
 # consumed by cctally-release readme-refresh; regenerated every run, never published)
 docs/img/manifest.json
+
+# Machine-owned roots the runner provisions and the transport never converges
+# (#529 S3). Listing them here aligns git's view with their status, so a
+# maintainer with a local .venv does not have it selected into the staged tree
+# and refused as a path inside a runner-owned root.
+/.venv/
+/.cctally-remote-state/

@@ -397,6 +397,17 @@ from _lib_dashboard_json import (
     encode_dashboard_json,
     encode_dashboard_json_bytes,
 )
+# #513 S1: the one map that says which settings leaves this endpoint writes,
+# which it accepts and ignores, and which it rejects. Pure and import-free, so
+# tests/test_config_documentation.py can read the same contract without
+# loading the dashboard.
+from _lib_dashboard_settings_contract import (
+    KNOWN_IGNORED as _SETTINGS_KNOWN_IGNORED,
+    SETTINGS_LEAF_DISPOSITIONS,
+    SETTINGS_OBJECT_PATHS,
+    SETTINGS_REQUIRED_LEAVES,
+    SETTINGS_TOP_LEVEL_BLOCKS,
+)
 from _cctally_config import save_config, _load_config_unlocked
 from _cctally_db import _render_migration_error_banner
 from _cctally_cache import (
@@ -1557,6 +1568,120 @@ def _validate_update_check_ttl_hours_value(*args, **kwargs):
 
 def _config_known_value(*args, **kwargs):
     return sys.modules["cctally"]._config_known_value(*args, **kwargs)
+
+
+# === POST /api/settings path classification (#513 S1, spec §1.3) =========
+# One rule for the whole endpoint: every submitted terminal path is looked up
+# in SETTINGS_LEAF_DISPOSITIONS. A writable leaf is validated and merged, a
+# known-ignored leaf is accepted and disclosed on the echo, and anything else
+# is a 400 naming that dotted path. This replaces the per-block unknown-key
+# loops that used to carry the same knowledge in five separate tuples.
+
+#: The six blocks in the order the "at least one of" message names them. The
+#: SET is asserted against the contract by
+#: tests/test_config_settings_dispositions.py; the ORDER is presentation.
+_SETTINGS_BLOCK_ORDER = (
+    "display", "alerts", "update", "cache_report", "budget", "dashboard",
+)
+
+#: Leaves that are refused for a specific, explainable reason rather than
+#: because nobody has heard of them. The classification adds a field pointer
+#: to these messages and changes nothing else -- a generic "unknown settings
+#: key" would be a worse answer than the sentence already written here.
+_SETTINGS_PURPOSE_WRITTEN_REJECTIONS = {
+    "alerts.command_template": (
+        "alerts.command_template is CLI/config-only "
+        "(not settable via the dashboard)"
+    ),
+    "dashboard.bind": (
+        "dashboard.bind is not settable via the dashboard "
+        "(bind-time / privacy-gate setting)"
+    ),
+    "dashboard.expose_transcripts": (
+        "dashboard.expose_transcripts is not settable via the dashboard "
+        "(bind-time / privacy-gate setting)"
+    ),
+}
+
+#: Unknown-key wording that shipped before the classification existed, keyed
+#: by the parent object path. Kept because harness cases pin these exact
+#: strings; paths without an entry get the generic dotted form.
+_SETTINGS_LEGACY_UNKNOWN_MESSAGES = {
+    "update": "unknown update settings key: {leaf}",
+    "update.check": "unknown update.check key: {leaf}",
+    "dashboard": "unknown dashboard settings key: {leaf}",
+}
+
+
+def _settings_unknown_message(path: str) -> str:
+    """The 400 message for a submitted path this endpoint does not accept."""
+    purpose_written = _SETTINGS_PURPOSE_WRITTEN_REJECTIONS.get(path)
+    if purpose_written is not None:
+        return purpose_written
+    parent, _, leaf = path.rpartition(".")
+    legacy = _SETTINGS_LEGACY_UNKNOWN_MESSAGES.get(parent)
+    if legacy is not None:
+        return legacy.format(leaf=leaf)
+    return f"unknown settings key: {path}"
+
+
+def _classify_settings_payload(payload: dict) -> tuple:
+    """Classify every terminal path in a settings body.
+
+    Returns ``(rejection, ignored_fields)``. ``rejection`` is ``None`` or the
+    ``(message, field)`` pair for the FIRST unacceptable path, walked in the
+    request's own key order so the pointer is stable for a given body.
+    ``ignored_fields`` is the sorted list of known-ignored paths present.
+
+    A non-dict value sitting at an interior path is deliberately NOT a
+    finding here: that is a structural failure, and the block's own
+    "must be an object" check owns it and words it better.
+    """
+    ignored: list[str] = []
+    rejection: "tuple[str, str] | None" = None
+
+    def walk(path: str, value: object) -> None:
+        nonlocal rejection
+        if rejection is not None:
+            return
+        disposition = SETTINGS_LEAF_DISPOSITIONS.get(path)
+        if disposition is not None:
+            if disposition == _SETTINGS_KNOWN_IGNORED:
+                ignored.append(path)
+            return
+        if path in SETTINGS_OBJECT_PATHS:
+            if isinstance(value, dict):
+                for leaf, sub_value in value.items():
+                    walk(f"{path}.{leaf}", sub_value)
+            return
+        rejection = (_settings_unknown_message(path), path)
+
+    for block, block_value in payload.items():
+        walk(block, block_value)
+    return rejection, sorted(ignored)
+
+
+def _settings_missing_required_leaf(payload: dict) -> "str | None":
+    """Return the first required leaf a named block failed to supply.
+
+    The emptiness rule operates on BLOCKS, not leaves: a named block carrying
+    no leaves is an ordinary partial-PUT no-op, which is what
+    ``{"cache_report": {}}`` relies on when a combined save's UI never opened
+    that tab. ``display`` is the one block that declares a required leaf.
+    """
+    for block, required in SETTINGS_REQUIRED_LEAVES.items():
+        if block not in payload:
+            continue
+        block_value = payload[block]
+        present = (
+            {f"{block}.{leaf}" for leaf in block_value}
+            if isinstance(block_value, dict)
+            else set()
+        )
+        missing = sorted(required - present)
+        if missing:
+            return missing[0]
+    return None
 
 
 def config_writer_lock(*args, **kwargs):
@@ -5177,6 +5302,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         — every top-level key is optional; any subset may be sent together
         (combined save). Unknown top-level keys are rejected with 400.
 
+        One classification rule (#513 S1). Every submitted terminal path is
+        looked up in ``SETTINGS_LEAF_DISPOSITIONS``
+        (``bin/_lib_dashboard_settings_contract.py``). A writable leaf is
+        validated and merged; a known-ignored leaf is accepted, not
+        persisted, and disclosed on the echo via ``ignored_fields``; anything
+        else is a 400 naming that dotted path in ``field``. Classification
+        runs BEFORE the per-block validators and before the ``budget.codex``
+        fail-closed guard, so an unknown leaf under ``budget.codex`` reports
+        itself rather than the prerequisite.
+
+        The emptiness rule operates on BLOCKS, not leaves: the body must name
+        at least one known block, but a named block carrying no leaves is an
+        ordinary partial-PUT no-op that still echoes its cooked block.
+        ``{"cache_report": {}}`` depends on this — it is what a combined save
+        sends when the user never opened that tab. ``display`` is the one
+        block declaring a required leaf (``SETTINGS_REQUIRED_LEAVES``), so
+        ``{"display": {}}`` stays a 400.
+
+        Every 400 carries a ``field``. Whole-document failures (over-cap
+        body, zero-length body, malformed JSON, non-object payload, no known
+        block) use ``"$"``; everything else names a block or a dotted leaf.
+
         Per-block validation:
           * ``display.tz`` — "local", "utc", or a valid IANA zone (via
             ``normalize_display_tz_value``); 400 on invalid.
@@ -5192,9 +5339,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             would silently accept ``true`` for a numeric field).
           * ``cache_report.anomaly_threshold_pp`` — JSON int (NOT bool /
             float / string), in ``[1, 100]``; 400 with
-            ``{error, field: "anomaly_threshold_pp"}`` on out-of-range
-            or non-int. Spec §6.1 hardcodes ``anomaly_window_days``;
-            F10 tracks lifting that.
+            ``{error, field: "cache_report.anomaly_threshold_pp"}`` on
+            out-of-range or non-int. The validator raises the bare leaf
+            name and this handler qualifies it, so the response carries
+            the same dotted form every other rejection uses. Spec §6.1
+            hardcodes ``anomaly_window_days``; F10 tracks lifting that.
           * ``budget`` — must be a dict; the inbound leaves
             (``weekly_usd`` / ``alerts_enabled`` / ``alert_thresholds`` /
             ``projected_enabled``) are merged onto the persisted ``budget``
@@ -5242,6 +5391,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         / bearer tokens — and the echo is returned to the client; the
         SSE ``alerts_settings`` mirror redacts identically). Do NOT
         re-add the raw template to the echo.
+        ``ignored_fields`` — a sorted array of the known-ignored dotted
+        paths this request carried — is present only when that set is
+        non-empty, which is what keeps the field additive for clients
+        written before it existed.
         ``saved_at`` is included for backward compat.
         """
         if not self._check_origin_csrf():
@@ -5251,44 +5404,59 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
             length = 0
+        # Whole-document failures name "$" as their field: there is no leaf
+        # to point at when the body itself is the problem.
         if length <= 0 or length > 4096:
-            self._respond_json(400, {"error": "body required (<=4 KB)"})
+            self._respond_json(
+                400, {"error": "body required (<=4 KB)", "field": "$"}
+            )
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            self._respond_json(400, {"error": "malformed json"})
+            self._respond_json(400, {"error": "malformed json", "field": "$"})
             return
         if not isinstance(payload, dict):
-            self._respond_json(400, {"error": "expected JSON object"})
+            self._respond_json(
+                400, {"error": "expected JSON object", "field": "$"}
+            )
             return
 
         # Reject unknown top-level keys (forward-compat hygiene).
-        allowed_top_keys = {
-            "display", "alerts", "update", "cache_report", "budget", "dashboard",
-        }
         for k in payload.keys():
-            if k not in allowed_top_keys:
+            if k not in SETTINGS_TOP_LEVEL_BLOCKS:
                 self._respond_json(
-                    400, {"error": f"unknown settings key: {k}"}
+                    400, {"error": f"unknown settings key: {k}", "field": k}
                 )
                 return
 
-        # Body must touch at least one known block.
-        if (
-            "display" not in payload
-            and "alerts" not in payload
-            and "update" not in payload
-            and "cache_report" not in payload
-            and "budget" not in payload
-            and "dashboard" not in payload
-        ):
+        # Body must name at least one known block.
+        if not (set(payload) & SETTINGS_TOP_LEVEL_BLOCKS):
             self._respond_json(
                 400,
                 {"error": (
                     "body must contain at least one of: "
-                    "display, alerts, update, cache_report, budget, dashboard"
-                )},
+                    + ", ".join(_SETTINGS_BLOCK_ORDER)
+                ), "field": "$"},
+            )
+            return
+
+        # Classify every submitted path against the one contract. This runs
+        # BEFORE the per-block validators and before the budget.codex
+        # fail-closed guard, so {"budget":{"codex":{"bogus":1}}} reports the
+        # unknown leaf rather than the prerequisite.
+        settings_rejection, ignored_fields = _classify_settings_payload(payload)
+        if settings_rejection is not None:
+            message, field_path = settings_rejection
+            self._respond_json(400, {"error": message, "field": field_path})
+            return
+
+        # A named block with no leaves is a no-op; `display` is the one block
+        # that declares a required leaf.
+        missing_leaf = _settings_missing_required_leaf(payload)
+        if missing_leaf is not None:
+            self._respond_json(
+                400, {"error": f"missing {missing_leaf}", "field": missing_leaf}
             )
             return
 
@@ -5318,9 +5486,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     cache_report_block
                 )
             except _CacheReportConfigError as exc:
+                # The validator names the bare leaf (its pure-function tests
+                # pin that); the HTTP contract is dotted end to end, so
+                # qualify it here rather than changing the kernel.
+                field_path = exc.field or "cache_report"
+                if field_path != "cache_report":
+                    field_path = f"cache_report.{field_path}"
                 self._respond_json(
-                    400,
-                    {"error": str(exc), "field": exc.field or "cache_report"},
+                    400, {"error": str(exc), "field": field_path},
                 )
                 return
 
@@ -5329,11 +5502,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         display_canonical: "str | None" = None
         if "display" in payload:
             display_block = payload["display"]
-            if not isinstance(display_block, dict) or "tz" not in display_block:
-                self._respond_json(
-                    400, {"error": "missing display.tz", "field": "display.tz"}
-                )
-                return
             try:
                 display_canonical = normalize_display_tz_value(display_block["tz"])
             except ValueError:
@@ -5363,7 +5531,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             alerts_block = payload["alerts"]
             if not isinstance(alerts_block, dict):
                 self._respond_json(
-                    400, {"error": "alerts must be an object"}
+                    400, {"error": "alerts must be an object", "field": "alerts"}
                 )
                 return
             if "enabled" in alerts_block and not isinstance(
@@ -5371,7 +5539,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ):
                 self._respond_json(
                     400,
-                    {"error": "alerts.enabled must be a JSON boolean"},
+                    {"error": "alerts.enabled must be a JSON boolean",
+                     "field": "alerts.enabled"},
                 )
                 return
             if "projected_enabled" in alerts_block and not isinstance(
@@ -5379,20 +5548,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ):
                 self._respond_json(
                     400,
-                    {"error": "alerts.projected_enabled must be a JSON boolean"},
+                    {"error": "alerts.projected_enabled must be a JSON boolean",
+                     "field": "alerts.projected_enabled"},
                 )
                 return
-            # The dispatch command template is CLI/config-only — never
-            # settable via the dashboard (it routinely holds secrets and the
-            # dashboard echoes settings to the client). Reject it explicitly
-            # rather than silently dropping it.
-            if "command_template" in alerts_block:
-                self._respond_json(
-                    400,
-                    {"error": "alerts.command_template is CLI/config-only "
-                              "(not settable via the dashboard)"},
-                )
-                return
+            # `alerts.command_template` is refused by the classification pass
+            # above (it routinely holds secrets and the dashboard echoes
+            # settings back to the client); its purpose-written message lives
+            # in _SETTINGS_PURPOSE_WRITTEN_REJECTIONS.
+            #
             # `notifier` is settable (the backend selector). Structural type
             # check only; the enum + cross-field rule (command needs a stored
             # template) is enforced free by `_get_alerts_config(merged)` below.
@@ -5400,7 +5564,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 alerts_block["notifier"], str
             ):
                 self._respond_json(
-                    400, {"error": "alerts.notifier must be a string"}
+                    400, {"error": "alerts.notifier must be a string",
+                          "field": "alerts.notifier"}
                 )
                 return
 
@@ -5412,17 +5577,18 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             budget_block = payload["budget"]
             if not isinstance(budget_block, dict):
                 self._respond_json(
-                    400, {"error": "budget must be an object"}
+                    400, {"error": "budget must be an object", "field": "budget"}
                 )
                 return
 
-        # Pre-validate the dashboard block (spec §5). Only
-        # ``cache_failure_markers`` is dashboard-writable — a JSON boolean
-        # (string/int rejected, mirroring the strict bool checks for
-        # ``alerts.enabled``). ``dashboard.bind`` / ``dashboard.expose_transcripts``
-        # are bind-time / privacy-gate settings, NOT live-mutable, so they are
-        # rejected explicitly here (rather than silently dropped). Outside the
-        # config_writer_lock so a 400 short-circuit doesn't take the lock.
+        # Pre-validate the dashboard block (spec §5). The writable leaves are
+        # JSON booleans (string/int rejected, mirroring the strict bool check
+        # for ``alerts.enabled``). ``dashboard.bind`` /
+        # ``dashboard.expose_transcripts`` are bind-time / privacy-gate
+        # settings, NOT live-mutable; the classification pass above refuses
+        # them by name with their purpose-written message, and refuses every
+        # other unknown leaf under this block. Outside the config_writer_lock
+        # so a 400 short-circuit doesn't take the lock.
         dashboard_validated: "dict | None" = None
         if "dashboard" in payload:
             dashboard_block = payload["dashboard"]
@@ -5432,24 +5598,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     {"error": "dashboard must be an object", "field": "dashboard"},
                 )
                 return
-            for leaf in dashboard_block.keys():
-                if leaf in ("bind", "expose_transcripts"):
-                    self._respond_json(
-                        400,
-                        {"error": (f"dashboard.{leaf} is not settable via the "
-                                   "dashboard (bind-time / privacy-gate setting)"),
-                         "field": f"dashboard.{leaf}"},
-                    )
-                    return
-                if leaf not in (
-                    "cache_failure_markers", "live_tail", "lan_auth"
-                ):
-                    self._respond_json(
-                        400,
-                        {"error": f"unknown dashboard settings key: {leaf}",
-                         "field": f"dashboard.{leaf}"},
-                    )
-                    return
             dashboard_validated = {}
             for _leaf in ("cache_failure_markers", "live_tail", "lan_auth"):
                 if _leaf in dashboard_block:
@@ -5463,27 +5611,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     dashboard_validated[_leaf] = dashboard_block[_leaf]
 
         # Pre-validate update shape. Only `update.check.{enabled,ttl_hours}`
-        # is settable today; any other key under `update` or `update.check`
-        # is rejected so adding e.g. `update.banner.*` later is forward
-        # compatible. `enabled` must be a JSON bool; `ttl_hours` an int
-        # (bools rejected — see _validate_update_check_ttl_hours_value).
+        # and `update.channel` are settable today; the classification pass
+        # above refuses any other key under `update` or `update.check`, so
+        # adding e.g. `update.banner.*` later is forward compatible.
+        # `enabled` must be a JSON bool; `ttl_hours` an int (bools rejected —
+        # see _validate_update_check_ttl_hours_value).
         update_check_validated: "dict | None" = None
         update_channel_validated: "str | None" = None
         if "update" in payload:
             update_in = payload["update"]
             if not isinstance(update_in, dict):
                 self._respond_json(
-                    400, {"error": "update must be an object"}
+                    400, {"error": "update must be an object", "field": "update"}
                 )
                 return
-            for inner in update_in.keys():
-                if inner not in ("check", "channel"):
-                    self._respond_json(
-                        400,
-                        {"error": f"unknown update settings key: {inner}",
-                         "field": f"update.{inner}"},
-                    )
-                    return
             # Release channel opt-in (beta-channel, spec 2026-07-21 §3). Enum
             # {stable,beta}; 400 on invalid. Mirrors the config-key validator.
             if "channel" in update_in:
@@ -5507,14 +5648,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                      "field": "update.check"},
                 )
                 return
-            for leaf in check_in.keys():
-                if leaf not in ("enabled", "ttl_hours"):
-                    self._respond_json(
-                        400,
-                        {"error": f"unknown update.check key: {leaf}",
-                         "field": f"update.check.{leaf}"},
-                    )
-                    return
             update_check_validated = {}
             if "enabled" in check_in:
                 if not isinstance(check_in["enabled"], bool):
@@ -5569,7 +5702,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     existing_alerts, dict
                 ):
                     self._respond_json(
-                        400, {"error": "alerts must be an object"}
+                        400, {"error": "alerts must be an object",
+                              "field": "alerts"}
                     )
                     return
                 merged_alerts = dict(existing_alerts or {})
@@ -5589,7 +5723,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 try:
                     _get_alerts_config(merged)
                 except _AlertsConfigError as exc:
-                    self._respond_json(400, {"error": str(exc)})
+                    self._respond_json(
+                        400,
+                        {"error": str(exc), "field": exc.field or "alerts"},
+                    )
                     return
 
             if "budget" in payload:
@@ -5603,7 +5740,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     existing_budget, dict
                 ):
                     self._respond_json(
-                        400, {"error": "budget must be an object"}
+                        400, {"error": "budget must be an object",
+                              "field": "budget"}
                     )
                     return
                 merged_budget = dict(existing_budget or {})
@@ -5625,7 +5763,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     incoming_codex = budget_in["codex"]
                     if not isinstance(incoming_codex, dict):
                         self._respond_json(
-                            400, {"error": "budget.codex must be an object"}
+                            400, {"error": "budget.codex must be an object",
+                                  "field": "budget.codex"}
                         )
                         return
                     existing_codex = merged_budget.get("codex")
@@ -5633,16 +5772,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         # Fail closed: the dashboard only TOGGLES an existing
                         # Codex budget — amounts are CLI-only — so it must never
                         # invent one. The frontend disables the toggle, this
-                        # backstops a direct POST.
+                        # backstops a direct POST. Reached only when every
+                        # submitted leaf is known: classification runs first.
                         self._respond_json(400, {"error": (
                             "no Codex budget configured — set one via the CLI "
                             "first (cctally budget set <amount> --vendor codex)"
-                        )})
+                        ), "field": "budget.codex"})
                         return
                     merged_codex = dict(existing_codex)
                     for sub in ("alerts_enabled", "projected_enabled"):
                         if sub in incoming_codex:
-                            merged_codex[sub] = bool(incoming_codex[sub])
+                            # Assigned verbatim. A bool() here would coerce
+                            # "yes" to True and destroy the evidence before
+                            # _get_budget_config could reject it, which is
+                            # exactly how this leaf came to disagree with its
+                            # Claude sibling (#513 F5). One boolean rule, and
+                            # it lives in the canonical validator.
+                            merged_codex[sub] = incoming_codex[sub]
                     merged_budget["codex"] = merged_codex
                 merged["budget"] = merged_budget
                 # Final validation against the merged block.
@@ -5651,7 +5797,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 try:
                     _get_budget_config(merged)
                 except _BudgetConfigError as exc:
-                    self._respond_json(400, {"error": str(exc)})
+                    self._respond_json(
+                        400,
+                        {"error": str(exc), "field": exc.field or "budget"},
+                    )
                     return
 
             if (
@@ -5860,6 +6009,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             }
             if "lan_auth" in dashboard_validated:
                 out["restart_required"] = ["dashboard.lan_auth"]
+        if ignored_fields:
+            # Disclosure, not a new capability: these leaves were always
+            # accepted-and-not-persisted, and a client had no way to tell
+            # that from a plain 200. Additive and emitted only when
+            # non-empty, so an ordinary write keeps its exact current shape.
+            # snake_case matches the surrounding legacy echo
+            # (`command_configured`, `saved_at`); CRUD echoes carry no
+            # schemaVersion (docs/cli-contract.md).
+            out["ignored_fields"] = ignored_fields
         out["saved_at"] = (
             dt.datetime.now(dt.timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7212,7 +7370,7 @@ def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
             tui.SyncFailureAttribution(
                 leg="stats-open",
                 database="stats",
-                corruption=isinstance(exc, c.StatsHealDeferred),
+                corruption=tui._stats_open_failure_is_corruption(exc),
             ),
         ),
         "doctor_payload": doctor_payload,
