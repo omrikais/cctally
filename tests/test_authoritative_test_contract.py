@@ -2179,7 +2179,12 @@ def _agentmem_gated_modules():
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if "_agentmem_gate" in text:
+        # Match the actual dependency edge, not this helper's prose mentioning
+        # the gate. On the public tree both gated modules are mirror-excluded;
+        # the broad substring search selected this module itself, launched a
+        # nested collection containing zero gated tests, then violated its own
+        # non-vacuity assertion instead of taking the intended no-module skip.
+        if re.search(r"^\s*from\s+_agentmem_gate\s+import\s+", text, re.MULTILINE):
             found.append(path.relative_to(REPO).as_posix())
     return found
 
@@ -2277,4 +2282,3 @@ def test_present_agentmem_announces_that_the_gated_tests_ran(tmp_path):
     lines = [l for l in r.stdout.splitlines() if "agentmem contract:" in l]
     assert len(lines) == 1, (lines, r.stdout[-3000:])
     assert "agentmem is present" in lines[0], lines[0]
-

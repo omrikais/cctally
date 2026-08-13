@@ -795,6 +795,17 @@ contract_classify_harness() {  # <name> <logfile> <exitfile> <min_cases>
 
     line=""
     if [ -f "$log" ]; then
+        # Detect the binary shape explicitly before asking grep to find the
+        # summary. BSD grep emits the matching NUL-bearing line while GNU grep
+        # may replace it with a binary-file diagnostic (or no stdout at all),
+        # which made the same log classify differently across the remote Mac
+        # gate and Linux CI. `tr | cmp` is byte-oriented under C locale and is
+        # portable across both estates: removing a NUL changes the stream iff
+        # the log carries one.
+        if ! LC_ALL=C tr -d '\000' < "$log" | cmp -s - "$log"; then
+            contract_fail infrastructure binary-log "$name" harness
+            return 0
+        fi
         line=$(grep -E "$_CONTRACT_SUMMARY_RE" "$log" 2>/dev/null | tail -1)
     fi
     if [ -z "$line" ]; then

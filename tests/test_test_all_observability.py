@@ -43,13 +43,26 @@ def _kernels():
     return sorted(BIN.glob("_lib_test_*.py"))
 
 
-# The vocabulary and public-path producers live in a maintainer-local kernel.
-# Without it the transformer has nothing to vouch for a word with and redacts
-# every detail by design, so the cases that assert a diagnostic SURVIVES are
-# skipped rather than weakened on a tree that cannot carry the producer.
-VOCABULARY_AVAILABLE = any(
-    path.name != EVIDENCE_KERNEL.name for path in _kernels()
-)
+def _has_vocabulary_producer(path):
+    """Whether a carried kernel provides the disclosure-vocabulary capability.
+
+    Match the capability rather than assuming every non-evidence kernel is the
+    maintainer-local producer. The public tree also carries the independent
+    isolation kernel, which made that filename-count proxy true while no
+    vocabulary existed and caused public-only assertions to run against the
+    intended redact-everything fallback.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"^def build_known_tokens\(", text, re.MULTILINE))
+
+
+# Without the maintainer-local producer the transformer has nothing to vouch
+# for a word with and redacts every detail by design, so cases that assert a
+# diagnostic SURVIVES are skipped rather than weakened on a public tree.
+VOCABULARY_AVAILABLE = any(_has_vocabulary_producer(path) for path in _kernels())
 
 
 def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None):

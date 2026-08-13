@@ -163,7 +163,11 @@ else
     expect_rc wrong-version 3 "$d" private 'could not read ShellCheck version'
     SHELLCHECK_BIN="$saved_shellcheck"
 
-    expect_rc real-tree 0 "$REPO_ROOT" private
+    # The gate's auto discriminator is the contract under test here: private
+    # owner checkouts carry .mirror-allowlist, while the published snapshot
+    # deliberately does not. Hard-coding `private` made this public harness
+    # demand maintainer-only targets that cannot exist in a mirror checkout.
+    expect_rc real-tree 0 "$REPO_ROOT" auto
 fi
 
 printf '%s\n' '----'

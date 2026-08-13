@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.96.1] - 2026-08-13
+
+### Fixed
+- Public Linux source-checkout CI now exercises the public ShellCheck surface, skips maintainer-only evidence-vocabulary and agentmem contract assertions when their producers are intentionally absent, and classifies NUL-bearing harness logs identically under GNU and BSD tooling. This restores the exact-SHA public gate that failed after the v1.96.0 beta snapshot while retaining fail-closed evidence redaction.
+
 ## [1.96.0] - 2026-08-13
 
 ### Added
