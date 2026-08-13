@@ -15,6 +15,7 @@ import {
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { useKeymap } from '../hooks/useKeymap';
 import { useModalFocus } from '../hooks/useModalFocus';
+import { useReducedMotion } from '../hooks/useReducedMotion';
 import { useScrollLock } from '../hooks/useScrollLock';
 import type {
   AlertAxis,
@@ -184,6 +185,7 @@ export function SettingsOverlay() {
   const prefs = useSyncExternalStore(subscribeStore, () => getState().prefs);
   const filterTerm = useSyncExternalStore(subscribeStore, () => getState().filterText);
   const display = useDisplayTz();
+  const reducedMotion = useReducedMotion();
   const alertsConfig = useSyncExternalStore(
     subscribeStore,
     () => getState().alertsConfig,
@@ -524,12 +526,32 @@ export function SettingsOverlay() {
     summaryRef.current?.focus();
   };
   const jumpToSection = (id: SectionId) => {
-    const heading = cardRef.current?.querySelector<HTMLElement>(
+    const scroller = scrollerRef.current;
+    const heading = scroller?.querySelector<HTMLElement>(
       `[data-settings-section="${id}"]`,
     );
-    if (!heading) return;
-    heading.scrollIntoView({ block: 'start' });
-    heading.focus();
+    if (!scroller || !heading) return;
+
+    // Native scrollIntoView walks every eligible ancestor. In Safari and
+    // Chromium that included `.modal-card` despite its overflow:hidden, moving
+    // the card's hidden scrollTop and permanently clipping the header, filter
+    // and rail. Own the one intended scrollport instead, and preserve the
+    // body's 16px content inset so the heading lands as content rather than
+    // flush against the card border.
+    const scrollerRect = scroller.getBoundingClientRect();
+    const headingRect = heading.getBoundingClientRect();
+    const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const desiredTop =
+      scroller.scrollTop + headingRect.top - scrollerRect.top - 16;
+    const top = Math.max(0, Math.min(desiredTop, maxScrollTop));
+    if (typeof scroller.scrollTo === 'function') {
+      scroller.scrollTo({ top, behavior: reducedMotion ? 'auto' : 'smooth' });
+    } else {
+      scroller.scrollTop = top;
+    }
+    // Keep the accessible focus handoff without letting the browser initiate a
+    // second, ancestor-wide scroll of its own.
+    heading.focus({ preventScroll: true });
   };
 
   // §3.2 — Save is disabled ONLY when nothing is dirty or a submit is in

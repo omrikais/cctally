@@ -39,6 +39,21 @@ _UNPRICED_CLAUDE = "claude-fixture-unpriced-9000"
 _PRICED_CLAUDE = "claude-3-5-haiku-20241022"
 _PRICED_CLAUDE_INPUT = 8e-07          # the embedded value
 _DRIFT_CLAUDE_INPUT = 9.99e-07        # the diverging LiteLLM value
+_MYTHOS_PREVIEW = "claude-mythos-preview"
+_MYTHOS_PREVIEW_LITELLM = {
+    "litellm_provider": "anthropic",
+    "input_cost_per_token": 1e-05,
+    "output_cost_per_token": 5e-05,
+    "cache_creation_input_token_cost": 1.25e-05,
+    "cache_read_input_token_cost": 1e-06,
+}
+
+
+def _litellm_inject(extra: dict | None = None) -> dict:
+    """Keep the live, allowlisted Preview mismatch non-stale in sparse fakes."""
+    result = {_MYTHOS_PREVIEW: dict(_MYTHOS_PREVIEW_LITELLM)}
+    result.update(extra or {})
+    return result
 
 
 def _seed_cache(db_path: pathlib.Path, *, unpriced: bool) -> None:
@@ -142,12 +157,12 @@ def main() -> None:
     # drift drives exit 1 and status stays "ok".
     d = ROOT / "drift_found"
     _seed_cache(d / "cache.db", unpriced=False)
-    _write_json(d / "litellm.json", {
+    _write_json(d / "litellm.json", _litellm_inject({
         _PRICED_CLAUDE: {
             "litellm_provider": "anthropic",
             "input_cost_per_token": _DRIFT_CLAUDE_INPUT,
         },
-    })
+    }))
     _write_json(d / "models.json", {"data": []})
     _write_gitignore(d)
 
@@ -165,12 +180,12 @@ def main() -> None:
     # exit 1 (finding wins) AND status degraded.
     d = ROOT / "finding_while_degraded"
     _seed_cache(d / "cache.db", unpriced=False)
-    _write_json(d / "litellm.json", {
+    _write_json(d / "litellm.json", _litellm_inject({
         _PRICED_CLAUDE: {
             "litellm_provider": "anthropic",
             "input_cost_per_token": _DRIFT_CLAUDE_INPUT,
         },
-    })
+    }))
     _write_gitignore(d)
 
     print(f"pricing-check fixtures built under {ROOT}")

@@ -2,5 +2,12 @@
   "claude-3-5-haiku-20241022": {
     "input_cost_per_token": 9.99e-07,
     "litellm_provider": "anthropic"
+  },
+  "claude-mythos-preview": {
+    "cache_creation_input_token_cost": 1.25e-05,
+    "cache_read_input_token_cost": 1e-06,
+    "input_cost_per_token": 1e-05,
+    "litellm_provider": "anthropic",
+    "output_cost_per_token": 5e-05
   }
 }

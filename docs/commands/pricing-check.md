@@ -97,9 +97,9 @@ only and does not affect the exit code.
   "staleSuppressions": [],
   "expiredSuppressions": [
     {
-      "model": "claude-sonnet-5",
+      "model": "claude-example-promo",
       "field": "input_cost_per_token",
-      "expires": "2026-08-31",
+      "expires": "2026-12-31",
       "reason": "…"
     }
   ]

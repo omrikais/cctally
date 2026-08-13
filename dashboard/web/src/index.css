@@ -13634,6 +13634,13 @@ mark.current {
 
 /* --- sections ------------------------------------------------------------- */
 .settings-section { margin: 0 0 var(--set-gap-lg); }
+/* Keep enough tail space for the final heading to use the same 16px landing
+   inset as every earlier section. Without it, a tall Safari scrollport reaches
+   max-scroll while Restore/CLI are still well below the anchor; the scroll-spy
+   then marks CLI active even when Restore was the rail target. */
+#settings-root .modal-body > .settings-section:last-child {
+  min-height: calc(100% - 16px);
+}
 .settings-section-title {
   margin: 0 0 var(--set-gap-sm);
   font-size: var(--fs-data);

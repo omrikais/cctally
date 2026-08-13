@@ -91,8 +91,8 @@ def _wire_dashboard_handlers(ns):
     ns["DashboardHTTPHandler"].display_tz_pref_override = None
 
 
-def _post_json(host, port, path, body):
-    c = http.client.HTTPConnection(host, port, timeout=2)
+def _post_json(host, port, path, body, *, timeout=2):
+    c = http.client.HTTPConnection(host, port, timeout=timeout)
     raw = json.dumps(body).encode()
     host_header = f"{host}:{port}"
     c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
@@ -105,6 +105,7 @@ def _post_json(host, port, path, body):
     r = c.getresponse()
     payload = r.read().decode("utf-8", errors="replace")
     parsed = json.loads(payload) if payload else None
+    c.close()
     return r.status, parsed
 
 
@@ -587,9 +588,14 @@ def test_post_settings_budget_period_change_triggers_reconcile(ns, monkeypatch):
         status, body = _post_json(
             "127.0.0.1", port, "/api/settings",
             {"budget": {"period": "calendar-month"}},
+            # The response intentionally waits for the real history reconcile.
+            # A loaded CI lane can legitimately take longer than the helper's
+            # ordinary two-second request budget.
+            timeout=10,
         )
     finally:
         srv.shutdown()
+        srv.server_close()
 
     assert status == 200, body
     # Both thresholds latched (alerted_at set, no dispatch) — the reconcile fired

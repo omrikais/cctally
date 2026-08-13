@@ -103,7 +103,10 @@ def test_real_rebuild_stall_is_bounded_and_retry_converges(tmp_path):
     fault_env = env.copy()
     fault_env.update({
         "CCTALLY_TEST_CACHE_SYNC_STALL_PHASE": "claude:ingest",
-        "CCTALLY_TEST_CACHE_SYNC_PHASE_TIMEOUT_SECONDS": "0.2",
+        # This is a no-progress detector, not an ingest performance budget.
+        # Leave enough headroom for loaded CI hosts to reach the injected
+        # ingest stall before the parent diagnoses it.
+        "CCTALLY_TEST_CACHE_SYNC_PHASE_TIMEOUT_SECONDS": "1.0",
     })
     actor = _start_statusline_actor(fault_env)
     started = time.monotonic()
@@ -122,7 +125,7 @@ def test_real_rebuild_stall_is_bounded_and_retry_converges(tmp_path):
         timeout=15,
     )
     elapsed = time.monotonic() - started
-    actor.wait(timeout=10)
+    actor.wait(timeout=30)
 
     assert stuck.returncode == 1
     assert elapsed < 5.0
@@ -164,7 +167,7 @@ def test_real_rebuild_stall_is_bounded_and_retry_converges(tmp_path):
         text=True,
         timeout=30,
     )
-    actor.wait(timeout=10)
+    actor.wait(timeout=30)
 
     assert retry.returncode == 0, retry.stderr
     assert "claude transcripts phase=prepare" in retry.stderr

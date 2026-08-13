@@ -48,7 +48,7 @@ def _get_meta(conn, key):
     return row[0] if row else None
 
 
-def _synced(tmp_path, monkeypatch):
+def _synced(tmp_path, monkeypatch, *, model="claude-opus-4-8"):
     """A synced, authoritative rollup (flag clear) over one priced session."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
@@ -58,7 +58,7 @@ def _synced(tmp_path, monkeypatch):
     projects.mkdir(parents=True, exist_ok=True)
     (projects / "a.jsonl").write_text(
         _asst_line("a1", "ma1", "ra1", "hi", session_id="s1",
-                   ts="2026-06-01T00:00:00Z"))
+                   ts="2026-06-01T00:00:00Z", model=model))
     core = ns["open_cache_db"]()
     try:
         cache.sync_cache(core)
@@ -103,13 +103,18 @@ def test_helper_noop_when_fingerprint_matches(tmp_path, monkeypatch):
 
 def test_sync_records_fingerprint_and_clears_flag(tmp_path, monkeypatch):
     """End-to-end wire-in: a stale fingerprint with NO new messages triggers a
-    full re-derive on the next sync, then clears the flag and records the fp."""
-    cache, conn = _synced(tmp_path, monkeypatch)
+    full re-derive on the next sync, updates a real stale Sonnet 5 cost, then
+    clears the flag and records the fingerprint."""
+    cache, conn = _synced(tmp_path, monkeypatch, model="claude-sonnet-5")
     try:
-        cost_before = conn.execute(
-            "SELECT cost_usd FROM conversation_sessions WHERE session_id='s1'"
-        ).fetchone()[0]
-        assert cost_before > 0
+        # Recreate the materialized value produced by the superseded $3/$15
+        # Sonnet 5 table: 1k input + 500 output = $0.0105. The retained source
+        # entry remains untouched, so the fingerprint path must recompute it
+        # through the current $2/$10 table to $0.007.
+        conn.execute(
+            "UPDATE conversation_sessions SET cost_usd=? WHERE session_id='s1'",
+            (0.0105,),
+        )
 
         conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                      (FP, "STALE"))
@@ -119,12 +124,11 @@ def test_sync_records_fingerprint_and_clears_flag(tmp_path, monkeypatch):
 
         assert _get_meta(conn, FLAG) is None, "backfill flag consumed"
         assert _get_meta(conn, FP) == cache.PRICING_SNAPSHOT_DATE
-        # Cost re-derived to the same value (pricing dict unchanged in-test), and
-        # the rollup stays authoritative.
         cost_after = conn.execute(
             "SELECT cost_usd FROM conversation_sessions WHERE session_id='s1'"
         ).fetchone()[0]
-        assert cost_after == cost_before
+        assert cost_after == 0.007
+        assert cost_after != 0.0105
     finally:
         conn.close()
 

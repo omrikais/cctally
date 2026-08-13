@@ -268,15 +268,21 @@ def test_regenerating_rewrites_the_committed_goldens():
     regeneration reported `REGEN` for every scenario and wrote into a directory
     the harness then deleted.
 
-    Every file is restored in `finally`, and the subtree is asserted clean, so a
-    failure here does not leave the tracked tree dirty. The corruption is held
+    Every file is restored in `finally`, and the subtree's status is asserted
+    unchanged from entry, so a failure leaves neither a clean checkout nor a
+    legitimate in-progress golden update any dirtier. The corruption is held
     under `fixture_tree_lock`, because while it is in place any other test that
-    reads `git status` over this subtree sees a tree this test dirtied.
+    reads `git status` over this subtree sees dirt this test introduced.
     """
     original = _committed_goldens()
     assert original, "no committed golden to regenerate"
 
     with fixture_tree_lock("pricing-check"):
+        status_before = subprocess.run(
+            ["git", "-C", str(REPO), "status", "--porcelain", "--",
+             "tests/fixtures/pricing-check"],
+            capture_output=True, text=True,
+        ).stdout
         try:
             for path in original:
                 path.write_bytes(b"corrupted by test_regenerating_rewrites\n")
@@ -316,4 +322,4 @@ def test_regenerating_rewrites_the_committed_goldens():
              "tests/fixtures/pricing-check"],
             capture_output=True, text=True,
         )
-        assert status.stdout == "", status.stdout
+        assert status.stdout == status_before, status.stdout

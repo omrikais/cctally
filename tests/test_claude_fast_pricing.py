@@ -402,4 +402,4 @@ def test_production_shaped_fast_accounting_reconciles_all_surfaces(tmp_path):
     assert got["cacheNet"] == pytest.approx(
         expected_saved - expected_wasted, abs=1e-12
     )
-    assert got["pricingFingerprint"] == "2026-07-31"
+    assert got["pricingFingerprint"] == pricing.PRICING_SNAPSHOT_DATE

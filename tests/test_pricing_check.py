@@ -37,16 +37,21 @@ def test_pricing_constants_present_and_wellformed():
 # Vendor-verified per-MTok rates for the current Claude generation, as
 # (input, output, 5-minute cache write, cache read) per-token costs, taken from
 # platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
-# Cache tiers follow the documented multipliers (write 1.25x base input, read
-# 0.1x). claude-sonnet-5 is deliberately the durable STANDARD $3/$15 rate, not
-# the $2/$10 introductory rate in effect through 2026-08-31 (#274) — the table
-# is date-blind. Extend this map when Anthropic ships a model.
+# Cache tiers follow the documented multipliers (5-minute write 1.25x base
+# input, 1-hour write 2x, read 0.1x). Mythos Preview retains its historical
+# Project Glasswing rate even though Mythos 5 succeeded it. Extend this map when
+# Anthropic ships a model.
 _CURRENT_GENERATION_RATES = {
     "claude-fable-5":   (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-haiku-4-5": (1e-06,  5e-06,   1.25e-06, 1e-07),
+    "claude-mythos-5":  (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
-    "claude-sonnet-5":  (3e-06,  1.5e-05, 3.75e-06, 3e-07),
+    "claude-sonnet-5":  (2e-06,  1e-05,   2.5e-06,  2e-07),
+}
+
+_HISTORICAL_GENERATION_RATES = {
+    "claude-mythos-preview": (2.5e-05, 1.25e-04, 3.125e-05, 2.5e-06),
 }
 
 
@@ -70,6 +75,45 @@ def test_current_generation_models_priced_at_vendor_rates(model, rates):
     # Claude 4.6 and later carry the full 1M window at standard pricing, so
     # these entries must NOT gain a >200K premium tier (unlike sonnet-4-5).
     assert not [k for k in got if k.endswith("_above_200k_tokens")]
+
+
+@pytest.mark.parametrize("model,rates", sorted(_HISTORICAL_GENERATION_RATES.items()))
+def test_historical_models_retain_vendor_rates(model, rates):
+    got = pricing._resolve_model_pricing(model, warn=False)
+    assert got is not None, f"{model} is unpriced — retained usage reads $0"
+    assert (
+        got["input_cost_per_token"],
+        got["output_cost_per_token"],
+        got["cache_creation_input_token_cost"],
+        got["cache_read_input_token_cost"],
+    ) == rates
+    assert not [k for k in got if k.endswith("_above_200k_tokens")]
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("claude-sonnet-5", 18.70),
+    ("claude-mythos-5", 93.50),
+    ("claude-mythos-preview", 233.75),
+])
+def test_refreshed_models_price_every_cache_tier(model, expected):
+    cost = pricing._calculate_entry_cost(
+        model,
+        {
+            "input_tokens": 1_000_000,
+            "output_tokens": 1_000_000,
+            "cache_creation_input_tokens": 2_000_000,
+            "cache_creation_1h_input_tokens": 1_000_000,
+            "cache_read_input_tokens": 1_000_000,
+        },
+    )
+    assert cost == pytest.approx(expected)
+
+
+def test_sonnet_5_permanent_rate_needs_no_drift_suppression():
+    assert not [
+        row for row in pricing.PRICING_DRIFT_ALLOWLIST
+        if row["model"] == "claude-sonnet-5"
+    ]
 
 
 def test_opus_5_entry_cost_is_computed_not_zeroed():
@@ -197,21 +241,21 @@ def test_stale_allowlist_entries_flags_resolved_divergence():
 
 
 def test_expired_allowlist_entries_strict_cutover():
-    # #279 S7 W7: an entry expiring ON 2026-08-31 is valid THROUGH that date and
+    # #279 S7 W7: an entry expiring ON 2030-01-31 is valid THROUGH that date and
     # only flagged the day AFTER; a no-`expires` entry never expires.
     allow = [
-        {"model": "claude-sonnet-5", "field": "input_cost_per_token",
-         "reason": "intro rate", "expires": "2026-08-31"},
+        {"model": "claude-example-promo", "field": "input_cost_per_token",
+         "reason": "temporary rate", "expires": "2030-01-31"},
         {"model": "claude-durable", "field": "output_cost_per_token",
          "reason": "no cutover"},
     ]
-    assert pc.expired_allowlist_entries(allow, "2026-07-10") == []
-    assert pc.expired_allowlist_entries(allow, "2026-08-31") == []  # valid THROUGH
-    got = pc.expired_allowlist_entries(allow, "2026-09-01")
-    assert len(got) == 1 and got[0]["model"] == "claude-sonnet-5"
+    assert pc.expired_allowlist_entries(allow, "2029-12-01") == []
+    assert pc.expired_allowlist_entries(allow, "2030-01-31") == []  # valid THROUGH
+    got = pc.expired_allowlist_entries(allow, "2030-02-01")
+    assert len(got) == 1 and got[0]["model"] == "claude-example-promo"
     # Accepts a full ISO datetime / date object too (uses the date prefix).
-    assert pc.expired_allowlist_entries(allow, "2026-09-01T12:00:00Z")[0]["model"] == "claude-sonnet-5"
-    assert pc.expired_allowlist_entries([], "2026-09-01") == []
+    assert pc.expired_allowlist_entries(allow, "2030-02-01T12:00:00Z")[0]["model"] == "claude-example-promo"
+    assert pc.expired_allowlist_entries([], "2030-02-01") == []
 
 
 def test_stale_allowlist_entries_empty_when_divergence_real():
@@ -573,9 +617,9 @@ def test_pricing_check_offline_ignores_codex_unattributed_model_sentinel(tmp_pat
 
 
 def test_pricing_check_offline_today_no_suppressions(tmp_path):
-    # #279 S7 W7: today (pre-cutover) the sonnet-5 intro-rate suppression is NOT
-    # expired, and staleSuppressions is SKIPPED offline (no network) — so both
-    # additive keys are empty and exit 0.
+    # staleSuppressions is SKIPPED offline (no network), and the current
+    # evidence-backed allowlist has no dated cutover, so both additive keys are
+    # empty and exit 0.
     r = _run_cctally(["pricing-check", "--offline", "--json"], home=tmp_path)
     assert r.returncode == 0, r.stderr
     doc = _json.loads(r.stdout)
@@ -585,18 +629,22 @@ def test_pricing_check_offline_today_no_suppressions(tmp_path):
     assert "litellm" not in doc["degraded_components"]
 
 
-def test_pricing_check_offline_expired_suppression_exit1(tmp_path):
-    # Past the sonnet-5 cutover (2026-09-01), the four intro-rate suppressions
-    # are expired → expiredSuppressions non-empty → actionable → exit 1. Date-
-    # derived, so it fires OFFLINE via the CCTALLY_AS_OF clock seam.
+def test_pricing_check_offline_does_not_revive_removed_sonnet_cutover(tmp_path):
+    # #560 removed Sonnet 5's cancelled 2026-09-01 price transition. Advancing
+    # beyond that date must stay clean rather than reviving the old four-entry
+    # expiry finding. The pure-kernel cutover test above retains generic expiry
+    # semantics independently of the live allowlist.
     r = _run_cctally(
         ["pricing-check", "--offline", "--json"], home=tmp_path,
         extra_env={"CCTALLY_AS_OF": "2026-09-01T00:00:00Z"},
     )
-    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert r.returncode == 0, (r.returncode, r.stderr)
     doc = _json.loads(r.stdout)
-    assert len(doc["expiredSuppressions"]) == 4, doc["expiredSuppressions"]
-    assert all(e["model"] == "claude-sonnet-5" for e in doc["expiredSuppressions"])
+    assert doc["expiredSuppressions"] == []
+    assert not [
+        row for row in pricing.PRICING_DRIFT_ALLOWLIST
+        if row["model"] == "claude-sonnet-5"
+    ]
 
 
 def test_pricing_issue_findings_present_stale_expired():
@@ -639,6 +687,21 @@ def _write_litellm(tmp_path, body):
     return f
 
 
+_MYTHOS_PREVIEW_LITELLM = {
+    "litellm_provider": "anthropic",
+    "input_cost_per_token": 1e-05,
+    "output_cost_per_token": 5e-05,
+    "cache_creation_input_token_cost": 1.25e-05,
+    "cache_read_input_token_cost": 1e-06,
+}
+
+
+def _litellm_with_allowlisted_preview(body=None):
+    snap = {"claude-mythos-preview": dict(_MYTHOS_PREVIEW_LITELLM)}
+    snap.update(body or {})
+    return snap
+
+
 def _models_file(tmp_path, ids, name="models.json"):
     f = tmp_path / name
     f.write_text(_json.dumps({"data": [{"id": i} for i in ids]}))
@@ -647,8 +710,10 @@ def _models_file(tmp_path, ids, name="models.json"):
 
 def test_pricing_check_drift_via_injected_litellm_exit1(tmp_path):
     # Inject a LiteLLM snapshot that diverges from our table on one value.
-    snap = {"claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
-            "input_cost_per_token": 9.99e-07}}  # embedded is 8e-07
+    snap = _litellm_with_allowlisted_preview({
+        "claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
+            "input_cost_per_token": 9.99e-07},  # embedded is 8e-07
+    })
     f = _write_litellm(tmp_path, snap)
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
@@ -664,6 +729,7 @@ def test_pricing_check_drift_via_injected_litellm_exit1(tmp_path):
     assert any(d["model"] == "claude-3-5-haiku-20241022"
                and d["field"] == "input_cost_per_token"
                for d in doc["drift"]["value_drift"]), doc
+    assert doc["staleSuppressions"] == []
 
 
 def test_pricing_check_degraded_clean_exit0(tmp_path):
@@ -686,8 +752,10 @@ def test_pricing_check_degraded_clean_exit0(tmp_path):
 def test_pricing_check_finding_while_degraded_exit1(tmp_path):
     # PRECEDENCE: a real drift on the LiteLLM leg + the /v1/models leg
     # degraded -> exit 1 (finding wins) but status stays degraded.
-    snap = {"claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
-            "input_cost_per_token": 9.99e-07}}
+    snap = _litellm_with_allowlisted_preview({
+        "claude-3-5-haiku-20241022": {"litellm_provider": "anthropic",
+            "input_cost_per_token": 9.99e-07},
+    })
     f = _write_litellm(tmp_path, snap)
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
@@ -701,14 +769,16 @@ def test_pricing_check_finding_while_degraded_exit1(tmp_path):
     assert "models_api" in doc["degraded_components"]
     assert any(d["model"] == "claude-3-5-haiku-20241022"
                for d in doc["drift"]["value_drift"]), doc
+    assert doc["staleSuppressions"] == []
 
 
 def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
     # The /v1/models leg surfaces a vendor model we don't price -> actionable.
     env = dict(os.environ, HOME=str(tmp_path), TZ="Etc/UTC",
                CCTALLY_DISABLE_DEV_AUTODETECT="1",
-               # LiteLLM clean (empty scoped set -> no drift).
-               CCTALLY_PRICING_LITELLM_FILE=str(_write_litellm(tmp_path, {})),
+               # LiteLLM clean except for the intentional Preview mismatch.
+               CCTALLY_PRICING_LITELLM_FILE=str(_write_litellm(
+                   tmp_path, _litellm_with_allowlisted_preview())),
                CCTALLY_PRICING_MODELS_FILE=str(
                    _models_file(tmp_path, ["claude-brand-new-vendor-model"])))
     r = subprocess.run([sys.executable, str(_CCTALLY), "pricing-check", "--json"],
@@ -717,6 +787,7 @@ def test_pricing_check_existence_gap_is_actionable_exit1(tmp_path):
     doc = _json.loads(r.stdout)
     assert doc["status"] == "ok"
     assert "claude-brand-new-vendor-model" in doc["existence"]["unpriced_vendor_models"]
+    assert doc["staleSuppressions"] == []
 
 
 def test_pricing_check_human_render_runs(tmp_path):

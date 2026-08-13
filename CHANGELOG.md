@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.96.2] - 2026-08-13
+
+### Fixed
+- CI no longer mistakes loaded-runner latency for a transcript-rebuild phase failure, a hung dashboard budget reconcile, a fake app-server that failed to start, or a writer-storm regression when readers remain healthy relative to both the uncontended baseline and concurrent writers.
+- Settings section links now scroll only the content pane, keep the modal chrome visible, and select the requested section consistently in Safari.
+- Claude Sonnet 5 usage now uses its permanent $2/$10 per-million-token rate, and Claude Mythos 5 plus retained Mythos Preview usage are no longer left unpriced.
+
 ## [1.96.1] - 2026-08-13
 
 ### Fixed

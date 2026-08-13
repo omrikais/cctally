@@ -53,7 +53,7 @@ def _chip_for_model(name: str) -> str:
 # Date the embedded pricing snapshots below were last verified against
 # vendor sources. Bump whenever CLAUDE_MODEL_PRICING / CODEX_MODEL_PRICING
 # is synced. Read by `pricing-check` + the release pre-flight staleness nudge.
-PRICING_SNAPSHOT_DATE = "2026-07-31"
+PRICING_SNAPSHOT_DATE = "2026-08-13"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 # Canonical machine-readable pricing source (Claude values + Codex values).
@@ -68,25 +68,20 @@ LITELLM_PRICES_URL = (
 # Guarded by `stale_allowlist_entries` (tests/test_pricing_check.py): an entry
 # that no longer corresponds to a real divergence fails the suite.
 #
-# claude-sonnet-5 (#274): LiteLLM tracks the $2/$10-per-MTok *introductory* rate
-# (in effect through 2026-08-31); we deliberately embed the durable *standard*
-# $3/$15 rate because the table is date-blind and the promo expires soon (see
-# the CLAUDE_MODEL_PRICING note below). The non-vacuity guard forces these four
-# entries out once LiteLLM reverts to the standard rate post-cutover.
+# claude-mythos-preview (#560): Anthropic's Project Glasswing launch priced the
+# historical Preview at $25/$125 per MTok after its credit period. LiteLLM
+# currently mirrors successor Mythos 5's lower $10/$50 rate onto the Preview
+# identifier. Retained Preview rows therefore keep the explicit historical
+# rate rather than being rewritten to the successor's rate.
 PRICING_DRIFT_ALLOWLIST: list[dict] = [
     {
-        "model": "claude-sonnet-5",
+        "model": "claude-mythos-preview",
         "field": field,
-        # Structured cutover date (#279 S7 W7): the intro rate is in effect
-        # THROUGH 2026-08-31, so this suppression is valid through then and
-        # `expired_allowlist_entries` flags it the day after. Keep the prose in
-        # `reason`; the date here is what the offline expiry check + the cron read.
-        "expires": "2026-08-31",
         "reason": (
-            "LiteLLM tracks the claude-sonnet-5 introductory rate "
-            "($2/$10 per MTok, through 2026-08-31); we deliberately embed the "
-            "durable standard $3/$15 rate (the table is date-blind). Remove "
-            "once LiteLLM reverts post-cutover (#274)."
+            "Anthropic priced historical Claude Mythos Preview at $25/$125 "
+            "per MTok after its Project Glasswing credit period; LiteLLM "
+            "currently mirrors successor Mythos 5's $10/$50 rate onto the "
+            "Preview identifier (#560)."
         ),
     }
     for field in (
@@ -99,23 +94,19 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 
 # Anthropic API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-# - Captured/verified: 2026-07-28. PRICING_SNAPSHOT_DATE has since moved to
-#   2026-07-31 for the Codex-side gpt-5.6-terra/-luna correction (#441); these
-#   Claude values were NOT re-verified that day.
-# - Verified by maintainer against docs.claude.com/en/docs/about-claude/pricing;
-#   update in PRs touching this table.
+# - Captured/verified: 2026-08-13 against LiteLLM plus Anthropic's current
+#   pricing page and model launch pages.
+# - Vendor sources: https://platform.claude.com/docs/en/about-claude/pricing,
+#   https://www.anthropic.com/news/claude-sonnet-5,
+#   https://www.anthropic.com/news/claude-fable-5-mythos-5, and
+#   https://www.anthropic.com/glasswing. Update in changes touching this table.
 #   2026-06-10: added claude-fable-5 ($10/$50 per MTok; 1M context, no
 #   long-context premium) — issue #172.
-#   2026-07-01: added claude-sonnet-5 ($3/$15 per MTok; 1M context, flat-rate
-#   across the full window — no long-context premium, same shape as
-#   claude-sonnet-4-6). Embedded the STANDARD rate, not the $2/$10 introductory
-#   rate in effect through 2026-08-31, because the table is date-blind and
-#   $3/$15 is the durable post-cutover price.
-#   2026-07-06 (#274): LiteLLM published a sonnet-5 entry at the $2/$10
-#   introductory rate, so the deliberate standard-rate choice now surfaces as
-#   value_drift on all four cost fields. Suppressed via PRICING_DRIFT_ALLOWLIST
-#   above (the non-vacuity guard forces removal once LiteLLM reverts to the
-#   standard rate after 2026-08-31).
+#   2026-07-01 (#274, superseded by #560): initially added claude-sonnet-5 at
+#   the then-announced future $3/$15 standard rate, preferring it over the
+#   launch promotion because this table is date-blind. LiteLLM's $2/$10 row was
+#   temporarily suppressed on all four fields. Anthropic later cancelled that
+#   transition; the 2026-08-13 entry below records the replacement decision.
 #   2026-07-24: added claude-opus-5 ($5/$25 per MTok — identical to Opus
 #   4.5/4.6/4.7/4.8; $6.25 5-minute cache write and $0.50 cache read at the
 #   standard 1.25x/0.1x multipliers). 1M context at standard pricing, so NO
@@ -139,6 +130,12 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   cache multipliers stack on the fast base rate. This snapshot bump is the
 #   pricing-fingerprint bust for safe conversation-rollup rederivation; durable
 #   journaled milestones and weekly snapshots are not rewritten.
+#   2026-08-13 (#560): Sonnet 5's $2/$10 launch pricing is now permanent, so
+#   replaced the cancelled $3/$15 rate and removed its four temporary drift
+#   suppressions. Added Mythos 5 at $10/$50 from Anthropic's launch/current
+#   pricing pages and historical Mythos Preview at the explicit $25/$125
+#   Project Glasswing rate. The snapshot bump re-arms the existing conversation
+#   rollup pricing fingerprint; immutable journaled/stored facts stay unchanged.
 # Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
 # 2x for a 1-hour write; reads are 0.1x under both. Documented as applying
 # consistently across all supported models, so the 1h rate is DERIVED from
@@ -240,6 +237,18 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 5e-06,
         "cache_creation_input_token_cost": 1.25e-06,
         "cache_read_input_token_cost": 1e-07,
+    },
+    "claude-mythos-5": {
+        "input_cost_per_token": 1e-05,
+        "output_cost_per_token": 5e-05,
+        "cache_creation_input_token_cost": 1.25e-05,
+        "cache_read_input_token_cost": 1e-06,
+    },
+    "claude-mythos-preview": {
+        "input_cost_per_token": 2.5e-05,
+        "output_cost_per_token": 1.25e-04,
+        "cache_creation_input_token_cost": 3.125e-05,
+        "cache_read_input_token_cost": 2.5e-06,
     },
     "claude-opus-4-1": {
         "input_cost_per_token": 1.5e-05,
@@ -344,10 +353,10 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_read_input_token_cost": 3e-07,
     },
     "claude-sonnet-5": {
-        "input_cost_per_token": 3e-06,
-        "output_cost_per_token": 1.5e-05,
-        "cache_creation_input_token_cost": 3.75e-06,
-        "cache_read_input_token_cost": 3e-07,
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 1e-05,
+        "cache_creation_input_token_cost": 2.5e-06,
+        "cache_read_input_token_cost": 2e-07,
     },
 }
 
@@ -389,9 +398,10 @@ _unknown_model_warnings: set[str] = set()
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 # - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
-#   since moved for two targeted syncs (2026-07-24, the Claude-side opus-5 sync;
-#   2026-07-31, the gpt-5.6-terra/-luna correction logged below). Codex values
-#   outside those two corrections were NOT re-verified on those days.
+#   since moved for three targeted syncs (2026-07-24, the Claude-side opus-5
+#   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below; and
+#   2026-08-13, the Claude-side Sonnet/Mythos sync above). Codex values outside
+#   the one Codex correction were NOT re-verified on those days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`

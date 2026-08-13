@@ -549,6 +549,53 @@ describe('the section rail and the filter (#513 S2 §2.1, §2.2)', () => {
     }
   });
 
+  it('scrolls only the settings pane and focuses the selected heading without native scrolling', () => {
+    render(<SettingsOverlay />);
+    openSettings();
+
+    const scroller = document.querySelector<HTMLElement>('#settings-scroller')!;
+    const heading = document.querySelector<HTMLElement>('[data-settings-section="cli"]')!;
+    const scrollTo = vi.fn();
+    const nativeScroll = vi.spyOn(heading, 'scrollIntoView');
+    const focus = vi.spyOn(heading, 'focus');
+
+    Object.defineProperties(scroller, {
+      scrollTop: { configurable: true, value: 120, writable: true },
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 100,
+      top: 100,
+      right: 500,
+      bottom: 400,
+      left: 0,
+      width: 500,
+      height: 300,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(heading, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 500,
+      top: 500,
+      right: 500,
+      bottom: 520,
+      left: 0,
+      width: 500,
+      height: 20,
+      toJSON: () => ({}),
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Managed from the CLI/i }));
+
+    // 120 current + (500 heading - 100 pane) - 16px visual inset.
+    expect(scrollTo).toHaveBeenCalledWith({ top: 504, behavior: 'smooth' });
+    expect(nativeScroll).not.toHaveBeenCalled();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
   it('REMOVES non-matching rows and emptied sections from the DOM', () => {
     render(<SettingsOverlay />);
     openSettings();

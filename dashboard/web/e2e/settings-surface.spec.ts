@@ -83,6 +83,81 @@ test.describe('#513 S2 — the settings surface in a real browser', () => {
     expect(narrow.railBottom).toBeLessThanOrEqual(narrow.scrollerTop + 1);
   });
 
+  test('section navigation travels inside the content pane without scrolling the modal card', async ({ page }) => {
+    for (const size of [
+      { width: 1440, height: 900 },
+      { width: 1440, height: 1600 },
+      { width: 390, height: 844 },
+    ]) {
+      await page.setViewportSize(size);
+      await page.emulateMedia({ reducedMotion: 'no-preference' });
+      await openSettings(page);
+      await page.evaluate(() => {
+        const state = window as unknown as { __settingsScrollSamples: number[] };
+        const scroller = document.querySelector<HTMLElement>('#settings-scroller')!;
+        state.__settingsScrollSamples = [scroller.scrollTop];
+        scroller.addEventListener('scroll', () => {
+          state.__settingsScrollSamples.push(scroller.scrollTop);
+        });
+      });
+
+      // A tall pane used to clamp this penultimate target to maximum scroll;
+      // the scroll-spy then highlighted the final CLI section instead of the
+      // Restore entry the user had selected (observed in Safari).
+      await page.getByRole('button', { name: 'Restore defaults', exact: true }).click();
+      await expect.poll(() => activeSection(page)).toBe('restore');
+      await expect.poll(() => page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>('#settings-scroller')!;
+        const heading = document.querySelector<HTMLElement>('[data-settings-section="restore"]')!;
+        return Math.round(heading.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+      })).toBe(16);
+
+      await page.getByRole('button', { name: 'Managed from the CLI', exact: true }).click();
+      await expect.poll(() => page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>('#settings-scroller')!;
+        const heading = document.querySelector<HTMLElement>('[data-settings-section="cli"]')!;
+        return Math.round(heading.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+      })).toBe(16);
+      await expect.poll(() => activeSection(page)).toBe('cli');
+
+      const result = await page.evaluate(() => {
+        const state = window as unknown as { __settingsScrollSamples: number[] };
+        const card = document.querySelector<HTMLElement>('#settings-root .modal-card')!;
+        const header = document.querySelector<HTMLElement>('#settings-root .modal-header')!;
+        const scroller = document.querySelector<HTMLElement>('#settings-scroller')!;
+        const heading = document.querySelector<HTMLElement>('[data-settings-section="cli"]')!;
+        const cardRect = card.getBoundingClientRect();
+        const headerRect = header.getBoundingClientRect();
+        const finalTop = scroller.scrollTop;
+        return {
+          cardScrollTop: card.scrollTop,
+          contentScrollTop: finalTop,
+          headingGap: Math.round(
+            heading.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+          ),
+          headerVisible:
+            headerRect.top >= cardRect.top && headerRect.bottom <= cardRect.bottom,
+          activeSection: document.activeElement?.getAttribute('data-settings-section'),
+          samples: state.__settingsScrollSamples,
+          hasIntermediateSample: state.__settingsScrollSamples.some(
+            (sample) => sample > 0 && sample < finalTop,
+          ),
+        };
+      });
+
+      expect(result.cardScrollTop, `${size.width}px: hidden modal card scrolled`).toBe(0);
+      expect(result.headerVisible, `${size.width}px: modal header left the card`).toBe(true);
+      expect(result.contentScrollTop, `${size.width}px: content pane did not move`).toBeGreaterThan(0);
+      expect(result.headingGap, `${size.width}px: heading missed the visual inset`).toBe(16);
+      expect(result.activeSection).toBe('cli');
+      expect(result.samples.length, `${size.width}px: no scroll journey was observed`).toBeGreaterThan(2);
+      expect(result.hasIntermediateSample, `${size.width}px: navigation jumped without travel`).toBe(true);
+
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#settings-root')).toHaveCount(0);
+    }
+  });
+
   test('active-section tracking follows the measured rule under a trusted wheel', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 700 });
     await openSettings(page);
