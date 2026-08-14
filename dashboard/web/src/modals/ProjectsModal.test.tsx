@@ -1100,3 +1100,48 @@ describe('ProjectsModal — desktop (>640w) unchanged regression', () => {
     });
   });
 });
+
+// #556 S4 F5 — the four window pills carry a real `disabled` attribute and a
+// `title` under Codex and All, because provider-native project history has no
+// week window. They had no disabled TREATMENT at all: a disabled `1w` pill and
+// an enabled `share %` pill in the same modal returned identical computed
+// `opacity`, `cursor`, `color`, `background-color` and `border-color`, and
+// `cursor: pointer` with `pointer-events: auto` positively signalled that an
+// inert control was clickable. The stylesheet carried 38 disabled-state rules
+// and none of their selectors matched `.pill`.
+//
+// JSDOM cannot evaluate the computed opacity, so this asserts the CONTRACT the
+// new rule depends on — the attribute and the title — rather than its visual
+// effect, which only the browser gate can see. It PASSES before the CSS change
+// and is therefore a regression guard for the selector's precondition, not a
+// red test for the defect itself.
+describe('ProjectsModal — disabled window pills under a non-Claude source (#556 S4)', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    _resetForTests();
+    _resetKeymap();
+    installGlobalKeydown();
+  });
+
+  afterEach(() => {
+    _resetKeymap();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('marks the window pills disabled under a non-Claude source', () => {
+    updateSnapshot(buildProjectsEnvelope({ windowWeeks: 4, projectCount: 3 }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'projects' });
+    const { container } = render(<ProjectsModal />);
+    const pills = container.querySelectorAll('.projects-controls .pill[disabled]');
+    expect(pills.length).toBe(4);
+    pills.forEach((p) => expect(p.getAttribute('title')).toBeTruthy());
+    // Non-vacuity: the Y-axis pills in the same container stay enabled, so the
+    // scoped rule really distinguishes two states rather than dimming every
+    // pill in the modal.
+    expect(
+      container.querySelectorAll('.projects-controls .pill:not([disabled])').length,
+    ).toBe(2);
+  });
+});

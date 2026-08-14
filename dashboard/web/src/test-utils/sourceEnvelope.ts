@@ -319,6 +319,8 @@ export function makeCodexSourceData(): CodexSourceData {
           period: 'calendar-month',
           threshold: 90,
           value: 90.5,
+          // #556 S3: a v7 Codex row carries both, equal-valued.
+          alerted_at: '2026-04-20T00:00:00Z',
           created_at: '2026-04-20T00:00:00Z',
         },
       ],
@@ -608,7 +610,8 @@ function makeDecoratedCodexParentOnly(): CodexSourceData {
         alerts: [
           {
             key: 'alert:codex-quota-a', source: 'codex', axis: 'quota',
-            threshold: 90, severity: 'warn', created_at: '2026-04-24T09:00:00Z',
+            threshold: 90, severity: 'warn',
+            alerted_at: '2026-04-24T09:00:00Z', created_at: '2026-04-24T09:00:00Z',
             account_key: ACCOUNT_A,
           },
           // A vendor-wide crossing: visible under focus, LABELLED vendor-wide,
@@ -616,6 +619,7 @@ function makeDecoratedCodexParentOnly(): CodexSourceData {
           {
             key: 'alert:codex-budget-90', source: 'codex', axis: 'codex_budget',
             period: 'calendar-month', threshold: 90, value: 90.5,
+            alerted_at: '2026-04-20T00:00:00Z',
             created_at: '2026-04-20T00:00:00Z', account_key: '*',
           },
         ],
@@ -901,6 +905,11 @@ export function makeClaudeSourceData(): ClaudeSourceData {
       daily: { rows: [], quantile_thresholds: [], peak: null },
       monthly: { rows: [] },
       weekly: { rows: [] },
+      // #556 S2 §6.3a — the All Daily outcome owns its complete canonical row
+      // shape. Empty here rather than absent: an empty provider is a zero leg,
+      // and a zero leg still has a shape. A MISSING sibling is a different
+      // state, which the adapter synthesizes `rows_absent` for.
+      daily_aggregate: { rows: [] },
     },
     sessions: {
       total: 1,
@@ -934,6 +943,21 @@ export function makeClaudeSourceData(): ClaudeSourceData {
         ],
       },
       trend: { window_weeks: 4, weeks: [], projects: [] },
+      // #556 S2 §3.5.1 — the bounded ranking sibling, folded over the shared
+      // absolute range. `drillable` states whether the drill-down route
+      // resolves each row (§3.8a).
+      aggregate: {
+        rows: [
+          {
+            key: 'project:claude-alpha',
+            label: 'project-00',
+            source: 'claude',
+            cost_usd: 8.0,
+            sessions_count: 1,
+            drillable: true,
+          },
+        ],
+      },
       rows: [
         {
           key: 'project:claude-alpha',
@@ -1052,19 +1076,31 @@ export function makeAllSourceEntry(
   };
   // The `all` alert union mirrors the Python `_combined_alert_rows`: each
   // provider's OWN rows (filtered to `source === provider`) concatenated in
-  // declared source order, then sorted by `created_at` desc (rows without a
-  // `created_at`, e.g. the Claude legacy-field rows, sink last). #294 S5 Task 7.
+  // declared source order, then sorted by the canonical FIRING instant,
+  // newest first, with equal instants keeping Claude before Codex and each
+  // provider's native order — which is what a stable sort gives.
+  //
+  // #556 S3 §5.1: this used to sort on `created_at`, and its comment said rows
+  // without one — "e.g. the Claude legacy-field rows" — sink last. That is the
+  // server defect E1, encoded here as the contract, so every client test built
+  // on this factory inherited a union in which every Claude row sits below
+  // every Codex row and no client test could have caught it.
   const claudeAlertRows = (claude.data?.alerts.rows ?? []).filter(
     (r) => (r as { source?: string }).source === 'claude',
   );
   const codexAlertRows = (codex.data?.alerts.rows ?? []).filter(
     (r) => (r as { source?: string }).source === 'codex',
   );
-  const unionAlertRows: unknown[] = [...claudeAlertRows, ...codexAlertRows].sort((a, b) =>
-    String((b as { created_at?: string }).created_at ?? '').localeCompare(
-      String((a as { created_at?: string }).created_at ?? ''),
-    ),
-  );
+  const firedAt = (row: unknown): number => {
+    const fields = row as { alerted_at?: string; created_at?: string };
+    const raw = fields.alerted_at ?? fields.created_at;
+    const parsed = raw == null ? NaN : Date.parse(raw);
+    return Number.isNaN(parsed) ? -Infinity : parsed;
+  };
+  const unionAlertRows: unknown[] = [...claudeAlertRows, ...codexAlertRows]
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => firedAt(b.row) - firedAt(a.row) || a.index - b.index)
+    .map((item) => item.row);
   return {
     availability: 'ok',
     freshness: 'fresh',
@@ -1087,6 +1123,21 @@ export function makeAllSourceEntry(
       ...(unavailable == null ? {} : { combined_unavailable: unavailable }),
       alerts: { rows: unionAlertRows },
       providers: { claude: claude.data, codex: codex.data },
+      // #556 S2 §3.5.1 — the ONE public copy of the shared range and of both
+      // aggregate outcomes. Two range rules coexist deliberately: `combined`
+      // above sums provider-native CYCLES, this ranges over one shared
+      // ABSOLUTE interval. A builder that emitted only the first would let an
+      // All-mode test pass against a payload no v6 server produces.
+      aggregates: {
+        range: {
+          kind: 'absolute_range',
+          label: 'Shared range',
+          start_at: '2026-03-26T00:00:00Z',
+          end_at: '2026-04-24T13:07:00Z',
+        },
+        projects: { state: 'available' },
+        daily: { state: 'available' },
+      },
     },
     ...overrides,
   } satisfies SourceEntry<AllSourceData>;
@@ -1215,7 +1266,9 @@ export function makeSourceEnvelope(
   overrides?: Partial<SourceEnvelopeSlice>,
 ): SourceEnvelopeSlice {
   return {
-    source_schema_version: 2,
+    // #556 S2 §3.9 — tracks the server's current `SOURCE_SCHEMA_VERSION`. No
+    // production client branches on it; the number is a signal, not a gate.
+    source_schema_version: 7,
     default_source: 'claude',
     source_order: ['claude', 'codex', 'all'],
     sources: makeSourcesMap(),

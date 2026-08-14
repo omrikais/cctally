@@ -2,7 +2,8 @@ import { fmt } from '../lib/fmt';
 import { cacheVocabulary } from '../lib/cacheReportVocabulary';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { ModelCostBars } from './ModelCostBars';
-import type { PeriodRow } from '../types/envelope';
+import type { DailyPanelRow, PeriodRow } from '../types/envelope';
+import { modelChipStyle } from '../lib/model';
 
 interface Props {
   row: PeriodRow;
@@ -10,10 +11,55 @@ interface Props {
   accentClass: 'accent-cyan' | 'accent-pink' | 'accent-indigo';
   periodNoun?: string;
   windowLabel?: string;
+  // #556 S2 §6.3 — the per-provider breakdown #312 §7.4 requires in exchange
+  // for aggregating daily cost. Supplied only under All; a provider with no
+  // activity that day is `null` rather than a $0.00 row, so the card can say
+  // it had none instead of showing a figure nobody measured.
+  providerLegs?: { claude: DailyPanelRow | null; codex: DailyPanelRow | null };
+}
+
+function DailyProviderLegs({
+  legs,
+}: { legs: { claude: DailyPanelRow | null; codex: DailyPanelRow | null } }) {
+  const entries = (['claude', 'codex'] as const).map((source) => ({
+    source,
+    label: source === 'claude' ? 'Claude' : 'Codex',
+    row: legs[source],
+  }));
+  return (
+    <div className="daily-provider-legs" data-testid="daily-provider-legs">
+      {entries.map(({ source, label, row }) => (
+        <div key={source} className="daily-provider-leg" data-provider-leg={source}>
+          <span className={`source-chip source-chip--${source}`}>{label}</span>
+          {row == null ? (
+            <span className="muted">No activity</span>
+          ) : (
+            <>
+              <span className="cost">{fmt.usd2(row.cost_usd)}</span>
+              {/* §6.2 — chips render PER LEG. The merged row carries no model
+                  set at all, because one stack over two providers' families
+                  sharing one denominator is not a model split of anything. */}
+              <span className="models-chips">
+                {row.models.map((m) => (
+                  <span
+                    key={m.model}
+                    className={`chip ${m.chip}`}
+                    style={modelChipStyle(m.model)}
+                  >
+                    {m.display}
+                  </span>
+                ))}
+              </span>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export function PeriodDetailCard({
-  row, variant, accentClass, periodNoun, windowLabel,
+  row, variant, accentClass, periodNoun, windowLabel, providerLegs,
 }: Props) {
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
@@ -62,6 +108,7 @@ export function PeriodDetailCard({
         </div>
       )}
       <ModelCostBars rows={row.models.map((m) => ({ model: m.model, cost_usd: m.cost_usd, label: m.display }))} />
+      {providerLegs && <DailyProviderLegs legs={providerLegs} />}
 
       <div className="tokens-row">
         {row.codex_tokens ? (

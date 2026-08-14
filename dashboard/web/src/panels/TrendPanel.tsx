@@ -191,9 +191,13 @@ export function TrendPanel() {
                 key={section.source}
                 className="provider-summary-card source-provider-section trend-provider-section"
                 data-provider-section={section.source}
-                aria-label={`${section.label} $ per 1% trend`}
+                aria-labelledby={`trend-panel-${section.source}-heading`}
               >
                 <div className="source-provider-head provider-composition-head">
+                  {/* #556 S4 F8 — see WeeklyPanel. */}
+                  <h3 className="sr-only" id={`trend-panel-${section.source}-heading`}>
+                    {section.label} $ per 1% trend
+                  </h3>
                   <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
                   <span className="provider-summary-label">
                     {section.rows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}

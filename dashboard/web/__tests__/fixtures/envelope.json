@@ -330,16 +330,34 @@
         "delta_cost_pct": 0.09,
         "is_current": true,
         "models": [
-          {"model": "claude-opus-4-5-20251101", "display": "opus-4-5", "chip": "opus",   "cost_usd": 26.51, "cost_pct": 55.0},
-          {"model": "claude-sonnet-4-5-20250929","display": "sonnet-4-5","chip": "sonnet","cost_usd": 14.46, "cost_pct": 30.0},
-          {"model": "claude-haiku-4-5-20251001", "display": "haiku-4-5", "chip": "haiku",  "cost_usd": 7.24,  "cost_pct": 15.0}
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 26.51,
+            "cost_pct": 55.0
+          },
+          {
+            "model": "claude-sonnet-4-5-20250929",
+            "display": "sonnet-4-5",
+            "chip": "sonnet",
+            "cost_usd": 14.46,
+            "cost_pct": 30.0
+          },
+          {
+            "model": "claude-haiku-4-5-20251001",
+            "display": "haiku-4-5",
+            "chip": "haiku",
+            "cost_usd": 7.24,
+            "cost_pct": 15.0
+          }
         ],
         "week_start_at": "2026-04-23T09:59:00+02:00",
-        "week_end_at":   "2026-04-30T09:59:00+02:00"
+        "week_end_at": "2026-04-30T09:59:00+02:00"
       },
       {
         "label": "04-16",
-        "cost_usd": 44.10,
+        "cost_usd": 44.1,
         "total_tokens": 320000000,
         "input_tokens": 380000,
         "output_tokens": 200000,
@@ -350,12 +368,30 @@
         "delta_cost_pct": 0.13,
         "is_current": false,
         "models": [
-          {"model": "claude-opus-4-5-20251101", "display": "opus-4-5", "chip": "opus",   "cost_usd": 21.17, "cost_pct": 48.0},
-          {"model": "claude-sonnet-4-5-20250929","display": "sonnet-4-5","chip": "sonnet","cost_usd": 16.76, "cost_pct": 38.0},
-          {"model": "claude-haiku-4-5-20251001", "display": "haiku-4-5", "chip": "haiku",  "cost_usd": 6.17,  "cost_pct": 14.0}
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 21.17,
+            "cost_pct": 48.0
+          },
+          {
+            "model": "claude-sonnet-4-5-20250929",
+            "display": "sonnet-4-5",
+            "chip": "sonnet",
+            "cost_usd": 16.76,
+            "cost_pct": 38.0
+          },
+          {
+            "model": "claude-haiku-4-5-20251001",
+            "display": "haiku-4-5",
+            "chip": "haiku",
+            "cost_usd": 6.17,
+            "cost_pct": 14.0
+          }
         ],
         "week_start_at": "2026-04-16T09:59:00+02:00",
-        "week_end_at":   "2026-04-23T09:59:00+02:00"
+        "week_end_at": "2026-04-23T09:59:00+02:00"
       }
     ],
     "total_cost_usd": 92.31,
@@ -365,7 +401,7 @@
     "rows": [
       {
         "label": "2026-04",
-        "cost_usd": 182.50,
+        "cost_usd": 182.5,
         "total_tokens": 1000000000,
         "input_tokens": 2000000,
         "output_tokens": 500000,
@@ -376,9 +412,27 @@
         "delta_cost_pct": 0.02,
         "is_current": true,
         "models": [
-          {"model": "claude-opus-4-5-20251101", "display": "opus-4-5", "chip": "opus", "cost_usd": 110.0, "cost_pct": 60.0},
-          {"model": "claude-sonnet-4-5-20250929","display": "sonnet-4-5","chip": "sonnet","cost_usd": 45.0, "cost_pct": 25.0},
-          {"model": "claude-haiku-4-5-20251001", "display": "haiku-4-5", "chip": "haiku","cost_usd": 27.5, "cost_pct": 15.0}
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 110.0,
+            "cost_pct": 60.0
+          },
+          {
+            "model": "claude-sonnet-4-5-20250929",
+            "display": "sonnet-4-5",
+            "chip": "sonnet",
+            "cost_usd": 45.0,
+            "cost_pct": 25.0
+          },
+          {
+            "model": "claude-haiku-4-5-20251001",
+            "display": "haiku-4-5",
+            "chip": "haiku",
+            "cost_usd": 27.5,
+            "cost_pct": 15.0
+          }
         ]
       },
       {
@@ -394,9 +448,27 @@
         "delta_cost_pct": -0.12,
         "is_current": false,
         "models": [
-          {"model": "claude-opus-4-5-20251101", "display": "opus-4-5", "chip": "opus", "cost_usd": 89.6, "cost_pct": 50.0},
-          {"model": "claude-sonnet-4-5-20250929","display": "sonnet-4-5","chip": "sonnet","cost_usd": 62.7, "cost_pct": 35.0},
-          {"model": "claude-haiku-4-5-20251001", "display": "haiku-4-5", "chip": "haiku","cost_usd": 26.9, "cost_pct": 15.0}
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 89.6,
+            "cost_pct": 50.0
+          },
+          {
+            "model": "claude-sonnet-4-5-20250929",
+            "display": "sonnet-4-5",
+            "chip": "sonnet",
+            "cost_usd": 62.7,
+            "cost_pct": 35.0
+          },
+          {
+            "model": "claude-haiku-4-5-20251001",
+            "display": "haiku-4-5",
+            "chip": "haiku",
+            "cost_usd": 26.9,
+            "cost_pct": 15.0
+          }
         ]
       }
     ],
@@ -407,37 +479,52 @@
     "rows": [
       {
         "start_at": "2026-04-26T14:00:00+00:00",
-        "end_at":   "2026-04-26T19:00:00+00:00",
-        "anchor":   "recorded",
+        "end_at": "2026-04-26T19:00:00+00:00",
+        "anchor": "recorded",
         "is_active": true,
         "cost_usd": 4.21,
         "models": [
-          { "model": "claude-opus-4-5-20251101", "display": "opus-4-5",
-            "chip": "opus", "cost_usd": 3.28, "cost_pct": 78 }
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 3.28,
+            "cost_pct": 78
+          }
         ],
         "label": "14:00 Apr 26"
       },
       {
         "start_at": "2026-04-26T09:00:00+00:00",
-        "end_at":   "2026-04-26T14:00:00+00:00",
-        "anchor":   "recorded",
+        "end_at": "2026-04-26T14:00:00+00:00",
+        "anchor": "recorded",
         "is_active": false,
         "cost_usd": 1.85,
         "models": [
-          { "model": "claude-sonnet-4-5-20250929", "display": "sonnet-4-5",
-            "chip": "sonnet", "cost_usd": 1.31, "cost_pct": 71 }
+          {
+            "model": "claude-sonnet-4-5-20250929",
+            "display": "sonnet-4-5",
+            "chip": "sonnet",
+            "cost_usd": 1.31,
+            "cost_pct": 71
+          }
         ],
         "label": "09:00 Apr 26"
       },
       {
         "start_at": "2026-04-25T19:00:00+00:00",
-        "end_at":   "2026-04-26T00:00:00+00:00",
-        "anchor":   "heuristic",
+        "end_at": "2026-04-26T00:00:00+00:00",
+        "anchor": "heuristic",
         "is_active": false,
         "cost_usd": 0.62,
         "models": [
-          { "model": "claude-haiku-4-5-20251001", "display": "haiku-4-5",
-            "chip": "haiku", "cost_usd": 0.25, "cost_pct": 40 }
+          {
+            "model": "claude-haiku-4-5-20251001",
+            "display": "haiku-4-5",
+            "chip": "haiku",
+            "cost_usd": 0.25,
+            "cost_pct": 40
+          }
         ],
         "label": "19:00 Apr 25"
       }
@@ -447,46 +534,110 @@
   },
   "daily": {
     "rows": [
-      { "date": "2026-04-26", "label": "04-26", "cost_usd": 8.40,
-        "is_today": true,  "intensity_bucket": 5,
-        "models": [{ "model": "claude-opus-4-5-20251101", "display": "opus-4-5",
-                     "chip": "opus", "cost_usd": 5.20, "cost_pct": 62 }],
-        "input_tokens": 412000, "output_tokens": 38400,
-        "cache_creation_tokens": 1200000, "cache_read_tokens": 8300000,
-        "total_tokens": 9950400, "cache_hit_pct": 87.3 },
-      { "date": "2026-04-25", "label": "04-25", "cost_usd": 5.71,
-        "is_today": false, "intensity_bucket": 4,
+      {
+        "date": "2026-04-26",
+        "label": "04-26",
+        "cost_usd": 8.4,
+        "is_today": true,
+        "intensity_bucket": 5,
+        "models": [
+          {
+            "model": "claude-opus-4-5-20251101",
+            "display": "opus-4-5",
+            "chip": "opus",
+            "cost_usd": 5.2,
+            "cost_pct": 62
+          }
+        ],
+        "input_tokens": 412000,
+        "output_tokens": 38400,
+        "cache_creation_tokens": 1200000,
+        "cache_read_tokens": 8300000,
+        "total_tokens": 9950400,
+        "cache_hit_pct": 87.3
+      },
+      {
+        "date": "2026-04-25",
+        "label": "04-25",
+        "cost_usd": 5.71,
+        "is_today": false,
+        "intensity_bucket": 4,
         "models": [],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_tokens": 0, "cache_read_tokens": 0,
-        "total_tokens": 0, "cache_hit_pct": null },
-      { "date": "2026-04-24", "label": "04-24", "cost_usd": 7.06,
-        "is_today": false, "intensity_bucket": 5,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "cache_hit_pct": null
+      },
+      {
+        "date": "2026-04-24",
+        "label": "04-24",
+        "cost_usd": 7.06,
+        "is_today": false,
+        "intensity_bucket": 5,
         "models": [],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_tokens": 0, "cache_read_tokens": 0,
-        "total_tokens": 0, "cache_hit_pct": null },
-      { "date": "2026-04-23", "label": "04-23", "cost_usd": 3.12,
-        "is_today": false, "intensity_bucket": 3,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "cache_hit_pct": null
+      },
+      {
+        "date": "2026-04-23",
+        "label": "04-23",
+        "cost_usd": 3.12,
+        "is_today": false,
+        "intensity_bucket": 3,
         "models": [],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_tokens": 0, "cache_read_tokens": 0,
-        "total_tokens": 0, "cache_hit_pct": null },
-      { "date": "2026-04-22", "label": "04-22", "cost_usd": 7.40,
-        "is_today": false, "intensity_bucket": 5,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "cache_hit_pct": null
+      },
+      {
+        "date": "2026-04-22",
+        "label": "04-22",
+        "cost_usd": 7.4,
+        "is_today": false,
+        "intensity_bucket": 5,
         "models": [],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_tokens": 0, "cache_read_tokens": 0,
-        "total_tokens": 0, "cache_hit_pct": null },
-      { "date": "2026-04-21", "label": "04-21", "cost_usd": 0.0,
-        "is_today": false, "intensity_bucket": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "cache_hit_pct": null
+      },
+      {
+        "date": "2026-04-21",
+        "label": "04-21",
+        "cost_usd": 0.0,
+        "is_today": false,
+        "intensity_bucket": 0,
         "models": [],
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_tokens": 0, "cache_read_tokens": 0,
-        "total_tokens": 0, "cache_hit_pct": null }
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "cache_hit_pct": null
+      }
     ],
-    "quantile_thresholds": [3.12, 5.71, 7.06, 7.40, 8.40],
-    "peak": { "date": "2026-04-26", "cost_usd": 8.40 },
+    "quantile_thresholds": [
+      3.12,
+      5.71,
+      7.06,
+      7.4,
+      8.4
+    ],
+    "peak": {
+      "date": "2026-04-26",
+      "cost_usd": 8.4
+    },
     "total_cost_usd": 31.69,
     "total_tokens": 9950400
   },
@@ -656,28 +807,66 @@
       }
     ]
   },
-  "source_schema_version": 2,
+  "source_schema_version": 7,
   "default_source": "claude",
-  "source_order": ["claude", "codex", "all"],
+  "source_order": [
+    "claude",
+    "codex",
+    "all"
+  ],
   "sources": {
     "claude": {
       "availability": "ok",
       "freshness": "fresh",
-      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "warnings": [],
       "data_version": "claude:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
       "capabilities": {
-        "hero": {"status": "supported", "semantics": "subscription-week"},
-        "daily": {"status": "supported", "semantics": "calendar-day"},
-        "monthly": {"status": "supported", "semantics": "calendar-month"},
-        "weekly": {"status": "supported", "semantics": "subscription-week"},
-        "sessions": {"status": "supported", "semantics": "legacy-session-rollup"},
-        "forensics": {"status": "supported", "semantics": "legacy-projection"},
-        "quota": {"status": "supported", "semantics": "subscription-week"},
-        "budget": {"status": "supported", "semantics": "subscription-week"},
-        "projects": {"status": "supported", "semantics": "legacy-projection"},
-        "alerts": {"status": "supported", "semantics": "provider-native"}
+        "hero": {
+          "status": "supported",
+          "semantics": "subscription-week"
+        },
+        "daily": {
+          "status": "supported",
+          "semantics": "calendar-day"
+        },
+        "monthly": {
+          "status": "supported",
+          "semantics": "calendar-month"
+        },
+        "weekly": {
+          "status": "supported",
+          "semantics": "subscription-week"
+        },
+        "sessions": {
+          "status": "supported",
+          "semantics": "legacy-session-rollup"
+        },
+        "forensics": {
+          "status": "supported",
+          "semantics": "legacy-projection"
+        },
+        "quota": {
+          "status": "supported",
+          "semantics": "subscription-week"
+        },
+        "budget": {
+          "status": "supported",
+          "semantics": "subscription-week"
+        },
+        "projects": {
+          "status": "supported",
+          "semantics": "legacy-projection"
+        },
+        "alerts": {
+          "status": "supported",
+          "semantics": "provider-native"
+        }
       },
       "data": {
         "hero": {
@@ -689,9 +878,113 @@
           "trend": null
         },
         "periods": {
-          "daily": {"rows": [], "quantile_thresholds": [], "peak": null},
-          "monthly": {"rows": []},
-          "weekly": {"rows": []}
+          "daily": {
+            "rows": [],
+            "quantile_thresholds": [],
+            "peak": null
+          },
+          "monthly": {
+            "rows": []
+          },
+          "weekly": {
+            "rows": []
+          },
+          "daily_aggregate": {
+            "rows": [
+              {
+                "date": "2026-04-26",
+                "label": "04-26",
+                "cost_usd": 8.4,
+                "is_today": true,
+                "intensity_bucket": 5,
+                "models": [
+                  {
+                    "model": "claude-opus-4-5-20251101",
+                    "display": "opus-4-5",
+                    "chip": "opus",
+                    "cost_usd": 5.2,
+                    "cost_pct": 62
+                  }
+                ],
+                "input_tokens": 412000,
+                "output_tokens": 38400,
+                "cache_creation_tokens": 1200000,
+                "cache_read_tokens": 8300000,
+                "total_tokens": 9950400,
+                "cache_hit_pct": 87.3
+              },
+              {
+                "date": "2026-04-25",
+                "label": "04-25",
+                "cost_usd": 5.71,
+                "is_today": false,
+                "intensity_bucket": 4,
+                "models": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "cache_hit_pct": null
+              },
+              {
+                "date": "2026-04-24",
+                "label": "04-24",
+                "cost_usd": 7.06,
+                "is_today": false,
+                "intensity_bucket": 5,
+                "models": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "cache_hit_pct": null
+              },
+              {
+                "date": "2026-04-23",
+                "label": "04-23",
+                "cost_usd": 3.12,
+                "is_today": false,
+                "intensity_bucket": 3,
+                "models": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "cache_hit_pct": null
+              },
+              {
+                "date": "2026-04-22",
+                "label": "04-22",
+                "cost_usd": 7.4,
+                "is_today": false,
+                "intensity_bucket": 5,
+                "models": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "cache_hit_pct": null
+              },
+              {
+                "date": "2026-04-21",
+                "label": "04-21",
+                "cost_usd": 0.0,
+                "is_today": false,
+                "intensity_bucket": 0,
+                "models": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "cache_hit_pct": null
+              }
+            ]
+          }
         },
         "sessions": {
           "total": 1,
@@ -710,47 +1003,132 @@
         },
         "projects": {
           "current_week": {
-            "week_label": "Apr 21–28",
+            "week_label": "Apr 21\u201328",
             "week_start_date": "2026-04-21",
             "week_start_at": "2026-04-21T00:00:00Z",
             "total_cost_usd": 8.0,
             "rows": [
-              {"key": "project:claude-alpha", "source": "claude", "cost_usd": 8.0, "attributed_pct": 100.0, "sessions_count": 1}
+              {
+                "key": "project:claude-alpha",
+                "source": "claude",
+                "cost_usd": 8.0,
+                "attributed_pct": 100.0,
+                "sessions_count": 1
+              }
             ]
           },
-          "trend": {"window_weeks": 4, "weeks": [], "projects": []},
+          "trend": {
+            "window_weeks": 4,
+            "weeks": [],
+            "projects": []
+          },
           "rows": [
-            {"key": "project:claude-alpha", "source": "claude", "cost_usd": 8.0, "attributed_pct": 100.0, "sessions_count": 1}
-          ]
+            {
+              "key": "project:claude-alpha",
+              "source": "claude",
+              "cost_usd": 8.0,
+              "attributed_pct": 100.0,
+              "sessions_count": 1
+            }
+          ],
+          "aggregate": {
+            "rows": [
+              {
+                "key": "project:agg-alpha",
+                "label": "project-00",
+                "source": "claude",
+                "cost_usd": 9.5,
+                "sessions_count": 4,
+                "drillable": true
+              },
+              {
+                "key": "project:agg-beta",
+                "label": "project-01",
+                "source": "claude",
+                "cost_usd": 3.25,
+                "sessions_count": 2,
+                "drillable": true
+              },
+              {
+                "key": "project:agg-orphan",
+                "label": "project-rolled-over",
+                "source": "claude",
+                "cost_usd": 1.75,
+                "sessions_count": 1,
+                "drillable": false
+              }
+            ]
+          }
         },
         "quota": {
-          "current_week": {"used_pct": 17.4},
+          "current_week": {
+            "used_pct": 17.4
+          },
           "blocks": [],
           "milestones": [],
           "five_hour_milestones": []
         },
-        "budget": {"forecast": null, "settings": {}},
-        "alerts": {"rows": []}
+        "budget": {
+          "forecast": null,
+          "settings": {}
+        },
+        "alerts": {
+          "rows": []
+        }
       }
     },
     "codex": {
       "availability": "ok",
       "freshness": "fresh",
-      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "warnings": [],
       "data_version": "codex:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
       "capabilities": {
-        "hero": {"status": "supported", "semantics": "native-reset-cycle"},
-        "daily": {"status": "supported", "semantics": "calendar-day"},
-        "monthly": {"status": "supported", "semantics": "calendar-month"},
-        "weekly": {"status": "supported", "semantics": "calendar-week"},
-        "sessions": {"status": "supported", "semantics": "inclusive-input-tokens"},
-        "forensics": {"status": "supported", "semantics": "inclusive-input-token-reuse"},
-        "quota": {"status": "derived", "semantics": "native-windows"},
-        "budget": {"status": "supported", "semantics": "calendar-period"},
-        "projects": {"status": "supported", "semantics": "qualified-attribution"},
-        "alerts": {"status": "supported", "semantics": "provider-native"}
+        "hero": {
+          "status": "supported",
+          "semantics": "native-reset-cycle"
+        },
+        "daily": {
+          "status": "supported",
+          "semantics": "calendar-day"
+        },
+        "monthly": {
+          "status": "supported",
+          "semantics": "calendar-month"
+        },
+        "weekly": {
+          "status": "supported",
+          "semantics": "calendar-week"
+        },
+        "sessions": {
+          "status": "supported",
+          "semantics": "inclusive-input-tokens"
+        },
+        "forensics": {
+          "status": "supported",
+          "semantics": "inclusive-input-token-reuse"
+        },
+        "quota": {
+          "status": "derived",
+          "semantics": "native-windows"
+        },
+        "budget": {
+          "status": "supported",
+          "semantics": "calendar-period"
+        },
+        "projects": {
+          "status": "supported",
+          "semantics": "qualified-attribution"
+        },
+        "alerts": {
+          "status": "supported",
+          "semantics": "provider-native"
+        }
       },
       "data": {
         "hero": {
@@ -760,15 +1138,33 @@
           "output_tokens": 64000,
           "reasoning_output_tokens": 8000,
           "total_tokens": 552000,
-          "cycle": {"window_minutes": 10080, "start_at": "2026-04-23T00:00:00Z", "resets_at": "2026-04-30T00:00:00Z"},
+          "cycle": {
+            "window_minutes": 10080,
+            "start_at": "2026-04-23T00:00:00Z",
+            "resets_at": "2026-04-30T00:00:00Z"
+          },
           "quota": {
             "window_count": 2,
             "active_window_count": 2,
             "latest_percent": 61.0,
             "freshness": "fresh",
             "active": [
-              {"key": "quota:codex-5h", "current_percent": 42.0, "captured_at": "2026-04-24T13:00:00Z", "resets_at": "2026-04-24T18:00:00Z", "freshness": "fresh", "stale_after_seconds": 900},
-              {"key": "quota:codex-weekly", "current_percent": 61.0, "captured_at": "2026-04-24T13:00:00Z", "resets_at": "2026-04-30T00:00:00Z", "freshness": "fresh", "stale_after_seconds": 3600}
+              {
+                "key": "quota:codex-5h",
+                "current_percent": 42.0,
+                "captured_at": "2026-04-24T13:00:00Z",
+                "resets_at": "2026-04-24T18:00:00Z",
+                "freshness": "fresh",
+                "stale_after_seconds": 900
+              },
+              {
+                "key": "quota:codex-weekly",
+                "current_percent": 61.0,
+                "captured_at": "2026-04-24T13:00:00Z",
+                "resets_at": "2026-04-30T00:00:00Z",
+                "freshness": "fresh",
+                "stale_after_seconds": 3600
+              }
             ]
           },
           "budget": {
@@ -782,20 +1178,112 @@
             "window_start_at": "2026-04-01T00:00:00Z",
             "window_end_at": "2026-05-01T00:00:00Z",
             "recent_24h_usd": 4.2,
-            "alert_thresholds": [90, 100],
-            "pace": {"daily_usd": 1.6, "projected_low_usd": 48.0, "projected_high_usd": 55.0, "week_avg_projection_usd": 50.0}
+            "alert_thresholds": [
+              90,
+              100
+            ],
+            "pace": {
+              "daily_usd": 1.6,
+              "projected_low_usd": 48.0,
+              "projected_high_usd": 55.0,
+              "week_avg_projection_usd": 50.0
+            }
           },
-          "alerts": {"count": 1}
+          "alerts": {
+            "count": 1
+          }
         },
         "periods": {
-          "daily": {"rows": [{"label": "04-24", "cost_usd": 12.3, "input_tokens": 480000, "cached_input_tokens": 120000, "output_tokens": 64000, "reasoning_output_tokens": 8000, "total_tokens": 552000, "models": ["gpt-5"]}], "total_cost_usd": 12.3, "total_tokens": 552000, "display_tz": "UTC"},
-          "monthly": {"rows": [{"label": "2026-04", "cost_usd": 38.5, "input_tokens": 1500000, "cached_input_tokens": 400000, "output_tokens": 200000, "reasoning_output_tokens": 25000, "total_tokens": 1700000, "models": ["gpt-5"]}], "total_cost_usd": 38.5, "total_tokens": 1700000, "display_tz": "UTC"},
-          "weekly": {"rows": [{"label": "04-20", "cost_usd": 20.1, "input_tokens": 800000, "cached_input_tokens": 200000, "output_tokens": 100000, "reasoning_output_tokens": 12000, "total_tokens": 900000, "models": ["gpt-5"]}], "total_cost_usd": 20.1, "total_tokens": 900000, "display_tz": "UTC"}
+          "daily": {
+            "rows": [
+              {
+                "label": "04-24",
+                "cost_usd": 12.3,
+                "input_tokens": 480000,
+                "cached_input_tokens": 120000,
+                "output_tokens": 64000,
+                "reasoning_output_tokens": 8000,
+                "total_tokens": 552000,
+                "models": [
+                  "gpt-5"
+                ]
+              }
+            ],
+            "total_cost_usd": 12.3,
+            "total_tokens": 552000,
+            "display_tz": "UTC"
+          },
+          "monthly": {
+            "rows": [
+              {
+                "label": "2026-04",
+                "cost_usd": 38.5,
+                "input_tokens": 1500000,
+                "cached_input_tokens": 400000,
+                "output_tokens": 200000,
+                "reasoning_output_tokens": 25000,
+                "total_tokens": 1700000,
+                "models": [
+                  "gpt-5"
+                ]
+              }
+            ],
+            "total_cost_usd": 38.5,
+            "total_tokens": 1700000,
+            "display_tz": "UTC"
+          },
+          "weekly": {
+            "rows": [
+              {
+                "label": "04-20",
+                "cost_usd": 20.1,
+                "input_tokens": 800000,
+                "cached_input_tokens": 200000,
+                "output_tokens": 100000,
+                "reasoning_output_tokens": 12000,
+                "total_tokens": 900000,
+                "models": [
+                  "gpt-5"
+                ]
+              }
+            ],
+            "total_cost_usd": 20.1,
+            "total_tokens": 900000,
+            "display_tz": "UTC"
+          }
         },
         "sessions": {
           "rows": [
-            {"key": "session:codex-a", "source": "codex", "label": "Session 1", "last_activity": "2026-04-24T12:30:00Z", "cost_usd": 6.4, "input_tokens": 240000, "cached_input_tokens": 60000, "output_tokens": 32000, "reasoning_output_tokens": 4000, "total_tokens": 276000, "models": ["gpt-5"]},
-            {"key": "session:codex-b", "source": "codex", "label": "Session 2", "last_activity": "2026-04-24T11:00:00Z", "cost_usd": 5.9, "input_tokens": 240000, "cached_input_tokens": 60000, "output_tokens": 32000, "reasoning_output_tokens": 4000, "total_tokens": 276000, "models": ["gpt-5-codex"]}
+            {
+              "key": "session:codex-a",
+              "source": "codex",
+              "label": "Session 1",
+              "last_activity": "2026-04-24T12:30:00Z",
+              "cost_usd": 6.4,
+              "input_tokens": 240000,
+              "cached_input_tokens": 60000,
+              "output_tokens": 32000,
+              "reasoning_output_tokens": 4000,
+              "total_tokens": 276000,
+              "models": [
+                "gpt-5"
+              ]
+            },
+            {
+              "key": "session:codex-b",
+              "source": "codex",
+              "label": "Session 2",
+              "last_activity": "2026-04-24T11:00:00Z",
+              "cost_usd": 5.9,
+              "input_tokens": 240000,
+              "cached_input_tokens": 60000,
+              "output_tokens": 32000,
+              "reasoning_output_tokens": 4000,
+              "total_tokens": 276000,
+              "models": [
+                "gpt-5-codex"
+              ]
+            }
           ],
           "total_sessions": 2,
           "total_cost_usd": 12.3,
@@ -808,19 +1296,103 @@
             "latest_percent": 61.0,
             "freshness": "fresh",
             "active": [
-              {"key": "quota:codex-5h", "current_percent": 42.0, "captured_at": "2026-04-24T13:00:00Z", "resets_at": "2026-04-24T18:00:00Z", "freshness": "fresh", "stale_after_seconds": 900},
-              {"key": "quota:codex-weekly", "current_percent": 61.0, "captured_at": "2026-04-24T13:00:00Z", "resets_at": "2026-04-30T00:00:00Z", "freshness": "fresh", "stale_after_seconds": 3600}
+              {
+                "key": "quota:codex-5h",
+                "current_percent": 42.0,
+                "captured_at": "2026-04-24T13:00:00Z",
+                "resets_at": "2026-04-24T18:00:00Z",
+                "freshness": "fresh",
+                "stale_after_seconds": 900
+              },
+              {
+                "key": "quota:codex-weekly",
+                "current_percent": 61.0,
+                "captured_at": "2026-04-24T13:00:00Z",
+                "resets_at": "2026-04-30T00:00:00Z",
+                "freshness": "fresh",
+                "stale_after_seconds": 3600
+              }
             ]
           },
           "histories": [
-            {"key": "quota:codex-5h", "source": "codex", "label": "5-hour limit", "observed_slot": 0, "window_minutes": 300, "current_percent": 42.0, "captured_at": "2026-04-24T13:00:00Z", "freshness": "fresh", "stale_after_seconds": 900, "forecast": {"status": "ok", "current_percent": 42.0, "rate_percent_per_hour": 8.0, "projected_percent": 74.0, "resets_at": "2026-04-24T18:00:00Z", "remaining_seconds": 18000, "sample_count": 6, "sample_span_seconds": 3600, "confidence": "high"}},
-            {"key": "quota:codex-weekly", "source": "codex", "label": "Weekly limit", "observed_slot": 0, "window_minutes": 10080, "current_percent": 61.0, "captured_at": "2026-04-24T13:00:00Z", "freshness": "fresh", "stale_after_seconds": 3600, "forecast": {"status": "ok", "current_percent": 61.0, "rate_percent_per_hour": 1.5, "projected_percent": 80.0, "resets_at": "2026-04-30T00:00:00Z", "remaining_seconds": 216000, "sample_count": 10, "sample_span_seconds": 86400, "confidence": "medium"}}
+            {
+              "key": "quota:codex-5h",
+              "source": "codex",
+              "label": "5-hour limit",
+              "observed_slot": 0,
+              "window_minutes": 300,
+              "current_percent": 42.0,
+              "captured_at": "2026-04-24T13:00:00Z",
+              "freshness": "fresh",
+              "stale_after_seconds": 900,
+              "forecast": {
+                "status": "ok",
+                "current_percent": 42.0,
+                "rate_percent_per_hour": 8.0,
+                "projected_percent": 74.0,
+                "resets_at": "2026-04-24T18:00:00Z",
+                "remaining_seconds": 18000,
+                "sample_count": 6,
+                "sample_span_seconds": 3600,
+                "confidence": "high"
+              }
+            },
+            {
+              "key": "quota:codex-weekly",
+              "source": "codex",
+              "label": "Weekly limit",
+              "observed_slot": 0,
+              "window_minutes": 10080,
+              "current_percent": 61.0,
+              "captured_at": "2026-04-24T13:00:00Z",
+              "freshness": "fresh",
+              "stale_after_seconds": 3600,
+              "forecast": {
+                "status": "ok",
+                "current_percent": 61.0,
+                "rate_percent_per_hour": 1.5,
+                "projected_percent": 80.0,
+                "resets_at": "2026-04-30T00:00:00Z",
+                "remaining_seconds": 216000,
+                "sample_count": 10,
+                "sample_span_seconds": 86400,
+                "confidence": "medium"
+              }
+            }
           ],
           "milestones": [
-            {"key": "quota_milestone:codex-a", "source": "codex", "block_key": "block:codex-5h", "percent": 40, "captured_at": "2026-04-24T12:45:00Z"}
+            {
+              "key": "quota_milestone:codex-a",
+              "source": "codex",
+              "block_key": "block:codex-5h",
+              "percent": 40,
+              "captured_at": "2026-04-24T12:45:00Z"
+            }
           ],
           "blocks": [
-            {"key": "block:codex-5h", "source": "codex", "label": "13:00 Apr 24 UTC", "window_minutes": 300, "start_at": "2026-04-24T13:00:00Z", "end_at": "2026-04-24T18:00:00Z", "resets_at": "2026-04-24T18:00:00Z", "current_percent": 42.0, "orphaned": false, "is_active": true, "cost_usd": 12.3, "model_breakdowns": [{"modelName": "gpt-5", "cost": 8.0}, {"modelName": "gpt-5-codex", "cost": 4.3}]}
+            {
+              "key": "block:codex-5h",
+              "source": "codex",
+              "label": "13:00 Apr 24 UTC",
+              "window_minutes": 300,
+              "start_at": "2026-04-24T13:00:00Z",
+              "end_at": "2026-04-24T18:00:00Z",
+              "resets_at": "2026-04-24T18:00:00Z",
+              "current_percent": 42.0,
+              "orphaned": false,
+              "is_active": true,
+              "cost_usd": 12.3,
+              "model_breakdowns": [
+                {
+                  "modelName": "gpt-5",
+                  "cost": 8.0
+                },
+                {
+                  "modelName": "gpt-5-codex",
+                  "cost": 4.3
+                }
+              ]
+            }
           ]
         },
         "budget": {
@@ -835,26 +1407,69 @@
             "window_start_at": "2026-04-01T00:00:00Z",
             "window_end_at": "2026-05-01T00:00:00Z",
             "recent_24h_usd": 4.2,
-            "alert_thresholds": [90, 100],
-            "pace": {"daily_usd": 1.6, "projected_low_usd": 48.0, "projected_high_usd": 55.0, "week_avg_projection_usd": 50.0}
+            "alert_thresholds": [
+              90,
+              100
+            ],
+            "pace": {
+              "daily_usd": 1.6,
+              "projected_low_usd": 48.0,
+              "projected_high_usd": 55.0,
+              "week_avg_projection_usd": 50.0
+            }
           },
           "milestones": [
-            {"period_start_at": "2026-04-01T00:00:00Z", "period": "calendar-month", "threshold": 90, "budget_usd": 100.0, "spent_usd": 90.5, "consumption_pct": 90.5}
+            {
+              "period_start_at": "2026-04-01T00:00:00Z",
+              "period": "calendar-month",
+              "threshold": 90,
+              "budget_usd": 100.0,
+              "spent_usd": 90.5,
+              "consumption_pct": 90.5
+            }
           ],
           "projected": [
-            {"period": "calendar-month", "threshold": 90, "projected_value": 92.0, "denominator": 100.0, "crossed_at": "2026-04-20T00:00:00Z", "alerted_at": "2026-04-20T00:00:05Z"}
+            {
+              "period": "calendar-month",
+              "threshold": 90,
+              "projected_value": 92.0,
+              "denominator": 100.0,
+              "crossed_at": "2026-04-20T00:00:00Z",
+              "alerted_at": "2026-04-20T00:00:05Z"
+            }
           ]
         },
         "projects": {
           "rows": [
-            {"key": "project:codex-alpha", "source": "codex", "label": "alpha", "session_count": 3, "first_seen": "2026-04-20T00:00:00Z", "last_seen": "2026-04-24T12:30:00Z", "cost_usd": 8.0, "input_tokens": 320000, "cached_input_tokens": 80000, "output_tokens": 40000, "reasoning_output_tokens": 5000, "total_tokens": 360000}
+            {
+              "key": "project:codex-alpha",
+              "source": "codex",
+              "label": "alpha",
+              "session_count": 3,
+              "first_seen": "2026-04-20T00:00:00Z",
+              "last_seen": "2026-04-24T12:30:00Z",
+              "cost_usd": 8.0,
+              "input_tokens": 320000,
+              "cached_input_tokens": 80000,
+              "output_tokens": 40000,
+              "reasoning_output_tokens": 5000,
+              "total_tokens": 360000
+            }
           ],
           "total_cost_usd": 12.3,
           "total_tokens": 552000
         },
         "alerts": {
           "rows": [
-            {"key": "alert:codex-budget-90", "source": "codex", "axis": "codex_budget", "period": "calendar-month", "threshold": 90, "value": 90.5, "created_at": "2026-04-20T00:00:00Z"}
+            {
+              "key": "alert:codex-budget-90",
+              "source": "codex",
+              "axis": "codex_budget",
+              "period": "calendar-month",
+              "threshold": 90,
+              "value": 90.5,
+              "created_at": "2026-04-20T00:00:00Z"
+            }
           ]
         }
       }
@@ -862,24 +1477,68 @@
     "all": {
       "availability": "ok",
       "freshness": "fresh",
-      "domain_freshness": {"hero": "fresh", "quota": "fresh", "sessions": "fresh"},
+      "domain_freshness": {
+        "hero": "fresh",
+        "quota": "fresh",
+        "sessions": "fresh"
+      },
       "warnings": [],
       "data_version": "all:v1",
       "last_success_at": "2026-04-24T13:07:00Z",
       "capabilities": {
-        "hero": {"status": "derived", "semantics": "compatible-provider-totals"},
-        "quota": {"status": "not_applicable", "semantics": "provider-native"},
-        "budget": {"status": "not_applicable", "semantics": "provider-native"},
-        "alerts": {"status": "derived", "semantics": "provider-native-union"}
+        "hero": {
+          "status": "derived",
+          "semantics": "compatible-provider-totals"
+        },
+        "quota": {
+          "status": "not_applicable",
+          "semantics": "provider-native"
+        },
+        "budget": {
+          "status": "not_applicable",
+          "semantics": "provider-native"
+        },
+        "alerts": {
+          "status": "derived",
+          "semantics": "provider-native-union"
+        }
       },
       "data": {
-        "combined": {"cost_usd": 20.7, "total_tokens": 10502400},
+        "combined": {
+          "cost_usd": 20.7,
+          "total_tokens": 10502400
+        },
         "alerts": {
           "rows": [
-            {"key": "alert:codex-budget-90", "source": "codex", "axis": "codex_budget", "period": "calendar-month", "threshold": 90, "value": 90.5, "created_at": "2026-04-20T00:00:00Z"}
+            {
+              "key": "alert:codex-budget-90",
+              "source": "codex",
+              "axis": "codex_budget",
+              "period": "calendar-month",
+              "threshold": 90,
+              "value": 90.5,
+              "created_at": "2026-04-20T00:00:00Z"
+            }
           ]
         },
-        "providers": {"claude": null, "codex": null}
+        "providers": {
+          "claude": null,
+          "codex": null
+        },
+        "aggregates": {
+          "range": {
+            "kind": "absolute_range",
+            "label": "Shared range",
+            "start_at": "2026-03-26T00:00:00Z",
+            "end_at": "2026-04-24T13:07:00Z"
+          },
+          "projects": {
+            "state": "available"
+          },
+          "daily": {
+            "state": "available"
+          }
+        }
       }
     }
   },
@@ -900,7 +1559,19 @@
       "baseline_daily_row_count": 7
     },
     "days": [
-      {"date": "2026-04-24", "cache_hit_percent": 87.3, "input_tokens": 412000, "output_tokens": 38400, "cache_creation_tokens": 1200000, "cache_read_tokens": 8300000, "saved_usd": 4.0, "wasted_usd": 0.9, "net_usd": 3.1, "anomaly_triggered": false, "anomaly_reasons": []}
+      {
+        "date": "2026-04-24",
+        "cache_hit_percent": 87.3,
+        "input_tokens": 412000,
+        "output_tokens": 38400,
+        "cache_creation_tokens": 1200000,
+        "cache_read_tokens": 8300000,
+        "saved_usd": 4.0,
+        "wasted_usd": 0.9,
+        "net_usd": 3.1,
+        "anomaly_triggered": false,
+        "anomaly_reasons": []
+      }
     ],
     "by_project": [],
     "by_model": [],

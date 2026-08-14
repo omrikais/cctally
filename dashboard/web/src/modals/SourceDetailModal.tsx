@@ -5,6 +5,7 @@ import { useSnapshot } from '../hooks/useSnapshot';
 import { ALL_ACCOUNTS, resolveAccountFocus } from '../store/accountFocus';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
+import { formatSpan } from '../lib/projectWindow';
 import { modelChipClass, modelChipStyle } from '../lib/model';
 import { ModelCostBars } from './ModelCostBars';
 import { ProjectDetailContent } from './ProjectsDrillPanel';
@@ -94,7 +95,6 @@ export function SourceDetailModal() {
       key={`${open.source}:${open.resource}:${open.key}`}
       title={title}
       accentClass={open.resource === 'block' ? 'accent-cyan' : 'accent-orange'}
-      dataSource={open.source}
       onClose={close}
       focusLayer="source-detail"
       rootId="source-detail-root"
@@ -102,6 +102,7 @@ export function SourceDetailModal() {
       bodyId="source-detail-body"
       rootTestId="source-detail-modal"
       cardClassName="source-detail-card"
+      dataSource={open.source}
       headerExtras={(
         <ShareIcon
           panel={panel}
@@ -387,7 +388,28 @@ function CodexSessionDetailView({ d }: { d: CodexSessionDetailBody }) {
 
 function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
   const display = useDisplayTz();
+  const env = useSnapshot();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
+  // #556 S2 QA P1-3 — the drill states the window its totals cover.
+  //
+  // This detail is served by `_codex_detail_inputs`, which opens its read at
+  // `now - 365 days` and closes it at `now + 1µs`. That is a much wider window
+  // than the shared thirty-day range the ranked row beside it was priced over,
+  // so the two figures for one project differ by a large margin — and the
+  // modal named no window at all, leaving each number to imply the other was
+  // wrong. Naming the window is the whole fix: the requirement is truthful
+  // labelling, not matching the ranking.
+  //
+  // It goes through `formatSpan`, the same helper the Claude drill's
+  // `8w · Jun 22 – Aug 16` uses, which also fixes the pre-existing range
+  // defect on this surface. The bounds are a full year apart and
+  // `fmt.datetimeShort` carries no year, so both ends printed as "Aug 14
+  // 00:55" — a zero-width span directly below a FIRST SEEN of Apr 28.
+  const reportedWindow = formatSpan(
+    { startAt: d.range_start, endAt: d.range_end },
+    ctx,
+    { clampEndTo: env?.generated_at },
+  );
   const models: CodexModelBreakdown[] = d.models.map((model) => ({
     modelName: model.model,
     cost: model.cost_usd,
@@ -404,6 +426,13 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
         <span className="msess-badge sd-project-label" title={d.label || 'Codex project'}>{d.label || 'Codex project'}</span>
         <span className={`m-pill ${providerAccentClass('codex')}`}>Codex</span>
       </div>
+      {reportedWindow && (
+        <p className="sd-window-note" data-testid="codex-project-window">
+          Totals cover {reportedWindow} — the retained Codex window this detail
+          reads, which is wider than the shared range a ranked row is priced
+          over.
+        </p>
+      )}
       <div className="m-hero cols-3">
         <div className="m-kv kv-cost"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#dollar" /></svg><div><div className="v">{fmt.usd2(d.cost_usd)}</div><div className="lbl">Total cost</div></div></div>
         <div className="m-kv kv-dur"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#clock" /></svg><div><div className="v">{d.session_count}</div><div className="lbl">Sessions</div></div></div>
@@ -413,7 +442,7 @@ function CodexProjectDetailView({ d }: { d: CodexProjectDetailBody }) {
         <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#calendar" /></svg>
         <div><span className="k">first seen</span><span className="v">{fmt.datetimeShort(d.first_seen, ctx)}</span></div>
         <div><span className="k">last activity</span><span className="v">{fmt.datetimeShort(d.last_seen, ctx)}</span></div>
-        <div><span className="k">range</span><span className="v">{fmt.datetimeShort(d.range_start, ctx)} → {fmt.datetimeShort(d.range_end, ctx)}</span></div>
+        <div data-testid="codex-project-range"><span className="k">range</span><span className="v">{reportedWindow ?? '—'}</span></div>
       </div>
       <h3 className="m-sec sec-tok"><svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg>Native token totals</h3>
       <CodexTokenGrid totals={d} />

@@ -165,7 +165,9 @@ for (const viewport of MATRIX) {
     await selectSource(page, 'codex');
     await expect(page.getByTestId('hero-five-hour')).toHaveCount(0);
     const codexBlocks = page.locator('#panel-blocks');
-    await expect(codexBlocks.getByRole('heading', { name: /Blocks/ })).toContainText('optional 5h · current cycle');
+    // #556 S2 QA — the scope statement moved off the truncating h2 and onto
+    // the panel's wrapping sub-line. Same string, different element.
+    await expect(codexBlocks.locator('.panel-range-note')).toHaveText('optional 5h · current cycle');
     await expect(codexBlocks).toContainText('the 7-day Codex cycle remains available');
     await page.screenshot({ path: screenshotPath(viewport, 'codex-no-five-hour'), fullPage: true });
 

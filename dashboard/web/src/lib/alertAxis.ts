@@ -18,7 +18,7 @@ export const AXIS_CHIP_LABEL: Record<AlertAxis, string> = {
   budget: 'BUDGET',
   projected: 'PROJECTED',
   project_budget: 'PROJECT',
-  codex_budget: 'CODEX',
+  codex_budget: 'BUDGET',
 };
 
 export const AXIS_TITLE_LABEL: Record<AlertAxis, string> = {

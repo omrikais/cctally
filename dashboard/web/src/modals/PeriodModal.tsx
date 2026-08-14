@@ -11,7 +11,13 @@ import { keyOf, stepPeriod, type PeriodVariant } from './periodNav';
 import { dailyToPeriodRow } from './historyData';
 import { dispatch, getState, subscribeStore, topmostStoreFocusLayer, type ModalKind } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
-import { presentationDailyRows, presentationPeriodRows } from '../lib/dashboardPresentation';
+import {
+  presentationDailyLegs,
+  presentationDailyRows,
+  presentationPeriodRows,
+  type AggregateWithheld,
+} from '../lib/dashboardPresentation';
+import { withheldMessage } from '../lib/withheldCopy';
 import type { DashboardSelection, Envelope, PeriodRow } from '../types/envelope';
 import type { SharePanelId } from '../share/types';
 
@@ -33,6 +39,10 @@ interface Props {
   panelLabel: string;         // 'Daily' | 'Weekly' | 'Monthly'
   triggerId: string;          // '<panel>-modal'
   wide?: boolean;
+  // #556 S4 — the >=1025px internal-pane scroll contract, separate from
+  // `wide`. Weekly and Monthly render `.period-two-pane` and opt in; Daily
+  // renders navigator + detail only and must not.
+  paneScroll?: boolean;
 }
 
 const UNIT_PLURAL: Record<Variant, string> = { day: 'days', week: 'weeks', month: 'months' };
@@ -53,22 +63,35 @@ function weeklyVocabulary(source: DashboardSelection) {
 
 interface Keyed { key: string; nav: PeriodNavRow; period: PeriodRow; }
 
-function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSelection): Keyed[] {
+// #556 S2 §3.7 — the modal renders the same three states its panel does.
+//
+// `buildKeyed` used to map a non-available daily outcome to `[]`, and the
+// modal's empty branch then said "No usage history yet." — the honest-emptiness
+// reading of a real fault, and the very copy the panel beside it had just
+// stopped showing. Opening the modal one keystroke later contradicted the
+// panel. The Projects modal already carried this state; Daily did not.
+interface KeyedResult { rows: Keyed[]; withheld: AggregateWithheld | null; }
+
+function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSelection): KeyedResult {
   if (variant === 'day') {
-    const rows = presentationDailyRows(env, source);
-    return rows.map((r, i) => ({
+    const daily = presentationDailyRows(env, source);
+    if (daily.state !== 'available') return { rows: [], withheld: daily };
+    const rows = daily.rows;
+    return { rows: rows.map((r, i) => ({
       key: r.date,
       nav: { key: r.date, label: r.label, cost: r.cost_usd, isCurrent: r.is_today, isEmpty: r.cost_usd <= 0 },
       period: dailyToPeriodRow(r, rows[i + 1]),
-    }));
+    })), withheld: null };
   }
   const rows = presentationPeriodRows(env, source, variant === 'week' ? 'weekly' : 'monthly');
   const v: PeriodVariant = variant;
-  return rows.map((r) => ({
+  return { withheld: null, rows: rows.map((r) => ({
     key: keyOf(r, v),
     nav: {
       key: keyOf(r, v),
-      label: source === 'all' && variant === 'week' && r.source != null
+      // #556 S2 §5.4 — the navigator qualifies BOTH period kinds now, for the
+      // same reason the table does: unmerged monthly rows can share a label.
+      label: source === 'all' && r.source != null
         ? `${r.source === 'claude' ? 'Claude' : 'Codex'} · ${r.label}`
         : r.label,
       cost: r.cost_usd,
@@ -76,10 +99,10 @@ function buildKeyed(variant: Variant, env: Envelope | null, source: DashboardSel
       isEmpty: r.cost_usd <= 0,
     },
     period: r,
-  }));
+  })) };
 }
 
-export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panelLabel, triggerId, wide }: Props) {
+export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panelLabel, triggerId, wide, paneScroll }: Props) {
   // Bound when OPEN_MODAL fires. A source switch changes the board behind the
   // modal, never the period rows or share target already in front of the user.
   const source = useSyncExternalStore(
@@ -98,7 +121,7 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
     () => (variant === 'day' ? getState().openDailyDate : null),
   );
 
-  const keyed = buildKeyed(variant, env, source);
+  const { rows: keyed, withheld } = buildKeyed(variant, env, source);
   const navRows = keyed.map((k) => k.nav);
   const periodRows = keyed.map((k) => k.period);
 
@@ -137,11 +160,28 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
     />
   );
 
+  // Under All neither weekly nor monthly counts what its unit noun implies:
+  // both are unmerged, so one calendar month or one wall-clock week
+  // contributes a row per provider. Weekly already said "N provider periods";
+  // monthly said "last 10 months" over a count of ten PROVIDER-months, which
+  // the panel footer's span then contradicted (2026-01 – 2026-08 is eight).
+  // Neither drops "last", because neither is a trailing-N-units window.
+  const monthlyPlural = navRows.length === 1 ? 'provider month' : 'provider months';
   const title = navRows.length > 0
     ? source === 'all' && variant === 'week'
       ? `${panelLabel} · ${navRows.length} ${vocabulary.plural}`
-      : `${panelLabel} · last ${navRows.length} ${variant === 'week' ? vocabulary.plural : UNIT_PLURAL[variant]}`
+      : source === 'all' && variant === 'month'
+        ? `${panelLabel} · ${navRows.length} ${monthlyPlural}`
+        : `${panelLabel} · last ${navRows.length} ${variant === 'week' ? vocabulary.plural : UNIT_PLURAL[variant]}`
     : panelLabel;
+
+  // #556 S2 §6.3 — the modal owns SELECTION, so it resolves the legs for the
+  // selected day and hands them to the card. Only under All and only for the
+  // daily variant: the single-provider tabs have nothing to break down, and
+  // weekly/monthly rows are never merged.
+  const dailyLegs = variant === 'day' && source === 'all' && effectiveKey != null
+    ? presentationDailyLegs(env, effectiveKey)
+    : undefined;
 
   const detail = selectedRow && (
     <PeriodDetailCard
@@ -150,12 +190,17 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
       accentClass={accentClass}
       periodNoun={variant === 'week' ? vocabulary.noun : undefined}
       windowLabel={variant === 'week' ? vocabulary.window : undefined}
+      providerLegs={dailyLegs}
     />
   );
 
   return (
-    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras} wide={wide} dataSource={source}>
-      {navRows.length === 0 ? (
+    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras} wide={wide} paneScroll={paneScroll} dataSource={source}>
+      {withheld ? (
+        <div className="panel-empty panel-withheld" data-withheld-code={withheld.code}>
+          {withheldMessage(withheld, 'history')}
+        </div>
+      ) : navRows.length === 0 ? (
         <div className="panel-empty">No usage history yet.</div>
       ) : (
         <>
@@ -178,7 +223,11 @@ export function PeriodModal({ variant, accentClass, sharePanel, modalKind, panel
                   accentClass={accentClass}
                   selectedKey={effectiveKey}
                   onSelect={setSelectedKey}
-                  showSource={source === 'all' && variant === 'week'}
+                  // #556 S2 §5.4 — MONTHLY gets `showSource` too. Its rows
+                  // are no longer merged into `source: 'all'`, so two rows can
+                  // now share a label and the provider column is what tells
+                  // them apart.
+                  showSource={source === 'all'}
                   periodLabel={variant === 'week' ? vocabulary.column : undefined}
                 />
               </div>

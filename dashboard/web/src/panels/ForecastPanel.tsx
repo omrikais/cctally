@@ -16,6 +16,7 @@ import {
   type ForecastPresentation,
 } from '../lib/dashboardPresentation';
 import { SourceChip } from './sourcePanel';
+import type { Envelope } from '../types/envelope';
 
 // #416 QA P0 — the shared blank. A forecast is a claim about ONE quota
 // allowance, and a decorated Codex provider has several; no summary statistic
@@ -38,61 +39,93 @@ export function ForecastPerAccountValue(): JSX.Element {
 function ForecastProviderSummary({
   section,
   perAccount,
+  env,
 }: {
   section: ProviderPresentationSection<ForecastPresentation>;
   perAccount: boolean;
+  env: Envelope | null;
 }) {
-  const value = section.value;
-  const verdict = perAccount ? null : resolveVerdict(value?.verdict ?? null);
+  // #556 S4 — a section with no forecast used to collapse to a bare reason
+  // line beneath a literal `unavailable` status chip, where that provider's
+  // own tab renders a labelled dash structure. The substitute is derived from
+  // the canonical presenter rather than assembled here, so the labels and the
+  // dashes come from one place; `presentationForecastComposition` calls the
+  // same function over the same envelope.
+  const substituted = section.value == null;
+  const value = section.value ?? presentationForecast(env, section.source);
+  const verdict = perAccount || substituted ? null : resolveVerdict(value.verdict);
   const verdictClass = verdict?.cls ?? 'good';
+  const foot = perAccount
+    // Under decoration `presentationForecast` still derives Confidence from
+    // the FIRST eligible weekly history — one arbitrarily chosen account — so
+    // publishing it as the provider's would reconcile against no account card
+    // and no tab. The canonical per-account panel already filters it out; this
+    // is that same rule. `Budget pace` is a SPEND axis and stays.
+    ? value.foot.filter((line) => line.label !== 'Confidence')
+    : value.foot;
   return (
     <div
       className="source-provider-section provider-summary-card forecast-provider-summary"
       data-provider-section={section.source}
-      aria-label={`${section.label} forecast`}
+      // #556 S4 F8 — a plain `<div>` takes no accessible name, so the region
+      // role is what makes the heading below name a landmark.
+      role="region"
+      aria-labelledby={`forecast-panel-${section.source}-heading`}
     >
       <div className="source-provider-head">
+        <h3 className="sr-only" id={`forecast-panel-${section.source}-heading`}>
+          {section.label} forecast
+        </h3>
         <SourceChip source={section.source} />
-        {section.status !== 'available' && !perAccount && (
+        {/* docs/dashboard-gotchas.md:730 — the status chip describes
+            `section.value`, so a surface rendering a substitute renders no
+            chip. The reason below is a different claim and survives. */}
+        {section.status !== 'available' && !perAccount && !substituted && (
           <span className="provider-section-status">{section.status}</span>
         )}
       </div>
-      {value == null && !perAccount ? (
+      <div className="provider-summary-kpis">
+        <div>
+          <span className="provider-summary-label">{value.primaryLabel}</span>
+          <strong className={`provider-summary-value is-${verdictClass}`}>
+            {perAccount
+              ? <ForecastPerAccountValue />
+              : verdictClass === 'over' && value.projected != null
+                ? '≥100%'
+                : fmt.pct1(value.projected)}
+          </strong>
+        </div>
+        <div>
+          <span className="provider-summary-label">
+            {perAccount ? 'Current quota' : value.recentLabel}
+          </span>
+          <strong className="provider-summary-value">
+            {perAccount ? <ForecastPerAccountValue /> : fmt.pct1(value.recent)}
+          </strong>
+        </div>
+      </div>
+      {verdict && (
+        <span className={`fc-verdict-chip is-${verdictClass}`}>
+          <span className="fc-verdict-glyph" aria-hidden="true">{verdict.glyph}</span>
+          {' '}{verdict.label}
+        </span>
+      )}
+      {section.reason && !perAccount && (
         <div className="provider-section-reason">{section.reason}</div>
-      ) : (
-        <>
-          <div className="provider-summary-kpis">
-            <div>
-              <span className="provider-summary-label">
-                {value?.primaryLabel ?? 'Projected @ reset'}
-              </span>
-              <strong className={`provider-summary-value is-${verdictClass}`}>
-                {perAccount
-                  ? <ForecastPerAccountValue />
-                  : verdictClass === 'over' && value!.projected != null
-                    ? '≥100%'
-                    : fmt.pct1(value!.projected)}
-              </strong>
+      )}
+      {/* #556 S4 — the panel dropped every foot line although the composition
+          already handed it one, so Codex lost Confidence and Budget pace and
+          Claude lost both budget rows. Same markup as the single-provider
+          card's footer below. */}
+      {foot.length > 0 && (
+        <div className="fc-budget-foot">
+          {foot.map((line) => (
+            <div className="fc-foot-line" key={line.label}>
+              <span className="fc-foot-k">{line.label}</span>
+              <span className="fc-foot-v">{line.value}</span>
             </div>
-            <div>
-              <span className="provider-summary-label">
-                {perAccount ? 'Current quota' : value!.recentLabel}
-              </span>
-              <strong className="provider-summary-value">
-                {perAccount ? <ForecastPerAccountValue /> : fmt.pct1(value!.recent)}
-              </strong>
-            </div>
-          </div>
-          {verdict && (
-            <span className={`fc-verdict-chip is-${verdictClass}`}>
-              <span className="fc-verdict-glyph" aria-hidden="true">{verdict.glyph}</span>
-              {' '}{verdict.label}
-            </span>
-          )}
-          {section.reason && !perAccount && (
-            <div className="provider-section-reason">{section.reason}</div>
-          )}
-        </>
+          ))}
+        </div>
       )}
     </div>
   );
@@ -158,6 +191,7 @@ export function ForecastPanel() {
             <ForecastProviderSummary
               key={section.source}
               section={section}
+              env={env}
               perAccount={section.source === 'codex' && codexPerAccount}
             />
           ))}

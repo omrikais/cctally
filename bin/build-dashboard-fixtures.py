@@ -88,6 +88,7 @@ from _fixture_builders import (  # noqa: E402
     bump_codex_physical_mutation_seq,
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_account,
     seed_codex_conversation_thread,
     seed_codex_quota_snapshot,
@@ -126,7 +127,9 @@ def _stamp_and_verify(stats_conn: sqlite3.Connection) -> None:
 
 
 def _iso(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Serialize a datetime as UTC-ISO with `Z` suffix, preserving any
+    fractional second (#568)."""
+    return fixture_source_timestamp_z(d)
 
 
 def _scenario_dirs(name: str) -> tuple[Path, Path]:
@@ -260,6 +263,7 @@ def _seed_budget_milestone(
     period: str = "subscription-week",
     vendor: str = "claude",
     alerted: bool = True,
+    alerted_at_raw: str | None = None,          # #556 S3 §5.3
 ) -> None:
     """Seed one ``budget_milestones`` row (issue #19) in the unified
     vendor-tagged table (#143). ``vendor`` ∈ ``'claude'|'codex'`` (default
@@ -273,7 +277,14 @@ def _seed_budget_milestone(
     ``budget:<period_start_at>:<period>:<threshold>`` shape. ``alerted_at`` is
     set to ``crossed_at`` (set-then-dispatch) when ``alerted`` so the dashboard
     envelope's budget leg (``WHERE alerted_at IS NOT NULL``) picks it up; left
-    NULL otherwise."""
+    NULL otherwise.
+
+    ``alerted_at_raw`` (#556 S3 §5.3) writes a VERBATIM ISO string as the firing
+    instant instead. Two reasons it takes a string and not a datetime: the
+    firing instant is a different moment from the crossing instant and a
+    fixture must be able to say so, and ``_iso`` canonicalizes every aware
+    datetime to UTC ``Z``, which would erase the offset spelling the
+    ``all-combined`` alert rows exist to exercise."""
     consumption_pct = (spent_usd / budget_usd * 100.0) if budget_usd else 0.0
     stats_conn.execute(
         """INSERT INTO budget_milestones
@@ -289,7 +300,11 @@ def _seed_budget_milestone(
             float(spent_usd),
             float(consumption_pct),
             _iso(crossed_at),
-            _iso(crossed_at) if alerted else None,
+            # `alerted_at_raw` bypasses `_iso` DELIBERATELY. `_iso` canonicalizes
+            # every aware datetime to UTC 'Z', which would erase the offset
+            # spelling this fixture exists to exercise.
+            (alerted_at_raw if alerted_at_raw is not None
+             else (_iso(crossed_at) if alerted else None)),
         ),
     )
 
@@ -366,7 +381,15 @@ def _seed_session(
             cache_conn,
             source_path=file_path,
             line_offset=next_off,
-            timestamp_utc=_iso(ts),
+            # The DATETIME, not `_iso(ts)`. `_iso` formats with `strftime`
+            # ("%H:%M:%SZ"), which silently truncates microseconds — so a
+            # boundary sentinel seeded one microsecond outside a bound landed
+            # exactly ON it and could not discriminate at all (#556 S2 §9.2).
+            # `seed_session_entry` normalizes through `fixture_timestamp_utc`,
+            # which accepts a datetime and preserves the fraction. Every
+            # pre-existing caller passes a whole-second datetime, so their
+            # stored bytes are unchanged.
+            timestamp_utc=ts,
             model=model,
             input_tokens=inp,
             output_tokens=out,
@@ -407,7 +430,13 @@ def _seed_session_multi_model(
             cache_conn,
             source_path=file_path,
             line_offset=next_off,
-            timestamp_utc=_iso(ts),
+            # The DATETIME, not `_iso(ts)`: `_iso` formats with `strftime`,
+            # which silently truncates microseconds. The seeder normalizes
+            # through `fixture_timestamp_utc`, which accepts a datetime and
+            # preserves the fraction. Byte-neutral for every whole-second
+            # caller here, and it keeps a future sub-second sentinel able to
+            # discriminate (#556 S2 §9.2).
+            timestamp_utc=ts,
             model=model,
             input_tokens=inp,
             output_tokens=out,
@@ -1532,7 +1561,13 @@ def _seed_codex_history(
             cache_conn,
             source_path=file_path,
             line_offset=line_offset,
-            timestamp_utc=_iso(ts),
+            # The DATETIME, not `_iso(ts)`: `_iso` formats with `strftime`,
+            # which silently truncates microseconds. The seeder normalizes
+            # through `fixture_timestamp_utc`, which accepts a datetime and
+            # preserves the fraction. Byte-neutral for every whole-second
+            # caller here, and it keeps a future sub-second sentinel able to
+            # discriminate (#556 S2 §9.2).
+            timestamp_utc=ts,
             session_id=session_id,
             model="gpt-5",
             input_tokens=input_tokens,
@@ -1716,7 +1751,7 @@ def _seed_all_combined_claude(
         line_offset_start=next_off,
     )
     # Inside BOTH cycles.
-    _seed_session(
+    next_off = _seed_session(
         cache_conn,
         session_id="allcomb-claude-overlap-0000-0000-0000-0",
         project_path="/fake/repos/all-combined-claude",
@@ -1727,6 +1762,125 @@ def _seed_all_combined_claude(
         ],
         line_offset_start=next_off,
     )
+    _seed_all_combined_range_sentinels(
+        cache_conn, as_of=as_of, line_offset_start=next_off,
+    )
+
+
+# #556 S2 §9.2 — the shared-range sentinels.
+#
+# The shared aggregate range is midnight of the earliest built daily bucket to
+# `now_utc`, exclusive at `now_utc + 1 microsecond`. This scenario's daily panel
+# is a full thirty rows, so its floor is deterministic: AS_OF minus 29 days, at
+# UTC midnight.
+_AC_DAILY_PANEL_DAYS = 30
+
+# The zone these two scenarios render in. They write no `EXTRA_FLAGS`, so no
+# `--tz` override reaches the CLI and no `display.tz` is seeded, which leaves
+# the harness environment governing — and every harness pins `TZ=Etc/UTC`.
+# Named here rather than spelled `dt.timezone.utc` inside `_ac_shared_start`,
+# because that function mirrors `resolve_shared_range`'s DISPLAY-zone floor:
+# hardcoding UTC inside it makes the mirror hold only while the precondition
+# does, silently, which is the same defect class one level up from the
+# microsecond truncation this file already fixed once.
+_AC_DISPLAY_TZ = dt.timezone.utc
+
+def _assert_ac_display_zone(scenario_dir: Path) -> None:
+    """Refuse to build if the scenario ever declares a display-zone override.
+
+    `_ac_shared_start` floors to `_AC_DISPLAY_TZ`, so a scenario that gained an
+    `EXTRA_FLAGS=--tz ...` line would place its "at-start" and "before-start"
+    sentinels at the wrong instant while every boundary assertion kept passing.
+    """
+    text = (scenario_dir / "input.env").read_text()
+    assert "EXTRA_FLAGS" not in text, (
+        f"{scenario_dir.name} declares EXTRA_FLAGS; _ac_shared_start floors to "
+        f"{_AC_DISPLAY_TZ} and would resolve the wrong shared start"
+    )
+
+
+def _ac_shared_start(as_of: dt.datetime) -> dt.datetime:
+    """The resolved shared start, DERIVED from `as_of` rather than pinned.
+
+    A hardcoded literal is the same defect class the microsecond truncation
+    was: if AS_OF moves, the "at-start" and "before-start" sentinels quietly
+    stop being at the start, and the boundary assertions keep passing while
+    testing nothing. This mirrors `resolve_shared_range`'s panel branch —
+    midnight, in the scenario's display timezone, of the panel's oldest row.
+    """
+    oldest_day = as_of.astimezone(_AC_DISPLAY_TZ).date() - dt.timedelta(
+        days=_AC_DAILY_PANEL_DAYS - 1,
+    )
+    return dt.datetime.combine(
+        oldest_day, dt.time.min, tzinfo=_AC_DISPLAY_TZ,
+    )
+
+
+def _seed_all_combined_range_sentinels(
+    cache_conn: sqlite3.Connection,
+    *,
+    as_of: dt.datetime,
+    line_offset_start: int,
+) -> int:
+    """Seed the sentinels the All aggregate contract is decided by.
+
+    Four boundary points, because two cannot distinguish the intended
+    comparisons from the erroneous ones: exactly at the start (included), one
+    microsecond before it (excluded), exactly at `now_utc` (included), and
+    exactly at the exclusive end (excluded). Each gets its own project, so
+    membership is readable straight off the published ranking.
+
+    Plus two more the ranking itself depends on. The PRE-WEEK project sits
+    inside the shared range but before Claude's current subscription week, so it
+    appears in the All ranking only if the Claude fold is genuinely
+    range-bounded — a regression to week-anchoring drops it. The TWIN PAIR is
+    two projects at different roots sharing a basename with identical cost and
+    identical session counts: the identical accounting tuple is what made the
+    client's reverse search ambiguous, and the shared basename is what forces
+    `_project_disambiguate_labels` to emit overrides at all.
+    """
+    next_off = line_offset_start
+    shared_start = _ac_shared_start(as_of)
+    twin_tokens = (44_000, 6_000, 0, 0)
+    for session_id, project_path, ts, tokens in (
+        # INCLUDED: exactly at the resolved shared start.
+        ("allcomb-range-at-start-0000-0000-0000-0",
+         "/fake/repos/allcomb-at-start",
+         shared_start, (52_000, 7_000, 0, 0)),
+        # EXCLUDED: one microsecond before it.
+        ("allcomb-range-before-start-0000-0000-000",
+         "/fake/repos/allcomb-before-start",
+         shared_start - dt.timedelta(microseconds=1), (61_000, 8_000, 0, 0)),
+        # INCLUDED: exactly at `now_utc`.
+        ("allcomb-range-at-now-0000-0000-0000-000",
+         "/fake/repos/allcomb-at-now",
+         as_of, (33_000, 4_000, 0, 0)),
+        # EXCLUDED: exactly at the exclusive upper bound.
+        ("allcomb-range-at-end-0000-0000-0000-000",
+         "/fake/repos/allcomb-at-end",
+         as_of + dt.timedelta(microseconds=1), (77_000, 9_000, 0, 0)),
+        # The load-bearing sentinel: in range, before the subscription week.
+        ("allcomb-range-preweek-0000-0000-0000-00",
+         "/fake/repos/allcomb-preweek",
+         _AC_CLAUDE_WEEK_START - dt.timedelta(days=3), (85_000, 11_000, 0, 0)),
+        # The twin pair — same basename, different roots, identical tuples.
+        ("allcomb-range-twin-repos-0000-0000-0000",
+         "/fake/repos/allcomb-twin/twin",
+         _AC_CLAUDE_WEEK_START - dt.timedelta(days=2), twin_tokens),
+        ("allcomb-range-twin-forks-0000-0000-0000",
+         "/fake/forks/allcomb-twin/twin",
+         _AC_CLAUDE_WEEK_START - dt.timedelta(days=2), twin_tokens),
+    ):
+        inp, out, cc, cr = tokens
+        next_off = _seed_session(
+            cache_conn,
+            session_id=session_id,
+            project_path=project_path,
+            model="claude-sonnet-4-6",
+            entries=[(ts, inp, out, cc, cr)],
+            line_offset_start=next_off,
+        )
+    return next_off
 
 
 def _seed_all_combined_codex(
@@ -1769,17 +1923,35 @@ def _seed_all_combined_codex(
     # picks it up. That is the other directional mutation. The two providers'
     # accounting lives in separate tables, so one row could only ever catch one
     # direction — hence a provider-specific row for each.
+    #
+    # The last two are the CODEX HALF of the §9.2 boundary claim. The spec
+    # requires the four boundary points to agree across both provider
+    # encodings, and Codex accounting lives in its own table, so a Claude row
+    # can never exercise it. The first sits exactly at the resolved shared
+    # start — outside Codex's native cycle, which is the point: the shared
+    # ranking range and the native cycle are different intervals, and this row
+    # is in one and not the other. The second sits exactly at `as_of`, the
+    # endpoint the Claude CLI kernel includes inclusively and the Codex read
+    # admits through its half-open `now_utc + 1us` bound.
     rows = (
         (_AC_CLAUDE_WEEK_START + dt.timedelta(hours=6), 310_000, 120_000, 24_000, 6_000),
         (_AC_CODEX_CYCLE_START + dt.timedelta(hours=9), 140_000, 55_000, 11_000, 2_500),
         (as_of - dt.timedelta(hours=3), 95_000, 30_000, 8_000, 1_500),
+        (_ac_shared_start(as_of), 21_000, 6_000, 1_800, 400),
+        (as_of, 13_000, 4_000, 1_100, 250),
     )
     for line_offset, (ts, inp, cached, out, reasoning) in enumerate(rows):
         seed_codex_session_entry(
             cache_conn,
             source_path=file_path,
             line_offset=line_offset,
-            timestamp_utc=_iso(ts),
+            # The DATETIME, not `_iso(ts)`: `_iso` formats with `strftime`,
+            # which silently truncates microseconds. The seeder normalizes
+            # through `fixture_timestamp_utc`, which accepts a datetime and
+            # preserves the fraction. Byte-neutral for every whole-second
+            # caller here, and it keeps a future sub-second sentinel able to
+            # discriminate (#556 S2 §9.2).
+            timestamp_utc=ts,
             session_id=_AC_CODEX_SESSION_ID,
             model="gpt-5",
             input_tokens=inp,
@@ -2015,6 +2187,44 @@ def build_all_combined(as_of: dt.datetime) -> None:
     try:
         _seed_all_combined_claude(stats_conn, cache_conn, as_of)
         _seed_all_combined_codex(cache_conn, as_of)
+        # #556 S3 §5.3 — four budget alerts whose TRUE firing order interleaves
+        # the providers: Claude, Codex, Claude, Codex. Seeded HERE rather than
+        # in either shared seeder, because `build_all_combined_decorated` calls
+        # both and would otherwise change too — and because
+        # `_seed_all_combined_codex` receives only `cache_conn`, while these
+        # rows live in stats.db.
+        #
+        # Row 2 is spelled `+02:00`. Its true instant, 13:58Z, belongs SECOND,
+        # but its local-time text sorts above every `Z`-spelled row, so a
+        # lexicographic compare anywhere in the chain puts it first — that is
+        # the trap, and it is why the seeder needed a raw-string override.
+        #
+        # The crossing instants are a DIFFERENT permutation, not merely
+        # different values: their descending order is Codex, Claude, Codex,
+        # Claude. A uniform offset would preserve the ordering exactly, so a
+        # regression to sorting on `crossed_at` would reproduce this golden and
+        # pass unnoticed.
+        for _vendor, _period, _threshold, _period_start, _alerted_raw, _crossed in (
+            ("claude", "subscription-week", 50, _AC_CLAUDE_WEEK_START,
+             "2026-04-16T13:59:00Z", dt.datetime(2026, 4, 16, 13, 40, tzinfo=dt.timezone.utc)),
+            ("codex", "calendar-month", 60, _AC_CODEX_CYCLE_START,
+             "2026-04-16T15:58:00+02:00", dt.datetime(2026, 4, 16, 13, 55, tzinfo=dt.timezone.utc)),
+            ("claude", "subscription-week", 75, _AC_CLAUDE_WEEK_START,
+             "2026-04-16T13:57:00Z", dt.datetime(2026, 4, 16, 13, 50, tzinfo=dt.timezone.utc)),
+            ("codex", "calendar-month", 80, _AC_CODEX_CYCLE_START,
+             "2026-04-16T13:56:00Z", dt.datetime(2026, 4, 16, 13, 45, tzinfo=dt.timezone.utc)),
+        ):
+            _seed_budget_milestone(
+                stats_conn,
+                week_start=_period_start,
+                threshold=_threshold,
+                budget_usd=100.0,
+                spent_usd=float(_threshold),
+                crossed_at=_crossed,
+                period=_period,
+                vendor=_vendor,
+                alerted_at_raw=_alerted_raw,
+            )
         _stamp_and_verify(stats_conn)
         stats_conn.commit()
         cache_conn.commit()
@@ -2025,6 +2235,7 @@ def build_all_combined(as_of: dt.datetime) -> None:
         app_dir, root_key=_AC_CODEX_ROOT_KEY, now=as_of,
     )
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+    _assert_ac_display_zone(scenario_dir)
 
 
 def build_all_combined_decorated(as_of: dt.datetime) -> None:
@@ -2070,6 +2281,7 @@ def build_all_combined_decorated(as_of: dt.datetime) -> None:
         app_dir, root_key=_AC_CODEX_ROOT_KEY, now=as_of,
     )
     (scenario_dir / "input.env").write_text(f"AS_OF={_iso(as_of)}\n")
+    _assert_ac_display_zone(scenario_dir)
 
 
 SCENARIOS: dict[str, tuple[dt.datetime, "callable"]] = {

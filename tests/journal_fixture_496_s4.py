@@ -51,6 +51,8 @@ def run_worker(
     pin: "str | None" = None,
     trace: bool = False,
     no_quota_cache: bool = False,
+    compact_projection_mutant: bool = False,
+    memory_probe: bool = False,
     timeout: float = 600.0,
 ) -> dict:
     """One rebuild in a fresh subprocess over a fresh data dir; its dump."""
@@ -66,6 +68,8 @@ def run_worker(
         "pin": pin,
         "tracemalloc": trace,
         "no_quota_cache": no_quota_cache,
+        "compact_projection_mutant": compact_projection_mutant,
+        "memory_probe": memory_probe,
     }
     config_path.write_text(json.dumps(config))
 

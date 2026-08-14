@@ -11,7 +11,15 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { sourceAccounts } from '../store/accountFocus';
 import { resolveSourceView } from '../store/sourceView';
 import { openShareModal } from '../store/shareSlice';
-import { presentationBlocks, presentationProviders, type BlockPresentationRow } from '../lib/dashboardPresentation';
+import {
+  blocksDisplayedSpan,
+  blocksFooterLegs,
+  presentationBlocks,
+  presentationProviders,
+  type BlockPresentationRow,
+} from '../lib/dashboardPresentation';
+import { formatSpan } from '../lib/projectWindow';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 import type { CodexSourceData } from '../types/envelope';
 
 function openBlockDetail(r: BlockPresentationRow): void {
@@ -142,6 +150,16 @@ export function BlocksPanel() {
       ? codexAccountLabels.get(row.accountKey) ?? null
       : null
   );
+  // #556 S2 QA — the string is unchanged; it renders somewhere else. Inside
+  // the h2 this was the worst truncation on the board: at 390px clientWidth
+  // 126 against scrollWidth 267, 47% visible, so `Blocks (5h · current
+  // provider cycles)` rendered as "Blocks (5h · curren…" and the composition
+  // was exactly what was hidden. It now renders on `.panel-range-note`, the
+  // wrapping full-width sub-line, and the h2 carries the panel name alone.
+  // Splitting it instead — unit in the h2, cycle on the note — was measured
+  // and rejected: `Blocks (optional 5h)`, the Codex-without-a-native-window
+  // form, still needed 161px against the 126px the actions cluster leaves,
+  // so the unit itself would clip at 78%.
   const blocksScope = activeSource === 'codex'
     ? `${codexHasFiveHourWindow ? '5h' : 'optional 5h'} · current cycle`
     : activeSource === 'all'
@@ -153,6 +171,23 @@ export function BlocksPanel() {
   // the no-double-count invariant while keeping Codex-only totals truthful.
   const total = allRows.reduce((sum, row) => sum + row.value, 0);
   const hasHeuristic = rows.some((r) => r.anchor === 'heuristic');
+  const display = useDisplayTz();
+  // #556 S2 §6.4 — the summed total stays (the blocks contract requires the
+  // footer to equal the sum of the displayed rows) and gains the attribution
+  // and the coverage it never stated. Coverage is the interval the DISPLAYED
+  // rows span, never a claim of continuous coverage and never a shared cycle:
+  // the two providers run independent five-hour clocks.
+  const footerLegs = activeSource === 'all' ? blocksFooterLegs(allRows) : null;
+  // Clamped to the snapshot instant: an ACTIVE block's `end_at` is its
+  // projected reset, so the coverage line would otherwise name a future hour
+  // as an interval windows were shown for.
+  const displayedSpan = activeSource === 'all'
+    ? formatSpan(
+        blocksDisplayedSpan(allRows),
+        { tz: display.resolvedTz, offsetLabel: display.offsetLabel },
+        { clampEndTo: env?.generated_at },
+      )
+    : null;
 
   // First-mount animation: paint .gauge-fill width:0, then rAF flips to
   // target width so the CSS transition interpolates. Spec §2.5.
@@ -180,9 +215,7 @@ export function BlocksPanel() {
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#layers" />
           </svg>
-          <h2>
-            Blocks <span className="sub">({blocksScope})</span>
-          </h2>
+          <h2>Blocks</h2>
         </div>
         <div className="panel-header-actions">
           <ShareIcon
@@ -222,6 +255,12 @@ export function BlocksPanel() {
           <PanelGrip />
         </div>
       </div>
+      {/* The window unit and the cycle the displayed rows come from. It
+          renders on EVERY tab, not only under All: the statement exists on
+          every tab and the h2 truncated on every tab, so one panel keeps one
+          pattern. It stays outside the collapsible body, because it describes
+          the title rather than the rows. */}
+      <div className="panel-range-note">{blocksScope}</div>
       <div className="panel-body" id="panel-blocks-body">
         {rows.length === 0 ? (
             presentationProviders(env, activeSource).hydrating ? (
@@ -265,6 +304,25 @@ export function BlocksPanel() {
               </>
             )}
           </span>
+          {footerLegs && (
+            <span className="blocks-foot-attribution">
+              {displayedSpan && (
+                <>
+                  <span className="blocks-foot-span">
+                    windows shown span {displayedSpan}
+                  </span>
+                  <span className="sep" aria-hidden="true"> · </span>
+                </>
+              )}
+              {footerLegs.map((leg, index) => (
+                <span key={leg.source} className="blocks-foot-leg">
+                  {index > 0 && <span className="sep" aria-hidden="true"> · </span>}
+                  {leg.label} {leg.count} {leg.count === 1 ? 'block' : 'blocks'}{' '}
+                  {fmt.usd2(leg.cost)}
+                </span>
+              ))}
+            </span>
+          )}
         </div>
       )}
     </section>

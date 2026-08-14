@@ -38,6 +38,10 @@ import os
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from _fixture_builders import fixture_source_timestamp_z  # noqa: E402
+
 
 def _load_cctally():
     """Load the cctally script when executed standalone. In a pytest context the
@@ -126,8 +130,7 @@ _CORRECTION_EVERY_TICKS = 3
 
 
 def _iso(minutes: int) -> str:
-    return (_BASE + dt.timedelta(minutes=minutes)).isoformat(
-        timespec="seconds").replace("+00:00", "Z")
+    return fixture_source_timestamp_z(_BASE + dt.timedelta(minutes=minutes))
 
 
 class _SegmentWriter:

@@ -71,8 +71,10 @@ describe('<WeeklyModal /> (#264 S2)', () => {
     updateSnapshot(baseEnvelope());
     dispatch({ type: 'OPEN_MODAL', kind: 'weekly' });
     render(<WeeklyModal />);
-    // Wide two-pane variant.
-    expect(document.querySelector('.modal-card.modal-wide')).not.toBeNull();
+    // Wide two-pane variant. #556 S4: Weekly is one of the three modals that
+    // really renders `.period-two-pane`, so it must opt in to the >=1025px
+    // pane-scroll contract explicitly rather than inheriting it from `wide`.
+    expect(document.querySelector('.modal-card.modal-wide.modal-pane-scroll')).not.toBeNull();
     const twoPane = document.querySelector('.period-two-pane');
     expect(twoPane).not.toBeNull();
     expect(twoPane?.querySelector('.period-detail-pane .detail-card')).not.toBeNull();

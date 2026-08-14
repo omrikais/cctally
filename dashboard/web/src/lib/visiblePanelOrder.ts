@@ -6,6 +6,17 @@ import type { GridPanelId } from './panelIds';
 import type { SourceView } from '../store/sourceView';
 
 // Return a NEW canonical-order array; the caller's `order` is never mutated.
+//
+// #556 S4 — READ THE SIGNATURE AS DOCUMENTED, NOT AS IMPLIED. The `view`
+// parameter is deliberately unused and no source filtering exists anywhere in
+// this module. There is ONE persisted ten-card order; this function returns it
+// verbatim for every source selection, and `mapVisibleReorderToFull` therefore
+// maps a complete canonical permutation rather than a filtered subsequence.
+// The parameter is retained because six call sites and two persistence
+// reducers pass it, and because callers depend on the fresh-array copy; its
+// presence is the only thing in the code that still suggests a filtered board,
+// which is why it is named here. Full deletion of this seam is filed as its
+// own cleanup.
 export function deriveVisiblePanelOrder(
   order: GridPanelId[],
   view: SourceView,

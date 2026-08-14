@@ -1,7 +1,8 @@
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
+import fixture from '../../__tests__/fixtures/envelope.json';
 import { DailyPanel, formatDailyCell } from './DailyPanel';
-import { _resetForTests, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import { fmt } from '../lib/fmt';
 import type { DailyPanelRow, Envelope } from '../types/envelope';
 
@@ -115,5 +116,116 @@ describe('DailyPanel compact cost on the desktop bento card (#264 S4 A4)', () =>
     const cellCost = container.querySelector('#panel-daily .daily-cell .c');
     expect(cellCost?.textContent).toBe('$519');
     expect(screen.getByText('$519')).toBeInTheDocument();
+  });
+});
+
+// #556 S2 Task 16 — Daily states its composition and renders a withheld
+// outcome rather than "No usage history yet".
+describe('#556 S2 — All composition and the withheld state', () => {
+  function allEnvelope(outcome?: Record<string, unknown>): Envelope {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    if (outcome) env.sources!.all.data!.aggregates!.daily = outcome as never;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    return env;
+  }
+
+  it('states that the heatmap sums both providers', () => {
+    allEnvelope();
+    const { container } = render(<DailyPanel />);
+    // On the sub-line, not in the h2: see the '#556 S2 QA' describe below.
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toContain('both providers');
+  });
+
+  it('renders a withheld outcome instead of an empty-history message', () => {
+    // The empty array was the ONLY way this adapter could report a failure, so
+    // a range problem read as "No usage history yet" — honest emptiness over a
+    // real fault.
+    allEnvelope({ state: 'withheld', code: 'claude_fold_failed', provider: 'claude' });
+    const { container } = render(<DailyPanel />);
+    expect(container.querySelector('.panel-withheld')!.textContent)
+      .toContain("Claude's totals");
+    expect(container.textContent).not.toContain('No usage history yet');
+    expect(container.querySelector('.daily-cal-grid')).toBeNull();
+  });
+});
+
+
+// #556 S2 QA P1-1 — the same cold-load defect on Daily. `presentationDailyRows`
+// synthesizes `rows_absent` for a null envelope, and the withheld branch was
+// tested BEFORE the hydrating one, so the first paint of a persisted All
+// selection told the user the server was wrong.
+describe('#556 S2 — a cold load of the All tab', () => {
+  it('shows the hydrating skeleton, not the wrong-server copy', () => {
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<DailyPanel />);
+
+    expect(container.querySelector('.panel-skeleton')).not.toBeNull();
+    expect(container.querySelector('.panel-withheld')).toBeNull();
+    expect(container.textContent).not.toContain('does not publish');
+    expect(container.textContent).not.toContain('Reload to pick up');
+  });
+});
+
+// #556 S2 QA P2-6 / P3 — the header must not assert a range the body says is
+// unresolved, and its sub-span takes the same parenthesised form as its three
+// siblings.
+describe('#556 S2 — the Daily title', () => {
+  function allEnv(outcome?: Record<string, unknown>): void {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    if (outcome) env.sources!.all.data!.aggregates!.daily = outcome as never;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  }
+
+  it('degrades to "withheld" instead of still claiming 30 days', () => {
+    allEnv({ state: 'withheld', code: 'range_unresolved' });
+    const { container } = render(<DailyPanel />);
+    const title = container.querySelector('.panel-header h2')!.textContent!
+      + ' ' + container.querySelector('.panel-range-note')!.textContent!;
+    expect(title).toContain('withheld');
+    expect(title).not.toContain('30 days');
+    expect(title).not.toContain('both providers');
+  });
+
+  it('states the window on the sub-line, like Projects, Weekly, Monthly and Blocks', () => {
+    allEnv();
+    const { container } = render(<DailyPanel />);
+    expect(container.querySelector('.panel-header h2')!.textContent)
+      .toContain('heatmap');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('30 days · both providers');
+  });
+});
+
+
+// #556 S2 QA — Daily's composition was not truncated at 390px; it was ABSENT.
+// `#panel-daily .panel-header h2 .sub { display: none }` (#264 S4) hides the
+// whole sub-span on phones, so the h2 measured 100% visible reading only
+// "Daily" and the words "30 days · both providers" rendered nowhere. Moving
+// them onto `.panel-range-note` states the composition on every viewport; the
+// #264 rule keeps hiding the redundant descriptor word, which is all it ever
+// claimed to be about.
+describe('#556 S2 QA — the Daily composition survives the mobile sub-span rule', () => {
+  it('puts the window and the composition outside the hidden .sub', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<DailyPanel />);
+
+    expect(container.querySelector('.panel-header h2 .sub')!.textContent)
+      .toBe('heatmap');
+    const note = container.querySelector('.panel-range-note')!;
+    expect(note.textContent).toBe('30 days · both providers');
+    expect(container.querySelector('.panel-header .panel-range-note')).toBeNull();
+    expect(note.parentElement!.querySelector(':scope > .panel-header')).not.toBeNull();
+  });
+
+  it('says only the window on a single-provider tab', () => {
+    updateSnapshot(structuredClone(fixture) as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<DailyPanel />);
+    expect(container.querySelector('.panel-range-note')!.textContent).toBe('30 days');
   });
 });

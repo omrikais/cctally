@@ -96,6 +96,12 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(detail.querySelector('.msess-tok-grid')).not.toBeNull();
     expect(detail.querySelector('.msess-model-caption')).not.toBeNull();
     expect(screen.getByRole('heading', { name: 'Session detail' })).toBeInTheDocument();
+    // The card publishes the provider it was opened for. #556 S4 F7 deleted
+    // this attribute as unread; `e2e/period-native-vocabulary.spec.ts` read it,
+    // and that Playwright lane went red on main. Provider-local `data-source`
+    // attributes set by inner components are a different attribute on a
+    // different element and are untouched.
+    expect(screen.getByRole('dialog')).toHaveAttribute('data-source', 'codex');
     // No conversation-reader affordance — only the canonical Share and close
     // controls are present.
     const buttons = within(screen.getByRole('dialog')).getAllByRole('button');
@@ -215,6 +221,10 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(fetchFn).toHaveBeenCalledWith(
       '/api/source/claude/project/project%3Aopaque?weeks=4',
     );
+    // #556 S2 (Task 0b) — this case seeds NO snapshot, so no current-week
+    // anchor is published and no span can be resolved. The header falls back
+    // to the unit count rather than stating a span nothing established. The
+    // resolved-date form is asserted below, on a case that seeds one.
     expect(detail).toHaveTextContent('project-red · 3 sessions · $8.50 (4w)');
     expect(detail).toHaveTextContent('Models (this project)');
     expect(detail).toHaveTextContent('Recent sessions');
@@ -239,6 +249,62 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     fireEvent.click(screen.getByTestId('qualified-project-show-in-sessions'));
     expect(getState().filterText).toBe('project-red');
     expect(getState().openSourceDetail).toBeNull();
+  });
+
+  // #556 S2 Task 0b — a widened window must SAY it was widened.
+  //
+  // `_project_window_weeks_for_key` widens an All-originated drill so it
+  // reaches the shared range the row was ranked over. That widening is global:
+  // one shared start resolves for the whole snapshot, so a row ranked over
+  // thirty days opens an eight-week window and `window_cost_usd` is `>=` the
+  // ranked figure with nothing reconciling them. Naming the resolved dates is
+  // what stops the two numbers from implying each other.
+  it('states the resolved dates of a widened All-originated drill window', async () => {
+    const fetchFn = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({
+          source: 'claude',
+          resource: 'project',
+          data: {
+            detail_kind: 'claude_project',
+            key: 'project:opaque',
+            label: 'project-red',
+            // The SERVER's effective window, not the 4 the client requested.
+            window_weeks: 8,
+            window_cost_usd: 12.25,
+            window_attributed_pct: null,
+            models: [],
+            sessions: [],
+            models_total: 0,
+            sessions_total: 0,
+          },
+        }),
+      } as unknown as Response),
+    );
+    vi.stubGlobal('fetch', fetchFn);
+    updateSnapshot(fixture as unknown as Envelope);
+
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    act(() => dispatch({
+      type: 'OPEN_SOURCE_DETAIL',
+      source: 'claude',
+      resource: 'project',
+      key: 'project:opaque',
+    }));
+    render(<SourceDetailModal />);
+
+    const detail = await screen.findByTestId('claude-project-detail');
+    // week_start_at is 2026-04-21 in the fixture, so eight weeks back reaches
+    // 2026-03-03 and the window's own last covered day is 2026-04-27. The
+    // STATED end is Apr 24, because the fixture's `generated_at` is
+    // 2026-04-24T13:07 and a stated span never names a day that has not
+    // happened. This case previously asserted Apr 27 — a future Sunday.
+    expect(detail).toHaveTextContent('8w · Mar 03 – Apr 24');
+    // The response's window, never the request's — the whole point is that the
+    // server widened it.
+    expect(detail).not.toHaveTextContent('4w');
   });
 
   it('uses the shared labelled modal lifecycle for focus, Escape, and return focus', async () => {
@@ -502,5 +568,63 @@ describe('SourceDetailModal — qualified fetch + native vocabulary (§5.6)', ()
     expect(detail).toHaveTextContent('No model breakdown is available.');
     expect(detail).toHaveTextContent('No retained quota observations are available.');
     expect(detail).toHaveTextContent('No quota milestones were crossed in this window.');
+  });
+});
+
+// #556 S2 QA P1-3 — the Codex drill must state what it actually reports.
+//
+// Observed: a ranked row said $6747.94 over the shared thirty-day range, and
+// the drill it opened said $8307.56 / 957 sessions / FIRST SEEN Apr 28 — the
+// server's own 365-day read — while stating no window at all. Two figures, one
+// project, nothing labelling either, so each implied the other was wrong. This
+// is the same untruthfulness the session removed for Claude (whose drill now
+// reads "8w · Jun 22 – Aug 16") and left standing for Codex.
+//
+// The pre-existing RANGE defect is on the same surface. Its bounds are a full
+// year apart, and `fmt.datetimeShort` carries no year, so both ends rendered
+// as the same string.
+describe('the Codex project drill states its reported window', () => {
+  function stubYearLongProject(): void {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        source: 'codex', resource: 'project', data: {
+          detail_kind: 'codex_project', key: 'project:year', label: 'year-project',
+          // What `_codex_detail_inputs` actually passes: `now - 365 days` to
+          // `now + 1µs`.
+          range_start: '2025-08-14T00:55:00Z', range_end: '2026-08-14T00:55:00Z',
+          first_seen: '2026-04-28T21:47:00Z', last_seen: '2026-08-14T00:55:00Z',
+          session_count: 957, cost_usd: 8307.56, input_tokens: 10,
+          cached_input_tokens: 5, output_tokens: 2, reasoning_output_tokens: 1,
+          total_tokens: 12, models: [], sessions: [],
+        },
+      }),
+    } as Response)));
+  }
+
+  it('labels its totals with the resolved window, in the Claude drill form', async () => {
+    stubYearLongProject();
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'project', key: 'project:year' });
+    render(<SourceDetailModal />);
+
+    const window = await screen.findByTestId('codex-project-window');
+    expect(window.textContent).toContain('Aug 14 2025 – Aug 14 2026');
+    // It must say the totals are the window's, so the ranked figure beside it
+    // is not read as a contradiction.
+    expect(window.textContent).toMatch(/totals? cover/i);
+  });
+
+  it('renders the range as a real span, not two copies of one date', async () => {
+    stubYearLongProject();
+    dispatch({ type: 'OPEN_SOURCE_DETAIL', source: 'codex', resource: 'project', key: 'project:year' });
+    render(<SourceDetailModal />);
+
+    const detail = await screen.findByTestId('codex-project-detail');
+    const range = detail.querySelector('[data-testid="codex-project-range"]')!;
+    expect(range.textContent).toContain('Aug 14 2025 – Aug 14 2026');
+    // The shipped form: "Aug 14 00:55 UTC → Aug 14 00:55 UTC", a year rendered
+    // as a zero-width span directly below a FIRST SEEN of Apr 28.
+    expect(range.textContent).not.toMatch(/Aug 14 \d{2}:\d{2}.*→.*Aug 14 \d{2}:\d{2}/);
   });
 });

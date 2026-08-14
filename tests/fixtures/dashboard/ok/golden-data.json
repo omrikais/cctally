@@ -2534,7 +2534,7 @@
     "codex",
     "all"
   ],
-  "source_schema_version": 5,
+  "source_schema_version": 7,
   "sources": {
     "all": {
       "availability": "ok",
@@ -2557,6 +2557,20 @@
         }
       },
       "data": {
+        "aggregates": {
+          "daily": {
+            "state": "available"
+          },
+          "projects": {
+            "state": "available"
+          },
+          "range": {
+            "end_at": "2026-04-16T14:00:00Z",
+            "kind": "absolute_range",
+            "label": "Shared range",
+            "start_at": "2026-03-18T00:00:00Z"
+          }
+        },
         "alerts": {
           "rows": [
             {
@@ -3875,6 +3889,522 @@
                 "total_cost_usd": 134.16424485000002,
                 "total_tokens": 27575771
               },
+              "daily_aggregate": {
+                "rows": [
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 5.19,
+                    "date": "2026-04-16",
+                    "input_tokens": 760000,
+                    "intensity_bucket": 2,
+                    "is_today": true,
+                    "label": "04-16",
+                    "models": [
+                      {
+                        "chip": "opus",
+                        "cost_pct": 54.91329479768786,
+                        "cost_usd": 2.85,
+                        "display": "opus-4-7",
+                        "model": "claude-opus-4-7"
+                      },
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 45.08670520231213,
+                        "cost_usd": 2.34,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 118000,
+                    "total_tokens": 878000
+                  },
+                  {
+                    "cache_creation_tokens": 1342871,
+                    "cache_hit_pct": 16.718000847835725,
+                    "cache_read_tokens": 691723,
+                    "cost_usd": 20.16228315,
+                    "date": "2026-04-15",
+                    "input_tokens": 2103000,
+                    "intensity_bucket": 4,
+                    "is_today": false,
+                    "label": "04-15",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 55.36219815462715,
+                        "cost_usd": 11.16228315,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      },
+                      {
+                        "chip": "opus",
+                        "cost_pct": 44.63780184537286,
+                        "cost_usd": 9.000000000000002,
+                        "display": "opus-4-7",
+                        "model": "claude-opus-4-7"
+                      }
+                    ],
+                    "output_tokens": 334000,
+                    "total_tokens": 4471594
+                  },
+                  {
+                    "cache_creation_tokens": 1220988,
+                    "cache_hit_pct": 20.940228874598972,
+                    "cache_read_tokens": 854189,
+                    "cost_usd": 18.7919617,
+                    "date": "2026-04-14",
+                    "input_tokens": 2004000,
+                    "intensity_bucket": 2,
+                    "is_today": false,
+                    "label": "04-14",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 57.96074871736248,
+                        "cost_usd": 10.8919617,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      },
+                      {
+                        "chip": "opus",
+                        "cost_pct": 42.039251282637515,
+                        "cost_usd": 7.900000000000001,
+                        "display": "opus-4-7",
+                        "model": "claude-opus-4-7"
+                      }
+                    ],
+                    "output_tokens": 319000,
+                    "total_tokens": 4398177
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 5.0600000000000005,
+                    "date": "2026-04-13",
+                    "input_tokens": 720000,
+                    "intensity_bucket": 1,
+                    "is_today": false,
+                    "label": "04-13",
+                    "models": [
+                      {
+                        "chip": "opus",
+                        "cost_pct": 57.31225296442688,
+                        "cost_usd": 2.9000000000000004,
+                        "display": "opus-4-7",
+                        "model": "claude-opus-4-7"
+                      },
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 42.68774703557312,
+                        "cost_usd": 2.16,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 116000,
+                    "total_tokens": 836000
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-12",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-12",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-11",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-11",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-10",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-10",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-09",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-09",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 22.92,
+                    "date": "2026-04-08",
+                    "input_tokens": 3820000,
+                    "intensity_bucket": 5,
+                    "is_today": false,
+                    "label": "04-08",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 22.92,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 764000,
+                    "total_tokens": 4584000
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-07",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-07",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-06",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-06",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-05",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-05",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-04",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-04",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-03",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-03",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-04-02",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "04-02",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 21.12,
+                    "date": "2026-04-01",
+                    "input_tokens": 3520000,
+                    "intensity_bucket": 4,
+                    "is_today": false,
+                    "label": "04-01",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 21.12,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 704000,
+                    "total_tokens": 4224000
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-31",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-31",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-30",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-30",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-29",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-29",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-28",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-28",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-27",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-27",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-26",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-26",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 21.6,
+                    "date": "2026-03-25",
+                    "input_tokens": 3600000,
+                    "intensity_bucket": 5,
+                    "is_today": false,
+                    "label": "03-25",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 21.6,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 720000,
+                    "total_tokens": 4320000
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-24",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-24",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-23",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-23",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-22",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-22",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-21",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-21",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-20",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-20",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": null,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 0.0,
+                    "date": "2026-03-19",
+                    "input_tokens": 0,
+                    "intensity_bucket": 0,
+                    "is_today": false,
+                    "label": "03-19",
+                    "models": [],
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                  },
+                  {
+                    "cache_creation_tokens": 0,
+                    "cache_hit_pct": 0.0,
+                    "cache_read_tokens": 0,
+                    "cost_usd": 19.32,
+                    "date": "2026-03-18",
+                    "input_tokens": 3220000,
+                    "intensity_bucket": 3,
+                    "is_today": false,
+                    "label": "03-18",
+                    "models": [
+                      {
+                        "chip": "sonnet",
+                        "cost_pct": 100.0,
+                        "cost_usd": 19.32,
+                        "display": "sonnet-4-6",
+                        "model": "claude-sonnet-4-6"
+                      }
+                    ],
+                    "output_tokens": 644000,
+                    "total_tokens": 3864000
+                  }
+                ]
+              },
               "monthly": {
                 "rows": [
                   {
@@ -4179,6 +4709,66 @@
               }
             },
             "projects": {
+              "aggregate": {
+                "rows": [
+                  {
+                    "cost_usd": 53.04000000000003,
+                    "drillable": true,
+                    "key": "project:ej3ZrEstgQ8uXiOeXaB5T9GnoEP9Kx-45FXeQbIRWJg",
+                    "label": "project-2",
+                    "sessions_count": 8,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 29.160000000000014,
+                    "drillable": true,
+                    "key": "project:Kowyn2-u3F902U1-YhaqJ-70wo8Ykw3T6MNlIs6qHqE",
+                    "label": "project-1",
+                    "sessions_count": 8,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 27.600000000000012,
+                    "drillable": true,
+                    "key": "project:i5LVk5Wlql-YS_de78WR3gZ6FcBbT6swfQaw6DKHypg",
+                    "label": "project-3",
+                    "sessions_count": 7,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 10.8,
+                    "drillable": true,
+                    "key": "project:YLgguix0XAncEMqWg01C7CKw9Rks3EVovZWiqmICzP8",
+                    "label": "project-4",
+                    "sessions_count": 6,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 7.383344849999999,
+                    "drillable": true,
+                    "key": "project:ZxPXO_YNX_r74EwoxWogrjMioulOWDmnrol58u7zEA8",
+                    "label": "cache-heavy",
+                    "sessions_count": 1,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 3.8709,
+                    "drillable": true,
+                    "key": "project:q4Nu0zmNsVpOjbz5rsNsWkGuR61wKrB4VFsENIzuDKM",
+                    "label": "cache-waste",
+                    "sessions_count": 1,
+                    "source": "claude"
+                  },
+                  {
+                    "cost_usd": 2.31,
+                    "drillable": true,
+                    "key": "project:C0M9cz7G-DSowXIR46PyDD-ppEf9EoVQ-xdvKiEYkfs",
+                    "label": "fixture-demo",
+                    "sessions_count": 1,
+                    "source": "claude"
+                  }
+                ]
+              },
               "current_week": {
                 "rows": [
                   {
@@ -7409,6 +7999,522 @@
             "total_cost_usd": 134.16424485000002,
             "total_tokens": 27575771
           },
+          "daily_aggregate": {
+            "rows": [
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 5.19,
+                "date": "2026-04-16",
+                "input_tokens": 760000,
+                "intensity_bucket": 2,
+                "is_today": true,
+                "label": "04-16",
+                "models": [
+                  {
+                    "chip": "opus",
+                    "cost_pct": 54.91329479768786,
+                    "cost_usd": 2.85,
+                    "display": "opus-4-7",
+                    "model": "claude-opus-4-7"
+                  },
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 45.08670520231213,
+                    "cost_usd": 2.34,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 118000,
+                "total_tokens": 878000
+              },
+              {
+                "cache_creation_tokens": 1342871,
+                "cache_hit_pct": 16.718000847835725,
+                "cache_read_tokens": 691723,
+                "cost_usd": 20.16228315,
+                "date": "2026-04-15",
+                "input_tokens": 2103000,
+                "intensity_bucket": 4,
+                "is_today": false,
+                "label": "04-15",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 55.36219815462715,
+                    "cost_usd": 11.16228315,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  },
+                  {
+                    "chip": "opus",
+                    "cost_pct": 44.63780184537286,
+                    "cost_usd": 9.000000000000002,
+                    "display": "opus-4-7",
+                    "model": "claude-opus-4-7"
+                  }
+                ],
+                "output_tokens": 334000,
+                "total_tokens": 4471594
+              },
+              {
+                "cache_creation_tokens": 1220988,
+                "cache_hit_pct": 20.940228874598972,
+                "cache_read_tokens": 854189,
+                "cost_usd": 18.7919617,
+                "date": "2026-04-14",
+                "input_tokens": 2004000,
+                "intensity_bucket": 2,
+                "is_today": false,
+                "label": "04-14",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 57.96074871736248,
+                    "cost_usd": 10.8919617,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  },
+                  {
+                    "chip": "opus",
+                    "cost_pct": 42.039251282637515,
+                    "cost_usd": 7.900000000000001,
+                    "display": "opus-4-7",
+                    "model": "claude-opus-4-7"
+                  }
+                ],
+                "output_tokens": 319000,
+                "total_tokens": 4398177
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 5.0600000000000005,
+                "date": "2026-04-13",
+                "input_tokens": 720000,
+                "intensity_bucket": 1,
+                "is_today": false,
+                "label": "04-13",
+                "models": [
+                  {
+                    "chip": "opus",
+                    "cost_pct": 57.31225296442688,
+                    "cost_usd": 2.9000000000000004,
+                    "display": "opus-4-7",
+                    "model": "claude-opus-4-7"
+                  },
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 42.68774703557312,
+                    "cost_usd": 2.16,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 116000,
+                "total_tokens": 836000
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-12",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-12",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-11",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-11",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-10",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-10",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-09",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-09",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 22.92,
+                "date": "2026-04-08",
+                "input_tokens": 3820000,
+                "intensity_bucket": 5,
+                "is_today": false,
+                "label": "04-08",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 22.92,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 764000,
+                "total_tokens": 4584000
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-07",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-07",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-06",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-06",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-05",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-05",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-04",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-04",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-03",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-03",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-04-02",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "04-02",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 21.12,
+                "date": "2026-04-01",
+                "input_tokens": 3520000,
+                "intensity_bucket": 4,
+                "is_today": false,
+                "label": "04-01",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 21.12,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 704000,
+                "total_tokens": 4224000
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-31",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-31",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-30",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-30",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-29",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-29",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-28",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-28",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-27",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-27",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-26",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-26",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 21.6,
+                "date": "2026-03-25",
+                "input_tokens": 3600000,
+                "intensity_bucket": 5,
+                "is_today": false,
+                "label": "03-25",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 21.6,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 720000,
+                "total_tokens": 4320000
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-24",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-24",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-23",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-23",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-22",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-22",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-21",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-21",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-20",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-20",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": null,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+                "date": "2026-03-19",
+                "input_tokens": 0,
+                "intensity_bucket": 0,
+                "is_today": false,
+                "label": "03-19",
+                "models": [],
+                "output_tokens": 0,
+                "total_tokens": 0
+              },
+              {
+                "cache_creation_tokens": 0,
+                "cache_hit_pct": 0.0,
+                "cache_read_tokens": 0,
+                "cost_usd": 19.32,
+                "date": "2026-03-18",
+                "input_tokens": 3220000,
+                "intensity_bucket": 3,
+                "is_today": false,
+                "label": "03-18",
+                "models": [
+                  {
+                    "chip": "sonnet",
+                    "cost_pct": 100.0,
+                    "cost_usd": 19.32,
+                    "display": "sonnet-4-6",
+                    "model": "claude-sonnet-4-6"
+                  }
+                ],
+                "output_tokens": 644000,
+                "total_tokens": 3864000
+              }
+            ]
+          },
           "monthly": {
             "rows": [
               {
@@ -7713,6 +8819,66 @@
           }
         },
         "projects": {
+          "aggregate": {
+            "rows": [
+              {
+                "cost_usd": 53.04000000000003,
+                "drillable": true,
+                "key": "project:ej3ZrEstgQ8uXiOeXaB5T9GnoEP9Kx-45FXeQbIRWJg",
+                "label": "project-2",
+                "sessions_count": 8,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 29.160000000000014,
+                "drillable": true,
+                "key": "project:Kowyn2-u3F902U1-YhaqJ-70wo8Ykw3T6MNlIs6qHqE",
+                "label": "project-1",
+                "sessions_count": 8,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 27.600000000000012,
+                "drillable": true,
+                "key": "project:i5LVk5Wlql-YS_de78WR3gZ6FcBbT6swfQaw6DKHypg",
+                "label": "project-3",
+                "sessions_count": 7,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 10.8,
+                "drillable": true,
+                "key": "project:YLgguix0XAncEMqWg01C7CKw9Rks3EVovZWiqmICzP8",
+                "label": "project-4",
+                "sessions_count": 6,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 7.383344849999999,
+                "drillable": true,
+                "key": "project:ZxPXO_YNX_r74EwoxWogrjMioulOWDmnrol58u7zEA8",
+                "label": "cache-heavy",
+                "sessions_count": 1,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 3.8709,
+                "drillable": true,
+                "key": "project:q4Nu0zmNsVpOjbz5rsNsWkGuR61wKrB4VFsENIzuDKM",
+                "label": "cache-waste",
+                "sessions_count": 1,
+                "source": "claude"
+              },
+              {
+                "cost_usd": 2.31,
+                "drillable": true,
+                "key": "project:C0M9cz7G-DSowXIR46PyDD-ppEf9EoVQ-xdvKiEYkfs",
+                "label": "fixture-demo",
+                "sessions_count": 1,
+                "source": "claude"
+              }
+            ]
+          },
           "current_week": {
             "rows": [
               {

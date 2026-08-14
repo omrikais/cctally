@@ -60,6 +60,37 @@ def fixture_timestamp_utc(value: str | dt.datetime) -> str:
     return parsed.astimezone(dt.timezone.utc).isoformat()
 
 
+def fixture_source_timestamp_z(value: dt.datetime) -> str:
+    """Return the ``Z``-suffixed UTC form used by SOURCE records, preserving
+    any fractional second.
+
+    Distinct from ``fixture_timestamp_utc`` by DESTINATION, not by style:
+
+    * ``fixture_timestamp_utc`` renders the ``+00:00`` spelling that cache
+      ingestion persists into ``*.timestamp_utc`` columns, which readers
+      compare lexically at window boundaries.
+    * This helper renders the ``Z`` spelling that source JSONL records,
+      journal events and snapshot columns carry.
+
+    It replaces a ``strftime("%Y-%m-%dT%H:%M:%SZ")`` form duplicated across
+    the fixture builders, which truncated microseconds and so disarmed any
+    boundary sentinel seeded one microsecond off a bound (#568, found in
+    #556 S2). Output is byte-identical to that older form whenever
+    ``value.astimezone(dt.timezone.utc).microsecond == 0``, so no committed
+    golden moves.
+
+    Deliberately narrower than ``fixture_timestamp_utc``: it takes no string,
+    because accepting one would let an already-truncated string pass through
+    unchanged, and it refuses a naive datetime rather than silently reading
+    it as host-local time.
+    """
+    if not isinstance(value, dt.datetime):
+        raise TypeError("fixture source timestamp must be a datetime")
+    if value.utcoffset() is None:
+        raise ValueError("fixture source timestamp must include a UTC offset")
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 # Bytes 96–99 of the SQLite header carry SQLITE_VERSION_NUMBER for the
 # library that last wrote the file (per https://www.sqlite.org/fileformat.html
 # — "library write version"). The field is informational only; SQLite

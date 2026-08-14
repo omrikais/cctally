@@ -273,6 +273,13 @@ export interface Prefs {
   // load (invalid → null). The former `historyPeriod` toggle pref is gone; a
   // stale key left in a user's saved prefs rides along harmlessly (never read).
   historySortOverride: SortOverride | null;
+  // #556 S2 §5.3 — PERIOD-KIND-SCOPED sort overrides. Weekly and monthly
+  // expose different columns (`historyColumns` gives weekly `Used %` and
+  // `$/1%`, monthly neither), so one shared override applied a sort chosen on
+  // one table to a table that may not have the column at all. `historySortOverride`
+  // above is RETIRED — kept in the type only so the load path can recognise and
+  // drop a persisted value; nothing reads it.
+  historySortOverrides: { week: SortOverride | null; month: SortOverride | null };
 }
 
 // Toast variant pattern (T8). The `status` shape is the legacy
@@ -630,6 +637,7 @@ export function defaultPrefs(): Prefs {
     // S8 (#254): first-open period is Day (matches the heatmap card +
     // its per-day deep-link); no table sort override by default.
     historySortOverride: null,
+    historySortOverrides: { week: null, month: null },
   };
 }
 
@@ -695,7 +703,19 @@ function loadInitial(): UIState {
       // S2 (#264): coerce the shared Weekly/Monthly table sort override
       // defensively (invalid persisted value → null). A retired `historyPeriod`
       // key left in saved prefs is tolerated — never read, no strip pass.
-      prefs.historySortOverride = coerceSortOverride(prefs.historySortOverride ?? null);
+      //
+      // #556 S2 §5.3: the shared override is RESET on migration rather than
+      // adopted into either scope. It carries no provenance — nothing records
+      // whether the user chose it on the weekly table or the monthly one — so
+      // adopting it would apply a sort to a table the user never asked.
+      prefs.historySortOverride = null;
+      const scoped = (prefs as unknown as {
+        historySortOverrides?: { week?: unknown; month?: unknown };
+      }).historySortOverrides;
+      prefs.historySortOverrides = {
+        week: coerceSortOverride((scoped?.week ?? null) as SortOverride | null),
+        month: coerceSortOverride((scoped?.month ?? null) as SortOverride | null),
+      };
       // Persist the cursor advancement immediately so a tab refresh
       // doesn't re-run the migration on every load.
       if (rawVersion !== migrated.newVersion) {
@@ -1142,7 +1162,10 @@ export type Action =
   // of truth, so a flip in `dashboard.cache_failure_markers` (CLI or another
   // tab's Save) takes effect on the next tick.
   | { type: 'INGEST_DASHBOARD_PREFS'; prefs: DashboardPrefs }
-  | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions' | 'projects' | 'history'; override: SortOverride | null }
+  // #556 S2 §5.3 — `periodKind` is required for `table: 'history'` and
+  // meaningless for the other three, which have one table each.
+  | { type: 'SET_TABLE_SORT'; table: 'trend' | 'sessions' | 'projects'; override: SortOverride | null }
+  | { type: 'SET_TABLE_SORT'; table: 'history'; periodKind: 'week' | 'month'; override: SortOverride | null }
   | { type: 'CLEAR_TABLE_SORTS' }
   // ---------- Update subcommand actions (spec §6) ----------
   // OPEN_UPDATE_MODAL / CLOSE_UPDATE_MODAL: badge click + Esc / X.
@@ -1976,15 +1999,22 @@ export function dispatch(action: Action): void {
       state = { ...state, dashboardPrefs: action.prefs };
       break;
     case 'SET_TABLE_SORT': {
-      const key =
-        action.table === 'trend'
-          ? 'trendSortOverride'
-          : action.table === 'projects'
-            ? 'projectsSortOverride'
-            : action.table === 'history'
-              ? 'historySortOverride'
-              : 'sessionsSortOverride';
-      const prefs = { ...state.prefs, [key]: action.override };
+      const prefs = action.table === 'history'
+        ? {
+            ...state.prefs,
+            historySortOverrides: {
+              ...state.prefs.historySortOverrides,
+              [action.periodKind]: action.override,
+            },
+          }
+        : {
+            ...state.prefs,
+            [action.table === 'trend'
+              ? 'trendSortOverride'
+              : action.table === 'projects'
+                ? 'projectsSortOverride'
+                : 'sessionsSortOverride']: action.override,
+          };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       const next = { ...state, prefs };
       // Header-click sort reorders rendered rows; indices must follow.
@@ -1998,7 +2028,9 @@ export function dispatch(action: Action): void {
         sessionsSortOverride: null,
         projectsSortOverride: null,
         // S8 (#254): the History table sort is part of the reset surface.
+        // #556 S2 §5.3: both period kinds, since they are now independent.
         historySortOverride: null,
+        historySortOverrides: { week: null, month: null },
       };
       localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
       const next = { ...state, prefs };

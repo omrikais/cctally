@@ -1,4 +1,7 @@
 import type {
+  AggregateOutcome,
+  AggregateQualification,
+  AggregateRange,
   AllSourceData,
   BlocksPanelRow,
   CacheReportEnvelope,
@@ -130,6 +133,81 @@ function compositionSources(selection: DashboardSelection): SourceName[] {
   return selection === 'all' ? ['claude', 'codex'] : [selection];
 }
 
+// #556 S2 §3.7 — the discriminated aggregate result.
+//
+// An adapter that can only return rows has no way to say "this could not be
+// computed", so a range problem reached the user as an empty table ("No usage
+// history yet") or as a broken instance ("restart the dashboard"). Neither is
+// true, and during a v5-server/v6-client overlap both are EXPECTED, because
+// the in-place update path deliberately leaves an old client talking to a
+// restarted server without reloading the JavaScript.
+//
+// `unavailable` is today's single-provider null-envelope state, kept exactly
+// as it is so the Claude and Codex tabs are untouched. `withheld` is the new
+// All-only state.
+export interface AggregateAvailable<T> {
+  state: 'available';
+  rows: T;
+  // Null on the two single-provider tabs, which are not ranked over a shared
+  // range at all, and on an All payload whose range did not resolve.
+  range: AggregateRange | null;
+  qualifications: AggregateQualification[];
+}
+
+export interface AggregateWithheld {
+  state: 'withheld';
+  // NOT a closed union on the client. The rendering switch needs a required
+  // fallback branch so an unknown code from a newer server renders generic
+  // copy instead of nothing.
+  code: string;
+  provider?: SourceName;
+}
+
+export type ProjectsPresentation =
+  | AggregateAvailable<ProjectPresentationRow[]>
+  | AggregateWithheld
+  | { state: 'unavailable' };
+
+export type DailyPresentation =
+  | AggregateAvailable<DailyPanelRow[]>
+  | AggregateWithheld;
+
+const ROWS_ABSENT: AggregateWithheld = { state: 'withheld', code: 'rows_absent' };
+
+function withheldFrom(outcome: AggregateOutcome & { state: 'withheld' }): AggregateWithheld {
+  // `provider` is omitted rather than set to undefined: a provider-scoped code
+  // names its provider and a non-provider code carries no such key at all, and
+  // the copy layer branches on presence.
+  return outcome.provider == null
+    ? { state: 'withheld', code: outcome.code }
+    : { state: 'withheld', code: outcome.code, provider: outcome.provider };
+}
+
+/**
+ * Resolve one aggregate's outcome, ahead of composing its rows.
+ *
+ * Returns the withheld result to publish, or `null` when the caller should go
+ * on to compose rows. Both `rows_absent` synthesis rules live here: a missing
+ * `aggregates` object (a v5 server, which cannot emit a code for a field it
+ * does not know about) and a malformed outcome slot.
+ */
+function aggregateOutcomeFor(
+  env: Envelope | null,
+  domain: 'projects' | 'daily',
+): { withheld: AggregateWithheld } | { available: AggregateAvailable<never>['qualifications'] } {
+  const aggregates = env?.sources?.all?.data?.aggregates;
+  const outcome = aggregates?.[domain];
+  if (aggregates == null || outcome == null || typeof outcome.state !== 'string') {
+    return { withheld: ROWS_ABSENT };
+  }
+  if (outcome.state === 'withheld') return { withheld: withheldFrom(outcome) };
+  return { available: outcome.qualifications ?? [] };
+}
+
+function aggregateRange(env: Envelope | null): AggregateRange | null {
+  return env?.sources?.all?.data?.aggregates?.range ?? null;
+}
+
 export function presentationProviders(
   env: Envelope | null,
   selection: DashboardSelection,
@@ -235,39 +313,6 @@ function codexPeriodRow(
   };
 }
 
-function recomputeModelPct(models: ModelCostRow[], total: number): ModelCostRow[] {
-  return models.map((model) => ({
-    ...model,
-    cost_pct: total > 0 ? (model.cost_usd / total) * 100 : 0,
-  }));
-}
-
-function mergePeriodRows(claudeRows: PeriodRow[], codexRows: PeriodRow[]): PeriodRow[] {
-  const merged = new Map<string, PeriodRow>();
-  for (const row of [...claudeRows, ...codexRows]) {
-    const old = merged.get(row.label);
-    if (!old) {
-      merged.set(row.label, { ...row, source: 'all', models: [...row.models] });
-      continue;
-    }
-    const cost = old.cost_usd + row.cost_usd;
-    merged.set(row.label, {
-      ...old,
-      source: 'all',
-      cost_usd: cost,
-      total_tokens: old.total_tokens + row.total_tokens,
-      input_tokens: old.input_tokens + row.input_tokens,
-      output_tokens: old.output_tokens + row.output_tokens,
-      cache_creation_tokens: old.cache_creation_tokens + row.cache_creation_tokens,
-      cache_read_tokens: old.cache_read_tokens + row.cache_read_tokens,
-      codex_tokens: undefined,
-      used_pct: null,
-      dollar_per_pct: null,
-      models: recomputeModelPct([...old.models, ...row.models], cost),
-    });
-  }
-  return [...merged.values()].sort((a, b) => b.label.localeCompare(a.label));
-}
 
 export function presentationPeriodRows(
   env: Envelope | null,
@@ -291,16 +336,23 @@ export function presentationPeriodRows(
         ? (row.cost_usd - allRows[index + 1].cost_usd) / allRows[index + 1].cost_usd
         : null,
     }));
-  if (selection === 'all' && period === 'weekly') {
-    const cap = PERIOD_HISTORY_CAP.weekly;
-    // Independent reset axes do not share a join key. Keep each provider's
-    // history intact and grouped; source-qualified keys carry identity through
-    // selection and sorting even when visible labels collide.
+  if (selection === 'all') {
+    // #556 S2 §5.1 — MONTHLY IS UNMERGED, so both period kinds take this
+    // branch. Independent reset axes do not share a join key. Keep each
+    // provider's history intact and grouped; source-qualified keys carry
+    // identity through selection and sorting even when visible labels collide.
+    //
+    // The deleted `mergePeriodRows` was the only production caller of a
+    // function with two behaviours that made the merge unsafe: it nulled
+    // `used_pct` and `dollar_per_pct` only when two rows COLLIDED on a label,
+    // so the same row kept or lost its quota figures depending on whether the
+    // other provider happened to have that month; and it recomputed one model
+    // split across two providers' families. #294 S5 §6.2 says buckets are
+    // never merged, and #312 §7.4 supersedes that for DAILY only.
+    const cap = PERIOD_HISTORY_CAP[period];
     return [...legacy.slice(0, cap), ...codex.slice(0, cap)];
   }
-  const rows = selection === 'all'
-    ? mergePeriodRows(legacy, codex)
-    : selection === 'codex' ? codex : legacy;
+  const rows = selection === 'codex' ? codex : legacy;
   return rows.slice(0, PERIOD_HISTORY_CAP[period]);
 }
 
@@ -387,19 +439,57 @@ function gapFillDailyRows(
   return [...shaped, ...extras].sort((a, b) => b.date.localeCompare(a.date));
 }
 
-export function presentationDailyRows(env: Envelope | null, selection: DashboardSelection): DailyPanelRow[] {
+export function presentationDailyRows(
+  env: Envelope | null,
+  selection: DashboardSelection,
+): DailyPresentation {
   const providers = presentationProviders(env, selection);
-  const claudeRows = selection === 'claude'
-    ? env?.daily?.rows ?? []
-    : providers.claude?.periods.daily.rows ?? [];
-  const codexRows = [...(providers.codex?.periods.daily.rows ?? [])]
+  // The `?? []` stays for the two single-provider tabs, whose output is
+  // byte-frozen. The All branch below requires the sibling to be PRESENT.
+  const codexRows = [...(providers.codex?.periods?.daily?.rows ?? [])]
     .sort((a, b) => b.label.localeCompare(a.label))
     .map(codexDailyRow);
-  if (selection === 'claude') return claudeRows.slice(0, DAILY_HISTORY_CAP);
-  const canonicalShape = env?.daily?.rows ?? [];
-  if (selection === 'codex') {
-    return intensityRows(gapFillDailyRows(codexRows, canonicalShape, 'codex')).slice(0, DAILY_HISTORY_CAP);
+  if (selection === 'claude') {
+    return {
+      state: 'available',
+      range: null,
+      qualifications: [],
+      rows: (env?.daily?.rows ?? []).slice(0, DAILY_HISTORY_CAP),
+    };
   }
+  if (selection === 'codex') {
+    // The Codex tab keeps reading the legacy top-level panel for its canonical
+    // shape (§6.3a leaves this branch alone); only the All path stops.
+    return {
+      state: 'available',
+      range: null,
+      qualifications: [],
+      rows: intensityRows(
+        gapFillDailyRows(codexRows, env?.daily?.rows ?? [], 'codex'),
+      ).slice(0, DAILY_HISTORY_CAP),
+    };
+  }
+
+  const outcome = aggregateOutcomeFor(env, 'daily');
+  if ('withheld' in outcome) return outcome.withheld;
+
+  // §6.3a — under All the Daily outcome owns its COMPLETE canonical row shape
+  // and the presentation layer must not consult `env.daily.rows`. A display-day
+  // rollover forces a full rebuild; if the source build then fails, the prior
+  // bundle is retained while a freshly built legacy panel sits in the new
+  // snapshot, and reshaping the retained rows against it would put days on
+  // screen that the published range does not cover.
+  // BOTH siblings are required, symmetrically with `presentationProjects`.
+  // §3.5.1 names the Codex daily rows a required sibling of this aggregate,
+  // and checking only Claude let an `available` outcome with a missing Codex
+  // data object publish a Claude-only series under the shared-range label with
+  // nothing saying Codex was absent — malformed data reported as honest
+  // emptiness, which is the exact failure §3.7 exists to prevent. An EMPTY
+  // Codex row list stays a zero leg; only a MISSING sibling withholds.
+  const claudeRows = providers.claude?.periods.daily_aggregate?.rows;
+  const codexDaily = providers.codex?.periods?.daily?.rows;
+  if (claudeRows == null || codexDaily == null) return ROWS_ABSENT;
+  const canonicalShape = claudeRows;
   const merged = new Map<string, DailyPanelRow>();
   for (const row of [...claudeRows, ...codexRows]) {
     const old = merged.get(row.date);
@@ -408,10 +498,6 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
       continue;
     }
     const cost = old.cost_usd + row.cost_usd;
-    // Claude input excludes cache reads while Codex input is cache-inclusive.
-    // All rows are merged Claude-first, then Codex, so combine the two native
-    // denominators without counting either provider's cached input twice.
-    const cacheEligibleInput = old.input_tokens + old.cache_read_tokens + row.input_tokens;
     merged.set(row.date, {
       ...old,
       source: 'all',
@@ -421,15 +507,69 @@ export function presentationDailyRows(env: Envelope | null, selection: Dashboard
       cache_creation_tokens: old.cache_creation_tokens + row.cache_creation_tokens,
       cache_read_tokens: old.cache_read_tokens + row.cache_read_tokens,
       total_tokens: old.total_tokens + row.total_tokens,
-      cache_hit_pct: cacheEligibleInput > 0
-        ? (old.cache_read_tokens + row.cache_read_tokens) / cacheEligibleInput * 100
-        : null,
+      // §6.1 — WITHHELD, not computed. Claude's ratio is cache-read over input
+      // plus cache creation and read; Codex's input is ALREADY cache-inclusive.
+      // No ratio over their sum describes anything, and the compensation this
+      // replaced ("combine the two native denominators") was arithmetic over a
+      // quantity that does not exist. `PeriodDetailCard` already null-gates the
+      // block, so it simply does not render — which also removes a live wrong
+      // call, `cacheVocabulary(row.source ?? 'claude')` selecting Claude's
+      // vocabulary for an `all` row.
+      cache_hit_pct: null,
       codex_tokens: undefined,
-      models: recomputeModelPct([...old.models, ...row.models], cost),
+      // §6.2 — no merged chip set. The deleted `recomputeModelPct` folded two
+      // providers' model families into one stack sharing one denominator,
+      // which is not a model split of anything. The drill-down renders chips
+      // per provider leg instead (`presentationDailyLegs`). Deleting the
+      // helper with its last caller is deliberate: `mergePeriodRows` was the
+      // other one, and it went in §5.1.
+      models: [],
     });
   }
   const combined = [...merged.values()].sort((a, b) => b.date.localeCompare(a.date));
-  return intensityRows(gapFillDailyRows(combined, canonicalShape)).slice(0, DAILY_HISTORY_CAP);
+  return {
+    state: 'available',
+    range: aggregateRange(env),
+    qualifications: outcome.available,
+    rows: intensityRows(
+      gapFillDailyRows(combined, canonicalShape),
+    ).slice(0, DAILY_HISTORY_CAP),
+  };
+}
+
+// #556 S2 §6.3 — the Daily drill-down breakdown.
+//
+// #312 §7.4 authorises All to aggregate compatible daily USD cost *provided
+// the drill-down preserves the provider breakdown*. This is that breakdown,
+// built client-side from rows already in the snapshot: no new request, no new
+// wire data. It also discharges D11 for Daily — the merged row carries no
+// per-provider attribution, so the detail has to.
+//
+// Both legs come from the SAME collections the merged row was built from: the
+// Claude bounded sibling (§6.3a) and the Codex native daily rows. A provider
+// with no activity on that date contributes `null` rather than a zero row, so
+// the detail can say "Codex had no activity" instead of showing a $0.00 leg
+// that looks like a measurement.
+export interface DailyProviderLegs {
+  claude: DailyPanelRow | null;
+  codex: DailyPanelRow | null;
+}
+
+export function presentationDailyLegs(
+  env: Envelope | null,
+  date: string | null | undefined,
+): DailyProviderLegs {
+  if (date == null || date === '') return { claude: null, codex: null };
+  const providers = presentationProviders(env, 'all');
+  const claude = (providers.claude?.periods.daily_aggregate?.rows ?? [])
+    .find((row) => row.date === date) ?? null;
+  const codex = (providers.codex?.periods.daily.rows ?? [])
+    .map(codexDailyRow)
+    .find((row) => row.date === date) ?? null;
+  return {
+    claude: claude == null ? null : { ...claude, source: 'claude' },
+    codex,
+  };
 }
 
 export interface TrendPresentation {
@@ -754,36 +894,16 @@ export interface ProjectPresentationRow {
   sessionsCount: number;
   firstSeenAt: string | null;
   lastSeenAt: string | null;
+  // #556 S2 §3.8a — whether the drill-down route resolves this row. A false
+  // row keeps its rank, its label and its cost and renders with NO drill
+  // affordance, rather than offering an interaction that 404s.
+  drillable: boolean;
 }
 
-export function presentationProjects(env: Envelope | null, selection: DashboardSelection): ProjectPresentationRow[] | null {
-  const providers = presentationProviders(env, selection);
-  const legacyClaudeRows = env?.projects?.current_week.rows ?? [];
-  const sourceClaudeRows = selection === 'claude'
-    ? legacyClaudeRows
-    : providers.claude?.projects.current_week.rows ?? [];
-  const claudeRows = sourceClaudeRows.map((row) => {
-    // The provider bundle keeps an opaque qualified key for drill-down, while
-    // the canonical Claude envelope owns the display label. Join the two
-    // projections by their identical accounting tuple so All never exposes an
-    // opaque project key as visible copy.
-    const display = selection === 'claude' ? row : legacyClaudeRows.find(
-      (candidate) => candidate.cost_usd === row.cost_usd
-        && candidate.sessions_count === row.sessions_count,
-    );
-    return {
-      key: row.key,
-      source: 'claude' as const,
-      label: display?.key ?? row.key,
-      cost: row.cost_usd ?? 0,
-      pct: row.attributed_pct ?? null,
-      sessionsCount: row.sessions_count ?? 0,
-      firstSeenAt: null,
-      lastSeenAt: null,
-    };
-  });
-  if (selection === 'claude') return env?.projects == null ? null : claudeRows;
-  const codexRows = providers.codex?.projects.rows.map((row) => ({
+function codexProjectRows(
+  providers: PresentationProviders,
+): ProjectPresentationRow[] {
+  return providers.codex?.projects.rows.map((row) => ({
     key: row.key,
     source: 'codex' as const,
     label: row.label,
@@ -792,11 +912,97 @@ export function presentationProjects(env: Envelope | null, selection: DashboardS
     sessionsCount: row.session_count,
     firstSeenAt: row.first_seen,
     lastSeenAt: row.last_seen,
+    // A Codex project key is a native identity its own detail route resolves;
+    // nothing narrows the population the way the Claude legacy envelope does.
+    drillable: true,
   })) ?? [];
-  if (selection === 'codex' && providers.codex?.projects == null) return null;
-  const rows = selection === 'all' ? [...claudeRows, ...codexRows] : codexRows;
+}
+
+function rankByCostShare(rows: ProjectPresentationRow[]): ProjectPresentationRow[] {
+  // §4.2 — the percentage is a SHARE OF COST, not a share of quota, and the
+  // panel legend names it as one. This applies to Codex as well as All: the
+  // recomputation was never All-specific.
   const total = rows.reduce((sum, row) => sum + row.cost, 0);
-  return rows.sort((a, b) => b.cost - a.cost).map((row) => ({ ...row, pct: total > 0 ? row.cost / total * 100 : null }));
+  return rows
+    .slice()
+    .sort((a, b) => b.cost - a.cost)
+    .map((row) => ({ ...row, pct: total > 0 ? row.cost / total * 100 : null }));
+}
+
+export function presentationProjects(
+  env: Envelope | null,
+  selection: DashboardSelection,
+): ProjectsPresentation {
+  const providers = presentationProviders(env, selection);
+
+  if (selection === 'claude') {
+    if (env?.projects == null) return { state: 'unavailable' };
+    // The Claude tab is untouched: legacy rows, legacy display keys, and
+    // `attributed_pct` as a share of the week's quota.
+    return {
+      state: 'available',
+      range: null,
+      qualifications: [],
+      rows: (env.projects.current_week.rows ?? []).map((row) => ({
+        key: row.key,
+        source: 'claude' as const,
+        label: row.key,
+        cost: row.cost_usd ?? 0,
+        pct: row.attributed_pct ?? null,
+        sessionsCount: row.sessions_count ?? 0,
+        firstSeenAt: null,
+        lastSeenAt: null,
+        drillable: true,
+      })),
+    };
+  }
+
+  if (selection === 'codex') {
+    if (providers.codex?.projects == null) return { state: 'unavailable' };
+    return {
+      state: 'available',
+      // The Codex ranking is bounded by the SAME shared range the aggregate
+      // publishes: §3.2 resolves one `shared_start` for the tick and sets the
+      // exclusive upper bound to `now_utc + 1µs` specifically because that is
+      // "what the Codex projects read already uses". So the tab can name its
+      // period instead of stating none, which is what it did once the header's
+      // `(N this week)` — never true for Codex — was removed.
+      range: aggregateRange(env),
+      qualifications: [],
+      rows: rankByCostShare(codexProjectRows(providers)),
+    };
+  }
+
+  const outcome = aggregateOutcomeFor(env, 'projects');
+  if ('withheld' in outcome) return outcome.withheld;
+
+  // §4.1 + §4.3 — the ranking reads the BOUNDED sibling, both providers folded
+  // over the same shared absolute range, and reads the published `label`
+  // directly. The deleted alternative joined the opaque provider rows to the
+  // legacy envelope by their `(cost_usd, sessions_count)` tuple and fell back
+  // to printing the opaque key whenever that search missed.
+  const claudeAggregate = providers.claude?.projects.aggregate?.rows;
+  const codexDomain = providers.codex?.projects;
+  if (claudeAggregate == null || codexDomain == null) return ROWS_ABSENT;
+
+  const claudeRows: ProjectPresentationRow[] = claudeAggregate.map((row) => ({
+    key: row.key,
+    source: 'claude' as const,
+    label: row.label,
+    cost: row.cost_usd,
+    pct: null,
+    sessionsCount: row.sessions_count,
+    firstSeenAt: null,
+    lastSeenAt: null,
+    drillable: row.drillable === true,
+  }));
+
+  return {
+    state: 'available',
+    range: aggregateRange(env),
+    qualifications: outcome.available,
+    rows: rankByCostShare([...claudeRows, ...codexProjectRows(providers)]),
+  };
 }
 
 export interface BlockPresentationRow extends BlocksPanelRow {
@@ -836,7 +1042,68 @@ export function presentationBlocks(env: Envelope | null, selection: DashboardSel
   const codex = (providers.codex?.quota.blocks ?? [])
     .filter((row) => row.window_minutes === 300)
     .map(codexBlock);
-  return selection === 'claude' ? claude : selection === 'codex' ? codex : [...claude, ...codex];
+  if (selection === 'claude') return claude;
+  if (selection === 'codex') return codex;
+  // #556 S2 §6.4 — one time-ordered list, not one provider's list stacked on
+  // the other's. `[...claude, ...codex]` put every Claude window above every
+  // Codex window regardless of when either happened, so a block from this
+  // morning could sit below one from last week. Both providers carry required
+  // bounds, so a real ordering exists.
+  //
+  // A STABLE merge: equal instants tie-break on source then opaque key, so the
+  // rendered order cannot flip between two snapshots that carry the same rows.
+  return [...claude, ...codex].sort((a, b) => {
+    const left = Date.parse(a.start_at);
+    const right = Date.parse(b.start_at);
+    const byTime = (Number.isNaN(right) ? 0 : right) - (Number.isNaN(left) ? 0 : left);
+    if (byTime !== 0) return byTime;
+    if (a.source !== b.source) return a.source < b.source ? -1 : 1;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
+}
+
+// #556 S2 §6.4 — what the combined blocks footer may say.
+//
+// The footer keeps its sum: the blocks contract requires it to equal the sum of
+// the DISPLAYED rows. Beside it go per-provider counts and costs, and coverage
+// stated as the interval the displayed rows actually span. It must never claim
+// continuous coverage or imply a shared reset cycle — the two providers run
+// independent five-hour clocks, which is why the panel's sub-label reads
+// "current provider cycles" in the plural.
+export interface BlocksFooterLeg {
+  source: SourceName;
+  label: 'Claude' | 'Codex';
+  count: number;
+  cost: number;
+}
+
+export function blocksFooterLegs(rows: BlockPresentationRow[]): BlocksFooterLeg[] {
+  return (['claude', 'codex'] as const).map((source) => {
+    const own = rows.filter((row) => row.source === source);
+    return {
+      source,
+      label: providerLabel(source),
+      count: own.length,
+      cost: own.reduce((sum, row) => sum + row.value, 0),
+    };
+  });
+}
+
+/** The interval the displayed rows span: earliest start to latest end. */
+export function blocksDisplayedSpan(
+  rows: BlockPresentationRow[],
+): { startAt: string; endAt: string } | null {
+  let startAt: string | null = null;
+  let endAt: string | null = null;
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    const from = Date.parse(row.start_at);
+    const to = Date.parse(row.end_at);
+    if (!Number.isNaN(from) && from < start) { start = from; startAt = row.start_at; }
+    if (!Number.isNaN(to) && to > end) { end = to; endAt = row.end_at; }
+  }
+  return startAt == null || endAt == null ? null : { startAt, endAt };
 }
 
 // #443 S2 — `presentationCacheDays` is DELETED. Its only two production

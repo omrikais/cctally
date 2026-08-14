@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_codex_session_entry,
     seed_codex_session_file,
 )
@@ -92,8 +93,8 @@ def _build_scenario(base: Path, model: str) -> None:
                 conn,
                 source_path=src,
                 line_offset=i,
-                timestamp_utc=(base_ts + dt.timedelta(minutes=i)).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
+                timestamp_utc=fixture_source_timestamp_z(
+                    base_ts + dt.timedelta(minutes=i)
                 ),
                 session_id="aaaa",
                 model=model,

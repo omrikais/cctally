@@ -11,7 +11,7 @@
 // `codex_bengalfox` 5h rows sit on the PRIMARY slot and Codex stopped emitting
 // standard 300-minute windows on 2026-07-12, so `find(w === 300)` resolves to
 // the foreign pool whenever the standard 5h history is absent.
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
@@ -137,8 +137,11 @@ describe('client 5h selectors ignore foreign quota pools', () => {
       updateSnapshot(env);
       dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' as DashboardSelection });
     });
-    render(<BlocksPanel />);
-    expect(screen.getByText('(optional 5h · current cycle)')).toBeInTheDocument();
+    const { container } = render(<BlocksPanel />);
+    // The scope statement is unchanged; #556 S2 QA moved it out of the h2 and
+    // onto the panel's wrapping sub-line, so it no longer carries parentheses.
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('optional 5h · current cycle');
   });
 
   it('CurrentWeekModal does not anchor the current 5h block on a foreign pool', () => {

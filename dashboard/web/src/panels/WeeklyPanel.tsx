@@ -17,6 +17,9 @@ import { presentationPeriodRows, presentationProviders } from '../lib/dashboardP
 import type { PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
 import { PeriodAccountChips } from '../components/PeriodAccountChips';
+import { providerLegs, weeklySpan } from '../lib/periodFooter';
+import { formatSpan } from '../lib/projectWindow';
+import { useDisplayTz } from '../hooks/useDisplayTz';
 
 // #264 S2 / #265 — the Weekly summary TILE (restored from the S8 collapse).
 // #293 S3 — below 900px (stack mode) the card previews the newest
@@ -84,6 +87,21 @@ export function WeeklyPanel() {
   const totalLabel = activeSource === 'claude' ? `${allRows.length}w` : `${allRows.length} ${rowNoun}`;
   const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
+  const display = useDisplayTz();
+  // §5.2 — the combined figure keeps its place and gains the two things that
+  // make it readable: the span it covers (exact dates, from the per-row bounds
+  // both providers already carry) and the provider split it is made of.
+  const legs = activeSource === 'all' ? providerLegs(allRows) : null;
+  // The end is CLAMPED to the snapshot instant. The current row's
+  // `week_end_at` is its reset, so the unclamped span named the coming
+  // Sunday — a date that has not happened — beside a combined cost.
+  const span = activeSource === 'all'
+    ? formatSpan(
+        weeklySpan(allRows),
+        { tz: display.resolvedTz, offsetLabel: display.offsetLabel },
+        { clampEndTo: env?.generated_at },
+      )
+    : null;
 
   const seen = useRef<Set<string>>(new Set());
   const [, forceRender] = useState(0);
@@ -110,7 +128,16 @@ export function WeeklyPanel() {
           <use href="/static/icons.svg#bar-chart" />
         </svg>
         <h2>
-          Weekly <span className="sub">(model split)</span>
+          Weekly{' '}
+          {/* The h2 keeps the short descriptor and nothing else. Measured at
+              390px with the composition appended: clientWidth 178 against
+              scrollWidth 246 under the mobile `white-space: nowrap` /
+              `text-overflow: ellipsis` rule, so it rendered "Weekly (model
+              split · by pro…" and cut away the composition — the one thing
+              §7.1 requires the All title to state. The composition moved to
+              `.panel-range-note` below, the wrapping full-width sub-line
+              Projects introduced. */}
+          <span className="sub">(model split)</span>
         </h2>
         <div className="panel-header-actions">
           <ShareIcon
@@ -126,6 +153,13 @@ export function WeeklyPanel() {
           <PanelGrip />
         </div>
       </div>
+      {/* §7.1 — the All composition, in the shipped `by provider` vocabulary.
+          Rows really are grouped into one section per provider here, so the
+          phrase describes the layout. A single-provider tab composes nothing,
+          so it gets no sub-line at all rather than an empty one. */}
+      {activeSource === 'all' && (
+        <div className="panel-range-note">by provider</div>
+      )}
       <div className="panel-body">
         {allRows.length === 0 ? (
           hydrating ? (
@@ -140,9 +174,16 @@ export function WeeklyPanel() {
                 key={group.source}
                 className="provider-summary-card source-provider-section weekly-provider-section"
                 data-provider-section={group.source}
-                aria-label={`${group.source === 'claude' ? 'Claude' : 'Codex'} weekly quota history`}
+                aria-labelledby={`weekly-panel-${group.source}-heading`}
               >
                 <div className="source-provider-head provider-composition-head">
+                  {/* #556 S4 F8 — the section is named by a real heading rather
+                      than a competing `aria-label` string. Visually hidden, and
+                      absolutely positioned, so it is out of flow and the head's
+                      flex `gap` does not grow. */}
+                  <h3 className="sr-only" id={`weekly-panel-${group.source}-heading`}>
+                    {group.source === 'claude' ? 'Claude' : 'Codex'} weekly quota history
+                  </h3>
                   <span className={`source-chip source-chip--${group.source}`}>
                     {group.source === 'claude' ? 'Claude' : 'Codex'}
                   </span>
@@ -204,6 +245,22 @@ export function WeeklyPanel() {
               {totalLabel} total
               <span className="sep" aria-hidden="true"> · </span>
               <span className="total">{fmt.usd2(total)}{activeSource === 'all' ? ' combined cost' : ''}</span>
+            </span>
+          )}
+          {legs && (
+            <span className="period-foot-attribution">
+              {span && (
+                <>
+                  <span className="period-foot-span">{span}</span>
+                  <span className="sep" aria-hidden="true"> · </span>
+                </>
+              )}
+              {legs.map((leg, index) => (
+                <span key={leg.source} className="period-foot-leg">
+                  {index > 0 && <span className="sep" aria-hidden="true"> · </span>}
+                  {leg.label} {fmt.usd2(leg.cost)}
+                </span>
+              ))}
             </span>
           )}
         </div>

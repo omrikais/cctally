@@ -5,8 +5,8 @@ import { presentationBlocks } from './dashboardPresentation';
 import { deriveVisiblePanelOrder } from './visiblePanelOrder';
 import { PANEL_REGISTRY } from './panelRegistry';
 
-/** 1-indexed: position 1 = the FIRST VISIBLE panel for the active source.
- *  Out-of-range (incl. addressing a hidden panel's slot) → no-op. */
+/** 1-indexed over the persisted ten-card order, which every source shares.
+ *  Out-of-range → no-op. */
 export function openPanelByPosition(position: number): void {
   // B2/B3 (#207): during loading/error the live panels aren't mounted
   // (snapshot == null). Don't let a global digit binding pop a panel modal
@@ -17,8 +17,9 @@ export function openPanelByPosition(position: number): void {
   if (s.snapshot == null) return;
   const env = getScopedSnapshot(s);
   if (env == null) return;
-  // #294 S5 §6.11 — digits address VISIBLE positions only, so a source-hidden
-  // panel is unreachable by digit.
+  // #556 S4 — no panel is source-hidden. deriveVisiblePanelOrder returns the
+  // persisted order unchanged for every source, so a digit addresses the same
+  // card on every tab. The seam is kept for a source that filters in future.
   const order = deriveVisiblePanelOrder(
     s.prefs.panelOrder,
     resolveSourceView(env, s.activeSource),

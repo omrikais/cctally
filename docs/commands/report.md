@@ -26,7 +26,10 @@ fabricated as zero.
 series in separate source sections. It has **no** `combined` trend, average,
 USD, token total, used percent, reset, or dollars-per-percent field: one Codex
 accounting interval can overlap multiple logical limits, so adding per-limit
-series would double count physical usage. `--speed` applies to Codex/all;
+series would double count physical usage. That refusal is specifically about
+**overlapping logical-limit series**, not about combining providers as such:
+the dashboard does publish a combined USD figure over one shared absolute range
+for its cross-provider rankings, which carry no per-limit series to overlap. `--speed` applies to Codex/all;
 `--week-start-name`, `--mode`, `--offline`, and `--project` are Claude-only
 options (they affect only the Claude leg of `all`); `--detail` remains
 source-native in both sections.

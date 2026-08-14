@@ -72,9 +72,16 @@ function CacheProviderSummary({
     <div
       className="source-provider-section provider-summary-card cache-provider-summary"
       data-provider-section={section.source}
-      aria-label={`${section.label} cache report`}
+      // #556 S4 F8 — this container is a plain `<div>`, so an accessible name
+      // on it named nothing: a generic element takes no name. `role="region"`
+      // is what makes the heading below resolve to a landmark.
+      role="region"
+      aria-labelledby={`cache-report-panel-${section.source}-heading`}
     >
       <div className="source-provider-head">
+        <h3 className="sr-only" id={`cache-report-panel-${section.source}-heading`}>
+          {section.label} cache report
+        </h3>
         <SourceChip source={section.source} />
         {section.status !== 'available' && (
           <span className="provider-section-status">{section.status}</span>

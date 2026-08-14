@@ -16,6 +16,7 @@ import { cardRegionClick } from '../lib/cardRegion';
 import { presentationPeriodRows, presentationProviders } from '../lib/dashboardPresentation';
 import type { PeriodRow } from '../types/envelope';
 import { modelChipStyle } from '../lib/model';
+import { monthLabelSpan, providerLegs } from '../lib/periodFooter';
 
 // #264 S2 / #265 — the Monthly summary TILE (restored from the S8 collapse).
 // #293 S3 — below 900px (stack mode) the card previews the newest
@@ -66,10 +67,40 @@ export function MonthlyPanel() {
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const allRows = presentationPeriodRows(env, activeSource, 'monthly');
   const mode = useContext(BoardModeContext);
-  const { visible, hiddenCount } = summarize(allRows, mode);
+  // #556 S2 §5.1 — Monthly is unmerged, so under All it renders one section
+  // per provider, the treatment `WeeklyPanel` already implements. Kept LOCAL
+  // rather than extracted: the two panels' rows, columns and footers differ,
+  // and Monthly has no `used_pct` / `$/1%` axis at all.
+  const providerGroups = activeSource === 'all'
+    ? (['claude', 'codex'] as const).map((source) => {
+        const rows = allRows.filter((row) => row.source === source);
+        return { source, rows, ...summarize(rows, mode) };
+      })
+    : null;
+  const singleSummary = summarize(allRows, mode);
+  const visible = providerGroups?.flatMap((group) => group.visible)
+    ?? singleSummary.visible;
+  const hiddenCount = providerGroups?.reduce(
+    (sum, group) => sum + group.hiddenCount, 0,
+  ) ?? singleSummary.hiddenCount;
   const total = allRows.reduce((sum, row) => sum + row.cost_usd, 0);
   const hydrating = presentationProviders(env, activeSource).hydrating;
   const reduced = useReducedMotion();
+  // §5.2 — the combined figure gains its span and its provider split. The span
+  // is a MONTH-LABEL span, not exact dates: monthly rows carry no bounds and
+  // the current-month read ends at `now_utc` rather than at the month's end,
+  // so exact dates would assert a boundary the data does not carry. The
+  // difference from Weekly is deliberate.
+  const legs = activeSource === 'all' ? providerLegs(allRows) : null;
+  const span = activeSource === 'all' ? monthLabelSpan(allRows) : null;
+  // Under All the row count is PROVIDER-months, not calendar months: Monthly
+  // is unmerged, so one calendar month contributes a row per provider. "10mo
+  // total" beside a span of "2026-01 – 2026-08" invited the reader to check
+  // 8 calendar months against 10 and find the panel wrong. Weekly already says
+  // "provider periods" for the same reason.
+  const totalLabel = activeSource === 'all'
+    ? `${allRows.length} provider ${allRows.length === 1 ? 'month' : 'months'}`
+    : `${allRows.length}mo`;
 
   const seen = useRef<Set<string>>(new Set());
   const [, forceRender] = useState(0);
@@ -96,7 +127,12 @@ export function MonthlyPanel() {
           <use href="/static/icons.svg#calendar" />
         </svg>
         <h2>
-          Monthly <span className="sub">(model split)</span>
+          Monthly{' '}
+          {/* Same treatment as Weekly, for the same measured reason: at 390px
+              the joined form had clientWidth 178 against scrollWidth 254 and
+              truncated the composition away. The descriptor stays here; the
+              composition renders on `.panel-range-note` below. */}
+          <span className="sub">(model split)</span>
         </h2>
         <div className="panel-header-actions">
           <ShareIcon
@@ -112,6 +148,11 @@ export function MonthlyPanel() {
           <PanelGrip />
         </div>
       </div>
+      {/* §7.1 — same composition statement as Weekly; §5.1 gave Monthly the
+          same per-provider sections. */}
+      {activeSource === 'all' && (
+        <div className="panel-range-note">by provider</div>
+      )}
       <div className="panel-body">
         {allRows.length === 0 ? (
           hydrating ? (
@@ -119,6 +160,41 @@ export function MonthlyPanel() {
           ) : (
             <div className="panel-empty">No usage history yet.</div>
           )
+        ) : providerGroups ? (
+          <div className="source-all-sections provider-composition provider-composition--panel">
+            {providerGroups.map((group) => (
+              <section
+                key={group.source}
+                className="provider-summary-card source-provider-section monthly-provider-section"
+                data-provider-section={group.source}
+                aria-labelledby={`monthly-panel-${group.source}-heading`}
+              >
+                <div className="source-provider-head provider-composition-head">
+                  {/* #556 S4 F8 — see WeeklyPanel: named by a real heading, not
+                      a competing `aria-label`; sr-only, so nothing moves. */}
+                  <h3 className="sr-only" id={`monthly-panel-${group.source}-heading`}>
+                    {group.source === 'claude' ? 'Claude' : 'Codex'} monthly history
+                  </h3>
+                  <span className={`source-chip source-chip--${group.source}`}>
+                    {group.source === 'claude' ? 'Claude' : 'Codex'}
+                  </span>
+                  <span className="provider-summary-label">
+                    {group.rows.length} {group.rows.length === 1 ? 'month' : 'months'}
+                  </span>
+                </div>
+                {group.visible.length === 0 ? (
+                  <div className="panel-source-empty">No monthly history yet.</div>
+                ) : group.visible.map((r) => (
+                  <Row
+                    key={keyOf(r, 'month')}
+                    r={r}
+                    isFirstMount={!seen.current.has(keyOf(r, 'month'))}
+                    reduced={reduced}
+                  />
+                ))}
+              </section>
+            ))}
+          </div>
         ) : (
           visible.map((r) => (
             <Row
@@ -157,9 +233,27 @@ export function MonthlyPanel() {
             </span>
           ) : (
             <span>
-              {allRows.length}mo total
+              {totalLabel} total
               <span className="sep" aria-hidden="true"> · </span>
-              <span className="total">{fmt.usd2(total)}</span>
+              <span className="total">
+                {fmt.usd2(total)}{activeSource === 'all' ? ' combined cost' : ''}
+              </span>
+            </span>
+          )}
+          {legs && (
+            <span className="period-foot-attribution">
+              {span && (
+                <>
+                  <span className="period-foot-span">{span}</span>
+                  <span className="sep" aria-hidden="true"> · </span>
+                </>
+              )}
+              {legs.map((leg, index) => (
+                <span key={leg.source} className="period-foot-leg">
+                  {index > 0 && <span className="sep" aria-hidden="true"> · </span>}
+                  {leg.label} {fmt.usd2(leg.cost)}
+                </span>
+              ))}
             </span>
           )}
         </div>

@@ -103,7 +103,9 @@ def test_codex_budget_axis_registered():
     the TS-present axes until then so Task 3 commits green."""
     m = _load("_lib_alert_axes")
     by_id = {d.id: d for d in m.AXIS_REGISTRY}
-    assert by_id["codex_budget"].chip_label == "CODEX"
+    # #556 S3 §4.3: the chip names the METRIC, not the vendor — attribution
+    # travels in the row's source chip, which under All reads "Codex".
+    assert by_id["codex_budget"].chip_label == "BUDGET"
     assert by_id["codex_budget"].title_label == "Codex budget"
     assert by_id["codex_budget"].milestone_table == "budget_milestones"
     assert by_id["codex_budget"].vendor == "codex"

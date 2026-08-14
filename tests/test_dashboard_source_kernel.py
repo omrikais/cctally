@@ -61,6 +61,7 @@ def _provider_state(
     period: bool = True,
     ingest_backlog: dict[str, object] | None = None,
     last_success_at: dt.datetime | None = dt.datetime(2026, 7, 16, tzinfo=UTC),
+    aggregate_scope: dict[str, object] | None = None,
 ) -> SourceDashboardState:
     """One provider state in the #556 S1 v5 shape.
 
@@ -105,6 +106,132 @@ def _provider_state(
             **({"ingest_backlog": ingest_backlog} if ingest_backlog else {}),
         },
         account_scope=account_scope,
+        aggregate_scope=aggregate_scope,
+    )
+
+
+# === #556 S2 — the v6 aggregate wire contract (spec §3.5.1) =================
+
+S2_RANGE_START = "2026-06-20T00:00:00Z"
+S2_RANGE_END = "2026-07-20T00:00:00Z"
+S2_RANGE = source_kernel.aggregate_range(S2_RANGE_START, S2_RANGE_END)
+
+
+def _aggregating_pair(**overrides):
+    """Two healthy providers whose rows were folded over ONE shared range."""
+    scope = source_kernel.build_aggregate_scope(S2_RANGE)
+    claude = _provider_state(
+        "claude", aggregate_scope=overrides.get("claude_scope", scope),
+        warnings=overrides.get("claude_warnings", ()),
+        availability=overrides.get("claude_availability", "ok"),
+        freshness=overrides.get("claude_freshness", "fresh"),
+    )
+    codex = _provider_state(
+        "codex", aggregate_scope=overrides.get("codex_scope", scope),
+        warnings=overrides.get("codex_warnings", ()),
+        availability=overrides.get("codex_availability", "ok"),
+        freshness=overrides.get("codex_freshness", "fresh"),
+    )
+    return claude, codex
+
+
+def test_all_source_publishes_exactly_one_aggregates_object():
+    """§3.5.1 — one public range, and it is on the All source only."""
+    claude, codex = _aggregating_pair()
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    aggregates = combined.data["aggregates"]
+    assert dict(aggregates["range"]) == S2_RANGE
+    assert aggregates["projects"]["state"] == "available"
+    assert aggregates["daily"]["state"] == "available"
+    # The outcome carries state and reason only — never rows.
+    assert "rows" not in aggregates["projects"]
+    assert "rows" not in aggregates["daily"]
+
+
+def test_no_provider_domain_carries_an_aggregate_range():
+    """The serializer emits `claude.data` under BOTH `sources.claude.data` and
+    `sources.all.data.providers.claude`, so a range inside a provider domain
+    would be published three times over."""
+    claude, codex = _aggregating_pair()
+    combined = source_kernel.compose_all_state(claude, codex)
+
+    for provider in ("claude", "codex"):
+        domain = combined.data["providers"][provider]
+        assert "range" not in domain, provider
+        for section in domain.values():
+            if isinstance(section, dict):
+                assert "range" not in section, provider
+    # The carrier itself never reaches `data` at all.
+    assert "aggregate_scope" not in claude.data
+    assert "aggregate_scope" not in combined.data
+
+
+def test_a_provider_specific_withheld_code_always_names_its_provider():
+    """§3.5.1 — provider-specific causes MUST name their provider, and
+    non-provider causes MUST NOT."""
+    claude, codex = _aggregating_pair(
+        codex_availability="unavailable", codex_freshness="stale",
+        codex_scope=None,
+    )
+    withheld = source_kernel.compose_all_state(
+        claude, codex,
+    ).data["aggregates"]["projects"]
+    assert withheld["code"] == "provider_unavailable"
+    assert withheld["provider"] == "codex"
+
+    mismatched = source_kernel.aggregate_range(
+        "2026-06-21T00:00:00Z", S2_RANGE_END,
+    )
+    claude, codex = _aggregating_pair(
+        codex_scope=source_kernel.build_aggregate_scope(mismatched),
+    )
+    non_provider = source_kernel.compose_all_state(
+        claude, codex,
+    ).data["aggregates"]["projects"]
+    assert non_provider["code"] == "retained_range_mismatch"
+    assert "provider" not in non_provider
+
+
+def test_aggregate_precedence_holds_when_two_causes_co_occur():
+    """Total precedence, in the order the code union is declared."""
+    failed_fold = source_kernel.build_aggregate_scope(
+        S2_RANGE,
+        {"projects": {"state": "failed", "code": "claude_fold_failed"}},
+    )
+    # A fold failure AND an unavailable sibling: unavailability outranks.
+    claude, codex = _aggregating_pair(
+        claude_scope=failed_fold,
+        codex_availability="unavailable", codex_freshness="stale",
+        codex_scope=None,
+    )
+    outcome = source_kernel.compose_all_state(
+        claude, codex,
+    ).data["aggregates"]["projects"]
+    assert outcome["code"] == "provider_unavailable"
+
+    # A fold failure alone withholds only its own aggregate.
+    claude, codex = _aggregating_pair(claude_scope=failed_fold)
+    aggregates = source_kernel.compose_all_state(claude, codex).data["aggregates"]
+    assert aggregates["projects"]["code"] == "claude_fold_failed"
+    assert aggregates["daily"]["state"] == "available"
+
+
+def test_the_aggregate_outcome_enters_the_all_version_material():
+    """§3.6 — otherwise a failed and a successful fold over the same signature
+    publish different rows under one `data_version`."""
+    ok_claude, ok_codex = _aggregating_pair()
+    failed_claude, failed_codex = _aggregating_pair(
+        claude_scope=source_kernel.build_aggregate_scope(
+            S2_RANGE,
+            {"projects": {"state": "failed", "code": "claude_fold_failed"}},
+        ),
+    )
+    assert (
+        source_kernel.compose_all_state(ok_claude, ok_codex).data_version
+        != source_kernel.compose_all_state(
+            failed_claude, failed_codex,
+        ).data_version
     )
 
 
@@ -448,18 +575,25 @@ def test_all_composition_reports_both_empty_as_successful_empty_data():
 
 
 def test_all_composition_exposes_a_source_tagged_stably_sorted_alert_union():
+    # #556 S3 §5.2: these rows previously carried a fabricated `created_at` on
+    # the Claude side, which no Claude writer produces. The union is ordered by
+    # `alerted_at`, so the rows now carry the field production actually writes:
+    # `alerted_at` alone on Claude, and `alerted_at` plus the equal-valued
+    # `created_at` compatibility alias on Codex.
     claude = _provider_state(
         "claude",
         alerts=(
-            {"source": "claude", "key": "claude-old", "created_at": "2026-07-16T09:00:00Z"},
-            {"source": "claude", "key": "claude-same", "created_at": "2026-07-16T10:00:00Z"},
+            {"source": "claude", "key": "claude-old", "alerted_at": "2026-07-16T09:00:00Z"},
+            {"source": "claude", "key": "claude-same", "alerted_at": "2026-07-16T10:00:00Z"},
         ),
     )
     codex = _provider_state(
         "codex",
         alerts=(
-            {"source": "codex", "key": "codex-same", "created_at": "2026-07-16T10:00:00Z"},
-            {"source": "codex", "key": "codex-new", "created_at": "2026-07-16T11:00:00Z"},
+            {"source": "codex", "key": "codex-same", "alerted_at": "2026-07-16T10:00:00Z",
+             "created_at": "2026-07-16T10:00:00Z"},
+            {"source": "codex", "key": "codex-new", "alerted_at": "2026-07-16T11:00:00Z",
+             "created_at": "2026-07-16T11:00:00Z"},
         ),
     )
 

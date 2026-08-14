@@ -55,6 +55,8 @@ from _cctally_core import (
 )
 from _lib_dashboard_sources import (
     SOURCE_SCHEMA_VERSION,
+    canonical_alerted_at as _canonical_alerted_at,
+    canonical_alerted_at_sql as _canonical_alerted_at_sql,
     dashboard_resource_key as _dashboard_resource_key,
 )
 from _lib_display_tz import _compute_display_block, format_display_dt
@@ -361,6 +363,16 @@ def _alert_account_resolver(conn: sqlite3.Connection):
     return fields
 
 
+# #556 S3 §2.3. Every per-axis mapper orders by the CANONICAL firing instant
+# before its ``LIMIT``, because that limit decides which rows exist downstream
+# and a row excluded there is unrecoverable. Two spellings of one instant
+# compare equal here; a nonzero offset — which the ``all-combined`` fixture
+# stores deliberately — orders by its true instant rather than by its
+# local-time text.
+_CANON_ALERTED_AT = _canonical_alerted_at_sql()
+_CANON_ALERTED_AT_M = _canonical_alerted_at_sql("m.alerted_at")
+
+
 def _envelope_rows_weekly(
     conn, descriptor, limit, severity_for, account_fields,
 ) -> list[dict]:
@@ -377,7 +389,7 @@ def _envelope_rows_weekly(
                alerted_at, cumulative_cost_usd, reset_event_id, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
+        ORDER BY {_CANON_ALERTED_AT} DESC
         LIMIT ?
         """,
         (limit,),
@@ -431,7 +443,7 @@ def _envelope_rows_five_hour(
           ON b.five_hour_window_key = m.five_hour_window_key
          AND b.account_key = m.account_key
         WHERE m.alerted_at IS NOT NULL
-        ORDER BY m.alerted_at DESC
+        ORDER BY {_CANON_ALERTED_AT_M} DESC
         LIMIT ?
         """,
         (limit,),
@@ -506,7 +518,7 @@ def _envelope_rows_budget_family(
                budget_usd, spent_usd, consumption_pct, account_key
         FROM {descriptor.milestone_table}
         WHERE vendor = ? AND alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
+        ORDER BY {_CANON_ALERTED_AT} DESC
         LIMIT ?
         """,
         (default_noun, vendor, limit),
@@ -572,7 +584,7 @@ def _envelope_rows_projected(
                denominator, crossed_at_utc, alerted_at, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
+        ORDER BY {_CANON_ALERTED_AT} DESC
         LIMIT ?
         """,
         (limit,),
@@ -629,7 +641,7 @@ def _envelope_rows_project_budget(
                consumption_pct, crossed_at_utc, alerted_at, account_key
         FROM {descriptor.milestone_table}
         WHERE alerted_at IS NOT NULL
-        ORDER BY alerted_at DESC
+        ORDER BY {_CANON_ALERTED_AT} DESC
         LIMIT ?
         """,
         (limit,),
@@ -858,11 +870,29 @@ def _build_alerts_envelope_array(
         ))
 
     # Python's list.sort is stable. When two alerts share the same
-    # `alerted_at` ISO string (rare; multiple axes firing within the same
-    # millisecond), the union order (weekly, then 5h, then budget, then
+    # `alerted_at` instant (rare; multiple axes firing within the same
+    # second), the union order (weekly, then 5h, then budget, then
     # projected) determines the tiebreaker — no extra deterministic key is
     # added because the spec doesn't require one.
-    out.sort(key=lambda a: a["alerted_at"], reverse=True)
+    #
+    # #556 S3 §2.3: the slice below is a truncation, so this re-sort compares
+    # instants rather than spellings. Each axis reaches here already ordered by
+    # its own canonical SQL expression, but the axes are merged raw, so two
+    # differently-spelled instants meet for the first time right here.
+    def _order_key(alert):
+        # A raise here empties the whole legacy array AND the Claude projection
+        # derived from it, so the diagnostic must name the offending row the way
+        # `_combined_alert_rows` does — otherwise the operator sees an empty
+        # panel and a message that identifies nothing.
+        try:
+            return _canonical_alerted_at(alert["alerted_at"])
+        except (KeyError, ValueError) as exc:
+            identity = alert.get("key") or alert.get("id")
+            raise ValueError(
+                f"alert row {identity!r} (axis {alert.get('axis')!r}): {exc}"
+            ) from exc
+
+    out.sort(key=_order_key, reverse=True)
     return out[:limit]
 
 
@@ -1270,21 +1300,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         }
 
     def _daily_row_to_dict(r: "DailyPanelRow") -> dict:
-        return {
-            "date":             r.date,
-            "label":            r.label,
-            "cost_usd":         r.cost_usd,
-            "is_today":         r.is_today,
-            "intensity_bucket": r.intensity_bucket,
-            "models":           list(r.models),
-            # ---- v2.3 additions ----
-            "input_tokens":          r.input_tokens,
-            "output_tokens":         r.output_tokens,
-            "cache_creation_tokens": r.cache_creation_tokens,
-            "cache_read_tokens":     r.cache_read_tokens,
-            "total_tokens":          r.total_tokens,
-            "cache_hit_pct":         r.cache_hit_pct,
-        }
+        # #556 S2 §6.3a: one owner for the daily row wire shape. The All-only
+        # `periods.daily_aggregate.rows` sibling publishes the same shape, and
+        # the client reads one shape whichever sibling produced it, so the
+        # dict is built in `_cctally_dashboard` and this renderer delegates.
+        return sys.modules["_cctally_dashboard"].daily_panel_row_to_wire(r)
 
     # Spec §2.7: empty state is `weekly.rows === []`, not `weekly === null`.
     # Always emit a `{rows: [...]}` envelope (possibly empty) so the panel

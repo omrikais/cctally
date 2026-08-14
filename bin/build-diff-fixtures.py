@@ -26,6 +26,7 @@ from _fixture_builders import (  # noqa: E402
     FIXED_LAST_INGESTED_AT,
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_session_entry,
     seed_session_file,
     seed_weekly_usage_snapshot,
@@ -37,7 +38,9 @@ FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/diff"
 # -- Helpers -----------------------------------------------------------------
 
 def _iso(ts: dt.datetime) -> str:
-    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Serialize a datetime as UTC-ISO with `Z` suffix, preserving any
+    fractional second (#568)."""
+    return fixture_source_timestamp_z(ts)
 
 
 def _seed_anchor(

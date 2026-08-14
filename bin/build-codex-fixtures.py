@@ -33,6 +33,7 @@ from _fixture_builders import (  # noqa: E402
     FIXED_LAST_INGESTED_AT,
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_codex_session_entry,
     seed_codex_session_file,
 )
@@ -46,8 +47,9 @@ CODEX_SESSION_DIR = FIXTURES_ROOT / "codex-session"
 
 
 def _iso(ts: dt.datetime) -> str:
-    """UTC-ISO 'Z'-suffixed timestamp, seconds precision."""
-    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """UTC-ISO 'Z'-suffixed timestamp, preserving any fractional
+    second (#568)."""
+    return fixture_source_timestamp_z(ts)
 
 
 def _iso_ms(ts: dt.datetime) -> str:

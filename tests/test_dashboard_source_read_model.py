@@ -3530,7 +3530,17 @@ def _build_tick_bundle(tui, stats, *, now_utc, prior_bundle=None):
         codex_ingest_contended=False,
         claude_cost_usd=0.0,
         claude_total_tokens=0,
-        common_range_start=now_utc - dt.timedelta(days=30),
+        # Resolved through the production helper rather than as a raw
+        # `now - 30 days`. Every production producer of this bound floors it to
+        # display-day midnight, and the resolved start is folded into each
+        # provider's version material at the exact granularity
+        # `compose_all_aggregates` compares it (#556 S2 §3.6). A bound that
+        # moved by thirty minutes between two ticks would therefore rebuild
+        # every provider on every tick, which is the opposite of the reuse
+        # these tests assert.
+        common_range_start=tui._tui_common_source_range_start(
+            (), now_utc=now_utc, display_tz=dt.timezone.utc,
+        ),
         prior_bundle=prior_bundle,
         raw_config=_TICK_CONFIG,
     )
@@ -4241,11 +4251,35 @@ S1_556_SCOPED_DELTAS = frozenset({
 })
 
 
+# #556 S2 — the v6 aggregate contract (spec §3.5.1, §3.9). New REQUIRED fields
+# appear on a v6 payload, which supersedes normal-payload byte identity for this
+# version exactly as S1's `legs` object did for v5. The set is fully qualified,
+# and each entry is a PREFIX because the additions are whole subtrees: an
+# `aggregates` object with a range and two outcomes, and two rows-only provider
+# siblings. Prefix matching is what keeps every leaf beneath them out of the
+# oracle without also un-watching `rows`, `range` or `state` anywhere else.
+S2_556_SCOPED_DELTA_PREFIXES = (
+    "sources.all.data.aggregates",
+    "sources.all.data.providers.claude.projects.aggregate",
+    "sources.all.data.providers.claude.periods.daily_aggregate",
+    "sources.claude.data.projects.aggregate",
+    "sources.claude.data.periods.daily_aggregate",
+)
+
+
+def _is_s2_556_delta(path):
+    return any(
+        path == prefix or path.startswith(prefix + ".")
+        or path.startswith(prefix + "[")
+        for prefix in S2_556_SCOPED_DELTA_PREFIXES
+    )
+
+
 def _is_allowed_delta(path):
     segments = path.split(".")
     if segments[-1] in ALLOWED_DELTAS:
         return True
-    if path in S1_556_SCOPED_DELTAS:
+    if path in S1_556_SCOPED_DELTAS or _is_s2_556_delta(path):
         return True
     return segments[-1] in CODEX_SCOPED_DELTAS and "codex" in segments
 # NOT a wire semantic: `data_version` embeds `current_generation()`, a
@@ -4375,6 +4409,7 @@ def _unexpected_claude_deltas(before_claude, after_claude):
         )
         if path.split(".")[-1] not in VOLATILE_FIELDS
         and path not in S1_556_SCOPED_DELTAS
+        and not _is_s2_556_delta(path)
     ]
 
 

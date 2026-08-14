@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
+    fixture_source_timestamp_z,
     seed_session_entry,
     seed_session_file,
 )
@@ -63,7 +64,9 @@ _AS_OF = dt.datetime(2026, 5, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
 
 
 def _iso(ts: dt.datetime) -> str:
-    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Serialize a datetime as UTC-ISO with `Z` suffix, preserving any
+    fractional second (#568)."""
+    return fixture_source_timestamp_z(ts)
 
 
 def _make_git_root(home: Path, rel: str) -> str:

@@ -4,6 +4,7 @@ import {
   alertDisplay,
   collectToastAlertRows,
   seedFormsForRow,
+  selectAlertRowsForView,
   selectSourceAlertRows,
   toastAlertId,
 } from './alertIdentity';
@@ -155,13 +156,13 @@ describe('selectSourceAlertRows — active-source projection for the panel', () 
     expect(selectSourceAlertRows(resolveSourceView(env, 'codex')).map(toastAlertId)).toEqual([
       'codex:alert:codex-budget-90',
     ]);
-    // All = the server-built union (both providers present, order is the
-    // server's created_at-desc; Claude legacy-field rows carry no created_at so
-    // they sort last). Assert set membership, not order.
-    const allSources = selectSourceAlertRows(resolveSourceView(env, 'all')).map((r) => r.source);
-    expect(allSources).toContain('claude');
-    expect(allSources).toContain('codex');
-    expect(allSources).toHaveLength(2);
+    // All = the server-built union, ordered by the canonical FIRING instant
+    // across both providers. #556 S3 §5.2: this used to assert set membership
+    // and explicitly decline to check order, which is why no client test could
+    // catch E1. The Claude row fired at 12:00Z on the 16th and the Codex row at
+    // 00:00Z on the 20th, so Codex is genuinely first.
+    const allRows = selectSourceAlertRows(resolveSourceView(env, 'all'));
+    expect(allRows.map((r) => r.source)).toEqual(['codex', 'claude']);
   });
 });
 
@@ -175,12 +176,13 @@ describe('alertDisplay — presentation adapter', () => {
     expect(d.severity).toBe('warn'); // threshold 90 → warn
     expect(d.whenIso).toBe('2026-04-16T12:00:00Z');
   });
-  it('Codex budget row → CODEX chip, threshold-derived severity, created_at', () => {
+  it('Codex budget row → BUDGET chip, threshold-derived severity, created_at', () => {
     const d = alertDisplay(codexBudgetRow);
     expect(d.source).toBe('codex');
     expect(d.sourceLabel).toBe('Codex');
     expect(d.chipClass).toBe('chip--codex_budget');
-    expect(d.chipLabel).toBe('CODEX');
+    // #556 S3 §4.2 — from AXIS_CHIP_LABEL, not from a hardcode beside it.
+    expect(d.chipLabel).toBe('BUDGET');
     expect(d.severity).toBe('warn');
     expect(d.whenIso).toBe('2026-04-20T00:00:00Z');
   });
@@ -189,5 +191,84 @@ describe('alertDisplay — presentation adapter', () => {
     expect(d.chipClass).toBe('chip--quota');
     expect(d.chipLabel).toBe('QUOTA');
     expect(d.severity).toBe('warn');
+  });
+});
+
+// #556 S3 §2.8 — one accessor, so the instant a row is ORDERED by and the
+// instant it PRINTS are the same value by construction rather than by two
+// independent choices that happened to agree.
+describe('alertDisplay — the firing instant is one accessor for both providers', () => {
+  // The two values differ here ON PURPOSE. In a v7 payload they are equal, so
+  // a test built from a real row cannot tell which field the accessor read —
+  // it would pass whether or not the accessor changed at all.
+  it('prefers alerted_at on a v7 Codex row', () => {
+    const row: SourceAlertRow = {
+      ...codexBudgetRow,
+      alerted_at: '2026-04-20T00:05:00Z',
+      created_at: '2026-04-19T00:00:00Z',
+    } as SourceAlertRow;
+    expect(alertDisplay(row).whenIso).toBe('2026-04-20T00:05:00Z');
+  });
+
+  it('prefers alerted_at on a v7 Codex quota row too', () => {
+    const row: SourceAlertRow = {
+      ...codexQuotaRow,
+      alerted_at: '2026-04-21T00:07:00Z',
+      created_at: '2026-04-19T00:00:00Z',
+    } as SourceAlertRow;
+    expect(alertDisplay(row).whenIso).toBe('2026-04-21T00:07:00Z');
+  });
+
+  it('falls back to created_at on a pre-v7 Codex row', () => {
+    expect(alertDisplay(codexBudgetRow).whenIso).toBe('2026-04-20T00:00:00Z');
+    expect(alertDisplay(codexQuotaRow).whenIso).toBe('2026-04-21T00:00:00Z');
+  });
+
+  it('orders by the same instant it prints, for both providers', () => {
+    const rows: SourceAlertRow[] = [
+      { ...codexBudgetRow, alerted_at: '2026-04-16T11:00:00Z' } as SourceAlertRow,
+      claudeRow,
+    ];
+    const printed = rows.map((row) => alertDisplay(row).whenIso);
+    const ordered = [...rows]
+      .sort((a, b) => Date.parse(alertDisplay(b).whenIso ?? '') - Date.parse(alertDisplay(a).whenIso ?? ''))
+      .map((row) => alertDisplay(row).whenIso);
+    expect(printed).toEqual(['2026-04-16T11:00:00Z', '2026-04-16T12:00:00Z']);
+    expect(ordered).toEqual(['2026-04-16T12:00:00Z', '2026-04-16T11:00:00Z']);
+  });
+});
+
+describe('selectAlertRowsForView (§3.3)', () => {
+  it('reads the active source projection whenever a bundle exists', () => {
+    const claude = makeClaudeSourceEntry({
+      data: {
+        ...makeClaudeSourceData(),
+        alerts: { rows: [claudeRow] as unknown as Record<string, unknown>[] },
+      },
+    });
+    const codex = makeCodexSourceEntry();
+    const all = makeAllSourceEntry(claude, codex);
+    const env = bundleWith({ sources: { claude, codex, all } });
+    const legacy: SourceAlertRow[] = [
+      { ...claudeRow, id: 'legacy-only', key: 'legacy-only' } as SourceAlertRow,
+    ];
+    const rows = selectAlertRowsForView(
+      resolveSourceView(env, 'claude'), legacy, true,
+    );
+    // The populated-legacy preference is GONE: a bundle wins even when the
+    // legacy array has rows of its own.
+    expect(rows.map((r) => (r as { id?: string }).id)).toEqual([
+      'weekly:2026-04-13:90:0',
+    ]);
+  });
+
+  it('falls back to the legacy array only when there is no bundle', () => {
+    const legacy: SourceAlertRow[] = [
+      { ...claudeRow, id: 'legacy-only' } as SourceAlertRow,
+    ];
+    const rows = selectAlertRowsForView(
+      resolveSourceView(null, 'claude'), legacy, false,
+    );
+    expect(rows.map((r) => (r as { id?: string }).id)).toEqual(['legacy-only']);
   });
 });

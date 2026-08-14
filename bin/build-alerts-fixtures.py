@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_session_entry,
     seed_session_file,
     seed_week_reset_event,
@@ -64,8 +65,8 @@ DEFAULT_AS_OF = "2026-04-29T14:30:00Z"
 # Active subscription week (Mon-Mon). resets_at = the Monday-end UTC epoch.
 WEEK_START = dt.datetime(2026, 4, 27, 14, 0, 0, tzinfo=dt.timezone.utc)
 WEEK_END = WEEK_START + dt.timedelta(days=7)
-WEEK_START_ISO = WEEK_START.strftime("%Y-%m-%dT%H:%M:%SZ")
-WEEK_END_ISO = WEEK_END.strftime("%Y-%m-%dT%H:%M:%SZ")
+WEEK_START_ISO = fixture_source_timestamp_z(WEEK_START)
+WEEK_END_ISO = fixture_source_timestamp_z(WEEK_END)
 WEEK_START_DATE = WEEK_START.date().isoformat()
 WEEK_END_DATE = WEEK_END.date().isoformat()
 RESETS_AT_EPOCH = int(WEEK_END.timestamp())  # what record-usage --resets-at expects
@@ -78,7 +79,9 @@ FIVE_H_RESETS_AT_EPOCH = int(FIVE_H_RESETS_AT.timestamp())
 
 
 def _iso(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Serialize a datetime as UTC-ISO with `Z` suffix, preserving any
+    fractional second (#568)."""
+    return fixture_source_timestamp_z(d)
 
 
 def _add_alerted_at_columns(stats_db: Path) -> None:

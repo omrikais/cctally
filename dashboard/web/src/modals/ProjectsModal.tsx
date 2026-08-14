@@ -39,6 +39,7 @@ import { costClass } from '../lib/cost';
 import { applyTableSort } from '../lib/tableSort';
 import { PROJECTS_COLUMNS, type ProjectsTableRow } from '../lib/projectsColumns';
 import { presentationProjects } from '../lib/dashboardPresentation';
+import { withheldMessage } from '../lib/withheldCopy';
 import type { DashboardSelection, SourceName } from '../types/envelope';
 
 // Mobile sort-cycle pill (≤640w). Mirrors PROJECTS_COLUMNS ids and
@@ -68,10 +69,23 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
   // #416 — the expansion of a scoped panel stays scoped (see `useScopedSnapshot`).
   const env = useScopedSnapshot(source);
   const isClaude = source === 'claude';
-  const sourceRows = useMemo(
+  // #556 S2 §3.7 — the adapter returns a discriminated outcome, and this modal
+  // renders all three states: `available` supplies rows, `withheld` gets its
+  // own copy naming the missing fact (see `withheldCopy` below and the ranked-
+  // bars fallback), and `unavailable` keeps the existing copy.
+  const sourceResult = useMemo(
     () => (isClaude ? null : presentationProjects(env, source)),
     [env, isClaude, source],
   );
+  const sourceRows = sourceResult != null && sourceResult.state === 'available'
+    ? sourceResult.rows
+    : null;
+  // §3.7 — a withheld aggregate names the missing fact instead of falling to
+  // the generic "attribution unavailable" copy, which reads as a broken
+  // instance.
+  const withheldCopy = sourceResult != null && sourceResult.state === 'withheld'
+    ? withheldMessage(sourceResult, 'ranking')
+    : null;
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const projectKey = useSyncExternalStore(subscribeStore, () => getState().openProjectKey);
@@ -457,7 +471,9 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
           />
         ) : (
           <div className="projects-ranked panel-empty m-unavailable" data-testid="projects-ranked-bars">
-            {sourceRows == null ? 'Project attribution unavailable.' : 'No project activity in this source window.'}
+            {withheldCopy ?? (sourceRows == null
+              ? 'Project attribution unavailable.'
+              : 'No project activity in this source window.')}
           </div>
         )}
 

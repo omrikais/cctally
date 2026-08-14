@@ -7,7 +7,7 @@ import {
   alertAccount,
   alertDisplay,
   filterAlertRowsForAccount,
-  selectSourceAlertRows,
+  selectAlertRowsForView,
   toastAlertId,
 } from '../lib/alertIdentity';
 import { VENDOR_WIDE_ACCOUNT, type AccountCard, type SourceAlertRow } from '../types/envelope';
@@ -27,10 +27,12 @@ import { AlertsEmptyGauge } from './AlertsEmptyGauge';
 // the open-modal handler doesn't fire on the same gesture.
 //
 // #294 S5 §6.7 — the panel is source-aware. It reads the ACTIVE source's alert
-// projection through the seam (`selectSourceAlertRows`), never the legacy
-// top-level array. On a pre-S4 envelope (no `sources` bundle) it falls back to
-// the legacy `state.alerts` (wrapped as Claude rows) so older servers and unit
-// tests keep working; Claude-mode rendering is value-identical either way.
+// projection through the shared seam (`selectAlertRowsForView`), never the
+// legacy top-level array. On a pre-S4 envelope (no `sources` bundle) it falls
+// back to the legacy `state.alerts` (wrapped as Claude rows) so older servers
+// and unit tests keep working. #556 S3 §3.2: the Claude projection is that
+// legacy array filtered by ownership — a SUBSET, not an equal — and it
+// preserves every field of the rows it keeps.
 export function RecentAlertsPanel(): JSX.Element {
   const env = useScopedSnapshot();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
@@ -48,17 +50,12 @@ export function RecentAlertsPanel(): JSX.Element {
     source: 'claude' as const,
     key: a.id,
   }));
-  // #294 S5 §6.7 / §5.2 — Codex + All read the source projection. Claude reads
-  // the legacy top-level projection when populated (the §5.2 Claude legacy-
-  // compatible view — value-identical to the source projection in production,
-  // which mirrors both), else the source projection. A pre-S4 envelope (no
-  // bundle) always uses the legacy rows.
-  const allRows: SourceAlertRow[] =
-    !hasBundle
-      ? claudeLegacyRows
-      : activeSource === 'claude' && claudeLegacyRows.length > 0
-        ? claudeLegacyRows
-        : selectSourceAlertRows(view);
+  // #556 S3 §3.1/§3.3 — one shared selector for the panel and the modal.
+  // Whenever a bundle exists the active source's OWN projection is read; the
+  // legacy top-level array is the pre-bundle fallback only.
+  const allRows: SourceAlertRow[] = selectAlertRowsForView(
+    view, claudeLegacyRows, hasBundle,
+  );
   const rowsCarryAccounts = allRows.some((row) => alertAccount(row) != null);
   const accountScoped = scope.accountKey != null
     || (scope.requestedKey != null && rowsCarryAccounts);
@@ -187,6 +184,16 @@ export function RecentAlertsPanel(): JSX.Element {
           <PanelGrip />
         </div>
       </div>
+      {/* #556 S3 §4.6 — a SIBLING of `.panel-header`, never inside it: the
+          S2 CSS contract gives this element full card width and lets it wrap,
+          which is how it stays readable at 390px. Placed inside the header it
+          would compete with the header actions for a nowrap row, which is
+          exactly how S2's own 390px defect arose. Gated on `activeSource ===
+          'all'` EXPLICITLY rather than on a negated Claude check, because S2
+          shipped a bug where the else-branch also caught Codex. */}
+      {activeSource === 'all' && (
+        <div className="panel-range-note">Both providers, newest first</div>
+      )}
       <div className="panel-body" id="panel-alerts-body">
         {alerts.length === 0 ? (
           <AlertsEmptyGauge

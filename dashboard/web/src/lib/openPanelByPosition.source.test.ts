@@ -99,17 +99,23 @@ describe('openPanelByPosition — source-bound non-Claude interactions', () => {
   });
 
   it('All: the Blocks position uses the canonical modal for a Claude-backed row', () => {
+      // #556 S2 §6.4 — the blocks list interleaves chronologically now, and
+      // the "open the active block" affordance takes the FIRST DISPLAYED
+      // active row. The fixture's Codex five-hour window starts 13:00, so the
+      // Claude block under test starts later than it: this case is about
+      // ROUTING a Claude-backed row through the canonical modal, and it must
+      // not silently become a test of which provider happens to sort first.
     const env = structuredClone(fixture) as unknown as Envelope;
     env.sources!.claude.data!.quota.blocks = [{
       key: 'opaque:server-issued-block-key',
       source: 'claude',
-      start_at: '2026-04-24T08:00:00Z',
-      end_at: '2026-04-24T13:00:00Z',
+      start_at: '2026-04-24T18:00:00Z',
+      end_at: '2026-04-24T23:00:00Z',
       anchor: 'recorded',
       is_active: true,
       cost_usd: 4.2,
       models: [],
-      label: '08:00 Apr 24 UTC',
+      label: '18:00 Apr 24 UTC',
     }];
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
@@ -117,7 +123,7 @@ describe('openPanelByPosition — source-bound non-Claude interactions', () => {
     openPanelByPosition(8);
 
     expect(getState().openModal).toBe('block');
-    expect(getState().openBlockStartAt).toBe('2026-04-24T08:00:00Z');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T18:00:00Z');
     expect(getState().openSourceDetail).toBeNull();
   });
 

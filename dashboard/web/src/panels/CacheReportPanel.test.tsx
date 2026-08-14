@@ -545,6 +545,31 @@ describe('<CacheReportPanel /> #443 S1 provider status in single-source view', (
 });
 
 describe('<CacheReportPanel /> #443 S1 all-mode summary', () => {
+  // #556 S4 F8 — see WeeklyPanel.test.tsx for the rule this asserts. This
+  // surface additionally needs `role="region"`, because its section container
+  // is a plain `<div>`: an `aria-label` or `aria-labelledby` on a generic
+  // element names nothing, so without the role the heading would resolve to an
+  // element with no landmark to name.
+  it('names each provider section by its own heading and exposes a region (#556 S4)', () => {
+    updateSnapshot(withCodexSection(thinBaselineNetNegativeCacheReport()));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<CacheReportPanel />);
+    const sections = container.querySelectorAll('[data-provider-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      expect(s.getAttribute('role')).toBe('region');
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      expect(s.getAttribute('aria-label')).toBeNull();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(/^(Claude|Codex) cache report$/);
+    });
+    const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
   it('applies the insufficient gate in the all-mode summary', () => {
     // Thin baseline + net_negative: the panel says Building baseline, so the
     // all-mode summary must not say anomaly for the same data (#443 F6).

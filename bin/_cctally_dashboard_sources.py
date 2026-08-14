@@ -37,6 +37,8 @@ from _lib_dashboard_sources import (
     SourceDashboardState,
     SourceDashboardWarning,
     assess_codex_projection_coherence,
+    canonical_alerted_at,
+    canonical_alerted_at_sql,
     dashboard_resource_key,
 )
 from _lib_quota import (
@@ -860,6 +862,33 @@ _RESOURCE_ROWS = {
     "block": ("quota", "blocks"),
 }
 
+# #556 S2: additional collections a resource may ALSO be routed through.
+#
+# The primary above stays the capability gate — its absence is still
+# `SourceCapabilityUnavailable`. These are searched only after the primary
+# misses, and their own absence is an ordinary not-found rather than a
+# capability failure, because a provider legitimately need not publish them (a
+# Codex source has no aggregate sibling, and a Claude source whose bounded fold
+# failed publishes none either).
+#
+# Projects needs one because `projects.rows` is the current SUBSCRIPTION WEEK
+# while `projects.aggregate.rows` is folded over the thirty-day shared range.
+# Without this the aggregate ranking would publish rows the drill-down route
+# answers 404 for — in the committed `all-combined` fixture, four of six.
+_RESOURCE_EXTRA_ROWS: Mapping[str, tuple[tuple[str, ...], ...]] = MappingProxyType({
+    "project": (("projects", "aggregate", "rows"),),
+})
+
+
+def _rows_at(data: Mapping, path: "tuple[str, ...]") -> "list | tuple":
+    """Read one optional nested rows collection, or an empty tuple."""
+    node: object = data
+    for step in path:
+        if not isinstance(node, Mapping):
+            return ()
+        node = node.get(step)
+    return node if isinstance(node, (list, tuple)) else ()
+
 
 def _public_copy(value: object) -> object:
     """Detach a bounded source row from its immutable published state."""
@@ -910,6 +939,21 @@ def source_detail_lookup(
         row for row in rows
         if isinstance(row, Mapping) and row.get("key") == key
     ]
+    if not key_matches:
+        # Only after the primary collection misses, so every key that resolves
+        # today keeps resolving to the same row. The account-ownership branch
+        # below does NOT see an unchanged candidate set — a key that resolves
+        # only here reaches it as a row the primary collection never carried.
+        # That leaks nothing, because an aggregate row carries no
+        # `account_key` and the ownership check refuses a row it cannot
+        # attribute, but the set is genuinely wider than it was.
+        for path in _RESOURCE_EXTRA_ROWS.get(resource, ()):
+            key_matches = [
+                row for row in _rows_at(data, path)
+                if isinstance(row, Mapping) and row.get("key") == key
+            ]
+            if key_matches:
+                break
     if not key_matches:
         raise SourceResourceNotFound()
     if account is not None:
@@ -2430,6 +2474,12 @@ def refresh_codex_source_clock(
         # combined figure fail closed on an idle tick that changed nothing else.
         account_scope=state.account_scope,
         private_session_labels=state.private_session_labels,
+        # #556 S2 §3.6: the aggregate carrier travels with the rows it
+        # describes. This clock refreshes presentation axes only and publishes
+        # the SAME rows, so it must carry the range that bounded them —
+        # dropping it here would withhold the aggregate on any idle tick whose
+        # clock moved.
+        aggregate_scope=state.aggregate_scope,
     )
     return state if refreshed_state == state else refreshed_state
 
@@ -2475,39 +2525,55 @@ def _alerts_wire(
             "accountLabel": label,
         }
 
+    # #556 S3 §2.1/§2.4: the firing instant is what this wire filters on, what
+    # the panel orders by and what it prints, so it is what every leg selects,
+    # orders by and publishes. Two legs previously ordered, truncated and
+    # published the CROSSING instant instead, which is a different moment: a
+    # row that fired most recently but crossed longest ago was dropped at the
+    # LIMIT and never reached the panel at all. `created_at` stays as an
+    # equal-valued compatibility alias for a client reading a pre-v7 envelope.
+    canon = canonical_alerted_at_sql()
+
+    def _instants(raw: object) -> dict[str, str]:
+        value = canonical_alerted_at(raw)
+        return {"alerted_at": value, "created_at": value}
+
     try:
-        for period, threshold, consumption_pct, crossed_at, account_key in stats_conn.execute(
-            "SELECT period, threshold, consumption_pct, crossed_at_utc, account_key "
+        for period, threshold, consumption_pct, crossed_at, alerted_at, account_key in stats_conn.execute(
+            "SELECT period, threshold, consumption_pct, crossed_at_utc, alerted_at, account_key "
             "FROM budget_milestones WHERE vendor='codex' AND alerted_at IS NOT NULL "
-            "ORDER BY crossed_at_utc DESC, threshold DESC LIMIT ?",
+            f"ORDER BY {canon} DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
         ):
             rows.append({
+                # The resource key keeps the crossing instant it has always
+                # carried: it is an opaque identity, and re-keying every
+                # historical Codex alert row is not this session's change.
                 "key": dashboard_resource_key("alert", "codex", "codex_budget", period, threshold, crossed_at),
                 "source": "codex",
                 "axis": "codex_budget", "period": period, "threshold": threshold,
-                "value": consumption_pct, "created_at": crossed_at,
+                "value": consumption_pct, **_instants(alerted_at),
                 **_account(account_key),
             })
-        for period, threshold, projected_value, crossed_at, account_key in stats_conn.execute(
-            "SELECT period, threshold, projected_value, crossed_at_utc, account_key "
+        for period, threshold, projected_value, crossed_at, alerted_at, account_key in stats_conn.execute(
+            "SELECT period, threshold, projected_value, crossed_at_utc, alerted_at, account_key "
             "FROM projected_milestones WHERE metric='codex_budget_usd' AND alerted_at IS NOT NULL "
-            "ORDER BY crossed_at_utc DESC, threshold DESC LIMIT ?",
+            f"ORDER BY {canon} DESC, threshold DESC LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
         ):
             rows.append({
                 "key": dashboard_resource_key("alert", "codex", "projected", period, threshold, crossed_at),
                 "source": "codex",
                 "axis": "projected", "period": period, "threshold": threshold,
-                "value": projected_value, "created_at": crossed_at,
+                "value": projected_value, **_instants(alerted_at),
                 **_account(account_key),
             })
         for (root_key, logical_key, observed_slot, window_minutes, resets_at,
-             threshold, severity, created_at, account_key) in stats_conn.execute(
+             threshold, severity, created_at, alerted_at, account_key) in stats_conn.execute(
             "SELECT source_root_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, "
-            "threshold, severity, created_at_utc, account_key FROM quota_threshold_events "
+            "threshold, severity, created_at_utc, alerted_at, account_key FROM quota_threshold_events "
             "WHERE source='codex' AND disposition='alerted' AND orphaned_at IS NULL "
-            "ORDER BY created_at_utc DESC, source_root_key, logical_limit_key, observed_slot, threshold "
+            f"ORDER BY {canon} DESC, source_root_key, logical_limit_key, observed_slot, threshold "
             "LIMIT ?",
             (SOURCE_HISTORY_LIMIT,),
         ):
@@ -2518,14 +2584,14 @@ def _alerts_wire(
                 ),
                 "source": "codex",
                 "axis": "quota", "threshold": threshold, "severity": severity,
-                "created_at": created_at,
+                **_instants(alerted_at),
                 **_account(account_key),
             })
     except sqlite3.Error:
         return ()
     return tuple(sorted(
         rows,
-        key=lambda item: str(item.get("created_at") or ""),
+        key=lambda item: canonical_alerted_at(item["alerted_at"]),
         reverse=True,
     )[:SOURCE_HISTORY_LIMIT])
 

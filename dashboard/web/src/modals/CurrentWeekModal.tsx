@@ -282,11 +282,21 @@ function WeekNavChip({
   pillText,
   accentClass,
   singleId,
+  unitNoun,
 }: {
   nav: MilestoneNav;
   pillText: string;
   accentClass: string;
   singleId: (v: string) => string | undefined;
+  // #556 S4 — the unit this navigator steps through, used verbatim in the two
+  // buttons' accessible names. Claude navigates subscription WEEKS and Codex
+  // navigates reset-defined quota CYCLES, which its own pill, title and chip
+  // all call cycles; the shared chip previously said "week" for both, so a
+  // screen reader heard a Claude concept on the Codex section. Required rather
+  // than defaulted, so a new call site has to state which unit it steps, and
+  // passed explicitly rather than derived from the accent class or the
+  // provider string.
+  unitNoun: string;
 }) {
   const { index, weekKey, setWeekKey } = nav;
   const olderTarget = stepWeek(index, weekKey, 1);
@@ -300,7 +310,7 @@ function WeekNavChip({
       <button
         type="button"
         className={`m-pill ${accentClass} mcw-weeknav-btn`}
-        aria-label="Older week"
+        aria-label={`Older ${unitNoun}`}
         disabled={!canOlder}
         onClick={() => { if (olderTarget != null) setWeekKey(olderTarget); }}
       >
@@ -310,7 +320,7 @@ function WeekNavChip({
       <button
         type="button"
         className={`m-pill ${accentClass} mcw-weeknav-btn`}
-        aria-label="Newer week"
+        aria-label={`Newer ${unitNoun}`}
         disabled={!canNewer}
         onClick={() => { if (weekKey != null) setWeekKey(newerTarget); }}
       >
@@ -772,6 +782,12 @@ function CodexCurrentCycleModal({
     : 'reset';
   const singleId = (value: string) => embedded ? undefined : value;
 
+  // #556 S4 F8 - when this presenter is embedded under a provider heading in
+  // the All modal, its own section headings drop one level. Left at h3 they
+  // would be apparent PEERS of the provider section that contains them, which
+  // is a worse hierarchy than no heading at all.
+  const SecTag = embedded ? 'h4' : 'h3';
+
   // Keyboard (single-provider variants only; embedded registers nothing).
   const bindings = useMemo<Binding[]>(() => {
     const isTopmost = () =>
@@ -836,7 +852,7 @@ function CodexCurrentCycleModal({
     >
       <section className="modal-current-week" data-source="codex">
         {cycleIndex.length > 0 ? (
-          <WeekNavChip nav={nav} pillText={pill} accentClass="accent-orange" singleId={singleId} />
+          <WeekNavChip nav={nav} pillText={pill} accentClass="accent-orange" singleId={singleId} unitNoun="cycle" />
         ) : (
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-orange" id={singleId('mcw-week-pill')}>{pill}</span>
@@ -888,10 +904,10 @@ function CodexCurrentCycleModal({
           </div>
         </div>
 
-        <h3 className="m-sec sec-ms">
+        <SecTag className="m-sec sec-ms">
           <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#hash" /></svg>
           Milestones
-        </h3>
+        </SecTag>
         <div className="mcw-mshead">
           <span className="m-pill accent-orange" id={singleId('mcw-ms-count')}>{weeklyMilestones.length} crossed</span>
           <span className="mcw-ms-sub">Derived from retained OpenAI quota observations</span>
@@ -933,10 +949,10 @@ function CodexCurrentCycleModal({
         {!loading && !error && (
           hasBlocks ? (
             <>
-              <h3 className="m-sec sec-ms sec-5h">
+              <SecTag className="m-sec sec-ms sec-5h">
                 <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg>
                 5h blocks
-              </h3>
+              </SecTag>
               <BlockNavHeader
                 blocks={blocks}
                 selectedIndex={selectedBlockIndex}
@@ -952,10 +968,10 @@ function CodexCurrentCycleModal({
             // compact index + active-block envelope. The first older step
             // still lazily fetches detail before applying its direction.
             <>
-              <h3 className="m-sec sec-ms sec-5h">
+              <SecTag className="m-sec sec-ms sec-5h">
                 <svg className="icon" aria-hidden="true"><use href="/static/icons.svg#activity" /></svg>
                 5h blocks
-              </h3>
+              </SecTag>
               <CurrentBlockNavHeader
                 blockCount={selectedEntry?.block_count ?? 0}
                 block={currentBlockPreview}
@@ -1045,6 +1061,12 @@ function ClaudeCurrentWeekModal({
   );
   const subText = useDetail ? null : msSub(envMs);
   const singleId = (value: string) => embedded ? undefined : value;
+
+  // #556 S4 F8 - when this presenter is embedded under a provider heading in
+  // the All modal, its own section headings drop one level. Left at h3 they
+  // would be apparent PEERS of the provider section that contains them, which
+  // is a worse hierarchy than no heading at all.
+  const SecTag = embedded ? 'h4' : 'h3';
 
   // Block list: current-default → the envelope active block (rendered as the
   // live fhStream, no nav); historic / fetched → the payload's blocks.
@@ -1158,7 +1180,7 @@ function ClaudeCurrentWeekModal({
     >
       <section className="modal-current-week" data-source="claude">
         {index.length > 0 ? (
-          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} />
+          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} unitNoun="week" />
         ) : (
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-green" id={singleId('mcw-week-pill')}>{weekPillText}</span>
@@ -1211,12 +1233,12 @@ function ClaudeCurrentWeekModal({
           </div>
         </div>
 
-        <h3 className="m-sec sec-ms">
+        <SecTag className="m-sec sec-ms">
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#hash" />
           </svg>
           Milestones
-        </h3>
+        </SecTag>
         <div className="mcw-mshead">
           <span className="m-pill accent-purple" id={singleId('mcw-ms-count')}>
             {weeklyCount} crossed
@@ -1297,12 +1319,12 @@ function ClaudeCurrentWeekModal({
             non-empty live stream; only the TABLE below varies (spec §4). */}
         {!loading && !error && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
           <>
-            <h3 className="m-sec sec-ms sec-5h">
+            <SecTag className="m-sec sec-ms sec-5h">
               <svg className="icon" aria-hidden="true">
                 <use href="/static/icons.svg#activity" />
               </svg>
               5h milestones
-            </h3>
+            </SecTag>
             {showBlockNav ? (
               <BlockNavHeader
                 blocks={payloadBlocks}
@@ -1481,16 +1503,28 @@ function AllCurrentWeekModal({
         </p>
       ))}
       <div className="provider-composition provider-composition--modal current-week-provider-composition">
-        <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="claude">
+        <section
+          className="source-provider-section provider-composition-section current-week-provider-section"
+          data-provider-section="claude"
+          aria-labelledby="current-usage-claude-heading"
+        >
           <div className="source-provider-head provider-composition-head">
+            {/* #556 S4 F8 — this section had no accessible name at all. The
+                heading supplies one; sr-only, so nothing moves. */}
+            <h3 className="sr-only" id="current-usage-claude-heading">Claude subscription week</h3>
             <SourceChip source="claude" />
             <span>subscription week</span>
           </div>
           {claudeReason && <p className="provider-section-reason">{claudeReason}</p>}
           <ClaudeCurrentWeekModal env={env} ctx={ctx} display={display} embedded />
         </section>
-        <section className="source-provider-section provider-composition-section current-week-provider-section" data-provider-section="codex">
+        <section
+          className="source-provider-section provider-composition-section current-week-provider-section"
+          data-provider-section="codex"
+          aria-labelledby="current-usage-codex-heading"
+        >
           <div className="source-provider-head provider-composition-head">
+            <h3 className="sr-only" id="current-usage-codex-heading">Codex native 7-day quota</h3>
             <SourceChip source="codex" />
             <span>native 7-day quota</span>
           </div>

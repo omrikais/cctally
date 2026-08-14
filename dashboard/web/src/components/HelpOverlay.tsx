@@ -10,10 +10,6 @@ import { resolveSourceView } from '../store/sourceView';
 import { deriveVisiblePanelOrder } from '../lib/visiblePanelOrder';
 import { ModalHeader } from '../modals/ModalHeader';
 
-// #294 S5 §6.9 — one-line pointers for the panels a source intentionally does
-// not show, so a Codex user learns WHERE the equivalent information lives rather
-// than seeing a ghost panel. Panels without a bespoke note fall back to a
-// generic line.
 interface KeyTableProps {
   panelOrder: readonly GridPanelId[];
 }
@@ -84,6 +80,14 @@ function KeyTable({ panelOrder }: KeyTableProps) {
         <tr><td>Hold + drag a card</td><td>rearrange the dashboard</td></tr>
         <tr><td><kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd></td><td>swap focused card with neighbor</td></tr>
         <tr><td><kbd>↑</kbd>/<kbd>↓</kbd></td><td>Select period (Daily / Weekly / Monthly modal)</td></tr>
+        {/* #556 S4 — the hero is not a grid card. `GridPanelId` is
+            `Exclude<PanelId, 'current-week'>`, so no digit can reach it and a
+            reader scanning the digit rows above finds nothing that opens it.
+            Written as prose in the key column, like the Hold+drag row, because
+            these are affordances rather than a registered single key: no new
+            keybinding is added, since the digits stay assigned to the ten grid
+            cards. */}
+        <tr><td>Click the hero, or focus it and press Enter or Space</td><td>Open the Current Usage modal</td></tr>
       </tbody>
     </table>
   );
@@ -150,10 +154,6 @@ export function HelpOverlay() {
     () => deriveVisiblePanelOrder(fullPanelOrder, sourceView),
     [fullPanelOrder, sourceView],
   );
-  // #294 S5 §6.9 — the panels the active source intentionally hides (per §5.5),
-  // each with a one-line pointer. Suppressed while hydrating (§5.2) and outside
-  // the dashboard workspace (the selector doesn't apply to conversations).
-  const hiddenItems: Array<{ panel: string; note: string }> = [];
   useKeymap([
     // `?` is all-views chrome (#156).
     { key: '?', scope: 'global', view: 'any', action: () => setOpen((o) => !o) },
@@ -206,19 +206,6 @@ export function HelpOverlay() {
             <KeyTable panelOrder={panelOrder} />
             {view === 'conversations' && <ConversationsKeyTable />}
           </>
-        )}
-        {hiddenItems.length > 0 && (
-          <div className="help-hidden-capabilities">
-            <p className="help-hidden-heading">
-              The {activeSource === 'all' ? 'All' : activeSource === 'codex' ? 'Codex' : 'Claude'} source
-              doesn&apos;t show:
-            </p>
-            <ul className="help-hidden-list">
-              {hiddenItems.map((it) => (
-                <li key={it.panel}>{it.note}</li>
-              ))}
-            </ul>
-          </div>
         )}
         <p className="meta">
           cctally · <span id="help-server-url">{window.location.origin}</span>

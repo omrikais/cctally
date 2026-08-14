@@ -14,7 +14,7 @@ import {
   alertAccount,
   alertDisplay,
   filterAlertRowsForAccount,
-  selectSourceAlertRows,
+  selectAlertRowsForView,
   toastAlertId,
 } from '../lib/alertIdentity';
 import { resolveSourceView } from '../store/sourceView';
@@ -26,9 +26,10 @@ import type { AlertEntry, CodexAlertRow, SourceAlertRow } from '../types/envelop
 // `accent-amber` border + close button).
 //
 // #294 S5 §6.7 — the modal is source-aware, sharing the panel's seam. It reads
-// the active source's alert projection (`selectSourceAlertRows`) when a `sources`
-// bundle is present, else falls back to the legacy `state.alerts` (wrapped as
-// Claude rows) for older servers / unit tests. Claude rows render richly (full
+// the active source's alert projection (`selectAlertRowsForView`, the one
+// selector both components call) when a `sources` bundle is present, else
+// falls back to the legacy `state.alerts` (wrapped as Claude rows) for older
+// servers / unit tests. Claude rows render richly (full
 // context/cost cells, unchanged); Codex rows render their lean cells.
 //
 // IMPORTANT: the T5 envelope-rebuild path does NOT include `primary_model` for
@@ -184,14 +185,11 @@ export function RecentAlertsModal(): JSX.Element {
     source: 'claude' as const,
     key: a.id,
   }));
-  // #294 S5 §6.7 / §5.2 — see RecentAlertsPanel: Codex/All read the source
-  // projection; Claude reads the legacy top-level projection when populated.
-  const allRows: SourceAlertRow[] =
-    !hasBundle
-      ? claudeLegacyRows
-      : activeSource === 'claude' && claudeLegacyRows.length > 0
-        ? claudeLegacyRows
-        : selectSourceAlertRows(view);
+  // #556 S3 §3.3 — the same shared selector the panel calls, so the two can no
+  // longer be changed apart.
+  const allRows: SourceAlertRow[] = selectAlertRowsForView(
+    view, claudeLegacyRows, hasBundle,
+  );
   const focusedRows = filterAlertRowsForAccount(allRows, scope.requestedKey);
 
   const display = useDisplayTz();

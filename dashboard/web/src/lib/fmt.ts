@@ -96,6 +96,20 @@ function fmtDateShort(iso: string | null | undefined, ctx: FmtCtx): string | nul
   return `${p.month} ${p.day}`;
 }
 
+// "May 01 2025" — `fmtDateShort` plus the calendar YEAR, for a span whose two
+// bounds fall in different years. The year-free form is the default because
+// almost every span the dashboard states sits inside one year and the year is
+// noise there; it becomes wrong the moment a span crosses one, because two
+// bounds twelve months apart then render as the same string and the span reads
+// as zero-width. Same tz handling as `fmtDateShort` — the calendar day inside
+// `ctx.tz` — so the two are interchangeable per bound.
+function fmtDateShortWithYear(iso: string | null | undefined, ctx: FmtCtx): string | null {
+  const d = isoToDate(iso);
+  if (!d) return null;
+  const p = partsByType(d, ctx.tz, { month: 'short', day: '2-digit', year: 'numeric' });
+  return `${p.month} ${p.day} ${p.year}`;
+}
+
 // "Apr 27" — calendar-date formatter for `YYYY-MM-DD` inputs that
 // represent a CALENDAR DAY, not a clock instant (e.g. weekly alert
 // payloads' `week_start_date`). Bypasses the tz-conversion path
@@ -382,6 +396,7 @@ export const fmt = {
   datetimeShort:  fmtDatetimeShort,
   datetimeShortZ: fmtDatetimeShortZ,
   dateShort:      fmtDateShort,
+  dateShortWithYear: fmtDateShortWithYear,
   startedShort:   fmtStartedShort,
   timeHHmm:       fmtTimeHHmm,
   // Threshold-actions T8: Toast helpers. `weekStart` deliberately

@@ -12,6 +12,7 @@ import * as store from '../store/store';
 import { BoardModeContext } from '../lib/boardModeContext';
 import { useReducedMotion } from '../hooks/useReducedMotion';
 import type { Envelope, ModelCostRow, PeriodRow } from '../types/envelope';
+import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
 
 vi.mock('../hooks/useReducedMotion');
 
@@ -223,5 +224,232 @@ describe('#293 S3 — stacked summary window', () => {
             && (a as { kind?: string }).kind === 'monthly',
     );
     expect(opens).toHaveLength(1);
+  });
+});
+
+// #556 S2 §5.1 — under All, Monthly renders provider SECTIONS, the treatment
+// WeeklyPanel already implements. Locally, not extracted: the two panels' rows,
+// columns and footers differ.
+describe('#556 S2 — All-mode provider sections', () => {
+  function allEnvelope(): Envelope {
+    const env = baseEnvelope() as unknown as Record<string, unknown>;
+    env.source_schema_version = 7;
+    env.default_source = 'claude';
+    env.source_order = ['claude', 'codex', 'all'];
+    env.sources = {
+      claude: {
+        availability: 'ok', capabilities: {}, warnings: [],
+        last_success_at: '2026-07-01T10:00:00Z',
+        data: {
+          hero: { cost_usd: 0, total_tokens: 0, header: null, current_week: null, forecast: null, trend: null },
+          periods: {
+            daily: { rows: [], quantile_thresholds: [], peak: null },
+            monthly: { rows: MONTHLY.slice(0, 2) },
+            weekly: { rows: [] },
+          },
+          sessions: { rows: [] },
+          projects: { current_week: { rows: [] }, trend: { projects: [] }, rows: [] },
+          quota: { current_week: {}, blocks: [], milestones: [], five_hour_milestones: [] },
+          budget: { forecast: null, settings: null },
+          alerts: { rows: [] },
+        },
+      },
+      codex: {
+        availability: 'ok', capabilities: {}, warnings: [],
+        last_success_at: '2026-07-01T10:00:00Z',
+        data: {
+          hero: {}, periods: {
+            daily: { rows: [] },
+            monthly: {
+              rows: [{
+                label: '2026-06', cost_usd: 44, input_tokens: 3,
+                cached_input_tokens: 1, output_tokens: 1,
+                reasoning_output_tokens: 0, total_tokens: 5, models: ['gpt-5'],
+              }],
+            },
+            weekly: { rows: [] },
+          },
+          projects: { rows: [] },
+          quota: { histories: [], blocks: [], summary: { active: [] } },
+          budget: { status: null }, alerts: { rows: [] },
+          cache_report: null,
+        },
+      },
+      all: {
+        availability: 'ok', capabilities: {}, warnings: [],
+        last_success_at: '2026-07-01T10:00:00Z',
+        data: { combined: null, alerts: { rows: [] }, providers: { claude: null, codex: null } },
+      },
+    };
+    return env as unknown as Envelope;
+  }
+
+  beforeEach(() => {
+    updateSnapshot(allEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  });
+
+  // #556 S4 F8 — see WeeklyPanel.test.tsx for the rule this asserts: an h3
+  // naming the section, the accessible name resolved through it, no competing
+  // `aria-label`, and unique ids.
+  it('names each provider section by its own heading (#556 S4)', () => {
+    const { container } = render(<MonthlyPanel />);
+    const sections = container.querySelectorAll('[data-provider-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      expect(s.getAttribute('aria-label')).toBeNull();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(/^(Claude|Codex) monthly history$/);
+    });
+    const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('renders one labelled section per provider instead of one merged list', () => {
+    const { container } = render(<MonthlyPanel />);
+    const claude = container.querySelector('[data-provider-section="claude"]');
+    const codex = container.querySelector('[data-provider-section="codex"]');
+    expect(claude).not.toBeNull();
+    expect(codex).not.toBeNull();
+    expect(claude!.textContent).toContain('2026-07');
+    expect(codex!.textContent).toContain('2026-06');
+  });
+
+  it('keeps each provider row in its own section rather than merging by label', () => {
+    const { container } = render(<MonthlyPanel />);
+    const codex = container.querySelector('[data-provider-section="codex"]');
+    // $44.00 is the Codex row's own cost. A merged row would have added it to
+    // the Claude row sharing its label.
+    expect(codex!.textContent).toContain('$44.00');
+    expect(container.querySelector('[data-provider-section="claude"]')!.textContent)
+      .not.toContain('$44.00');
+  });
+});
+
+// #556 S2 §5.2 — Monthly states a MONTH-LABEL span, deliberately not exact
+// dates. Monthly rows carry no bounds, and the server's current-month read ends
+// at `now_utc` rather than at the end of the labelled month, so month labels
+// cannot distinguish a partial current month from a complete one. Claiming
+// exact dates would assert a boundary the data does not carry.
+describe('#556 S2 — the All monthly footer', () => {
+  function allEnvelope(): Envelope {
+    const slice = makeSourceEnvelope();
+    slice.sources.claude.data!.periods.monthly.rows = [
+      { label: '2026-04', cost_usd: 30, total_tokens: 1, input_tokens: 1,
+        output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+        used_pct: null, dollar_per_pct: null, delta_cost_pct: null,
+        is_current: true, models: [] },
+      { label: '2026-03', cost_usd: 20, total_tokens: 1, input_tokens: 1,
+        output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+        used_pct: null, dollar_per_pct: null, delta_cost_pct: null,
+        is_current: false, models: [] },
+    ];
+    slice.sources.codex.data!.periods.monthly.rows = [{
+      label: '2026-02', cost_usd: 12, input_tokens: 1, cached_input_tokens: 0,
+      output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 1,
+      models: ['gpt-5'],
+    }];
+    return { ...baseEnvelope(), ...slice } as unknown as Envelope;
+  }
+
+  beforeEach(() => {
+    updateSnapshot(allEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  });
+
+  it('states the combined cost, the month-label span and both provider legs', () => {
+    const { container } = render(<MonthlyPanel />);
+    const foot = container.querySelector('.panel-foot');
+    expect(foot!.textContent).toContain('$62.00');
+    expect(foot!.textContent).toContain('2026-02 – 2026-04');
+    expect(foot!.textContent).toContain('Claude $50.00');
+    expect(foot!.textContent).toContain('Codex $12.00');
+  });
+
+  it('never claims exact dates, which monthly rows do not carry', () => {
+    const { container } = render(<MonthlyPanel />);
+    const foot = container.querySelector('.panel-foot');
+    expect(foot!.textContent).not.toMatch(/[A-Z][a-z]{2} \d{2}/);
+  });
+});
+
+
+// #556 S2 QA P3 — the footer counts PROVIDER-months and must say so.
+//
+// "10mo total" beside a span of "2026-01 – 2026-08" invites the arithmetic
+// 2026-01 through 2026-08 = 8 calendar months, and the 10 is Claude's 8 plus
+// Codex's 2. Weekly already gets this right with "24 provider periods total".
+describe('#556 S2 — the Monthly footer and modal name what they count', () => {
+  function allEnvelope(): Envelope {
+    const slice = makeSourceEnvelope();
+    slice.sources.claude.data!.periods.monthly.rows = [
+      { label: '2026-04', cost_usd: 30, total_tokens: 1, input_tokens: 1,
+        output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+        used_pct: null, dollar_per_pct: null, delta_cost_pct: null,
+        is_current: true, models: [] },
+    ];
+    slice.sources.codex.data!.periods.monthly.rows = [{
+      label: '2026-02', cost_usd: 12, input_tokens: 1, cached_input_tokens: 0,
+      output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 1,
+      models: ['gpt-5'],
+    }];
+    return { ...baseEnvelope(), ...slice } as unknown as Envelope;
+  }
+
+  it('says "provider months", not "mo", under All', () => {
+    updateSnapshot(allEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<MonthlyPanel />);
+    const foot = container.querySelector('.panel-foot')!.textContent!;
+    expect(foot).toContain('provider months total');
+    expect(foot).not.toMatch(/\d+mo total/);
+  });
+
+  it('leaves the single-provider footer reading "Nmo total"', () => {
+    updateSnapshot(allEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<MonthlyPanel />);
+    const foot = container.querySelector('.panel-foot');
+    if (foot) {
+      expect(foot.textContent).toMatch(/\d+mo total/);
+      expect(foot.textContent).not.toContain('provider months');
+    }
+  });
+});
+
+
+// #556 S2 QA — same defect and same remedy as Weekly. Measured at 390px before
+// this change: the Monthly h2 had clientWidth 178 against scrollWidth 254, 70%
+// visible, and `by provider` was in the hidden 30%.
+describe('#556 S2 QA — the Monthly composition is off the h2', () => {
+  beforeEach(() => {
+    updateSnapshot({ ...baseEnvelope(), ...makeSourceEnvelope() } as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  });
+
+  it('states "by provider" on the sub-line, not inside the truncating h2', () => {
+    const { container } = render(<MonthlyPanel />);
+    const h2 = container.querySelector('.panel-header h2')!.textContent!;
+    expect(h2).toContain('model split');
+    expect(h2).not.toContain('by provider');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toContain('by provider');
+  });
+
+  it('renders the sub-line as a SIBLING of the header, which is what lets it wrap', () => {
+    const { container } = render(<MonthlyPanel />);
+    expect(container.querySelector('.panel-header .panel-range-note')).toBeNull();
+    const note = container.querySelector('.panel-range-note')!;
+    expect(note.parentElement!.querySelector(':scope > .panel-header')).not.toBeNull();
+  });
+
+  it('adds no sub-line on a single-provider tab, which composes nothing', () => {
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<MonthlyPanel />);
+    expect(container.querySelector('.panel-range-note')).toBeNull();
   });
 });

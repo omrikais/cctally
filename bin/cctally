@@ -1372,6 +1372,19 @@ _dashboard_build_blocks_panel = _cctally_dashboard._dashboard_build_blocks_panel
 _dashboard_build_blocks_view = _cctally_dashboard._dashboard_build_blocks_view
 _dashboard_build_daily_panel = _cctally_dashboard._dashboard_build_daily_panel
 _empty_dashboard_snapshot = _cctally_dashboard._empty_dashboard_snapshot
+# #556 S2: the shared cross-provider aggregate range and the two range-native
+# folds it feeds. Re-exported so the source-bundle builder in
+# `_cctally_tui._tui_build_source_bundle` reaches them through `_cctally()`,
+# which is also the seam its fold-failure tests monkeypatch.
+resolve_shared_range = _cctally_dashboard.resolve_shared_range
+iter_shared_range_entries = _cctally_dashboard.iter_shared_range_entries
+fold_projects_over_range = _cctally_dashboard.fold_projects_over_range
+fold_daily_over_range = _cctally_dashboard.fold_daily_over_range
+materialise_daily_calendar = _cctally_dashboard.materialise_daily_calendar
+build_daily_aggregate_rows = _cctally_dashboard.build_daily_aggregate_rows
+daily_panel_row_to_wire = _cctally_dashboard.daily_panel_row_to_wire
+build_project_aggregate_rows = _cctally_dashboard.build_project_aggregate_rows
+legacy_project_labels = _cctally_dashboard.legacy_project_labels
 # _iso_z is NOT bound here anymore — the former dashboard-then-forecast
 # double-bind collapses to a single canonical bind below (#279 S6 W4).
 # Projects panel + modal (spec 2026-05-19-projects-panel-design.md).

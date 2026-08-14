@@ -22,6 +22,46 @@ function cloneFixture(): Envelope {
   return structuredClone(fixture) as unknown as Envelope;
 }
 
+// #556 S2 §3.7 — the two aggregate adapters now return a discriminated
+// outcome, so a withheld state can never collapse into an empty list. These
+// unwrap an `available` result and fail loudly on anything else, which is what
+// keeps a test from silently asserting over `[]`.
+function dailyRowsOf(result: ReturnType<typeof presentationDailyRows>): DailyPanelRow[] {
+  if (result.state !== 'available') {
+    throw new Error(`expected an available daily outcome, got ${JSON.stringify(result)}`);
+  }
+  return result.rows;
+}
+
+function projectRowsOf(result: ReturnType<typeof presentationProjects>) {
+  if (result.state !== 'available') {
+    throw new Error(`expected an available projects outcome, got ${JSON.stringify(result)}`);
+  }
+  return result.rows;
+}
+
+// Give an envelope the v6 All contract: the rows-only Claude siblings plus the
+// single public `aggregates` object. `sources.all.data.providers.*` stays null
+// in the fixture, so the siblings go where `presentationProviders`' documented
+// fallback resolves them.
+function withV6Aggregates(env: Envelope, claudeDaily: DailyPanelRow[]): Envelope {
+  const claude = env.sources!.claude.data!;
+  claude.periods.daily_aggregate = { rows: claudeDaily.map((row) => ({ ...row })) };
+  claude.projects.aggregate = claude.projects.aggregate ?? { rows: [] };
+  env.sources!.all.data = {
+    ...(env.sources!.all.data ?? { combined: null, alerts: { rows: [] }, providers: { claude: null, codex: null } }),
+    aggregates: {
+      range: {
+        kind: 'absolute_range', label: 'Shared range',
+        start_at: '2026-03-26T00:00:00Z', end_at: '2026-04-24T13:07:00Z',
+      },
+      projects: { state: 'available' },
+      daily: { state: 'available' },
+    },
+  };
+  return env;
+}
+
 function periodRow(label: string): PeriodRow {
   return {
     label, cost_usd: 1, total_tokens: 1, input_tokens: 1,
@@ -315,7 +355,12 @@ describe('provider-neutral dashboard presentation adapters', () => {
       expect(presentationPeriodRows(env, selection, 'weekly')).toHaveLength(
         selection === 'all' ? 24 : 12,
       );
-      expect(presentationPeriodRows(env, selection, 'monthly')).toHaveLength(8);
+      // #556 S2 §5.1 — the All monthly cap is now per PROVIDER, exactly as
+      // weekly's already was, because the merge that used to collapse two
+      // providers' months into one row is deleted.
+      expect(presentationPeriodRows(env, selection, 'monthly')).toHaveLength(
+        selection === 'all' ? 16 : 8,
+      );
     },
   );
 
@@ -328,9 +373,11 @@ describe('provider-neutral dashboard presentation adapters', () => {
       env.daily = { rows: claudeRows, quantile_thresholds: [], peak: null };
       env.sources!.claude.data!.periods.daily.rows = claudeRows;
       env.sources!.codex.data!.periods.daily.rows = codexRows;
-      env.sources!.all.data = null;
+      // Under All the canonical shape is the BOUNDED sibling, never the
+      // legacy top-level panel (§6.3a).
+      withV6Aggregates(env, claudeRows);
 
-      const rows = presentationDailyRows(env, selection);
+      const rows = dailyRowsOf(presentationDailyRows(env, selection));
       expect(rows).toHaveLength(30);
       expect(rows[0].date).toBe('2026-07-31');
       expect(rows[29].date).toBe('2026-07-02');
@@ -353,17 +400,24 @@ describe('provider-neutral dashboard presentation adapters', () => {
       cached_input_tokens: 7, output_tokens: 8, reasoning_output_tokens: 2,
       total_tokens: 40, models: ['gpt-5'],
     }];
-    env.sources!.all.data = null;
+    // The All outcome owns its canonical shape, so the bounded sibling is
+    // what the merge reads — never the legacy top-level panel (§6.3a).
+    withV6Aggregates(env, claude.periods.daily.rows);
 
-    const rows = presentationDailyRows(env, 'all');
-    expect(rows).toHaveLength(env.daily.rows.length);
+    const rows = dailyRowsOf(presentationDailyRows(env, 'all'));
+    expect(rows).toHaveLength(claude.periods.daily.rows.length);
     const combined = rows.find((row) => row.date === '2026-04-24');
     expect(combined).toMatchObject({
       date: '2026-04-24', input_tokens: 40,
       cache_read_tokens: 10, output_tokens: 15, total_tokens: 60,
     });
     expect(combined!.cost_usd).toBeCloseTo(20.7, 9);
-    expect(combined!.cache_hit_pct).toBeCloseTo(10 / 43 * 100, 9);
+    // #556 S2 §6.1 — the combined ratio is WITHHELD, not recomputed. Claude's
+    // ratio is cache-read over input plus cache creation and read; Codex's
+    // input is already cache-inclusive, so no ratio over their sum describes
+    // anything. The `cacheEligibleInput` compensation this assertion used to
+    // pin went with it.
+    expect(combined!.cache_hit_pct).toBeNull();
   });
 
   it('All falls back to sibling provider entries when nested providers are absent', () => {
@@ -402,7 +456,7 @@ describe('provider-neutral dashboard presentation adapters', () => {
     }];
 
     const weekly = presentationPeriodRows(env, 'codex', 'weekly')[0];
-    const daily = presentationDailyRows(env, 'codex').find((row) => row.cost_usd === 12);
+    const daily = dailyRowsOf(presentationDailyRows(env, 'codex')).find((row) => row.cost_usd === 12);
 
     expect(weekly.codex_tokens).toEqual({
       input_tokens: 1_200, cached_input_tokens: 300,
@@ -517,7 +571,7 @@ describe('provider-neutral dashboard presentation adapters', () => {
       { modelName: 'gpt-5.6-terra', cost: 3 },
     ];
 
-    const row = presentationDailyRows(env, 'codex').find((item) => item.cost_usd === 10);
+    const row = dailyRowsOf(presentationDailyRows(env, 'codex')).find((item) => item.cost_usd === 10);
     expect(row?.models).toMatchObject([
       { model: 'gpt-5.6-sol', cost_pct: 70 },
       { model: 'gpt-5.6-terra', cost_pct: 30 },
@@ -547,7 +601,7 @@ describe('provider-neutral dashboard presentation adapters', () => {
       models: ['gpt-5.6-sol'],
     }];
 
-    const rows = presentationDailyRows(env, 'codex');
+    const rows = dailyRowsOf(presentationDailyRows(env, 'codex'));
     expect(rows.map((row) => row.date)).toEqual(
       env.daily.rows.map((row) => row.date),
     );
@@ -611,26 +665,99 @@ describe('provider-neutral dashboard presentation adapters', () => {
     expect(row?.key).toBe('block:opaque-server-issued');
   });
 
-  it('keeps the qualified Claude project key but renders its canonical label in All', () => {
+  // #556 S2 §5.1 — Monthly is UNMERGED.
+  //
+  // #294 S5 §6.2 states that daily and monthly rows render per active source
+  // and that buckets are never merged. #312 §7.4, written one day later,
+  // explicitly authorises the DAILY aggregation and supersedes it there.
+  // Nothing authorises the monthly merge, and the merge was never safe: it
+  // nulled `used_pct` and `dollar_per_pct` only when two rows collided on a
+  // label, and it recomputed one model split across two providers' families.
+  it('keeps each provider its own monthly rows under All', () => {
     const env = cloneFixture();
-    const projected = env.sources!.claude.data!.projects.current_week.rows[0];
-    const cost = projected.cost_usd ?? 8;
-    const sessions = projected.sessions_count ?? 1;
+    env.sources!.claude.data!.periods.monthly.rows = [
+      { label: '2026-04', cost_usd: 10, total_tokens: 4, input_tokens: 2,
+        output_tokens: 1, cache_creation_tokens: 1, cache_read_tokens: 0,
+        used_pct: 40, dollar_per_pct: 0.25, delta_cost_pct: null,
+        is_current: true, models: [] },
+    ];
+    env.sources!.codex.data!.periods.monthly.rows = [
+      { label: '2026-04', cost_usd: 7, input_tokens: 3, cached_input_tokens: 1,
+        output_tokens: 1, reasoning_output_tokens: 0, total_tokens: 5,
+        models: ['gpt-5'] },
+    ];
+
+    const rows = presentationPeriodRows(env, 'all', 'monthly');
+
+    // Two rows sharing one label, each keeping its own source — not one row
+    // labelled `all`.
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.source)).toEqual(['claude', 'codex']);
+    expect(rows.every((row) => row.label === '2026-04')).toBe(true);
+    expect(rows.some((row) => row.source === 'all')).toBe(false);
+    // The Claude row keeps the two quota fields the merge used to null.
+    expect(rows[0].used_pct).toBe(40);
+    expect(rows[0].dollar_per_pct).toBe(0.25);
+  });
+
+  it('caps each provider independently under All monthly, as weekly already does', () => {
+    const env = cloneFixture();
+    env.sources!.claude.data!.periods.monthly.rows = Array.from(
+      { length: 12 },
+      (_, i) => ({
+        label: `2026-${String(12 - i).padStart(2, '0')}`, cost_usd: 1,
+        total_tokens: 1, input_tokens: 1, output_tokens: 0,
+        cache_creation_tokens: 0, cache_read_tokens: 0, used_pct: null,
+        dollar_per_pct: null, delta_cost_pct: null, is_current: false,
+        models: [],
+      }),
+    );
+    env.sources!.codex.data!.periods.monthly.rows = Array.from(
+      { length: 12 },
+      (_, i) => codexPeriodRow(`2025-${String(12 - i).padStart(2, '0')}`),
+    );
+
+    const rows = presentationPeriodRows(env, 'all', 'monthly');
+    expect(rows.filter((row) => row.source === 'claude')).toHaveLength(8);
+    expect(rows.filter((row) => row.source === 'codex')).toHaveLength(8);
+  });
+
+  it('reads the published label off the bounded ranking instead of searching for it', () => {
+    // #556 S2 §4.3 — the deleted alternative joined the opaque provider rows to
+    // the legacy envelope by their `(cost_usd, sessions_count)` tuple and fell
+    // back to `row.key` whenever that search missed, which printed an opaque
+    // key as visible copy. The bounded sibling publishes the label, so there is
+    // nothing left to search for and nothing left to miss.
+    const env = cloneFixture();
+    env.sources!.claude.data!.projects.aggregate = {
+      rows: [{
+        key: 'project:opaque-qualified-key',
+        label: 'cctally-dev',
+        source: 'claude',
+        cost_usd: 8,
+        sessions_count: 2,
+        drillable: true,
+      }],
+    };
+    // Two identical accounting tuples in the legacy collection, which is what
+    // made the old reverse search ambiguous. Nothing consults them now.
     env.projects = {
       current_week: {
         week_label: null, week_start_date: null, week_start_at: null,
-        total_cost_usd: cost,
-        rows: [{ key: 'cctally-dev', bucket_path: '/workspace/cctally-dev', cost_usd: cost, attributed_pct: projected.attributed_pct ?? null, sessions_count: sessions }],
+        total_cost_usd: 16,
+        rows: [
+          { key: 'other-a', bucket_path: '/w/a', cost_usd: 8, attributed_pct: null, sessions_count: 2 },
+          { key: 'other-b', bucket_path: '/w/b', cost_usd: 8, attributed_pct: null, sessions_count: 2 },
+        ],
       },
       trend: { window_weeks: 0, weeks: [], projects: [] },
     };
-    const legacy = env.projects!.current_week.rows[0];
-    projected.key = 'project:opaque-qualified-key';
-    projected.cost_usd = cost;
-    projected.sessions_count = sessions;
-    env.sources!.all.data = null;
-    const row = presentationProjects(env, 'all')!.find((item) => item.source === 'claude')!;
+    withV6Aggregates(env, env.daily!.rows);
+
+    const row = projectRowsOf(presentationProjects(env, 'all'))
+      .find((item) => item.source === 'claude')!;
     expect(row.key).toBe('project:opaque-qualified-key');
-    expect(row.label).toBe(legacy.key);
+    expect(row.label).toBe('cctally-dev');
+    expect(row.drillable).toBe(true);
   });
 });

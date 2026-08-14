@@ -161,3 +161,64 @@ def test_direct_sql_cache_builders_store_production_offset(
         "2026-07-15T11:00:00+00:00",
         "2026-07-15T11:30:00+00:00",
     ]
+
+
+def test_source_timestamp_z_preserves_the_fraction() -> None:
+    base = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    assert fixtures.fixture_source_timestamp_z(base) == "2026-04-20T12:00:00Z"
+    assert fixtures.fixture_source_timestamp_z(
+        base + dt.timedelta(microseconds=1)
+    ) == "2026-04-20T12:00:00.000001Z"
+    assert fixtures.fixture_source_timestamp_z(
+        base.replace(microsecond=123000)
+    ) == "2026-04-20T12:00:00.123000Z"
+    assert fixtures.fixture_source_timestamp_z(
+        base.replace(microsecond=123456)
+    ) == "2026-04-20T12:00:00.123456Z"
+
+
+def test_source_timestamp_z_normalizes_a_non_utc_offset() -> None:
+    plus_two = dt.timezone(dt.timedelta(hours=2))
+    assert fixtures.fixture_source_timestamp_z(
+        dt.datetime(2026, 4, 20, 14, 0, tzinfo=plus_two)
+    ) == "2026-04-20T12:00:00Z"
+
+
+def test_source_timestamp_z_rejects_naive_and_non_datetime() -> None:
+    with pytest.raises(ValueError):
+        fixtures.fixture_source_timestamp_z(dt.datetime(2026, 4, 20, 12, 0))
+    with pytest.raises(TypeError):
+        fixtures.fixture_source_timestamp_z("2026-04-20T12:00:00Z")
+
+
+_Z_FORM_BUILDERS = (
+    "build-alerts-fixtures.py",
+    "build-blocks-fixtures.py",
+    "build-budget-fixtures.py",
+    "build-cache-report-fixtures.py",
+    "build-codex-fixtures.py",
+    "build-daily-instances-fixtures.py",
+    "build-dashboard-fixtures.py",
+    "build-diff-fixtures.py",
+    "build-mode-fixtures.py",
+    "build-readme-fixtures.py",
+    "build-session-fixtures.py",
+    "build-weekly-fixtures.py",
+)
+
+
+@pytest.mark.parametrize("filename", _Z_FORM_BUILDERS)
+def test_builder_iso_discriminates_one_microsecond(filename: str) -> None:
+    """A sentinel one microsecond off a bound must not serialize ONTO it.
+
+    #556 S2 seeded exactly such a sentinel to prove a half-open range excluded
+    it; `strftime` truncated the fraction, the sentinel landed on the bound, the
+    assertion passed for the wrong reason, and the golden recorded that pass.
+    """
+    module_name = filename.replace("-", "_").removesuffix(".py") + "_boundary_test"
+    builder = _load_builder(filename, module_name)
+    bound = dt.datetime(2026, 4, 20, 12, 0, tzinfo=dt.timezone.utc)
+    just_past = bound + dt.timedelta(microseconds=1)
+
+    assert builder._iso(just_past) == "2026-04-20T12:00:00.000001Z"
+    assert builder._iso(just_past) != builder._iso(bound)

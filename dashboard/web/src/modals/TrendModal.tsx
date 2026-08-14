@@ -332,6 +332,12 @@ function CanonicalTrendModal({
   const N = rows.length;
   const idFor = (base: string): string => embedded ? `${base}-${source}` : base;
 
+  // #556 S4 F8 - when this presenter is embedded under a provider heading, its
+  // own section headings drop one level. Left at h3 they would be apparent
+  // PEERS of the provider section that contains them, which is a worse
+  // hierarchy than no heading at all.
+  const SecTag = embedded ? 'h4' : 'h3';
+
   // Decorate rows with their chronological index (finding 2) BEFORE sorting,
   // so the "Now / W−1 / W−2" label and the `.cur` highlight follow the row's
   // identity through any sort — the map index over `tableRows` is the SORTED
@@ -420,7 +426,7 @@ function CanonicalTrendModal({
           </div>
         )}
 
-        <h3 className="m-sec sec-spark">
+        <SecTag className="m-sec sec-spark">
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#trending-down" />
           </svg>
@@ -430,7 +436,7 @@ function CanonicalTrendModal({
             <span className="sw-lbl">$/1%</span>
             <><span className="sw sw-used" /><span className="sw-lbl">used %</span></>
           </span>
-        </h3>
+        </SecTag>
         <div className="mtr-sparkhero">
           <svg
             id={idFor('mtr-svg')}
@@ -539,12 +545,12 @@ function CanonicalTrendModal({
           </div>{/* /period-detail-pane */}
 
           <div className="period-table-pane">
-        <h3 className="m-sec sec-tbl">
+        <SecTag className="m-sec sec-tbl">
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#hash" />
           </svg>
           Weekly detail
-        </h3>
+        </SecTag>
         <div className="mtr-tbl-head">
           <span className="m-pill accent-purple" id={idFor('mtr-tbl-count')}>
             {N} weeks
@@ -606,6 +612,7 @@ function CanonicalTrendModal({
       accentClass="accent-amber"
       headerExtras={headerExtras}
       wide
+      paneScroll
     >
       {content}
     </Modal>
@@ -644,9 +651,13 @@ export function TrendModal() {
             key={section.source}
             className="provider-composition-section"
             data-provider-section={section.source}
-            aria-label={`${section.label} $ per 1% trend history`}
+            aria-labelledby={`trend-modal-${section.source}-heading`}
           >
             <div className="source-provider-head provider-composition-head">
+              {/* #556 S4 F8 — surface-qualified id; see CacheReportModal. */}
+              <h3 className="sr-only" id={`trend-modal-${section.source}-heading`}>
+                {section.label} $ per 1% trend history
+              </h3>
               <span className={`source-chip source-chip--${section.source}`}>{section.label}</span>
               <span className="provider-summary-label">
                 {section.historyRows.length} {section.source === 'claude' ? 'weeks' : 'cycles'}

@@ -35,7 +35,14 @@ function alert(
 
 function decoratedClaudeEnv(): Envelope {
   const env = makeSourceEnvelope() as unknown as Envelope & {
-    sources: { claude: { data: { accounts?: AccountCard[] } } };
+    sources: {
+      claude: {
+        data: {
+          accounts?: AccountCard[];
+          alerts: { rows: Record<string, unknown>[] };
+        };
+      };
+    };
   };
   env.sources.claude.data.accounts = [card(WORK, 'work'), card(PERSONAL, 'personal')];
   env.alerts = [
@@ -43,6 +50,16 @@ function decoratedClaudeEnv(): Envelope {
     alert(92, PERSONAL, 'personal'),
     alert(93, '*', 'All accounts'),
   ];
+  // #556 S3 §3.1 — a bundle is present, so the panel and the modal read the
+  // Claude PROJECTION rather than the legacy array. The projection is that
+  // array filtered by ownership and preserves every field of the rows it keeps
+  // (§3.2), which is exactly what account scoping depends on, so the two carry
+  // identical rows here.
+  env.sources.claude.data.alerts = {
+    rows: env.alerts.map((a) => ({
+      ...a, source: 'claude', key: (a as { id: string }).id,
+    })) as Record<string, unknown>[],
+  };
   return env;
 }
 

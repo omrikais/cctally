@@ -55,13 +55,18 @@ AXIS_REGISTRY: "tuple[AlertAxisDescriptor, ...]" = (
         "project_budget", "PROJECT", "Project budget", "project_budget_milestones"
     ),
     # Per-vendor Codex budget alerts (calendar-period; calendar-period-codex-budgets
-    # feature). Distinct "CODEX" chip vs the global "BUDGET" / per-project
-    # "PROJECT" chips. As of #143 it shares the unified vendor-tagged
+    # feature). #556 S3 §4.3: the chip reads "BUDGET", the same as the Claude
+    # budget axis, because it names the METRIC. Attribution is the row's source
+    # chip, which under All reads "Codex" — a chip reading "CODEX" beside a
+    # source chip reading "Codex" said the same thing twice and named neither
+    # the metric nor anything the source chip did not already say. The two
+    # BUDGET chips stay visually distinct through `chip--codex_budget`, which
+    # keeps its own colour. As of #143 it shares the unified vendor-tagged
     # `budget_milestones` table with the Claude `budget` axis; the envelope
     # mapper's `WHERE vendor=?` filter does the row-level split (keyed on the
     # resolved period-window start instant period_start_at, threshold).
     AlertAxisDescriptor(
-        "codex_budget", "CODEX", "Codex budget", "budget_milestones", vendor="codex"
+        "codex_budget", "BUDGET", "Codex budget", "budget_milestones", vendor="codex"
     ),
 )
 

@@ -1019,17 +1019,128 @@ def _claude_project_key_for_path(snapshot, project_path: object) -> str | None:
     return None
 
 
+def _claude_aggregate_project_rows(snapshot) -> "tuple":
+    """The published bounded project rows, or an empty tuple.
+
+    They live on the frozen source bundle rather than on the legacy envelope,
+    and a provider whose bounded fold failed publishes none.
+    """
+    bundle = getattr(snapshot, "source_bundle", None)
+    try:
+        data = bundle.sources["claude"].data
+    except (AttributeError, KeyError, TypeError):
+        return ()
+    if not isinstance(data, Mapping):
+        return ()
+    projects = data.get("projects")
+    aggregate = projects.get("aggregate") if isinstance(projects, Mapping) else None
+    rows = aggregate.get("rows") if isinstance(aggregate, Mapping) else None
+    return tuple(rows) if isinstance(rows, (list, tuple)) else ()
+
+
+# The window sizes `GET /api/source/<source>/project/<key>?weeks=N` accepts.
+PROJECT_WINDOW_WEEKS_CHOICES = (1, 4, 8, 12)
+
+
+def resolve_aggregate_project_window_weeks(
+    requested: int, *, shared_start_at: object, current_week_start_at: object,
+) -> int:
+    """The drill window a row published by the All ranking must resolve with.
+
+    The two windows are anchored differently and one does not contain the
+    other. The ranking is ``n`` calendar days ending today. The drill is
+    ``weeks_back`` weeks anchored at the CURRENT MONDAY —
+    ``[cw_start - 7 * (weeks_back - 1), cw_start + 7)`` — so at the default four
+    weeks it reaches twenty-one days before that Monday, which is twenty-one to
+    twenty-seven days before today. Against a thirty-day ranking that leaves up
+    to nine days at the start of the ranking window ranked and undrillable: a
+    row published at a real dollar figure opens a modal reporting
+    ``window_cost_usd: 0.0`` and no sessions.
+
+    So the window is the SMALLEST accepted choice whose span reaches the
+    resolved shared start, and never narrower than the caller asked for. When
+    NO accepted choice reaches it — a shared start further back than twelve
+    weeks before the current Monday — the widest choice is returned instead,
+    which is the closest the accepted set can come rather than a span that
+    reaches. It is not silent either way: ``window_weeks`` is in the payload
+    and the detail states the resolved span it covered, so a window that falls
+    short says so rather than implying it reached. When either bound is
+    unresolvable the caller's value stands, because guessing a wider window
+    over an unknown range would state a span nothing established.
+
+    Pure. ``_build_claude_source_detail`` supplies the two bounds.
+    """
+    if not isinstance(shared_start_at, str) or not isinstance(
+        current_week_start_at, str,
+    ):
+        return requested
+    try:
+        shared_start = parse_iso_datetime(
+            shared_start_at, "aggregates.range.start_at",
+        )
+        cw_start = parse_iso_datetime(
+            current_week_start_at, "projects.current_week.week_start_at",
+        )
+    except ValueError:
+        return requested
+    covering = [
+        weeks for weeks in PROJECT_WINDOW_WEEKS_CHOICES
+        if cw_start - dt.timedelta(days=7 * (weeks - 1)) <= shared_start
+    ]
+    if not covering:
+        return max(PROJECT_WINDOW_WEEKS_CHOICES[-1], requested)
+    return max(min(covering), requested)
+
+
+def _published_aggregate_start_at(snapshot) -> object:
+    """``sources.all.data.aggregates.range.start_at``, or ``None``."""
+    bundle = getattr(snapshot, "source_bundle", None)
+    try:
+        data = bundle.sources["all"].data
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    aggregates = data.get("aggregates")
+    published = (
+        aggregates.get("range") if isinstance(aggregates, Mapping) else None
+    )
+    return published.get("start_at") if isinstance(published, Mapping) else None
+
+
+def _project_window_weeks_for_key(snapshot, key: str, requested: int) -> int:
+    """Widen the drill window for a key the All ranking published.
+
+    A key absent from the published aggregate rows was not ranked over the
+    shared range, so nothing about that range describes it and the caller's
+    window stands unchanged.
+    """
+    if not any(
+        isinstance(row, Mapping) and row.get("key") == key
+        for row in _claude_aggregate_project_rows(snapshot)
+    ):
+        return requested
+    env = getattr(snapshot, "projects_envelope", None)
+    current = env.get("current_week") if isinstance(env, Mapping) else None
+    return resolve_aggregate_project_window_weeks(
+        requested,
+        shared_start_at=_published_aggregate_start_at(snapshot),
+        current_week_start_at=(
+            current.get("week_start_at") if isinstance(current, Mapping) else None
+        ),
+    )
+
+
 def _claude_project_key_for_source_key(snapshot, key: str) -> str | None:
     env = getattr(snapshot, "projects_envelope", None)
-    if not isinstance(env, Mapping):
-        return None
     candidates: list[object] = []
-    current = env.get("current_week")
-    if isinstance(current, Mapping):
-        candidates.extend(current.get("rows") or ())
-    trend = env.get("trend")
-    if isinstance(trend, Mapping):
-        candidates.extend(trend.get("projects") or ())
+    if isinstance(env, Mapping):
+        current = env.get("current_week")
+        if isinstance(current, Mapping):
+            candidates.extend(current.get("rows") or ())
+        trend = env.get("trend")
+        if isinstance(trend, Mapping):
+            candidates.extend(trend.get("projects") or ())
     for row in candidates:
         if not isinstance(row, Mapping):
             continue
@@ -1038,6 +1149,16 @@ def _claude_project_key_for_source_key(snapshot, key: str) -> str | None:
             dashboard_resource_key("project", "claude", project_key) == key
         ):
             return project_key
+    # #556 S2 remediation: there is deliberately NO fallback to the published
+    # aggregate rows here. A retained bundle outlives the per-tick envelope
+    # rebuild, so its labels can be stale, and `_project_detail_for_window`
+    # resolves whatever this returns against the CURRENT envelope. Labels are
+    # population-sensitive, so a stale label either misses there anyway — the
+    # same 404, reached one step later — or names a DIFFERENT bucket and serves
+    # another project's sessions under this key. A guarded fallback would be
+    # dead code besides: the aggregate key is minted from its label by the same
+    # rule the loop above inverts, so any label the current envelope still
+    # carries has already matched.
     return None
 
 
@@ -1094,6 +1215,13 @@ def _build_claude_source_detail(
         project_key = _claude_project_key_for_source_key(snapshot, key)
         if project_key is None:
             raise SourceResourceNotFound()
+        # #556 S2 remediation: a row the All ranking published states a figure
+        # over the shared range, so its detail has to reach that range. The
+        # default four-week drill is anchored at the current Monday and misses
+        # up to nine days at the start of a thirty-day ranking.
+        window_weeks = _project_window_weeks_for_key(
+            snapshot, key, window_weeks,
+        )
         conn = open_db()
         try:
             conn.execute("ATTACH DATABASE ? AS cache_db", (str(_cctally_core.CACHE_DB_PATH),))
@@ -2976,6 +3104,87 @@ def _group_a_daily_buckets(now_utc, *, n, display_tz):
         cache_conn.close()
 
 
+def materialise_daily_calendar(
+    view_rows,
+    *,
+    now_utc: "dt.datetime",
+    n: int = 30,
+    display_tz: "ZoneInfo | None" = None,
+) -> "list[DailyPanelRow]":
+    """Materialize the contiguous ``n``-day calendar. Pure, no I/O.
+
+    ``view_rows`` is ``build_daily_view``'s gap-free newest-first row sequence,
+    which carries the data-plane fields and leaves ``label`` and
+    ``intensity_bucket`` at dataclass defaults (spec §4.4). This adapter
+    overlays those rows onto the calendar window, adds a zero-cost row for
+    every gap day so the heatmap shows a faded cell, and fills the two
+    presentation-only fields.
+
+    #556 S2 §6.3a extracted this from ``_dashboard_build_daily_panel``, which
+    opens its own connection through Group A or ``get_entries`` and cannot be
+    called from the pinned source-bundle fold. Unlike that function, this one
+    emits a COMPLETE shape for an empty provider rather than nothing: under All
+    an empty provider is a zero leg, and a zero leg still has a shape, so the
+    client never needs a second source for the calendar it renders.
+    """
+    rows_by_date = {r.date: r for r in (view_rows or ())}
+    today_local = (
+        now_utc.astimezone(display_tz) if display_tz is not None
+        # internal fallback: host-local intentional
+        else now_utc.astimezone()
+    ).date()
+
+    rows: list[DailyPanelRow] = []
+    for i in range(n):
+        d = today_local - dt.timedelta(days=i)
+        date_str = d.isoformat()
+        existing = rows_by_date.get(date_str)
+        if existing is not None:
+            # Use the view-model row but fill the presentation-only
+            # ``label`` (intensity_bucket is set by
+            # ``_compute_intensity_buckets`` below).
+            rows.append(dataclasses.replace(existing, label=date_str[5:]))
+        else:
+            # Zero-cost gap day: tokens default to 0, cache_hit_pct to None
+            # (avoids /0 and signals 'no data' cleanly to the modal tile).
+            rows.append(DailyPanelRow(
+                date=date_str,
+                label=date_str[5:],
+                cost_usd=0.0,
+                is_today=(d == today_local),
+                intensity_bucket=0,
+                models=[],
+            ))
+
+    _compute_intensity_buckets(rows)
+    return rows
+
+
+def daily_panel_row_to_wire(row: "DailyPanelRow") -> dict:
+    """One wire shape for a daily row, whichever sibling published it.
+
+    ``snapshot_to_envelope``'s ``_daily_row_to_dict`` delegates here, so the
+    All-only ``periods.daily_aggregate.rows`` sibling and the legacy
+    ``periods.daily.rows`` cannot drift into two shapes the client would have
+    to tell apart.
+    """
+    return {
+        "date":             row.date,
+        "label":            row.label,
+        "cost_usd":         row.cost_usd,
+        "is_today":         row.is_today,
+        "intensity_bucket": row.intensity_bucket,
+        "models":           list(row.models),
+        # ---- v2.3 additions ----
+        "input_tokens":          row.input_tokens,
+        "output_tokens":         row.output_tokens,
+        "cache_creation_tokens": row.cache_creation_tokens,
+        "cache_read_tokens":     row.cache_read_tokens,
+        "total_tokens":          row.total_tokens,
+        "cache_hit_pct":         row.cache_hit_pct,
+    }
+
+
 def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
                                   now_utc: "dt.datetime",
                                   *,
@@ -3050,42 +3259,13 @@ def _dashboard_build_daily_panel(conn: "sqlite3.Connection",
     if not view.rows:
         return []
 
-    # Materialize the contiguous N-day window. ``view.rows`` is gap-free
-    # (newest-first) and carries the data-plane fields; the adapter
-    # overlays it onto the calendar window and fills the presentation-
-    # only ``label`` / ``intensity_bucket`` (which the builder left at
-    # dataclass defaults per spec §4.4).
-    rows_by_date = {r.date: r for r in view.rows}
-    today_local = (
-        now_utc.astimezone(display_tz) if display_tz is not None
-        # internal fallback: host-local intentional
-        else now_utc.astimezone()
-    ).date()
-
-    rows: list[DailyPanelRow] = []
-    for i in range(n):
-        d = today_local - dt.timedelta(days=i)
-        date_str = d.isoformat()
-        existing = rows_by_date.get(date_str)
-        if existing is not None:
-            # Use the view-model row but fill the presentation-only
-            # ``label`` (intensity_bucket is set by
-            # ``_compute_intensity_buckets`` below).
-            rows.append(dataclasses.replace(existing, label=date_str[5:]))
-        else:
-            # Zero-cost gap day: tokens default to 0, cache_hit_pct to None
-            # (avoids /0 and signals 'no data' cleanly to the modal tile).
-            rows.append(DailyPanelRow(
-                date=date_str,
-                label=date_str[5:],
-                cost_usd=0.0,
-                is_today=(d == today_local),
-                intensity_bucket=0,
-                models=[],
-            ))
-
-    _compute_intensity_buckets(rows)
-    return rows
+    # Materialize the contiguous N-day window. #556 S2 §6.3a extracted the
+    # block below into ``materialise_daily_calendar`` so the All-only Claude
+    # daily leg can reach it without this function's I/O; the Claude tab's
+    # behaviour is unchanged, including the empty-provider early return above.
+    return materialise_daily_calendar(
+        view.rows, now_utc=now_utc, n=n, display_tz=display_tz,
+    )
 
 
 # --- Projects panel / modal (spec 2026-05-19-projects-panel-design.md) ------
@@ -3217,6 +3397,202 @@ def _projects_iter_session_entries(conn: "sqlite3.Connection",
         yield row
 
 
+# === #556 S2 — the shared cross-provider aggregate range (spec §3.2, §3.4) ===
+#
+# One UTC interval, resolved once per tick and passed immutably to both Claude
+# folds. Membership is ``shared_start <= parsed_timestamp < shared_end_exclusive``
+# enforced on PARSED datetimes with microseconds preserved.
+#
+# ``_projects_iter_session_entries`` deliberately cannot serve this read. It
+# implements an inclusive ``[since, until]`` query, truncates both bounds to
+# whole seconds and spells them with a ``Z`` suffix, and compares with ``<=``.
+# Production ingestion writes ``timestamp.astimezone(utc).isoformat()``
+# (``bin/_cctally_cache.py``), so a stored value keeps its ``+00:00`` offset and
+# its microseconds. SQLite compares that TEXT column lexically, and ``+`` (0x2B)
+# sorts BELOW ``Z`` (0x5A) — so an entry exactly at the lower bound would be
+# dropped, while an entry inside the closing second would be admitted past the
+# exclusive upper bound. This iterator therefore uses the SQL predicate only as
+# an outward-widened CANDIDATE filter and enforces the real comparison in Python.
+#
+# The published range's `kind` and `label` are NOT declared here. They live once,
+# beside the canonicaliser that emits them, as `AGGREGATE_RANGE_KIND` and
+# `AGGREGATE_RANGE_LABEL` in `bin/_lib_dashboard_sources.py`.
+
+
+def resolve_shared_range(daily_panel, *, now_utc, display_tz, n: int = 30):
+    """Return ``(shared_start, shared_end_exclusive)`` for the All aggregates.
+
+    ``shared_start`` is the earliest day of the already-built ``n``-day daily
+    panel, taken at midnight in the resolved display timezone.
+    ``shared_end_exclusive`` is ``now_utc + 1 microsecond``, which is the bound
+    the Codex projects read already applies, so the Codex tab stays
+    byte-stable.
+
+    BOTH branches floor to display-timezone midnight, and the fallback branch
+    resolves the same calendar day the panel branch would have named **provided
+    the panel is exactly ``n`` contiguous days ending today**. Every production
+    panel has that shape (``materialise_daily_calendar`` gap-fills a contiguous
+    calendar), so the two branches agree there. They do NOT agree in general: a
+    caller that hands in a sparse or shorter panel gets that panel's own oldest
+    day from the first branch and ``today - (n - 1) days`` from the fallback.
+    Two separate defects require the flooring, and neither is visible with a
+    pinned bound:
+
+    1. The start is folded into version material at DAY granularity
+       (``aggregate_scope_identity``), while ``compose_all_aggregates`` compares
+       the two providers' carriers on the exact canonical string. A start that
+       moves within a day therefore passes the reuse gate for an unchanged
+       provider while a rebuilt provider records the newer instant, and the two
+       carriers then disagree. The old fallback, ``now_utc - 30 days``, is a
+       microsecond-precise instant that advances on every tick, so on a
+       Claude-inactive, Codex-active install every tick withheld both
+       aggregates as ``retained_range_mismatch`` and published no range at all.
+    2. ``daily_aggregate.rows`` is ``n`` CALENDAR days ending today
+       (``materialise_daily_calendar``). A rolling ``n * 24h`` fallback started
+       part-way through a further day, so the published range stated a span the
+       row table did not cover.
+    """
+    now_utc = now_utc.astimezone(dt.timezone.utc)
+    if daily_panel:
+        # The panel is newest-first, so the oldest of its FIRST `n` rows is the
+        # `n`-day floor. Reading `daily_panel[-1]` unconditionally ignored `n`,
+        # so a caller asking for a shorter window than the panel it passed got
+        # the panel's full extent from this branch and the shorter window from
+        # the fallback — two branches describing different spans under one
+        # parameter.
+        earliest_day = dt.date.fromisoformat(
+            daily_panel[min(max(n, 1), len(daily_panel)) - 1].date,
+        )
+    else:
+        today_local = (
+            now_utc.astimezone(display_tz) if display_tz is not None
+            # internal fallback: host-local intentional
+            else now_utc.astimezone()
+        ).date()
+        earliest_day = today_local - dt.timedelta(days=n - 1)
+    if display_tz is not None:
+        start = dt.datetime.combine(
+            earliest_day, dt.time.min, tzinfo=display_tz,
+        ).astimezone(dt.timezone.utc)
+    else:
+        # internal fallback: host-local intentional
+        start = dt.datetime.combine(
+            earliest_day, dt.time.min,
+        ).astimezone(dt.timezone.utc)
+    return start, now_utc + dt.timedelta(microseconds=1)
+
+
+def _shared_range_candidate_bounds(start, end_exclusive):
+    """Whole-second SQL bounds widened OUTWARD on both ends.
+
+    One second of slack in each direction is what makes the candidate set a
+    strict superset regardless of how a stored timestamp spells its offset
+    (``+00:00`` or ``Z``) or whether it carries a fractional part.
+    """
+    low = start.astimezone(dt.timezone.utc).replace(
+        microsecond=0,
+    ) - dt.timedelta(seconds=1)
+    high = end_exclusive.astimezone(dt.timezone.utc).replace(
+        microsecond=0,
+    ) + dt.timedelta(seconds=1)
+    return low.isoformat(), high.isoformat()
+
+
+def iter_shared_range_entries(conn, *, start, end_exclusive):
+    """Yield ``session_entries`` rows inside ``[start, end_exclusive)``.
+
+    Column order matches ``_projects_iter_session_entries`` exactly, so
+    ``_fold_projects_entry``'s per-row arithmetic consumes these rows unchanged
+    (spec §3.4 — reuse the arithmetic, not the week-bucket gate).
+
+    Two stages: an indexed candidate ``SELECT`` over widened whole-second
+    bounds, then the authoritative half-open comparison on parsed datetimes.
+    """
+    since_iso, until_iso = _shared_range_candidate_bounds(start, end_exclusive)
+    cur = conn.execute(
+        "SELECT e.id, e.timestamp_utc, e.model, e.input_tokens, "
+        "       e.output_tokens, e.cache_create_tokens, e.cache_read_tokens, "
+        "       e.cost_usd_raw, e.source_path, "
+        "       sf.session_id, sf.project_path, "
+        "       e.cache_create_1h_tokens, e.speed "
+        "FROM session_entries e "
+        "LEFT JOIN session_files sf ON sf.path = e.source_path "
+        "WHERE e.timestamp_utc >= ? AND e.timestamp_utc <= ? "
+        "ORDER BY e.timestamp_utc ASC, e.id ASC",
+        (since_iso, until_iso),
+    )
+    for row in cur:
+        ts = parse_iso_datetime(row[1], "session_entries.timestamp_utc")
+        if start <= ts < end_exclusive:
+            yield row
+
+
+def _shared_range_row_to_usage_entry(row):
+    """Rebuild the ``UsageEntry`` the daily aggregator consumes.
+
+    Field-for-field identical to ``_cctally_cache.iter_entries``, including
+    ``datetime.fromisoformat`` rather than ``parse_iso_datetime`` — the daily
+    aggregate has to reproduce what the legacy daily panel would compute over
+    the same rows, so this construction must not diverge from that one.
+    """
+    (_entry_id, ts_iso, model, input_tok, output_tok,
+     cache_create, cache_read, cost_raw, source_path,
+     _session_id, _project_path, cache_1h, speed) = row
+    return _cctally().UsageEntry(
+        timestamp=dt.datetime.fromisoformat(ts_iso),
+        model=model,
+        usage=claude_usage_dict(   # #195 chokepoint
+            input_tokens=input_tok,
+            output_tokens=output_tok,
+            cache_creation_tokens=cache_create,
+            cache_read_tokens=cache_read,
+            cache_1h_tokens=cache_1h,
+            speed=speed,
+        ),
+        cost_usd=cost_raw,
+        source_path=source_path,
+    )
+
+
+def fold_daily_over_range(rows, *, display_tz=None, mode: str = "auto"):
+    """Fold the shared candidate stream into per-day ``BucketUsage``.
+
+    Consumes the SAME already-materialised sequence the projects fold reads
+    (spec §3.4 — one candidate read, two folds). ``_aggregate_daily`` skips
+    ``<synthetic>`` rows itself, so both folds share that policy.
+    """
+    return _aggregate_daily(
+        [_shared_range_row_to_usage_entry(row) for row in rows],
+        mode=mode,
+        tz=display_tz,
+    )
+
+
+def build_daily_aggregate_rows(
+    rows,
+    *,
+    now_utc: "dt.datetime",
+    display_tz=None,
+    n: int = 30,
+    mode: str = "auto",
+) -> "list[DailyPanelRow]":
+    """The complete canonical thirty-day shape for the All Daily aggregate.
+
+    Pure apart from the caller's already-completed read. Folds the shared
+    candidate stream, runs it through the same ``build_daily_view`` data plane
+    the legacy panel uses, then materializes the contiguous calendar — so an
+    empty Claude provider still publishes a full zero-cost shape (§6.3a).
+    """
+    buckets = fold_daily_over_range(rows, display_tz=display_tz, mode=mode)
+    view = _cctally().build_daily_view(
+        (), now_utc=now_utc, display_tz=display_tz, mode=mode,
+        aggregated_override=buckets,
+    )
+    return materialise_daily_calendar(
+        view.rows, now_utc=now_utc, n=n, display_tz=display_tz,
+    )
+
+
 class _ProjWeekBucket(NamedTuple):
     """One (bucket_path, week) immutable aggregate for the projects-envelope
     per-week cache (#269 §14 Win 2).
@@ -3248,7 +3624,7 @@ def _fold_projects_entry(
     row: tuple,
     *,
     resolver_cache: dict,
-    week_start: "dt.datetime",
+    week_start: "dt.datetime | None",
 ) -> "float | None":
     """Fold ONE ``_projects_iter_session_entries`` row onto ``mut`` (the shared
     per-row body, #271 §20 Codex-P1a).
@@ -3267,6 +3643,13 @@ def _fold_projects_entry(
     order-safe for the warm append because every delta row sorts strictly after
     ``tail`` (#271 §20), so a delta row is never the first-seen of a bucket that
     already exists in ``mut``.
+
+    ``week_start=None`` (#556 S2 §3.4) disables ONLY the week-bucket gate, for
+    the range-native fold that ranks projects over one absolute interval. Every
+    other caller passes a real week start and is byte-unchanged. The gate is the
+    single line below; the cost, identity, session and first/last-seen
+    arithmetic beneath it is what both callers share, and sharing it is what
+    keeps the dashboard reconcilable with the CLI.
     """
     c = _cctally()
     (entry_id, ts_iso, model, input_tok, output_tok,
@@ -3275,7 +3658,7 @@ def _fold_projects_entry(
     if model == "<synthetic>":
         return None
     ts = parse_iso_datetime(ts_iso, "session_entries.timestamp_utc")
-    if _projects_week_start_monday_utc(ts) != week_start:
+    if week_start is not None and _projects_week_start_monday_utc(ts) != week_start:
         return None
     entry_cost = _calculate_entry_cost(
         model,
@@ -3314,6 +3697,172 @@ def _fold_projects_entry(
     if ts > a["last_seen"]:
         a["last_seen"] = ts
     return entry_cost
+
+
+def fold_projects_over_range(rows, *, resolver_cache=None) -> "dict[str, dict]":
+    """Fold an ALREADY-MATERIALISED candidate stream into per-bucket totals.
+
+    #556 S2 §3.4. Takes rows rather than a connection because one candidate read
+    serves both All-only Claude folds: reopening or rescanning would price the
+    same thirty-day population twice and extend the pinned cache snapshot's
+    WAL-holding lifetime for no gain.
+
+    Returns the RAW ``mut`` shape ``_fold_projects_entry`` maintains —
+    ``{bucket_path: {"cost_usd", "sessions" (a set), "first_seen", "last_seen",
+    "first_order", "first_id", "first_key" (the ``ProjectKey``)}}``. The
+    ``ProjectKey`` is retained deliberately: §3.8 disambiguates labels over
+    exactly this bounded population, and the legacy builder's collision-safe
+    label has already been replaced by an opaque key by the time the source
+    bundle sees ``claude_data``, so there is nothing left to capture there.
+
+    No ``attributed_pct`` is computed. Weekly quota attribution divides by a
+    subscription week's total (``_build_projects_envelope`` does it later), which
+    is not meaningful for an absolute-range ranking.
+    """
+    mut: "dict[str, dict]" = {}
+    cache = {} if resolver_cache is None else resolver_cache
+    for row in rows:
+        _fold_projects_entry(mut, row, resolver_cache=cache, week_start=None)
+    return mut
+
+
+def legacy_project_labels(projects_envelope: object) -> "dict[str, str]":
+    """``bucket_path`` -> legacy display key, over the two published collections.
+
+    These are exactly the collections ``_project_detail_for_window`` resolves a
+    requested display key against (`current_week.rows`, then `trend.projects`),
+    so this is the population in which agreement between the aggregate identity
+    and the legacy one is both possible and useful. A bucket outside it cannot
+    be served by the drill-down under either label.
+
+    Pure; the caller supplies the envelope the sync thread already built.
+    """
+    mapped: "dict[str, str]" = {}
+    env = projects_envelope if isinstance(projects_envelope, Mapping) else {}
+    current = env.get("current_week")
+    trend = env.get("trend")
+    collections = (
+        (current.get("rows") if isinstance(current, Mapping) else None),
+        (trend.get("projects") if isinstance(trend, Mapping) else None),
+    )
+    for collection in collections:
+        for row in collection or ():
+            if not isinstance(row, Mapping):
+                continue
+            bucket_path = row.get("bucket_path")
+            display_key = row.get("key")
+            if isinstance(bucket_path, str) and bucket_path and (
+                isinstance(display_key, str) and display_key
+            ):
+                mapped.setdefault(bucket_path, display_key)
+    return mapped
+
+
+def build_project_aggregate_rows(
+    rows, *, resolver_cache=None, legacy_labels=None,
+) -> "list[dict]":
+    """Published `providers.claude.projects.aggregate.rows` (spec §3.5.1).
+
+    Folds the shared candidate stream, labels each bucket, and publishes it as
+    ``{key, label, source, cost_usd, sessions_count, drillable}``.
+
+    **The label is the legacy display key wherever the legacy population knows
+    the bucket, and the bounded disambiguated label otherwise.** The opaque key
+    is minted from whichever label is published, through the same rule the
+    legacy Claude project rows use (``dashboard_resource_key("project",
+    "claude", <display key>)``).
+
+    **The published population is not the routable one, and each row says
+    which it is in.** The legacy population is not a superset of the bounded
+    one on either axis. It is not a superset in COST, because ``trend_projects``
+    skips a bucket whose cost is 0.0 across every trend week and
+    ``current_week.rows`` carries only buckets with a current-week entry. It is
+    not a superset in TIME either: the envelope walks
+    ``[weeks_full[0], cw_start + 7d]`` and drops any entry whose
+    Monday-anchored week falls outside ``weeks_full``, so an entry after the
+    current week's nominal end is invisible to it while this fold correctly
+    reaches ``now``. ``tests/fixtures/dashboard/tz-override`` is that shape: one
+    priced project at exactly ``now``, published in the aggregate and absent
+    from both legacy collections.
+
+    Filtering the published rows to the legacy population would drop that real
+    row rather than fix it, and widening ``_build_projects_envelope``'s window
+    is out of scope here because the Claude tab and the reconcile harness both
+    read it. So the gap is resolved at the SEAM instead: ``drillable`` states,
+    per row, whether the drill-down can reach that bucket, computed from the
+    same collections ``_claude_project_key_for_source_key`` searches. A
+    ``False`` row keeps its rank, its label and its cost — the ranking stays
+    complete — and the client renders it without a drill affordance rather
+    than offering an interaction that 404s.
+
+    ``drillable`` is exactly ``bucket_path in legacy_labels``. That is the
+    condition under which the published label IS a legacy display key, so the
+    minted opaque key is the one the route inverts. Deliberately NOT "the
+    published label happens to appear among the legacy display keys": for a
+    bucket the legacy population does not carry, a bounded label that collided
+    with some OTHER bucket's legacy key would resolve, and serve that other
+    project's sessions under this row's identity. A mis-route is worse than a
+    withheld drill, so the predicate names the bucket, not the string.
+
+    The split is what makes the aggregate rows ROUTABLE. Labels are
+    population-sensitive by design (`bin/_cctally_project.py`), so
+    disambiguating over the bounded thirty-day population and over the legacy
+    twelve-week one can produce different overrides for the same project — a
+    project sharing a basename with an older root forces an override in one
+    population and not in the other. Two labels means two opaque keys, and the
+    drill-down resolves the requested key against the LEGACY display keys
+    (`_claude_project_key_for_source_key` -> `_project_detail_for_window`), so
+    a bounded-only key 404s even for a project both collections know.
+    Preferring the legacy key where one exists makes the two identities agree
+    by construction, and it does not weaken §9.2's twin-pair requirement:
+    the legacy population disambiguates that pair too, so the two rows keep
+    distinct labels and distinct identities.
+
+    ``legacy_labels`` is ``{bucket_path: display_key}`` from
+    ``legacy_project_labels``. A bucket it does not carry falls back to the
+    bounded disambiguated label. ``None`` means "no legacy population was
+    supplied" and is NOT a production path: production withholds the aggregate
+    when no envelope was built (`_tui_build_claude_aggregates`), because
+    publishing rows against an unknown routable population is the silent
+    identity change this rule exists to prevent. It is kept for kernel callers
+    that fold a store with no envelope beside it.
+
+    No ``attributed_pct``: quota attribution divides by a subscription week's
+    total and means nothing over an absolute range. No ``bucket_path``, git
+    root or raw source path — opaque keys stay non-reversible.
+    """
+    c = _cctally()
+    folded = fold_projects_over_range(rows, resolver_cache=resolver_cache)
+    bucket_paths_sorted = sorted(folded)
+    augmented_by_idx = c._project_disambiguate_labels(
+        [{"key": folded[bp]["first_key"]} for bp in bucket_paths_sorted],
+    )
+    legacy = legacy_labels if isinstance(legacy_labels, Mapping) else {}
+    published: "list[dict]" = []
+    for idx, bucket_path in enumerate(bucket_paths_sorted):
+        accumulator = folded[bucket_path]
+        legacy_label = legacy.get(bucket_path)
+        label = legacy_label or augmented_by_idx.get(
+            idx, accumulator["first_key"].display_key,
+        )
+        published.append({
+            "key": dashboard_resource_key("project", "claude", label),
+            "label": label,
+            "source": "claude",
+            # Whether `GET /api/source/claude/project/<key>` can resolve this
+            # row. See the docstring: the predicate names the BUCKET, so a
+            # bounded label that collides with an unrelated legacy key never
+            # advertises a drill that would serve the wrong project.
+            "drillable": legacy_label is not None,
+            # NOT rounded, for the same reason `current_week.rows` is not:
+            # `round(..., 6)` introduces ~1e-6 error that breaks the 1e-9
+            # reconcile tolerance.
+            "cost_usd": accumulator["cost_usd"],
+            "sessions_count": len(accumulator["sessions"]),
+        })
+    # Desc by cost, ties broken by label so the ranking is byte-stable.
+    published.sort(key=lambda row: (-row["cost_usd"], row["label"]))
+    return published
 
 
 def _aggregate_projects_week_raw(

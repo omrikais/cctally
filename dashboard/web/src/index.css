@@ -1757,24 +1757,6 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   min-width: 320px;
   color: var(--text);
 }
-/* #294 S5 §6.9 — Help's per-source hidden-capability notes. */
-#help-overlay .help-hidden-capabilities {
-  margin-top: 14px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-soft);
-}
-#help-overlay .help-hidden-heading {
-  margin: 0 0 4px;
-  font-size: var(--fs-meta);
-  font-weight: 700;
-  color: var(--text-dim);
-}
-#help-overlay .help-hidden-list {
-  margin: 0;
-  padding-left: 18px;
-  color: var(--text-dim);
-  font-size: 13px;
-}
 #help-overlay .help-header {
   display: flex; justify-content: space-between; align-items: center;
   margin: 0 0 12px;
@@ -1865,10 +1847,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
    becomes a flex column (nav auto · two-pane flex:1 · footer auto); the grid
    panes stretch to the bounded two-pane height and scroll within. Gated to
    ≥1025px — below that the two-pane is single-column and the modal keeps its
-   natural full-sheet scroll (fine on mobile). Scoped to `.modal-wide`
-   (Weekly/Monthly only); Daily and every other modal are untouched. */
+   natural full-sheet scroll (fine on mobile).
+   Scoped to `.modal-wide.modal-pane-scroll` (#556 S4): `wide` is width alone,
+   and this contract is opt-in, because a modal that sets `wide` without
+   rendering `.period-two-pane` would otherwise get `overflow:hidden` with no
+   pane to scroll — which is exactly what clipped the All Current Usage and
+   All Trend modals. Daily and every other modal remain untouched. */
 @media (min-width: 1025px) {
-  .modal-card.modal-wide .modal-body {
+  .modal-card.modal-wide.modal-pane-scroll .modal-body {
     display: flex; flex-direction: column; min-height: 0; overflow: hidden;
   }
   /* #264 S3: the Trend modal nests `.period-two-pane` inside a
@@ -1881,14 +1867,14 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
      (modal-body → modal-trend flex:1 col → chipstrip auto + two-pane flex:1 →
      panes scroll internally). Harmless for Weekly/Monthly (they have no
      `.modal-trend`). */
-  .modal-card.modal-wide .modal-trend {
+  .modal-card.modal-wide.modal-pane-scroll .modal-trend {
     display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
   }
-  .modal-card.modal-wide .period-two-pane {
+  .modal-card.modal-wide.modal-pane-scroll .period-two-pane {
     flex: 1 1 auto; min-height: 0; align-items: stretch;
   }
-  .modal-card.modal-wide .period-two-pane > .period-detail-pane,
-  .modal-card.modal-wide .period-two-pane > .period-table-pane {
+  .modal-card.modal-wide.modal-pane-scroll .period-two-pane > .period-detail-pane,
+  .modal-card.modal-wide.modal-pane-scroll .period-two-pane > .period-table-pane {
     min-height: 0; overflow: auto;
   }
 }
@@ -3378,6 +3364,14 @@ mark.current {
 .panel-empty {
   text-align: center; color: var(--text-faint); font-size: var(--fs-meta); padding: 24px 0;
 }
+/* #556 S2 §3.7 — a WITHHELD aggregate. It is always rendered as
+ * `panel-empty panel-withheld`, and the second class carries no rule on
+ * purpose: the state is distinguished by its COPY, which names the missing
+ * fact, not by a different look. It exists as a hook — for the tests that
+ * assert the state, and for `[data-withheld-code]`, which carries the reason.
+ * Deliberately NOT given an alert colour: nothing is broken, one figure is
+ * unavailable, and dressing it as a fault is the "restart the dashboard"
+ * reading this section removed. */
 /* Center the empty-state copy in the panel body instead of top-anchoring,
    so tall panels don't show dead space below the message (#207 C3). */
 .panel-body:has(> .panel-empty) {
@@ -6287,6 +6281,113 @@ mark.current {
 .projects-row:hover { background: color-mix(in srgb, var(--accent-magenta) 6%, transparent); }
 .projects-row.tail { cursor: default; }
 .projects-row.tail:hover { background: transparent; }
+/* #556 S2 §3.8a — a ranked row the drill-down route cannot resolve. It keeps
+ * its rank, label and cost; only the interaction goes away, so the cursor and
+ * the hover affordance must go away with it. Same treatment as `.tail`, which
+ * is the panel's existing vocabulary for a non-clickable row. */
+.projects-row.is-static { cursor: default; }
+.projects-row.is-static:hover { background: transparent; }
+
+/* #556 S2 QA P1-2 — a panel header's sub-line: the resolved range, the window,
+ * and the composition under All. It is a SIBLING of `.panel-header` rather than
+ * a child, so it spans the full card width instead of competing with the
+ * actions cluster, and it WRAPS. That is the whole reason it exists: inside the
+ * h2 this text met the mobile `white-space: nowrap` / `text-overflow: ellipsis`
+ * rule and the composition — the point of the change — was the part cut off at
+ * 390px. Measured there before the move: Blocks 47% of its h2 visible, Monthly
+ * 70%, Weekly 72%, Projects 45%, and Daily's whole sub-span suppressed by
+ * `#panel-daily .panel-header h2 .sub { display: none }`.
+ * The negative top margin pulls it up under the header's own 14px bottom
+ * margin so it reads as part of the title block rather than as body content.
+ * ONE class for all six panels: Projects introduced it, the other four
+ * adopted it rather than growing a second mechanism beside it, and Recent
+ * Sessions joined in #572. Weekly, Monthly and Sessions state a composition
+ * and no range, so they gate on the selection alone; Daily and Projects
+ * state a data-dependent range, so their notes vary by outcome. */
+.panel-range-note {
+  margin: -10px 0 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* #556 S2 QA P3 — the visible, announced reason a ranked row offers no drill.
+ * Spans the whole row grid, so it lands on its own line under the row's four
+ * columns without disturbing them. It replaces a `title` attribute as the ONLY
+ * statement of the reason: a title is not a touch disclosure and a screen
+ * reader does not read one on a non-focusable element. */
+.projects-row-nodrill {
+  grid-column: 1 / -1;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* #556 S2 §6.4 — the combined blocks footer's second line: the interval the
+ * displayed windows span, and the per-provider counts and costs. Two
+ * independent five-hour clocks, so this never reads as one continuous run. */
+.blocks-foot-attribution {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+/* `.blocks-foot-span` and `.blocks-foot-leg` are deliberately RULE-FREE. They
+ * are hooks, not styles: both inherit `.blocks-foot-attribution`'s size and
+ * colour, which is exactly what the line should look like, and they exist so a
+ * test and a future style change can name the two halves. Giving either a rule
+ * now would only restate the parent. Stated here rather than left as four
+ * classes with no rules anywhere, which reads as an omission. */
+
+/* #556 S2 §6.3 — the Daily drill-down's per-provider breakdown. The merged row
+ * publishes one cost and NO model set, so the legs are where the attribution
+ * lives; a provider with no activity that day reads "No activity" rather than
+ * showing a $0.00 row that looks like a measurement. */
+.daily-provider-legs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.daily-provider-leg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.daily-provider-leg .cost { color: var(--accent-green); }
+.daily-provider-leg .muted { color: var(--text-dim); }
+
+/* #556 S2 §5.2 — the combined period footer's second line: the span the figure
+ * covers and the provider legs it is made of. Wraps rather than clipping,
+ * because at 390px the split alone can exceed the card width. */
+.period-foot-attribution {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.period-foot-span { color: var(--text-dim); }
+/* `.period-foot-leg` is deliberately RULE-FREE, for the same reason as its two
+ * blocks siblings: it inherits `.period-foot-attribution` and exists as a hook
+ * for tests and for a future per-leg treatment. */
+
+/* #556 S2 §4.2 — ONE legend naming what the percentage column reports: a share
+ * of the week's quota on the Claude tab, a share of the ranked cost on Codex
+ * and All. Rendered on EVERY tab, deliberately: the recomputation was never
+ * All-specific, so the Codex tab has always shown a share of cost in the slot
+ * the Claude tab uses for a share of quota. (This comment sat forty lines
+ * above the rule it describes until the QA pass; it is back beside it.) */
+.projects-legend {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  padding: 0 6px;
+}
 .projects-row:focus-visible { outline: 2px solid var(--accent-magenta); outline-offset: -2px; }
 .projects-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .projects-row .name.muted,
@@ -6387,6 +6488,15 @@ mark.current {
   background: color-mix(in srgb, var(--accent-magenta) 18%, transparent);
   border-color: var(--accent-magenta); color: #f5d0fe;
 }
+/* #556 S4 — the window pills carry a real `disabled` attribute under Codex and
+   All, but `.pill` had no disabled treatment at all, so they rendered
+   pixel-identical to enabled pills with `cursor: pointer` still promising a
+   click. Scoped to the Projects controls rather than `.pill` globally: the
+   only other bare `.pill` is a non-interactive span in the Cache Report
+   spotlight, and a global rule would make a visual token into a control
+   contract. Declared after `.pill.on` so a disabled pill that is also the
+   selected one still dims. */
+.projects-controls .pill:disabled { opacity: 0.4; cursor: default; }
 .projects-controls .sep { color: var(--text-dim); margin: 0 4px; }
 
 .projects-notice {
@@ -7949,6 +8059,16 @@ mark.current {
 .sd-tokens dt { color: var(--text-faint); }
 .sd-tokens dd { margin: 0; }
 .sd-note { color: var(--accent-amber); margin: 0 0 var(--space-3); }
+/* #556 S2 QA P1-3 — the Codex project drill states the window its totals
+ * cover. Muted rather than amber: it is a label on a correct figure, not a
+ * degradation warning like `.sd-note`. Wraps freely, because the sentence is
+ * longer than a phone-width modal line. */
+.sd-window-note {
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+  margin: 0 0 var(--space-3);
+  line-height: 1.4;
+}
 .sd-privacy-note {
   margin-top: var(--space-3);
   padding: var(--space-2) var(--space-3);

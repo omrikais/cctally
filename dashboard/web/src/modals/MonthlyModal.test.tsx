@@ -71,7 +71,9 @@ describe('<MonthlyModal /> (#264 S2)', () => {
     updateSnapshot(baseEnvelope());
     dispatch({ type: 'OPEN_MODAL', kind: 'monthly' });
     render(<MonthlyModal />);
-    expect(document.querySelector('.modal-card.modal-wide')).not.toBeNull();
+    // #556 S4: Monthly really renders `.period-two-pane`, so it opts in to the
+    // >=1025px pane-scroll contract explicitly rather than inheriting it.
+    expect(document.querySelector('.modal-card.modal-wide.modal-pane-scroll')).not.toBeNull();
     const twoPane = document.querySelector('.period-two-pane');
     expect(twoPane).not.toBeNull();
     expect(twoPane?.querySelector('.period-detail-pane .detail-card')).not.toBeNull();

@@ -42,14 +42,14 @@ import journal_fixture_496_s4 as F
 #: it would be measuring is asserted structurally in `tests/test_quota_journal.py`.
 
 #: Per-observation allocation that survives to the peak BEYOND the encoded byte
-#: length of the retained line. Measured on this fixture at roughly 986 bytes,
-#: of which about 41 is the `bytes` object header plus the list slot and the
-#: rest is the cache leg's own per-observation anchor state — a pre-existing
-#: property of `_apply_quota_records`, not of the retention this session added.
-#: 2048 leaves headroom for run-to-run variation while still failing a
-#: regression that retained decoded dictionaries, which cost several thousand
-#: bytes per observation rather than one thousand.
-_PER_RECORD_OVERHEAD_BYTES = 2048
+#: length of the retained line. #508 Task C measured three runs on each fleet
+#: runner: the current path used 176.46--176.49 bytes/record (0.026 bytes of
+#: cross-run spread), while the rejected coordinate/routing projection added
+#: 525.90 deep bytes and raised the slope to 702.34--702.35 bytes/record. 512 is
+#: the next binary ceiling above the measured baseline: 335 bytes/record of
+#: headroom, while the controlled compact-projection mutant remains 190 bytes
+#: beyond it. Reproduce with `tests/_measure_rebuild_memory_508.py` remotely.
+_PER_RECORD_OVERHEAD_BYTES = 512
 #: The read path alone must retain NOTHING per dropped observation. Measured
 #: delta with the cache leg disabled: 40 KB over 11,100 added observations.
 _FLAT_RETENTION_ALLOWANCE_BYTES = 1_000_000
@@ -93,6 +93,30 @@ def tier1_slope_without_the_leg(tmp_path_factory):
         work, "doubled", build=F.tier1_build(extra_quota_lines=extra),
         trace=True, no_quota_cache=True)
     return base, doubled
+
+
+@pytest.fixture(scope="session")
+def tier1_slope_with_compact_projection_mutant(tmp_path_factory):
+    """The same pair with Task C's rejected coordinate projection retained."""
+    work = tmp_path_factory.mktemp("rebuild_slope_projection_mutant")
+    base = F.run_worker(
+        work, "base", build=F.tier1_build(), trace=True,
+        compact_projection_mutant=True)
+    extra = int(base["shape"]["counts"]["obs_quota"])
+    doubled = F.run_worker(
+        work, "doubled", build=F.tier1_build(extra_quota_lines=extra),
+        trace=True, compact_projection_mutant=True)
+    return base, doubled
+
+
+def _slope_inputs(base, doubled):
+    added_records = (doubled["traversal"]["quota_replay"]["lines"]
+                     - base["traversal"]["quota_replay"]["lines"])
+    added_bytes = (doubled["traversal"]["quota_replay"]["bytes"]
+                   - base["traversal"]["quota_replay"]["bytes"])
+    growth = doubled["traced_peak_bytes"] - base["traced_peak_bytes"]
+    assert added_records > 0 and added_bytes > 0
+    return added_records, added_bytes, growth
 
 
 def test_the_read_path_retains_nothing_per_dropped_observation(
@@ -162,17 +186,33 @@ def test_peak_allocation_grows_only_by_the_added_observation_bytes(tier1_slope):
     of it.
     """
     base, doubled = tier1_slope
-    added_records = (doubled["traversal"]["quota_replay"]["lines"]
-                     - base["traversal"]["quota_replay"]["lines"])
-    added_bytes = (doubled["traversal"]["quota_replay"]["bytes"]
-                   - base["traversal"]["quota_replay"]["bytes"])
-    assert added_records > 0 and added_bytes > 0
+    added_records, added_bytes, growth = _slope_inputs(base, doubled)
     allowance = added_bytes + _PER_RECORD_OVERHEAD_BYTES * added_records
-    growth = doubled["traced_peak_bytes"] - base["traced_peak_bytes"]
     assert growth <= allowance, (
         f"peak allocation grew {growth} bytes for {added_records} added "
         f"observations totalling {added_bytes} encoded bytes; allowance "
         f"{allowance}")
+
+
+def test_compact_projection_regression_is_rejected(
+    tier1_slope_with_compact_projection_mutant
+):
+    """Freeze the mechanism gap #507 identified, not just a lower constant.
+
+    The controlled mutant retains the coordinate/routing tuple proposed and
+    rejected by the S4 design.  It must still fit the historical +2048 bound,
+    proving that this is the exact regression the replacement gate adds, and
+    it must exceed the measurement-derived current bound.
+    """
+    base, doubled = tier1_slope_with_compact_projection_mutant
+    added_records, added_bytes, growth = _slope_inputs(base, doubled)
+    old_allowance = added_bytes + 2048 * added_records
+    assert growth <= old_allowance, (
+        "controlled compact-projection mutant no longer demonstrates the "
+        "historical gate gap")
+    allowance = added_bytes + _PER_RECORD_OVERHEAD_BYTES * added_records
+    assert growth > allowance, (
+        "compact-projection mutant passed the replacement memory-slope gate")
 
 
 # ==========================================================================

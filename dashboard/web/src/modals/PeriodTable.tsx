@@ -78,9 +78,12 @@ export function PeriodTable({
 }: Props) {
   const hv = variant === 'weekly' ? 'week' : 'month';
   const columns = historyColumns(hv, showSource, periodLabel);
+  // #556 S2 §5.3 — the override is scoped to THIS period kind. Weekly and
+  // monthly expose different columns, so a sort chosen on one table cannot
+  // apply to the other.
   const sortOverride = useSyncExternalStore(
     subscribeStore,
-    () => getState().prefs.historySortOverride,
+    () => getState().prefs.historySortOverrides[hv],
   );
 
   // Decorate PeriodRow[] → HistoryTableRow[] (keyed via keyOf), then apply
@@ -89,7 +92,16 @@ export function PeriodTable({
   // with PeriodModal via decorateHistoryRows so the ↑/↓ ordered key list
   // and the rendered row order never drift.
   const decorated = decorateHistoryRows(rows, hv);
-  const sorted = applyTableSort(decorated, columns, sortOverride);
+  // #556 S2 §5.3 — under All the ordering applies INDEPENDENTLY INSIDE each
+  // provider section. Sorting the union would interleave two providers'
+  // independent histories into one ranked list, which is exactly the blend the
+  // unmerge exists to prevent; the provider column would then be the only
+  // thing telling a reader that adjacent rows come from different reset axes.
+  const sorted = showSource
+    ? (['claude', 'codex'] as const).flatMap((source) => applyTableSort(
+        decorated.filter((row) => row.source === source), columns, sortOverride,
+      ))
+    : applyTableSort(decorated, columns, sortOverride);
 
   return (
     <table
@@ -101,7 +113,10 @@ export function PeriodTable({
         columns={columns}
         override={sortOverride}
         onChange={(next) =>
-          dispatch({ type: 'SET_TABLE_SORT', table: 'history', override: next })
+          dispatch({
+            type: 'SET_TABLE_SORT', table: 'history', periodKind: hv,
+            override: next,
+          })
         }
         accentVar={`--${accentClass}`}
       />

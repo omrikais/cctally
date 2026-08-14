@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fixture_builders import (  # noqa: E402
     create_cache_db,
     create_stats_db,
+    fixture_source_timestamp_z,
     seed_codex_session_entry,
     seed_session_entry,
     seed_session_file,
@@ -70,7 +71,9 @@ CAL_WEEK_START = dt.datetime(2026, 6, 8, 0, 0, 0, tzinfo=dt.timezone.utc)  # Mon
 
 
 def _iso(d: dt.datetime) -> str:
-    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Serialize a datetime as UTC-ISO with `Z` suffix, preserving any
+    fractional second (#568)."""
+    return fixture_source_timestamp_z(d)
 
 
 def _seed_window_snapshot(stats_conn, *, weekly_percent: float, as_of: dt.datetime) -> None:

@@ -336,8 +336,9 @@ The alert is a sixth axis (`codex_budget`) alongside `weekly` / `five_hour` /
 #### Dashboard surfacing
 
 Fired Codex alerts appear in the dashboard "Recent alerts" panel/modal (and as a
-toast) with a distinct **"CODEX"** chip (vs the global "BUDGET" / per-project
-"PROJECT" chips) and a **period-aware** label ("Month of …" / "Calendar week of
+toast) with a **"BUDGET"** chip in its own colour — the chip names the metric,
+and the row's separate source chip says which provider it belongs to — and a
+**period-aware** label ("Month of …" / "Calendar week of
 …", not "Week"). The same period-aware label fix applies to calendar-period
 **Claude** budget alerts. A Codex projected-pace crossing reuses the
 **"PROJECTED"** chip with a vendor-tagged context line — *"projected \$230 of

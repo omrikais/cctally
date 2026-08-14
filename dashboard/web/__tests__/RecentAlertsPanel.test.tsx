@@ -66,6 +66,32 @@ function mkFiveHourAlert(idx: number, threshold: 90 | 95 = 95): AlertEntry {
   };
 }
 
+// #556 S3 §3.1 — the populated-legacy preference branch is gone: whenever a
+// `sources` bundle exists the panel/modal read the ACTIVE source's own
+// projection. These tests mount over the shared `envelope.json` fixture, which
+// carries a bundle, so seeding through `INGEST_SNAPSHOT_ALERTS` alone would
+// leave the surface empty. Publish the same rows on the Claude projection too,
+// which is what the server does in production — the projection is the legacy
+// array filtered by ownership (§3.2), preserving every field of the rows it
+// keeps, so the two carry identical values here.
+function seedAlerts(alerts: AlertEntry[]): void {
+  dispatch({
+    type: 'INGEST_SNAPSHOT_ALERTS',
+    alerts,
+    alertsSettings: DEFAULT_ALERTS_SETTINGS,
+    isFirstTick: true,
+  });
+  const env = JSON.parse(JSON.stringify(fixture)) as Record<string, never>;
+  const sources = (env as unknown as {
+    sources: { claude: { data: { alerts: { rows: unknown[] } } } };
+    data_version?: string;
+  }).sources;
+  sources.claude.data.alerts = {
+    rows: alerts.map((a) => ({ ...a, source: 'claude', key: a.id })),
+  };
+  updateSnapshot(env as unknown as Envelope);
+}
+
 describe('<RecentAlertsPanel />', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -88,12 +114,7 @@ describe('<RecentAlertsPanel />', () => {
 
   it('renders up to 10 most-recent alerts (slices a 15-alert store)', () => {
     const alerts = Array.from({ length: 15 }, (_, i) => mkAlert(i));
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts,
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts(alerts);
     render(<RecentAlertsPanel />);
     const rows = document.querySelectorAll('.alert-row');
     expect(rows.length).toBe(10);
@@ -106,12 +127,7 @@ describe('<RecentAlertsPanel />', () => {
     // a distinct "red" tier — it sits in the warn band alongside 90.) The tier
     // class is axis-agnostic (weekly / five_hour / budget all go through
     // alertSeverity), so exercise all three axes here.
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90), mkFiveHourAlert(2, 95), mkBudgetAlert(3, 100)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkAlert(1, 90), mkFiveHourAlert(2, 95), mkBudgetAlert(3, 100)]);
     render(<RecentAlertsPanel />);
     const cells = document.querySelectorAll('.alert-threshold');
     expect(cells.length).toBe(3);
@@ -124,12 +140,7 @@ describe('<RecentAlertsPanel />', () => {
   });
 
   it('renders a BUDGET chip for budget-axis alerts (issue #19)', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkBudgetAlert(1, 90)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkBudgetAlert(1, 90)]);
     render(<RecentAlertsPanel />);
     const chip = document.querySelector('.chip--budget');
     expect(chip).not.toBeNull();
@@ -150,12 +161,7 @@ describe('<RecentAlertsPanel />', () => {
   });
 
   it('panel click dispatches openAction (OPEN_MODAL alerts)', async () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkAlert(1, 90)]);
     render(<RecentAlertsPanel />);
     const user = userEvent.setup();
     const panel = document.querySelector(

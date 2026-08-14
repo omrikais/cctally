@@ -1280,6 +1280,9 @@ export interface CodexBudgetAlertRow {
   threshold: number;
   value: number;
   created_at: string;
+  /** #556 S3 §2.8 — canonical firing instant, v7+. Optional for pre-v7,
+   *  where `created_at` is the only instant a Codex alert row carried. */
+  alerted_at?: string;
   account_key?: string;
   accountKey?: string;
   accountLabel?: string;
@@ -1292,6 +1295,9 @@ export interface CodexProjectedAlertRow {
   threshold: number;
   value: number;
   created_at: string;
+  /** #556 S3 §2.8 — canonical firing instant, v7+. Optional for pre-v7,
+   *  where `created_at` is the only instant a Codex alert row carried. */
+  alerted_at?: string;
   account_key?: string;
   accountKey?: string;
   accountLabel?: string;
@@ -1303,6 +1309,9 @@ export interface CodexQuotaAlertRow {
   threshold: number;
   severity: string;
   created_at: string;
+  /** #556 S3 §2.8 — canonical firing instant, v7+. Optional for pre-v7,
+   *  where `created_at` is the only instant a Codex alert row carried. */
+  alerted_at?: string;
   account_key?: string;
   accountKey?: string;
   accountLabel?: string;
@@ -1434,12 +1443,48 @@ export interface ClaudePeriodsDomain {
   daily: DailyEnvelope;
   monthly: MonthlyEnvelope;
   weekly: WeeklyEnvelope;
+  // #556 S2 §6.3a — the All Daily outcome owns its COMPLETE canonical row
+  // shape: thirty contiguous calendar days, gap-filled, `is_today` and
+  // intensity materialised, emitted even when Claude is empty. The All
+  // presentation must not consult `env.daily.rows` for shape, because a day
+  // rollover rebuilds that panel while a retained bundle keeps the rows the
+  // retained range describes, and reshaping one against the other would put
+  // rows on screen that the published range does not cover.
+  //
+  // Optional for the same v5-server reason as `projects.aggregate`.
+  daily_aggregate?: { rows: DailyPanelRow[] };
 }
 
 export interface ClaudeSessionsDomain {
   total?: number;
   sort_key?: string;
   rows: ClaudeSessionSourceRow[];
+}
+
+// #556 S2 §3.5.1 — one project row of the shared-range ranking, transcribed
+// from `bin/_cctally_dashboard.py::build_project_aggregate_rows`.
+//
+// `label` is the LEGACY display key wherever the legacy twelve-week population
+// knows the bucket, and the bounded disambiguated label otherwise (§3.8, as
+// amended by rev6). The opaque `key` is minted from whichever label is
+// published, which is what makes the ranked identity and the routable identity
+// the same value.
+//
+// `drillable` (§3.8a) states whether the drill-down route resolves this row.
+// The legacy population is not a superset of the bounded one — a project active
+// between a week's rollover and the envelope re-anchoring is ranked and in no
+// route-visible collection — so a `false` row keeps its rank, label and cost
+// and renders WITHOUT a drill affordance rather than offering one that 404s.
+//
+// `attributed_pct` is deliberately absent: quota attribution divides by a
+// subscription week's total and means nothing over an absolute range.
+export interface ProjectAggregateRow {
+  key: string;
+  label: string;
+  source: 'claude';
+  cost_usd: number;
+  sessions_count: number;
+  drillable: boolean;
 }
 
 // The Claude projects domain keeps the legacy current_week/trend sub-shapes
@@ -1458,6 +1503,12 @@ export interface ClaudeProjectsDomain {
     projects: ClaudeProjectSourceRow[];
   };
   rows: ClaudeProjectSourceRow[];
+  // #556 S2 §3.5.1 — the rows-only sibling, bounded by the shared absolute
+  // range. NO range and NO outcome live here: both are published once, on the
+  // All source data. Optional because a v5 server emits neither, and because
+  // the client must synthesize `rows_absent` rather than read a missing
+  // sibling as honest emptiness.
+  aggregate?: { rows: ProjectAggregateRow[] };
 }
 
 // A Claude 5h-block source row = the legacy BlocksPanelRow with the opaque
@@ -1566,6 +1617,61 @@ export interface AllCombined {
   qualifications?: AllCombinedQualification[];
 }
 
+// #556 S2 §3.5.1 — the shared cross-provider aggregate contract.
+//
+// TWO RANGE RULES COEXIST, deliberately. A combined TOTAL (S1's `combined`
+// above) sums provider-native cycles, each leg naming its own. A cross-provider
+// RANKING uses ONE shared absolute calendar range, published here exactly once.
+// Neither is a simplification of the other.
+
+// The shared range. A sibling of `AllCombinedPeriod`, not a widening of it:
+// that type is shaped around subscription and native cycles. Both bounds are
+// canonical `...Z`.
+//
+// `end_at` legitimately TRAILS the current clock. On an idle tick the prior
+// bundle is kept and only provider clocks refresh, so the range keeps
+// describing the rows actually on screen. That is correctness, not staleness.
+export interface AggregateRange {
+  kind: 'absolute_range';
+  label: string;
+  start_at: string;
+  end_at: string;
+}
+
+// Closed for SERVER generation and for tests. The CLIENT must not treat it as
+// closed — the in-place update path deliberately lets an old client meet a
+// newer server, so every rendering switch over these needs a required fallback
+// branch. `rows_absent` is CLIENT-SYNTHESIZED and never server-emitted.
+export type KnownAggregateWithheldCode =
+  | 'range_unresolved'
+  | 'provider_unavailable'
+  | 'provider_incoherent'
+  | 'claude_fold_failed'
+  | 'retained_range_mismatch'
+  | 'rows_absent';
+
+// A note that qualifies a PUBLISHED ranking rather than withholding it. Known
+// code: `codex_project_metadata_partial`. `code` stays `string` for the same
+// forward-compatibility reason as the withheld codes.
+export interface AggregateQualification {
+  code: string;
+  provider: SourceName;
+}
+
+// Precedence, when more than one cause holds, is total and in the order the
+// known codes are declared: `range_unresolved`, `provider_unavailable`,
+// `provider_incoherent`, `claude_fold_failed`, `retained_range_mismatch`. At
+// equal rank Claude is named before Codex.
+export type AggregateOutcome =
+  | { state: 'available'; qualifications?: AggregateQualification[] }
+  | { state: 'withheld'; code: string; provider?: SourceName };
+
+export interface AllAggregates {
+  range: AggregateRange | null;
+  projects: AggregateOutcome;
+  daily: AggregateOutcome;
+}
+
 export interface AllSourceData {
   // Stays PRESENT as `null` when withheld. Only `combined_unavailable` is
   // omitted-when-inapplicable.
@@ -1582,6 +1688,12 @@ export interface AllSourceData {
     claude: ClaudeSourceData | null;
     codex: CodexSourceData | null;
   };
+  // #556 S2 §3.5.1 — the ONE public copy of the shared range and of both
+  // aggregate outcomes. The rows themselves stay on the provider domains and
+  // the adapter composes them, which is what keeps exactly one copy of
+  // everything. Optional: a v5 server emits no `aggregates` object at all, and
+  // the adapter synthesizes `rows_absent` for that case.
+  aggregates?: AllAggregates;
 }
 
 // ---- Source-aware alert rows (§6.7) -----------------------------------

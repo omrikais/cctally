@@ -18,9 +18,11 @@ describe('AXIS_CHIP_LABEL / AXIS_TITLE_LABEL', () => {
     expect(AXIS_TITLE_LABEL[axis]).toBe('Project budget');
   });
 
-  it('resolves the codex_budget axis to the CODEX chip', () => {
+  it('resolves the codex_budget axis to the BUDGET chip', () => {
     const axis: AlertAxis = 'codex_budget';
-    expect(AXIS_CHIP_LABEL[axis]).toBe('CODEX');
+    // #556 S3 §4.3 — the chip names the METRIC. Attribution travels in the
+    // row's source chip, so two axes can share one chip string.
+    expect(AXIS_CHIP_LABEL[axis]).toBe('BUDGET');
     expect(AXIS_TITLE_LABEL[axis]).toBe('Codex budget');
   });
 
@@ -34,7 +36,7 @@ describe('AXIS_CHIP_LABEL / AXIS_TITLE_LABEL', () => {
       budget: 'BUDGET',
       projected: 'PROJECTED',
       project_budget: 'PROJECT',
-      codex_budget: 'CODEX',
+      codex_budget: 'BUDGET',
     });
     expect(AXIS_TITLE_LABEL).toEqual({
       weekly: 'Weekly',

@@ -25,7 +25,11 @@ describe('S4 source envelope wire shape (guard)', () => {
     const env = fixture as Record<string, unknown>;
 
     // The four bundle fields are TOP-LEVEL siblings, not nested under `sources`.
-    expect(env.source_schema_version).toBe(2);
+    // #556 S2 §3.9 — the fixture tracks the CURRENT server version (6 -> 7 for
+    // #556 S3's canonical `alerted_at` on every Codex alert row). The
+    // assertion is about placement, not about the number: no production client
+    // branches on it, which is exactly why every wire change here is additive.
+    expect(env.source_schema_version).toBe(7);
     expect(env.default_source).toBe('claude');
     expect(env.source_order).toEqual(['claude', 'codex', 'all']);
   });
@@ -79,7 +83,10 @@ describe('S4 source envelope wire shape (guard)', () => {
     const slice = makeSourceEnvelope() as unknown as Record<string, unknown>;
 
     // Top-level siblings, mirroring the JSON fixture + the real serializer.
-    expect(slice.source_schema_version).toBe(2);
+    // #556 S2 §3.9 — tracks the server's current version, exactly as the JSON
+    // fixture above does. Keeping the two in step is the invariant; the
+    // number is not.
+    expect(slice.source_schema_version).toBe(7);
     expect(slice.default_source).toBe('claude');
     expect(slice.source_order).toEqual(['claude', 'codex', 'all']);
 

@@ -854,9 +854,17 @@ def test_source_schema_version_moves_with_the_retired_s2_transition():
     #556 S1 took it to 5: Claude's `hero.cost_usd` / `hero.total_tokens` were a
     thirty-day rollup and are now current-cycle actuals, and `data.combined`
     gained a required `legs` object.
+
+    #556 S2 takes it to 6: the All source gained a required `aggregates` object
+    — one shared absolute range plus a typed outcome for Projects and for Daily
+    — and two rows-only siblings appeared on the Claude provider domain.
+
+    #556 S3 takes it to 7: every Codex alert row gained `alerted_at`, and
+    `created_at` became an equal-valued alias for that firing instant rather
+    than the crossing instant two of the three legs used to publish.
     """
     from _lib_dashboard_sources import SOURCE_SCHEMA_VERSION
-    assert SOURCE_SCHEMA_VERSION == 5
+    assert SOURCE_SCHEMA_VERSION == 7
 
 
 # Spec §5 also asked for Codex "field-survival assertions" HERE. They live

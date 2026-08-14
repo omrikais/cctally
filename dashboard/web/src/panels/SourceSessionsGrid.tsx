@@ -255,6 +255,19 @@ export function SourceSessionsGrid() {
           <PanelGrip />
         </div>
       </div>
+      {/* #572 — the All composition, on the shared `.panel-range-note`
+          sub-line. Not in the `h2`: on phones that element is
+          `white-space: nowrap` with `text-overflow: ellipsis`, and the
+          measured casualty was always the composition itself. Fixed rather
+          than derived, because it states what the panel is composed of and
+          not which providers happen to have rows right now; the per-row
+          source chips disclose the contents. It claims no ordering: recency
+          holds only while `sourceSessionsSort` is unset, so a sorted table
+          would contradict a recency claim. Must precede the mobile controls,
+          or its negative top margin pulls it into their padded strip. */}
+      {isAll && (
+        <div className="panel-range-note">both providers, interleaved</div>
+      )}
       {isMobile && <SessionsControls />}
       <div className="panel-body panel-body--scroll" id="panel-sessions-body">
         {showSkeleton ? (

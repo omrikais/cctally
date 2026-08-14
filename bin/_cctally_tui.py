@@ -281,6 +281,11 @@ from _lib_dashboard_sources import (
     SourceDashboardBundle,
     SourceDashboardState,
     SourceDashboardWarning,
+    aggregate_range,
+    aggregate_scope_failed,
+    aggregate_scope_identity,
+    build_aggregate_scope,
+    claude_stats_digest,
     codex_stats_digest,
     compose_all_state,
     dashboard_resource_key,
@@ -2311,7 +2316,12 @@ def _snapshot_data_version(sig) -> str:
     # in is what leaves the idle short-circuit so the source bundle is rebuilt
     # at all. Empty once the backlog has drained, so it is byte-neutral there.
     backlog = getattr(sig, "codex_ingest_backlog_sig", "")
-    return out if not backlog else f"{out}.b{backlog}"
+    out = out if not backlog else f"{out}.b{backlog}"
+    # #556 S3 §2.9: the Claude alert relations. A fired or armed Claude alert
+    # moves no numeric leg above, so without this the detail endpoints' change
+    # signal stays flat across a tick that added an alert row.
+    claude_digest = getattr(sig, "claude_stats_digest", "")
+    return out if not claude_digest else f"{out}.x{claude_digest}"
 
 
 def _tui_source_copy(value: object) -> object:
@@ -2340,6 +2350,38 @@ def _tui_claude_resource_row(
     wire["key"] = dashboard_resource_key(resource, "claude", identity)
     wire["source"] = "claude"
     return wire
+
+
+def alert_row_owner(
+    axis: object, vendor: object, metric: object,
+) -> str:
+    """Total ownership classifier for a legacy alert row (#556 S3 §3.4).
+
+    Raises on an unregistered axis, so adding a seventh axis without deciding
+    its owner fails a test instead of shipping a row invisible everywhere. The
+    predicate this replaced answered `False` for an unknown axis, which reads
+    as "Codex owns it" and is indistinguishable from a real Codex row.
+    """
+    if axis in {"weekly", "five_hour", "budget", "project_budget"}:
+        # An absent vendor is the established Claude meaning: the legacy rows
+        # predate the additive vendor field. An explicit non-Claude vendor is
+        # never relabelled — `project_budget` gained that check here, having
+        # previously claimed every row whatever its vendor said.
+        return "codex" if vendor == "codex" else "claude"
+    if axis == "projected":
+        # The metric is the owner here, and it is enumerated rather than
+        # defaulted. Defaulting an unrecognized metric to Claude would let a
+        # future Codex-side projected metric render in the Claude tab, and
+        # defaulting it to Codex would drop it from every surface without a
+        # word — the two failure modes this classifier exists to prevent.
+        if metric in {"weekly_pct", "budget_usd"}:
+            return "claude"
+        if metric == "codex_budget_usd":
+            return "codex"
+        raise ValueError(f"no ownership rule for projected metric {metric!r}")
+    if axis == "codex_budget":
+        return "codex"
+    raise ValueError(f"no ownership rule for alert axis {axis!r}")
 
 
 def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object]:
@@ -2445,17 +2487,7 @@ def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object
         axis = raw.get("axis")
         vendor = raw.get("vendor")
         metric = raw.get("metric")
-        owns_alert = (
-            (axis in {"weekly", "five_hour"} and vendor in {None, "claude"})
-            # Legacy top-level Claude budget rows predate the additive vendor
-            # field; the distinct Codex axis is ``codex_budget``.  Treat an
-            # absent vendor as that established Claude meaning, while an
-            # explicit non-Claude vendor must never be relabeled.
-            or (axis == "budget" and vendor in {None, "claude"})
-            or axis == "project_budget"
-            or (axis == "projected" and metric in {"weekly_pct", "budget_usd"})
-        )
-        if not owns_alert:
+        if alert_row_owner(axis, vendor, metric) != "claude":
             continue
         alert_rows.append(_tui_claude_resource_row(
             raw,
@@ -2720,6 +2752,121 @@ def _tui_with_account_scope(
     return dataclasses.replace(state, account_scope=scope)
 
 
+_AGGREGATE_FOLD_FAILED = {"state": "failed", "code": "claude_fold_failed"}
+
+
+def _tui_build_claude_aggregates(
+    cache_conn,
+    *,
+    shared_start: dt.datetime,
+    shared_end_exclusive: dt.datetime,
+    now_utc: dt.datetime,
+    display_tz_name: str | None,
+    # NOT `legacy_project_labels`: that is the name of the public kernel
+    # function this receives the RESULT of (`c.legacy_project_labels`), and a
+    # parameter shadowing it inside a function that also calls it reads as a
+    # recursive reference.
+    legacy_labels: "dict[str, str] | None" = None,
+):
+    """Both All-only Claude legs, from ONE candidate read (spec §3.3, §3.4).
+
+    Returns ``(payload, outcomes)`` where ``payload`` holds the published rows
+    for whichever legs succeeded and ``outcomes`` names each leg's state.
+
+    Runs on the caller's PINNED cache connection, beside the Codex read and on
+    the same snapshot. Both legacy paths stay untouched: the attached-cache
+    block continues to serve ``env.projects`` and the Group-A read continues to
+    serve ``env.daily``, for the Claude tab.
+
+    Each fold has its OWN error boundary, so one failure cannot take the bundle
+    or the other leg down. A failure of the shared read itself fails both, since
+    neither leg has rows. A failure is a typed withheld outcome rather than an
+    escaped exception: today an exception inside this helper is caught by the
+    outer handler, which publishes the prior bundle or none at all, so a
+    cold-start fold failure could never become the outcome §3.7 promises.
+    """
+    from zoneinfo import ZoneInfo
+
+    c = _cctally()
+    display_tz = ZoneInfo(display_tz_name) if display_tz_name else None
+    payload: dict[str, object] = {}
+    outcomes: dict[str, object] = {
+        "projects": {"state": "ok"}, "daily": {"state": "ok"},
+    }
+    try:
+        rows = tuple(c.iter_shared_range_entries(
+            cache_conn, start=shared_start, end_exclusive=shared_end_exclusive,
+        ))
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "claude shared-range candidate read failed", exc_info=True,
+        )
+        return {}, {
+            "projects": dict(_AGGREGATE_FOLD_FAILED),
+            "daily": dict(_AGGREGATE_FOLD_FAILED),
+        }
+    if legacy_labels is None:
+        # No projects envelope was built this tick, so the routable population
+        # is unknown. Publishing anyway would relabel every row from the
+        # bounded population, mint different opaque keys, and hand them to a
+        # drill-down that resolves against an envelope it rebuilds for itself
+        # — the rows on screen and the rows the route can serve would be two
+        # different populations, and nothing would say so. Withholding states
+        # the failure instead, and `claude_fold_failed` also disqualifies the
+        # bundle from idle reuse, so the next tick's envelope gets a chance.
+        _lib_log.get_logger("dashboard").error(
+            "claude range projects fold has no projects envelope",
+        )
+        outcomes["projects"] = dict(_AGGREGATE_FOLD_FAILED)
+    else:
+        try:
+            payload["projects"] = c.build_project_aggregate_rows(
+                rows, legacy_labels=legacy_labels,
+            )
+        except Exception:
+            _lib_log.get_logger("dashboard").error(
+                "claude range projects fold failed", exc_info=True,
+            )
+            outcomes["projects"] = dict(_AGGREGATE_FOLD_FAILED)
+    try:
+        payload["daily"] = [
+            c.daily_panel_row_to_wire(row)
+            for row in c.build_daily_aggregate_rows(
+                rows, now_utc=now_utc, display_tz=display_tz,
+            )
+        ]
+    except Exception:
+        _lib_log.get_logger("dashboard").error(
+            "claude range daily fold failed", exc_info=True,
+        )
+        outcomes["daily"] = dict(_AGGREGATE_FOLD_FAILED)
+    return payload, outcomes
+
+
+def _tui_claude_data_with_aggregates(
+    claude_data: dict[str, object] | None,
+    payload: dict[str, object],
+    *,
+    fallback: dict[str, object],
+) -> dict[str, object]:
+    """Attach the rows-only siblings without mutating the caller's dict.
+
+    ``providers.claude.projects.aggregate`` and
+    ``providers.claude.periods.daily_aggregate`` are rows and nothing else — no
+    range, no outcome. Those live once, on the All source.
+    """
+    base = dict(claude_data) if claude_data is not None else dict(fallback)
+    if "projects" in payload:
+        projects = dict(base.get("projects") or {})
+        projects["aggregate"] = {"rows": payload["projects"]}
+        base["projects"] = projects
+    if "daily" in payload:
+        periods = dict(base.get("periods") or {})
+        periods["daily_aggregate"] = {"rows": payload["daily"]}
+        base["periods"] = periods
+    return base
+
+
 def _tui_build_source_bundle(
     *,
     stats_conn,
@@ -2733,6 +2880,7 @@ def _tui_build_source_bundle(
     claude_total_tokens: int,
     claude_data: dict[str, object] | None = None,
     common_range_start: dt.datetime | None = None,
+    projects_envelope: dict | None = None,
     prior_bundle: SourceDashboardBundle | None = None,
     raw_config: dict[str, object] | None = None,
 ) -> SourceDashboardBundle:
@@ -2758,10 +2906,48 @@ def _tui_build_source_bundle(
             cache_conn.execute("BEGIN")
             cache_read_tx = True
         if common_range_start is None:
-            common_range_start = now_utc - dt.timedelta(days=30)
+            # Resolved through the SAME helper the callers use, with no daily
+            # panel. A bare `now_utc - 30 days` here is a microsecond-precise
+            # instant that advances on every tick, and the resolved start is
+            # folded into both providers' version material at exactly the
+            # granularity `compose_all_aggregates` compares it — so a start
+            # that moves within a display day makes an unchanged provider's
+            # retained carrier disagree with a rebuilt one's, and both
+            # aggregates are then withheld as `retained_range_mismatch`
+            # permanently. Both production callers pass a resolved start, so
+            # this is the last producer that could reintroduce that shape.
+            #
+            # The zone lookup is guarded because this branch exists to be a
+            # SAFE fallback. An unresolvable `display_tz_name` raising out of
+            # it would take down the whole source build over the one path whose
+            # purpose is to keep going, so an unusable name degrades to UTC —
+            # which is what `resolve_shared_range` already does for `None`.
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            _fallback_tz = None
+            if display_tz_name:
+                try:
+                    _fallback_tz = ZoneInfo(display_tz_name)
+                except (ZoneInfoNotFoundError, ValueError, OSError):
+                    _fallback_tz = None
+            common_range_start, _fallback_end = c.resolve_shared_range(
+                None,
+                now_utc=now_utc,
+                display_tz=_fallback_tz,
+            )
         if common_range_start.tzinfo is None or common_range_start.utcoffset() is None:
             raise ValueError("common_range_start must be timezone-aware")
         common_range_start = common_range_start.astimezone(dt.timezone.utc)
+        # #556 S2 §3.2: ONE interval, resolved once and passed immutably to
+        # both Claude folds and to the Codex read. The exclusive upper bound is
+        # what the Codex projects read already applies, so the Codex tab stays
+        # byte-stable. The PUBLISHED `end_at` is `now_utc` itself.
+        shared_end_exclusive = now_utc.astimezone(
+            dt.timezone.utc,
+        ) + dt.timedelta(microseconds=1)
+        published_range = aggregate_range(
+            common_range_start.isoformat(),
+            now_utc.astimezone(dt.timezone.utc).isoformat(),
+        )
         semantics = resolve_dashboard_source_semantics(
             raw_config if raw_config is not None else c.load_config(),
             display_tz_name=display_tz_name,
@@ -2784,6 +2970,11 @@ def _tui_build_source_bundle(
         from _cctally_quota import assert_projection_readable
         assert_projection_readable(stats_conn)
         stats_digest = codex_stats_digest(stats_conn)
+        # #556 S3 §2.9: the Claude alert relations. Nothing else in the
+        # signature moves when a Claude alert fires or is armed, so without
+        # this the idle path can keep serving a prior bundle that predates the
+        # alert.
+        claude_digest = claude_stats_digest(stats_conn)
         # #341 finding 9: the account registry/active-identity digest. Empty for
         # every <=1-account install (byte-neutral — appended only when non-empty),
         # so single-account source versions stay byte-identical to today; a
@@ -2798,6 +2989,7 @@ def _tui_build_source_bundle(
             generation=c.current_generation(),
             codex_stats_digest=stats_digest,
             accounts_digest=accounts_digest,
+            claude_stats_digest=claude_digest,
         )
         _acct_suffix = f":a{accounts_digest}" if accounts_digest else ""
         # public #5: the hook's budgeted ingest can change what the Codex
@@ -2808,10 +3000,21 @@ def _tui_build_source_bundle(
         # wire. Empty (and so byte-neutral) once the backlog has drained.
         _backlog = getattr(signature, "codex_ingest_backlog_sig", "")
         _backlog_suffix = f":b{_backlog}" if _backlog else ""
+        # #556 S2 §3.6: the resolved range and the per-aggregate outcome enter
+        # BOTH providers' version material. Both, so a shared-start change (a
+        # display-day rollover) rebuilds them in lockstep and a coherent pair
+        # can never disagree about the interval their rows cover. The fragment
+        # below assumes SUCCESS, which is what makes it also the reuse gate: a
+        # prior generation whose fold failed carries a different fragment and
+        # therefore cannot be reused.
+        _aggregate_suffix = ":g" + aggregate_scope_identity(
+            build_aggregate_scope(published_range),
+        )
         codex_version = (
             f"codex:{signature.max_codex_id}:"
             f"{signature.codex_physical_mutation_seq}:{stats_digest}:"
             f"{semantics.codex_identity}{_acct_suffix}{_backlog_suffix}"
+            f"{_aggregate_suffix}"
         )
         # #556 S1 §3.6: normalized period identity, so a nominal week rollover
         # invalidates the generation even when no database signature moved.
@@ -2821,7 +3024,8 @@ def _tui_build_source_bundle(
             f"{signature.max_wus_id}:{signature.max_wcs_id}:"
             f"{signature.reset_sig[0]}:{signature.reset_sig[1]}:"
             f"{signature.generation}:{semantics.claude_identity}"
-            f":p{_period_identity}{_acct_suffix}"
+            f":p{_period_identity}{_acct_suffix}{_aggregate_suffix}"
+            f":x{claude_digest}"
         )
         prior_claude = (
             prior_bundle.sources.get("claude")
@@ -2853,6 +3057,14 @@ def _tui_build_source_bundle(
             claude = reuse_coherent_source_state(
                 prior_claude, data_version=claude_version,
             )
+            # #556 S2 §3.6, gate 2 of 2. The version fragment above already
+            # rejects a failed generation, but this gate is stated explicitly
+            # rather than left implicit in string arithmetic: exact-version
+            # provider reuse returns the PRIOR OBJECT unchanged, so a caught
+            # fold failure that survived reuse would withhold the aggregate for
+            # the life of the process. Gate 1 is the bundle-level idle guard.
+            if claude is not None and aggregate_scope_failed(claude):
+                claude = None
         if claude is None:
             claude_available = "ok" if (claude_cost_usd or claude_total_tokens) else "empty"
             # #341 Task 4 (Ruling C): the conditional per-account Claude wire,
@@ -2875,6 +3087,47 @@ def _tui_build_source_bundle(
                 # wire must never fail the whole dashboard tick — it just falls
                 # back to the byte-stable undecorated shape.
                 claude_accounts = []
+            # #556 S2 §3.3: both All-only Claude legs fold HERE, on the pinned
+            # cache connection, after BEGIN and beside the Codex read, so the
+            # two providers describe one snapshot. Folding them earlier — in
+            # the attached-cache block or through the Group-A daily read — runs
+            # against a different connection, and a cache commit in between
+            # would publish Claude generation A beside Codex generation B while
+            # the bundle's version names B.
+            aggregate_payload, aggregate_outcomes = _tui_build_claude_aggregates(
+                cache_conn,
+                shared_start=common_range_start,
+                shared_end_exclusive=shared_end_exclusive,
+                now_utc=now_utc,
+                display_tz_name=semantics.display_tz_name,
+                # The legacy display keys the drill-down route resolves
+                # against. Published rows adopt them wherever they exist, so
+                # the aggregate identity and the legacy one agree and the
+                # bounded rows stay routable. The raw envelope is required —
+                # `claude_data` has already replaced every legacy display key
+                # with an opaque key and dropped `bucket_path`, so the map
+                # cannot be recovered from it.
+                # `None` — not an empty map — when no envelope was built, so
+                # the fold can tell "the legacy population is empty" from "the
+                # legacy population is unknown" and withhold on the second.
+                legacy_labels=(
+                    c.legacy_project_labels(projects_envelope)
+                    if projects_envelope is not None else None
+                ),
+            )
+            claude_aggregate_scope = build_aggregate_scope(
+                published_range, aggregate_outcomes,
+            )
+            if aggregate_scope_failed(claude_aggregate_scope):
+                # The published version must distinguish a failed fold from a
+                # successful one over the same signature and the same bounds;
+                # otherwise both would publish different rows under one
+                # `data_version`. It also makes the next tick's success-shaped
+                # candidate version mismatch, forcing the rebuild §3.6 requires.
+                claude_version = (
+                    f"{claude_version}:x"
+                    f"{aggregate_scope_identity(claude_aggregate_scope)}"
+                )
             claude = SourceDashboardState(
                 source="claude",
                 availability=claude_available,
@@ -2895,9 +3148,10 @@ def _tui_build_source_bundle(
                     "alerts": CapabilityRecord("supported", "provider-native"),
                 },
                 data={
-                    **(
-                        claude_data
-                        if claude_data is not None else {
+                    **_tui_claude_data_with_aggregates(
+                        claude_data,
+                        aggregate_payload,
+                        fallback={
                             "hero": {
                                 "cost_usd": claude_cost_usd,
                                 "total_tokens": claude_total_tokens,
@@ -2908,13 +3162,14 @@ def _tui_build_source_bundle(
                             "quota": {"blocks": (), "milestones": ()},
                             "budget": {"label": "Claude subscription budget"},
                             "alerts": {"rows": ()},
-                        }
+                        },
                     ),
                     **({"accounts": claude_accounts} if claude_accounts else {}),
                 },
                 domain_freshness=_tui_claude_domain_freshness(
                     claude_data, now_utc=now_utc,
                 ),
+                aggregate_scope=claude_aggregate_scope,
             )
         if codex_ingest_failed:
             warning = SourceDashboardWarning(
@@ -2958,6 +3213,13 @@ def _tui_build_source_bundle(
                     prior_codex, data_version=codex_version,
                 )
             )
+            # #556 S2 §3.6: symmetric with Claude. Codex's rows are already
+            # bounded by this same range, so its carrier records no fold of its
+            # own — but a retained failure state must never be reused, and the
+            # gate is stated on both providers so a future Codex-side fold
+            # inherits it.
+            if codex is not None and aggregate_scope_failed(codex):
+                codex = None
         if codex is None:
             try:
                 codex = build_codex_source_state(
@@ -2976,6 +3238,13 @@ def _tui_build_source_bundle(
                         cache_report_anomaly_threshold_pp=semantics.cache_report_anomaly_threshold_pp,
                     ),
                     data_version=codex_version,
+                )
+                # Attached ONLY on a fresh build, never on the reuse or degrade
+                # paths: those carry rows this tick did not produce, and their
+                # own carrier already describes the range that bounds them.
+                codex = dataclasses.replace(
+                    codex,
+                    aggregate_scope=build_aggregate_scope(published_range),
                 )
             except Exception:
                 _lib_log.get_logger("dashboard").error(
@@ -3026,12 +3295,14 @@ def _tui_build_source_bundle(
             cache_read_tx = False
         post_stats_digest = codex_stats_digest(stats_conn)
         post_accounts_digest = accounts_identity_digest(stats_conn)
+        post_claude_digest = claude_stats_digest(stats_conn)
         post_signature = c.compute_signature(
             cache_conn,
             stats_conn,
             generation=c.current_generation(),
             codex_stats_digest=post_stats_digest,
             accounts_digest=post_accounts_digest,
+            claude_stats_digest=post_claude_digest,
         )
         stats_generation_moved = (
             post_signature.max_wus_id != signature.max_wus_id
@@ -3039,6 +3310,7 @@ def _tui_build_source_bundle(
             or post_signature.reset_sig != signature.reset_sig
             or post_stats_digest != stats_digest
             or post_accounts_digest != accounts_digest
+            or post_claude_digest != claude_digest
         )
         if stats_generation_moved:
             if prior_bundle is not None:
@@ -3111,6 +3383,14 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
                 or state.freshness != "fresh"
                 or state.data is None):
             return False
+        # #556 S2 §3.6, gate 1 of 2. A locally caught fold failure leaves an
+        # otherwise `ok` and `fresh` provider, so without this leg the bundle
+        # would qualify for idle reuse and one transient failure would withhold
+        # the aggregate for the life of the process. Falling through here routes
+        # to the bounded source-adapter rebuild, which re-folds — at most one
+        # rebuild per tick, so it creates no retry loop.
+        if aggregate_scope_failed(state):
+            return False
     return True
 
 
@@ -3120,18 +3400,18 @@ def _tui_common_source_range_start(
     now_utc: dt.datetime,
     display_tz: dt.tzinfo | None,
 ) -> dt.datetime:
-    """Return the shared provider interval from the already-built daily rows."""
-    if daily_panel:
-        earliest_day = dt.date.fromisoformat(daily_panel[-1].date)
-        if display_tz is not None:
-            return dt.datetime.combine(
-                earliest_day, dt.time.min, tzinfo=display_tz,
-            ).astimezone(dt.timezone.utc)
-        # internal fallback: host-local intentional
-        return dt.datetime.combine(
-            earliest_day, dt.time.min,
-        ).astimezone(dt.timezone.utc)
-    return now_utc - dt.timedelta(days=30)
+    """Return the shared provider interval from the already-built daily rows.
+
+    #556 S2 §3.2: the start bound is now resolved by
+    ``_cctally_dashboard.resolve_shared_range``, which also owns the exclusive
+    upper bound the Claude folds enforce. This wrapper stays because every
+    existing caller wants only the start, and because it is the monkeypatch
+    surface the source-invalidation tests already use.
+    """
+    start, _end_exclusive = _cctally().resolve_shared_range(
+        daily_panel, now_utc=now_utc, display_tz=display_tz,
+    )
+    return start
 
 
 def _tui_build_snapshot(
@@ -4079,6 +4359,7 @@ def _tui_build_snapshot_once(
                     claude_total_tokens=daily_total_tokens,
                     claude_data=_tui_project_claude_source_data(legacy_envelope),
                     common_range_start=common_range_start,
+                    projects_envelope=projects_envelope_block,
                     prior_bundle=prior_source_bundle,
                     raw_config=raw_config,
                 )
@@ -4232,6 +4513,7 @@ def _tui_compute_dispatch_signature(stats_conn):
             generation=sc.current_generation(),
             codex_stats_digest=codex_stats_digest(stats_conn),
             accounts_digest=accounts_identity_digest(stats_conn),
+            claude_stats_digest=claude_stats_digest(stats_conn),
         )
     finally:
         cache_conn.close()
@@ -4409,6 +4691,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                         now_utc=now_utc,
                         display_tz=source_display_tz,
                     ),
+                    projects_envelope=prior.projects_envelope,
                     prior_bundle=source_bundle,
                     raw_config=raw_config,
                 )

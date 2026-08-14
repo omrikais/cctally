@@ -93,6 +93,31 @@ export function selectSourceAlertRows(view: SourceView): SourceAlertRow[] {
   return Array.isArray(rows) ? (rows as SourceAlertRow[]) : [];
 }
 
+// #556 S3 §3.1/§3.3. The panel and the modal carried this ternary
+// independently; changing one and not the other would split them silently,
+// which is E1's failure class. The populated-legacy preference is GONE:
+// nothing in production dispatches INGEST_SNAPSHOT_ALERTS, so `legacyRows` is
+// empty in normal operation and that branch was never taken.
+export function selectAlertRowsForView(
+  view: SourceView,
+  legacyRows: SourceAlertRow[],
+  hasBundle: boolean,
+): SourceAlertRow[] {
+  return hasBundle ? selectSourceAlertRows(view) : legacyRows;
+}
+
+// The canonical firing instant, from ONE accessor for both providers. A v7
+// Codex row carries `alerted_at`; a pre-v7 one carries only `created_at`,
+// which is why the fallback stays. Reading the same field the union is ordered
+// by is what keeps the printed instant and the sort key from drifting apart.
+function alertWhenIso(row: SourceAlertRow): string | null {
+  const fields = row as SourceAlertRow & {
+    alerted_at?: string;
+    created_at?: string;
+  };
+  return fields.alerted_at ?? fields.created_at ?? null;
+}
+
 // Severity for a bare threshold — byte-identical bands with the Python kernel
 // (info <90 / warn 90-99 / critical >=100).
 function severityForThreshold(threshold: number | null | undefined): AlertSeverity {
@@ -136,7 +161,7 @@ export function alertDisplay(row: SourceAlertRow): SourceAlertDisplay {
       severity: alertSeverity(row),
       chipClass: `chip--${row.axis}`,
       chipLabel: AXIS_CHIP_LABEL[row.axis],
-      whenIso: row.alerted_at ?? null,
+      whenIso: alertWhenIso(row),
     };
   }
   // Codex source rows (lean _alerts_wire shapes).
@@ -148,11 +173,16 @@ export function alertDisplay(row: SourceAlertRow): SourceAlertDisplay {
       severity: normalizeSeverity(row.severity, row.threshold),
       chipClass: 'chip--quota',
       chipLabel: 'QUOTA',
-      whenIso: row.created_at ?? null,
+      whenIso: alertWhenIso(row),
     };
   }
   const chipClass = row.axis === 'projected' ? 'chip--projected' : 'chip--codex_budget';
-  const chipLabel = row.axis === 'projected' ? 'PROJECTED' : 'CODEX';
+  // #556 S3 §4.2 — one map governs every rendered chip. This line used to
+  // hardcode the same two strings, so a provider-sourced Codex row took its
+  // chip from here and never from `AXIS_CHIP_LABEL`; renaming only the map
+  // would have changed nothing on the panel or in the modal while the
+  // Python↔TS parity test stayed green.
+  const chipLabel = AXIS_CHIP_LABEL[row.axis];
   return {
     source: 'codex',
     sourceLabel: SOURCE_LABEL.codex,
@@ -160,6 +190,6 @@ export function alertDisplay(row: SourceAlertRow): SourceAlertDisplay {
     severity: severityForThreshold(row.threshold),
     chipClass,
     chipLabel,
-    whenIso: row.created_at ?? null,
+    whenIso: alertWhenIso(row),
   };
 }

@@ -415,7 +415,7 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     openCodex();
     updateSnapshot(codexEnvWithIndex(CODEX_IDX));
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
     await waitFor(() => expect(spy).toHaveBeenCalledWith('/api/milestones/codex/week/milestone_cycle%3Acodex-prev'));
     await screen.findByText(/Block 3 of 3/);
     fireEvent.click(screen.getByLabelText('Older block'));
@@ -461,7 +461,7 @@ describe('Codex current-cycle block navigator (P2-A)', () => {
     await within(claude).findByText('Jul 16–Jul 18');
     expect(within(codex).queryByText('Cyc prev')).toBeNull();
 
-    fireEvent.click(within(codex).getByLabelText('Older week'));
+    fireEvent.click(within(codex).getByLabelText('Older cycle'));
     await within(codex).findByText('Apr 16–Apr 23');
     expect(within(claude).getByText('Jul 16–Jul 18')).toBeTruthy();
   });
@@ -507,7 +507,7 @@ describe('current-cycle range and reset semantics (#412 Task B)', () => {
     updateSnapshot(codexEnvWithIndex([CODEX_IDX[0], equal]));
 
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
 
     await screen.findByText('Apr 16–Apr 23');
     const mini = document.querySelector<HTMLElement>('#mcw-mini')!;
@@ -532,12 +532,52 @@ describe('current-cycle range and reset semantics (#412 Task B)', () => {
     updateSnapshot(codexEnvWithIndex([CODEX_IDX[0], clipped]));
 
     render(<CurrentWeekModal />);
-    fireEvent.click(screen.getByLabelText('Older week'));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
 
     await screen.findByText('Jul 13–Jul 20');
     expect(document.querySelector('#mcw-week-pill')).toHaveTextContent(/^Jul 13–Jul 20$/);
     const mini = document.querySelector<HTMLElement>('#mcw-mini')!;
     expect(within(mini).getByText(/nominal reset/i)).toBeTruthy();
     expect(mini).toHaveTextContent('Jul 27');
+  });
+});
+
+// #556 S4 F6 — `WeekNavChip` is shared by both providers and hard-coded
+// `Older week` / `Newer week`. On the Claude section that is correct. On the
+// Codex section it names a Claude concept: Codex navigates reset-defined quota
+// CYCLES, which the section's own pill, title and chip all call cycles, so a
+// screen reader heard "week" where every visible label said "cycle".
+//
+// This state is unreachable on a store with more than one Codex account: the
+// Codex call site is gated behind `perAccountCycles === false`, and a decorated
+// provider takes the "All accounts" shell, which contains no navigator at all.
+// The fixture is therefore deliberately undecorated — it omits
+// `sources.codex.data.accounts` rather than supplying an empty array, leaves
+// `accountKey` unset, and carries two cycle-index entries so both directions
+// and both enabled states exist. No realistic browser pass can reach this, so
+// it is verified here and is deliberately absent from the acceptance criteria.
+describe('provider-specific navigator vocabulary (#556 S4)', () => {
+  it('names the Codex navigator in cycle vocabulary, and leaves Claude on week', () => {
+    const env = codexEnvWithIndex(CODEX_IDX);
+    env.current_week = makeEnv(INDEX).current_week;
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    dispatch({ type: 'OPEN_MODAL', kind: 'current-week' });
+    updateSnapshot(env);
+    const { container } = render(<CurrentWeekModal />);
+
+    const codex = container.querySelector<HTMLElement>('[data-provider-section="codex"]')!;
+    // Non-vacuity: the undecorated branch really renders a navigator. If the
+    // fixture were decorated this element would be absent and every assertion
+    // below would pass or fail for the wrong reason.
+    expect(codex.querySelector('.mcw-weeknav')).not.toBeNull();
+    expect(within(codex).getByLabelText('Older cycle')).toBeInTheDocument();
+    expect(within(codex).getByLabelText('Newer cycle')).toBeInTheDocument();
+    expect(within(codex).queryByLabelText('Older week')).toBeNull();
+    expect(within(codex).queryByLabelText('Newer week')).toBeNull();
+
+    const claude = container.querySelector<HTMLElement>('[data-provider-section="claude"]')!;
+    expect(within(claude).getByLabelText('Older week')).toBeInTheDocument();
+    expect(within(claude).getByLabelText('Newer week')).toBeInTheDocument();
+    expect(within(claude).queryByLabelText('Older cycle')).toBeNull();
   });
 });

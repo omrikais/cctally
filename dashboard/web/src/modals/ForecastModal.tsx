@@ -458,15 +458,25 @@ function AllForecastSection({
       className="modal-forecast provider-composition-section"
       data-source={section.source}
       data-provider-section={section.source}
-      aria-label={`${section.label} forecast detail`}
+      aria-labelledby={`forecast-modal-${section.source}-heading`}
     >
       <div className="source-provider-head provider-composition-head">
+        {/* #556 S4 F8 — surface-qualified id; see CacheReportModal. */}
+        <h3 className="sr-only" id={`forecast-modal-${section.source}-heading`}>
+          {section.label} forecast detail
+        </h3>
         <SourceChip source={section.source} />
         <strong>{section.label} forecast</strong>
         {section.status !== 'available' && perAccountRows == null && (
           <span className="provider-section-status">{section.status}</span>
         )}
       </div>
+      {/* #556 S4 F8 - the subsection headings below render at h4, one level
+          under this section's own provider heading. AllForecastSection has no
+          standalone form: it is reached only from the All composition, so the
+          level is unconditional here rather than gated on an `embedded` flag.
+          Left at h3 they would be apparent PEERS of the provider that contains
+          them, which is a worse hierarchy than no heading at all. */}
       {perAccountRows != null ? (
         <CodexPerAccountForecastTable rows={perAccountRows} />
       ) : value == null ? (
@@ -495,7 +505,7 @@ function AllForecastSection({
               </div>
             </div>
           </div>
-          <h3 className="m-sec sec-range">Range vs. caps</h3>
+          <h4 className="m-sec sec-range">Range vs. caps</h4>
           <div className="mfc-rangewrap provider-range-summary" aria-label={`${section.label} projected usage against caps`}>
             <div className="mfc-rangetrack">
               <div className="mfc-zone safe" />
@@ -511,12 +521,12 @@ function AllForecastSection({
               <div className="mfc-bound b110"><div className="lbl">110%</div></div>
             </div>
           </div>
-          <h3 className="m-sec sec-rates">Provider-native projection</h3>
+          <h4 className="m-sec sec-rates">Provider-native projection</h4>
           <div className="mfc-kvgrid">
             <div className="mfc-krow"><span className="l">Projected</span><span className="v v-cyan">{fmt.pct1(value.projected)}</span></div>
             <div className="mfc-krow"><span className="l">Current / recent</span><span className="v v-green">{fmt.pct1(value.recent)}</span></div>
           </div>
-          <h3 className="m-sec sec-bud">Provider-native budgets and confidence</h3>
+          <h4 className="m-sec sec-bud">Provider-native budgets and confidence</h4>
           <div className="mfc-kvgrid mfc-kvgrid-single">
             {value.foot.map((line) => (
               <div className="mfc-krow" key={line.label}>

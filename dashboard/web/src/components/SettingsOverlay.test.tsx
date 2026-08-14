@@ -1091,7 +1091,7 @@ describe('<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2
     // Only a History override exists — the reset must still enable (it is the
     // fourth table axis, alongside trend/sessions/projects).
     act(() =>
-      dispatch({ type: 'SET_TABLE_SORT', table: 'history', override: { column: 'cost_usd', direction: 'asc' } }),
+      dispatch({ type: 'SET_TABLE_SORT', table: 'history', periodKind: 'week', override: { column: 'cost_usd', direction: 'asc' } }),
     );
     // Dirty a server field so Save is enabled and fires a POST we can await.
     seedAlertsConfig({ notifier: 'auto' });
@@ -1101,10 +1101,10 @@ describe('<SettingsOverlay /> restore defaults — deferred, no data loss (SET-2
     fireEvent.change(screen.getByLabelText('Alert notifier'), { target: { value: 'none' } });
     fireEvent.click(resetBtn);
     // Deferred: untouched until Save.
-    expect(getState().prefs.historySortOverride).toEqual({ column: 'cost_usd', direction: 'asc' });
+    expect(getState().prefs.historySortOverrides.week).toEqual({ column: 'cost_usd', direction: 'asc' });
     fireEvent.click(screen.getByRole('button', { name: /^Save/ }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    expect(getState().prefs.historySortOverride).toBeNull(); // CLEAR_TABLE_SORTS applied on Save
+    expect(getState().prefs.historySortOverrides.week).toBeNull(); // CLEAR_TABLE_SORTS applied on Save
   });
 
   it('Restore view preferences resets the sort field only (narrowed), deferred', () => {
@@ -2087,7 +2087,7 @@ describe('SettingsOverlay — Table column sorting reset (deferred)', () => {
       dispatch({ type: 'SET_TABLE_SORT', table: 'trend', override: { column: 'cost', direction: 'desc' } });
       dispatch({ type: 'SET_TABLE_SORT', table: 'sessions', override: { column: 'cost', direction: 'desc' } });
       dispatch({ type: 'SET_TABLE_SORT', table: 'projects', override: { column: 'cost', direction: 'desc' } });
-      dispatch({ type: 'SET_TABLE_SORT', table: 'history', override: { column: 'cost', direction: 'desc' } });
+      dispatch({ type: 'SET_TABLE_SORT', table: 'history', periodKind: 'month', override: { column: 'cost', direction: 'desc' } });
     });
     const user = userEvent.setup();
     render(<SettingsOverlay />);
@@ -2097,6 +2097,6 @@ describe('SettingsOverlay — Table column sorting reset (deferred)', () => {
     expect(getState().prefs.trendSortOverride).toBeNull();
     expect(getState().prefs.sessionsSortOverride).toBeNull();
     expect(getState().prefs.projectsSortOverride).toBeNull();
-    expect(getState().prefs.historySortOverride).toBeNull();
+    expect(getState().prefs.historySortOverrides).toEqual({ week: null, month: null });
   });
 });

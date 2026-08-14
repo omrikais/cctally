@@ -11,6 +11,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { presentationDailyRows, presentationProviders } from '../lib/dashboardPresentation';
 import { warningForDomain } from '../lib/sourceGating';
+import { withheldMessage } from '../lib/withheldCopy';
 import { DegradedChip } from './sourcePanel';
 import type { DailyPanelRow } from '../types/envelope';
 
@@ -108,7 +109,11 @@ export function DailyPanel() {
     subscribeStore,
     () => getState().prefs.dailyCollapsed,
   );
-  const rows = presentationDailyRows(env, activeSource);
+  const daily = presentationDailyRows(env, activeSource);
+  const rows = daily.state === 'available' ? daily.rows : [];
+  // §3.7 — an empty array used to be the ONLY way this adapter could report a
+  // failure, so a withheld aggregate read as "No usage history yet".
+  const withheld = daily.state === 'withheld' ? daily : null;
   // Envelope rows are newest-first; the calendar grid renders oldest-first
   // (top-left → bottom-right).
   const orderedRows = [...rows].reverse();
@@ -145,7 +150,17 @@ export function DailyPanel() {
             <use href="/static/icons.svg#grid" />
           </svg>
           <h2>
-            Daily <span className="sub">heatmap · 30 days</span>
+            Daily{' '}
+            {/* Only the descriptor word stays in the h2, and only it is what
+                `#panel-daily .panel-header h2 .sub { display: none }` (#264
+                S4) was ever about — "the card body already shows the heatmap
+                + legend, so the descriptor is redundant". The window and the
+                composition were inside that same span, so on phones they
+                rendered NOWHERE: the h2 measured 100% visible at 390px
+                reading "Daily", which looked like compliance and was
+                absence. They now render on `.panel-range-note` below, which
+                that rule does not touch. */}
+            <span className="sub">heatmap</span>
           </h2>
           {warning && <DegradedChip gate={{ mode: 'degraded', warning, noSuccessYet: false }} />}
         </div>
@@ -185,13 +200,37 @@ export function DailyPanel() {
           <PanelGrip />
         </div>
       </div>
+      {/* §7.1 — the All composition, stated. Deliberately "both providers"
+          rather than the shipped "by provider" suffix: the cells are a SUM of
+          the two providers' days, not one section each, and the per-provider
+          split lives one level down in the drill-down (§6.3). Saying "by
+          provider" over a summed heatmap would describe a layout this panel
+          does not have.
+
+          A withheld outcome degrades the whole line, the way Projects
+          degrades to "(withheld)". Keeping "30 days · both providers" over a
+          body saying the shared range could not be resolved asserts the very
+          range the body withholds. */}
+      <div className="panel-range-note">
+        {withheld
+          ? 'withheld'
+          : `30 days${activeSource === 'all' ? ' · both providers' : ''}`}
+      </div>
       <div className="panel-body" id="panel-daily-body">
-        {rows.length === 0 ? (
-          hydrating ? (
-            <PanelSkeleton />
-          ) : (
-            <div className="panel-empty">No usage history yet.</div>
-          )
+        {/* HYDRATING IS TESTED FIRST, ahead of `withheld`. The store's initial
+            snapshot is null while `activeSource` is persisted, so a cold load
+            of the All tab renders once before the bootstrap arrives and
+            `presentationDailyRows(null, 'all')` synthesizes `rows_absent` for
+            it. Reaching the withheld branch there told the user their page was
+            talking to the wrong server. */}
+        {hydrating && rows.length === 0 ? (
+          <PanelSkeleton />
+        ) : withheld ? (
+          <div className="panel-empty panel-withheld" data-withheld-code={withheld.code}>
+            {withheldMessage(withheld, 'history')}
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="panel-empty">No usage history yet.</div>
         ) : (
           <>
             <div className="daily-legend" aria-label="Color intensity legend">

@@ -2,7 +2,7 @@
 // label (calendar-period-codex-budgets, spec §6).
 //
 // The sixth alert axis surfaces in the existing Recent-alerts panel + modal with
-// a distinct "CODEX" chip and a period-aware context label ("Month of …" /
+// a "BUDGET" chip in its own colour and a period-aware context label ("Month of …" /
 // "Calendar week of …"), read from the alert `period` / `period_start_at`
 // context — NOT the hardcoded "Week of …". These tests seed codex_budget +
 // calendar-period budget envelope items and assert the surfaces render the
@@ -86,18 +86,20 @@ beforeEach(() => {
 });
 
 describe('codex_budget axis in Recent alerts', () => {
-  it('renders the CODEX chip in the panel', () => {
+  it('renders the BUDGET chip in the panel, in the codex_budget colour', () => {
     ingest([codexBudgetEntry()]);
-    render(<RecentAlertsPanel />);
-    const chip = screen.getByText('CODEX');
-    expect(chip.className).toContain('chip--codex_budget');
+    const { container } = render(<RecentAlertsPanel />);
+    // #556 S3 §4.3/§4.5 — the chip STRING is shared with the Claude budget
+    // axis, so the class is what identifies this row's axis. Selecting by text
+    // would match a Claude budget chip just as well.
+    const chip = container.querySelector('.chip--codex_budget');
+    expect(chip?.textContent).toBe('BUDGET');
   });
 
-  it('renders the CODEX chip + a Month period label in the modal', () => {
+  it('renders the BUDGET chip + a Month period label in the modal', () => {
     ingest([codexBudgetEntry()]);
-    render(<RecentAlertsModal />);
-    // CODEX chip in the Axis column.
-    expect(screen.getByText('CODEX')).toBeInTheDocument();
+    const { container } = render(<RecentAlertsModal />);
+    expect(container.querySelector('.chip--codex_budget')?.textContent).toBe('BUDGET');
     // Context cell leads with the period-aware noun ("Month"), NOT "Week".
     const ctx = document.querySelector('.alert-context--codex_budget');
     expect(ctx).not.toBeNull();

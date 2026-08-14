@@ -28,6 +28,25 @@ import tracemalloc
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
+def _deep_size(value, seen=None) -> int:
+    """Recursive retained size for the opt-in Task C mutant evidence."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    total = sys.getsizeof(value)
+    if isinstance(value, dict):
+        total += sum(
+            _deep_size(key, seen) + _deep_size(item, seen)
+            for key, item in value.items()
+        )
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        total += sum(_deep_size(item, seen) for item in value)
+    return total
+
+
 def _rss_bytes() -> int:
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return value if sys.platform == "darwin" else value * 1024
@@ -85,6 +104,45 @@ def main() -> int:
     if config.get("build"):
         shape = builder.build(**config["build"])
 
+    # Task C's controlled mechanism-level mutant: retain the coordinate and
+    # routing fields a compact observation projection would need, instead of
+    # dropping them after the raw line is retained.  The hook is confined to
+    # this fresh benchmark subprocess; production has no mutation seam.
+    compact_projection = []
+    if config.get("compact_projection_mutant"):
+        original_is_quota_obs = jr._is_codex_quota_obs
+
+        def _is_quota_obs_with_projection(record):
+            selected = original_is_quota_obs(record)
+            if selected:
+                payload = record.get("payload") or {}
+                compact_projection.append((
+                    payload.get("source_root_key"),
+                    payload.get("source_path"),
+                    payload.get("line_offset"),
+                    payload.get("logical_limit_key"),
+                    payload.get("observed_slot"),
+                    payload.get("window_minutes"),
+                    payload.get("resets_at_utc"),
+                    record.get("at"),
+                ))
+            return selected
+
+        jr._is_codex_quota_obs = _is_quota_obs_with_projection
+
+    decoded_probe = []
+    if config.get("memory_probe"):
+        original_decode_line = jr._lib_journal.decode_line
+
+        def _decode_line_with_probe(raw):
+            record = original_decode_line(raw)
+            if (len(decoded_probe) < 256 and record is not None
+                    and jr._is_codex_quota_obs(record)):
+                decoded_probe.append((len(raw), _deep_size(record)))
+            return record
+
+        jr._lib_journal.decode_line = _decode_line_with_probe
+
     trace = bool(config.get("tracemalloc"))
     if trace:
         tracemalloc.start()
@@ -134,6 +192,15 @@ def main() -> int:
         ],
         "rss_peak_bytes": _rss_bytes(),
         "traced_peak_bytes": traced_peak,
+        "compact_projection": {
+            "records": len(compact_projection),
+            "deep_bytes": _deep_size(compact_projection),
+        },
+        "decoded_probe": {
+            "records": len(decoded_probe),
+            "encoded_bytes": [item[0] for item in decoded_probe],
+            "deep_bytes": [item[1] for item in decoded_probe],
+        },
     }
     for attr in ("phase_seconds", "traversal", "peak_heap_bytes",
                  "quota_lock_hold_seconds"):

@@ -8,6 +8,7 @@ import {
   ACCOUNT_A,
   makeDecoratedCodexSourceData,
 } from '../test-utils/sourceEnvelope';
+import { openActiveOrNewestBlockModal } from '../store/actions';
 
 beforeEach(() => {
   localStorage.clear();
@@ -88,7 +89,10 @@ describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
 
     expect(container.querySelector('[data-source="codex"]')).not.toBeNull();
     expect((container.querySelector('.panel-expand') as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByRole('heading', { name: /Blocks/ })).toHaveTextContent('optional 5h · current cycle');
+    // The scope statement is unchanged; it moved from the h2 onto the
+    // wrapping sub-line, because inside the h2 it truncated at 390px.
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('optional 5h · current cycle');
     expect(screen.getByText('No native 5-hour window is currently reported; the 7-day Codex cycle remains available.')).toBeInTheDocument();
   });
 
@@ -98,10 +102,12 @@ describe('BlocksPanel empty-week ⤢ (#265 D)', () => {
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
 
-    render(<BlocksPanel />);
+    const { container } = render(<BlocksPanel />);
 
-    expect(screen.getByRole('heading', { name: /Blocks/ })).toHaveTextContent('5h · current cycle');
-    expect(screen.getByRole('heading', { name: /Blocks/ })).not.toHaveTextContent('optional');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('5h · current cycle');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .not.toContain('optional');
     expect(screen.getByText('No 5-hour activity blocks in the current Codex cycle.')).toBeInTheDocument();
   });
 });
@@ -201,17 +207,23 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
   });
 
   it('All expand uses the canonical Block modal for its active Claude row', () => {
+      // #556 S2 §6.4 — the blocks list interleaves chronologically now, and
+      // the "open the active block" affordance takes the FIRST DISPLAYED
+      // active row. The fixture's Codex five-hour window starts 13:00, so the
+      // Claude block under test starts later than it: this case is about
+      // ROUTING a Claude-backed row through the canonical modal, and it must
+      // not silently become a test of which provider happens to sort first.
     const env = structuredClone(fixture) as unknown as Envelope;
     env.sources!.claude.data!.quota.blocks = [{
       key: 'opaque:server-issued-block-key',
       source: 'claude',
-      start_at: '2026-04-24T08:00:00Z',
-      end_at: '2026-04-24T13:00:00Z',
+      start_at: '2026-04-24T18:00:00Z',
+      end_at: '2026-04-24T23:00:00Z',
       anchor: 'recorded',
       is_active: true,
       cost_usd: 4.2,
       models: [],
-      label: '08:00 Apr 24 UTC',
+      label: '18:00 Apr 24 UTC',
     }];
     updateSnapshot(env);
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
@@ -220,7 +232,187 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open Blocks' }));
 
     expect(getState().openModal).toBe('block');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T18:00:00Z');
+    expect(getState().openSourceDetail).toBeNull();
+  });
+});
+
+// #556 S2 §6.4 — the footer keeps its sum and says what the sum is made of.
+describe('#556 S2 — the All blocks footer', () => {
+  function allBlocksEnvelope(): Envelope {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'block:claude-a', source: 'claude',
+      start_at: '2026-04-24T08:00:00Z', end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded', is_active: true, cost_usd: 4, models: [],
+      label: '08:00 Apr 24 UTC',
+    }];
+    env.sources!.codex.data!.quota.blocks = [{
+      key: 'block:codex-a', source: 'codex', label: '13:00 Apr 24 UTC',
+      window_minutes: 300, start_at: '2026-04-24T13:00:00Z',
+      end_at: '2026-04-24T18:00:00Z', resets_at: '2026-04-24T18:00:00Z',
+      current_percent: 20, orphaned: false, is_active: true, cost_usd: 6,
+      model_breakdowns: [],
+    }];
+    return env;
+  }
+
+  beforeEach(() => {
+    updateSnapshot(allBlocksEnvelope());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  });
+
+  it('keeps the summed total and names the per-provider counts and costs', () => {
+    // The blocks contract requires the footer to equal the sum of the
+    // DISPLAYED rows, so the total stays. What was missing beside it is the
+    // attribution, and a statement of what the interleaved list actually spans.
+    const { container } = render(<BlocksPanel />);
+    const foot = container.querySelector('.panel-foot');
+    expect(foot!.textContent).toContain('$10.00');
+    expect(foot!.textContent).toContain('Claude 1 block $4.00');
+    expect(foot!.textContent).toContain('Codex 1 block $6.00');
+  });
+
+  it('states coverage as the displayed interval, never as a shared cycle', () => {
+    const { container } = render(<BlocksPanel />);
+    const foot = container.querySelector('.panel-foot');
+    expect(foot!.textContent).toContain('Apr 24');
+    // Two independent five-hour clocks. The footer must not imply the rows
+    // form one continuous run or share a reset.
+    expect(foot!.textContent).not.toMatch(/continuous|shared cycle|combined cycle/i);
+  });
+
+  it('leaves the single-provider footer alone', () => {
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<BlocksPanel />);
+    expect(container.querySelector('.panel-foot')!.textContent)
+      .not.toContain('Claude 1 block');
+  });
+});
+
+
+// #556 S2 QA P2-11 — the expand affordance's target changed, and nothing
+// pinned it.
+//
+// `const row = allRows.find((item) => item.is_active) ?? allRows[0]` is
+// byte-identical to `main`. What changed underneath it is `presentationBlocks`:
+// `[...claude, ...codex]` became a chronological merge, so "the first displayed
+// active row" is now the NEWEST active window rather than always a Claude one.
+// That is the correct behaviour for a time-ordered list — the affordance opens
+// what the eye lands on first — but it is a real routing change on a rule the
+// plan listed as unchanged, so it gets a test.
+describe('#556 S2 — which block the expand affordance opens under All', () => {
+  function withActiveBlocks(claudeStart: string, codexStart: string): Envelope {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [{
+      key: 'block:claude-active', source: 'claude',
+      start_at: claudeStart, end_at: '2026-04-24T23:00:00Z',
+      anchor: 'recorded', is_active: true, cost_usd: 4, models: [],
+      label: 'Claude active',
+    }];
+    env.sources!.codex.data!.quota.blocks = [{
+      key: 'block:codex-active', source: 'codex', label: 'Codex active',
+      window_minutes: 300, start_at: codexStart,
+      end_at: '2026-04-24T23:00:00Z', resets_at: '2026-04-24T23:00:00Z',
+      current_percent: 20, orphaned: false, is_active: true, cost_usd: 6,
+      model_breakdowns: [],
+    }];
+    return env;
+  }
+
+  it('opens the NEWEST active window, which can be the Codex one', () => {
+    // Under `[...claude, ...codex]` this opened the Claude block regardless of
+    // when either started. Under the time-ordered list the newer Codex window
+    // sorts first and is what the affordance targets.
+    updateSnapshot(withActiveBlocks('2026-04-24T08:00:00Z', '2026-04-24T18:00:00Z'));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<BlocksPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Blocks' }));
+
+    expect(getState().openSourceDetail).toEqual({
+      source: 'codex', resource: 'block', key: 'block:codex-active',
+    });
+    expect(getState().openModal).not.toBe('block');
+  });
+
+  it('opens the Claude one when IT is the newest, through the canonical modal', () => {
+    updateSnapshot(withActiveBlocks('2026-04-24T18:00:00Z', '2026-04-24T08:00:00Z'));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    render(<BlocksPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Blocks' }));
+
+    expect(getState().openModal).toBe('block');
+    expect(getState().openBlockStartAt).toBe('2026-04-24T18:00:00Z');
+    expect(getState().openSourceDetail).toBeNull();
+  });
+
+  it('leaves the 7-key shortcut on the legacy Claude blocks collection', () => {
+    // `openActiveOrNewestBlockModal` reads `snapshot.blocks.rows`, the
+    // top-level Claude panel, NOT `presentationBlocks`. The ordering change
+    // cannot reach it, so the digit shortcut still opens a Claude block under
+    // every selection.
+    const env = withActiveBlocks('2026-04-24T08:00:00Z', '2026-04-24T18:00:00Z');
+    env.blocks = { rows: [{
+      start_at: '2026-04-24T08:00:00Z', end_at: '2026-04-24T13:00:00Z',
+      anchor: 'recorded', is_active: true, cost_usd: 4, models: [],
+      label: '08:00 Apr 24 UTC',
+    }] } as never;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    openActiveOrNewestBlockModal();
+
+    expect(getState().openModal).toBe('block');
     expect(getState().openBlockStartAt).toBe('2026-04-24T08:00:00Z');
     expect(getState().openSourceDetail).toBeNull();
+  });
+});
+
+
+// #556 S2 QA — Blocks was the worst-truncated header on the board. Measured at
+// 390px before this change: clientWidth 126 against scrollWidth 267, 47%
+// visible, so `Blocks (5h · current provider cycles)` rendered as "Blocks (5h ·
+// curren…" and the composition — which cycles the rows come from — was the
+// part cut away. The whole scope statement moves, unshortened, onto
+// `.panel-range-note`, the wrapping full-width sub-line Projects introduced.
+// It moves WHOLE rather than splitting unit-in-h2 / cycle-on-the-note, because
+// `Blocks (optional 5h)` alone still measured 161px against the 126px the
+// actions cluster leaves — 78%, clipping the unit.
+describe('#556 S2 QA — the Blocks composition is off the h2', () => {
+  it('states the provider cycles on the sub-line under All, not in the h2', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    const { container } = render(<BlocksPanel />);
+
+    expect(container.querySelector('.panel-header h2')!.textContent!.trim())
+      .toBe('Blocks');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('5h · current provider cycles');
+  });
+
+  it('states the Claude week on the sub-line too, so one panel has one pattern', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+
+    const { container } = render(<BlocksPanel />);
+
+    expect(container.querySelector('.panel-header h2')!.textContent!.trim())
+      .toBe('Blocks');
+    expect(container.querySelector('.panel-range-note')!.textContent)
+      .toBe('5h · current week');
+  });
+
+  it('renders the sub-line as a SIBLING of the header, which is what lets it wrap', () => {
+    updateSnapshot(structuredClone(fixture) as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<BlocksPanel />);
+    expect(container.querySelector('.panel-header .panel-range-note')).toBeNull();
+    const note = container.querySelector('.panel-range-note')!;
+    expect(note.parentElement!.querySelector(':scope > .panel-header')).not.toBeNull();
   });
 });

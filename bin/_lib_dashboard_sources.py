@@ -45,7 +45,30 @@ CapabilityStatus = Literal[
 # number; after an in-place `execvp` update a still-loaded old client renders the
 # new figure under old copy until it reloads, and that one-reconnect transient is
 # accepted, consistent with the 2 -> 3 precedent above.
-SOURCE_SCHEMA_VERSION = 5
+# 5 -> 6 (#556 S2): the All source gained a required `aggregates` object —
+# one `range` describing the shared absolute interval every cross-provider
+# ranking covers, plus a typed `available`/`withheld` outcome for Projects and
+# for Daily. Two rows-only siblings appeared beside it on the Claude provider
+# domain, `projects.aggregate` and `periods.daily_aggregate`, whose rows are
+# folded over that same interval. Because those fields are REQUIRED on a v6
+# payload, this supersedes normal-payload byte identity for this version,
+# exactly as S1's `legs` object did for v5; the additive-omission discipline
+# continues to govern every genuinely optional field. Nothing existing changed
+# shape: `projects.current_week`, `projects.trend`, the flat route-lookup
+# `projects.rows` and `periods.daily` are untouched. No client branches on this
+# number — the bump ships as the signal it has always been, which is exactly
+# why the wire change is additive: after an in-place `execvp` update a
+# still-loaded old client renders precisely what it renders today until it
+# reloads, and no forced page reload is required.
+# 6 -> 7 (#556 S3): every Codex alert row gained `alerted_at`, the canonical
+# firing instant, and `created_at` became an equal-valued compatibility alias
+# for it rather than the crossing instant it used to carry. The All source's
+# alert union is ordered by that instant across both providers instead of by a
+# field only one of them wrote. `alerted_at` is additive and `created_at`
+# remains present, so a pre-v7 client reading `created_at` keeps working — but
+# the VALUE it reads changed on two of the three Codex legs, which is why this
+# is a version bump and not a silent addition.
+SOURCE_SCHEMA_VERSION = 7
 DEFAULT_SOURCE = "claude"
 SOURCE_ORDER = ("claude", "codex", "all")
 SOURCE_FRESHNESS_DOMAINS = ("hero", "quota", "sessions")
@@ -161,6 +184,24 @@ class SourceDashboardState:
     # publishes only ``data``, then the HTTP/SSE envelope layer injects a label
     # into its request-local copies when that request's transcript gate is open.
     private_session_labels: Mapping[str, str] | None = None
+    # #556 S2 §3.6 — the per-aggregate carrier. Server-only, in the same class
+    # as ``clock_data`` and ``account_scope``: the resolved shared range never
+    # enters a provider ``data`` domain, because composition embeds each
+    # provider's ``data`` under the All source and a range inside it would be
+    # published three times over. Shape:
+    #
+    #   {"range": {"kind", "label", "start_at", "end_at"},
+    #    "projects": {"state": "ok"} | {"state": "failed", "code": ...},
+    #    "daily":    {"state": "ok"} | {"state": "failed", "code": ...}}
+    #
+    # ``account_scope`` is the right precedent for STORAGE CLASS and the wrong
+    # one for LIFECYCLE. Account scope is deliberately reattached from the
+    # current tick after every build, reuse and degrade branch; doing that here
+    # would overwrite the range that describes RETAINED rows with the range of a
+    # tick that produced none. This carrier therefore travels with the rows it
+    # describes and is never re-derived on a reuse or degrade path. Explicit
+    # constructors must copy it.
+    aggregate_scope: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         validate_dashboard_selection(self.source)
@@ -206,6 +247,10 @@ class SourceDashboardState:
             object.__setattr__(self, "clock_data", _freeze(self.clock_data))
         if self.account_scope is not None:
             object.__setattr__(self, "account_scope", _freeze(self.account_scope))
+        if self.aggregate_scope is not None:
+            object.__setattr__(
+                self, "aggregate_scope", _freeze(self.aggregate_scope),
+            )
         if self.private_session_labels is not None:
             private_session_labels = {
                 _nonempty_string(key, "private session label key"):
@@ -325,6 +370,11 @@ def degrade_source_state(
         # `account_scope_unresolved` on an install whose count read fine.
         account_scope=prior.account_scope,
         private_session_labels=prior.private_session_labels,
+        # #556 S2 §3.6: the carrier travels with the rows it describes. A
+        # degraded generation retains `prior.data`, so it must retain the range
+        # that bounded those rows — re-deriving it from the current tick would
+        # publish a range the retained rows do not cover.
+        aggregate_scope=prior.aggregate_scope,
     )
 
 
@@ -519,6 +569,44 @@ def _period_instant(value: object) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def canonical_alerted_at(value: object) -> str:
+    """Normalize an aware ISO-8601 firing instant to one UTC ``Z`` spelling.
+
+    #556 S3 §2.2. The union sorted on a field one writer never wrote, so a
+    missing or malformed value must raise here rather than degrade to a
+    sentinel that sorts silently. Sub-second precision is truncated, so two
+    alerts firing in the same second compare equal and fall back to source
+    order; no writer emits it today.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"alerted_at must be a non-empty ISO-8601 string, got {value!r}")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"unparseable alerted_at {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"naive alerted_at {value!r}; an aware instant is required")
+    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canonical_alerted_at_sql(column: str = "alerted_at") -> str:
+    """The SQL twin of :func:`canonical_alerted_at`, for ordering in SQLite.
+
+    #556 S3 §2.3. Every per-axis ``LIMIT`` decides MEMBERSHIP, not merely
+    order, so a row excluded by a textual comparison of two spellings of one
+    instant cannot be recovered by any later projection. SQLite parses the
+    timezone indicator, so for every aware spelling this returns the same
+    canonical UTC ``Z`` string the Python helper returns —
+    ``tests/test_556_s3_alert_ordering.py`` pins that agreement over the
+    committed estate. The twins diverge on exactly one input: SQLite reads a
+    naive value as UTC where the Python helper raises, so such a row is ordered
+    here and rejected later. An unparseable value yields SQL ``NULL``, which
+    sorts last under ``DESC``, so the ``LIMIT`` usually drops that row before
+    composition can reject it — corruption is truncated away, not surfaced.
+    """
+    return f"strftime('%Y-%m-%dT%H:%M:%SZ', {column})"
 
 
 def _leg_period(
@@ -722,6 +810,256 @@ def _combined_outcome(
     }, None
 
 
+# === #556 S2 — the shared cross-provider aggregates (spec §3.5.1, §3.7) =====
+#
+# Two range rules coexist. A combined TOTAL sums provider-native cycles (S1,
+# above). A cross-provider RANKING uses one shared absolute calendar range, and
+# that is what these aggregates publish. Both are deliberate.
+#
+# Withholding is a typed outcome rather than an empty list, because an empty
+# list renders as honest emptiness and a range problem is not emptiness.
+
+AGGREGATE_NAMES: tuple[str, ...] = ("projects", "daily")
+AGGREGATE_RANGE_KIND = "absolute_range"
+AGGREGATE_RANGE_LABEL = "Shared range"
+
+# Precedence is TOTAL and follows the declared code order (§3.5.1). The first
+# two are ordered so the predicates stay mutually exclusive: `_coherent_provider`
+# already subsumes unavailability, so testing incoherence first would make
+# `provider_unavailable` unreachable.
+_AGGREGATE_CAUSE_RANK: Mapping[str, int] = MappingProxyType({
+    "range_unresolved": 1,
+    "provider_unavailable": 2,
+    "provider_incoherent": 3,
+    "claude_fold_failed": 4,
+    "retained_range_mismatch": 5,
+})
+
+# One server warning maps to one published qualification. The figure stays
+# AVAILABLE: the server already publishes a qualified Codex projects subset in
+# this state, and withholding the whole ranking over it would discard real data.
+_AGGREGATE_QUALIFYING_WARNINGS: Mapping[str, tuple[str, str]] = MappingProxyType({
+    # warning code -> (published qualification code, aggregate it qualifies)
+    "codex_metadata_incomplete": ("codex_project_metadata_partial", "projects"),
+})
+
+
+def aggregate_range(start_at: object, end_at: object) -> dict | None:
+    """Canonicalise one resolved absolute range, or ``None`` if it does not."""
+    start = _period_instant(start_at)
+    end = _period_instant(end_at)
+    if start is None or end is None:
+        return None
+    return {
+        "kind": AGGREGATE_RANGE_KIND,
+        "label": AGGREGATE_RANGE_LABEL,
+        "start_at": start,
+        "end_at": end,
+    }
+
+
+def build_aggregate_scope(
+    published_range: Mapping[str, object] | None,
+    outcomes: Mapping[str, object] | None = None,
+) -> dict:
+    """The server-only carrier a freshly built provider generation gets."""
+    scope: dict = {"range": dict(published_range) if published_range else None}
+    for name in AGGREGATE_NAMES:
+        entry = (outcomes or {}).get(name)
+        scope[name] = dict(entry) if isinstance(entry, Mapping) else {"state": "ok"}
+    return scope
+
+
+def aggregate_scope_failed(value: object) -> bool:
+    """Whether a provider generation records a failed aggregate fold.
+
+    Accepts either a ``SourceDashboardState`` or a raw carrier mapping, because
+    both gates need the predicate and one of them runs before the state exists.
+
+    A failure must not become permanent. A locally caught fold failure leaves an
+    otherwise `ok` and `fresh` provider, and that bundle would qualify for idle
+    reuse while exact-version provider reuse returns the prior object unchanged
+    — so one transient failure would withhold the aggregate for the life of the
+    process. This predicate is read at BOTH gates.
+    """
+    scope = (
+        value if isinstance(value, Mapping)
+        else getattr(value, "aggregate_scope", None)
+    )
+    if not isinstance(scope, Mapping):
+        return False
+    for name in AGGREGATE_NAMES:
+        entry = scope.get(name)
+        if isinstance(entry, Mapping) and entry.get("state") != "ok":
+            return True
+    return False
+
+
+def aggregate_scope_identity(scope: object) -> str:
+    """The version fragment a provider's aggregate carrier contributes.
+
+    Carries the resolved range START and the per-aggregate outcome, so a failed
+    and a successful fold over the same database signature can never publish
+    different rows under one ``data_version``.
+
+    ``end_at`` is deliberately EXCLUDED. It is ``now_utc``, which advances on
+    every tick by construction, so folding it in would make every provider
+    version unique per tick and defeat `reuse_coherent_source_state` on every
+    path — including the reuse §3.6 itself reasons about. The START is the bound
+    that can actually move (a display-day rollover), and it is folded into BOTH
+    providers' versions so they rebuild in lockstep and a coherent pair can
+    never disagree about it.
+
+    The start participates as the EXACT canonical instant, at the same
+    granularity `compose_all_aggregates` compares it. That is the point: the
+    composition publishes a range only when every coherent provider's canonical
+    ``start_at`` is the same string, and this identity is what forces the two
+    providers to rebuild in lockstep so they can be. A coarser identity would
+    make a difference the composition rejects invisible to the gate that is
+    supposed to resolve it — an unchanged provider would keep reusing the old
+    carrier while a rebuilt one recorded the new instant, and both aggregates
+    would be withheld as ``retained_range_mismatch`` on every subsequent tick.
+    That is the original defect, and one value read at two granularities is its
+    structural shape.
+
+    An earlier revision folded the start at DAY granularity to protect against
+    a ``now_utc - 30 days`` fallback that advanced on every tick. That fallback
+    is gone: every producer of this bound now floors to display-timezone
+    midnight — `resolve_shared_range` on both its branches, and
+    `_tui_build_source_bundle`'s own fallback, which resolves through the same
+    helper. So the exact instant changes at most once per display day, which is
+    a tick that must rebuild anyway because the daily panel rolled over.
+
+    ``end_at`` is the only value still excluded, for the reason above.
+    """
+    if not isinstance(scope, Mapping):
+        return "none"
+    published = scope.get("range")
+    start = (
+        published.get("start_at") if isinstance(published, Mapping) else None
+    )
+    parts = [str(start or "")]
+    for name in AGGREGATE_NAMES:
+        entry = scope.get(name)
+        state = entry.get("state") if isinstance(entry, Mapping) else None
+        code = entry.get("code") if isinstance(entry, Mapping) else None
+        parts.append(f"{name}:{state or 'unknown'}" + (f":{code}" if code else ""))
+    return "|".join(parts)
+
+
+def _aggregate_scope_range(state: SourceDashboardState) -> dict | None:
+    scope = getattr(state, "aggregate_scope", None)
+    if not isinstance(scope, Mapping):
+        return None
+    published = scope.get("range")
+    if not isinstance(published, Mapping):
+        return None
+    return aggregate_range(published.get("start_at"), published.get("end_at"))
+
+
+def _aggregate_fold_failed(state: SourceDashboardState, name: str) -> bool:
+    scope = getattr(state, "aggregate_scope", None)
+    if not isinstance(scope, Mapping):
+        return False
+    entry = scope.get(name)
+    return isinstance(entry, Mapping) and entry.get("state") != "ok"
+
+
+def _aggregate_qualifications(
+    claude: SourceDashboardState, codex: SourceDashboardState, name: str,
+) -> list[dict]:
+    """Notes that qualify a PUBLISHED aggregate. Empty means omit the key."""
+    qualifications: list[dict] = []
+    for provider, state in (("claude", claude), ("codex", codex)):
+        for warning in state.warnings:
+            mapped = _AGGREGATE_QUALIFYING_WARNINGS.get(warning.code)
+            if mapped is not None and mapped[1] == name:
+                qualifications.append(
+                    {"code": mapped[0], "provider": provider},
+                )
+    return qualifications
+
+
+def compose_all_aggregates(
+    claude: SourceDashboardState, codex: SourceDashboardState,
+) -> dict:
+    """The single public ``sources.all.data.aggregates`` object (§3.5.1).
+
+    The outcome carries STATE AND REASON only; the rows live on the provider
+    domains and the client composes them. That is what keeps exactly one public
+    copy of the range and one public copy of the rows.
+
+    Every cause is evaluated per aggregate, so a Projects fold failure cannot
+    withhold Daily.
+    """
+    pairs: tuple[tuple[PhysicalSource, SourceDashboardState], ...] = (
+        ("claude", claude), ("codex", codex),
+    )
+    coherent = [
+        (provider, state) for provider, state in pairs
+        if _coherent_provider(state)
+    ]
+    ranges = {
+        provider: _aggregate_scope_range(state) for provider, state in coherent
+    }
+    resolved = [value for value in ranges.values() if value is not None]
+    starts = {value["start_at"] for value in resolved}
+
+    shared: list[tuple[int, int, str, PhysicalSource | None]] = []
+    if coherent and len(resolved) != len(coherent):
+        # A coherent provider whose rows are not bounded by a known range.
+        shared.append((_AGGREGATE_CAUSE_RANK["range_unresolved"], 0,
+                       "range_unresolved", None))
+    for rank_provider, (provider, state) in enumerate(pairs):
+        if state.availability == "unavailable":
+            shared.append((_AGGREGATE_CAUSE_RANK["provider_unavailable"],
+                           rank_provider, "provider_unavailable", provider))
+    for rank_provider, (provider, state) in enumerate(pairs):
+        if state.availability != "unavailable" and not _coherent_provider(state):
+            shared.append((_AGGREGATE_CAUSE_RANK["provider_incoherent"],
+                           rank_provider, "provider_incoherent", provider))
+    if len(starts) > 1:
+        shared.append((_AGGREGATE_CAUSE_RANK["retained_range_mismatch"], 0,
+                       "retained_range_mismatch", None))
+
+    published_range: dict | None = None
+    if coherent and len(resolved) == len(coherent) and len(starts) == 1:
+        # Published only when EVERY coherent provider supplied a range and they
+        # agree. Publishing one leg's range while the other's is unresolved or
+        # different would state a span the composed rows do not cover.
+        #
+        # A reused provider provably has no new accounting rows — its physical
+        # signature is part of the version that made the reuse legal — so the
+        # later of the two ends is the instant BOTH legs are complete to.
+        published_range = {
+            **resolved[0],
+            "end_at": max(value["end_at"] for value in resolved),
+        }
+
+    aggregates: dict = {"range": published_range}
+    for name in AGGREGATE_NAMES:
+        causes = list(shared)
+        if _aggregate_fold_failed(claude, name):
+            causes.append((_AGGREGATE_CAUSE_RANK["claude_fold_failed"], 0,
+                           "claude_fold_failed", "claude"))
+        if causes:
+            _rank, _provider_rank, code, provider = min(
+                causes, key=lambda cause: (cause[0], cause[1]),
+            )
+            aggregates[name] = {
+                "state": "withheld",
+                "code": code,
+                **({"provider": provider} if provider is not None else {}),
+            }
+            continue
+        qualifications = _aggregate_qualifications(claude, codex, name)
+        aggregates[name] = {
+            "state": "available",
+            **({"qualifications": qualifications} if qualifications else {}),
+        }
+    return aggregates
+
+
 def _combined_alert_rows(
     claude: SourceDashboardState,
     codex: SourceDashboardState,
@@ -739,13 +1077,23 @@ def _combined_alert_rows(
             if not isinstance(row, Mapping) or row.get("source") != source:
                 continue
             ordered.append(row)
+
+    def _instant(row: Mapping[str, object]) -> str:
+        try:
+            return canonical_alerted_at(row.get("alerted_at"))
+        except ValueError as exc:
+            identity = row.get("id") if row.get("id") is not None else row.get("key")
+            raise ValueError(
+                f"{row.get('source')!r} alert row {identity!r}: {exc}"
+            ) from exc
+
+    # #556 S3 §2.5: composition is the chokepoint. The previous sort keyed on
+    # `created_at`, which the Claude projection never wrote, so every Claude
+    # row collapsed to "" and sorted last. Validating here means a future leg,
+    # axis or provider that omits the canonical instant fails visibly instead.
     # Python's stable sort preserves declared source order, then each source's
-    # native order, when alert timestamps tie.
-    return tuple(sorted(
-        ordered,
-        key=lambda row: str(row.get("created_at") or ""),
-        reverse=True,
-    ))
+    # native order, when firing instants tie.
+    return tuple(sorted(ordered, key=_instant, reverse=True))
 
 
 def compose_all_state(
@@ -756,6 +1104,11 @@ def compose_all_state(
     if claude.source != "claude" or codex.source != "codex":
         raise ValueError("all composition requires Claude and Codex provider states")
     combined, combined_unavailable = _combined_outcome(claude, codex)
+    aggregates = compose_all_aggregates(claude, codex)
+    # Computed ONCE: the same ordered union is hashed into the version below
+    # and published in `data` further down, so the identity and the rows can
+    # never describe different orderings.
+    combined_alerts = _combined_alert_rows(claude, codex)
     providers_coherent = _coherent_provider(claude) and _coherent_provider(codex)
     if providers_coherent:
         availability: Availability = (
@@ -790,6 +1143,20 @@ def compose_all_state(
             # `combined is not None` would leave materially different All
             # states sharing one `data_version` (invariant 6).
             combined, combined_unavailable,
+            # #556 S2 §3.6: the COMPLETE `AllAggregates` value, not merely the
+            # range. A failed and a successful fold over the same database
+            # signature and the same bounds publish different rows, so hashing
+            # only the range would leave them sharing one `data_version`.
+            aggregates,
+            # #556 S3 §2.9: the ordered alert union's identity. Without it the
+            # version material omitted alerts entirely, so two materially
+            # different unions — a different order, a different membership, a
+            # newly fired alert — collided on one `data_version`.
+            [
+                (str(row.get("source")), str(row.get("id") or row.get("key")),
+                 canonical_alerted_at(row.get("alerted_at")))
+                for row in combined_alerts
+            ],
         ],
         separators=(",", ":"),
         sort_keys=True,
@@ -823,7 +1190,11 @@ def compose_all_state(
             # Emitted iff the figure is withheld; omitted-when-inapplicable.
             **({"combined_unavailable": combined_unavailable}
                if combined is None else {}),
-            "alerts": {"rows": _combined_alert_rows(claude, codex)},
+            "alerts": {"rows": combined_alerts},
+            # #556 S2 §3.5.1: the ONE public copy of the shared range and of
+            # both aggregate outcomes. The rows stay on the provider domains
+            # under `providers` below, so nothing is published twice.
+            "aggregates": aggregates,
             "providers": {
                 "claude": claude.data,
                 "codex": codex.data,
@@ -907,6 +1278,94 @@ _CODEX_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+# #556 S3 §2.9. The Claude twin of the relation table above, over the five
+# alert tables the Claude projection reads. `codex_stats_digest` already covers
+# Codex's alert rows; Claude's were covered by nothing, and the dispatch
+# signature's stats legs are `MAX(id)` over the two weekly snapshot tables plus
+# the reset-event change signal — none of which a milestone INSERT or an
+# `alerted_at` arming UPDATE touches. A fired Claude alert could therefore
+# leave the idle path short-circuiting on a retained prior bundle. Measured
+# before the leg was added: inserting a `budget_milestones` row with
+# `vendor='claude'` left every existing leg byte-identical.
+#
+# Only the alert-bearing columns are selected, for the same reason the Codex
+# table selects a fixed list: the digest is an identity over what the surface
+# publishes, not a checksum of the table file.
+_CLAUDE_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
+    (
+        "percent_milestones",
+        "SELECT week_start_date, percent_threshold, captured_at_utc, "
+        "cumulative_cost_usd, reset_event_id, account_key, alerted_at "
+        "FROM percent_milestones WHERE alerted_at IS NOT NULL "
+        "ORDER BY week_start_date, percent_threshold, reset_event_id, account_key, "
+        "captured_at_utc, cumulative_cost_usd, alerted_at",
+    ),
+    (
+        "five_hour_milestones",
+        "SELECT five_hour_window_key, percent_threshold, captured_at_utc, "
+        "block_cost_usd, reset_event_id, account_key, alerted_at "
+        "FROM five_hour_milestones WHERE alerted_at IS NOT NULL "
+        "ORDER BY five_hour_window_key, percent_threshold, reset_event_id, account_key, "
+        "captured_at_utc, block_cost_usd, alerted_at",
+    ),
+    (
+        "budget_milestones",
+        "SELECT vendor, period_start_at, period, threshold, budget_usd, spent_usd, "
+        "consumption_pct, crossed_at_utc, account_key, alerted_at "
+        "FROM budget_milestones WHERE vendor <> 'codex' AND alerted_at IS NOT NULL "
+        "ORDER BY vendor, period_start_at, period, threshold, account_key, "
+        "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at",
+    ),
+    (
+        "projected_milestones",
+        "SELECT week_start_at, period, metric, threshold, projected_value, denominator, "
+        "crossed_at_utc, account_key, alerted_at FROM projected_milestones "
+        "WHERE metric <> 'codex_budget_usd' AND alerted_at IS NOT NULL "
+        "ORDER BY week_start_at, period, metric, threshold, account_key, "
+        "projected_value, denominator, crossed_at_utc, alerted_at",
+    ),
+    (
+        "project_budget_milestones",
+        "SELECT week_start_at, project_key, threshold, budget_usd, spent_usd, "
+        "consumption_pct, crossed_at_utc, account_key, alerted_at "
+        "FROM project_budget_milestones WHERE alerted_at IS NOT NULL "
+        "ORDER BY week_start_at, project_key, threshold, account_key, "
+        "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at",
+    ),
+)
+
+
+def _stats_relations_digest(
+    stats_conn: sqlite3.Connection,
+    relations: tuple[tuple[str, str], ...],
+) -> str:
+    relation_rows: list[list[list[object]]] = []
+    for _name, query in relations:
+        try:
+            rows = stats_conn.execute(query).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            rows = ()
+        relation_rows.append([list(row) for row in rows])
+    canonical = json.dumps(
+        relation_rows,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def claude_stats_digest(stats_conn: sqlite3.Connection) -> str:
+    """Hash the Claude-owned alert relations, canonically ordered.
+
+    A missing table is an empty relation, so an older or fresh stats database
+    still has a stable digest — the same posture ``codex_stats_digest`` takes.
+    """
+    return _stats_relations_digest(stats_conn, _CLAUDE_STATS_DIGEST_RELATIONS)
+
+
 def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
     """Hash exact, canonically ordered Codex-derived stats relations.
 
@@ -915,22 +1374,7 @@ def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
     then follows the source all-or-prior failure matrix instead of publishing a
     guessed identity.
     """
-    relations: list[list[list[object]]] = []
-    for _name, query in _CODEX_STATS_DIGEST_RELATIONS:
-        try:
-            rows = stats_conn.execute(query).fetchall()
-        except sqlite3.OperationalError as exc:
-            if "no such table" not in str(exc).lower():
-                raise
-            rows = ()
-        relations.append([list(row) for row in rows])
-    canonical = json.dumps(
-        relations,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    return _stats_relations_digest(stats_conn, _CODEX_STATS_DIGEST_RELATIONS)
 
 
 def assess_codex_projection_coherence(

@@ -431,6 +431,19 @@ _FIXTURE_ROOT = (
     / "fixtures" / "dashboard" / "all-combined"
 )
 _FIXTURE_AS_OF = "2026-04-16T14:00:00+00:00"
+# The EXCLUSIVE upper bound, which is `as_of + 1 microsecond`.
+#
+# The Codex spend read is half-open and closes at ``now_utc + 1 microsecond``
+# (`bin/_cctally_dashboard_sources.py`), so an entry stamped exactly at
+# ``now_utc`` is INSIDE the leg the golden publishes. #556 S2 added a Codex
+# sentinel at exactly that instant, so an oracle that stopped at ``as_of``
+# exclusively counted less than the golden did and reported a boundary rule the
+# production code does not use. Lexical ordering agrees with the instant
+# ordering here: ``+`` (0x2B) sorts below ``.`` (0x2E), so a stored
+# ``...T14:00:00+00:00`` compares below this bound and is admitted.
+_FIXTURE_AS_OF_EXCLUSIVE = (
+    dt.datetime.fromisoformat(_FIXTURE_AS_OF) + dt.timedelta(microseconds=1)
+).isoformat()
 
 
 def _fixture_golden() -> dict:
@@ -466,6 +479,22 @@ def _iso_utc(value: str) -> str:
         UTC).isoformat()
 
 
+def _earlier_iso(left: str, right: str) -> str:
+    """The earlier of two ISO instants, re-emitted in one canonical spelling.
+
+    A bare ``min()`` over these two strings is a LEXICAL comparison, and it
+    agrees with the instant ordering only while both operands happen to be
+    spelled the same way. ``+`` (0x2B) sorts below ``Z`` (0x5A) and below ``.``
+    (0x2E), so a ``...Z``-spelled bound against a ``...+00:00``-spelled one
+    selects by spelling rather than by time, silently choosing the wrong bound.
+    Comparing parsed datetimes and formatting once removes the dependence.
+    """
+    return _iso_utc(min(
+        dt.datetime.fromisoformat(left.replace("Z", "+00:00")),
+        dt.datetime.fromisoformat(right.replace("Z", "+00:00")),
+    ).isoformat())
+
+
 def test_all_combined_fixture_legs_are_bounded_by_their_own_cycles():
     """§6.2 — each directional wrong-bound mutation moves ITS OWN leg.
 
@@ -489,10 +518,9 @@ def test_all_combined_fixture_legs_are_bounded_by_their_own_cycles():
     try:
         claude_own = _claude_tokens_between(conn, claude_start, _FIXTURE_AS_OF)
         claude_wrong = _claude_tokens_between(conn, codex_start, _FIXTURE_AS_OF)
-        codex_own = _codex_tokens_between(
-            conn, codex_start, min(codex_end, _FIXTURE_AS_OF))
-        codex_wrong = _codex_tokens_between(
-            conn, claude_start, min(codex_end, _FIXTURE_AS_OF))
+        codex_upper = _earlier_iso(codex_end, _FIXTURE_AS_OF_EXCLUSIVE)
+        codex_own = _codex_tokens_between(conn, codex_start, codex_upper)
+        codex_wrong = _codex_tokens_between(conn, claude_start, codex_upper)
     finally:
         conn.close()
 

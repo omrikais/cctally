@@ -73,6 +73,13 @@ labels never merge.
 
 For Codex, `--weeks N` means configured **calendar** weeks. For `--source all`,
 that calendar interval is resolved once and used for both provider sections.
+
+The dashboard's All Projects panel adopts the same one-absolute-range rule this
+command enforces: both providers are folded over one shared interval, and the
+panel names its resolved dates rather than describing the ranking as a week. It
+publishes **no quota-share percentage** under All — quota attribution divides by
+a subscription week's total and means nothing over an absolute range — so the
+percentage there is a share of the ranked cost and the panel legend says so.
 Codex cannot calculate Claude-style `--sort used`, so that value is rejected
 for Codex and all-source requests. Other project filters, grouping, ordering,
 breakdown, timezone, and share flags apply inside each source section.

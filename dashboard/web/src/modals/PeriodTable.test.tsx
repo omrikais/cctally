@@ -157,3 +157,66 @@ describe('PeriodTable sortable headers', () => {
     expect(firstRowLabel(container)).toContain('2026-W27');
   });
 });
+
+// #556 S2 §5.3 / §5.4 — the monthly variant under All: its own sort scope, its
+// own provider column, and no cross-provider interleaving.
+describe('#556 S2 — All monthly table', () => {
+  const ALL_ROWS: PeriodRow[] = [
+    periodRow({ label: '2026-04', source: 'claude', cost_usd: 5, used_pct: null, dollar_per_pct: null }),
+    periodRow({ label: '2026-03', source: 'claude', cost_usd: 30, used_pct: null, dollar_per_pct: null }),
+    periodRow({ label: '2026-04', source: 'codex', cost_usd: 20, used_pct: null, dollar_per_pct: null }),
+    periodRow({ label: '2026-03', source: 'codex', cost_usd: 1, used_pct: null, dollar_per_pct: null }),
+  ];
+
+  // DELETED: 'renders the provider column for monthly'. It passed unchanged on
+  // `main`, because it handed `showSource` to the component explicitly and
+  // `PeriodTable` has always rendered the column when told to. What this
+  // session changed is that `PeriodModal` now PASSES it for the monthly
+  // variant, and that is not observable from here. The discriminating version
+  // lives one level up, in ProviderModalParity.test.tsx's
+  // 'keeps two same-labelled provider rows distinct instead of merging them',
+  // which renders <MonthlyModal /> and reads the chips out of the real table.
+
+  it('sorts INSIDE each provider section rather than interleaving them', () => {
+    // Sorting the union by cost would produce 30, 20, 5, 1 — one ranked list
+    // over two independent reset axes, which is exactly the blend the unmerge
+    // exists to prevent.
+    const { container } = render(
+      <PeriodTable
+        rows={ALL_ROWS} variant="monthly" accentClass="accent-pink"
+        selectedKey={null} onSelect={vi.fn()} showSource
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /Cost \(USD\)/ }));
+    const sources = [...container.querySelectorAll('tbody tr')].map(
+      (row) => row.querySelector('.source-chip')!.textContent,
+    );
+    expect(sources).toEqual(['Claude', 'Claude', 'Codex', 'Codex']);
+    const costs = [...container.querySelectorAll('tbody tr')].map(
+      (row) => row.querySelectorAll('td')[3].textContent,
+    );
+    expect(costs).toEqual(['$30.00', '$5.00', '$20.00', '$1.00']);
+  });
+
+  it('keeps a monthly sort out of the weekly table', () => {
+    const { unmount } = render(
+      <PeriodTable
+        rows={ALL_ROWS} variant="monthly" accentClass="accent-pink"
+        selectedKey={null} onSelect={vi.fn()} showSource
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /Cost \(USD\)/ }));
+    unmount();
+
+    // The weekly table has its own scope, so it renders in envelope order.
+    const { container } = render(
+      <PeriodTable rows={ROWS} variant="weekly" accentClass="accent-cyan"
+        selectedKey={null} onSelect={vi.fn()} />,
+    );
+    const labels = [...container.querySelectorAll('tbody tr td:first-child')].map(
+      (cell) => cell.textContent,
+    );
+    expect(labels).toEqual(['2026-W26', '2026-W27']);
+  });
+});
+

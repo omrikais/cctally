@@ -9,6 +9,7 @@ import { CacheReportModal } from './CacheReportModal';
 import { ForecastModal } from './ForecastModal';
 import { CurrentWeekModal } from './CurrentWeekModal';
 import { WeeklyModal } from './WeeklyModal';
+import { MonthlyModal } from './MonthlyModal';
 
 const envelope = fixture as unknown as Envelope;
 
@@ -470,4 +471,194 @@ it('renders native Codex $/1% and daily budgets without unavailable placeholders
   expect(container.textContent).toContain('$10.00 / day');
   expect(container.textContent).toContain('$8.67 / day');
   expect(container.textContent).not.toContain('Forecast unavailable');
+});
+
+// #556 S2 §5.4 — the MONTHLY variant of PeriodModal / PeriodTable under All,
+// which had no coverage at all: the parity suite exercised only the weekly one.
+describe('#556 S2 — the All monthly destination', () => {
+  function withMonths(): Envelope {
+    const env = structuredClone(envelope) as Envelope;
+    env.sources!.claude.data!.periods.monthly.rows = [{
+      label: '2026-04', cost_usd: 30, total_tokens: 1, input_tokens: 1,
+      output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+      used_pct: null, dollar_per_pct: null, delta_cost_pct: null,
+      is_current: true, models: [],
+    }];
+    env.sources!.codex.data!.periods.monthly.rows = [{
+      label: '2026-04', cost_usd: 12, input_tokens: 1, cached_input_tokens: 0,
+      output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 1,
+      models: ['gpt-5'],
+    }];
+    return env;
+  }
+
+  it('keeps two same-labelled provider rows distinct instead of merging them', () => {
+    act(() => {
+      updateSnapshot(withMonths());
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    });
+    const { container } = render(<MonthlyModal />);
+
+    // A Source column, and one row per provider under the shared label.
+    const chips = [...container.querySelectorAll('tbody .source-chip')]
+      .map((chip) => chip.textContent);
+    expect(chips).toEqual(['Claude', 'Codex']);
+    // Neither row is labelled "Combined", which is what a merged row rendered.
+    expect(chips).not.toContain('Combined');
+  });
+
+  it('qualifies the navigator label so two April rows are tellable apart', () => {
+    act(() => {
+      updateSnapshot(withMonths());
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    });
+    const { container } = render(<MonthlyModal />);
+    const text = container.textContent ?? '';
+    expect(text).toContain('Claude · 2026-04');
+    expect(text).toContain('Codex · 2026-04');
+  });
+});
+
+
+// #556 S2 QA P3 — the Monthly modal title repeated the panel footer's
+// calendar-month reading of a provider-month count.
+it('titles the All monthly modal in provider months', () => {
+  const env = structuredClone(envelope) as unknown as Envelope;
+  env.sources!.claude.data!.periods.monthly.rows = [{
+    label: '2026-04', cost_usd: 30, total_tokens: 1, input_tokens: 1,
+    output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+    used_pct: null, dollar_per_pct: null, delta_cost_pct: null,
+    is_current: true, models: [],
+  }];
+  env.sources!.codex.data!.periods.monthly.rows = [{
+    label: '2026-02', cost_usd: 12, input_tokens: 1, cached_input_tokens: 0,
+    output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 1,
+    models: ['gpt-5'],
+  }];
+  act(() => {
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+  });
+  const { container } = render(<MonthlyModal />);
+  const title = container.querySelector('.modal-title, h2')!.textContent!;
+  expect(title).toContain('2 provider months');
+  expect(title).not.toContain('last 2 months');
+});
+
+// #556 S4 F1 — `wide` is width alone; the >=1025px internal-pane scroll
+// contract is the separate `paneScroll` opt-in, emitted as
+// `.modal-pane-scroll`. Only a modal that really renders `.period-two-pane`
+// may claim it. The two All modals below ask for width and must NOT inherit
+// the pane contract: before this split they got an `overflow: hidden` body
+// with no pane to scroll, which left their content clipped at 1440x900 with
+// no scroller anywhere in the card.
+describe('the pane-scroll contract is opt-in, not implied by width (#556 S4)', () => {
+  it('gives the single-provider Trend modal the pane contract', () => {
+    const { container } = renderFor('claude', <TrendModal />);
+    const card = container.querySelector('.modal-card')!;
+    expect(card.className).toContain('modal-wide');
+    expect(card.className).toContain('modal-pane-scroll');
+  });
+
+  it('withholds the pane contract from the All Trend modal', () => {
+    const { container } = renderFor('all', <TrendModal />);
+    const card = container.querySelector('.modal-card')!;
+    expect(card.className).toContain('modal-wide');
+    expect(card.className).not.toContain('modal-pane-scroll');
+    // The All branch really has no `.period-two-pane` of its own at the body
+    // level — it nests one per embedded provider — which is why inheriting the
+    // contract clipped it.
+    expect(container.querySelector('.modal-body > .period-two-pane')).toBeNull();
+  });
+
+  it('withholds the pane contract from the All Current Usage modal', () => {
+    const { container } = renderFor('all', <CurrentWeekModal />);
+    const card = container.querySelector('.modal-card')!;
+    expect(card.className).toContain('modal-wide');
+    expect(card.className).not.toContain('modal-pane-scroll');
+  });
+
+  // The All branch is the one that names its provider on the card; the
+  // single-provider branch is already scoped by the board and never passed a
+  // value. #556 S4 F7 deleted the attribute outright as unread, which turned
+  // `e2e/period-native-vocabulary.spec.ts` red on main.
+  it('publishes data-source only on the All Trend card', () => {
+    for (const source of ['claude', 'codex'] as const) {
+      const { container } = renderFor(source, <TrendModal />);
+      expect(container.querySelector('.modal-card')!.hasAttribute('data-source')).toBe(false);
+      cleanup();
+    }
+    const { container } = renderFor('all', <TrendModal />);
+    expect(container.querySelector('.modal-card')).toHaveAttribute('data-source', 'all');
+  });
+});
+
+// #556 S4 F8 — the modal half of the same rule the five panel tests assert:
+// every All provider section exposes a level-3 heading naming that section,
+// and the section's accessible name resolves THROUGH that heading via
+// `aria-labelledby` rather than through a competing `aria-label` string. h3
+// because a modal title is an h2, so a provider section sits one level below
+// it; ids are surface-qualified so a panel and its modal can be mounted at
+// once without colliding.
+//
+// Subsection headings inside these modals drop to h4 when embedded. Left at h3
+// they would become apparent PEERS of the provider section that contains them,
+// which is a worse hierarchy than no heading at all.
+describe('All provider sections are named by their own heading (#556 S4)', () => {
+  function assertHeadings(container: HTMLElement, pattern: RegExp, expectRegion: boolean) {
+    const sections = container.querySelectorAll('[data-provider-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      if (expectRegion) expect(s.getAttribute('role')).toBe('region');
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      expect(s.getAttribute('aria-label')).toBeNull();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(pattern);
+    });
+    const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  }
+
+  it('names both Cache Report modal sections', () => {
+    const composed = structuredClone(envelope);
+    composed.sources!.codex.data!.cache_report = asCodexCacheReport(composed.cache_report!);
+    composed.sources!.all.data!.providers.codex = composed.sources!.codex.data;
+    act(() => {
+      updateSnapshot(composed);
+      dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    });
+    const { container } = render(<CacheReportModal />);
+    assertHeadings(container, /^(Claude|Codex) cache report detail$/, false);
+  });
+
+  it('names both Forecast modal sections', () => {
+    const { container } = renderFor('all', <ForecastModal />);
+    assertHeadings(container, /^(Claude|Codex) forecast detail$/, false);
+  });
+
+  it('names both Trend modal sections', () => {
+    const { container } = renderFor('all', <TrendModal />);
+    assertHeadings(container, /^(Claude|Codex) \$ per 1% trend history$/, false);
+  });
+
+  it('names both Current Usage modal sections', () => {
+    const { container } = renderFor('all', <CurrentWeekModal />);
+    assertHeadings(
+      container,
+      /^(Claude subscription week|Codex native 7-day quota)$/,
+      false,
+    );
+  });
+
+  it('drops embedded subsection headings to h4 so they are not peers of their provider', () => {
+    const { container } = renderFor('all', <TrendModal />);
+    container.querySelectorAll('[data-provider-section]').forEach((s) => {
+      // The section's OWN heading is the only h3 inside it; every heading the
+      // embedded modal body renders is one level deeper.
+      expect(s.querySelectorAll('h3').length).toBe(1);
+    });
+  });
 });

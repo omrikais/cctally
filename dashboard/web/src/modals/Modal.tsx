@@ -24,7 +24,21 @@ interface ModalProps {
   // without churning Modal's signature.
   headerExtras?: ReactNode;
   // S2 #264 — wide two-pane variant for Weekly/Monthly; `min(1040px,94vw)`.
+  // Width ONLY. Whether the body delegates scrolling to internal panes is
+  // `paneScroll`, deliberately separate: #556 S4 found the All Current Usage
+  // and All Trend modals asking for width and silently inheriting a
+  // pane-scroll contract whose panes they never render, which left their
+  // content clipped with no scroller anywhere at >=1025px.
   wide?: boolean;
+  // S4 #556 — opt in to the >=1025px internal-pane scroll contract. Only
+  // modals that actually render `.period-two-pane` may set this.
+  paneScroll?: boolean;
+  // The provider whose data the modal is showing, published on the card as
+  // `data-source`. Bound when the modal opens and deliberately NOT re-read
+  // afterwards, so a source switch on the board behind an open modal cannot
+  // change it. `e2e/period-native-vocabulary.spec.ts` asserts exactly that,
+  // and it is the only direct observable of the binding — #556 S4 F7 removed
+  // this prop as unread, which turned that assertion red on main.
   dataSource?: 'claude' | 'codex' | 'all';
   onClose?: () => void;
   focusLayer?: Exclude<StoreFocusLayer, null>;
@@ -49,6 +63,7 @@ export function Modal({
   children,
   headerExtras,
   wide,
+  paneScroll,
   dataSource,
   onClose,
   focusLayer = 'panel',
@@ -96,7 +111,7 @@ export function Modal({
       <div className="modal-backdrop" onClick={close} />
       <div
         ref={cardRef}
-        className={`modal-card ${accentClass}${wide ? ' modal-wide' : ''}${cardClassName ? ` ${cardClassName}` : ''}`}
+        className={`modal-card ${accentClass}${wide ? ' modal-wide' : ''}${paneScroll ? ' modal-pane-scroll' : ''}${cardClassName ? ` ${cardClassName}` : ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

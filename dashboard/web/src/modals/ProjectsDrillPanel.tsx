@@ -10,6 +10,8 @@
 // `sessions_total > sessions.length` adds a "+N more" affordance below
 // the visible list (spec §3.5).
 import { useProjectDetail } from '../hooks/useProjectDetail';
+import { useSnapshot } from '../hooks/useSnapshot';
+import { claudeCurrentWeekStartAt, claudeDrillWindow, formatSpan } from '../lib/projectWindow';
 import { dispatch } from '../store/store';
 import { fmt } from '../lib/fmt';
 import { useDisplayTz } from '../hooks/useDisplayTz';
@@ -46,6 +48,35 @@ interface ProjectDetailContentProps {
   testId?: string;
   sessionTestIdPrefix?: string;
   showInSessionsTestId?: string;
+}
+
+// #556 S2 Task 0b — the drill states the span it actually reported.
+//
+// `_project_window_weeks_for_key` widens an All-originated drill so it reaches
+// the shared range its row was ranked over, and that widening is global: one
+// shared start resolves for the whole snapshot, so a row ranked over thirty
+// days opens a fifty-six-day window. `window_cost_usd` is then `>=` the ranked
+// figure with nothing reconciling them, which is the untruthfulness this
+// session exists to remove, one level down. Naming the resolved dates labels
+// each figure so neither implies the other.
+//
+// The anchor and the arithmetic both come from published data — the response's
+// OWN `window_weeks` (the server's effective value, not the client's request)
+// and `projects.current_week.week_start_at`. When either is unresolvable the
+// header falls back to the unit count rather than stating a span nothing
+// established.
+// The stated end is CLAMPED to the snapshot's own `generated_at`: the window
+// runs to the current week's Sunday, so on six days in seven the unclamped
+// form named days no data can exist for, beside a cost figure. The anchor is
+// the envelope instant, never the client clock.
+function useDrillWindowSpan(windowWeeks: number): string | null {
+  const env = useSnapshot();
+  const display = useDisplayTz();
+  return formatSpan(
+    claudeDrillWindow(claudeCurrentWeekStartAt(env), windowWeeks),
+    { tz: display.resolvedTz, offsetLabel: display.offsetLabel },
+    { clampEndTo: env?.generated_at },
+  );
 }
 
 export function ProjectsDrillPanel({ projectKey, windowWeeks }: ProjectsDrillPanelProps) {
@@ -103,6 +134,7 @@ export function ProjectDetailContent({
   const display = useDisplayTz();
   const ctx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   const remaining = Math.max(0, data.sessions_total - data.sessions.length);
+  const windowSpan = useDrillWindowSpan(data.window_weeks);
 
   return (
     <div className="projects-drill" data-testid={testId} aria-live="polite">
@@ -110,7 +142,10 @@ export function ProjectDetailContent({
         <span className="title">
           ▾ {data.label} · {data.sessions_total} session{data.sessions_total === 1 ? '' : 's'}
           {' · '}
-          {fmt.usd2(data.window_cost_usd)} ({data.window_weeks}w)
+          {fmt.usd2(data.window_cost_usd)}
+          {windowSpan == null
+            ? ` (${data.window_weeks}w)`
+            : ` · ${data.window_weeks}w · ${windowSpan}`}
         </span>
       </div>
       <div className="projects-drill-grid">

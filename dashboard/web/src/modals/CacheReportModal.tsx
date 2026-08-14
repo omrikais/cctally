@@ -155,9 +155,14 @@ function AllCacheReportSection({
     <section
       className="provider-composition-section cache-provider-detail"
       data-provider-section={section.source}
-      aria-label={`${section.label} cache report detail`}
+      aria-labelledby={`cache-report-modal-${section.source}-heading`}
     >
       <div className="source-provider-head provider-composition-head">
+        {/* #556 S4 F8 — surface-qualified id, so the panel and this modal can
+            be mounted at once without two elements claiming one id. */}
+        <h3 className="sr-only" id={`cache-report-modal-${section.source}-heading`}>
+          {section.label} cache report detail
+        </h3>
         <SourceChip source={section.source} />
         <strong>{section.label} cache report</strong>
         {section.status !== 'available' && (

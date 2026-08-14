@@ -106,6 +106,16 @@ class SnapshotSignature(NamedTuple):
     # Codex mutation happens along. Empty when nothing is owed (the writer
     # DELETEs the key at zero), so a fully-ingested store is byte-neutral.
     codex_ingest_backlog_sig: str = ""
+    # #556 S3 §2.9: the Claude twin of `codex_stats_digest`. The stats legs
+    # above are `MAX(id)` over the two weekly snapshot tables plus the
+    # reset-event change signal, and a Claude milestone INSERT or an
+    # `alerted_at` arming UPDATE touches none of them — measured: inserting a
+    # `budget_milestones` row with `vendor='claude'` left every other leg
+    # byte-identical. Without this leg a fired Claude alert could leave the
+    # idle path short-circuiting on a retained prior bundle. Unlike the two
+    # legs above, this one is a digest and is never empty: a store with no
+    # armed Claude alert carries a constant hash, not the empty string.
+    claude_stats_digest: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -221,6 +231,7 @@ def compute_signature(
     generation: int,
     codex_stats_digest: str = "",
     accounts_digest: str = "",
+    claude_stats_digest: str = "",
 ) -> SnapshotSignature:
     """Composite data-version signature across cache.db + stats.db (spec §3).
 
@@ -243,6 +254,7 @@ def compute_signature(
         codex_stats_digest=str(codex_stats_digest),
         accounts_digest=str(accounts_digest),
         codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
+        claude_stats_digest=str(claude_stats_digest),
     )
 
 

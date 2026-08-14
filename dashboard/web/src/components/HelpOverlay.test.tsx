@@ -197,3 +197,30 @@ describe('<HelpOverlay /> Esc wins by layer, not registration order (#159)', () 
     expect(shareLikeEsc).not.toHaveBeenCalled();
   });
 });
+
+// #556 S4 F3 — the overlay carried a "The <source> source doesn't show:"
+// disclosure fed by a `hiddenItems` array that was declared empty and never
+// written to, so the block could not render for any source. It described a
+// capability-gated board the code does not implement: the standing #324
+// decision gives every source selection the same canonical ten-card board,
+// and capability differences render inside the card as honest empty states.
+//
+// The overlay also never named the hero. `GridPanelId` is
+// `Exclude<PanelId, 'current-week'>`, so no digit can structurally reach the
+// Current Usage modal, and a reader who scanned the digit rows for it found
+// nothing. No keybinding is added — the digits stay assigned to the ten grid
+// cards — so the row states the affordances that exist.
+describe('<HelpOverlay /> describes the shipped board (#556 S4)', () => {
+  it('shows no hidden-capabilities block', () => {
+    const { container } = render(<HelpOverlay />);
+    openHelp();
+    expect(container.querySelector('.help-hidden-capabilities')).toBeNull();
+  });
+
+  it('tells the reader how to open Current Usage', () => {
+    render(<HelpOverlay />);
+    openHelp();
+    expect(screen.getByText(/Current Usage/i)).toBeInTheDocument();
+    expect(screen.getByText(/Enter or Space/i)).toBeInTheDocument();
+  });
+});

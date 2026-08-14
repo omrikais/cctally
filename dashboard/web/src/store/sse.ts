@@ -131,7 +131,12 @@ export function startSSE(cb: SSECallbacks = {}): void {
   };
 }
 
-// Dispatches INGEST_SNAPSHOT_ALERTS for the just-applied snapshot.
+// #556 S3 §7 — this said "Dispatches INGEST_SNAPSHOT_ALERTS for the
+// just-applied snapshot." It does not: `ingestAlerts` dispatches
+// INGEST_SOURCE_ALERTS, from the two provider projections. No production
+// caller dispatches INGEST_SNAPSHOT_ALERTS at all, so the legacy top-level
+// `state.alerts` array is empty in normal operation. This comment is what made
+// a false claim about production behaviour plausible during the S3 design.
 // `alerts ?? []` defends against backends without T5 that omit the
 // field entirely (graceful degradation; the reducer still runs and
 // the panel just stays empty). `alerts_settings` is similarly

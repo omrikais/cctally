@@ -109,6 +109,32 @@ function mkFiveHourAlert(idx: number, threshold: 90 | 95 = 95): AlertEntry {
   };
 }
 
+// #556 S3 §3.1 — the populated-legacy preference branch is gone: whenever a
+// `sources` bundle exists the panel/modal read the ACTIVE source's own
+// projection. These tests mount over the shared `envelope.json` fixture, which
+// carries a bundle, so seeding through `INGEST_SNAPSHOT_ALERTS` alone would
+// leave the surface empty. Publish the same rows on the Claude projection too,
+// which is what the server does in production — the projection is the legacy
+// array filtered by ownership (§3.2), preserving every field of the rows it
+// keeps, so the two carry identical values here.
+function seedAlerts(alerts: AlertEntry[]): void {
+  dispatch({
+    type: 'INGEST_SNAPSHOT_ALERTS',
+    alerts,
+    alertsSettings: DEFAULT_ALERTS_SETTINGS,
+    isFirstTick: true,
+  });
+  const env = JSON.parse(JSON.stringify(fixture)) as Record<string, never>;
+  const sources = (env as unknown as {
+    sources: { claude: { data: { alerts: { rows: unknown[] } } } };
+    data_version?: string;
+  }).sources;
+  sources.claude.data.alerts = {
+    rows: alerts.map((a) => ({ ...a, source: 'claude', key: a.id })),
+  };
+  updateSnapshot(env as unknown as Envelope);
+}
+
 describe('<RecentAlertsModal />', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -123,24 +149,14 @@ describe('<RecentAlertsModal />', () => {
     // Seed 120 alerts; the modal must cap at 100. (The store can hold
     // more than 100 in transit — the cap is the modal's UI policy.)
     const alerts = Array.from({ length: 120 }, (_, i) => mkAlert(i));
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts,
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts(alerts);
     render(<RecentAlertsModal />);
     const rows = document.querySelectorAll('tbody tr');
     expect(rows.length).toBe(100);
   });
 
   it('table columns: %, axis, cost, context, alerted', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90), mkFiveHourAlert(2, 95)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkAlert(1, 90), mkFiveHourAlert(2, 95)]);
     render(<RecentAlertsModal />);
     const headers = Array.from(document.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim().toLowerCase() ?? '',
@@ -149,12 +165,7 @@ describe('<RecentAlertsModal />', () => {
   });
 
   it('ESC closes modal via existing modal pattern', async () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkAlert(1, 90)]);
     render(<RecentAlertsModal />);
     expect(getState().openModal).toBe('alerts');
     const user = userEvent.setup();
@@ -168,12 +179,7 @@ describe('<RecentAlertsModal />', () => {
     // (the envelope rebuild path strips it), the modal renders the row
     // with "Block <time>" and never the literal text "primary_model"
     // or a model name we didn't supply.
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkFiveHourAlert(2, 95)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkFiveHourAlert(2, 95)]);
     render(<RecentAlertsModal />);
     const tbody = document.querySelector('tbody')!;
     expect(tbody.textContent ?? '').not.toMatch(/primary_model/);
@@ -182,12 +188,7 @@ describe('<RecentAlertsModal />', () => {
   });
 
   it('weekly alert context includes week-of date and $/1% when present', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkAlert(1, 90)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkAlert(1, 90)]);
     render(<RecentAlertsModal />);
     const tbody = document.querySelector('tbody')!;
     expect(tbody.textContent ?? '').toMatch(/Week of/);
@@ -199,12 +200,7 @@ describe('<RecentAlertsModal />', () => {
     // test* memory): drives a budget alert through the full
     // RecentAlertsModal render — chip label, CostCell (→ spent_usd), and
     // ContextCell ("Week of …" + "% of budget").
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkBudgetAlert(1, 90)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkBudgetAlert(1, 90)]);
     render(<RecentAlertsModal />);
     const row = document.querySelector('tbody tr')!;
     // Axis chip.
@@ -224,12 +220,7 @@ describe('<RecentAlertsModal />', () => {
     // Modal-level integration: drives a projected weekly_pct alert through
     // the full RecentAlertsModal render — chip label + metric-aware
     // ContextCell ("projected 102% of cap").
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkProjectedWeeklyAlert(100)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkProjectedWeeklyAlert(100)]);
     render(<RecentAlertsModal />);
     const row = document.querySelector('tbody tr')!;
     const chip = row.querySelector('.chip--projected');
@@ -241,12 +232,7 @@ describe('<RecentAlertsModal />', () => {
   });
 
   it('renders a projected budget_usd row: "projected $312 of $300" (issue #121)', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [mkProjectedBudgetAlert(100)],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([mkProjectedBudgetAlert(100)]);
     render(<RecentAlertsModal />);
     const row = document.querySelector('tbody tr')!;
     expect(row.querySelector('.chip--projected')).toHaveTextContent('PROJECTED');
@@ -272,14 +258,9 @@ describe('<RecentAlertsModal />', () => {
   // critical and a warn alert through the full modal render and assert the
   // parent wiring lands the right tier class — not just the helper.
   it('applies the critical tier class to a critical alert', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      // severity:'critical' on a threshold (90) that would otherwise derive
-      // 'warn' — proves consumption, not recompute.
-      alerts: [{ ...mkAlert(1, 90), severity: 'critical' }],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    // severity:'critical' on a threshold (90) that would otherwise derive
+    // 'warn' — proves consumption, not recompute.
+    seedAlerts([{ ...mkAlert(1, 90), severity: 'critical' }]);
     render(<RecentAlertsModal />);
     const cell = document.querySelector('td.alert-threshold')!;
     expect(cell.className).toContain('severity-critical');
@@ -288,12 +269,7 @@ describe('<RecentAlertsModal />', () => {
   });
 
   it('applies the warn tier class to a warn alert', () => {
-    dispatch({
-      type: 'INGEST_SNAPSHOT_ALERTS',
-      alerts: [{ ...mkAlert(1, 90), severity: 'warn' }],
-      alertsSettings: DEFAULT_ALERTS_SETTINGS,
-      isFirstTick: true,
-    });
+    seedAlerts([{ ...mkAlert(1, 90), severity: 'warn' }]);
     render(<RecentAlertsModal />);
     const cell = document.querySelector('td.alert-threshold')!;
     expect(cell.className).toContain('severity-warn');

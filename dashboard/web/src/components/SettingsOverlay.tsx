@@ -718,9 +718,12 @@ export function SettingsOverlay() {
   // The "Table column sorting" reset is only meaningful when SOME table has a
   // column-click override — check all four (trend + sessions + projects +
   // history; the History Weekly/Monthly table is the fourth axis, S8 #254).
+  // #556 S2 §5.3 — the History axis is now two independent overrides (weekly
+  // and monthly expose different columns), and either one enables the reset.
   const tableSortHasOverride =
     !!prefs.trendSortOverride || !!prefs.sessionsSortOverride ||
-    !!prefs.projectsSortOverride || !!prefs.historySortOverride;
+    !!prefs.projectsSortOverride || !!prefs.historySortOverrides.week ||
+    !!prefs.historySortOverrides.month;
   // "Card order" reset is only meaningful when the panel order differs from the
   // canonical default — gate the toggle the same way as the other two restores
   // so it can't stage a no-op reset (a phantom "1 change" + pointless

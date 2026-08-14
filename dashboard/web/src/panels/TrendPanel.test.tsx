@@ -221,6 +221,28 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     expect(cells).toEqual(['07-18 06:24', '30%', '$21.31', '+3.12 ↑']);
   });
 
+  // #556 S4 F8 — see WeeklyPanel.test.tsx for the rule this asserts: an h3
+  // naming the section, the accessible name resolved through it, no competing
+  // `aria-label`, and unique ids.
+  it('names each provider section by its own heading (#556 S4)', () => {
+    updateSnapshot(trendLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+    const sections = container.querySelectorAll('[data-provider-section]');
+    expect(sections.length).toBe(2);
+    sections.forEach((s) => {
+      const labelledBy = s.getAttribute('aria-labelledby');
+      expect(labelledBy).toBeTruthy();
+      expect(s.getAttribute('aria-label')).toBeNull();
+      const heading = container.querySelector(`[id="${labelledBy}"]`);
+      expect(heading).not.toBeNull();
+      expect(heading!.tagName).toBe('H3');
+      expect(heading!.textContent).toMatch(/^(Claude|Codex) \$ per 1% trend$/);
+    });
+    const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
   it('All mode renders provider-separated trend sections, never one combined series', () => {
     updateSnapshot(trendLeakEnv());
     dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });

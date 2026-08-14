@@ -258,6 +258,39 @@ def test_dashboard_dispatch_signature_leaves_idle_path_on_stats_only_digest_chan
         stats.close()
 
 
+def test_dashboard_dispatch_signature_moves_on_a_real_armed_claude_alert(
+    tmp_path, monkeypatch,
+):
+    """#556 S3 §2.9: pin the wiring, not only the helper's sensitivity.
+
+    The leg exists to leave the idle short-circuit when a Claude alert fires.
+    Passing a digest in by hand proves the signature reacts to one; only a real
+    INSERT proves `_tui_compute_dispatch_signature` and `_snapshot_data_version`
+    call it at all. Deleting the production argument leaves both digests empty
+    and equal, which is what the first assertion catches.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    stats = ns["open_db"]()
+    try:
+        before = ns["_cctally_tui"]._tui_compute_dispatch_signature(stats)
+        stats.execute(
+            "INSERT INTO budget_milestones ("
+            "vendor, period_start_at, period, threshold, budget_usd, spent_usd, "
+            "consumption_pct, crossed_at_utc, alerted_at) VALUES ("
+            "'claude', '2026-04-13T00:00:00Z', 'subscription-week', 50, "
+            "100.0, 50.0, 50.0, '2026-04-16T13:40:00Z', '2026-04-16T13:59:00Z')"
+        )
+        stats.commit()
+        after = ns["_cctally_tui"]._tui_compute_dispatch_signature(stats)
+
+        assert before.claude_stats_digest != after.claude_stats_digest
+        assert before != after
+        assert ns["_snapshot_data_version"](before) != ns["_snapshot_data_version"](after)
+    finally:
+        stats.close()
+
+
 def test_ordinary_tui_snapshot_does_no_codex_dashboard_work_and_has_no_source_bundle(
     tmp_path, monkeypatch,
 ):
@@ -463,6 +496,7 @@ def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -479,6 +513,7 @@ def test_source_bundle_retains_the_prior_complete_generation_when_postvalidation
 
         monkeypatch.setattr(tui_module, "codex_stats_digest", moving_digest)
         rebuilt = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now + ns["dt"].timedelta(minutes=1),
             display_tz_name="UTC",
@@ -510,6 +545,7 @@ def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -546,6 +582,7 @@ def test_source_bundle_publishes_pinned_snapshot_when_only_cache_moves(
         )
 
         rebuilt = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now + ns["dt"].timedelta(minutes=1),
             display_tz_name="UTC",
@@ -622,7 +659,29 @@ def test_real_dispatch_keeps_the_unchanged_provider_object_across_owned_changes(
             now_utc=now, precompute_envelope=True, runtime_bind="127.0.0.1",
         )
         assert after_prune.source_bundle.sources["claude"] is not first.source_bundle.sources["claude"]
-        assert after_prune.source_bundle.sources["codex"] is first.source_bundle.sources["codex"]
+        # #556 S2 §3.6: this prune removes the ONLY Claude session, so the daily
+        # panel empties and the shared aggregate range takes its fallback
+        # branch. Both branches now floor to display-timezone midnight of the
+        # SAME calendar day — the panel is either a full thirty-row calendar or
+        # empty, and the fallback names `today - 29` exactly as the panel's
+        # oldest row does — so the resolved start does NOT move here, and Codex
+        # is reused by object identity.
+        #
+        # Assert the shared start POSITIVELY rather than inferring it from
+        # unchanged data. The two providers carry the start at day granularity
+        # in their version material by design, precisely so a provider-only
+        # mutation cannot leave the composed aggregate describing a range one
+        # half no longer covers; naming the fragment is what proves the
+        # lockstep held rather than that nothing happened to notice.
+        claude_scope = after_prune.source_bundle.sources["claude"].aggregate_scope
+        assert (
+            claude_scope["range"]["start_at"]
+            == first.source_bundle.sources["claude"].aggregate_scope["range"]["start_at"]
+        ), "the fallback resolves the same calendar day the panel floor did"
+        assert after_prune.source_bundle.sources["codex"] is first.source_bundle.sources["codex"], (
+            "the shared start did not move, so exact-version reuse holds"
+        )
+        assert after_prune.source_bundle.sources["codex"].data == first.source_bundle.sources["codex"].data
 
         config = {"alerts": {"notifier": "osascript"}}
         after_claude_config = ns["_tui_build_snapshot"](
@@ -672,6 +731,7 @@ def test_source_bundle_threads_the_canonical_fast_tier_and_week_start(
         monkeypatch.setattr(tui_module, "build_codex_source_state", capture)
 
         bundle = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -736,12 +796,19 @@ def test_source_bundle_publishes_the_complete_legacy_derived_claude_projection(
             "current_week": {"rows": [{"key": "legacy-project", "bucket_path": "/private/cctally", "cost_usd": 1.25}]},
             "trend": {"projects": [{"key": "legacy-project", "bucket_path": "/private/cctally", "weekly_cost": [1.25]}]},
         },
-        "alerts": [{"axis": "weekly", "threshold": 90}],
+        # #556 S3: every row in the legacy array is selected by
+        # `alerted_at IS NOT NULL`, so a stub without one is not a shape the
+        # projection can receive. Composition now orders on that field and
+        # rejects a row that lacks it.
+        "alerts": [
+            {"axis": "weekly", "threshold": 90, "alerted_at": "2026-07-16T01:30:00Z"},
+        ],
         "alerts_settings": {"enabled": True},
     }
     try:
         claude_data = ns["_cctally_tui"]._tui_project_claude_source_data(legacy_envelope)
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -795,7 +862,6 @@ def test_claude_projection_filters_mixed_legacy_alert_ownership_without_duplicat
         {"axis": "codex_budget", "threshold": 90, "alerted_at": "2026-07-16T04:00:00Z"},
         {"axis": "projected", "metric": "budget_usd", "threshold": 90, "alerted_at": "2026-07-16T05:00:00Z"},
         {"axis": "projected", "metric": "codex_budget_usd", "threshold": 90, "alerted_at": "2026-07-16T06:00:00Z"},
-        {"axis": "projected", "metric": "five_hour_pct", "threshold": 90, "alerted_at": "2026-07-16T07:00:00Z"},
     ]
     legacy = {"alerts": legacy_alerts}
 
@@ -811,6 +877,25 @@ def test_claude_projection_filters_mixed_legacy_alert_ownership_without_duplicat
     assert legacy["alerts"] == legacy_alerts
 
 
+def test_an_unrecognized_projected_metric_fails_rather_than_picking_a_side():
+    """#556 S3 §3.4. This row used to be dropped silently.
+
+    Dropping it hid it from every surface, and the obvious replacement —
+    treating an unrecognized metric as Claude's — would put a future Codex-side
+    projected metric in the Claude tab. The classifier refuses both.
+    """
+    ns = load_script()
+    legacy = {
+        "alerts": [
+            {"axis": "projected", "metric": "five_hour_pct", "threshold": 90,
+             "alerted_at": "2026-07-16T07:00:00Z"},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="projected metric"):
+        ns["_cctally_tui"]._tui_project_claude_source_data(legacy)
+
+
 def test_source_bundle_retains_prior_whole_codex_state_on_ingest_contention(
     tmp_path, monkeypatch,
 ):
@@ -820,6 +905,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_contention(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -828,6 +914,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_contention(
             claude_total_tokens=0,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -856,6 +943,7 @@ def test_source_bundle_reports_unavailable_codex_when_contention_has_no_prior(
     stats = ns["open_db"]()
     try:
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc),
             display_tz_name="UTC",
@@ -882,6 +970,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_failure(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -890,6 +979,7 @@ def test_source_bundle_retains_prior_whole_codex_state_on_ingest_failure(
             claude_total_tokens=0,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -924,6 +1014,7 @@ def test_source_bundle_retains_prior_whole_claude_state_on_ingest_degradation(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -932,6 +1023,7 @@ def test_source_bundle_retains_prior_whole_claude_state_on_ingest_degradation(
             claude_total_tokens=120,
         )
         current = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -969,6 +1061,7 @@ def test_source_bundle_reports_unavailable_claude_without_prior_on_ingest_degrad
     stats = ns["open_db"]()
     try:
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc),
             display_tz_name="UTC",
@@ -1001,6 +1094,7 @@ def test_snapshot_keeps_prior_complete_source_bundle_when_signature_and_builder_
     stats = ns["open_db"]()
     try:
         prior_bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1069,6 +1163,7 @@ def test_source_bundle_hero_uses_native_cycle_while_periods_respect_visible_rang
         assert narrowed.data["periods"]["daily"]["rows"] == ()
 
         bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1147,6 +1242,7 @@ def test_dashboard_snapshot_retains_prior_claude_on_real_ingest_contention(
     stats = ns["open_db"]()
     try:
         prior_bundle = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1186,6 +1282,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1198,6 +1295,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
         )
         cache.commit()
         claude_changed = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1215,6 +1313,7 @@ def test_source_bundle_reuses_exact_unchanged_provider_objects(
         )
         cache.commit()
         codex_changed = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1563,6 +1662,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         prior = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1583,6 +1683,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
                 lambda *_args, **_kwargs: source_module.ProjectionCoherence(False, "mismatch"),
             )
             incoherent = ns["_cctally_tui"]._tui_build_source_bundle(
+                projects_envelope={},
                 stats_conn=stats,
                 now_utc=now,
                 display_tz_name="UTC",
@@ -1602,6 +1703,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
         assert incoherent.sources["all"].data["combined"] is None
 
         recovered = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1636,6 +1738,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("private /canary/root")),
             )
             failed_domain = ns["_cctally_tui"]._tui_build_source_bundle(
+                projects_envelope={},
                 stats_conn=stats,
                 now_utc=now,
                 display_tz_name="UTC",
@@ -1654,6 +1757,7 @@ def test_codex_projection_and_source_build_failed_retain_prior_then_recover(
         assert "private /canary/root" not in repr(failed_domain.sources["codex"].warnings)
 
         recovered_domain = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats,
             now_utc=now,
             display_tz_name="UTC",
@@ -1995,12 +2099,14 @@ def test_source_bundle_rebuilds_on_account_switch(tmp_path, monkeypatch):
         monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
                             lambda: {_ACCT_A})
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
         )
         monkeypatch.setattr(_cctally_account, "resolve_active_account_keys",
                             lambda: {_ACCT_B})
         second = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=1.0, claude_total_tokens=10,
             prior_bundle=first,
@@ -2116,6 +2222,7 @@ def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
     now = ns["dt"].datetime(2026, 7, 16, tzinfo=ns["dt"].timezone.utc)
     try:
         first = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False, claude_cost_usd=0.0,
             claude_total_tokens=0,
@@ -2129,6 +2236,7 @@ def test_codex_source_is_rebuilt_when_only_the_ingest_backlog_record_changes(
             cache.close()
 
         second = ns["_cctally_tui"]._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=1),
             display_tz_name="UTC", codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0, prior_bundle=first,
@@ -2219,19 +2327,30 @@ def test_claude_source_version_changes_on_a_clock_only_week_rollover(
     before = ns["dt"].datetime(2026, 7, 19, 12, 0, tzinfo=ns["dt"].timezone.utc)
     after = ns["dt"].datetime(2026, 7, 20, 15, 0, tzinfo=ns["dt"].timezone.utc)
     try:
+        # #556 S2: the shared aggregate range is pinned across both builds, for
+        # the same reason every database signature is. Left unpinned it would
+        # default to `now_utc - 30 days` and move with the clock, so this test
+        # would witness a range change rather than the week rollover it is
+        # about — and the Codex assertion below would then be measuring the
+        # deliberate lockstep invalidation of §3.6 instead.
+        pinned_range_start = before - ns["dt"].timedelta(days=30)
         first = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=before, display_tz_name="UTC",
             codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0,
+            common_range_start=pinned_range_start,
             claude_data=_claude_data_for_week(
                 tui_module,
                 week_start=_ROLLOVER_WEEK_START, week_end=_ROLLOVER_WEEK_END,
             ),
         )
         rolled = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=after, display_tz_name="UTC",
             codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0,
+            common_range_start=pinned_range_start,
             claude_data=_claude_data_for_week(
                 tui_module,
                 week_start=_ROLLOVER_WEEK_END, week_end=_ROLLOVER_NEXT_END,
@@ -2245,7 +2364,18 @@ def test_claude_source_version_changes_on_a_clock_only_week_rollover(
     assert (rolled.sources["claude"].data_version
             != first.sources["claude"].data_version)
     assert rolled.sources["claude"] is not first.sources["claude"]
-    # The rollover is Claude-local: Codex must not be dragged into it.
+    # The rollover is Claude-local WITH THE RANGE HELD FIXED, which is what
+    # `pinned_range_start` above does. Codex must not be dragged into a
+    # subscription-week rollover by itself.
+    #
+    # With a real derived range this is not the whole story, and the difference
+    # is deliberate rather than an oversight: a rollover that also crosses a
+    # display day moves the shared start, and #556 S2 §3.6 puts that start in
+    # BOTH providers' version material precisely so they rebuild together. So
+    # a day-crossing rollover DOES invalidate Codex. This test isolates the
+    # period identity from the range identity; the lockstep is asserted in
+    # `test_real_dispatch_keeps_the_unchanged_provider_object_across_owned_changes`
+    # and in `tests/test_556_s2_aggregate_ranges.py`.
     assert (rolled.sources["codex"].data_version
             == first.sources["codex"].data_version)
 
@@ -2267,6 +2397,7 @@ def test_an_unchanged_claude_period_does_not_churn_the_source_version(
     now = ns["dt"].datetime(2026, 7, 19, 12, 0, tzinfo=ns["dt"].timezone.utc)
     try:
         first = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now, display_tz_name="UTC",
             codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0,
@@ -2276,6 +2407,7 @@ def test_an_unchanged_claude_period_does_not_churn_the_source_version(
             ),
         )
         again = tui_module._tui_build_source_bundle(
+            projects_envelope={},
             stats_conn=stats, now_utc=now + ns["dt"].timedelta(minutes=5),
             display_tz_name="UTC", codex_ingest_contended=False,
             claude_cost_usd=0.0, claude_total_tokens=0,

@@ -12,6 +12,7 @@ import {
   _resetForTests as _resetKeymap,
 } from '../store/keymap';
 import type { DailyPanelRow, Envelope, ModelCostRow, PeriodRow } from '../types/envelope';
+import allFixture from '../../__tests__/fixtures/envelope.json';
 
 const models: ModelCostRow[] = [
   { model: 'claude-opus-4-8', display: 'opus-4-8', chip: 'opus', cost_usd: 6, cost_pct: 60 },
@@ -120,5 +121,40 @@ describe('<DailyModal /> (#264 S2)', () => {
     expect(document.querySelector('.detail-card')?.textContent).toContain('06-30');
     fireEvent.keyDown(document, { key: 'ArrowUp' });
     expect(document.querySelector('.detail-card')?.textContent).toContain('07-01');
+  });
+});
+
+// #556 S2 QA P2-8 — the modal must not contradict the panel one keystroke later.
+//
+// `buildKeyed` mapped a non-available daily outcome to `[]`, and the modal then
+// rendered "No usage history yet." — exactly the honest-emptiness reading spec
+// §3.7 exists to remove, and exactly the copy the panel beside it had just
+// stopped showing. The Projects modal already had this state; Daily did not.
+describe('<DailyModal /> under a withheld All daily outcome', () => {
+  function openWithheld(code: string, provider?: string): void {
+    const env = structuredClone(allFixture) as unknown as Envelope;
+    env.sources!.all.data!.aggregates!.daily = {
+      state: 'withheld', code, ...(provider ? { provider } : {}),
+    } as never;
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    openDaily();
+  }
+
+  it('names the missing fact instead of reporting no history', () => {
+    openWithheld('provider_incoherent', 'codex');
+    render(<DailyModal />);
+    const block = document.querySelector('.panel-withheld');
+    expect(block).not.toBeNull();
+    expect(block!.textContent).toContain('Codex data is out of date');
+    expect(document.body.textContent).not.toContain('No usage history yet');
+  });
+
+  it('renders generic copy for a code this build has never heard of', () => {
+    openWithheld('some_future_code');
+    render(<DailyModal />);
+    const block = document.querySelector('.panel-withheld');
+    expect(block!.textContent).toContain('withheld');
+    expect(block!.textContent).toContain('some_future_code');
   });
 });
