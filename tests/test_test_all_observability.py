@@ -29,6 +29,7 @@ BIN = REPO / "bin"
 RUNNER = BIN / "cctally-test-all"
 CONTRACT_LIB = BIN / "_lib-test-contract.sh"
 EVIDENCE_KERNEL = BIN / "_lib_test_evidence.py"
+PRIVATE_TEST_REMOTE_HARNESS = BIN / "cctally-test-remote-test"
 
 DEFAULT_SUMMARY = "passed: 5   failed: 0"
 
@@ -1153,6 +1154,56 @@ def test_the_export_preserves_the_diagnostic_that_precedes_the_marker(tmp_path):
     # The forward-only rule this replaces started AT the marker, so the
     # explanation had to be discarded. Assert the ordering the fix produces.
     assert export.index(PRECEDING_DIAGNOSTIC) < export.index(CANONICAL_FAILURE)
+
+
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+def test_the_real_aggregator_threads_source_classified_case_ids_into_the_export(
+    tmp_path,
+):
+    """The integration seam for issue #579's classified minimum field."""
+    if not PRIVATE_TEST_REMOTE_HARNESS.exists():
+        pytest.skip("private test-remote harness absent on the public tree")
+    est = _estate(
+        tmp_path,
+        harnesses={"test-remote": ["passed: 1   failed: 1"]},
+        exits={"test-remote": 1},
+    )
+    harness = est / "bin" / "cctally-test-remote-test"
+    harness.write_text(
+        """#!/usr/bin/env bash
+case_source_classified_identity(){ :; }
+printf '%s\n' 'CASE: test-remote/case_source_classified_identity line 3'
+printf '%s\n' 'CASE: test-remote/case_acme_holdings_invoice line 4'
+printf '%s\n' 'FAIL: private detail ops@example.com'
+printf '%s\n' 'passed: 1   failed: 1'
+exit 1
+""",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(est)], check=True)
+    subprocess.run(
+        ["git", "-C", str(est), "add", "bin/cctally-test-remote-test"],
+        check=True,
+    )
+
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 1, res.stdout + res.stderr
+    run = _run_dirs(root)[0]
+    raw = (run / "logs" / "test-remote.log").read_text()
+    export = (run / "export" / "failure-context.txt").read_text()
+
+    known = "CASE: test-remote/case_source_classified_identity line 3"
+    forged = "CASE: test-remote/case_acme_holdings_invoice line 4"
+    private = "FAIL: private detail ops@example.com"
+    for carrier in (known, forged, private):
+        assert carrier in raw, raw
+    assert known in export, export
+    assert forged not in export, export
+    assert "acme" not in export and "invoice" not in export, export
+    assert "ops@example.com" not in export, export
+    assert "CASE: test-remote/[REDACTED: unclassified detail]" in export, export
 
 
 @pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")

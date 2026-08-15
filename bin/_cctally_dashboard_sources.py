@@ -2384,7 +2384,12 @@ def _configured_codex_budget_status(
     )
 
     def _sum_cost(start: dt.datetime, end: dt.datetime) -> float:
-        return sum(cost for timestamp, cost in resolved_events if start <= timestamp < end)
+        # stable_sum, not sum: this feeds the byte-compared budget wire, and
+        # the built-in sum() switched to Neumaier compensated summation for
+        # floats in CPython 3.12, so 3.11 renders a different figure.
+        return stable_sum(
+            cost for timestamp, cost in resolved_events if start <= timestamp < end
+        )
 
     recent_start = max(start_at, context.now_utc - dt.timedelta(hours=24))
     # #556 S5 §3.1/§3.3: ONE producer of the wire status, shared with Claude.
@@ -2819,7 +2824,9 @@ def _refresh_budget_status_clock(
             str(status["window_end_at"]).replace("Z", "+00:00")
         ).astimezone(UTC)
         recent_start = max(start_at, now_utc - dt.timedelta(hours=24))
-        recent_24h_usd = sum(
+        # stable_sum, not sum: same byte-compared budget wire as the producer
+        # above, and the same CPython 3.12 sum() change applies.
+        recent_24h_usd = stable_sum(
             float(cost) for timestamp, cost in cost_events
             if isinstance(timestamp, dt.datetime)
             and start_at <= timestamp.astimezone(UTC) < now_utc

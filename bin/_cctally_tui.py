@@ -3209,11 +3209,16 @@ def _tui_claude_budget_domain(
             window_start_at=start_at,
             window_end_at=end_at,
             target_usd=target,
-            spent_usd=sum(
+            # stable_sum, not sum: both figures are published on the dashboard
+            # wire and byte-compared by the dashboard goldens, and the built-in
+            # sum() switched to Neumaier compensated summation for floats in
+            # CPython 3.12, so the same spend renders 49.20424485 on 3.12+ and
+            # 49.204244850000016 on 3.11.
+            spent_usd=stable_sum(
                 cost for timestamp, cost in events
                 if start_at <= timestamp < now_utc
             ),
-            recent_24h_usd=sum(
+            recent_24h_usd=stable_sum(
                 cost for timestamp, cost in events
                 if recent_start <= timestamp < now_utc
             ),

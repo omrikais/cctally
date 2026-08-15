@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.99.1] - 2026-08-15
+
+### Fixed
+- The dashboard now recognizes the previous calendar day as `Yesterday` across a fall-back daylight-saving transition instead of falling through to the absolute timestamp (#584).
+- Budget figures no longer depend on which Python version is running cctally. The dashboard's Claude and Codex budget blocks added their spend with the built-in `sum()`, which CPython changed in 3.12 to use compensated summation, so the same spend over the same entries produced `$49.20424485` on Python 3.12 and later and `$49.204244850000016` on Python 3.11. The rendered figure is rounded to cents and never differed to the eye, but the published payload did, which is why the repository's own byte-comparison of that payload failed on 3.11. These four sums now use the exactly-rounded helper the rest of the cost surfaces already use, so every supported interpreter publishes the same number.
+- `cctally account attribute --help` no longer prints `(default: None)` beneath `--since`, which is a required argument and therefore has no default. Python 3.13 already suppressed it and 3.11 and 3.12 did not, so the same command printed two different help texts depending on the interpreter. cctally now applies the 3.13 rule on every supported version, and this covers every required option on every subcommand, not only this one.
+
 ## [1.99.0] - 2026-08-15
 
 ### Added
@@ -18,6 +25,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Complete the Claude/Codex parity certification with current source-aware dashboard, analytics, sharing, conversation, privacy, and scale evidence; the TUI remains explicitly Claude-only under its bugfix-only maintenance policy (#322).
 
 ### Fixed
+- Failed authoritative test-gate records now retain the exact `test-remote` case function and source line even when private assertion detail is redacted, and the local record survives the next passing invocation (#579).
 - Schema tables, views, triggers and indexes in both cache stores now have a structural delivery guard, so a definition added without a migration cannot silently reach only fresh installations (#580).
 - Claude-active dashboard refreshes now incrementally update the `All` view's shared-range project and daily aggregates instead of rescanning and repricing the full thirty-day Claude history on every new entry. On the 60,000-entry benchmark with one live append before each warm run, the median added source-build time fell from about 404 ms to 2.5 ms while project and daily totals remained byte-identical to a cold rebuild (#567).
 - A Codex-active dashboard refresh now updates only changed rollout paths, accounts, and day/period/session/project aggregates instead of re-reading and re-aggregating the complete retained Codex history. On a copied production store with 154,600 Codex entries, a caught-up live dirty iteration including ingest completed in 4.77 seconds (9.77-second cooldown-adjusted publish period) while preserving the exact prior dashboard payload (#582).

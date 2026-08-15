@@ -57,6 +57,22 @@ class CLIHelpFormatter(
         kwargs.setdefault("max_help_position", 30)
         super().__init__(prog, **kwargs)  # type: ignore[arg-type]
 
+    def _get_help_string(self, action: argparse.Action) -> "str | None":
+        """Never state a default for a required argument.
+
+        CPython 3.13 stopped appending ``(default: ...)`` to a required
+        argument's help; 3.11 and 3.12 still append it. Without this the same
+        parser prints two different help texts depending on the interpreter,
+        so `cctally account attribute --help` renders a meaningless
+        ``(default: None)`` under `--since` on the two older versions and the
+        goldened help diverges on every lane that is not 3.13. Pinning the
+        3.13 rule for every supported version is what makes `--help` a
+        property of this program rather than of the interpreter running it.
+        """
+        if action.required:
+            return action.help
+        return super()._get_help_string(action)
+
 
 _PHYSICAL_PROVIDER_SOURCES = ("claude", "codex")
 

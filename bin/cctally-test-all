@@ -500,13 +500,15 @@ def _roots():
 
 
 def _context():
-    """The ScrubContext, with both private facts injected or neither.
+    """The ScrubContext, with private disclosure facts injected fail-closed.
 
     `is_public_path` and `known_tokens` are None when the private kernel is
-    absent or refuses, which redacts more rather than less.
+    absent or refuses, which redacts more rather than less. The same rule
+    applies to the exact test-remote case identifiers.
     """
     is_public = None
     tokens = None
+    case_ids = None
     repo = _env("EV_REPO_ROOT")
     if PRIV is not None:
         builder = getattr(PRIV, "build_disclosure_predicate", None) or getattr(
@@ -521,8 +523,15 @@ def _context():
             tokens = PRIV.build_known_tokens(repo)
         except Exception:                               # noqa: BLE001
             tokens = None
+        try:
+            case_ids = PRIV.build_known_test_remote_case_ids(repo)
+        except Exception:                               # noqa: BLE001
+            case_ids = None
     return EV.ScrubContext(
-        roots=_roots(), is_public_path=is_public, known_tokens=tokens
+        roots=_roots(),
+        is_public_path=is_public,
+        known_tokens=tokens,
+        known_case_ids=case_ids,
     )
 
 

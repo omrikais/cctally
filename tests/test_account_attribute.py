@@ -281,6 +281,13 @@ def _cli(app_dir: pathlib.Path, codex_home: pathlib.Path, *args: str,
         "CODEX_HOME": str(codex_home),
         "CCTALLY_DISABLE_TELEMETRY": "1",
         "CCTALLY_DISABLE_UPDATE_CHECK": "1",
+        # AC7 drives `cache-sync --rebuild`, which reaches the conversations
+        # transcript probe. That probe clones copy-on-write and fails closed
+        # when the filesystem cannot, which every hosted Linux workspace on
+        # ext4/overlayfs does — so without this the two AC7 legs and the two
+        # after the retraction exit 1 on Linux while passing on APFS. The seam
+        # is guarded by PYTEST_CURRENT_TEST and is unreachable from production.
+        "CCTALLY_TEST_CONVERSATION_PROBE_COPY": "1",
         "TZ": "Etc/UTC",
         **(extra_env or {}),
     }

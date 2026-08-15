@@ -201,10 +201,6 @@ function fmtStartedShortOrNull(
 // 30-hour-old alert seen just after midnight. Calendar transitions
 // honor `ctx.tz` so a 23:30 alert in a +03 zone correctly reads
 // "Yesterday" the next morning even if `Date.now()` lives in UTC.
-// CAVEAT: "the previous calendar day" is DERIVED by subtracting 24h from
-// `nowMs`, which is one calendar day back on every day except a fall-back
-// DST day, where the subtraction lands inside today and no instant can
-// match. Known defect, tracked in #584; #574 left the ladder untouched.
 // #574: the absolute branch carries the clock time, because a bare
 // calendar day rendered every alert that fired on one day as the same
 // string. Matches the chokepoint rule: every datetime render in the
@@ -235,12 +231,17 @@ function fmtRelativeOrAbsolute(
   const todayKey = `${today.year}-${today.month}-${today.day}`;
   const thenKey  = `${then.year}-${then.month}-${then.day}`;
   if (todayKey !== thenKey && deltaMs < 172_800_000) {
-    // Compute "yesterday" in ctx.tz by subtracting one day from today.
-    const y = new Date(nowMs - 86_400_000);
-    const yp = partsByType(y, ctx.tz, {
-      year: 'numeric', month: '2-digit', day: '2-digit',
-    });
-    const yKey = `${yp.year}-${yp.month}-${yp.day}`;
+    // Subtract from the extracted civil date, not from the instant: a
+    // fall-back day is 25 hours long, so nowMs - 24h can still be today.
+    const yesterday = new Date(0);
+    yesterday.setUTCFullYear(
+      Number(today.year), Number(today.month) - 1, Number(today.day) - 1,
+    );
+    const yKey = [
+      yesterday.getUTCFullYear(),
+      pad2(yesterday.getUTCMonth() + 1),
+      pad2(yesterday.getUTCDate()),
+    ].join('-');
     if (thenKey === yKey) return 'Yesterday';
   }
   return fmtDatetimeShort(iso, ctx);

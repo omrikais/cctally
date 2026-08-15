@@ -423,6 +423,15 @@ _MARKER_PREFIX_RE = re.compile(
     + "|".join(HARD_MARKERS + SUPPLEMENTAL_MARKERS)
     + r")(?P<sep>:?)(?P<rest>.*)$"
 )
+# A deliberately tiny disclosure lane for the hermetic remote-wrapper harness.
+# The case name is not free text: the private caller injects the exact set of
+# `case_*` functions present in the tracked harness source.  The numeric source
+# line carries no repository or host content and makes the fixed `top-level`
+# fallback useful for older assertions that are not grouped in a function.
+_TEST_REMOTE_CASE_RE = re.compile(
+    r"^(?P<head>CASE:\s+test-remote/)(?P<case>case_[A-Za-z0-9_]+|top-level)"
+    r"(?P<tail>\s+line\s+[1-9][0-9]*)$"
+)
 # ANY `<segment>/<segment>` token, routed through the predicate. This rule used
 # to enumerate five known-public top-level directories, which left every other
 # one — `.githooks/`, `.agentmem/`, `scripts/`, `homebrew/`, `telemetry/` —
@@ -483,12 +492,22 @@ class ScrubContext:
     is the same fail-closed default, for the same reason.
     """
 
-    def __init__(self, roots=None, is_public_path=None, known_tokens=None):
+    def __init__(
+        self,
+        roots=None,
+        is_public_path=None,
+        known_tokens=None,
+        known_case_ids=None,
+    ):
         self.roots = dict(roots or {})
         self.is_public_path = is_public_path
         self.known_tokens = (
             None if known_tokens is None
             else frozenset(str(token).lower() for token in known_tokens)
+        )
+        self.known_case_ids = (
+            None if known_case_ids is None
+            else frozenset(str(case_id) for case_id in known_case_ids)
         )
         # One alternation, longest prefix first, so /Users/x/.claude does not
         # lose to /Users/x. Compiled once here rather than rebuilt per line.
@@ -514,6 +533,9 @@ class ScrubContext:
 
     def token_is_known(self, word: str) -> bool:
         return self.known_tokens is not None and word.lower() in self.known_tokens
+
+    def case_id_is_known(self, case_id: str) -> bool:
+        return self.known_case_ids is not None and case_id in self.known_case_ids
 
 
 # The reduction is a SEGMENT rewrite, not three successive text rewrites.
@@ -714,6 +736,12 @@ def scrub_line(line, ctx: "ScrubContext") -> str:
     if line is None:
         return UNCLASSIFIED_PLACEHOLDER
     raw = line.rstrip("\n")
+
+    case_ref = _TEST_REMOTE_CASE_RE.match(raw)
+    if case_ref:
+        if ctx.case_id_is_known(case_ref.group("case")):
+            return raw
+        return case_ref.group("head") + UNCLASSIFIED_DETAIL
 
     for pattern in _STRUCTURED_VERBATIM:
         if pattern.match(raw):

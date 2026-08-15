@@ -232,6 +232,17 @@ describe('fmt.relativeOrAbsolute (#574 — inspectable firing instant)', () => {
     )).toBe('Yesterday');
   });
 
+  it('finds the previous calendar day across a fall-back DST transition', () => {
+    // New York's 2026 fall-back makes this local day 25 hours long. Subtracting
+    // exactly 24 hours from 23:30 EST lands at 00:30 EDT on the same date, so
+    // millisecond arithmetic cannot identify the previous calendar day.
+    const now = Date.parse('2026-11-02T04:30:00Z'); // Nov 1 23:30 EST
+    const instant = '2026-11-01T03:45:00Z'; // Oct 31 23:45 EDT
+    expect(fmt.relativeOrAbsolute(
+      instant, { tz: 'America/New_York', offsetLabel: 'EST' }, now,
+    )).toBe('Yesterday');
+  });
+
   it('renders the absolute branch in ctx.tz with the instant\'s own zone abbreviation', () => {
     const now = Date.parse('2026-04-20T00:00:00Z');
     const instant = '2026-04-16T21:32:00Z';

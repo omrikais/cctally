@@ -366,6 +366,10 @@ KNOWN_TOKENS = frozenset({
 
 def _ctx(**kw):
     kw.setdefault("known_tokens", KNOWN_TOKENS)
+    kw.setdefault(
+        "known_case_ids",
+        {"top-level", "case_a_failed_canonical_run_keeps_a_mac_side_extract"},
+    )
     return K.ScrubContext(
         roots={"home": "/Users/testuser", "repo": "/repo", "tmp": "/tmp"}, **kw
     )
@@ -532,6 +536,23 @@ def test_a_marker_keeps_its_prefix_and_scrubs_its_dynamic_suffix():
     assert out.startswith("FAIL:")
     assert "/Users/testuser" not in out
     assert "<home>" in out
+
+
+def test_a_source_classified_test_remote_case_identifier_survives_verbatim():
+    line = (
+        "CASE: test-remote/"
+        "case_a_failed_canonical_run_keeps_a_mac_side_extract line 5624"
+    )
+    assert K.scrub_line(line, _ctx()) == line
+    assert K.validate_export([line], {"repo": "/repo"}) == []
+
+
+def test_an_unknown_test_remote_case_identifier_fails_closed():
+    line = "CASE: test-remote/case_acme_holdings_invoice line 5624"
+    out = K.scrub_line(line, _ctx())
+    assert "acme" not in out
+    assert "invoice" not in out
+    assert "REDACTED" in out
 
 
 def test_a_marker_suffix_carrying_a_json_payload_is_redacted():
